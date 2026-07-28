@@ -4411,8 +4411,15 @@ pub fn check_program_with_effects(
     // rewrote every call target to the mangled name, so nothing else needs renaming.
     let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some((oname, targs)) = worklist.pop_front() {
-        let mangled =
-            mangle_mono(&oname, &targs, &tagged_types, &structs, &enums, &fn_types);
+        let mangled = mangle_mono(
+            &oname,
+            &targs,
+            &tagged_types,
+            &structs,
+            &enums,
+            &tuples,
+            &fn_types,
+        );
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
         }
@@ -4785,7 +4792,9 @@ fn refine_fn_value_types(
             externs: &externs,
             structs: &program.structs,
             enums: &program.enums,
+            tuples: &program.tuples,
             tagged_types: &program.tagged_types,
+            loop_result_tys: Vec::new(),
         };
         scan.block(&f.body);
         if let Some(value) = f.body.value.as_deref() {
@@ -4842,7 +4851,9 @@ fn compute_effect_sets(
             externs: &externs,
             structs: &program.structs,
             enums: &program.enums,
+            tuples: &program.tuples,
             tagged_types: &program.tagged_types,
+            loop_result_tys: Vec::new(),
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -4967,7 +4978,11 @@ struct EffectScan<'a> {
     externs: &'a std::collections::HashSet<&'a str>,
     structs: &'a [StructDef],
     enums: &'a [hir::EnumDef],
+    tuples: &'a [hir::TupleDef],
     tagged_types: &'a [hir::TaggedType],
+    /// Result types of the lexically enclosing loops. A `break value` joins only the innermost
+    /// entry, so nested-loop exits cannot contaminate an outer loop's callback origins.
+    loop_result_tys: Vec<Ty>,
 }
 
 /// One source-value projection on the path to a concrete function-valued leaf.  Unlike the former
@@ -4977,6 +4992,7 @@ struct EffectScan<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FnEffectProjection {
     StructField(u32),
+    TupleElement(u32),
     EnumPayload { variant: u32, index: u32 },
     OptionSome,
     ResultOk,
@@ -5082,7 +5098,20 @@ impl EffectScan<'_> {
                         self.join_return_effects(e);
                     }
                 }
-                Stmt::Break(Some(e)) | Stmt::Expr(e) => self.expr(e),
+                Stmt::Break(Some(e)) => {
+                    self.expr(e);
+                    if self.known_effects.is_some()
+                        && let Some(loop_ty) = self.loop_result_tys.last().copied()
+                    {
+                        self.join_concrete_effects(
+                            loop_ty,
+                            e,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        );
+                    }
+                }
+                Stmt::Expr(e) => self.expr(e),
                 Stmt::Return(None) | Stmt::Break(None) => {}
             }
         }
@@ -5184,6 +5213,12 @@ impl EffectScan<'_> {
                 .get(id as usize)
                 .and_then(|def| def.fields.get(index as usize))
                 .map(|field| field.ty),
+            (Ty::Tuple(id), FnEffectProjection::TupleElement(index)) => self
+                .tuples
+                .get(id as usize)
+                .and_then(|def| def.elems.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
             (
                 Ty::Enum(id),
                 FnEffectProjection::EnumPayload { variant, index },
@@ -5239,6 +5274,13 @@ impl EffectScan<'_> {
                 .map(|value| self.projected_fn_effect(value, rest))
                 .unwrap_or(Some(FnEffect::Unknown)),
             (
+                ExprKind::Tuple { elems, .. },
+                FnEffectProjection::TupleElement(index),
+            ) => elems
+                .get(index as usize)
+                .map(|value| self.projected_fn_effect(value, rest))
+                .unwrap_or(Some(FnEffect::Unknown)),
+            (
                 ExprKind::EnumValue {
                     variant,
                     payload,
@@ -5276,12 +5318,78 @@ impl EffectScan<'_> {
                 ExprKind::ArrayToArray { source, stages, .. },
                 FnEffectProjection::ArrayElement,
             ) if stages.is_empty() => self.projected_fn_effect(source, path),
+            (
+                ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv),
+                FnEffectProjection::ArrayElement,
+            ) => self.projected_fn_effect(recv, path),
             (ExprKind::Index { recv, .. }, _) => {
                 let mut wrapped = Vec::with_capacity(path.len() + 1);
                 wrapped.push(FnEffectProjection::ArrayElement);
                 wrapped.extend_from_slice(path);
                 self.projected_fn_effect(recv, &wrapped)
             }
+            (ExprKind::Field { root, path: field_path }, _) => {
+                let Some(root_ty) =
+                    self.locals.get(*root as usize).map(|local| local.ty)
+                else {
+                    return Some(FnEffect::Unknown);
+                };
+                let mut wrapped =
+                    Vec::with_capacity(field_path.len() + path.len());
+                wrapped.extend(
+                    field_path
+                        .iter()
+                        .copied()
+                        .map(FnEffectProjection::StructField),
+                );
+                wrapped.extend_from_slice(path);
+                self.projected_type_effect(root_ty, &wrapped)
+            }
+            (ExprKind::IndexField { base, path: field_path, .. }, _) => {
+                let Some(base_ty) =
+                    self.locals.get(*base as usize).map(|local| local.ty)
+                else {
+                    return Some(FnEffect::Unknown);
+                };
+                let mut wrapped =
+                    Vec::with_capacity(field_path.len() + path.len() + 1);
+                wrapped.push(FnEffectProjection::ArrayElement);
+                wrapped.extend(
+                    field_path
+                        .iter()
+                        .copied()
+                        .map(FnEffectProjection::StructField),
+                );
+                wrapped.extend_from_slice(path);
+                self.projected_type_effect(base_ty, &wrapped)
+            }
+            (ExprKind::ElemField { recv, path: field_path, .. }, _) => {
+                let mut wrapped =
+                    Vec::with_capacity(field_path.len() + path.len() + 1);
+                wrapped.push(FnEffectProjection::ArrayElement);
+                wrapped.extend(
+                    field_path
+                        .iter()
+                        .copied()
+                        .map(FnEffectProjection::StructField),
+                );
+                wrapped.extend_from_slice(path);
+                self.projected_fn_effect(recv, &wrapped)
+            }
+            (ExprKind::TupleIndex { recv, index }, _) => {
+                let mut wrapped = Vec::with_capacity(path.len() + 1);
+                wrapped.push(FnEffectProjection::TupleElement(*index));
+                wrapped.extend_from_slice(path);
+                self.projected_fn_effect(recv, &wrapped)
+            }
+            (
+                ExprKind::ResultMapErr { result, .. },
+                FnEffectProjection::ResultOk,
+            ) => self.projected_fn_effect(result, path),
+            (
+                ExprKind::ResultMapErr { .. },
+                FnEffectProjection::ResultErr,
+            ) => Some(FnEffect::Unknown),
             (ExprKind::ElseUnwrap { opt, fallback }, _) => {
                 let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
                     Ty::Option(_) => Some(FnEffectProjection::OptionSome),
@@ -5308,6 +5416,11 @@ impl EffectScan<'_> {
                 self.projected_fn_effect(result, &wrapped)
             }
             (ExprKind::Call { .. }, _) => {
+                self.projected_type_effect(expr.ty, path)
+            }
+            (ExprKind::Loop { .. }, _) => {
+                // Every break bound to this loop joins `expr.ty` during the fixed-point refinement
+                // walk, so the settled result type is the exact producer-owned callback cell.
                 self.projected_type_effect(expr.ty, path)
             }
             (ExprKind::Local(local), _) => self
@@ -5454,6 +5567,7 @@ impl EffectScan<'_> {
         if !matches!(
             ty,
             Ty::Struct(_)
+                | Ty::Tuple(_)
                 | Ty::Enum(_)
                 | Ty::Option(_)
                 | Ty::Result(..)
@@ -5482,6 +5596,22 @@ impl EffectScan<'_> {
                 for (index, field) in def.fields.iter().enumerate() {
                     path.push(FnEffectProjection::StructField(index as u32));
                     self.join_concrete_effects(field.ty, incoming, path, visiting);
+                    path.pop();
+                }
+            }
+            Ty::Tuple(id) => {
+                let Some(def) = self.tuples.get(id as usize) else {
+                    visiting.pop();
+                    return;
+                };
+                for (index, element) in def.elems.iter().enumerate() {
+                    path.push(FnEffectProjection::TupleElement(index as u32));
+                    self.join_concrete_effects(
+                        scalar_to_ty(*element),
+                        incoming,
+                        path,
+                        visiting,
+                    );
                     path.pop();
                 }
             }
@@ -5599,6 +5729,36 @@ impl EffectScan<'_> {
             ExprKind::ArrayBuilderBuild(i) => self.expr(i),
             _ => unreachable!("effect_array_builder on a non-array_builder op"),
         }
+    }
+
+    /// Scan one loop until every callback-origin cell reaches a backedge fixpoint. Function-value
+    /// effects form a finite three-point lattice, and each loop-carried assignment joins into the
+    /// existing cell; two transitions per cell are therefore a conservative convergence bound.
+    /// Ordinary effect collection does not mutate these cells and needs only one structural pass.
+    fn loop_body(&mut self, body: &Block, result_ty: Ty) {
+        self.loop_result_tys.push(result_ty);
+        if self.known_effects.is_some() {
+            let max_passes = self.fn_types.len().saturating_mul(2).saturating_add(1);
+            for _ in 0..max_passes {
+                let before: Vec<FnEffect> = self
+                    .fn_types
+                    .iter()
+                    .map(|function| function.effect.get())
+                    .collect();
+                self.block(body);
+                if self
+                    .fn_types
+                    .iter()
+                    .map(|function| function.effect.get())
+                    .eq(before)
+                {
+                    break;
+                }
+            }
+        } else {
+            self.block(body);
+        }
+        self.loop_result_tys.pop();
     }
 
     fn expr(&mut self, e: &Expr) {
@@ -6268,7 +6428,10 @@ impl EffectScan<'_> {
                 self.expr(builder);
                 self.expr(arg);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Loop { body: b, .. } => self.block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
+                self.block(b)
+            }
+            ExprKind::Loop { body, .. } => self.loop_body(body, e.ty),
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
@@ -12561,6 +12724,17 @@ impl<'a, 't> Checker<'a, 't> {
                 .get(aid as usize)
                 .zip(self.enums.get(bid as usize))
                 .is_some_and(|(a, b)| a.source_name == b.source_name),
+            (Ty::Tuple(aid), Ty::Tuple(bid)) => self
+                .tuples
+                .get(aid as usize)
+                .zip(self.tuples.get(bid as usize))
+                .is_some_and(|(a, b)| {
+                    a.elems.len() == b.elems.len()
+                        && a.elems
+                            .iter()
+                            .zip(&b.elems)
+                            .all(|(a, b)| self.source_scalar_matches(*a, *b))
+                }),
             (Ty::Option(a), Ty::Option(b))
             | (Ty::Box(a), Ty::Box(b))
             | (Ty::Slice(a), Ty::Slice(b))
@@ -24209,6 +24383,7 @@ impl<'a, 't> Checker<'a, 't> {
                             self.tagged_types,
                             self.structs,
                             self.enums,
+                            self.tuples,
                             self.fn_types,
                         );
                     }
@@ -25433,12 +25608,20 @@ fn mangle_mono(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
         s.push('$');
-        s.push_str(&ty_mangle(*a, tagged_types, structs, enums, fn_types));
+        s.push_str(&ty_mangle(
+            *a,
+            tagged_types,
+            structs,
+            enums,
+            tuples,
+            fn_types,
+        ));
     }
     s
 }
@@ -25451,6 +25634,7 @@ fn mangle_mono_source(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
 ) -> String {
     let mut s = name.to_string();
@@ -25461,6 +25645,7 @@ fn mangle_mono_source(
             tagged_types,
             structs,
             enums,
+            tuples,
             fn_types,
         ));
     }
@@ -25473,9 +25658,18 @@ fn ty_mangle(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
 ) -> String {
-    ty_mangle_impl(ty, tagged_types, structs, enums, fn_types, true)
+    ty_mangle_impl(
+        ty,
+        tagged_types,
+        structs,
+        enums,
+        tuples,
+        fn_types,
+        true,
+    )
 }
 
 fn source_ty_mangle(
@@ -25483,9 +25677,18 @@ fn source_ty_mangle(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
 ) -> String {
-    ty_mangle_impl(ty, tagged_types, structs, enums, fn_types, false)
+    ty_mangle_impl(
+        ty,
+        tagged_types,
+        structs,
+        enums,
+        tuples,
+        fn_types,
+        false,
+    )
 }
 
 fn ty_mangle_impl(
@@ -25493,6 +25696,7 @@ fn ty_mangle_impl(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
     include_fn_origin: bool,
 ) -> String {
@@ -25502,6 +25706,7 @@ fn ty_mangle_impl(
         tagged_types: &[hir::TaggedType],
         structs: &[StructDef],
         enums: &[hir::EnumDef],
+        tuples: &[hir::TupleDef],
         fn_types: &[hir::FnTy],
         include_fn_origin: bool,
         tagged_visiting: &mut HashSet<u32>,
@@ -25515,6 +25720,7 @@ fn ty_mangle_impl(
                 tagged_types,
                 structs,
                 enums,
+                tuples,
                 fn_types,
                 include_fn_origin,
                 tagged_visiting,
@@ -25594,6 +25800,7 @@ fn ty_mangle_impl(
                     tagged_types,
                     structs,
                     enums,
+                    tuples,
                     fn_types,
                     include_fn_origin,
                     tagged_visiting,
@@ -25608,6 +25815,7 @@ fn ty_mangle_impl(
                         tagged_types,
                         structs,
                         enums,
+                        tuples,
                         fn_types,
                         include_fn_origin,
                         tagged_visiting,
@@ -25622,11 +25830,33 @@ fn ty_mangle_impl(
                     tagged_types,
                     structs,
                     enums,
+                    tuples,
                     fn_types,
                     include_fn_origin,
                     tagged_visiting,
                     fn_visiting
                 )
+            ),
+            Ty::Tuple(id) => tuples.get(id as usize).map_or_else(
+                || "U_invalid".to_string(),
+                |tuple| {
+                    format!(
+                        "U{}_{}",
+                        tuple.elems.len(),
+                        tuple
+                            .elems
+                            .iter()
+                            .map(|element| {
+                                scalar(
+                                    *element,
+                                    tagged_visiting,
+                                    fn_visiting,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("_")
+                    )
+                },
             ),
             Ty::Fn(id) if fn_visiting.insert(id) => {
                 let result = fn_types.get(id as usize).map_or_else(
@@ -25688,6 +25918,7 @@ fn ty_mangle_impl(
                                 tagged_types,
                                 structs,
                                 enums,
+                                tuples,
                                 fn_types,
                                 include_fn_origin,
                                 tagged_visiting,
@@ -25708,6 +25939,7 @@ fn ty_mangle_impl(
         tagged_types,
         structs,
         enums,
+        tuples,
         fn_types,
         include_fn_origin,
         &mut HashSet::new(),
@@ -26976,13 +27208,27 @@ fn instantiate_struct(
     span: Span,
     diags: &mut Diagnostics,
 ) -> u32 {
-    let mangled =
-        mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
+    let mangled = mangle_mono(
+        name,
+        args,
+        cx.tagged_types,
+        cx.structs,
+        cx.enums,
+        cx.tuples,
+        cx.fn_types,
+    );
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
     }
-    let source_name =
-        mangle_mono_source(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
+    let source_name = mangle_mono_source(
+        name,
+        args,
+        cx.tagged_types,
+        cx.structs,
+        cx.enums,
+        cx.tuples,
+        cx.fn_types,
+    );
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
         let fty = subst_param_ty(f.ty, args, cx.tagged_types);
@@ -27047,13 +27293,27 @@ fn instantiate_enum(
     span: Span,
     diags: &mut Diagnostics,
 ) -> u32 {
-    let mangled =
-        mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
+    let mangled = mangle_mono(
+        name,
+        args,
+        cx.tagged_types,
+        cx.structs,
+        cx.enums,
+        cx.tuples,
+        cx.fn_types,
+    );
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
     }
-    let source_name =
-        mangle_mono_source(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
+    let source_name = mangle_mono_source(
+        name,
+        args,
+        cx.tagged_types,
+        cx.structs,
+        cx.enums,
+        cx.tuples,
+        cx.fn_types,
+    );
     let mut variants = Vec::with_capacity(tmpl.variants.len());
     for v in &tmpl.variants {
         let payload: Vec<Scalar> = v
@@ -29024,18 +29284,21 @@ mod tests {
         let by_value = function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None);
         let origins = vec![by_value.clone(), by_value.clone()];
         assert_ne!(
-            ty_mangle(Ty::Fn(0), &[], &[], &[], &origins),
-            ty_mangle(Ty::Fn(1), &[], &[], &[], &origins),
+            ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
+            ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
             "concrete function-value origins need distinct semantic monomorphs so later effect refinement cannot alias their cells"
         );
         assert_eq!(
-            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &origins),
-            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &origins),
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
+            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
             "source-visible function types erase inferred effect origins"
         );
-        let mangle_signature = |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[function]);
+        let mangle_signature =
+            |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function]);
         let source_mangle_signature =
-            |function| source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[function]);
+            |function| {
+                source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function])
+            };
         assert_ne!(
             mangle_signature(by_value.clone()),
             mangle_signature(function(ast::ParamMode::Out, hir::ReturnBorrowSummary::None)),
@@ -29067,6 +29330,64 @@ mod tests {
                 },
             )),
             "return provenance remains source-visible signature identity"
+        );
+    }
+
+    #[test]
+    fn tuple_mangling_is_structural_and_erases_nested_callback_origins() {
+        let structs = vec![
+            StructDef {
+                name: "Holder$origin0".to_string(),
+                source_name: "Holder$fn_i64_i64".to_string(),
+                fields: vec![],
+                align: None,
+                c_repr: false,
+            },
+            StructDef {
+                name: "Holder$origin1".to_string(),
+                source_name: "Holder$fn_i64_i64".to_string(),
+                fields: vec![],
+                align: None,
+                c_repr: false,
+            },
+        ];
+        let tuples = vec![
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynStructArray(0),
+                    Scalar::Int(IntTy { bits: 64, signed: true }),
+                ],
+            },
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynStructArray(1),
+                    Scalar::Int(IntTy { bits: 64, signed: true }),
+                ],
+            },
+        ];
+        assert_ne!(
+            ty_mangle(Ty::Tuple(0), &[], &structs, &[], &tuples, &[]),
+            ty_mangle(Ty::Tuple(1), &[], &structs, &[], &tuples, &[]),
+            "semantic tuple identity retains nested concrete callback origins"
+        );
+        assert_eq!(
+            source_ty_mangle(
+                Ty::Tuple(0),
+                &[],
+                &structs,
+                &[],
+                &tuples,
+                &[],
+            ),
+            source_ty_mangle(
+                Ty::Tuple(1),
+                &[],
+                &structs,
+                &[],
+                &tuples,
+                &[],
+            ),
+            "source tuple identity recursively erases nested callback origins"
         );
     }
 }

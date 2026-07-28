@@ -908,6 +908,247 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn loop_carried_callback_effects_reach_a_fixpoint() {
+    let direct = "\
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut f := quiet
+  mut i := 0
+  loop {
+    g := f
+    if i == 1 { return g(x) }
+    f = loud
+    i = i + 1
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-loop-carried-direct-callback", direct)
+            .contains("has an observable side effect"),
+        "a callback assigned at the loop tail must reach consumers on the next iteration"
+    );
+
+    let aggregate = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut holder := Holder { callback: quiet }
+  mut i := 0
+  loop {
+    current := holder
+    if i == 1 { return current.callback(x) }
+    holder = Holder { callback: loud }
+    i = i + 1
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-loop-carried-aggregate-callback", aggregate)
+            .contains("has an observable side effect"),
+        "loop backedges must converge recursively through callback-bearing aggregates"
+    );
+}
+
+#[test]
+fn pure_callback_projections_preserve_exact_origins() {
+    let field = "\
+Envelope<T> { value: T }
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn worker(x: i64) -> i64 {
+  envelope := Envelope { value: Holder { callback: quiet } }
+  holder := envelope.value
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-field-callback-projection", field),
+        "a direct field projection must preserve its nested Pure callback origin"
+    );
+
+    let element_field = field.replace(
+        "  envelope := Envelope { value: Holder { callback: quiet } }\n  holder := envelope.value",
+        "  envelopes := [Envelope { value: Holder { callback: quiet } }]\n  holder := envelopes[0].value",
+    );
+    assert!(
+        !check_errs(
+            "parmap-pure-element-field-callback-projection",
+            &element_field,
+        ),
+        "a struct-array element field must preserve its nested Pure callback origin"
+    );
+
+    let slice = "\
+Holder<T> { callback: T }
+Choice<T> { Some(T), None }
+fn quiet(x: i64) -> i64 = x + 1
+fn worker(x: i64) -> i64 {
+  choices := [
+    Choice.Some(Holder { callback: quiet }),
+    Choice.Some(Holder { callback: quiet }),
+  ]
+  view := choices[0..2]
+  choice := view[x % 2]
+  return match choice {
+    Some(holder) => holder.callback(x),
+    None => x,
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let slice_diagnostics =
+        check_diagnostics("parmap-pure-slice-callback-projection", slice);
+    assert!(
+        slice_diagnostics.is_empty(),
+        "an identity slice view must preserve its array element callback origins:\n{slice_diagnostics}"
+    );
+
+    let map_err = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn keep_error(e: Error) -> Error = e
+fn wrap<T>(value: T) -> Result<T, Error> = Ok(value)
+fn worker(x: i64) -> i64 {
+  mapped := wrap(Holder { callback: quiet }).map_err(keep_error)
+  holder := mapped else { return x }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-map-err-ok-callback", map_err),
+        "map_err must preserve the exact callback origin in its unchanged Ok payload"
+    );
+
+    let loop_value = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn worker(x: i64) -> i64 {
+  holder := loop {
+    if x < 0 { break Holder { callback: quiet } }
+    break Holder { callback: quiet }
+  }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-loop-break-callback", loop_value),
+        "a value-producing loop must join only its own known-Pure break values"
+    );
+
+    let impure_loop_value = loop_value
+        .replace(
+            "fn quiet(x: i64) -> i64 = x + 1",
+            "fn quiet(x: i64) -> i64 = x + 1\nfn loud(x: i64) -> i64 { print(x); return x }",
+        )
+        .replacen(
+            "break Holder { callback: quiet }",
+            "break Holder { callback: loud }",
+            1,
+        );
+    assert!(
+        check_diagnostics(
+            "parmap-joined-loop-break-callback",
+            &impure_loop_value,
+        )
+        .contains("has an observable side effect"),
+        "a loop result must conservatively join every reachable break callback origin"
+    );
+}
+
+#[test]
+fn tuple_callback_aggregates_use_recursive_source_identity_and_effects() {
+    let pure = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn make() -> (array<Holder<fn(i64) -> i64>>, i64) {
+  holders := [Holder { callback: quiet }].to_array()
+  return (holders, 41)
+}
+fn main() -> i32 {
+  (holders, value) := make()
+  return holders[0].callback(value) as i32
+}
+";
+    assert!(
+        !check_errs("tuple-callback-aggregate-source-identity", pure),
+        "tuple source equality must recurse through callback-bearing array elements"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("tuple-callback-aggregate-source-identity", pure)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+
+    let joined = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  pair := if x < 0 {
+    ([Holder { callback: quiet }].to_array(), 0)
+  } else {
+    ([Holder { callback: loud }].to_array(), 0)
+  }
+  (holders, ignored) := pair
+  return holders[0].callback(x + ignored)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-joined-tuple-callback-aggregate", joined)
+            .contains("has an observable side effect"),
+        "tuple joins and destructuring must retain every nested callback effect origin"
+    );
+}
+
+#[test]
 fn extern_fn_type_effect_is_impure_through_indirection() {
     let src = "\
 extern \"C\" fn abs(x: i32) -> i32
