@@ -1583,7 +1583,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
                 if f.blocks
                     .get(*then_bb as usize)
                     .and_then(|block| block.stmts.first())
-                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_)))
+                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_) | Stmt::DropValue(_)))
         )
     }
 
@@ -2108,6 +2108,22 @@ impl Builder {
         self.cur = drop_bb;
         self.push(Stmt::Drop(slot));
         self.set_drop_flag(slot, false);
+        self.terminate(Term::Goto(next_bb));
+        self.cur = next_bb;
+    }
+
+    /// Drop an owned value only when its containing aggregate is individually owned. Unlike
+    /// [`Self::emit_drop_if_live`], this leaves the owner's flag set: field replacement destroys
+    /// only the old leaf and immediately installs another leaf with the same allocation mode.
+    fn emit_drop_value_if_owner_live(&mut self, owner: Slot, value: Operand) {
+        let flag = self.drop_flags[owner as usize].expect("owned aggregate has a drop flag");
+        let live = self.fresh_value(Ty::Bool);
+        self.push(Stmt::Let(live, Rvalue::Load(flag)));
+        let drop_bb = self.new_block();
+        let next_bb = self.new_block();
+        self.terminate(Term::Branch(Operand::Value(live), drop_bb, next_bb));
+        self.cur = drop_bb;
+        self.push(Stmt::DropValue(value));
         self.terminate(Term::Goto(next_bb));
         self.cur = next_bb;
     }
@@ -2812,7 +2828,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             null_moved_source(b, value);
             let old = b.fresh_value(leaf_ty);
             b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
-            b.push(Stmt::DropValue(Operand::Value(old)));
+            b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
             b.push(Stmt::StoreField(*root, path.clone(), replacement));
         }
         hir::Stmt::AssignIndex { base, index, value } => {

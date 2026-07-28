@@ -974,6 +974,7 @@ fn tagged_payload_needs_l1b_drop(
     enums: &[hir::EnumDef],
 ) -> bool {
     match payload {
+        Scalar::DynArray(PrimScalar::String) => true,
         Scalar::DynStructArray(id) => struct_is_move(id, structs, enums),
         Scalar::DynResponseArray => true,
         _ => {

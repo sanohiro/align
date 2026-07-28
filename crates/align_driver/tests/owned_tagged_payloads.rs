@@ -125,6 +125,45 @@ fn field_replacement_covers_all_tag_transitions() {
 }
 
 #[test]
+fn arena_owned_field_replacement_does_not_drop_the_old_leaf_individually() {
+    let src = format!(
+        "{DECL}\
+         fn main() -> i32 {{\n\
+           mut v := Item {{ detail: Some(\"old\".clone()), n: 7 }}\n\
+           v.detail = Some(\"new\".clone())\n\
+           return v.n as i32\n\
+         }}\n"
+    );
+    let mut sm = SourceMap::new();
+    let mut checked = check(&mut sm, "arena-owned-field-replace.align", &src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+
+    // The public language has no arena-backed `string` producer yet: `.clone()` is deliberately
+    // free-standing. Override the analysis facts on this already-checked HIR to exercise the MIR
+    // provenance path that future arena-backed owned leaves use. Both the aggregate and replacement
+    // are marked arena-owned, so the old field must be left for ArenaEnd rather than DropValue.
+    let main = checked
+        .hir
+        .fns
+        .iter_mut()
+        .find(|f| f.name == "main")
+        .expect("main function");
+    main.drop_individual_locals.clear();
+    for individual in main.drop_individual_exprs.values_mut() {
+        *individual = false;
+    }
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("drop_value"),
+        "arena-owned field replacement must not individually free its old leaf:\n{mir}"
+    );
+}
+
+#[test]
 fn fixed_array_option_string_field_replacement_is_rejected() {
     let cases = [
         (
@@ -621,6 +660,38 @@ fn option_struct_that_is_move_through_enum_remains_an_l1b_diagnostic() {
 #[test]
 fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
     for (name, src, expected) in [
+        (
+            "fs-read-dir-retained-result.align",
+            concat!(
+                "import std.fs\n",
+                "fn main() -> i32 {\n",
+                "  result := fs.read_dir(\".\")\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "retained Move Option/Result payloads are implemented in L1b",
+        ),
+        (
+            "dns-resolve-retained-result.align",
+            concat!(
+                "import std.net\n",
+                "fn main() -> i32 {\n",
+                "  result := dns.resolve(\"localhost\")\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "retained Move Option/Result payloads are implemented in L1b",
+        ),
+        (
+            "option-string-array.align",
+            concat!(
+                "fn main() -> i32 {\n",
+                "  value: Option<array<string>> := None\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "recursive/deep Move tagged payloads are implemented in L1b",
+        ),
         (
             "user-result-move-enum.align",
             concat!(
