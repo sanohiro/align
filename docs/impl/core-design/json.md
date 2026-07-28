@@ -58,8 +58,8 @@ fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes w
 `Option` fields (trailing-comma layout), and `array<Struct>` fields. **J3a** extends this to a **Move**
 union field — the full multimodal `content: str | array<Part>` (`Content { Text(str), Parts(array<Part>) }`)
 composes into `Message`, decoding/encoding both shapes and round-tripping byte-identically. A Move-enum
-field makes the enclosing struct **Move**: `struct_is_move`/`ty_owns_buffer_rec` became enum-aware (a
-`Ty::Enum` arm consulting `enum_is_move`, threaded through every Move-ness caller in lockstep), and
+field makes the enclosing struct **Move**: the canonical recursive `DropPlan` sees the enum payload
+and `struct_is_move`/`enum_is_move` derive from it in lockstep, and
 `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched `drop_enum`; the
 runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the union's owned
 payload on the decode error path. `match m.content { … }` moves the owned payload out and zeroes the
@@ -67,7 +67,10 @@ field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggreg
 `Drop` frees null there (single-free). The union's variants are part of the structural MIR type
 tables, so a variant change invalidates the decode/encode cache. **Boundary:** because a
 Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
-`Message` decode target binds with `?`. The following J3b slice supplies owned-element deep free, so
+`Message` decode target binds with `?`. A top-level Move-union decode must likewise be consumed
+directly with `?`; retaining or returning its raw `Result<MoveUnion, Error>` is an L1b diagnostic
+because recursive tagged-payload Drop is not yet available. The following J3b slice supplies
+owned-element deep free, so
 `Chat { messages: array<Message> }` also round-trips when `Message` is Move.
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
@@ -129,9 +132,11 @@ omits a `None` field entirely** (never `"k":null`), so `decode(encode(x))` round
 optional field is exempt from `all_required_seen`, and the shared `write_value` writes the payload at
 the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing object to a
 trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
-the static layout). **v1 boundary:** an Option payload must be **non-owned** (`Option<string>` /
-`Option<Move-struct>` rejected at declaration — no consumer, and owned-Option-drop-as-a-field is
-deferred). **`Option<struct>` encode (T1b, SHIPPED):** `Some` renders the nested object via the runtime
+the static layout). **v1 boundary:** an Option payload used at the JSON boundary must be
+**non-owned**. L1a permits `Option<string>` in ordinary language structs, but `json.decode` and
+`json.encode` reject a target containing that field because the JSON descriptor consumer remains
+deferred; `Option<Move-struct>` remains rejected by the L1b type gate. **`Option<struct>` encode
+(T1b, SHIPPED):** `Some` renders the nested object via the runtime
 descriptor-driven encoder (a new `OptionStructField` template piece → `align_rt_json_encode_object`, a
 single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
 scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its

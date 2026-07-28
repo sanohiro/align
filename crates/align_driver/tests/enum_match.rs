@@ -235,6 +235,27 @@ fn match_on_option() {
 }
 
 #[test]
+fn wildcard_match_owns_a_bound_payload_consumed_by_a_fresh_wrapper() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  s := \"hello\".clone()\n",
+        "  x := match Some(s) { _ => 7 }\n",
+        "  return x\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("option-bound-wildcard-owner", src)
+            .status
+            .code(),
+        Some(7),
+        "the fresh Option owner must take the bound string exactly once"
+    );
+}
+
+#[test]
 fn match_on_result_arm_order_and_wildcard() {
     if !backend_available() {
         return;
@@ -628,8 +649,8 @@ fn move_enum_struct_field_is_move_and_drops_clean() {
     if !backend_available() {
         return;
     }
-    // J3: a Move sum-type field (an owned-array payload variant) is now supported — it makes the
-    // enclosing struct Move (`ty_owns_buffer_rec`'s enum arm), and `drop_struct_fields`'s `Ty::Enum`
+    // J3: a Move sum-type field (an owned-array payload variant) is now supported — the recursive
+    // DropPlan makes the enclosing struct Move, and `drop_struct_fields`'s `Ty::Enum`
     // arm frees the live variant's buffer via the tag-switched `drop_enum`. Construct a struct holding
     // a `Nums([...])` field, read the payload through a `match m.c`, and let the struct drop at scope
     // end. A clean run proves single-free (the owned array is freed exactly once, by the struct's Drop
@@ -642,6 +663,162 @@ fn move_enum_struct_field_is_move_and_drops_clean() {
         return (m.tag + match m.c { Text(t) => t.len() as i64, Nums(ns) => ns.sum() }) as i32\n}\n";
     let out = build_and_run("enum-movefield", src);
     assert_eq!(out.status.code(), Some(19)); // tag 7 + (3+4+5)
+}
+
+#[test]
+fn copy_variant_binding_does_not_consume_a_direct_move_enum_field() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  m := Msg { c: Content.Text(\"hello\") }\n",
+        "  first := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  second := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  return (first * 10 + second) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-copy-field-rematch", src).status.code(),
+        Some(55)
+    );
+}
+
+#[test]
+fn materialized_move_enum_scrutinee_transfers_each_control_source() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  m := Msg { c: Content.Text(\"hello\") }\n",
+        "  other := Msg { c: Content.Text(\"other\") }\n",
+        "  first := match if true { m.c } else { other.c } { Text(t) => t.len(), _ => 0 }\n",
+        "  second := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  return (first * 10 + second) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-control-source-borrow", src)
+            .status
+            .code(),
+        Some(55),
+        "a borrowing control-result join must preserve each bound field source"
+    );
+}
+
+#[test]
+fn copy_only_match_borrows_control_sources_through_transparent_scopes() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        (
+            "enum-block-control-source-borrow",
+            "{ if true { m.c } else { other.c } }",
+        ),
+        (
+            "enum-unsafe-control-source-borrow",
+            "unsafe { if true { m.c } else { other.c } }",
+        ),
+        (
+            "enum-arena-control-source-borrow",
+            "arena { if true { m.c } else { other.c } }",
+        ),
+        (
+            "enum-task-group-control-source-borrow",
+            "task_group { if true { m.c } else { other.c } }",
+        ),
+    ];
+    for (name, scrutinee) in cases {
+        let src = format!(
+            "Content {{ Text(str), Nums(array<i64>) }}\n\
+             Msg {{ c: Content }}\n\
+             fn main() -> i32 {{\n\
+               m := Msg {{ c: Content.Text(\"hello\") }}\n\
+               other := Msg {{ c: Content.Text(\"other\") }}\n\
+               first := match {scrutinee} {{ Text(t) => t.len(), _ => 0 }}\n\
+               second := match m.c {{ Text(t) => t.len(), _ => 0 }}\n\
+               return (first * 10 + second) as i32\n\
+             }}\n"
+        );
+        assert_eq!(
+            build_and_run(name, &src).status.code(),
+            Some(55),
+            "a transparent wrapper must preserve the selected Copy-only match source: {name}"
+        );
+    }
+}
+
+#[test]
+fn wrapped_copy_only_wildcard_preserves_an_owned_enum_source() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        (
+            "enum-block-wildcard-borrow",
+            "{ if true { left.c } else { right.c } }",
+        ),
+        (
+            "enum-task-group-direct-wildcard-borrow",
+            "task_group { left.c }",
+        ),
+        (
+            "enum-task-group-wildcard-borrow",
+            "task_group { if true { left.c } else { right.c } }",
+        ),
+    ];
+    for (name, scrutinee) in cases {
+        let src = format!(
+            "Content {{ Text(str), Nums(array<i64>) }}\n\
+             Msg {{ c: Content }}\n\
+             fn main() -> i32 {{\n\
+               left := Msg {{ c: Content.Nums([3, 4, 5].to_array()) }}\n\
+               right := Msg {{ c: Content.Nums([90].to_array()) }}\n\
+               ignored := match {scrutinee} {{\n\
+                 Text(t) => t.len() as i64\n\
+                 _ => 0\n\
+               }}\n\
+               return match left.c {{ Text(t) => t.len() as i32, Nums(ns) => ns.sum() as i32 }}\n\
+             }}\n"
+        );
+        assert_eq!(
+            build_and_run(name, &src).status.code(),
+            Some(12),
+            "a Copy-only wildcard must leave the owned variant in its original source: {name}"
+        );
+    }
+}
+
+#[test]
+fn move_binding_owns_a_materialized_enum_control_result() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  left := Msg { c: Content.Nums([3, 4, 5].to_array()) }\n",
+        "  right := Msg { c: Content.Nums([90].to_array()) }\n",
+        "  total := match if true { left.c } else { right.c } {\n",
+        "    Text(t) => t.len() as i64\n",
+        "    Nums(ns) => ns.sum()\n",
+        "  }\n",
+        "  return total as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-control-move-binding", src)
+            .status
+            .code(),
+        Some(12)
+    );
 }
 
 #[test]
@@ -679,10 +856,10 @@ fn array_string_and_move_struct_enum_payloads_rejected() {
 
 #[test]
 fn move_enum_option_result_payload_rejected() {
-    // A Move sum type as an `Option`/`Result` payload is deferred (the drop machinery frees a flat
-    // `{ptr,len}` for a payload, not a tag-switched enum drop; `payload_is_move` is table-free and
-    // cannot see the Move enum, so admitting it would leak). Rejected at the `Some`/`Ok`/`Err` wrap
-    // site — the sole origin of such a value. (A scalar-only enum payload stays allowed.)
+    // A Move sum type as an `Option`/`Result` payload is deferred. The recursive DropPlan sees the
+    // owned enum shape, but nested tagged lowering and move-out/null-container semantics land in
+    // L1b. Rejected at the `Some`/`Ok`/`Err` wrap site — the sole origin of such a value. (A
+    // scalar-only enum payload stays allowed.)
     assert!(check_errs(
         "moveenum-some",
         "Content { Text(str), Nums(array<i64>) }\n\

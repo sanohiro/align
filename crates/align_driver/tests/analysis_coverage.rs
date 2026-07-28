@@ -7,6 +7,120 @@
 mod common;
 use common::*;
 
+#[test]
+fn recursive_drop_plan_is_cycle_safe() {
+    let src = "\
+Node { next: Option<Node> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("recursive-drop-plan", src),
+        "an inline recursive tagged field must diagnose instead of recursing or panicking"
+    );
+}
+
+#[test]
+fn unsupported_owned_option_field_fails_closed() {
+    let src = "\
+Holder { values: Option<array<i64>> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("unsupported-owned-option-field", src),
+        "L1a must not silently admit another owned Option field"
+    );
+}
+
+#[test]
+fn unsupported_move_enum_option_field_fails_closed() {
+    let src = "\
+Content { Empty, Data(array<i64>) }
+Holder { value: Option<Content> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("unsupported-move-enum-option-field", src),
+        "L1a must reject an Option payload whose resolved enum DropPlan owns storage"
+    );
+}
+
+#[test]
+fn move_struct_enum_payload_is_rejected_independent_of_declaration_order() {
+    let src = "\
+Inner { content: Content }
+Wrapper { Wrapped(Inner) }
+Content { Empty, Data(array<i64>) }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("late-enum-move-struct-payload", src),
+        "a later-resolved enum must not let a Move struct bypass the sum-type payload gate"
+    );
+}
+
+#[test]
+fn generic_struct_owned_option_fields_are_revalidated_after_monomorphization() {
+    let direct = "\
+Owned { name: string }
+Wrap<T> { value: Option<T> }
+Holder { wrapped: Wrap<Owned> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("generic-struct-direct-owned-option", direct),
+        "a generic struct monomorph must not admit Option<MoveStruct>"
+    );
+
+    let transitive = "\
+Inner { content: Content }
+Wrap<T> { value: Option<T> }
+Holder { wrapped: Wrap<Inner> }
+Content { Empty, Data(array<i64>) }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("generic-struct-enum-owned-option", transitive),
+        "a cached generic struct must be revalidated after its payload becomes Move through an enum"
+    );
+
+    let array = "\
+Wrap<T> { value: Option<T> }
+Holder { wrapped: Wrap<array<i64>> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("generic-struct-array-owned-option", array),
+        "a generic struct monomorph must not admit another owned Option payload"
+    );
+}
+
+#[test]
+fn generic_enum_move_payloads_are_revalidated_after_monomorphization() {
+    let direct = "\
+Inner { content: Content }
+Wrap<T> { Wrapped(T), Empty }
+Holder { wrapped: Wrap<Inner> }
+Content { Empty, Data(array<i64>) }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("generic-enum-move-struct-payload", direct),
+        "a cached generic enum must reject a struct that becomes Move after enum resolution"
+    );
+
+    let array = "\
+Inner { content: Content }
+Wrap<T> { Wrapped(T), Empty }
+Holder { wrapped: Wrap<array<Inner>> }
+Content { Empty, Data(array<i64>) }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("generic-enum-move-array-payload", array),
+        "a cached generic enum must reject an array whose struct element becomes Move later"
+    );
+}
+
 // --- 1-2: an arena value escaping through a `match` arm (region_of lacked `Match`) ---
 #[test]
 fn arena_value_escaping_via_match_arm_is_rejected() {

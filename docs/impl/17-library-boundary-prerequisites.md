@@ -1204,17 +1204,26 @@ borrow-bearing type are prohibited.
 
 ### L1a — recursive DropPlan framework and `Option<string>` fields
 
-This is the first implementation PR. Its exact scope is:
+**Status: complete.** This first implementation slice:
 
 - introduce one canonical recursive owned-value/Drop-plan classifier after all struct/enum
   definitions are resolved;
 - make `Option<string>` a legal struct field and use it as the first conditional owned leaf;
+- permit a recursive Move `Result` Ok producer only when an immediate `?` consumes the tagged
+  aggregate; the Err payload must remain shallow because `?` propagates it, and retaining or
+  returning the raw tagged value—or declaring it in a parameter/return type—remains an explicit
+  L1b diagnostic;
 - mark the enclosing struct Move;
 - emit tag-tested Drop for the field on normal/early cleanup and drop-old reassignment;
 - move/null the live payload on whole-struct moves and supported field extraction;
 - keep `Option<MoveStruct>`, Move sum/Result payloads, recursive types, nested partial moves not
   covered by the existing place machinery, and arbitrary Move collection elements rejected with
   explicit diagnostics until their owning slices;
+- keep partial replacement fail-closed unless its exact old-value Drop lowering exists: direct
+  struct fields support `string` and `Option<string>`, fixed-array element fields support `string`,
+  and larger Move leaves require whole-struct or whole-element replacement;
+- keep fixed-array element-field reads Copy-only except that `string` is exposed as a borrowed
+  `str`; every other Move leaf is an explicit diagnostic;
 - add no database, resource, borrow syntax, or runtime library dependency.
 
 Planned changed files:
@@ -1246,6 +1255,10 @@ Acceptance:
 - replacing `Some(old)` drops old before installing new; `Some -> None` drops old; `None -> Some`
   does not touch uninitialized payload;
 - `?` during construction drops every already-initialized owned field exactly once;
+- `?` over a bound Result transfers a shallow Move Err before exit cleanup, with allocation/free
+  parity at the caller;
+- an arena-owned shallow Move Err is rejected at `?` because exit cleanup would end its arena
+  before propagation;
 - `Option<MoveStruct>` still receives the explicit L1b-not-yet-supported diagnostic;
 - invalid recursive and unsupported deep partial-move cases fail with diagnostics, never panic;
 - emitted LLVM has one tag branch on Drop and no allocation on the `None`/unrelated success path;
@@ -1265,9 +1278,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 bench/owned_tagged_payload/run.sh
 ```
 
-The focused test invokes successful programs under the repository's double-free/leak-sensitive
-allocation harness and compile-fail programs through the normal diagnostic path. The benchmark is
-manual evidence recorded in the PR; it does not become an ordinary CI gate.
+The focused test runs successful programs through the normal double-free-sensitive runtime path and
+compile-fail programs through the normal diagnostic path. The manual alloc-count benchmark is the
+leak-sensitive gate, including field tag transitions and early-`?` construction cleanup; it does
+not become an ordinary CI gate.
+
+Recorded native Apple Silicon evidence:
+
+```text
+scalar:         0.781 ms  alloc=       0 free=       0
+None:           1.644 ms  alloc=       0 free=       0
+Some:          37.199 ms  alloc= 1000000 free= 1000000
+1%-Some:        2.180 ms  alloc=   10000 free=   10000
+replacement:   57.641 ms  alloc= 3000000 free= 3000000
+conditional:   25.566 ms  alloc= 1500000 free= 1500000
+match/loop:    50.572 ms  alloc= 3000000 free= 3000000
+early `?`:     17.223 ms  alloc= 1000000 free= 1000000
+raw LLVM Option Drop tag branches: 38
+```
+
+The counts are the correctness gate; timings are one manual regression record and remain
+host-sensitive.
 
 ### L1b — Move sum/Option/Result payload completion
 

@@ -11,7 +11,10 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move, FloatTy, IntTy, Layout, Scalar, Ty};
+use align_sema::{
+    DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
+};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -1580,7 +1583,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
                 if f.blocks
                     .get(*then_bb as usize)
                     .and_then(|block| block.stmts.first())
-                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_)))
+                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_) | Stmt::DropValue(_)))
         )
     }
 
@@ -2109,6 +2112,22 @@ impl Builder {
         self.cur = next_bb;
     }
 
+    /// Drop an owned value only when its containing aggregate is individually owned. Unlike
+    /// [`Self::emit_drop_if_live`], this leaves the owner's flag set: field replacement destroys
+    /// only the old leaf and immediately installs another leaf with the same allocation mode.
+    fn emit_drop_value_if_owner_live(&mut self, owner: Slot, value: Operand) {
+        let flag = self.drop_flags[owner as usize].expect("owned aggregate has a drop flag");
+        let live = self.fresh_value(Ty::Bool);
+        self.push(Stmt::Let(live, Rvalue::Load(flag)));
+        let drop_bb = self.new_block();
+        let next_bb = self.new_block();
+        self.terminate(Term::Branch(Operand::Value(live), drop_bb, next_bb));
+        self.cur = drop_bb;
+        self.push(Stmt::DropValue(value));
+        self.terminate(Term::Goto(next_bb));
+        self.cur = next_bb;
+    }
+
     fn push(&mut self, s: Stmt) {
         // Only track source lines when lowering located (explain-opt / debug info). Kept tiny and the
         // line work in a separate `#[inline(never)]` helper: `push` is inlined into `lower_expr`, a
@@ -2359,9 +2378,15 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         }
         // A partial owned-field move out of a struct (`n := u.name`) took the `string` field's
         // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
-        // null there, not the buffer the new binding now owns. (Sema allows this only for a depth-1
-        // `string` field; deeper paths / Move-struct fields stay rejected, so `path` is `[idx]`.)
-        hir::ExprKind::Field { root, path } if path.len() == 1 && (e.ty == Ty::String || align_sema::is_move_handle(e.ty)) => {
+        // null there, not the buffer the new binding now owns. Sema allows this for a depth-1
+        // `string`, `Option<string>`, or Move-handle field; deeper paths / Move-struct fields stay
+        // rejected, so `path` is `[idx]`.
+        hir::ExprKind::Field { root, path }
+            if path.len() == 1
+                && (e.ty == Ty::String
+                    || e.ty == Ty::Option(Scalar::String)
+                    || align_sema::is_move_handle(e.ty)) =>
+        {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
@@ -2369,7 +2394,10 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // struct slot (the whole `{ tag, payloads }` aggregate) so the struct's exit `Drop` →
         // `drop_enum` reads tag 0 and frees null, not the buffer `ps` now owns. Mirrors the `string`
         // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
-        hir::ExprKind::Field { root, path } if path.len() == 1 && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums)) => {
+        hir::ExprKind::Field { root, path }
+            if path.len() == 1
+                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums)) =>
+        {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
@@ -2432,9 +2460,8 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
         hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
             block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
         }
-        // A task_group is not borrow-transparent: its tail local dies with the scope, so the
-        // wrapper is a fresh value in the caller. Forward that local's ordinary ownership bit to
-        // the synthetic owner instead of classifying the inner Local as a borrowed place.
+        // A TaskGroup reaches this arm only when its tail can be fresh: may_need_synthetic_owner
+        // sees through a bound tail place. Forward the fresh value's ordinary ownership bit.
         hir::ExprKind::TaskGroup(_) => lowered_drop_flag(b, e, operand),
         _ => lowered_drop_flag(b, e, operand),
     }
@@ -2447,6 +2474,36 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, true),
         hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, true),
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
+            lower_block_for_borrow(b, block).unwrap_or(Operand::Const(Const::Unit))
+        }
+        hir::ExprKind::Arena(block) => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.arenas.push(handle);
+            let tail = lower_block_for_borrow(b, block);
+            b.arenas.pop();
+            if b.is_terminated() {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
+        hir::ExprKind::TaskGroup(block) => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::TgBegin));
+            b.task_groups.push(handle);
+            let tail = lower_block_for_borrow(b, block);
+            b.task_groups.pop();
+            if b.is_terminated() {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::TgWait(Operand::Value(handle)));
+                b.push(Stmt::TgEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
         _ => lower_expr(b, e),
     }
 }
@@ -2467,9 +2524,8 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
     let live = temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
     b.push(Stmt::Store(owner, operand.clone()));
     b.set_drop_flag_operand(owner, live);
-    // A task_group result is fresh to the enclosing expression but may be backed by a bound tail
-    // local inside the scope. The hidden borrow owner takes that value, so clear the inner source
-    // exactly as the consumed-call path does before both cleanups can observe it as live.
+    // A task_group reaches this hidden-owner path only for a tail that can be fresh. Transfer its
+    // source exactly as the consumed-call path does before both cleanups can observe it as live.
     if matches!(e.kind, hir::ExprKind::TaskGroup(_)) {
         null_moved_source(b, e);
     }
@@ -2604,6 +2660,22 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
     })
 }
 
+/// Lower a borrow-transparent block while preserving borrowing semantics through its tail.
+/// Statements still use their ordinary ownership rules; only the value delivered by the block is
+/// borrowed by the enclosing expression.
+fn lower_block_for_borrow(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
+    for s in &block.stmts {
+        lower_stmt(b, s);
+        if b.is_terminated() {
+            return None;
+        }
+    }
+    block.value.as_ref().map(|e| {
+        b.set_span(e.span);
+        lower_expr_for_borrow(b, e)
+    })
+}
+
 /// A representative source span for a statement — the span of its primary expression, used to
 /// anchor the statement's lowered instructions to a source line (debug info).
 fn stmt_span(s: &hir::Stmt) -> Option<Span> {
@@ -2714,26 +2786,50 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             }
         }
         hir::Stmt::AssignField { root, path, value } => {
+            // Like whole-local `s = s`, exact field self-assignment preserves the value and its
+            // ownership. Dropping the destination before reloading the identical RHS would read
+            // freed storage; storing and then nulling the identical source would erase it.
+            if matches!(
+                &value.kind,
+                hir::ExprKind::Field { root: source, path: source_path }
+                    if source == root && source_path == path
+            ) {
+                return;
+            }
             // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
             // leaves stored under the extended path); a scalar value is a single field store.
-            // If the leaf being overwritten is an owned `string` field, free the OLD value first
-            // (else it leaks — Slice 3 handled whole-struct reassign, not field-level) and null the
-            // RHS's moved source so it isn't double-freed. (Slice 4b: an owned nested-struct value
-            // `u.addr = Address{…}` still expands via `store_value_at` — its own owned fields are a
-            // later slice; only a direct `string` leaf is drop-of-old'd here.)
-            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. }) && field_ty_at(b, *root, path) == Ty::String;
-            if drop_old_field {
-                let old = b.fresh_value(Ty::String);
-                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
-                b.push(Stmt::DropValue(Operand::Value(old)));
+            // If the leaf being overwritten has L1a's supported owned Drop plan (`string` or
+            // `Option<string>`), drop the OLD value first and null a moved RHS source after the
+            // replacement is stored. Nested aggregate replacement remains in its owning slice.
+            let leaf_ty = field_ty_at(b, *root, path);
+            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums);
+            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. })
+                && (matches!(leaf_plan, DropPlan::Leaf(Ty::String))
+                    || matches!(
+                        leaf_plan,
+                        DropPlan::Option(ref payload)
+                            if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
+                    ));
+            if !drop_old_field {
+                store_value_at(b, *root, &mut path.clone(), value);
+                return;
             }
-            store_value_at(b, *root, &mut path.clone(), value);
-            // Null the RHS's moved source *after* the store — `store_value_at` lowers `value`
-            // internally, so nulling a variable RHS beforehand would store null. (The old value was
-            // already freed above, before the overwrite.)
-            if drop_old_field {
-                null_moved_source(b, value);
+            // Assignment evaluates the RHS before mutating the destination. Capture it first so
+            // borrows of the old field remain valid during evaluation and a consuming RHS can
+            // transfer that exact ownership back into the destination.
+            let replacement = lower_expr(b, value);
+            if b.is_terminated() {
+                return;
             }
+            // The replacement is already captured, so clear its old source before the store. This
+            // is path-local for control-flow RHSs: an arm that transfers the destination zeros it,
+            // while a fresh-value arm leaves the old value live. Dropping the destination
+            // afterwards therefore frees exactly the paths that still own the old payload.
+            null_moved_source(b, value);
+            let old = b.fresh_value(leaf_ty);
+            b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
+            b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
+            b.push(Stmt::StoreField(*root, path.clone(), replacement));
         }
         hir::Stmt::AssignIndex { base, index, value } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
@@ -10517,6 +10613,10 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
     let propagated = b.fresh_value(b.ret);
     b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
+    // `?` consumes the Result on both edges. A bound source with an owned Err payload must be
+    // cleared before exit cleanup, or its local Drop frees the same payload now owned by the
+    // returned `Err` (use-after-free / double-free in the caller).
+    null_moved_source(b, inner);
     // `?` exits the function: free open arenas and drop owned locals first.
     b.emit_exit_cleanup();
     b.terminate(Term::Return(Some(Operand::Value(propagated))));
@@ -10524,8 +10624,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
     // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
     // slot — its exit `Drop` then frees null, not the moved-out buffer (no double-free). On the
-    // Err edge the source's ok payload is already {null,0} (zeroed at construction), so the
-    // exit-cleanup drop there is a harmless no-op.
+    // Err edge clears the source above because its error payload may itself be Move.
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
@@ -10619,11 +10718,48 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         return Operand::Const(Const::Unit);
     }
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
-    let scrut = lower_expr(b, scrutinee);
+    // A Copy-only binding borrows the sum value, including bound-place arms of a control-flow
+    // scrutinee. A Move binding transfers the selected payload, so a control join must own its
+    // selected source before extraction.
+    let binds_move_payload = arms.iter().flat_map(|arm| &arm.bindings).any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
+    let scrut = if binds_move_payload {
+        lower_expr(b, scrutinee)
+    } else {
+        lower_expr_for_borrow(b, scrutinee)
+    };
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
     }
     let scrut_flag = lowered_drop_flag(b, scrutinee, &scrut);
+    // A fresh/materialized scrutinee has no bound place left to drop it on an arm that binds no
+    // Move payload. Give the whole sum a hidden owner before branching. A Move-binding arm clears
+    // this owner after transferring the active payload; every other arm drops it before evaluating
+    // its body. Direct bound places remain path-local and are nulled only on a transferring arm.
+    let scrut_owner = (needs_drop_flag(scrutinee.ty, &b.structs, &b.tuples, &b.enums)
+        && may_need_synthetic_owner(scrutinee))
+    .then(|| {
+        let owner = b.new_synthetic_owner(scrutinee.ty);
+        b.push(Stmt::Store(owner, scrut.clone()));
+        let live = if binds_move_payload {
+            scrut_flag
+                .clone()
+                .unwrap_or(Operand::Const(Const::Bool(false)))
+        } else {
+            temporary_drop_flag(b, scrutinee, &scrut)
+                .unwrap_or(Operand::Const(Const::Bool(false)))
+        };
+        b.set_drop_flag_operand(owner, live);
+        // A consuming match transferred every fresh/materialized source into this owner. Copy-only
+        // bound sources, including a task-group bound tail place, remain borrowed.
+        if binds_move_payload || match_scrutinee_transfers_source_to_owner(scrutinee) {
+            null_moved_source(b, scrutinee);
+        }
+        owner
+    });
     let join_bb = b.new_block();
     match scrutinee.ty {
         Ty::Enum(enum_id) => {
@@ -10632,7 +10768,14 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 enum_id,
                 arms,
                 &scrut,
-                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                (
+                    result_slot,
+                    result_flag,
+                    result_temp_flag,
+                    join_bb,
+                    borrow_result,
+                    scrut_owner,
+                ),
                 scrutinee,
                 scrut_flag,
             )
@@ -10643,7 +10786,14 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 scrutinee.ty,
                 arms,
                 &scrut,
-                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                (
+                    result_slot,
+                    result_flag,
+                    result_temp_flag,
+                    join_bb,
+                    borrow_result,
+                    scrut_owner,
+                ),
                 scrutinee,
                 scrut_flag,
             )
@@ -10655,6 +10805,29 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
+/// Whether a fresh match scrutinee structurally consumes a bound source into the hidden owner.
+/// Control-flow joins handle this path-by-path in `store_control_result`; direct bound places remain
+/// borrowed. Constructor wrappers consume their payload, including through transparent scopes.
+/// A task-group reaches this helper only when its tail can be fresh; a bound tail place does not
+/// need a synthetic owner and is filtered by `may_need_synthetic_owner` before this helper is used.
+fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::OptionSome(_)
+        | hir::ExprKind::ResultOk(_)
+        | hir::ExprKind::ResultErr(_)
+        | hir::ExprKind::EnumValue { .. }
+        | hir::ExprKind::TaskGet(_)
+        | hir::ExprKind::TaskGroup(_) => true,
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
+            block
+                .value
+                .as_deref()
+                .is_some_and(match_scrutinee_transfers_source_to_owner)
+        }
+        _ => false,
+    }
+}
+
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
 fn lower_match_enum(
@@ -10662,11 +10835,18 @@ fn lower_match_enum(
     enum_id: u32,
     arms: &[hir::MatchArm],
     scrut: &Operand,
-    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+        Option<Slot>,
+    ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -10700,19 +10880,33 @@ fn lower_match_enum(
         }
         b.cur = arm_bb;
         bind_payload(b, arm);
+        let transfers_payload = arm.bindings.iter().any(|local| {
+            b.slots
+                .get(*local as usize)
+                .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        });
         // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
         // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
-        if !arm.bindings.is_empty() {
+        if transfers_payload {
             null_moved_source(b, scrutinee);
         }
+        let active_may_own = enum_match_arm_may_own(b, enum_id, arm);
+        discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
         finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
     bind_payload(b, d);
-    if !d.bindings.is_empty() {
+    let transfers_payload = d.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
+    if transfers_payload {
         null_moved_source(b, scrutinee);
     }
+    let active_may_own = enum_match_arm_may_own(b, enum_id, d);
+    discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
     finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
 }
 
@@ -10724,16 +10918,25 @@ fn lower_match_binary(
     ty: Ty,
     arms: &[hir::MatchArm],
     scrut: &Operand,
-    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+        Option<Slot>,
+    ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
+        let active_may_own = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums);
+        discharge_match_scrutinee(b, scrut_owner, false, active_may_own);
         finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         return;
     }
@@ -10748,18 +10951,95 @@ fn lower_match_binary(
     b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
     b.cur = pos_bb;
     bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
+    let pos_transfers = pos.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
     // Binding an owned payload (Ok/Some) moves it out of the scrutinee; null the scrutinee so its
     // exit `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
-    if !pos.bindings.is_empty() {
+    if pos_transfers {
         null_moved_source(b, scrutinee);
     }
+    let pos_may_own = binary_match_arm_may_own(b, ty, true);
+    discharge_match_scrutinee(b, scrut_owner, pos_transfers, pos_may_own);
     finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
-    if !neg.bindings.is_empty() {
+    let neg_transfers = neg.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
+    if neg_transfers {
         null_moved_source(b, scrutinee);
     }
+    let neg_may_own = binary_match_arm_may_own(b, ty, false);
+    discharge_match_scrutinee(b, scrut_owner, neg_transfers, neg_may_own);
     finish_arm(b, &neg.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+}
+
+/// Discharge the hidden owner of a fresh/materialized match scrutinee on the selected arm.
+/// A Move binding inherits the scrutinee's ownership bit and becomes the sole owner; an arm without
+/// such a binding consumes the whole sum by dropping its active variant before the body can diverge.
+fn discharge_match_scrutinee(
+    b: &mut Builder,
+    owner: Option<Slot>,
+    transfers_payload: bool,
+    active_may_own: bool,
+) {
+    let Some(owner) = owner else {
+        return;
+    };
+    if transfers_payload || !active_may_own {
+        b.set_drop_flag(owner, false);
+    } else {
+        b.emit_drop_if_live(owner);
+    }
+}
+
+/// Whether an enum arm can select a variant with an owned payload. A wildcard is conservatively
+/// the whole enum; the tag-switched destructor remains precise for its selected variant.
+fn enum_match_arm_may_own(b: &Builder, enum_id: u32, arm: &hir::MatchArm) -> bool {
+    let Some(def) = b.enums.get(enum_id as usize) else {
+        return true;
+    };
+    let variant_may_own = |variant: &align_sema::hir::EnumVariant| {
+        variant.payload.iter().any(|payload| {
+            needs_drop_flag(
+                align_sema::scalar_to_ty(*payload),
+                &b.structs,
+                &b.tuples,
+                &b.enums,
+            )
+        })
+    };
+    if arm.variants.is_empty() {
+        def.variants.iter().any(variant_may_own)
+    } else {
+        arm.variants
+            .iter()
+            .filter_map(|variant| def.variants.get(*variant as usize))
+            .any(variant_may_own)
+    }
+}
+
+/// Whether the selected half of an Option/Result can own a payload. This avoids emitting a known
+/// null destructor on `None` or a Copy `Err` merely because the opposite arm moves an owned value.
+fn binary_match_arm_may_own(b: &Builder, ty: Ty, positive: bool) -> bool {
+    let payload = match (ty, positive) {
+        (Ty::Option(payload), true) | (Ty::Result(payload, _), true) => Some(payload),
+        (Ty::Result(_, payload), false) => Some(payload),
+        _ => None,
+    };
+    payload.is_some_and(|payload| {
+        needs_drop_flag(
+            align_sema::scalar_to_ty(payload),
+            &b.structs,
+            &b.tuples,
+            &b.enums,
+        )
+    })
 }
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
@@ -11253,7 +11533,7 @@ mod tests {
     }
 
     #[test]
-    fn task_group_tail_moves_clear_the_inner_source_and_forward_ownership() {
+    fn task_group_tail_moves_clear_the_inner_source() {
         let p = lower(
             "fn make() -> string {\n  return task_group { s := \"hello\".clone(); s }\n}\nfn take(s: string) -> i64 = s.len()\nfn call() -> i64 = take(task_group { s := \"world\".clone(); s })\nfn main() -> i32 = 0\n",
         );
@@ -11288,18 +11568,56 @@ mod tests {
             );
         }
 
-        let call = p.fns.iter().find(|f| f.name == "call").expect("call MIR");
+    }
+
+    #[test]
+    fn mixed_move_binding_match_drops_a_materialized_wildcard_scrutinee() {
+        let p = lower(
+            "Content { First(array<i64>), Second(array<i64>) }\n\
+             Msg { c: Content }\n\
+             fn mixed() -> i64 {\n\
+               left := Msg { c: Content.Second([1, 2].to_array()) }\n\
+               right := Msg { c: Content.Second([9].to_array()) }\n\
+               return match if true { left.c } else { right.c } {\n\
+                 First(xs) => xs.sum()\n\
+                 _ => 0\n\
+               }\n\
+             }\n\
+             fn main() -> i32 = mixed() as i32\n",
+        );
+        let f = p.fns.iter().find(|f| f.name == "mixed").expect("mixed match MIR");
         assert!(
-            call.blocks.iter().flat_map(|block| &block.stmts).any(
+            f.blocks.iter().flat_map(|block| &block.stmts).any(
                 |stmt| matches!(
                     stmt,
-                    Stmt::Store(slot, Operand::Value(value))
-                        if call.slots[*slot as usize] == Ty::Bool
-                            && call.value_tys[*value as usize] == Ty::Bool
+                    Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Enum(_))
                 )
             ),
-            "a consumed task_group value must forward its runtime ownership bit:\n{}",
-            print::function_to_string(call)
+            "the wildcard arm must drop the hidden owner of the materialized Move enum:\n{}",
+            print::function_to_string(f)
+        );
+    }
+
+    #[test]
+    fn wildcard_match_drops_a_fresh_owned_sum_without_move_bindings() {
+        let p = lower(
+            "fn wildcard() -> i64 {\n\
+               return match Some(\"x\".clone()) {\n\
+                 _ => 0\n\
+               }\n\
+             }\n\
+             fn main() -> i32 = wildcard() as i32\n",
+        );
+        let f = p.fns.iter().find(|f| f.name == "wildcard").expect("wildcard match MIR");
+        assert!(
+            f.blocks.iter().flat_map(|block| &block.stmts).any(
+                |stmt| matches!(
+                    stmt,
+                    Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Option(_))
+                )
+            ),
+            "a lone wildcard must drop its fresh owned Option scrutinee:\n{}",
+            print::function_to_string(f)
         );
     }
 

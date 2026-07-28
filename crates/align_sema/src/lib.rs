@@ -7,7 +7,7 @@
 //! to a concrete width by context; if still unconstrained at the end, default to `i64`
 //! (`03-types.md` §2). Move/arena/effect checking is M3+.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use align_ast::{self as ast, BinOp, UnOp};
 use align_diag::Diagnostics;
@@ -898,13 +898,259 @@ fn json_encodable_scalar(s: Scalar) -> bool {
     matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)
 }
 
-/// Whether an `Option`/`Result` type carries an owned (Move) payload that the aggregate owns
-/// — so the aggregate is itself a Move type and its drop must free that payload (MMv2 slice 8a).
-pub fn payload_is_move(ty: Ty) -> bool {
+/// The canonical recursive cleanup classification for a resolved owned value.
+///
+/// This is deliberately representation-independent: MIR owns *when* cleanup runs and LLVM owns
+/// *how* each leaf is lowered, while this plan is the single answer to which live children need
+/// cleanup. `Option`/`Result`/sum nodes retain their tag shape even when all current payloads are
+/// Copy, so admitting another finite Move payload cannot silently bypass the recursive walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropPlan {
+    None,
+    Leaf(Ty),
+    Struct {
+        id: u32,
+        fields: Vec<(u32, std::sync::Arc<DropPlan>)>,
+        needs_drop: bool,
+    },
+    Option(std::sync::Arc<DropPlan>),
+    Result {
+        ok: std::sync::Arc<DropPlan>,
+        err: std::sync::Arc<DropPlan>,
+    },
+    Enum {
+        id: u32,
+        variants: Vec<Vec<std::sync::Arc<DropPlan>>>,
+        needs_drop: bool,
+    },
+    /// A malformed or cyclic resolved definition. Sema diagnoses the definition separately; the
+    /// classifier remains fail-closed so a later analysis cannot accidentally call it Copy.
+    Invalid,
+}
+
+impl DropPlan {
+    pub fn needs_drop(&self) -> bool {
+        match self {
+            DropPlan::None => false,
+            DropPlan::Leaf(_) | DropPlan::Invalid => true,
+            DropPlan::Struct { needs_drop, .. } | DropPlan::Enum { needs_drop, .. } => *needs_drop,
+            DropPlan::Option(payload) => payload.needs_drop(),
+            DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
+        }
+    }
+}
+
+/// Build the recursive Drop plan after named definitions have been resolved. The returned plan is
+/// finite for every valid Align type; inline recursive definitions produce [`DropPlan::Invalid`]
+/// rather than recursing or panicking.
+pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropPlan {
+    // Keep traversal state sparse. `drop_plan` is queried from per-expression analyses, and most
+    // roots are primitive or touch only a small nominal subgraph; zeroing four vectors sized to
+    // every definition on every query made those common classifications quadratic in program
+    // size. ID-keyed sets/maps retain constant-time cycle/cache checks while allocating only for
+    // nominal nodes reachable from this root.
+    let mut struct_cache = HashMap::new();
+    let mut enum_cache = HashMap::new();
+    let mut struct_active = HashSet::new();
+    let mut enum_active = HashSet::new();
+    drop_plan_rec(
+        ty,
+        structs,
+        enums,
+        &mut struct_active,
+        &mut enum_active,
+        &mut struct_cache,
+        &mut enum_cache,
+    )
+    .as_ref()
+    .clone()
+}
+
+/// Whether a tagged payload needs recursive/deep cleanup that L1a's shallow Option/Result
+/// destructor cannot perform.
+fn tagged_payload_needs_l1b_drop(
+    payload: Scalar,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+) -> bool {
+    match payload {
+        Scalar::DynArray(PrimScalar::String) => true,
+        Scalar::DynStructArray(id) => struct_is_move(id, structs, enums),
+        Scalar::DynResponseArray => true,
+        _ => {
+            !payload.is_move()
+                && drop_plan(scalar_to_ty(payload), structs, enums).needs_drop()
+        }
+    }
+}
+
+fn drop_plan_rec(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    struct_active: &mut HashSet<u32>,
+    enum_active: &mut HashSet<u32>,
+    struct_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
+    enum_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
+) -> std::sync::Arc<DropPlan> {
     match ty {
-        Ty::Option(s) => s.is_move(),
-        Ty::Result(o, e) => o.is_move() || e.is_move(),
-        _ => false,
+        Ty::Struct(id) => {
+            if let Some(plan) = struct_cache.get(&id) {
+                return plan.clone();
+            }
+            if !struct_active.insert(id) {
+                return std::sync::Arc::new(DropPlan::Invalid);
+            }
+            let Some(def) = structs.get(id as usize) else {
+                struct_active.remove(&id);
+                return std::sync::Arc::new(DropPlan::Invalid);
+            };
+            let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    (
+                        index as u32,
+                        drop_plan_rec(
+                            field.ty,
+                            structs,
+                            enums,
+                            struct_active,
+                            enum_active,
+                            struct_cache,
+                            enum_cache,
+                        ),
+                    )
+                })
+                .collect();
+            struct_active.remove(&id);
+            let needs_drop = fields
+                .iter()
+                .any(|(_, plan)| plan.needs_drop());
+            let plan = std::sync::Arc::new(DropPlan::Struct {
+                id,
+                fields,
+                needs_drop,
+            });
+            struct_cache.insert(id, plan.clone());
+            plan
+        }
+        Ty::Option(payload) => std::sync::Arc::new(DropPlan::Option(drop_plan_rec(
+            scalar_to_ty(payload),
+            structs,
+            enums,
+            struct_active,
+            enum_active,
+            struct_cache,
+            enum_cache,
+        ))),
+        Ty::Result(ok, err) => std::sync::Arc::new(DropPlan::Result {
+            ok: drop_plan_rec(
+                scalar_to_ty(ok),
+                structs,
+                enums,
+                struct_active,
+                enum_active,
+                struct_cache,
+                enum_cache,
+            ),
+            err: drop_plan_rec(
+                scalar_to_ty(err),
+                structs,
+                enums,
+                struct_active,
+                enum_active,
+                struct_cache,
+                enum_cache,
+            ),
+        }),
+        Ty::Enum(id) => {
+            if let Some(plan) = enum_cache.get(&id) {
+                return plan.clone();
+            }
+            if !enum_active.insert(id) {
+                return std::sync::Arc::new(DropPlan::Invalid);
+            }
+            let Some(def) = enums.get(id as usize) else {
+                enum_active.remove(&id);
+                return std::sync::Arc::new(DropPlan::Invalid);
+            };
+            let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
+                .variants
+                .iter()
+                .map(|variant| {
+                    variant
+                        .payload
+                        .iter()
+                        .map(|payload| {
+                            drop_plan_rec(
+                                scalar_to_ty(*payload),
+                                structs,
+                                enums,
+                                struct_active,
+                                enum_active,
+                                struct_cache,
+                                enum_cache,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            enum_active.remove(&id);
+            let needs_drop = variants
+                .iter()
+                .flatten()
+                .any(|plan| plan.needs_drop());
+            let plan = std::sync::Arc::new(DropPlan::Enum {
+                id,
+                variants,
+                needs_drop,
+            });
+            enum_cache.insert(id, plan.clone());
+            plan
+        }
+        // These types have an existing, non-recursive cleanup leaf. Aggregate layout is not
+        // encoded here: codegen's leaf lowering remains the representation source of truth.
+        ty if matches!(
+            ty,
+            Ty::Box(_)
+                | Ty::Task(_)
+                | Ty::DynArray(_)
+                | Ty::DynStructArray(..)
+                | Ty::DynSliceArray(_)
+                | Ty::DynResponseArray
+                | Ty::String
+                | Ty::Builder
+                | Ty::StrFinder
+                | Ty::Writer
+                | Ty::Reader
+                | Ty::Buffer
+                | Ty::ArrayBuilder(_)
+                | Ty::Regex
+                | Ty::Captures
+                | Ty::CliCommand
+                | Ty::CliParsed
+                | Ty::TcpConn
+                | Ty::TcpListener
+                | Ty::UdpSocket
+                | Ty::Child
+                | Ty::File
+                | Ty::HttpRequest
+                | Ty::HttpResponse
+                | Ty::HttpClient
+                | Ty::HttpServer
+                | Ty::HttpRequestCtx
+                | Ty::ResponseBuilder
+                | Ty::HttpStream
+                | Ty::Command
+                | Ty::RunOutput
+                | Ty::DictEncoded(..)
+        ) =>
+        {
+            std::sync::Arc::new(DropPlan::Leaf(ty))
+        }
+        _ => std::sync::Arc::new(DropPlan::None),
     }
 }
 
@@ -1082,29 +1328,14 @@ pub fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef
             Ty::Array(s, _)
                 if s.is_move()
                     || matches!(s, Scalar::Struct(id) if struct_is_move(id, structs, enums))
-                    || matches!(s, Scalar::Enum(id) if enum_is_move(id, enums))
+                    || matches!(s, Scalar::Enum(id) if enum_is_move(id, structs, enums))
         )
 }
 
-/// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, a nested
-/// struct that does, or a **Move** sum-type field (an owned `array<T>` payload variant, J3) — which
-/// makes it a **Move** type with a recursive `Drop` (Slice 3). The struct
-/// graph is *meant* to be acyclic (pass 0b-2 / `struct_acyclic` reports any cycle as an error), but
-/// the compiler keeps running later passes on the erroneous program, which then call this on a
-/// cyclic struct — so the walk is **cycle-safe** (a `visiting` set, like `struct_acyclic`) to report
-/// the error gracefully instead of overflowing the stack.
+/// Whether struct `id` has a recursive Drop plan. The canonical plan is cycle-safe and fail-closed
+/// for malformed definitions; the definition-validation pass emits the user-facing diagnostic.
 pub fn struct_is_move(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
-    struct_is_move_rec(id, structs, enums, &mut Vec::new())
-}
-
-fn struct_is_move_rec(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
-    if visiting.contains(&id) {
-        return false; // a cycle (already reported by `struct_acyclic`) — not a Move type here
-    }
-    visiting.push(id);
-    let res = structs.get(id as usize).is_some_and(|def| def.fields.iter().any(|f| ty_owns_buffer_rec(f.ty, structs, enums, visiting)));
-    visiting.pop();
-    res
+    drop_plan(Ty::Struct(id), structs, enums).needs_drop()
 }
 
 /// Whether sum type `id` is a **Move** type — any variant carries an owned (Move) payload, so its
@@ -1113,30 +1344,10 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], vi
 /// payload is a scalar / `str` view / non-Move struct owns nothing and stays **Copy** (region-tracked
 /// iff a `str` payload — see `tracks_region` / `region_of`).
 ///
-/// Keyed on `Scalar::is_move()` alone — the SAME predicate `drop_enum` uses to pick which payload
-/// fields to free — so the classifier and the drop stay in lockstep. Pass 0c admits only owned
-/// `array<T>` (a flat-freeable `{ptr,len}`) and the opaque `response_builder` handle as Move
-/// payloads; a Move *struct* payload is rejected there (it would need recursive field drops).
-pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
-    enums.get(id as usize).is_some_and(|e| e.variants.iter().flat_map(|v| v.payload.iter()).any(|s| s.is_move()))
-}
-
-/// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
-/// field makes its enclosing struct a Move type. A free-standing owned collection/string/builder, an
-/// `Option`/`Result` with a Move payload, or a nested Move struct. (Tuples can't be struct fields, so
-/// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
-/// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
-///
-/// **Enum fields (J3):** a sum-type field IS consulted here — a **Move** enum field (an owned
-/// `array<T>` payload variant, J2) makes its enclosing struct Move, dropped by `drop_struct_fields`'s
-/// `Ty::Enum` arm (which calls the tag-switched `drop_enum`). A non-Move enum field (scalar / `str` /
-/// plain-struct payloads) owns nothing and leaves its struct non-Move (`enum_is_move` is table-only,
-/// no recursion into `struct_is_move` — an enum's struct payloads are always non-Move, pass 0c).
-fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput)
-        || payload_is_move(ty)
-        || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, enums, visiting))
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
+/// Uses the same canonical recursive Drop plan as structs, `Option`, and `Result`. Pass 0c still
+/// rejects Move-struct payloads until L1b wires recursive tagged extraction and lowering.
+pub fn enum_is_move(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    drop_plan(Ty::Enum(id), structs, enums).needs_drop()
 }
 
 /// Byte threshold for the **huge struct copy** lint (`draft.md` §16): a struct passed/returned **by
@@ -1332,15 +1543,16 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
         || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
 }
 
-fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
-        || payload_is_move(ty)
+fn ty_is_move(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+) -> bool {
+    drop_plan(ty, structs, enums).needs_drop()
         || ty_tuple_is_move(ty, tuples)
-        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
         // A fixed array of Move structs owns every element recursively.
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums))
-        // A Move sum type (owns an `array<Struct>` payload, J2).
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -1428,16 +1640,9 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
-        || payload_is_move(ty)
-        // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
-        // each owned field (Slice 3).
-        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
+    (!matches!(ty, Ty::Box(_) | Ty::Task(_)) && drop_plan(ty, structs, enums).needs_drop())
         // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums))
-        // A Move sum type (owns an `array<Struct>` payload, J2) — its `Drop` switches on the tag and
-        // frees the live variant's owned payload (`drop_enum`).
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
@@ -1468,8 +1673,9 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
 /// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
 /// bound places are borrowed from their binding instead; a block is transparent to its value (see
-/// [`borrow_transparent_value`]). Control-flow nodes are conservatively eligible and their per-path
-/// runtime temporary bit prevents a bound arm from being dropped.
+/// [`borrow_transparent_value`]), and a task group is transparent when its ordinary tail value is a
+/// bound place because the group owns task storage only. Control-flow nodes are conservatively
+/// eligible and their per-path runtime temporary bit prevents a bound arm from being dropped.
 ///
 /// The second half of MIR's `lower_borrowed_owned` condition, with [`needs_drop_flag`] — shared
 /// here so `MoveCheck`'s borrow liveness ends a temporary's generation at exactly the loop edge
@@ -1477,6 +1683,12 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
 pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
     if let Some(inner) = borrow_transparent_value(e) {
         return may_need_synthetic_owner(inner);
+    }
+    // A task_group owns task storage, not ordinary lexical locals. A bound tail place therefore
+    // remains borrowed from that place in a borrowing context; only a genuinely fresh tail needs
+    // a hidden owner. Region escape remains checked on the TaskGroup wrapper itself.
+    if let hir::ExprKind::TaskGroup(block) = &e.kind {
+        return block.value.as_deref().is_some_and(may_need_synthetic_owner);
     }
     match &e.kind {
         hir::ExprKind::Local(_)
@@ -3140,26 +3352,6 @@ pub fn check_program_with_effects(
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
             let fty = structs[i].fields[fi].ty;
-            // An `Option<T>` field's payload must be **non-owned** in v1 (REST-gateway runway Slice B).
-            // A non-owned payload (scalar / `str` view / plain-data struct) needs no drop, so an
-            // Option field adds zero owned-drop surface; an owned payload (`Option<string>`, an owned
-            // collection, or a Move struct) would need a new conditional "free the payload iff Some"
-            // drop-as-a-field path that has no consumer yet — `json.decode` only ever fills a decoded
-            // view/scalar/plain-struct into an Option field. Reject the owned case cleanly (deferred),
-            // rather than silently leak it (a Move-struct payload is invisible to the table-free
-            // `payload_is_move`, so it would otherwise mis-classify the struct as non-Move).
-            if let Ty::Option(sc) = fty {
-                let owned = sc.is_move() || matches!(sc, Scalar::Struct(nid) if struct_is_move(nid, &structs, &enums));
-                if owned {
-                    diags.error(
-                        format!(
-                            "an `Option` struct field must have a non-owned payload for now (got Option<{}>) — an owned/Move Option payload is a later slice",
-                            ty_name(scalar_to_ty(sc))
-                        ),
-                        f.span,
-                    );
-                }
-            }
             // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
             // struct's `Drop` (`drop_struct_fields`). Its **element** must be non-owned in v1 so that
             // buffer is a single flat free: a scalar / `str` view / plain-data (non-Move) struct.
@@ -3224,12 +3416,8 @@ pub fn check_program_with_effects(
                     // A `str` view payload (J1): makes the enum region-tracked (see `tracks_region` /
                     // `region_of` / `ty_may_borrow`), never Move (a `str` borrows, owns nothing).
                     Ty::Str => payload.push(Scalar::Str),
-                    Ty::Struct(id) if struct_is_move(id, &structs, &enums) => diags.error(
-                        format!("a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)", structs[id as usize].name),
-                        t.span(),
-                    ),
                     // A plain-data struct payload — `str`-bearing is now allowed (J1: the enum is
-                    // region-tracked through it). A Move struct is caught above.
+                    // region-tracked through it). Move-ness is checked after all enums resolve.
                     Ty::Struct(id) => {
                         payload.push(Scalar::Struct(id));
                     }
@@ -3242,15 +3430,14 @@ pub fn check_program_with_effects(
                         "an `array<string>` sum-type payload is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
                         t.span(),
                     ),
-                    Ty::DynStructArray(eid, _) if struct_is_move(eid, &structs, &enums) => diags.error(
-                        format!("an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice", structs[eid as usize].name),
-                        t.span(),
-                    ),
+                    Ty::DynStructArray(eid, _) => {
+                        payload.push(Scalar::DynStructArray(eid));
+                    }
                     // Every other owned `array<T>` — a scalar / `str` / plain-data-struct element (one
                     // flat free). A non-representable element (a nested `array<array<T>>`, an `soa`
                     // column) has no payload `Scalar`, so `ty_to_scalar` is `None` — reject it cleanly
                     // rather than panic (Gate 3: the compiler must diagnose, never crash on bad input).
-                    Ty::DynArray(_) | Ty::DynStructArray(_, _) => match ty_to_scalar(ty) {
+                    Ty::DynArray(_) => match ty_to_scalar(ty) {
                         Some(s) => payload.push(s),
                         None => diags.error(
                             format!("an owned-array sum-type payload must have a scalar / `str` / plain-struct element for now, got {}", ty_name(ty)),
@@ -3301,9 +3488,9 @@ pub fn check_program_with_effects(
                 span,
             );
         }
-        // A **Move** enum field (an owned `array<T>` payload variant, J2) is now supported (J3): it
-        // makes the enclosing struct Move (`ty_owns_buffer_rec`'s enum arm reads the `enums` table),
-        // and `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched
+        // A **Move** enum field (an owned `array<T>` payload variant, J2) is now supported (J3): the
+        // canonical recursive DropPlan makes the enclosing struct Move, and
+        // `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched
         // `drop_enum`. No rejection here — a Move enum field is as legal as a `string`/owned-array field.
     }
 
@@ -3847,6 +4034,118 @@ pub fn check_program_with_effects(
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
     }
+
+    // Final resolved-type safety gate. It deliberately runs after the generic-function worklist:
+    // struct and enum monomorphs can be created while resolving declarations or function bodies,
+    // and their ownership may depend on a concrete enum whose reserved slot was still empty at the
+    // creation site. No graph-dependent payload decision is allowed to stay cached from that phase.
+    let generic_struct_span = |name: &str| {
+        generic_struct_decls.iter().find_map(|(module, is_entry, decl)| {
+            let mut prefix = mangle_fn(module, *is_entry, &decl.name.name);
+            prefix.push('$');
+            name.starts_with(&prefix).then_some(decl.span)
+        })
+    };
+    let generic_enum_span = |name: &str| {
+        generic_enum_decls.iter().find_map(|(module, is_entry, decl)| {
+            let mut prefix = mangle_fn(module, *is_entry, &decl.name.name);
+            prefix.push('$');
+            name.starts_with(&prefix).then_some(decl.span)
+        })
+    };
+
+    // L1a lowers conditional field cleanup only for `Option<string>`. Revalidate every concrete
+    // and monomorph struct against the complete DropPlan graph, including Move enums and structs
+    // that become Move transitively through an enum.
+    for (sid, def) in structs.iter().enumerate() {
+        for (fi, field) in def.fields.iter().enumerate() {
+            let Ty::Option(payload) = field.ty else {
+                continue;
+            };
+            if payload == Scalar::String
+                || !drop_plan(scalar_to_ty(payload), &structs, &enums).needs_drop()
+            {
+                continue;
+            }
+            let span = if sid < struct_decls.len() {
+                struct_decls[sid].2.fields[fi].span
+            } else {
+                generic_struct_span(&def.name)
+                    .expect("an invalid owned Option field belongs to a generic struct monomorph")
+            };
+            if let Scalar::Struct(nid) = payload {
+                let name = structs
+                    .get(nid as usize)
+                    .map_or("<invalid struct>", |nested| nested.name.as_str());
+                diags.error(
+                    format!(
+                        "an `Option` struct field cannot contain the Move struct '{}' yet — Option<MoveStruct> is implemented in L1b",
+                        name
+                    ),
+                    span,
+                );
+            } else {
+                diags.error(
+                    format!(
+                        "an `Option` struct field cannot contain owned payload Option<{}> yet — only Option<string> is implemented in L1a",
+                        ty_name(scalar_to_ty(payload))
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    // Sum-type Drop does not recurse into struct payloads or array elements yet. Check every
+    // concrete and monomorph enum only now, so declaration order and early monomorph caching cannot
+    // turn a Move struct into an accepted Copy payload.
+    for (eid, def) in enums.iter().enumerate() {
+        let mut span = None;
+        for variant in &def.variants {
+            for payload in &variant.payload {
+                let (struct_id, array) = match payload {
+                    Scalar::Struct(id) => (*id, false),
+                    Scalar::DynStructArray(id) => (*id, true),
+                    _ => continue,
+                };
+                if !struct_is_move(struct_id, &structs, &enums) {
+                    continue;
+                }
+                let source_span = *span.get_or_insert_with(|| {
+                    if eid < enum_decls.len() {
+                        enum_decls[eid].2.span
+                    } else {
+                        generic_enum_span(&def.name)
+                            .expect("an invalid Move struct payload belongs to a generic enum monomorph")
+                    }
+                });
+                if array {
+                    let name = structs
+                        .get(struct_id as usize)
+                        .map_or("<invalid struct>", |nested| nested.name.as_str());
+                    diags.error(
+                        format!(
+                            "an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
+                            name
+                        ),
+                        source_span,
+                    );
+                } else {
+                    let name = structs
+                        .get(struct_id as usize)
+                        .map_or("<invalid struct>", |nested| nested.name.as_str());
+                    diags.error(
+                        format!(
+                            "a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)",
+                            name
+                        ),
+                        source_span,
+                    );
+                }
+            }
+        }
+    }
+
     let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types, imported_fns };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
@@ -5307,6 +5606,9 @@ enum EscapeFlowOp<'a> {
     /// A by-value call transfers a Move value to the callee. Arena-owned storage cannot cross
     /// that function boundary because the callee has no caller-region provenance.
     CallTransfer(&'a Expr, u32),
+    /// `?` returns the active Err payload from the function. An owned error must therefore be
+    /// free-standing, not allocated in an arena that exit cleanup ends before the return.
+    TryErrEscape(&'a Expr, u32),
     ReturnEscape(&'a Expr, u32),
 }
 
@@ -5526,6 +5828,19 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
+            EscapeFlowOp::TryErrEscape(result, depth) => {
+                let contains_arena_owned =
+                    self.try_error_contains_arena_owned(result, depth);
+                if contains_arena_owned {
+                    self.diags.error(
+                        "cannot propagate an arena-owned error through `?` (the arena is freed before the error returns); use a free-standing owned error"
+                            .to_string(),
+                        result.span,
+                    );
+                } else {
+                    self.check_try_error_borrow_escape(result, depth);
+                }
+            }
             EscapeFlowOp::ReturnEscape(value, depth) => {
                 self.check_return_escape(value, depth)
             }
@@ -5586,6 +5901,93 @@ impl<'a> EscapeCheck<'a> {
             // A function result cannot borrow arena-owned storage across its own return boundary.
             ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => false,
             _ => !self.drop_is_individual(e, depth),
+        }
+    }
+
+    /// Check the implicit Err return edge of `?` for a borrowed payload. This is independent of
+    /// cleanup ownership: a `str` or `slice` needs no Drop but may still borrow a local or arena
+    /// allocation that is destroyed before the propagated Result reaches the caller.
+    ///
+    /// Fresh constructors preserve variant precision. A bound or control-flow Result uses its
+    /// conservative joined region because L1a has no per-variant borrow-provenance bit.
+    fn check_try_error_borrow_escape(&mut self, result: &Expr, depth: u32) {
+        let Ty::Result(_, err) = result.ty else {
+            return;
+        };
+        if !self.region_bearing(scalar_to_ty(err)) {
+            return;
+        }
+        match &result.kind {
+            ExprKind::ResultOk(_) => {}
+            ExprKind::ResultErr(error) => self.check_return_escape(error, depth),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                if let Some(value) = &block.value {
+                    self.check_try_error_borrow_escape(value, depth);
+                }
+            }
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                if let Some(value) = &block.value {
+                    self.check_try_error_borrow_escape(value, depth + 1);
+                }
+            }
+            ExprKind::If { then, els, .. } => {
+                for block in [then, els] {
+                    if let Some(value) = &block.value {
+                        self.check_try_error_borrow_escape(value, depth);
+                    }
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    self.check_try_error_borrow_escape(&arm.body, depth);
+                }
+            }
+            _ => self.check_return_escape(result, depth),
+        }
+    }
+
+    /// Whether the Err payload implicitly returned by `?` may be arena-owned. Preserve variant
+    /// precision for fresh constructors; a bound/control-flow Result uses the conservative joined
+    /// ownership bit because L1a has only one cleanup-provenance bit for the aggregate.
+    fn try_error_contains_arena_owned(&mut self, result: &Expr, depth: u32) -> bool {
+        let Ty::Result(_, err) = result.ty else {
+            return false;
+        };
+        if !needs_drop_flag(
+            scalar_to_ty(err),
+            self.structs,
+            self.tuples,
+            self.enums,
+        ) {
+            return false;
+        }
+        match &result.kind {
+            ExprKind::ResultOk(_) => false,
+            ExprKind::ResultErr(error) => {
+                self.call_transfer_contains_arena_owned(error, depth)
+            }
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth)),
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth + 1)),
+            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
+                block
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| self.try_error_contains_arena_owned(value, depth))
+            }),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .any(|arm| self.try_error_contains_arena_owned(&arm.body, depth)),
+            // A callee cannot return arena-owned storage across its own function boundary.
+            ExprKind::Call { .. }
+            | ExprKind::CallFnValue { .. }
+            | ExprKind::ResultMapErr { .. } => false,
+            _ => self.call_transfer_contains_arena_owned(result, depth),
         }
     }
 
@@ -7522,8 +7924,12 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(f, depth);
                 }
             }
+            ExprKind::Try(i) => {
+                self.walk(i, depth);
+                self.push_flow_op(EscapeFlowOp::TryErrEscape(i, depth));
+            }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
+            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
@@ -8910,6 +9316,23 @@ fn field_moved(moved: &MovedSet, id: LocalId, n: u32) -> bool {
     moved.contains(&MovedKey::Field(id, n)) || moved.contains(&MovedKey::Whole(id))
 }
 
+/// Whether a match scrutinee's result is assembled through a control-flow join. When an outer arm
+/// moves a payload out, MIR must lower this shape consuming so the join owns its selected source.
+/// Transparent scopes expose the same result shape without adding a join.
+fn match_scrutinee_materializes_result(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::ElseUnwrap { .. } => true,
+        ExprKind::Block(block)
+        | ExprKind::Arena(block)
+        | ExprKind::TaskGroup(block)
+        | ExprKind::Unsafe(block) => block
+            .value
+            .as_deref()
+            .is_some_and(match_scrutinee_materializes_result),
+        _ => false,
+    }
+}
+
 /// Re-binding a local (`x := …`) clears every move record for it (whole and per-field).
 fn clear_moved(moved: &mut MovedSet, id: LocalId) {
     moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
@@ -9040,6 +9463,13 @@ impl<'a> MoveCheck<'a> {
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
             ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
+            // A task_group owns only spawned task storage. Its bound ordinary tail place keeps the
+            // same borrow root; region escape is checked separately on the wrapper.
+            ExprKind::TaskGroup(block) => {
+                if let Some(value) = &block.value {
+                    roots.extend(self.storage_roots(value));
+                }
+            }
             // Not a fail-open default: this DELEGATES to [`Self::borrow_sources`], whose own
             // classification is exhaustive, so a new `ExprKind` is still forced to be classified —
             // there, once, rather than in both places. The arms above exist only because a *place*
@@ -9626,23 +10056,41 @@ impl<'a> MoveCheck<'a> {
                 // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
                 // check below (same diagnostic; the field write has no index expr to span, so it
                 // points at the RHS instead).
-                Stmt::AssignField { root, value, .. } => {
+                Stmt::AssignField { root, path, value } => {
                     self.check_borrow_use(*root, value.span);
                     if whole_moved(moved, *root) {
                         let name = &self.f.locals[*root as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), value.span);
                     }
-                    self.expr(value, moved, true, true);
-                    if self.is_move_ty(value.ty) {
+                    let self_assign = matches!(
+                        &value.kind,
+                        ExprKind::Field { root: source, path: source_path }
+                            if source == root && source_path == path
+                    );
+                    if self_assign {
+                        // MIR emits no code for an exact place self-assignment. Analyze the read
+                        // without consuming it so existing borrows of the root stay valid too.
+                        self.expr(value, moved, false, false);
+                    } else {
+                        self.expr(value, moved, true, true);
+                    }
+                    // The assignment installs a live replacement even when its RHS moved out of
+                    // this same field through a transparent wrapper, consuming call, or one arm of
+                    // a control-flow expression. MIR zeros the source on precisely the paths that
+                    // moved it before dropping the path-local old destination.
+                    if let [field] = path.as_slice() {
+                        moved.remove(&MovedKey::Field(*root, *field));
+                    }
+                    // `v.field = v.field` is the field analogue of `s = s`: it preserves the
+                    // value and ownership instead of leaving the destination marked moved. MIR
+                    // emits no code for this exact place identity, so do not invalidate borrows.
+                    if !self_assign && self.is_move_ty(value.ty) {
                         self.invalidate_owner(*root);
                     }
                 }
-                // `base[index] = value` / `base[index].field = value` — writing an element is a use
-                // of `base` (an owned array could have been moved away), so flag use-after-move on
-                // it; index and value are read (not moved; Copy).
-                Stmt::AssignIndex { base, index, value }
-                | Stmt::AssignElemField { base, index, value, .. }
-                | Stmt::AssignElem { base, index, value, .. } => {
+                // `base[index] = value` — primitive array elements are Copy, so the index and value
+                // are read without consuming either.
+                Stmt::AssignIndex { base, index, value } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
@@ -9650,6 +10098,20 @@ impl<'a> MoveCheck<'a> {
                     }
                     self.expr(index, moved, false, false);
                     self.expr(value, moved, false, false);
+                }
+                // Struct element-field and whole-element stores may install an owned `string` or
+                // Move struct. MIR drops the old destination and nulls a moved RHS source, so
+                // MoveCheck must consume that RHS as well. Copy-only dynamic/SoA stores are
+                // unaffected by a consuming context.
+                Stmt::AssignElemField { base, index, value, .. }
+                | Stmt::AssignElem { base, index, value, .. } => {
+                    self.check_borrow_use(*base, index.span);
+                    if whole_moved(moved, *base) {
+                        let name = &self.f.locals[*base as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), index.span);
+                    }
+                    self.expr(index, moved, false, false);
+                    self.expr(value, moved, true, true);
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
@@ -9746,6 +10208,60 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Transfer only the bound source(s) that produced a match scrutinee's result value.
+    ///
+    /// The scrutinee has already been evaluated non-consuming, so statements, conditions, and
+    /// nested operations must not be walked again. Re-enter only transparent/control-result tails
+    /// and direct places, mirroring MIR's `null_moved_source`. Control expressions transfer their
+    /// result sources during their own single evaluation when they fill a Move-typed join slot, so
+    /// this helper deliberately does not re-enter them.
+    fn consume_match_result(&mut self, e: &Expr, moved: &mut MovedSet, direct: bool) {
+        match &e.kind {
+            ExprKind::Local(id) if self.is_move(*id) => {
+                if !direct {
+                    let name = &self.f.locals[*id as usize].name;
+                    self.diags.error(
+                        format!(
+                            "cannot move owned value '{name}' out through a conditional \
+                             expression yet; bind the `if`/`else` result to a local first"
+                        ),
+                        e.span,
+                    );
+                }
+                self.invalidate_owner(*id);
+                moved.insert(MovedKey::Whole(*id));
+            }
+            ExprKind::Field { root, path } if path.len() == 1 => {
+                let field = path[0];
+                if e.ty == Ty::String
+                    || e.ty == Ty::Option(Scalar::String)
+                    || is_move_handle(e.ty)
+                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums))
+                {
+                    self.invalidate_owner(*root);
+                    moved.insert(MovedKey::Field(*root, field));
+                } else if self.is_move_ty(e.ty) {
+                    self.diags.error(
+                        "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                        e.span,
+                    );
+                }
+            }
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => {
+                if let Some(value) = &block.value {
+                    self.consume_match_result(value, moved, direct);
+                }
+            }
+            // Constructors consume their payloads during ordinary evaluation; loop `break` values
+            // and Move-typed control results transfer theirs while filling their join slot. Fresh
+            // results and Copy places own no source slot for the outer match to clear.
+            _ => {}
+        }
+    }
+
     fn expr(
         &mut self,
         e: &Expr,
@@ -9804,10 +10320,16 @@ impl<'a> MoveCheck<'a> {
                             format!("use of moved field '{fld_name}' of '{name}'")
                         };
                         self.diags.error(msg, e.span);
-                    } else if consuming && (e.ty == Ty::String || is_move_handle(e.ty)) {
-                        // A partial move of a depth-1 owned `string` field (`n := u.name`,
+                    } else if consuming
+                        && (e.ty == Ty::String
+                            || e.ty == Ty::Option(Scalar::String)
+                            || is_move_handle(e.ty)
+                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums)))
+                    {
+                        // A partial move of a depth-1 owned `string`/`Option<string>` field (`n := u.name`,
                         // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
-                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle):
+                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle), or
+                        // a Move enum field materialized through control flow:
                         // mark just that field moved. The
                         // struct's recursive `Drop` frees null there (MIR nulls the field on move);
                         // the struct can no longer move as a whole, and the field can't be reused,
@@ -10099,7 +10621,6 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.expr(scrutinee, moved, false, false);
                 // Arms are mutually exclusive, so each is checked in the *same* incoming state:
                 // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
                 // Without this the arms share one set, so a value consumed in arm A is wrongly seen
@@ -10107,16 +10628,67 @@ impl<'a> MoveCheck<'a> {
                 // (`=> { return … }`) contributes nothing to the fall-through, so its moves must not
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
-                let scrutinee_roots = self.borrow_sources(scrutinee);
-                let scrutinee_local = match &scrutinee.kind {
-                    ExprKind::Local(id) => Some(*id),
-                    _ => None,
+                // Extracting a Move payload consumes the scrutinee on precisely those arms that
+                // bind one. Walk that consuming form once through the ordinary expression
+                // dataflow, so blocks and control-flow values cannot drift from MIR's recursive,
+                // path-local `null_moved_source`. Non-binding/Copy arms retain the incoming state.
+                // This single walk also emits any use-after-move or unsupported conditional-move
+                // diagnostic once rather than once per arm.
+                let has_move_binding = arms
+                    .iter()
+                    .flat_map(|arm| &arm.bindings)
+                    .any(|binding| self.is_move(*binding));
+                // Evaluate once for every arm. If a Move payload can be extracted, derive its
+                // transfer state in that same walk for a control-joined scrutinee; a direct place
+                // stays borrowed until the selected Move-binding arm extracts it.
+                self.borrows = incoming_borrows.clone();
+                let consuming_control = has_move_binding
+                    && match_scrutinee_materializes_result(scrutinee);
+                self.expr(
+                    scrutinee,
+                    moved,
+                    consuming_control,
+                    consuming_control,
+                );
+                let evaluated = moved.clone();
+                let evaluated_borrows = self.borrows.clone();
+                let (consumed, consumed_borrows) = if has_move_binding {
+                    if consuming_control {
+                        (
+                            Some(evaluated.clone()),
+                            Some(evaluated_borrows.clone()),
+                        )
+                    } else {
+                        let mut state = evaluated.clone();
+                        self.borrows = evaluated_borrows.clone();
+                        self.consume_match_result(scrutinee, &mut state, true);
+                        (Some(state), Some(self.borrows.clone()))
+                    }
+                } else {
+                    (None, None)
                 };
+                // An evaluated block/control value may have reassigned a view before yielding it.
+                // Derive payload-binding provenance from that post-evaluation state, not the
+                // incoming state, or the binding can retain stale roots and outlive its real owner.
+                self.borrows = evaluated_borrows.clone();
+                let scrutinee_roots = self.borrow_sources(scrutinee);
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
-                    let mut m = moved.clone();
-                    self.borrows = incoming_borrows.clone();
+                    let arm_moves_payload = a.bindings.iter().any(|binding| self.is_move(*binding));
+                    let mut m = if arm_moves_payload {
+                        consumed.as_ref().expect("Move binding has consumed state").clone()
+                    } else {
+                        evaluated.clone()
+                    };
+                    self.borrows = if arm_moves_payload {
+                        consumed_borrows
+                            .as_ref()
+                            .expect("Move binding has consumed borrow state")
+                            .clone()
+                    } else {
+                        evaluated_borrows.clone()
+                    };
                     for binding in &a.bindings {
                         let roots = if self.local_may_borrow(*binding) {
                             scrutinee_roots.clone()
@@ -10130,20 +10702,6 @@ impl<'a> MoveCheck<'a> {
                         // fixpoint, and the next iteration's freshly bound value is rejected as
                         // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
                         clear_moved(&mut m, *binding);
-                        // And extracting a MOVE payload moves it OUT of the scrutinee: MIR nulls
-                        // the scrutinee's payload slot at arm entry (the binding owns the buffer
-                        // now), so a Local scrutinee becomes whole-moved in this arm's state —
-                        // using or re-matching it would read the nulled payload as a silent wrong
-                        // result. Tag-only / Copy-payload arms extract nothing owned and leave it
-                        // live; the arm join then makes the post-match state "moved iff some
-                        // taken arm extracted", the standard may-analysis. (Found by the #593
-                        // adversarial review: the arm-entry `clear_moved` above had unshielded
-                        // this pre-existing hole's loop form.)
-                        if let Some(sl) = scrutinee_local
-                            && self.is_move(*binding)
-                        {
-                            m.insert(MovedKey::Whole(sl));
-                        }
                     }
                     self.expr(&a.body, &mut m, consuming, direct);
                     if hir_expr_diverges(&a.body) {
@@ -11434,8 +11992,26 @@ impl<'a, 't> Checker<'a, 't> {
                         }
                     }
                     Place::Field { root, path, ty } => {
-                        let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignField { root, path, value: v });
+                        // Direct field replacement has typed drop-old lowering only for the two
+                        // L1a owned leaves. Gate the final leaf here (not while recursively
+                        // resolving the receiver), so `outer.inner.name = …` can still reach its
+                        // supported `string` leaf through an intermediate Move struct.
+                        if drop_plan(ty, self.structs, self.enums).needs_drop()
+                            && !matches!(ty, Ty::String | Ty::Option(Scalar::String))
+                        {
+                            self.diags.error(
+                                format!(
+                                    "field replacement of {} is not supported yet (owned field replacement currently supports only `string` and `Option<string>` leaves; replace the whole struct)",
+                                    self.ty_display(ty)
+                                ),
+                                place.span,
+                            );
+                            let v = self.check_expr(value, None);
+                            stmts.push(Stmt::Expr(v));
+                        } else {
+                            let v = self.check_expr(value, Some(ty));
+                            stmts.push(Stmt::AssignField { root, path, value: v });
+                        }
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));
@@ -11715,6 +12291,23 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return Place::Err;
                 }
+                // Fixed struct-array field replacement has one owned-leaf lowering: `string`.
+                // Any other recursive Drop plan needs a typed drop-old operation; the raw field
+                // store would leak the old value and would not null a bound RHS source.
+                if !soa
+                    && !is_dyn
+                    && leaf_ty != Ty::String
+                    && drop_plan(leaf_ty, self.structs, self.enums).needs_drop()
+                {
+                    self.diags.error(
+                        format!(
+                            "element-field assignment of {} into a fixed struct array is not supported yet (owned element-field replacement currently supports only `string`; replace the whole element)",
+                            self.ty_display(leaf_ty)
+                        ),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
                 let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
                 if i.ty == Ty::Error {
                     return Place::Err;
@@ -11799,17 +12392,40 @@ impl<'a, 't> Checker<'a, 't> {
     /// recompile after the pre-existing error is fixed. A *warning* (e.g. the unnecessary-heap lint)
     /// does not gate it: the error count, not the diagnostic count, is the checkpoint.
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
-        // No expected type → nothing to reconcile; `constrain(_, None)` is a no-op, so skip the
-        // error-count checkpoints entirely (the common case for most sub-expressions).
-        let Some(_) = expected else {
-            return self.check_expr_inner(e, None);
-        };
         let errors_before = self.diags.error_count();
         let result = self.check_expr_inner(e, expected);
-        if self.diags.error_count() == errors_before {
+        if self.diags.error_count() == errors_before && expected.is_some() {
             self.constrain(result.ty, expected, e.span);
         }
+        if self.diags.error_count() == errors_before
+            && self.has_unsupported_recursive_tagged_payload(result.ty)
+        {
+            self.diags.error(
+                format!(
+                    "materializing {} with a recursive Move payload is not supported yet — consume the producer directly with `?`; retained Move Option/Result payloads are implemented in L1b",
+                    self.ty_display(result.ty)
+                ),
+                e.span,
+            );
+        }
         result
+    }
+
+    /// Whether `ty` is an Option/Result whose payload needs recursive Drop but is not one of the
+    /// legacy shallow Move scalars already handled by the tagged destructor.
+    fn has_unsupported_recursive_tagged_payload(&self, ty: Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Option(payload) => self.has_unsupported_recursive_tagged_scalar(payload),
+            Ty::Result(ok, err) => {
+                self.has_unsupported_recursive_tagged_scalar(ok)
+                    || self.has_unsupported_recursive_tagged_scalar(err)
+            }
+            _ => false,
+        }
+    }
+
+    fn has_unsupported_recursive_tagged_scalar(&self, payload: Scalar) -> bool {
+        tagged_payload_needs_l1b_drop(payload, self.structs, self.enums)
     }
 
     fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
@@ -13676,16 +14292,13 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// A **Move** sum type (owns an `array<Struct>` payload, J2) is deferred as an `Option`/`Result`
-    /// payload. The drop machinery's `payload_is_move` arm frees a flat `{ptr,len}`, but a Move-enum
-    /// payload would need a *tag-switched* drop of the nested enum (no consumer yet); worse,
-    /// `payload_is_move` is table-free so it cannot even see the Move enum, so admitting it would
-    /// silently leak. Reject at the wrap site (`Some`/`Ok`/`Err`) — this is the sole origin of a
-    /// Move-enum-in-`Option`/`Result` *value*, so no leaking value can survive. Nullable/fallible
-    /// owned unions (`Option<Content>`) are a later slice (J3 matrix fill).
+    /// payload. The canonical Drop plan sees it, but L1b must still add nested tag-switched lowering
+    /// and move-out/null-container semantics. Reject at the wrap site (`Some`/`Ok`/`Err`) — this is
+    /// the sole origin of a Move-enum-in-`Option`/`Result` value, so no unsupported value survives.
     fn reject_move_enum_payload(&mut self, ty: Ty, wrapper: &str, span: Span) {
         let ty = self.resolve(ty);
         if let Ty::Enum(id) = ty
-            && enum_is_move(id, self.enums)
+            && enum_is_move(id, self.structs, self.enums)
         {
             self.diags.error(
                 format!("a Move sum type ({}) cannot be a `{wrapper}` payload yet — a nullable/fallible owned union is a later slice; use the value whole for now", self.ty_display(ty)),
@@ -15079,7 +15692,7 @@ impl<'a, 't> Checker<'a, 't> {
         // droppable `StructArray`, so admitting it would leak each element's buffer. Reject cleanly —
         // a Move enum is used as a single value for now.
         if let Ty::Enum(id) = self.resolve(elem_ty)
-            && enum_is_move(id, self.enums)
+            && enum_is_move(id, self.structs, self.enums)
         {
             self.diags.error(
                 format!("`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value", self.ty_display(elem_ty)),
@@ -17870,9 +18483,10 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 // An `Option<T>` field is optional (missing key / JSON `null` → `None`); its payload
-                // must itself be decodeable. `Option<Struct>` recurses into the payload struct. The
-                // owned-payload restriction (no `Option<string>`/`Option<Move-struct>`) is enforced at
-                // declaration (pass 0b-2), so a decodeable Option payload here is scalar/str/plain-struct.
+                // must itself be decodeable. `Option<Struct>` recurses into the payload struct.
+                // `Option<string>` is legal as a language field after L1a but remains outside the
+                // JSON descriptor boundary; `Option<Move-struct>` is still rejected by L1b's type
+                // gate. A decodeable Option payload here is therefore scalar/str/plain-struct.
                 Ty::Option(Scalar::Int(_)) | Ty::Option(Scalar::Float(_)) | Ty::Option(Scalar::Bool) | Ty::Option(Scalar::Str) => {}
                 // The one field shape the two directions disagree on. `json_payload_tag_sub` tags an
                 // `Option<enum>` payload as kind 6 with a real `JsonUnion` sub-pointer, so the runtime
@@ -18289,8 +18903,23 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
-            || payload_is_move(elem)
+        if matches!(
+            elem,
+            Ty::Box(_)
+                | Ty::DynArray(_)
+                | Ty::DynStructArray(..)
+                | Ty::String
+                | Ty::Builder
+                | Ty::Reader
+                | Ty::Writer
+                | Ty::Buffer
+                | Ty::ArrayBuilder(_)
+                | Ty::TcpConn
+                | Ty::TcpListener
+                | Ty::UdpSocket
+                | Ty::Child
+        ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
+            && drop_plan(elem, self.structs, self.enums).needs_drop())
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs, self.enums))
         {
             self.diags.error(
@@ -18339,7 +18968,23 @@ impl<'a, 't> Checker<'a, 't> {
                 // unconstructible today (each handle is rejected as an array element at construction),
                 // so this arm can't currently be reached — kept in sync so a future array-of-handle
                 // path can't slip past this guard silently.
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(elem) {
+                if matches!(
+                    elem,
+                    Ty::Box(_)
+                        | Ty::DynArray(_)
+                        | Ty::String
+                        | Ty::Builder
+                        | Ty::Reader
+                        | Ty::Writer
+                        | Ty::Buffer
+                        | Ty::ArrayBuilder(_)
+                        | Ty::TcpConn
+                        | Ty::TcpListener
+                        | Ty::UdpSocket
+                        | Ty::Child
+                ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
+                    && drop_plan(elem, self.structs, self.enums).needs_drop())
+                {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -21499,12 +22144,15 @@ impl<'a, 't> Checker<'a, 't> {
         if leaf_ty == Ty::String {
             leaf_ty = Ty::Str;
         }
-        // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
-        // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
-        // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(leaf_ty) {
+        // Fail closed for every other Move leaf. A runtime element index cannot record which
+        // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
+        // both the result and the array owning the same payload.
+        if drop_plan(leaf_ty, self.structs, self.enums).needs_drop() {
             self.diags.error(
-                format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
+                format!(
+                    "reading a Move-type field {} out of an array element is not supported yet",
+                    self.ty_display(leaf_ty)
+                ),
                 span,
             );
             return err;
@@ -21657,7 +22305,25 @@ impl<'a, 't> Checker<'a, 't> {
             (Some(ok), Ty::Result(_, err)) => ty_to_scalar(ok).map(|o| Ty::Result(o, err)),
             _ => None,
         };
-        let v = self.check_expr(inner, inner_expected);
+        // Bypass only the outer materialization guard: this tagged Result is a transient producer
+        // consumed immediately by `?`. Nested subexpressions still go through `check_expr`, so a
+        // retained recursive tagged value cannot be smuggled through an operand expression.
+        let errors_before = self.diags.error_count();
+        let v = self.check_expr_inner(inner, inner_expected);
+        if self.diags.error_count() == errors_before && inner_expected.is_some() {
+            self.constrain(v.ty, inner_expected, inner.span);
+        }
+        if self.diags.error_count() == errors_before
+            && matches!(
+                self.resolve(v.ty),
+                Ty::Result(_, err) if self.has_unsupported_recursive_tagged_scalar(err)
+            )
+        {
+            self.diags.error(
+                "propagating a recursive Move error payload through `?` is not supported yet — Move Result error payloads are implemented in L1b",
+                inner.span,
+            );
+        }
         // `wait()?` on a fallible task_group: control only continues past the `?` if no task failed
         // (the `Err` was propagated), so every task succeeded → `get()` is now safe (slice ④c-2).
         // Recognised when `?` is applied directly to `wait()` (`wait()?`, also `w := wait()?`);
@@ -21897,7 +22563,7 @@ impl<'a, 't> Checker<'a, 't> {
         // double-free. Reject the nested-place case cleanly (defer, like a nested `string`-field move);
         // a bare local and a depth-1 field both null correctly and stay allowed. A binding-less match
         // (`Or`/`_` patterns only) moves nothing, so it is fine at any depth.
-        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.enums))
+        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums))
             && matches!(&s.kind, ExprKind::Field { path, .. } if path.len() > 1)
             && arms.iter().any(|a| matches!(&a.pattern, ast::MatchPattern::Variant { bindings, .. } if !bindings.is_empty()))
         {
@@ -23556,16 +24222,24 @@ fn collection_scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics
     }
 }
 
-/// An `Option`/`Result` payload may not be a **Move struct** (one that owns a `string`/owned field):
-/// the aggregate's drop is scalar-shaped (`payload_is_move` / `move_payload_fields` free a flat
-/// `{ptr,len}`) and does not recurse into a struct's owned fields, so an owned-struct payload would
-/// leak / double-free. Maps such a payload to `None` (with an error); passes anything else through
-/// unchanged (plain-data and `str`-bearing struct payloads keep their pre-Slice-3 behavior).
-fn reject_move_struct_payload(s: Option<Scalar>, structs: &[StructDef], enums: &[hir::EnumDef], what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+/// An `Option`/`Result` payload may not require recursive or deep cleanup: the canonical Drop plan
+/// sees that ownership, but L1b must add tagged lowering and move-out/null-container semantics.
+/// Maps such a payload to `None` (with an error); passes shallow supported payloads through.
+fn reject_unsupported_tagged_payload(
+    s: Option<Scalar>,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    what: &str,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<Scalar> {
     match s {
-        Some(Scalar::Struct(id)) if struct_is_move(id, structs, enums) => {
+        Some(payload) if tagged_payload_needs_l1b_drop(payload, structs, enums) => {
             diags.error(
-                format!("{what} cannot be the Move struct '{}' yet (its owned fields would not be dropped)", structs[id as usize].name),
+                format!(
+                    "{what} cannot be {} yet — recursive/deep Move tagged payloads are implemented in L1b",
+                    ty_name(scalar_to_ty(payload))
+                ),
                 span,
             );
             None
@@ -23999,7 +24673,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, cx.enums, "Option payload", span, diags) {
+            match reject_unsupported_tagged_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, cx.enums, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -24092,8 +24766,8 @@ fn resolve_type(
                 }
             };
             match (
-                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, cx.enums, "Result ok payload", span, diags),
-                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, cx.enums, "Result err payload", span, diags),
+                reject_unsupported_tagged_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, cx.enums, "Result ok payload", span, diags),
+                reject_unsupported_tagged_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, cx.enums, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
@@ -24190,8 +24864,8 @@ fn resolve_user_type(
 /// Whether `ty` is a bare Move **handle** — a single opaque-pointer resource handle whose drop
 /// closes/frees it (a reader/writer/buffer, a socket, a file, an http request/response/client/
 /// server/ctx/stream, a cli command/parsed). Admitted as a struct field (F1②, the pkg.web request
-/// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (`ty_owns_buffer_rec`
-/// already classifies it so), and its recursive drop closes the handle exactly once. This set MUST
+/// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (the canonical DropPlan
+/// classifies the handle as a leaf), and its recursive drop closes the handle exactly once. This set MUST
 /// stay in lockstep with `align_codegen_llvm::handle_free_fn` (a field type allowed here but not
 /// freed there would leak). Excludes `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer
 /// drops) and the `{ptr,len}` owned collections (`string`/`array` — their own field arms).
@@ -24246,22 +24920,20 @@ fn is_field_ok(ty: Ty) -> bool {
     match ty {
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
-        // J1b). An enum is **never Move** today (its payloads are scalar / `str` / non-Move struct —
-        // `enum_payload_ok`), so it needs no recursive `Drop`; a `str`-bearing enum field region-ties
-        // the enclosing struct to the borrowed storage (`struct_has_str_rec` / `tracks_region` handle
-        // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
-        // arm gains the same non-Move / Drop split the `array<T>` field has.
+        // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
+        // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
+        // enclosing struct to borrowed storage (`struct_has_str_rec` / `tracks_region` handle that).
         Ty::Enum(_) => true,
         // A Move **handle** field (F1②, the pkg.web request `Ctx` owning its `http_request_ctx`). A
         // bare pointer handle (`file`, `http_request_ctx`, a reader/writer/buffer, a socket, an http
         // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
         // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
-        // handle arm → the null-safe `*_free`; `ty_owns_buffer_rec` already classifies the struct as
-        // Move). The admitted set matches codegen's `handle_free_fn`.
+        // handle arm → the null-safe `*_free`; the DropPlan leaf makes the struct Move). The admitted
+        // set matches codegen's `handle_free_fn`.
         _ if is_move_handle(ty) => true,
         // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
         // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no
-        // heap (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays **Copy** — a Move
+        // heap (its DropPlan is `None`, so the enclosing struct stays **Copy** — a Move
         // `Ctx` would be consumed by its own accessors) and needs no drop. It region-ties the
         // enclosing struct to the request buffer: `region_of(StructLit)` folds in each field's region,
         // so a `Ctx` built from a local ctx handle cannot outlive it.
@@ -24269,7 +24941,7 @@ fn is_field_ok(ty: Ty) -> bool {
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
         // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
-        // (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays non-Move) and needs no
+        // (its DropPlan is `None`, so the enclosing struct stays non-Move) and needs no
         // drop. It region-ties the enclosing struct to the borrowed buffer: `region_of(StructLit)`
         // folds in each field value's region, so a struct holding a slice field cannot outlive the
         // buffer the slice views (the escape check enforces it). A `slice<str>` element also carries
@@ -24277,7 +24949,7 @@ fn is_field_ok(ty: Ty) -> bool {
         Ty::Slice(_) => true,
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
-        // `abi_type`/`ty_size_align` already size it), owns no heap (`ty_owns_buffer_rec` excludes it,
+        // `abi_type`/`ty_size_align` already size it), owns no heap (its DropPlan is `None`,
         // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
@@ -24447,7 +25119,12 @@ fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx,
             // Without this, `Opt<string>` / `Opt<StructWithStrField>` would slip through, putting a
             // Move/region-tracked value in an enum that is neither dropped nor region-tracked
             // (use-after-free / leak).
-            if !enum_payload_ok(p, cx.structs, cx.enums) {
+            // Struct ownership can depend on an enum definition that is still a reserved empty
+            // slot while an early monomorph is cached. Validate those graph-dependent shapes once
+            // all type and function-driven monomorphization is complete.
+            if !matches!(p, Scalar::Struct(_) | Scalar::DynStructArray(_))
+                && !enum_payload_ok(p, cx.structs, cx.enums)
+            {
                 diags.error(
                     format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
                     span,
@@ -25743,16 +26420,18 @@ mod tests {
             "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    mut p := Pair { left: make(), right: make() }\n    p.right = [2].to_array()\n    print(p.left.len())\n  }\n  return 0\n}\n";
         let (_p, d) = check(field_reassign);
         assert!(
-            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
-            "field assignment must not introduce mixed aggregate ownership"
+            d.iter()
+                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
+            "owned-array field replacement must fail closed before it can introduce mixed aggregate ownership"
         );
 
         let joined_field =
             "Wrap { xs: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn run(c: bool) -> i32 {\n  arena {\n    mut w := Wrap { xs: make() }\n    if c {\n      w = Wrap { xs: [2].to_array() }\n    }\n    w.xs = [3].to_array()\n    return 0\n  }\n}\nfn main() -> i32 = run(false)\n";
         let (_p, d) = check(joined_field);
         assert!(
-            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
-            "a heap/arena path-dependent aggregate must reject field mutation"
+            d.iter()
+                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
+            "a heap/arena path-dependent aggregate must reject unsupported owned-field mutation"
         );
     }
 
@@ -26214,5 +26893,160 @@ mod tests {
             "P { x: i64 }\nfn main() -> i32 {\n  xs := [P{x: 1}, P{x: 2}]\n  cs := xs.chunks(1)\n  return 0\n}\n",
         );
         assert!(d.has_errors(), "chunking a struct array must be rejected");
+    }
+
+    #[test]
+    fn drop_plan_recurses_through_option_and_nested_structs() {
+        let structs = vec![
+            StructDef {
+                name: "Inner".to_string(),
+                fields: vec![FieldDef {
+                    name: "detail".to_string(),
+                    ty: Ty::Option(Scalar::String),
+                }],
+                align: None,
+                c_repr: false,
+            },
+            StructDef {
+                name: "Outer".to_string(),
+                fields: vec![FieldDef {
+                    name: "inner".to_string(),
+                    ty: Ty::Struct(0),
+                }],
+                align: None,
+                c_repr: false,
+            },
+        ];
+        let plan = drop_plan(Ty::Struct(1), &structs, &[]);
+        assert!(plan.needs_drop());
+        let DropPlan::Struct { fields, .. } = plan else {
+            panic!("outer plan must be a struct");
+        };
+        let DropPlan::Struct {
+            fields: inner_fields,
+            ..
+        } = fields[0].1.as_ref()
+        else {
+            panic!("nested plan must be a struct");
+        };
+        assert!(matches!(
+            inner_fields[0].1.as_ref(),
+            DropPlan::Option(payload) if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
+        ));
+    }
+
+    #[test]
+    fn drop_plan_fails_closed_on_cycles_and_missing_ids() {
+        let cyclic = vec![StructDef {
+            name: "Node".to_string(),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: Ty::Option(Scalar::Struct(0)),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        assert!(drop_plan(Ty::Struct(0), &cyclic, &[]).needs_drop());
+        assert_eq!(drop_plan(Ty::Struct(99), &cyclic, &[]), DropPlan::Invalid);
+
+        let missing_nested = vec![StructDef {
+            name: "Broken".to_string(),
+            fields: vec![FieldDef {
+                name: "value".to_string(),
+                ty: Ty::Option(Scalar::Struct(99)),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        assert!(
+            drop_plan(Ty::Struct(0), &missing_nested, &[]).needs_drop(),
+            "a missing nested struct ID must fail closed without panicking"
+        );
+        let missing_enum_payload = vec![hir::EnumDef {
+            name: "BrokenEnum".to_string(),
+            variants: vec![hir::EnumVariant {
+                name: "Value".to_string(),
+                payload: vec![Scalar::Struct(99)],
+                field_base: 1,
+            }],
+        }];
+        assert!(
+            drop_plan(Ty::Enum(0), &[], &missing_enum_payload).needs_drop(),
+            "a missing enum payload struct ID must fail closed without panicking"
+        );
+    }
+
+    #[test]
+    fn drop_plan_shares_repeated_subgraphs() {
+        let mut structs = vec![StructDef {
+            name: "S0".to_string(),
+            fields: vec![FieldDef {
+                name: "copy".to_string(),
+                ty: Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        for depth in 1..40 {
+            let child = (depth - 1) as u32;
+            structs.push(StructDef {
+                name: format!("S{depth}"),
+                fields: vec![
+                    FieldDef {
+                        name: "left".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                    FieldDef {
+                        name: "right".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            });
+        }
+        let plan = drop_plan(Ty::Struct(39), &structs, &[]);
+        assert!(
+            !plan.needs_drop(),
+            "Copy repeated subgraphs must use the cached nominal classification"
+        );
+        let DropPlan::Struct { fields, .. } = plan else {
+            panic!("root plan must be a struct");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&fields[0].1, &fields[1].1),
+            "repeated nominal children must share one memoized DropPlan node"
+        );
+    }
+
+    #[test]
+    fn drop_plan_handles_a_deep_linear_nominal_chain() {
+        let mut structs = vec![StructDef {
+            name: "S0".to_string(),
+            fields: vec![FieldDef {
+                name: "copy".to_string(),
+                ty: Ty::Bool,
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        for depth in 1..512 {
+            structs.push(StructDef {
+                name: format!("S{depth}"),
+                fields: vec![FieldDef {
+                    name: "next".to_string(),
+                    ty: Ty::Struct((depth - 1) as u32),
+                }],
+                align: None,
+                c_repr: false,
+            });
+        }
+        assert!(
+            !drop_plan(Ty::Struct(511), &structs, &[]).needs_drop(),
+            "ID-indexed visitation must classify a deep Copy chain without path scans"
+        );
     }
 }

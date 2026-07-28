@@ -234,14 +234,24 @@ resolution and generic monomorphization:
 DropPlan =
   None
   Leaf(kind)
-  Struct(fields with non-None plans)
-  Tagged(tag offset, variant payload plans)
+  Struct(indexed field plans, including None)
+  Option(payload plan)
+  Result(ok plan, error plan)
+  Enum(indexed variant payload plans)
 ```
 
-A composite is Move iff its plan is not `None`. `Tagged` covers `Option`, `Result`, and user sums;
-only the active payload is dropped. The same plan drives move/null-source and drop-old
+A composite is Move iff `plan.needs_drop()` is true; all-Copy composites retain their exact
+topology with a cached false bit. The topology records the active-payload rule. User enums and the
+recursive `Option<string>` field/temporary path lower it with a tag test; standalone legacy
+`Option`/`Result` scalar-payload slots retain their zero-initialized inactive-field cleanup until
+L1b unifies the remaining tagged lowering. The same plan drives move/null-source and drop-old
 classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
-plans are rejected with the existing recursive-type diagnostic. Collection element eligibility is
+plans are rejected with the existing recursive-type diagnostic. Nominal struct and sum nodes are
+memoized by type ID, shared, and carry their computed Move bit, so both construction and
+classification of a repeated acyclic subgraph remain linear in the resolved type graph rather than
+expanding as a tree. Cycle detection and memoization use sparse ID-keyed state, so work is
+proportional to the nominal subgraph reachable from the queried type rather than the complete
+program type table; a deep nominal chain remains linear as well. Collection element eligibility is
 separate and does not follow merely from having a Drop plan.
 
 ### Checking

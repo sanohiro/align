@@ -755,7 +755,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
       today; fix both, and add rows to `sema_and_codegen_struct_layout_agree`, which is a
       hand-written table with no row for a Move-handle, `Ty::Fn`, or `Ty::Slice` field either.
       Deliberately **not** added: `ty_is_move`, `is_owned_droppable`, `handle_free_fn`,
-      `null_moved_source`, `ty_owns_buffer_rec` (it must not make its enclosing struct Move), and —
+      `null_moved_source`, the `DropPlan` owned-leaf set (it must not make its enclosing struct Move), and —
       importantly — **no `Scalar` variant**, which keeps the view out of `Option`/`Result` payloads
       and array elements by fail-closed default (worth a tailored diagnostic: today it reports
       "must be a scalar (composite payloads are not supported yet)", which is the right answer with

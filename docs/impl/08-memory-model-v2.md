@@ -503,8 +503,8 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    function could not even return `Result<string, Error>`. This slice lets an `Option`/`Result`
    hold an owned **Move** payload.
    - **[done] 8a — owned `string` payload.** Added `Scalar::String` (var-free, so `Ty: Copy`
-     holds) with `Scalar::is_move()`; `payload_is_move(ty)` marks an `Option`/`Result` whose
-     payload is owned. Such an aggregate is itself Move: it joins `drop_locals` / `is_move` /
+     holds) with `Scalar::is_move()`; the canonical recursive `DropPlan` marks an `Option`/`Result`
+     whose payload is owned. Such an aggregate is itself Move: it joins `drop_locals` / `is_move` /
      `ret_is_move`, and its `Drop` frees each owned payload field's buffer pointer (`Some`/`Ok` =
      field 1, `Err` = field 2) **null-safely**. The key invariant that makes the drop branch-free:
      constructors now build on a **zeroed** aggregate (`const_zero`, not `get_undef`), so the

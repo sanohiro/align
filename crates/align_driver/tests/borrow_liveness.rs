@@ -843,14 +843,19 @@ fn main() -> Result<(), Error> {
 /// `keep = { inner }` therefore walked straight past the whole scope-end-drop rule and printed freed
 /// heap bytes — two characters away from the rejected `keep = inner`.
 ///
-/// `arena {}` / `task_group {}` are deliberately NOT transparent in either function, so they are
-/// covered by the `IterTemp` path instead (over-approximately, but soundly).
+/// `arena {}` remains region-bound. A `task_group` bound tail place is transparent for ordinary
+/// storage roots because the group owns task storage only; a fresh tail still takes `IterTemp`.
 #[test]
 fn a_block_wrapper_does_not_launder_a_view_of_a_dropped_source() {
-    let cases: [(&str, &str); 5] = [
+    let cases: [(&str, &str); 7] = [
         ("bare", "keep = { inner }"),
         ("decl-inside", "keep = { made := mk(\"AAAAAAAAAAAAAAAA\"); made }"),
         ("unsafe", "keep = unsafe { inner }"),
+        ("task-group", "keep = task_group { inner }"),
+        (
+            "task-group-decl-inside",
+            "keep = task_group { made := mk(\"AAAAAAAAAAAAAAAA\"); made }",
+        ),
         ("through-call", "keep = identity({ inner })"),
         ("nested", "keep = { { { inner } } }"),
     ];
@@ -905,12 +910,33 @@ fn main() -> i32 {
 }
 ";
     assert!(!check_errs("borrow-block-outer-source", ok));
+
+    let task_group_ok = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  outer := mk(\"hello\")
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    keep = task_group { outer }
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    assert!(!check_errs(
+        "borrow-task-group-outer-source",
+        task_group_ok
+    ));
 }
 
 /// **KNOWN OVER-REJECTION — the third of the family, pinned so a reader doesn't assume otherwise.**
 ///
 /// `may_need_synthetic_owner` is conservatively `true` for the wrappers whose *runtime* value can
-/// still be a bound place — `if`, `match`, `else`-unwrap, `arena {}`, `task_group {}` — so borrowing
+/// still be a bound place — `if`, `match`, `else`-unwrap, `arena {}`, or control flow in a
+/// `task_group` tail — so borrowing
 /// one over sources declared OUTSIDE the loop mints a spurious `IterTemp`. MIR proves it safe: the
 /// synthetic owner's temporary flag is stored `false` on every bound-arm path, so the drop-if-live
 /// folds away and neither loop edge emits a drop (the only drops are the sources at function exit).

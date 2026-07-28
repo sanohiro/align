@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-27. `main` includes the shipped wave through #664.
+_Last updated: 2026-07-28. `main` includes the shipped wave through #666.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -238,11 +238,21 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
-review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). The next
-implementation slice is L1a only: the canonical recursive Drop plan and sound
-`Option<string>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. The required order is L1a recursive DropPlan/`Option<string>`
-fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
+review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). L1a is complete: the
+canonical recursive Drop plan and sound `Option<string>` struct fields are implemented with
+tag-tested Drop, move/null handling, focused analysis coverage, and an alloc-count benchmark.
+Partial Move-leaf replacement fails closed without an exact drop-old lowering, and fixed-array
+field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
+larger Move leaves. A recursive Move `Result` Ok producer is accepted only when `?` consumes it
+immediately; its Err payload must stay shallow because `?` propagates it, and retaining or returning
+the raw tagged value—or declaring it in a parameter/return type—is an L1b diagnostic. Bound shallow
+Move errors transfer out before `?` runs exit cleanup, and an arena-owned Err is rejected before
+that implicit return. The next
+implementation slice is L1b only: Move tagged payloads through
+Option/Result/user sums. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+variants before L1a–L7 are complete. The remaining required order is L1b Move tagged payloads
+through Result, L2 borrow
+summaries, L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
 L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
 `RegionPlain` bound. No safe driver begins before L1a–L7 are complete. L2 includes contextual

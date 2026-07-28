@@ -3508,7 +3508,7 @@ SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptan
 `18-pkg-db-review.md`.
 
 ```text
-L1a recursive DropPlan framework + Option<string> fields
+L1a recursive DropPlan framework + Option<string> fields — complete
 L1b Move sum/Option/Result payload completion
 L2  contextual parameter modes + all-peer aliases + capture provenance + Move-return cleanup ABI
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent views + root transfer
@@ -3532,6 +3532,19 @@ D12 region-owned category metadata + EXPLAIN
 D13 batch/SoA/high-value native paths
 D14 dynamic SQL + proved callback surfaces
 ```
+
+L1a establishes the canonical cycle-safe recursive `DropPlan` classifier and admits
+`Option<string>` as the first conditional owned struct-field leaf. Enclosing and nested structs are
+Move, Drop tests the `Option` tag before freeing the live string, supported partial moves zero the
+whole tagged field, and whole-value return/pass/control-flow/reassignment reuse the existing
+path-local cleanup bit. Fixed-array element-field replacement of `Option<string>` remains an
+explicit diagnostic until tagged partial collection writes have a typed conditional-Drop lowering.
+More generally, direct field and fixed-array field replacement fail closed for Move leaves without
+an exact drop-old lowering, and fixed-array field reads admit only Copy leaves or a borrowed view of
+`string`; whole-struct/whole-element replacement is supported. `Option<MoveStruct>` and every other
+owned `Option` field remain explicit L1b diagnostics. The focused ownership and analysis suites
+plus the alloc-count probe pin balanced Some frees, zero None allocations, and the raw LLVM tag
+guard.
 
 L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
 they are being built, but no probe API becomes public. Its recorded SQLite/libpq evidence includes

@@ -83,6 +83,14 @@ fn main() -> i32 {
 }
 
 #[test]
+fn element_replace_from_a_variable_consumes_the_source() {
+    assert!(check_errs(
+        "ms-elem-replace-var-move",
+        "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut us := [User{name: \"a\".clone(), age: 1}]\n  v := User{name: \"new\".clone(), age: 7}\n  us[0] = v\n  return v.age as i32\n}\n"
+    ));
+}
+
+#[test]
 fn whole_array_reassignment_is_rejected() {
     // A fixed array can't be *wholly* reassigned (array values aren't materialized) — assign
     // elements individually. Clean error for a Move-struct array (and a scalar array alike).
@@ -199,6 +207,73 @@ fn main() -> i32 {
 ";
     // "aaaa" freed (drop-of-old), "cc"(2) stored; us[1] "bee"(3) untouched → 2 + 3 = 5.
     assert_eq!(build_and_run("ms-elem-field-reassign", src).status.code(), Some(5));
+}
+
+#[test]
+fn element_owned_field_reassign_consumes_the_source() {
+    assert!(check_errs(
+        "ms-elem-field-reassign-move",
+        "User { name: string }\nfn main() -> i32 {\n  mut us := [User{name: \"old\".clone()}]\n  s := \"new\".clone()\n  us[0].name = s\n  return s.len() as i32\n}\n"
+    ));
+}
+
+#[test]
+fn unsupported_move_leaf_partial_replacement_is_rejected() {
+    let cases = [
+        (
+            "move-leaf-direct-field-replace.align",
+            "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut value := Outer{inner: Inner{name: \"old\".clone()}}\n  replacement := Inner{name: \"new\".clone()}\n  value.inner = replacement\n  return 0\n}\n",
+            "field replacement of Inner is not supported yet",
+        ),
+        (
+            "move-leaf-element-field-replace.align",
+            "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut values := [Outer{inner: Inner{name: \"old\".clone()}}]\n  replacement := Inner{name: \"new\".clone()}\n  values[0].inner = replacement\n  return 0\n}\n",
+            "element-field assignment of Inner into a fixed struct array is not supported yet",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "unsupported Move-leaf replacement must fail closed: {name}"
+        );
+        assert!(
+            rendered.contains(expected),
+            "diagnostic must name the unsupported partial replacement in {name}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn nested_direct_string_field_replacement_remains_supported() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut value := Outer{inner: Inner{name: \"old\".clone()}}\n  value.inner.name = \"newer\".clone()\n  return value.inner.name.len() as i32\n}\n";
+    assert_eq!(
+        build_and_run("nested-direct-string-field-replace", src)
+            .status
+            .code(),
+        Some(5)
+    );
+}
+
+#[test]
+fn reading_a_move_leaf_from_a_fixed_array_is_rejected() {
+    let src = "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  values := [Outer{inner: Inner{name: \"owned\".clone()}}]\n  copied := values[0].inner\n  return copied.name.len() as i32\n}\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "move-leaf-element-field-read.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "reading a Move leaf from a runtime-selected array element must fail closed"
+    );
+    assert!(
+        rendered.contains("reading a Move-type field Inner out of an array element is not supported yet"),
+        "diagnostic must name the unsupported owned read:\n{rendered}"
+    );
 }
 
 #[test]

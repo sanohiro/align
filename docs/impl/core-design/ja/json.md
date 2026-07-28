@@ -53,15 +53,17 @@ SHIPPED）:** 構造体フィールドは union であってよい（`Message { 
 合成される。**J3a** はこれを **Move** union フィールドへ拡張する — 完全なマルチモーダル
 `content: str | array<Part>`（`Content { Text(str), Parts(array<Part>) }`）が `Message` に合成され、
 両シェイプを decode/encode して byte-identical にラウンドトリップする。Move-enum フィールドは外側 struct を
-**Move** にする: `struct_is_move`/`ty_owns_buffer_rec` が enum 対応（`enum_is_move` を参照する `Ty::Enum`
-アーム、全 Move 判定呼び出し箇所へ一括スレッド）になり、`drop_struct_fields` の `Ty::Enum` アームが
+**Move** にする: canonical な再帰的 `DropPlan` が enum payload を認識し、
+`struct_is_move`/`enum_is_move` はそこから一貫して導出される。`drop_struct_fields` の `Ty::Enum` アームが
 tag-switched な `drop_enum` で生きているバリアントを解放する。ランタイム `drop_decoded_owned` には
 **kind-6** アーム（`→ drop_decoded_union`）が加わり、decode エラーパスで union の所有 payload を解放する。
 `match m.content { … }` は所有 payload をムーブアウトしフィールドをゼロ化する（`NullStructField` が型対応
 = `{tag,payloads}` 集約全体をゼロ化）ので、struct の `Drop` はそこで null を解放する（単一解放）。
 union のバリアントは構造化 MIR の型テーブルに含まれるので、バリアント変更で decode/encode キャッシュが
 無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
-payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。続く J3b
+payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。top-level
+Move union の decode も `?` で直接消費しなければならない。raw
+`Result<MoveUnion, Error>` の保持・返却は、再帰的 tagged-payload Drop が未実装のため L1b 診断となる。続く J3b
 スライスが所有要素の deep free を提供するため、`Message` が Move の場合も
 `Chat { messages: array<Message> }` までラウンドトリップする。
 
@@ -120,7 +122,9 @@ scalar / `str` / ネスト構造体）であってよい。**null ポリシー:*
 `all_required_seen` の対象外で、共有の `write_value` が payload スロットに書いてから `Some` tag を立てる。
 encode は `Option` を含むオブジェクトを trailing-comma 方式に切替え、`}` の前で `align_rt_builder_pop_comma`
 を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**v1 境界:** Option payload は **非所有**
-（`Option<string>`/`Option<Move-struct>` は宣言時に拒否）。**`Option<struct>` encode（T1b, SHIPPED）:**
+でなければならない。L1a 以降、通常の言語構造体では `Option<string>` を許可するが、そのフィールドを含む
+target は JSON descriptor consumer が未実装のため `json.decode` / `json.encode` で拒否する。
+`Option<Move-struct>` は引き続き L1b の型ゲートで拒否する。**`Option<struct>` encode（T1b, SHIPPED）:**
 `Some` は runtime の descriptor 駆動エンコーダ（新 `OptionStructField` テンプレートピース →
 `align_rt_json_encode_object`、descriptor テーブルで単一 struct を出力）でネストオブジェクトを描画し、
 `None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と
