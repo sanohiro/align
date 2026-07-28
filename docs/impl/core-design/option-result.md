@@ -70,11 +70,12 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
   *stance*, not a gap-by-accident: `match` + `else` + `?` cover the uses without growing a
   second, combinator-flavored control-flow dialect. Adding any of them is a design decision
   (One-way review) — record in `open-questions.md` before implementing.
-- **Recursive tagged Move payload implementation (required L1a/L1b):** `else` on a Move error must
-  drop the discarded `Err`; `?` must move/propagate it; `match` must move/null a bound live payload;
-  `Option<Move>` fields and Move sums inside `Result` must use the same plan. This is settled work,
-  not a remaining API decision. Arrays of arbitrary Move elements and recursive types remain
-  separate.
+- **Remaining recursive tagged Move slices:** L1b-a implements one direct existing-`Scalar` Move
+  payload per tagged arm, including recursive `Drop`, `match`, `else`, `?`, and `map_err`.
+  L1b-b still owns multiple Move payload partial construction/uniform ownership; L1b-c owns nested
+  tagged payload representation such as `Result<Option<T>, E>`. These are settled implementation
+  slices, not remaining API decisions. Arrays of arbitrary new Move-element layouts and recursive
+  types remain separate.
 
 ## Pitfalls
 
@@ -93,7 +94,8 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
 `crates/align_driver/tests/enum_match.rs` (Error variants, `error(c)` → exit code, `map_err`
 conversion, no-implicit-`?`-coercion, exhaustiveness); `m1.rs`/`m2.rs` Option/Result basics +
 `?`; `generics.rs:229` (`o else d` in a generic fn); `else_result.rs` (`else` on `Result` — Ok
-passthrough / Err fallback / nested chains / Move-Ok no double-free / Move-error deferral);
+passthrough / Err fallback / nested chains / Move-Ok no double-free / recursive Move-Err Drop);
+`owned_tagged_payloads.rs` (Move struct/sum/string/handle, all control edges, per-unit parity);
 `lint_unhandled_result.rs`; #308 main-error
 restriction tests; examples `option.align`, `result.align`, `match_option_result.align`,
 `error_enum.align`.

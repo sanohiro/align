@@ -1,4 +1,4 @@
-//! L1a: the canonical recursive Drop plan and `Option<string>` struct fields.
+//! L1a/L1b: the canonical recursive Drop plan and direct Move tagged payloads.
 //!
 //! Runtime cases intentionally exercise ownership transfers and replacement. A stale alias
 //! double-frees and aborts; a missing transfer corrupts the observed payload. Allocation/free
@@ -617,49 +617,51 @@ fn early_try_drops_already_initialized_owned_fields() {
 }
 
 #[test]
-fn option_move_struct_remains_an_l1b_diagnostic() {
+fn option_move_struct_field_constructs_extracts_and_drops() {
+    if !backend_available() {
+        return;
+    }
     let src = concat!(
         "Inner { name: string }\n",
         "Outer { value: Option<Inner> }\n",
-        "fn main() -> i32 = 0\n",
+        "fn main() -> i32 {\n",
+        "  outer := Outer { value: Some(Inner { name: \"owned\".clone() }) }\n",
+        "  inner := outer.value else { return 90 }\n",
+        "  return inner.name.len() as i32\n",
+        "}\n",
     );
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, "option-move-struct.align", src);
-    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-    assert!(
-        checked.diags.has_errors(),
-        "Option<MoveStruct> must remain rejected"
-    );
-    assert!(
-        rendered.contains("L1b"),
-        "diagnostic must name the owning slice:\n{rendered}"
+    assert_eq!(
+        build_and_run("option-move-struct", src).status.code(),
+        Some(5)
     );
 }
 
 #[test]
-fn option_struct_that_is_move_through_enum_remains_an_l1b_diagnostic() {
+fn option_struct_recursively_drops_a_move_sum_field() {
+    if !backend_available() {
+        return;
+    }
     let src = concat!(
         "Inner { content: Content }\n",
         "Content { Empty, Data(array<i64>) }\n",
         "Outer { value: Option<Inner> }\n",
-        "fn main() -> i32 = 0\n",
+        "fn main() -> i32 {\n",
+        "  outer := Outer { value: Some(Inner { content: Content.Data([1, 2, 3].to_array()) }) }\n",
+        "  inner := outer.value else { return 90 }\n",
+        "  return match inner.content { Empty => 91, Data(values) => values.len() as i32 }\n",
+        "}\n",
     );
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, "option-enum-move-struct.align", src);
-    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-    assert!(
-        checked.diags.has_errors(),
-        "Option<Struct> must not bypass L1b when only a resolved enum field makes the payload Move"
-    );
-    assert!(
-        rendered.contains("Option<MoveStruct> is implemented in L1b"),
-        "diagnostic must report the unsupported cleanup shape:\n{rendered}"
+    assert_eq!(
+        build_and_run("option-enum-move-struct", src)
+            .status
+            .code(),
+        Some(3)
     );
 }
 
 #[test]
-fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
-    for (name, src, expected) in [
+fn retained_result_with_recursive_move_payload_is_supported() {
+    for (name, src) in [
         (
             "fs-read-dir-retained-result.align",
             concat!(
@@ -669,7 +671,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "retained Move Option/Result payloads are implemented in L1b",
         ),
         (
             "dns-resolve-retained-result.align",
@@ -680,7 +681,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "retained Move Option/Result payloads are implemented in L1b",
         ),
         (
             "option-string-array.align",
@@ -690,7 +690,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "recursive/deep Move tagged payloads are implemented in L1b",
         ),
         (
             "user-result-move-enum.align",
@@ -702,7 +701,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "nullable/fallible owned union is a later slice",
         ),
         (
             "json-result-move-enum.align",
@@ -715,7 +713,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "recursive/deep Move tagged payloads are implemented in L1b",
         ),
         (
             "json-result-move-struct-array.align",
@@ -729,7 +726,6 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "recursive/deep Move tagged payloads are implemented in L1b",
         ),
         (
             "http-result-response-array.align",
@@ -742,25 +738,20 @@ fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
                 "  return 0\n",
                 "}\n",
             ),
-            "retained Move Option/Result payloads are implemented in L1b",
         ),
     ] {
         let mut sm = SourceMap::new();
         let checked = check(&mut sm, name, src);
-        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
         assert!(
-            checked.diags.has_errors(),
-            "retaining Result<MoveEnum, Error> must remain rejected"
-        );
-        assert!(
-            rendered.contains(expected),
-            "diagnostic must report the unsupported cleanup shape:\n{rendered}"
+            !checked.diags.has_errors(),
+            "retaining a recursive Move tagged payload must be supported in {name}:\n{}",
+            align_driver::format_diagnostics(&sm, &checked.diags)
         );
     }
 }
 
 #[test]
-fn recursive_move_tagged_payloads_are_rejected_in_signatures() {
+fn recursive_move_tagged_payloads_are_supported_in_signatures() {
     for (name, src) in [
         (
             "result-move-enum-param.align",
@@ -793,14 +784,10 @@ fn recursive_move_tagged_payloads_are_rejected_in_signatures() {
     ] {
         let mut sm = SourceMap::new();
         let checked = check(&mut sm, name, src);
-        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
         assert!(
-            checked.diags.has_errors(),
-            "unsupported tagged cleanup must be rejected at the declared type boundary"
-        );
-        assert!(
-            rendered.contains("recursive/deep Move tagged payloads are implemented in L1b"),
-            "diagnostic must identify the owning slice:\n{rendered}"
+            !checked.diags.has_errors(),
+            "recursive tagged cleanup must be accepted at the declared type boundary:\n{}",
+            align_driver::format_diagnostics(&sm, &checked.diags)
         );
     }
 }
@@ -859,6 +846,31 @@ fn try_cannot_propagate_an_arena_owned_shallow_move_error() {
 }
 
 #[test]
+fn try_cannot_propagate_an_arena_owned_recursive_move_error() {
+    let src = concat!(
+        "OwnedError { Values(array<i64>) }\n",
+        "fn relay() -> Result<i64, OwnedError> {\n",
+        "  arena {\n",
+        "    value: i64 := Err(OwnedError.Values([1, 2].to_array()))?\n",
+        "    return Ok(value)\n",
+        "  }\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "arena-recursive-error.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "an arena-owned recursive error cannot survive the implicit return edge of `?`"
+    );
+    assert!(
+        rendered.contains("cannot propagate an arena-owned error through `?`"),
+        "diagnostic must identify the recursive implicit escape:\n{rendered}"
+    );
+}
+
+#[test]
 fn try_cannot_propagate_a_borrowed_error() {
     for (name, body) in [
         (
@@ -911,7 +923,10 @@ fn try_may_propagate_a_free_standing_error_from_inside_an_arena() {
 }
 
 #[test]
-fn try_cannot_propagate_a_recursive_move_error_payload() {
+fn try_propagates_a_recursive_move_error_payload() {
+    if !backend_available() {
+        return;
+    }
     let src = concat!(
         "Part { kind: str }\n",
         "Content { Text(str), Parts(array<Part>) }\n",
@@ -921,18 +936,17 @@ fn try_cannot_propagate_a_recursive_move_error_payload() {
         "  value := base().map_err(own_error)?\n",
         "  return Ok(())\n",
         "}\n",
-        "fn main() -> i32 = 0\n",
+        "fn main() -> i32 = match relay() {\n",
+        "  Ok(value) => 90,\n",
+        "  Err(content) => match content {\n",
+        "    Text(value) => 91,\n",
+        "    Parts(parts) => parts.len() as i32,\n",
+        "  },\n",
+        "}\n",
     );
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, "try-move-error.align", src);
-    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-    assert!(
-        checked.diags.has_errors(),
-        "`?` propagates rather than consumes its error payload"
-    );
-    assert!(
-        rendered.contains("propagating a recursive Move error payload through `?`"),
-        "diagnostic must identify the unsupported propagation path:\n{rendered}"
+    assert_eq!(
+        build_and_run("try-move-error", src).status.code(),
+        Some(1)
     );
 }
 
@@ -956,6 +970,302 @@ fn try_transfers_a_bound_shallow_move_error_payload() {
     assert_eq!(
         build_and_run("try-bound-move-error", src).status.code(),
         Some(4)
+    );
+}
+
+#[test]
+fn native_db_error_payloads_close_direct_tagged_edges() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "NativeError { code: Option<string>, message: string }\n",
+        "DbError { Native(NativeError), Decode(string) }\n",
+        "Output { text: Option<string> }\n",
+        "fn run(mode: i64) -> Result<Output, DbError> {\n",
+        "  if mode == 0 { return Ok(Output { text: None }) }\n",
+        "  if mode == 1 { return Ok(Output { text: Some(\"ok\".clone()) }) }\n",
+        "  if mode == 2 {\n",
+        "    return Err(DbError.Native(NativeError { code: Some(\"7\".clone()), message: \"native\".clone() }))\n",
+        "  }\n",
+        "  return Err(DbError.Decode(\"decode\".clone()))\n",
+        "}\n",
+        "fn score(result: Result<Output, DbError>) -> i64 = match result {\n",
+        "  Ok(output) => match output.text { None => 1, Some(value) => 2 },\n",
+        "  Err(err) => match err { Native(value) => 3, Decode(message) => 4 },\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  return (score(run(0)) + score(run(1)) + score(run(2)) + score(run(3))) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("native-db-error-shape", src).status.code(),
+        Some(10)
+    );
+}
+
+#[test]
+fn recursive_move_results_replace_and_join_with_one_live_owner() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "DbError { Decode(string), Other }\n",
+        "fn run(mode: i64) -> Result<i64, DbError> {\n",
+        "  if mode == 0 { return Ok(5) }\n",
+        "  if mode == 1 { return Err(DbError.Decode(\"old\".clone())) }\n",
+        "  return Err(DbError.Decode(\"joined\".clone()))\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  mut first := run(1)\n",
+        "  first = if true { run(2) } else { run(0) }\n",
+        "  mut second := run(1)\n",
+        "  second = loop {\n",
+        "    if true { break run(2) }\n",
+        "    break run(0)\n",
+        "  }\n",
+        "  a := match first { Ok(value) => value, Err(err) => match err { Decode(message) => message.len(), Other => 90 } }\n",
+        "  b := match second { Ok(value) => value, Err(err) => match err { Decode(message) => message.len(), Other => 91 } }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("recursive-move-result-joins", src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn else_drops_a_recursive_move_error_before_fallback() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "NativeError { code: Option<string>, message: string }\n",
+        "DbError { Native(NativeError), Decode(string) }\n",
+        "fn fail() -> Result<i64, DbError> = Err(DbError.Native(NativeError {\n",
+        "  code: Some(\"7\".clone()),\n",
+        "  message: \"native\".clone(),\n",
+        "}))\n",
+        "fn main() -> i32 {\n",
+        "  value := fail() else { return 7 }\n",
+        "  return value as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("else-drop-recursive-error", src)
+            .status
+            .code(),
+        Some(7)
+    );
+}
+
+#[test]
+fn map_err_transfers_a_recursive_move_error() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "DbError { Decode(string), Other }\n",
+        "fn fail() -> Result<i64, string> = Err(\"decode\".clone())\n",
+        "fn wrap(message: string) -> DbError = DbError.Decode(message)\n",
+        "fn main() -> i32 = match fail().map_err(wrap) {\n",
+        "  Ok(value) => 90,\n",
+        "  Err(err) => match err { Decode(message) => message.len() as i32, Other => 91 },\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("map-err-recursive-error", src)
+            .status
+            .code(),
+        Some(6)
+    );
+}
+
+#[test]
+fn recursive_inline_sum_layouts_are_rejected() {
+    for (name, src) in [
+        (
+            "direct-recursive-sum.align",
+            "Cycle { Again(Cycle), End }\nfn main() -> i32 = 0\n",
+        ),
+        (
+            "mutual-recursive-sum.align",
+            "Left { RightValue(Right) }\nRight { LeftValue(Left) }\nfn main() -> i32 = 0\n",
+        ),
+        (
+            "optional-recursive-sum-field.align",
+            "Node { next: Option<Link> }\nLink { NodeValue(Node), End }\nfn main() -> i32 = 0\n",
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "inline recursive tagged layout must be rejected: {name}"
+        );
+        assert!(
+            rendered.contains("recursive"),
+            "diagnostic must identify the recursive layout in {name}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn later_l1b_payload_shapes_fail_closed_at_type_formation() {
+    for (name, src, expected) in [
+        (
+            "multiple-move-payloads.align",
+            concat!(
+                "PairError { Both(string, string), Empty }\n",
+                "fn main() -> i32 = 0\n",
+            ),
+            "implemented in L1b-b",
+        ),
+        (
+            "nested-tagged-payload.align",
+            concat!(
+                "Output { text: string }\n",
+                "DbError { Decode(string) }\n",
+                "fn run() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n",
+                "fn main() -> i32 = 0\n",
+            ),
+            "implemented in L1b-c",
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "later L1b payload shape must fail closed: {name}"
+        );
+        assert!(
+            rendered.contains(expected),
+            "diagnostic must name its owning L1b slice in {name}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn recursive_move_payloads_match_whole_program_and_per_unit_builds() {
+    if !backend_available() {
+        return;
+    }
+    let types = concat!(
+        "module types\n",
+        "pub NativeError { code: Option<string>, message: string }\n",
+        "pub DbError { Native(NativeError), Decode(string) }\n",
+        "pub fn fail(native: bool) -> Result<i64, DbError> {\n",
+        "  if native {\n",
+        "    return Err(DbError.Native(NativeError { code: Some(\"7\".clone()), message: \"native\".clone() }))\n",
+        "  }\n",
+        "  return Err(DbError.Decode(\"decode\".clone()))\n",
+        "}\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import types\n",
+        "fn score(result: Result<i64, types.DbError>) -> i64 = match result {\n",
+        "  Ok(value) => 90,\n",
+        "  Err(err) => match err { Native(value) => 3, Decode(message) => 4 },\n",
+        "}\n",
+        "fn main() -> i32 = (score(types.fail(true)) + score(types.fail(false))) as i32\n",
+    );
+    let files = [("types.align", types), ("main.align", main)];
+    let whole = build_and_run_multi("owned-tagged-whole", &files, "main.align");
+    assert_eq!(whole.status.code(), Some(7));
+    let per_unit = build_per_unit_multi("owned-tagged-per-unit", &files, "main.align");
+    assert_eq!(per_unit.link_and_run().status.code(), Some(7));
+}
+
+#[test]
+fn generic_sum_recomputes_recursive_move_plan_after_substitution() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Inner { name: string }\n",
+        "Maybe<T> { Value(T), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  value := Maybe.Value(Inner { name: \"owned\".clone() })\n",
+        "  return match value { Value(inner) => inner.name.len() as i32, Empty => 90 }\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("generic-recursive-move-plan", src)
+            .status
+            .code(),
+        Some(5)
+    );
+}
+
+#[test]
+fn direct_move_payload_construction_consumes_its_source() {
+    let src = concat!(
+        "NativeError { code: Option<string>, message: string }\n",
+        "DbError { Native(NativeError), Decode(string) }\n",
+        "fn main() -> i32 {\n",
+        "  native := NativeError { code: Some(\"7\".clone()), message: \"native\".clone() }\n",
+        "  err := DbError.Native(native)\n",
+        "  return native.message.len() as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "direct-move-payload-source.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(checked.diags.has_errors(), "sum construction must consume a Move struct source");
+    assert!(
+        rendered.contains("use of moved value 'native'"),
+        "diagnostic must name the consumed payload source:\n{rendered}"
+    );
+}
+
+#[test]
+fn recursive_tagged_drop_reaches_an_opaque_move_handle_leaf() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "import std.http\n",
+        "Payload { Response(response_builder), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  value := Some(Payload.Response(http.response(204)))\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("recursive-tagged-handle-leaf", src)
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn move_sum_payload_may_contain_another_move_sum() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Outer { InnerValue(Inner), Other }\n",
+        "Inner { Data(string), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  outer := Outer.InnerValue(Inner.Data(\"owned\".clone()))\n",
+        "  return match outer {\n",
+        "    InnerValue(inner) => match inner { Data(value) => value.len() as i32, Empty => 90 }\n",
+        "    Other => 91\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("nested-move-sum-payload", src)
+            .status
+            .code(),
+        Some(5)
     );
 }
 

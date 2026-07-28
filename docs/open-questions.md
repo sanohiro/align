@@ -2664,11 +2664,9 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    with *deliberate* fallback (legitimate; without one visible form, users wrap fallible APIs in
    `Option` helpers and the culture splits). **IMPLEMENTED** (sema's `check_else_unwrap` accepts a
    `Result` scrutinee and yields `Ok`'s type; MIR's `lower_else_unwrap` reuses the two-way Option
-   shape on the `ResultIsOk`/`ResultUnwrapOk` discriminant). The discarded `Err` must be a **Copy**
-   scalar — every `Result` error today is (the `Error` enum / a user error enum) — so there is
-   nothing to drop on the fallback path; a **Move** error (`Result<T, string>`) is rejected with a
-   clear "not yet" (its discarded buffer would leak) and lands when enum/Result Move payloads gain
-   discard-drop support.
+   shape on the `ResultIsOk`/`ResultUnwrapOk` discriminant). L1b-a extends this to a **Move** error:
+   MIR consumes the tagged value into a hidden owner and recursively drops the active discarded
+   `Err` before evaluating a fallback that may itself diverge.
 
 ### Separate compilation + ThinLTO — SHIPPED (M15 + ThinLTO S0–SV; design SETTLED 2026-07-14)
 
@@ -3625,8 +3623,10 @@ collections of Move elements. Design and the L1a/L1b PR split:
 `impl/17-library-boundary-prerequisites.md` §8/§10.
 
 The split is normative: L1a establishes the recursive plan and admits `Option<string>` as a struct
-field while still rejecting `Option<MoveStruct>`; L1b admits Move structs/sums as
-Option/Result/user-sum payloads and completes `match`/`else`/`?`/join behavior.
+field. L1b-a admits one direct existing-`Scalar` Move payload per tagged arm and completes its
+`match`/`else`/`?`/join behavior; L1b-b owns multiple Move payload partial construction and uniform
+ownership; L1b-c owns tagged-in-tagged representation and the exact
+`Result<Option<Output>, MoveError>` acceptance.
 
 ### Named arena region capability — Settled 2026-07-27 (required before `pkg.db`)
 

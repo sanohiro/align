@@ -162,6 +162,41 @@ Do not use independent review as the primary completion loop for a design.
 When a finding changes a public surface, update the ledger first and propagate
 that one decision through all affected documents in one pass.
 
+## Cross-cutting implementation gate
+
+Do not use repeated full-diff review as the implementation discovery loop.
+Before changing ownership, cleanup, FFI, ABI, an IR variant, or three or more
+compiler layers, write one implementation closure matrix in the owning plan or
+audit. At minimum, enumerate:
+
+- type formation and validation, construction, move-in, move-out, source
+  nulling, Drop, replacement, and return;
+- every affected control path, including `if`, `match`, `else`, `?`,
+  `map_err`, branch joins, loop joins, early exits, and malformed input;
+- generic monomorphization, interface serialization, whole-program and
+  per-unit compilation, runtime ownership provenance, and allocation parity;
+- the exact owner tests and benchmark row that close each applicable cell.
+
+For those cross-cutting changes, get one fresh independent adversarial review
+of the matrix and proposed PR boundaries before implementation. Resolve plan
+findings first. Split the work into the smallest independently correct,
+mergeable vertical PRs; if a proposed PR is expected to exceed roughly 1,000
+changed hand-written lines, record why it cannot be split safely before coding.
+
+Before requesting code review, perform one author-side matrix-to-diff pass.
+Every applicable matrix cell must point to implementation and a regression
+test, or be explicitly deferred by the plan of record. When a reviewer finds a
+bug, audit the entire diff for the same root-cause class and fix the class in
+one pass rather than patching only the reported line.
+
+The second review of a revised diff should normally converge. If it finds a
+new P1 or an equivalent soundness/correctness issue, stop the local patch loop:
+re-open the closure matrix, identify the missed invariant, and re-split or
+redesign the implementation before continuing. If implementation work goes
+two hours without a PR-ready independently mergeable checkpoint (excluding a
+single still-progressing required command), re-scope to the next smaller
+correct vertical slice and record the reason in `HANDOFF.md`.
+
 ## Build and verification
 
 The workspace runs end to end from lexer through executable generation.

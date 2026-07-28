@@ -2,9 +2,8 @@
 //! `Err`, deliberately discards the error and takes the fallback — completing the intent triangle
 //! `?` propagates / `else` falls back / `match` inspects. The error is discarded, so the
 //! unhandled-`Result` lint never fires on it. Symmetric with the existing `Option` `else`. The error
-//! must be a Copy scalar today (every `Result` error is — the `Error` enum / a user error enum); a
-//! Move error is deferred (rejected in sema, exercised in the `align_sema` unit tests). These are
-//! end-to-end run tests; each returns a small (`< 256`) exit code the harness reads back.
+//! may be Move: the discarded active Err is recursively dropped before fallback evaluation. These
+//! are end-to-end run tests; each returns a small (`< 256`) exit code the harness reads back.
 
 mod common;
 use common::*;
@@ -107,11 +106,7 @@ fn fallback_type_mismatch_is_a_clean_error() {
 }
 
 #[test]
-fn move_error_is_deferred() {
-    // A `Result<T, string>` (a Move error) is rejected — its discarded buffer would leak.
-    let bad = check_errs(
-        "else-res-move-error",
-        "fn f() -> Result<i32, string> = Err(\"x\".clone())\nfn main() -> i32 {\n  return f() else 0\n}\n",
-    );
-    assert!(bad, "else on a Result with a Move error must be rejected (deferred)");
+fn move_error_is_dropped_before_fallback() {
+    let src = "fn f() -> Result<i32, string> = Err(\"x\".clone())\nfn main() -> i32 {\n  return f() else 7\n}\n";
+    assert_eq!(run_code("else-res-move-error", src), 7);
 }

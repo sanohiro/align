@@ -2379,12 +2379,13 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // A partial owned-field move out of a struct (`n := u.name`) took the `string` field's
         // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
         // null there, not the buffer the new binding now owns. Sema allows this for a depth-1
-        // `string`, `Option<string>`, or Move-handle field; deeper paths / Move-struct fields stay
+        // `string`, `Option<Move>`, or Move-handle field; deeper paths / Move-struct fields stay
         // rejected, so `path` is `[idx]`.
         hir::ExprKind::Field { root, path }
             if path.len() == 1
                 && (e.ty == Ty::String
-                    || e.ty == Ty::Option(Scalar::String)
+                    || (matches!(e.ty, Ty::Option(_))
+                        && align_sema::drop_plan(e.ty, &b.structs, &b.enums).needs_drop())
                     || align_sema::is_move_handle(e.ty)) =>
         {
             b.push(Stmt::NullStructField(*root, path[0]));
@@ -10645,17 +10646,29 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
 /// result slot, `None` evaluates the fallback (which writes the slot or diverges).
 fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty, borrow_result: bool) -> Operand {
     // `else` unwraps an `Option` (Some/None) or a `Result` (Ok/Err) — the same two-way shape, just
-    // a different discriminant/unwrap rvalue. The `Err` case discards the error; sema restricts the
-    // error to a Copy scalar, so there is nothing to drop on the fallback path (a bound-local
-    // scrutinee with a Move *Ok* payload is nulled below, exactly like `Option<string>`).
+    // a different discriminant/unwrap rvalue. A Move container is consumed into one hidden owner:
+    // the positive edge transfers its payload and clears that owner, while the negative edge drops
+    // the active discarded payload before evaluating a possibly-diverging fallback.
     let is_result = matches!(opt.ty, Ty::Result(..));
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
+    let opt_owner = needs_drop_flag(opt.ty, &b.structs, &b.tuples, &b.enums)
+        .then(|| b.new_synthetic_owner(opt.ty));
     let opt_op = lower_expr(b, opt);
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
     }
     let opt_flag = lowered_drop_flag(b, opt, &opt_op);
     let opt_owners = b.borrow_owners(&opt_op);
+    if let Some(owner) = opt_owner {
+        b.push(Stmt::Store(owner, opt_op.clone()));
+        b.set_drop_flag_operand(
+            owner,
+            opt_flag
+                .clone()
+                .unwrap_or(Operand::Const(Const::Bool(false))),
+        );
+        null_moved_source(b, opt);
+    }
 
     let is_pos = b.fresh_value(Ty::Bool);
     let test = if is_result { Rvalue::ResultIsOk(opt_op.clone()) } else { Rvalue::OptionIsSome(opt_op.clone()) };
@@ -10692,12 +10705,19 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
         }
         b.push(Stmt::Store(result_slot, Operand::Value(val)));
     }
-    null_moved_source(b, opt);
+    if let Some(owner) = opt_owner {
+        b.set_drop_flag(owner, false);
+    } else {
+        null_moved_source(b, opt);
+    }
     b.terminate(Term::Goto(join_bb));
 
     // None/Err: the fallback yields the value, or diverges (then the block is already
     // terminated and the store/goto are skipped).
     b.cur = none_bb;
+    if let Some(owner) = opt_owner {
+        b.emit_drop_if_live(owner);
+    }
     let fb = lower_expr(b, fallback);
     if !b.is_terminated() {
         store_control_result(b, result_slot, result_flag, result_temp_flag, fallback, fb, borrow_result);
