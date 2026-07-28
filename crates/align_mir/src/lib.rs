@@ -93,6 +93,9 @@ pub struct Program {
     /// Sum-type layouts, indexed by the id in [`Ty::Enum`]; codegen builds the tagged struct
     /// `{ i32 tag, … }` from each (variant payloads + `field_base`).
     pub enums: Vec<hir::EnumDef>,
+    /// Concrete nested `Option` / `Result` layouts, indexed by [`Ty::Tagged`] /
+    /// [`Scalar::Tagged`]. Lowering canonicalizes this to the reachable, id-independent closure.
+    pub tagged_types: Vec<hir::TaggedType>,
     /// Tuple layouts, indexed by the id in [`Ty::Tuple`]; codegen builds an anonymous LLVM
     /// struct type from each element list.
     pub tuples: Vec<hir::TupleDef>,
@@ -1510,7 +1513,14 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
         .fns
         .iter()
         .map(|f| {
-            let mut mf = lower_fn(f, &program.tuples, &program.structs, &program.enums, lines.as_ref());
+            let mut mf = lower_fn(
+                f,
+                &program.tuples,
+                &program.structs,
+                &program.enums,
+                &program.tagged_types,
+                lines.as_ref(),
+            );
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
             // every function `internal` for byte-identity.
             mf.exportable = per_unit && f.exportable;
@@ -1528,7 +1538,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
             link_libs.push(l);
         }
     }
-    Program {
+    let mut mir = Program {
         fns,
         externs: program.externs.clone(),
         // Cross-unit `pub` callee declares are a per-unit-only concern; the whole-program path has
@@ -1537,7 +1547,347 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
         link_libs,
         structs: program.structs.clone(),
         enums: program.enums.clone(),
+        tagged_types: program.tagged_types.clone(),
         tuples: program.tuples.clone(),
+    };
+    canonicalize_tagged_types(&mut mir);
+    mir
+}
+
+/// Reduce the sema interner to the concrete MIR-reachable closure and assign ids from an
+/// id-independent structural key. Sema may retain unused generic-template entries; they must not
+/// perturb MIR, ABI, or cache identity.
+fn canonicalize_tagged_types(program: &mut Program) {
+    if program.tagged_types.is_empty() {
+        return;
+    }
+
+    fn collect_scalar(
+        scalar: Scalar,
+        table: &[hir::TaggedType],
+        reachable: &mut std::collections::BTreeSet<u32>,
+    ) {
+        if let Scalar::Tagged(id) = scalar
+            && reachable.insert(id)
+            && let Some(entry) = table.get(id as usize)
+        {
+            match *entry {
+                hir::TaggedType::Option(payload) => collect_scalar(payload, table, reachable),
+                hir::TaggedType::Result(ok, err) => {
+                    collect_scalar(ok, table, reachable);
+                    collect_scalar(err, table, reachable);
+                }
+            }
+        }
+    }
+
+    fn collect_ty(
+        ty: Ty,
+        table: &[hir::TaggedType],
+        reachable: &mut std::collections::BTreeSet<u32>,
+    ) {
+        match ty {
+            Ty::Tagged(id) => collect_scalar(Scalar::Tagged(id), table, reachable),
+            Ty::Option(s)
+            | Ty::Box(s)
+            | Ty::Slice(s)
+            | Ty::DynArray(s)
+            | Ty::ArrayBuilder(s)
+            | Ty::Task(s) => collect_scalar(s, table, reachable),
+            Ty::Result(ok, err) => {
+                collect_scalar(ok, table, reachable);
+                collect_scalar(err, table, reachable);
+            }
+            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => collect_scalar(s, table, reachable),
+            _ => {}
+        }
+    }
+
+    let mut reachable = std::collections::BTreeSet::new();
+    for def in &program.structs {
+        for field in &def.fields {
+            collect_ty(field.ty, &program.tagged_types, &mut reachable);
+        }
+    }
+    for def in &program.enums {
+        for variant in &def.variants {
+            for &payload in &variant.payload {
+                collect_scalar(payload, &program.tagged_types, &mut reachable);
+            }
+        }
+    }
+    for tuple in &program.tuples {
+        for &elem in &tuple.elems {
+            collect_scalar(elem, &program.tagged_types, &mut reachable);
+        }
+    }
+    for f in &program.fns {
+        collect_ty(f.ret, &program.tagged_types, &mut reachable);
+        for &ty in f.slots.iter().chain(&f.value_tys) {
+            collect_ty(ty, &program.tagged_types, &mut reachable);
+        }
+    }
+    for ext in &program.externs {
+        collect_ty(ext.ret, &program.tagged_types, &mut reachable);
+        for &ty in &ext.params {
+            collect_ty(ty, &program.tagged_types, &mut reachable);
+        }
+    }
+    for import in &program.imported_fns {
+        collect_ty(import.ret, &program.tagged_types, &mut reachable);
+        for &ty in &import.params {
+            collect_ty(ty, &program.tagged_types, &mut reachable);
+        }
+    }
+
+    fn scalar_key(
+        scalar: Scalar,
+        table: &[hir::TaggedType],
+        structs: &[hir::StructDef],
+        enums: &[hir::EnumDef],
+        active: &mut Vec<u32>,
+    ) -> Option<String> {
+        Some(match scalar {
+            Scalar::Struct(id) => format!("struct:{}", structs.get(id as usize)?.name),
+            Scalar::DynStructArray(id) => {
+                format!("dyn-struct-array:{}", structs.get(id as usize)?.name)
+            }
+            Scalar::Soa(id) => format!("soa:{}", structs.get(id as usize)?.name),
+            Scalar::Enum(id) => format!("enum:{}", enums.get(id as usize)?.name),
+            Scalar::Tagged(id) => {
+                if active.contains(&id) {
+                    return None;
+                }
+                active.push(id);
+                let key = match *table.get(id as usize)? {
+                    hir::TaggedType::Option(payload) => format!(
+                        "option<{}>",
+                        scalar_key(payload, table, structs, enums, active)?
+                    ),
+                    hir::TaggedType::Result(ok, err) => format!(
+                        "result<{},{}>",
+                        scalar_key(ok, table, structs, enums, active)?,
+                        scalar_key(err, table, structs, enums, active)?
+                    ),
+                };
+                active.pop();
+                key
+            }
+            // Abstract entries and function-table ids are not a concrete, id-independent ABI key.
+            Scalar::Param(_) | Scalar::Fn(_) => return None,
+            other => format!("{other:?}"),
+        })
+    }
+
+    let mut keyed = Vec::with_capacity(reachable.len());
+    for &old in &reachable {
+        let Some(key) = scalar_key(
+            Scalar::Tagged(old),
+            &program.tagged_types,
+            &program.structs,
+            &program.enums,
+            &mut Vec::new(),
+        ) else {
+            // Keep malformed compiler-internal state intact. The LLVM boundary validates every id
+            // and returns CodegenError; it must never guess a representation or panic.
+            return;
+        };
+        keyed.push((key, old));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut remap = vec![None; program.tagged_types.len()];
+    for (new, (_, old)) in keyed.iter().enumerate() {
+        remap[*old as usize] = Some(new as u32);
+    }
+
+    fn remap_scalar(s: &mut Scalar, remap: &[Option<u32>]) {
+        if let Scalar::Tagged(id) = s
+            && let Some(Some(new)) = remap.get(*id as usize)
+        {
+            *id = *new;
+        }
+    }
+    fn remap_ty(ty: &mut Ty, remap: &[Option<u32>]) {
+        match ty {
+            Ty::Tagged(id) => {
+                if let Some(Some(new)) = remap.get(*id as usize) {
+                    *id = *new;
+                }
+            }
+            Ty::Option(s)
+            | Ty::Box(s)
+            | Ty::Slice(s)
+            | Ty::DynArray(s)
+            | Ty::ArrayBuilder(s)
+            | Ty::Task(s) => remap_scalar(s, remap),
+            Ty::Result(ok, err) => {
+                remap_scalar(ok, remap);
+                remap_scalar(err, remap);
+            }
+            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => remap_scalar(s, remap),
+            _ => {}
+        }
+    }
+
+    let mut canonical = Vec::with_capacity(keyed.len());
+    for (_, old) in keyed {
+        let mut entry = program.tagged_types[old as usize];
+        match &mut entry {
+            hir::TaggedType::Option(payload) => remap_scalar(payload, &remap),
+            hir::TaggedType::Result(ok, err) => {
+                remap_scalar(ok, &remap);
+                remap_scalar(err, &remap);
+            }
+        }
+        canonical.push(entry);
+    }
+    for def in &mut program.structs {
+        for field in &mut def.fields {
+            remap_ty(&mut field.ty, &remap);
+        }
+    }
+    for def in &mut program.enums {
+        for variant in &mut def.variants {
+            for payload in &mut variant.payload {
+                remap_scalar(payload, &remap);
+            }
+        }
+    }
+    for tuple in &mut program.tuples {
+        for elem in &mut tuple.elems {
+            remap_scalar(elem, &remap);
+        }
+    }
+    for f in &mut program.fns {
+        remap_ty(&mut f.ret, &remap);
+        for ty in f.slots.iter_mut().chain(&mut f.value_tys) {
+            remap_ty(ty, &remap);
+        }
+        remap_function_embedded_types(f, &remap, remap_ty);
+    }
+    for ext in &mut program.externs {
+        remap_ty(&mut ext.ret, &remap);
+        for ty in &mut ext.params {
+            remap_ty(ty, &remap);
+        }
+    }
+    for import in &mut program.imported_fns {
+        remap_ty(&mut import.ret, &remap);
+        for ty in &mut import.params {
+            remap_ty(ty, &remap);
+        }
+    }
+    program.tagged_types = canonical;
+}
+
+/// Whether `program.tagged_types` is the unique compact canonical table produced by MIR lowering.
+///
+/// Codegen accepts hand-built and cache-derived MIR as well as normal lowering output. It uses this
+/// predicate after validating ids/cycles/parameters so an otherwise-well-formed but stale table
+/// cannot perturb ABI or cache identity with duplicate, unreachable, or source-order entries.
+pub fn tagged_types_are_canonical(program: &Program) -> bool {
+    for (index, entry) in program.tagged_types.iter().enumerate() {
+        if program.tagged_types[..index].contains(entry) {
+            return false;
+        }
+    }
+    let mut canonical = program.clone();
+    canonicalize_tagged_types(&mut canonical);
+    canonical.tagged_types == program.tagged_types
+}
+
+fn remap_function_embedded_types(
+    f: &mut Function,
+    remap: &[Option<u32>],
+    remap_ty: fn(&mut Ty, &[Option<u32>]),
+) {
+    let remap_vec = |tys: &mut Vec<Ty>| {
+        for ty in tys {
+            remap_ty(ty, remap);
+        }
+    };
+    let remap_stage = |stage: &mut ParMapStage| {
+        for ty in &mut stage.capture_tys {
+            remap_ty(ty, remap);
+        }
+        remap_ty(&mut stage.elem_in, remap);
+        remap_ty(&mut stage.elem_out, remap);
+    };
+
+    for block in &mut f.blocks {
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::StoreConstArray { elem, .. } | Stmt::VecStore { elem, .. } => {
+                    remap_ty(elem, remap)
+                }
+                Stmt::Let(_, rv) => match rv {
+                    Rvalue::Cast { from, to, .. } => {
+                        remap_ty(from, remap);
+                        remap_ty(to, remap);
+                    }
+                    Rvalue::IntArith { int_ty, .. } | Rvalue::MathOp { ty: int_ty, .. } => {
+                        remap_ty(int_ty, remap)
+                    }
+                    Rvalue::Closure { capture_tys, .. } => remap_vec(capture_tys),
+                    Rvalue::CallIndirect {
+                        param_tys, ret_ty, ..
+                    } => {
+                        remap_vec(param_tys);
+                        remap_ty(ret_ty, remap);
+                    }
+                    Rvalue::SpawnTask { capture_tys, r, .. } => {
+                        remap_vec(capture_tys);
+                        remap_ty(r, remap);
+                    }
+                    Rvalue::MakeVec { elem, .. }
+                    | Rvalue::VecExtract { elem, .. }
+                    | Rvalue::VecSumWhere { elem, .. }
+                    | Rvalue::VecDot { elem, .. }
+                    | Rvalue::VecMinMax { elem, .. }
+                    | Rvalue::VecSum { elem, .. }
+                    | Rvalue::VecLoad { elem, .. }
+                    | Rvalue::ArenaAlloc { elem, .. }
+                    | Rvalue::HeapAllocBuf { elem, .. }
+                    | Rvalue::Chunks { elem, .. }
+                    | Rvalue::SubSlice { elem, .. }
+                    | Rvalue::ConstArray { elem, .. }
+                    | Rvalue::JsonDecodeArray { elem, .. }
+                    | Rvalue::RandShuffle { elem, .. }
+                    | Rvalue::RandSample { elem, .. } => remap_ty(elem, remap),
+                    Rvalue::JsonDecodeScalar { scalar, .. }
+                    | Rvalue::JsonDocAsScalar { scalar, .. }
+                    | Rvalue::BytesRead { scalar, .. }
+                    | Rvalue::BufferPut { scalar, .. }
+                    | Rvalue::ArrayBuilderPush { scalar, .. } => remap_ty(scalar, remap),
+                    Rvalue::ParMapParallel {
+                        stages,
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        ..
+                    } => {
+                        for stage in stages {
+                            remap_stage(stage);
+                        }
+                        remap_vec(capture_tys);
+                        remap_ty(elem_in, remap);
+                        remap_ty(elem_out, remap);
+                    }
+                    Rvalue::ParMapReduce {
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        ..
+                    } => {
+                        remap_vec(capture_tys);
+                        remap_ty(elem_in, remap);
+                        remap_ty(elem_out, remap);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1912,6 +2262,8 @@ struct Builder {
     structs: Vec<hir::StructDef>,
     /// Enum defs — so `ty_may_borrow` sees a `str`-bearing sum type as borrow-carrying (J1).
     enums: Vec<hir::EnumDef>,
+    /// Nested tagged layouts used by ownership and representation classifiers.
+    tagged_types: Vec<hir::TaggedType>,
     /// Monotonic id for each `map_into` loop's alias scope (a fresh disjoint `in`/`out`
     /// scope pair per loop). Threaded into [`Rvalue::SliceIndexNoalias`] / [`Stmt::PtrStoreNoalias`]
     /// so codegen tags the source load and the `dst` store of the *same* loop with the same
@@ -2166,6 +2518,7 @@ fn lower_fn(
     tuples: &[hir::TupleDef],
     structs: &[hir::StructDef],
     enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
     let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
@@ -2195,6 +2548,7 @@ fn lower_fn(
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
         enums: enums.to_vec(),
+        tagged_types: tagged_types.to_vec(),
         alias_scope: 0,
         loops: Vec::new(),
         ctx: Box::new(BuilderCtx {
@@ -2324,7 +2678,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 // Share the exact sema/MIR ownership predicate. A handwritten type list previously
                 // omitted `DynSliceArray` (`chunks`) and could drift again when another owned form
                 // is added. Every type with a cleanup flag transfers by clearing that flag.
-                Some(&ty) => needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums),
+                Some(&ty) => needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types),
                 None => false,
             };
             if moved {
@@ -2384,8 +2738,9 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Field { root, path }
             if path.len() == 1
                 && (e.ty == Ty::String
-                    || (matches!(e.ty, Ty::Option(_))
-                        && align_sema::drop_plan(e.ty, &b.structs, &b.enums).needs_drop())
+                    || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+                        && align_sema::drop_plan(e.ty, &b.structs, &b.enums, &b.tagged_types)
+                            .needs_drop())
                     || align_sema::is_move_handle(e.ty)) =>
         {
             b.push(Stmt::NullStructField(*root, path[0]));
@@ -2397,7 +2752,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
         hir::ExprKind::Field { root, path }
             if path.len() == 1
-                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums)) =>
+                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums, &b.tagged_types)) =>
         {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
@@ -2513,7 +2868,9 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
 /// producers can extend it and scalar consumers can end it immediately.
 fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
-    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums) || !may_need_synthetic_owner(e) {
+    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        || !may_need_synthetic_owner(e)
+    {
         return lower_expr(b, e);
     }
     // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
@@ -2566,7 +2923,8 @@ fn control_result_slots(b: &mut Builder, ty: Ty) -> (Option<Slot>, Option<Slot>,
         return (None, None, None);
     }
     let value = b.new_slot(ty);
-    let flag = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums).then(|| b.new_slot(Ty::Bool));
+    let flag = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        .then(|| b.new_slot(Ty::Bool));
     let temp_flag = flag.map(|_| b.new_slot(Ty::Bool));
     (Some(value), flag, temp_flag)
 }
@@ -2712,7 +3070,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // bind. A nested struct-literal field is expanded in place (its leaves stored at the
                 // extended path), so no intermediate struct value is materialized.
                 hir::ExprKind::StructLit { .. }
-                    if needs_drop_flag(init.ty, &b.structs, &b.tuples, &b.enums) =>
+                    if needs_drop_flag(
+                        init.ty,
+                        &b.structs,
+                        &b.tuples,
+                        &b.enums,
+                        &b.tagged_types,
+                    ) =>
                 {
                     // A Move struct must use the guarded aggregate materializer. Completed fresh
                     // fields remain owned until every later field succeeds, and the destination
@@ -2803,7 +3167,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // `Option<string>`), drop the OLD value first and null a moved RHS source after the
             // replacement is stored. Nested aggregate replacement remains in its owning slice.
             let leaf_ty = field_ty_at(b, *root, path);
-            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums);
+            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums, &b.tagged_types);
             let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. })
                 && (matches!(leaf_plan, DropPlan::Leaf(Ty::String))
                     || matches!(
@@ -2976,7 +3340,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // A Move-struct element: free the *old* element's owned fields before overwriting it
                 // (else its buffers leak), and null the RHS's moved source so its own drop is a no-op
                 // (no double-free). A POD element needs neither. (Slice 4b.)
-                if struct_is_move(*struct_id, &b.structs, &b.enums) {
+                if struct_is_move(*struct_id, &b.structs, &b.enums, &b.tagged_types) {
                     b.push(Stmt::DropElem(*base, idx.clone(), *struct_id));
                     null_moved_source(b, value);
                 }
@@ -4211,8 +4575,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
                 _ => None,
             };
-            if align_sema::par_map_parallelizable(source.ty, stages, &b.structs, &b.enums)
-                && let Some(elem_in) = elem_in
+            if align_sema::par_map_parallelizable(
+                source.ty,
+                stages,
+                &b.structs,
+                &b.enums,
+                &b.tagged_types,
+            ) && let Some(elem_in) = elem_in
             {
                     let src = match source.ty {
                         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
@@ -4466,8 +4835,9 @@ fn lower_consumed_aggregate_parts(
         if b.is_terminated() {
             return None;
         }
-        if needs_drop_flag(part.ty, &b.structs, &b.tuples, &b.enums) {
-            let part_flag = lowered_drop_flag(b, part, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+        if needs_drop_flag(part.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+            let part_flag =
+                lowered_drop_flag(b, part, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
             // One aggregate flag gates recursive Drop of every owned member, so dropping the whole
             // value is safe only when every such member is individually allocated.
             aggregate_drop_flag = Some(match aggregate_drop_flag {
@@ -4535,7 +4905,7 @@ fn store_consumed_struct_fields(
             if b.is_terminated() {
                 return false;
             }
-            if needs_drop_flag(value.ty, &b.structs, &b.tuples, &b.enums) {
+            if needs_drop_flag(value.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
                 let flag = lowered_drop_flag(b, value, &operand)
                     .unwrap_or(Operand::Const(Const::Bool(false)));
                 *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
@@ -4648,7 +5018,9 @@ fn emit_named_call(b: &mut Builder, func: String, args: Vec<Operand>, ret_ty: Ty
 /// drops the already-created value. Once every argument succeeds, the caller clears the owner flag
 /// immediately before emitting the call and the callee becomes the sole owner.
 fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot>) {
-    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums) || !may_need_synthetic_owner(e) {
+    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        || !may_need_synthetic_owner(e)
+    {
         return (lower_expr(b, e), Vec::new());
     }
     // An aggregate may combine individually owned and arena-owned members. A single hidden owner
@@ -4785,7 +5157,9 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     let result = emit_named_call(b, func.clone(), ops.clone(), e.ty);
     if let Operand::Value(v) = &result {
         inherit_borrow_owners(b, *v, &ops);
-        if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums) {
+        if borrows_args
+            && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        {
             for op in &ops {
                 drop_borrow_owners(b, op);
             }
@@ -5316,7 +5690,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         Src::Slot(slot) => b.push(Stmt::Let(v, Rvalue::Index(slot, idx))),
     }
     if let Some(src) = borrowed_src {
-        if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples, &b.enums) {
+        if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
             inherit_borrow_owners(b, v, [&src]);
         } else {
             drop_borrow_owners(b, &src);
@@ -5512,7 +5886,7 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
         leaf
     };
     if let Some(source) = &slice_val {
-        if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples, &b.enums) {
+        if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
             inherit_borrow_owners(b, result, [source]);
         } else {
             drop_borrow_owners(b, source);
@@ -5656,7 +6030,7 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
             // owner before lowering because an element can return early; guarded element lowering
             // keeps the flag clear until the whole array is initialized.
             let owns_elements =
-                needs_drop_flag(source.ty, &b.structs, &b.tuples, &b.enums);
+                needs_drop_flag(source.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
             let slot = if owns_elements {
                 b.new_synthetic_owner(source.ty)
             } else {
@@ -5762,7 +6136,7 @@ fn store_array_elems(
     elem: Ty,
 ) -> Option<Operand> {
     if let Ty::Struct(sid) = elem
-        && struct_is_move(sid, &b.structs, &b.enums)
+        && struct_is_move(sid, &b.structs, &b.enums, &b.tagged_types)
     {
         // A fixed Move-struct array has one cleanup bit for every element. Keep each completed
         // element's fresh members under their exact hidden owners until the whole array succeeds;
@@ -5909,9 +6283,17 @@ fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec
 /// `free` stack/borrowed storage after the pipeline finishes.
 fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bool) -> bool {
     let parallel_par_map = match &source.kind {
-        hir::ExprKind::ArrayParMap { source: inner, stages, .. } => {
-            align_sema::par_map_parallelizable(inner.ty, stages, &b.structs, &b.enums)
-        }
+        hir::ExprKind::ArrayParMap {
+            source: inner,
+            stages,
+            ..
+        } => align_sema::par_map_parallelizable(
+            inner.ty,
+            stages,
+            &b.structs,
+            &b.enums,
+            &b.tagged_types,
+        ),
         _ => false,
     };
     let always_heap = parallel_par_map
@@ -7801,6 +8183,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::DynResponseArray
         | Scalar::Slice(_)
         | Scalar::Enum(_)
+        | Scalar::Tagged(_)
         | Scalar::Soa(_)
         | Scalar::JsonDoc
         | Scalar::Param(_)
@@ -10629,7 +11012,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
-    if needs_drop_flag(ok_ty, &b.structs, &b.tuples, &b.enums)
+    if needs_drop_flag(ok_ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         && let Some(flag) = inner_flag
     {
         b.attach_value_drop_flag(v, flag.clone());
@@ -10651,7 +11034,7 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     // the active discarded payload before evaluating a possibly-diverging fallback.
     let is_result = matches!(opt.ty, Ty::Result(..));
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
-    let opt_owner = needs_drop_flag(opt.ty, &b.structs, &b.tuples, &b.enums)
+    let opt_owner = needs_drop_flag(opt.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         .then(|| b.new_synthetic_owner(opt.ty));
     let opt_op = lower_expr(b, opt);
     if b.is_terminated() {
@@ -10742,9 +11125,9 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     // scrutinee. A Move binding transfers the selected payload, so a control join must own its
     // selected source before extraction.
     let binds_move_payload = arms.iter().flat_map(|arm| &arm.bindings).any(|local| {
-        b.slots
-            .get(*local as usize)
-            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        b.slots.get(*local as usize).is_some_and(|ty| {
+            needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        })
     });
     let scrut = if binds_move_payload {
         lower_expr(b, scrutinee)
@@ -10759,8 +11142,13 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     // Move payload. Give the whole sum a hidden owner before branching. A Move-binding arm clears
     // this owner after transferring the active payload; every other arm drops it before evaluating
     // its body. Direct bound places remain path-local and are nulled only on a transferring arm.
-    let scrut_owner = (needs_drop_flag(scrutinee.ty, &b.structs, &b.tuples, &b.enums)
-        && may_need_synthetic_owner(scrutinee))
+    let scrut_owner = (needs_drop_flag(
+        scrutinee.ty,
+        &b.structs,
+        &b.tuples,
+        &b.enums,
+        &b.tagged_types,
+    ) && may_need_synthetic_owner(scrutinee))
     .then(|| {
         let owner = b.new_synthetic_owner(scrutinee.ty);
         b.push(Stmt::Store(owner, scrut.clone()));
@@ -10901,9 +11289,9 @@ fn lower_match_enum(
         b.cur = arm_bb;
         bind_payload(b, arm);
         let transfers_payload = arm.bindings.iter().any(|local| {
-            b.slots
-                .get(*local as usize)
-                .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+            b.slots.get(*local as usize).is_some_and(|ty| {
+                needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+            })
         });
         // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
         // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
@@ -10918,9 +11306,9 @@ fn lower_match_enum(
     let d = &arms[default_idx];
     bind_payload(b, d);
     let transfers_payload = d.bindings.iter().any(|local| {
-        b.slots
-            .get(*local as usize)
-            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        b.slots.get(*local as usize).is_some_and(|ty| {
+            needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        })
     });
     if transfers_payload {
         null_moved_source(b, scrutinee);
@@ -10955,7 +11343,7 @@ fn lower_match_binary(
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
-        let active_may_own = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums);
+        let active_may_own = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
         discharge_match_scrutinee(b, scrut_owner, false, active_may_own);
         finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         return;
@@ -10972,9 +11360,9 @@ fn lower_match_binary(
     b.cur = pos_bb;
     bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
     let pos_transfers = pos.bindings.iter().any(|local| {
-        b.slots
-            .get(*local as usize)
-            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        b.slots.get(*local as usize).is_some_and(|ty| {
+            needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        })
     });
     // Binding an owned payload (Ok/Some) moves it out of the scrutinee; null the scrutinee so its
     // exit `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
@@ -10987,9 +11375,9 @@ fn lower_match_binary(
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
     let neg_transfers = neg.bindings.iter().any(|local| {
-        b.slots
-            .get(*local as usize)
-            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        b.slots.get(*local as usize).is_some_and(|ty| {
+            needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+        })
     });
     if neg_transfers {
         null_moved_source(b, scrutinee);
@@ -11031,6 +11419,7 @@ fn enum_match_arm_may_own(b: &Builder, enum_id: u32, arm: &hir::MatchArm) -> boo
                 &b.structs,
                 &b.tuples,
                 &b.enums,
+                &b.tagged_types,
             )
         })
     };
@@ -11058,6 +11447,7 @@ fn binary_match_arm_may_own(b: &Builder, ty: Ty, positive: bool) -> bool {
             &b.structs,
             &b.tuples,
             &b.enums,
+            &b.tagged_types,
         )
     })
 }
@@ -11177,6 +11567,7 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
         &b.structs,
         &b.tuples,
         &b.enums,
+        &b.tagged_types,
     )));
     if let Some(flag_slot) = result_flag {
         b.push(Stmt::Store(flag_slot, mapped_flag.clone()));
@@ -11350,6 +11741,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Char => "char".to_string(),
         Ty::Option(_) => "Option".to_string(),
         Ty::Result(..) => "Result".to_string(),
+        Ty::Tagged(_) => "nested tagged type".to_string(),
         Ty::Box(_) => "box".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
@@ -11433,6 +11825,87 @@ mod tests {
         let f = &p.fns[0];
         // entry stores the literal into x's slot; a later block returns the loaded value.
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Return(Some(_)))));
+    }
+
+    #[test]
+    fn nested_tagged_ids_are_canonical_across_declaration_order() {
+        let prefix = "Output { text: string }\nDbError { Decode(string) }\n";
+        let output = "fn output() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n";
+        let number = "fn number() -> Result<Option<i64>, DbError> = Ok(Some(1))\n";
+        let suffix = "fn main() -> i32 = 0\n";
+        let first = lower(&format!("{prefix}{output}{number}{suffix}"));
+        let second = lower(&format!("{prefix}{number}{output}{suffix}"));
+
+        assert_eq!(first.tagged_types, second.tagged_types);
+        let output_ret = |program: &Program| {
+            program
+                .fns
+                .iter()
+                .find(|f| f.name == "output")
+                .expect("output function")
+                .ret
+        };
+        assert_eq!(output_ret(&first), output_ret(&second));
+        assert_eq!(first.tagged_types.len(), 2);
+    }
+
+    #[test]
+    fn nested_tagged_canonicalization_keeps_expression_temporaries_and_drops_templates() {
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let mut program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                // This tag exists only on an SSA temporary: no signature, slot, or nominal type
+                // reaches it. The closure scan must still retain it.
+                value_tys: vec![Ty::Tagged(1)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![
+                // Simulate an unused generic-template entry left in sema's universe.
+                hir::TaggedType::Option(Scalar::Param(0)),
+                hir::TaggedType::Result(
+                    Scalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    Scalar::Bool,
+                ),
+            ],
+            tuples: vec![],
+        };
+        canonicalize_tagged_types(&mut program);
+        assert_eq!(
+            program.tagged_types,
+            vec![hir::TaggedType::Result(
+                Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+                Scalar::Bool,
+            )],
+            "the expression-only inner Result must survive while the unused generic template is omitted"
+        );
+        assert_eq!(program.fns[0].value_tys, vec![Ty::Tagged(0)]);
+        assert!(tagged_types_are_canonical(&program));
     }
 
     #[test]

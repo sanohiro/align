@@ -1290,6 +1290,14 @@ fn recursive_inline_sum_layouts_are_rejected() {
             "optional-recursive-sum-field.align",
             "Node { next: Option<Link> }\nLink { NodeValue(Node), End }\nfn main() -> i32 = 0\n",
         ),
+        (
+            "nested-tagged-recursive-struct-field.align",
+            "Node { next: Option<Result<Node, bool>> }\nfn main() -> i32 = 0\n",
+        ),
+        (
+            "nested-tagged-recursive-sum-field.align",
+            "Node { next: Option<Result<Link, bool>> }\nLink { NodeValue(Node), End }\nfn main() -> i32 = 0\n",
+        ),
     ] {
         let mut sm = SourceMap::new();
         let checked = check(&mut sm, name, src);
@@ -1306,25 +1314,450 @@ fn recursive_inline_sum_layouts_are_rejected() {
 }
 
 #[test]
-fn nested_tagged_payload_fails_closed_at_type_formation() {
-    let name = "nested-tagged-payload.align";
+fn nested_tagged_payload_executes_exact_pkg_db_shape() {
+    if !backend_available() {
+        return;
+    }
     let src = concat!(
-        "Output { text: string }\n",
+        "Output { text: string, note: Option<string> }\n",
+        "NativeError { code: Option<string>, message: string }\n",
+        "DbError { Native(NativeError), Decode(string) }\n",
+        "fn run(mode: i32) -> Result<Option<Output>, DbError> {\n",
+        "  if mode == 0 { return Ok(None) }\n",
+        "  if mode == 1 {\n",
+        "    return Ok(Some(Output { text: \"row\".clone(), note: Some(\"note\".clone()) }))\n",
+        "  }\n",
+        "  if mode == 2 { return Err(DbError.Decode(\"decode\".clone())) }\n",
+        "  return Err(DbError.Native(NativeError {\n",
+        "    code: Some(\"7\".clone()),\n",
+        "    message: \"native\".clone(),\n",
+        "  }))\n",
+        "}\n",
+        "fn score(result: Result<Option<Output>, DbError>) -> i32 = match result {\n",
+        "  Ok(value) => match value {\n",
+        "    Some(output) => output.text.len() as i32 + match output.note {\n",
+        "      Some(note) => note.len() as i32,\n",
+        "      None => 0,\n",
+        "    },\n",
+        "    None => 2,\n",
+        "  },\n",
+        "  Err(error) => match error {\n",
+        "    Native(value) => value.message.len() as i32 + match value.code {\n",
+        "      Some(code) => code.len() as i32,\n",
+        "      None => 0,\n",
+        "    },\n",
+        "    Decode(message) => message.len() as i32,\n",
+        "  },\n",
+        "}\n",
+        "fn main() -> i32 = score(run(0)) + score(run(1)) + score(run(2)) + score(run(3))\n",
+    );
+    let ir = emit_llvm(src);
+    assert!(
+        ir.contains("%align.tagged."),
+        "nested Option/Result payloads must use identified tagged LLVM types:\n{ir}"
+    );
+    assert!(
+        ir.contains("%align.tagged.0 = type { i8, %Output }")
+            && ir.contains("dropoptissome"),
+        "nested layout and recursive Option Drop must preserve their tags:\n{ir}"
+    );
+    assert_eq!(
+        build_and_run("nested-tagged-payload", src).status.code(),
+        Some(22)
+    );
+}
+
+#[test]
+fn nested_pkg_db_shape_preserves_transfer_and_replacement_rules() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Output { text: string, note: Option<string> }\n",
         "DbError { Decode(string) }\n",
-        "fn run() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n",
+        "fn run(mode: i32) -> Result<Option<Output>, DbError> {\n",
+        "  if mode == 0 { return Ok(None) }\n",
+        "  if mode == 1 {\n",
+        "    return Ok(Some(Output { text: \"row\".clone(), note: Some(\"note\".clone()) }))\n",
+        "  }\n",
+        "  return Err(DbError.Decode(\"decode\".clone()))\n",
+        "}\n",
+        "fn score(result: Result<Option<Output>, DbError>) -> i32 = match result {\n",
+        "  Ok(value) => match value {\n",
+        "    Some(output) => output.text.len() as i32 + match output.note {\n",
+        "      Some(note) => note.len() as i32,\n",
+        "      None => 0,\n",
+        "    },\n",
+        "    None => 2,\n",
+        "  },\n",
+        "  Err(error) => match error { Decode(message) => message.len() as i32 },\n",
+        "}\n",
+        "fn relay(mode: i32) -> Result<Option<Output>, DbError> {\n",
+        "  value := run(mode)?\n",
+        "  return Ok(value)\n",
+        "}\n",
+        "fn discard_error(mode: i32) -> i32 {\n",
+        "  value := run(mode) else { return 3 }\n",
+        "  return score(Ok(value))\n",
+        "}\n",
+        "fn source_error() -> Result<Option<Output>, string> = Err(\"decode\".clone())\n",
+        "fn wrap_error(message: string) -> DbError = DbError.Decode(message)\n",
+        "fn replace() -> i32 {\n",
+        "  mut result: Result<Option<Output>, DbError> := run(1)\n",
+        "  result = run(0)\n",
+        "  result = run(2)\n",
+        "  result = run(1)\n",
+        "  return score(result)\n",
+        "}\n",
+        "fn main() -> i32 = score(relay(1)) + score(relay(2))\n",
+        "  + discard_error(2) + discard_error(0)\n",
+        "  + score(source_error().map_err(wrap_error)) + replace()\n",
+    );
+    let mir = mir_text(src);
+    assert!(
+        mir.matches("    drop _0\n").count() >= 3 && mir.contains("    drop _6\n"),
+        "nested replacement and discarded error paths must retain recursive cleanup:\n{mir}"
+    );
+    assert_eq!(
+        build_and_run("nested-pkg-db-transfer-and-replacement", src)
+            .status
+            .code(),
+        Some(31)
+    );
+}
+
+#[test]
+fn nested_tagged_struct_fields_and_sum_payloads_use_recursive_ownership() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Holder { value: Result<Option<string>, string> }\n",
+        "Nested { value: Option<Result<string, string>> }\n",
+        "Wrapped { Value(Option<Result<string, string>>), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  holder := Holder { value: Ok(Some(\"a\".clone())) }\n",
+        "  nested := Nested { value: Some(Err(\"bb\".clone())) }\n",
+        "  wrapped := Wrapped.Value(Some(Ok(\"ccc\".clone())))\n",
+        "  a := match holder.value {\n",
+        "    Ok(value) => match value { Some(text) => text.len(), None => 90 },\n",
+        "    Err(message) => 91,\n",
+        "  }\n",
+        "  b := match nested.value {\n",
+        "    Some(value) => match value { Ok(text) => 92, Err(message) => message.len() },\n",
+        "    None => 93,\n",
+        "  }\n",
+        "  c := match wrapped {\n",
+        "    Value(value) => match value {\n",
+        "      Some(result) => match result { Ok(text) => text.len(), Err(message) => 94 },\n",
+        "      None => 95,\n",
+        "    },\n",
+        "    Empty => 96,\n",
+        "  }\n",
+        "  return (a + b + c) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("nested-tagged-fields-and-sum-payloads", src)
+            .status
+            .code(),
+        Some(6)
+    );
+}
+
+#[test]
+fn ignored_inner_tagged_binding_still_runs_recursive_drop() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  value: Option<Result<string, string>> := Some(Ok(\"owned\".clone()))\n",
+        "  return match value { Some(inner) => 7, None => 90 }\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "nested-tagged-ignored-inner.align", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let program = lower_to_mir(&checked.hir);
+    let main = program
+        .fns
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main MIR");
+    let inner_slot = main
+        .slots
+        .iter()
+        .position(|ty| matches!(ty, align_sema::Ty::Result(..)))
+        .expect("inner Result binding") as u32;
+    assert!(
+        main.blocks.iter().flat_map(|block| &block.stmts).any(
+            |stmt| matches!(stmt, align_mir::Stmt::Drop(slot) if *slot == inner_slot)
+        ),
+        "the ignored inner Result binding must retain path-local cleanup:\n{}",
+        align_mir::print::function_to_string(main)
+    );
+    let ir = emit_llvm(src);
+    assert!(
+        ir.contains("drop.result.ok"),
+        "the ignored inner Result binding must recursively drop its active owned arm:\n{ir}"
+    );
+    assert_eq!(
+        build_and_run("nested-tagged-ignored-inner", src)
+            .status
+            .code(),
+        Some(7)
+    );
+}
+
+#[test]
+fn generic_nested_tagged_results_reintern_each_concrete_shape() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Output { text: string, note: Option<string> }\n",
+        "fn wrap<T>(value: T) -> Result<Option<T>, string> = Ok(Some(value))\n",
+        "fn main() -> i32 {\n",
+        "  number: Result<Option<i64>, string> := wrap(5)\n",
+        "  output: Result<Option<Output>, string> := wrap(Output {\n",
+        "    text: \"row\".clone(),\n",
+        "    note: Some(\"note\".clone()),\n",
+        "  })\n",
+        "  a := match number { Ok(value) => value else 90, Err(message) => 91 }\n",
+        "  b := match output {\n",
+        "    Ok(value) => match value {\n",
+        "      Some(row) => row.text.len() + match row.note { Some(note) => note.len(), None => 0 },\n",
+        "      None => 92,\n",
+        "    },\n",
+        "    Err(message) => 93,\n",
+        "  }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("generic-nested-tagged-results", src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn nested_tagged_mismatch_diagnostics_render_structural_types() {
+    let src = concat!(
+        "fn take(value: Result<Option<i64>, bool>) -> i32 = 0\n",
+        "fn main() -> i32 {\n",
+        "  value: Result<Option<bool>, bool> := Ok(Some(true))\n",
+        "  return take(value)\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "nested-tagged-mismatch.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(checked.diags.has_errors(), "mismatched nested types must fail");
+    assert!(
+        rendered.contains("Result<Option<i64>, bool>")
+            && rendered.contains("Result<Option<bool>, bool>"),
+        "diagnostics must render complete structural nested types:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("nested tagged type") && !rendered.contains("tagged#"),
+        "diagnostics must not expose compiler-internal tagged identities:\n{rendered}"
+    );
+}
+
+#[test]
+fn generic_struct_and_sum_substitute_nested_tagged_payloads() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Holder<T> { value: Option<Result<T, string>> }\n",
+        "Envelope<T> { Value(Option<Result<T, string>>), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  holder_value: Option<Result<i64, string>> := Some(Ok(7))\n",
+        "  envelope_value: Option<Result<i64, string>> := Some(Ok(5))\n",
+        "  holder := Holder { value: holder_value }\n",
+        "  envelope := Envelope.Value(envelope_value)\n",
+        "  a := match holder.value {\n",
+        "    Some(result) => match result { Ok(value) => value, Err(message) => 90 },\n",
+        "    None => 91,\n",
+        "  }\n",
+        "  b := match envelope {\n",
+        "    Value(value) => match value {\n",
+        "      Some(result) => match result { Ok(number) => number, Err(message) => 92 },\n",
+        "      None => 93,\n",
+        "    },\n",
+        "    Empty => 94,\n",
+        "  }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("generic-nested-tagged-aggregates", src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn nested_tagged_table_changes_codegen_identity() {
+    let src = concat!(
+        "fn nested() -> Result<Option<i64>, bool> = Ok(Some(1))\n",
         "fn main() -> i32 = 0\n",
     );
-    let expected = "implemented in L1b-c";
     let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    let checked = check(&mut sm, "nested-tagged-codegen-hash.align", src);
     assert!(
-        checked.diags.has_errors(),
-        "later L1b payload shape must fail closed: {name}"
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
     );
-    assert!(
-        rendered.contains(expected),
-        "diagnostic must name its owning L1b slice in {name}:\n{rendered}"
+    let program = lower_to_mir(&checked.hir);
+    let mut changed = program.clone();
+    changed.tagged_types[0] =
+        align_sema::hir::TaggedType::Option(align_sema::Scalar::Bool);
+    assert_ne!(
+        align_interface::codegen_impl_hash(&program),
+        align_interface::codegen_impl_hash(&changed),
+        "the complete canonical tagged table must participate in object-cache identity"
+    );
+}
+
+#[test]
+fn nested_tagged_values_fail_closed_at_unsupported_boundaries() {
+    let cases = [
+        (
+            "nested-tagged-ffi.align",
+            concat!(
+                "extern \"C\" fn foreign(value: Option<Result<i64, bool>>) -> i64\n",
+                "fn main() -> i32 = 0\n",
+            ),
+            "FFI",
+        ),
+        (
+            "nested-tagged-box.align",
+            "fn take(value: box<Option<Result<i64, bool>>>) -> i32 = 0\nfn main() -> i32 = 0\n",
+            "box payload",
+        ),
+        (
+            "nested-tagged-array.align",
+            concat!(
+                "fn make() -> Option<Result<i64, bool>> = Some(Ok(1))\n",
+                "fn main() -> i32 {\n",
+                "  values := [make()]\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "array",
+        ),
+        (
+            "nested-tagged-print.align",
+            concat!(
+                "fn make() -> Option<Result<i64, bool>> = Some(Ok(1))\n",
+                "fn main() -> i32 {\n",
+                "  print(make())\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "print",
+        ),
+        (
+            "nested-tagged-hash.align",
+            concat!(
+                "fn make() -> Option<Result<i64, bool>> = Some(Ok(1))\n",
+                "fn main() -> i32 {\n",
+                "  value := hash64(make())\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "hash64",
+        ),
+        (
+            "nested-tagged-json.align",
+            concat!(
+                "import core.json\n",
+                "Holder { value: Option<Result<i64, bool>> }\n",
+                "fn main() -> i32 {\n",
+                "  holder := Holder { value: Some(Ok(1)) }\n",
+                "  encoded := json.encode(holder)\n",
+                "  return encoded.len() as i32\n",
+                "}\n",
+            ),
+            "json",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "{name} must reject a nested tagged value at this unsupported boundary"
+        );
+        assert!(
+            rendered.to_ascii_lowercase().contains(&expected.to_ascii_lowercase()),
+            "{name} diagnostic must name the rejected boundary:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn nested_tagged_public_surface_matches_whole_and_per_unit_builds() {
+    if !backend_available() {
+        return;
+    }
+    let producer = concat!(
+        "module query\n",
+        "pub Output { text: string, note: Option<string> }\n",
+        "pub DbError { Decode(string) }\n",
+        "pub fn run(mode: i32) -> Result<Option<Output>, DbError> {\n",
+        "  if mode == 0 { return Ok(None) }\n",
+        "  if mode == 1 {\n",
+        "    return Ok(Some(Output { text: \"row\".clone(), note: Some(\"note\".clone()) }))\n",
+        "  }\n",
+        "  return Err(DbError.Decode(\"decode\".clone()))\n",
+        "}\n",
+    );
+    let consumer = concat!(
+        "module main\n",
+        "import query\n",
+        "// This private shape exists only in the consumer unit and perturbs its local tagged table.\n",
+        "fn unrelated() -> Option<Result<i64, bool>> = Some(Ok(1))\n",
+        "fn score(result: Result<Option<query.Output>, query.DbError>) -> i32 = match result {\n",
+        "  Ok(value) => match value {\n",
+        "    Some(output) => output.text.len() as i32 + match output.note {\n",
+        "      Some(note) => note.len() as i32,\n",
+        "      None => 0,\n",
+        "    },\n",
+        "    None => 2,\n",
+        "  },\n",
+        "  Err(error) => match error { Decode(message) => message.len() as i32 },\n",
+        "}\n",
+        "fn main() -> i32 = score(query.run(0)) + score(query.run(1)) + score(query.run(2)) + match unrelated() {\n",
+        "  Some(value) => match value { Ok(n) => n as i32, Err(flag) => 90 },\n",
+        "  None => 91,\n",
+        "}\n",
+    );
+    let files = [("query.align", producer), ("main.align", consumer)];
+    assert_eq!(
+        build_and_run_multi("nested-tagged-whole", &files, "main.align")
+            .status
+            .code(),
+        Some(16)
+    );
+    assert_eq!(
+        build_per_unit_multi("nested-tagged-per-unit", &files, "main.align")
+            .link_and_run()
+            .status
+            .code(),
+        Some(16)
     );
 }
 

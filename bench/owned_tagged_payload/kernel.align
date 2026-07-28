@@ -5,6 +5,7 @@ Choice { Reuse, Fresh }
 NativeError { code: Option<string>, message: string }
 DbError { Native(NativeError), Decode(string) }
 MultiError { Both(string, string), Empty }
+Output { text: string, note: Option<string> }
 
 pub fn scalar_rows(reps: i64) -> i64 {
   mut i := 0
@@ -221,6 +222,78 @@ pub fn tagged_recursive_map_err(reps: i64) -> i64 {
         Decode(message) => message.len()
       }
     }
+    i = i + 1
+  }
+}
+
+fn nested_db_result(mode: i64) -> Result<Option<Output>, DbError> {
+  if mode == 0 { return Ok(None) }
+  if mode == 1 {
+    return Ok(Some(Output {
+      text: "row".clone(),
+      note: Some("note".clone()),
+    }))
+  }
+  if mode == 2 { return Err(DbError.Decode("decode".clone())) }
+  return Err(DbError.Native(NativeError {
+    code: Some("7".clone()),
+    message: "native".clone(),
+  }))
+}
+
+fn nested_db_score(result: Result<Option<Output>, DbError>) -> i64 = match result {
+  Ok(value) => match value {
+    Some(output) => output.text.len() + match output.note {
+      Some(note) => note.len()
+      None => 0
+    }
+    None => 2
+  }
+  Err(error) => match error {
+    Native(native) => native.message.len() + match native.code {
+      Some(code) => code.len()
+      None => 0
+    }
+    Decode(message) => message.len()
+  }
+}
+
+pub fn tagged_nested_none(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    total = total + nested_db_score(nested_db_result(0))
+    i = i + 1
+  }
+}
+
+pub fn tagged_nested_some(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    total = total + nested_db_score(nested_db_result(1))
+    i = i + 1
+  }
+}
+
+pub fn tagged_nested_decode(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    total = total + nested_db_score(nested_db_result(2))
+    i = i + 1
+  }
+}
+
+pub fn tagged_nested_native(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    total = total + nested_db_score(nested_db_result(3))
     i = i + 1
   }
 }

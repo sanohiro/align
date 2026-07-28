@@ -26,8 +26,8 @@ pub mod pgo;
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{
-    drop_plan, enum_is_move, scalar_to_ty, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy,
-    Layout, Scalar, StructDef, TupleDef, Ty, ERROR_VARIANT_CODE,
+    ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
+    drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
 use inkwell::AddressSpace;
@@ -663,6 +663,7 @@ fn build_module<'c>(
     exports: &[String],
     rt_lto_skip_guarded: bool,
 ) -> Result<(), CodegenError> {
+    validate_tagged_program(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
     let target_data = tm.get_target_data();
@@ -721,14 +722,61 @@ fn build_module<'c>(
         .iter()
         .map(|e| ctx.opaque_struct_type(&e.name))
         .collect();
+    // Concrete nested `Option` / `Result` values need their own named recursive-capable aggregate
+    // type. Create every shell before any body so a tagged payload can refer to another tagged
+    // value without relying on declaration order.
+    let tagged_types: Vec<StructType<'c>> = program
+        .tagged_types
+        .iter()
+        .enumerate()
+        .map(|(id, _)| ctx.opaque_struct_type(&format!("align.tagged.{id}")))
+        .collect();
     for (e, et) in program.enums.iter().zip(&enum_types) {
         let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
         for v in &e.variants {
             for &s in &v.payload {
-                fields.push(scalar_type(ctx, scalar_to_ty(s), &struct_types, &enum_types));
+                fields.push(scalar_type(
+                    ctx,
+                    scalar_to_ty(s),
+                    &struct_types,
+                    &enum_types,
+                    &tagged_types,
+                ));
             }
         }
         et.set_body(&fields, false);
+    }
+    for (tagged, llvm_ty) in program.tagged_types.iter().zip(&tagged_types) {
+        let fields = match *tagged {
+            hir::TaggedType::Option(payload) => vec![
+                ctx.i8_type().into(),
+                scalar_type(
+                    ctx,
+                    scalar_to_ty(payload),
+                    &struct_types,
+                    &enum_types,
+                    &tagged_types,
+                ),
+            ],
+            hir::TaggedType::Result(ok, err) => vec![
+                ctx.i8_type().into(),
+                scalar_type(
+                    ctx,
+                    scalar_to_ty(ok),
+                    &struct_types,
+                    &enum_types,
+                    &tagged_types,
+                ),
+                scalar_type(
+                    ctx,
+                    scalar_to_ty(err),
+                    &struct_types,
+                    &enum_types,
+                    &tagged_types,
+                ),
+            ],
+        };
+        llvm_ty.set_body(&fields, false);
     }
     // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
     // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
@@ -737,10 +785,29 @@ fn build_module<'c>(
     // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
     // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
     // unchanged.
-    let field_perm: Vec<Vec<u32>> =
-        program.structs.iter().map(|s| logical_to_physical(s, &program.structs, &program.enums)).collect();
+    let field_perm: Vec<Vec<u32>> = program
+        .structs
+        .iter()
+        .map(|s| {
+            logical_to_physical(
+                s,
+                &program.structs,
+                &program.enums,
+                &program.tagged_types,
+            )
+        })
+        .collect();
     for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
-        set_struct_body(ctx, *st, s, perm, &struct_types, &enum_types, &target_data);
+        set_struct_body(
+            ctx,
+            *st,
+            s,
+            perm,
+            &struct_types,
+            &enum_types,
+            &tagged_types,
+            &target_data,
+        );
     }
 
     // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements are primitive
@@ -749,8 +816,19 @@ fn build_module<'c>(
         .tuples
         .iter()
         .map(|t| {
-            let fields: Vec<BasicTypeEnum> =
-                t.elems.iter().map(|s| scalar_type(ctx, scalar_to_ty(*s), &struct_types, &enum_types)).collect();
+            let fields: Vec<BasicTypeEnum> = t
+                .elems
+                .iter()
+                .map(|s| {
+                    scalar_type(
+                        ctx,
+                        scalar_to_ty(*s),
+                        &struct_types,
+                        &enum_types,
+                        &tagged_types,
+                    )
+                })
+                .collect();
             ctx.struct_type(&fields, false)
         })
         .collect();
@@ -760,7 +838,17 @@ fn build_module<'c>(
     // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
-        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types, exports);
+        let fv = declare_fn(
+            ctx,
+            module,
+            f,
+            symbol_name(f),
+            &struct_types,
+            &enum_types,
+            &tagged_types,
+            &tuple_types,
+            exports,
+        );
         funcs.insert(f.name.clone(), fv);
     }
     // M15 S2 (per-unit): non-generic `pub` functions declared by interface-only dependencies. Each is
@@ -775,7 +863,15 @@ fn build_module<'c>(
         if funcs.contains_key(&imp.name) {
             continue;
         }
-        let fv = declare_imported_fn(ctx, module, imp, &struct_types, &enum_types, &tuple_types);
+        let fv = declare_imported_fn(
+            ctx,
+            module,
+            imp,
+            &struct_types,
+            &enum_types,
+            &tagged_types,
+            &tuple_types,
+        );
         funcs.insert(imp.name.clone(), fv);
     }
     // Keep the semantic signatures alongside the LLVM declarations. The latter intentionally
@@ -862,7 +958,8 @@ fn build_module<'c>(
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
             match pa {
-                ParamAbi::Direct => param_types.push(abi_type(ctx, ty, &struct_types, &enum_types).into()),
+                ParamAbi::Direct => param_types
+                    .push(abi_type(ctx, ty, &struct_types, &enum_types, &tagged_types).into()),
                 ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
                 // A by-value struct flattens to one `i64`/`double` per eightbyte — byte-identical to
                 // clang's own flattened parameter form. This is sound only because
@@ -890,7 +987,8 @@ fn build_module<'c>(
                 if ext.ret == Ty::Unit {
                     ctx.void_type().fn_type(&param_types, false)
                 } else {
-                    abi_type(ctx, ext.ret, &struct_types, &enum_types).fn_type(&param_types, false)
+                    abi_type(ctx, ext.ret, &struct_types, &enum_types, &tagged_types)
+                        .fn_type(&param_types, false)
                 }
             }
             ReturnAbi::StructRegs(sabi) => struct_ret_type(ctx, sabi).fn_type(&param_types, false),
@@ -2732,7 +2830,10 @@ fn build_module<'c>(
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
         let env = thunk.get_nth_param(0).unwrap().into_pointer_value();
-        let env_fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(ctx, *t, &struct_types, &enum_types)).collect();
+        let env_fields: Vec<BasicTypeEnum> = capture_tys
+            .iter()
+            .map(|t| abi_type(ctx, *t, &struct_types, &enum_types, &tagged_types))
+            .collect();
         let env_struct = ctx.struct_type(&env_fields, false);
         // The explicit parameters are forwarded as-is; the captures are loaded from the env.
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
@@ -2742,7 +2843,11 @@ fn build_module<'c>(
                 .build_struct_gep(env_struct, env, i as u32, "capg")
                 .map_err(|e| CodegenError::Lowering(e.to_string()))?;
             let v = tb
-                .build_load(abi_type(ctx, *cty, &struct_types, &enum_types), fld, "capv")
+                .build_load(
+                    abi_type(ctx, *cty, &struct_types, &enum_types, &tagged_types),
+                    fld,
+                    "capv",
+                )
                 .map_err(|e| CodegenError::Lowering(e.to_string()))?;
             call_args.push(v.into());
         }
@@ -2793,9 +2898,14 @@ fn build_module<'c>(
         if *fallible {
             // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, Error err }` (tag 0 = Ok).
             // On `Err`, write the full `Error` value to `err_slot` and return 1; on `Ok`, write R.
-            let ok_s = ty_to_scalar(*r).ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
-            let err_s = Scalar::Enum(error_id.ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?);
-            let result_ty = result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types);
+            let ok_s = ty_to_scalar(*r)
+                .ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
+            let err_s = Scalar::Enum(
+                error_id
+                    .ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?,
+            );
+            let result_ty =
+                result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types, &tagged_types);
             let agg = tb
                 .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -2826,7 +2936,7 @@ fn build_module<'c>(
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
-            let rt = scalar_type(ctx, *r, &struct_types, &enum_types);
+            let rt = scalar_type(ctx, *r, &struct_types, &enum_types, &tagged_types);
             let res = tb
                 .build_indirect_call(rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -2875,6 +2985,8 @@ fn build_module<'c>(
             field_perm: &field_perm,
             enum_types: &enum_types,
             enums: &program.enums,
+            tagged_types: &tagged_types,
+            tagged_defs: &program.tagged_types,
             tuple_types: &tuple_types,
             tuples: &program.tuples,
             target_data: &target_data,
@@ -2912,6 +3024,117 @@ fn build_module<'c>(
         program.fns.iter().find(|f| f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit))
     {
         emit_main_wrapper(ctx, module, funcs["main"], f.ret, !f.params.is_empty())?;
+    }
+    Ok(())
+}
+
+/// Validate the nested tagged table before any LLVM type lookup. This is the fail-closed seam for
+/// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
+/// `CodegenError`, never an out-of-bounds panic or the scalar `i32` fallback.
+fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
+    fn check_scalar(
+        scalar: Scalar,
+        table: &[hir::TaggedType],
+        active: &mut Vec<u32>,
+    ) -> Result<(), CodegenError> {
+        match scalar {
+            Scalar::Param(id) => Err(CodegenError::Lowering(format!(
+                "abstract tagged payload parameter {id} survived into MIR"
+            ))),
+            Scalar::Tagged(id) => {
+                if active.contains(&id) {
+                    return Err(CodegenError::Lowering(format!(
+                        "recursive nested tagged type id {id} survived into MIR"
+                    )));
+                }
+                let entry = table.get(id as usize).ok_or_else(|| {
+                    CodegenError::Lowering(format!("nested tagged type id {id} is missing"))
+                })?;
+                active.push(id);
+                match *entry {
+                    hir::TaggedType::Option(payload) => check_scalar(payload, table, active)?,
+                    hir::TaggedType::Result(ok, err) => {
+                        check_scalar(ok, table, active)?;
+                        check_scalar(err, table, active)?;
+                    }
+                }
+                active.pop();
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    fn check_ty(ty: Ty, table: &[hir::TaggedType]) -> Result<(), CodegenError> {
+        let mut active = Vec::new();
+        match ty {
+            Ty::Param(id) => Err(CodegenError::Lowering(format!(
+                "abstract type parameter {id} survived into MIR"
+            ))),
+            Ty::Tagged(id) => check_scalar(Scalar::Tagged(id), table, &mut active),
+            Ty::Option(s)
+            | Ty::Box(s)
+            | Ty::Slice(s)
+            | Ty::DynArray(s)
+            | Ty::ArrayBuilder(s)
+            | Ty::Task(s) => check_scalar(s, table, &mut active),
+            Ty::Result(ok, err) => {
+                check_scalar(ok, table, &mut active)?;
+                check_scalar(err, table, &mut active)
+            }
+            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => check_scalar(s, table, &mut active),
+            _ => Ok(()),
+        }
+    }
+
+    // Validate every retained entry, including an otherwise-unused corrupt one from a decoded
+    // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
+    // does not narrow a valid program.
+    for id in 0..program.tagged_types.len() {
+        check_scalar(
+            Scalar::Tagged(id as u32),
+            &program.tagged_types,
+            &mut Vec::new(),
+        )?;
+    }
+    for def in &program.structs {
+        for field in &def.fields {
+            check_ty(field.ty, &program.tagged_types)?;
+        }
+    }
+    for def in &program.enums {
+        for variant in &def.variants {
+            for &payload in &variant.payload {
+                check_scalar(payload, &program.tagged_types, &mut Vec::new())?;
+            }
+        }
+    }
+    for tuple in &program.tuples {
+        for &elem in &tuple.elems {
+            check_scalar(elem, &program.tagged_types, &mut Vec::new())?;
+        }
+    }
+    for f in &program.fns {
+        check_ty(f.ret, &program.tagged_types)?;
+        for &ty in f.slots.iter().chain(&f.value_tys) {
+            check_ty(ty, &program.tagged_types)?;
+        }
+    }
+    for ext in &program.externs {
+        check_ty(ext.ret, &program.tagged_types)?;
+        for &ty in &ext.params {
+            check_ty(ty, &program.tagged_types)?;
+        }
+    }
+    for import in &program.imported_fns {
+        check_ty(import.ret, &program.tagged_types)?;
+        for &ty in &import.params {
+            check_ty(ty, &program.tagged_types)?;
+        }
+    }
+    if !align_mir::tagged_types_are_canonical(program) {
+        return Err(CodegenError::Lowering(
+            "nested tagged type table is not compact, unique, and canonical".to_string(),
+        ));
     }
     Ok(())
 }
@@ -3068,13 +3291,20 @@ fn float_type<'c>(ctx: &'c Context, ty: Ty) -> FloatType<'c> {
 /// `struct_types`.
 /// A scalar's LLVM type. `sx` is the struct-type table (needed when the scalar is a
 /// struct payload — `Option`/`Result` can carry a struct).
-fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> BasicTypeEnum<'c> {
+fn scalar_type<'c>(
+    ctx: &'c Context,
+    ty: Ty,
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+    tx: &[StructType<'c>],
+) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Float(_) => float_type(ctx, ty).into(),
         Ty::Struct(id) => sx[id as usize].into(),
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
         // A sum type lowers to its non-union tagged struct `{ i32 tag, … }`.
         Ty::Enum(id) => ex[id as usize].into(),
+        Ty::Tagged(id) => tx[id as usize].into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
@@ -3129,17 +3359,36 @@ fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
 }
 
 /// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
-fn option_struct_type<'c>(ctx: &'c Context, s: Scalar, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> StructType<'c> {
-    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s), sx, ex)], false)
-}
-
-/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
-fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> StructType<'c> {
+fn option_struct_type<'c>(
+    ctx: &'c Context,
+    s: Scalar,
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+    tx: &[StructType<'c>],
+) -> StructType<'c> {
     ctx.struct_type(
         &[
             ctx.i8_type().into(),
-            scalar_type(ctx, scalar_to_ty(ok), sx, ex),
-            scalar_type(ctx, scalar_to_ty(err), sx, ex),
+            scalar_type(ctx, scalar_to_ty(s), sx, ex, tx),
+        ],
+        false,
+    )
+}
+
+/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
+fn result_struct_type<'c>(
+    ctx: &'c Context,
+    ok: Scalar,
+    err: Scalar,
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+    tx: &[StructType<'c>],
+) -> StructType<'c> {
+    ctx.struct_type(
+        &[
+            ctx.i8_type().into(),
+            scalar_type(ctx, scalar_to_ty(ok), sx, ex, tx),
+            scalar_type(ctx, scalar_to_ty(err), sx, ex, tx),
         ],
         false,
     )
@@ -3172,18 +3421,42 @@ fn closure_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
 
 /// LLVM type for a function parameter/return (scalars + `Option`/`Result`/`slice`/`str`,
 /// and structs/struct-arrays by value).
-fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> BasicTypeEnum<'c> {
+fn abi_type<'c>(
+    ctx: &'c Context,
+    ty: Ty,
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+    tx: &[StructType<'c>],
+) -> BasicTypeEnum<'c> {
     match ty {
-        Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
-        Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Option(s) => option_struct_type(ctx, s, sx, ex, tx).into(),
+        Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex, tx).into(),
+        Ty::Tagged(id) => tx[id as usize].into(),
+        Ty::Box(_)
+        | Ty::ArenaHandle
+        | Ty::Builder
+        | Ty::StrFinder
+        | Ty::Writer
+        | Ty::Reader
+        | Ty::Buffer
+        | Ty::ArrayBuilder(_)
+        | Ty::Regex
+        | Ty::Captures
+        | Ty::TcpConn
+        | Ty::TcpListener
+        | Ty::UdpSocket
+        | Ty::Child
+        | Ty::File
+        | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
-        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
-        _ => scalar_type(ctx, ty, sx, ex),
+        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
+            slice_struct_type(ctx).into()
+        }
+        _ => scalar_type(ctx, ty, sx, ex, tx),
     }
 }
 
@@ -3415,7 +3688,12 @@ fn task_tramp_key(ty: Ty) -> String {
 /// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
 /// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
 /// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
-fn field_abi_align(ty: Ty, structs: &[StructDef], enums: &[EnumDef]) -> u64 {
+fn field_abi_align(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> u64 {
     match ty {
         Ty::Int(it) => (it.bits / 8).max(1) as u64,
         Ty::Float(ft) => (ft.bits / 8) as u64,
@@ -3425,7 +3703,7 @@ fn field_abi_align(ty: Ty, structs: &[StructDef], enums: &[EnumDef]) -> u64 {
         Ty::Struct(id) | Ty::StructArray(id, _) => structs[id as usize]
             .fields
             .iter()
-            .map(|f| field_abi_align(f.ty, structs, enums))
+            .map(|f| field_abi_align(f.ty, structs, enums, tagged_types))
             .max()
             .unwrap_or(1),
         // A sum type lowers to `{ i32 tag, <payloads flattened> }` (`enum_types`), so its ABI
@@ -3435,9 +3713,42 @@ fn field_abi_align(ty: Ty, structs: &[StructDef], enums: &[EnumDef]) -> u64 {
             e.variants
                 .iter()
                 .flat_map(|v| v.payload.iter())
-                .map(|&s| field_abi_align(scalar_to_ty(s), structs, enums))
+                .map(|&s| field_abi_align(scalar_to_ty(s), structs, enums, tagged_types))
                 .fold(4, u64::max)
         }),
+        Ty::Option(payload) => {
+            field_abi_align(scalar_to_ty(payload), structs, enums, tagged_types)
+        }
+        Ty::Result(ok, err) => field_abi_align(
+            scalar_to_ty(ok),
+            structs,
+            enums,
+            tagged_types,
+        )
+        .max(field_abi_align(
+            scalar_to_ty(err),
+            structs,
+            enums,
+            tagged_types,
+        )),
+        Ty::Tagged(id) => match tagged_types.get(id as usize) {
+            Some(hir::TaggedType::Option(payload)) => {
+                field_abi_align(scalar_to_ty(*payload), structs, enums, tagged_types)
+            }
+            Some(hir::TaggedType::Result(ok, err)) => field_abi_align(
+                scalar_to_ty(*ok),
+                structs,
+                enums,
+                tagged_types,
+            )
+            .max(field_abi_align(
+                scalar_to_ty(*err),
+                structs,
+                enums,
+                tagged_types,
+            )),
+            None => 1,
+        },
         Ty::Array(s, _) => scalar_bytes(s).clamp(1, 8),
         _ => 8,
     }
@@ -3448,14 +3759,26 @@ fn field_abi_align(ty: Ty, structs: &[StructDef], enums: &[EnumDef]) -> u64 {
 /// (a *stable* sort), so the layout is deterministic. A `layout(C)` struct keeps declaration order
 /// (identity map) — its byte layout is the FFI/`raw`/json boundary and must not move. The returned
 /// vector `m` satisfies `m[logical] = physical`; invert with [`physical_order`] to emit the body.
-fn logical_to_physical(s: &StructDef, structs: &[StructDef], enums: &[EnumDef]) -> Vec<u32> {
+fn logical_to_physical(
+    s: &StructDef,
+    structs: &[StructDef],
+    enums: &[EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Vec<u32> {
     let n = s.fields.len();
     if s.c_repr {
         return (0..n as u32).collect();
     }
     // Physical order = logical indices sorted by descending alignment (stable → decl order on ties).
     let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, structs, enums)));
+    order.sort_by_key(|&i| {
+        std::cmp::Reverse(field_abi_align(
+            s.fields[i as usize].ty,
+            structs,
+            enums,
+            tagged_types,
+        ))
+    });
     // Invert: `map[logical] = physical`.
     let mut map = vec![0u32; n];
     for (phys, &logical) in order.iter().enumerate() {
@@ -3498,14 +3821,25 @@ fn set_struct_body<'c>(
     perm: &[u32],
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
+    tagged_types: &[StructType<'c>],
     target_data: &inkwell::targets::TargetData,
 ) {
     // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view, a
     // nested struct to its (now-created) struct type, a sum-type field to its `enum_types` entry —
     // J1b). Fields are emitted in physical order: physical slot `p` holds the logical field whose map
     // entry is `p`. The enum types must already exist (created opaque/literal before this runs).
-    let mut fields: Vec<BasicTypeEnum> =
-        physical_order(perm).iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, struct_types, enum_types)).collect();
+    let mut fields: Vec<BasicTypeEnum> = physical_order(perm)
+        .iter()
+        .map(|&li| {
+            abi_type(
+                ctx,
+                s.fields[li as usize].ty,
+                struct_types,
+                enum_types,
+                tagged_types,
+            )
+        })
+        .collect();
     if let Some(a) = s.align {
         // Measure the natural size (from an anonymous struct of the same fields), then pad the type
         // up to `round_up(natural_size, align)` so the array stride is over-aligned.
@@ -3547,6 +3881,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::JsonDoc => 16,
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
+        Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
@@ -3699,6 +4034,7 @@ fn abi_map_ty<'c>(
     ty: Ty,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
+    tagged_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
 ) -> BasicTypeEnum<'c> {
     match ty {
@@ -3707,9 +4043,14 @@ fn abi_map_ty<'c>(
         Ty::Tuple(id) => tuple_types[id as usize].into(),
         // No array-typed params/returns arise yet (arrays coerce to slices at calls),
         // but mirror `llvm_type` so it stays correct once array annotations land.
-        Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types).array_type(n).into(),
+        Ty::Array(s, n) => {
+            scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types, tagged_types)
+                .array_type(n)
+                .into()
+        }
         Ty::Enum(id) => enum_types[id as usize].into(),
-        _ => abi_type(ctx, ty, struct_types, enum_types),
+        Ty::Tagged(id) => tagged_types[id as usize].into(),
+        _ => abi_type(ctx, ty, struct_types, enum_types, tagged_types),
     }
 }
 
@@ -3724,12 +4065,18 @@ fn declare_fn<'c>(
     symbol: &str,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
+    tagged_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
     exports: &[String],
 ) -> FunctionValue<'c> {
-    let map = |ty: Ty| -> BasicTypeEnum<'c> { abi_map_ty(ctx, ty, struct_types, enum_types, tuple_types) };
-    let param_types: Vec<BasicMetadataTypeEnum> =
-        f.params.iter().map(|s| map(f.slots[*s as usize]).into()).collect();
+    let map = |ty: Ty| -> BasicTypeEnum<'c> {
+        abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
+    };
+    let param_types: Vec<BasicMetadataTypeEnum> = f
+        .params
+        .iter()
+        .map(|s| map(f.slots[*s as usize]).into())
+        .collect();
     let fn_ty = if f.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
@@ -3783,10 +4130,14 @@ fn declare_imported_fn<'c>(
     imp: &align_sema::hir::ImportedFn,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
+    tagged_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
 ) -> FunctionValue<'c> {
-    let map = |ty: Ty| -> BasicTypeEnum<'c> { abi_map_ty(ctx, ty, struct_types, enum_types, tuple_types) };
-    let param_types: Vec<BasicMetadataTypeEnum> = imp.params.iter().map(|&ty| map(ty).into()).collect();
+    let map = |ty: Ty| -> BasicTypeEnum<'c> {
+        abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
+    };
+    let param_types: Vec<BasicMetadataTypeEnum> =
+        imp.params.iter().map(|&ty| map(ty).into()).collect();
     let fn_ty = if imp.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
@@ -4280,6 +4631,9 @@ struct FnGen<'c, 'a> {
     /// Sum-type LLVM structs, indexed by the id in [`Ty::Enum`].
     enum_types: &'a [StructType<'c>],
     enums: &'a [EnumDef],
+    /// Nested tagged LLVM types and the semantic table that defines their payloads.
+    tagged_types: &'a [StructType<'c>],
+    tagged_defs: &'a [hir::TaggedType],
     /// Anonymous tuple types, indexed by the id in [`Ty::Tuple`].
     tuple_types: &'a [StructType<'c>],
     /// Tuple defs (element scalars) — to know which tuple elements are owned (Move) when dropping.
@@ -4809,6 +5163,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Ty::Tuple(id) => self.tuple_types.get(id as usize).is_some(),
             Ty::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            Ty::Tagged(id) => self.tagged_defs.get(id as usize).is_some(),
             Ty::Option(s) => self.validate_par_map_scalar(s),
             Ty::Result(ok, err) => self.validate_par_map_scalar(ok) && self.validate_par_map_scalar(err),
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => self.validate_par_map_scalar(s),
@@ -4824,11 +5179,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// load-and-drop or a copied owning capture.
     fn validate_par_map_kernel_type(&self, ty: Ty) -> Result<(), CodegenError> {
         self.validate_par_map_type(ty)?;
-        let valid = matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
-            || matches!(ty, Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums));
-        valid
-            .then_some(())
-            .ok_or_else(|| self.err(format!("par_map range kernel values must be primitive, str, or a Copy struct, got {ty:?}")))
+        let valid = matches!(
+            ty,
+            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
+        ) || matches!(ty, Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums, self.tagged_defs));
+        valid.then_some(()).ok_or_else(|| {
+            self.err(format!(
+                "par_map range kernel values must be primitive, str, or a Copy struct, got {ty:?}"
+            ))
+        })
     }
 
     /// A range input may additionally be a borrowed `slice<T>` header. This is the element value
@@ -4850,8 +5209,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// element layouts.
     fn validate_par_map_capture_type(&self, ty: Ty) -> Result<(), CodegenError> {
         self.validate_par_map_type(ty)?;
-        if align_sema::ty_capture_is_move(ty, self.structs, self.tuples, self.enums) {
-            return Err(self.err(format!("par_map captures must be Copy values, got owning {ty:?}")));
+        if align_sema::ty_capture_is_move(
+            ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_defs,
+        ) {
+            return Err(self.err(format!(
+                "par_map captures must be Copy values, got owning {ty:?}"
+            )));
         }
         let supported = matches!(
             ty,
@@ -4873,6 +5240,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 | Ty::JsonScanner(_)
                 | Ty::Option(_)
                 | Ty::Result(_, _)
+                | Ty::Tagged(_)
                 | Ty::Enum(_)
                 | Ty::Rng
                 | Ty::Fn(_)
@@ -4932,6 +5300,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match scalar {
             Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => self.struct_types.get(id as usize).is_some(),
             Scalar::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            Scalar::Tagged(id) => self.tagged_defs.get(id as usize).is_some(),
             _ => true,
         }
     }
@@ -5916,7 +6285,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let buf = self.builder.build_extract_value(sv, 0, "vsbuf").map_err(|e| self.err(e))?.into_pointer_value();
                     let index = self.operand(index)?.into_int_value();
                     let val = self.operand(value)?;
-                    let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                    let elem_lt = scalar_type(
+                        self.ctx,
+                        *elem,
+                        self.struct_types,
+                        self.enum_types,
+                        self.tagged_types,
+                    );
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vstoregep").map_err(|e| self.err(e))?
                     };
@@ -5942,7 +6317,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .get(*struct_id as usize)
                         .and_then(|s| s.fields.get(*field as usize))
                         .ok_or_else(|| self.err("soa column field index out of bounds"))?;
-                    let fty = scalar_type(self.ctx, field_def.ty, self.struct_types, self.enum_types);
+                    let fty = scalar_type(
+                        self.ctx,
+                        field_def.ty,
+                        self.struct_types,
+                        self.enum_types,
+                        self.tagged_types,
+                    );
                     let idx_v = self.operand(index)?.into_int_value();
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[idx_v], "colelem").map_err(|e| self.err(e))?
@@ -5999,9 +6380,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // element's owned fields read {null,0} until constructed — its per-element
                         // `Drop` then frees nulls on an unwritten element (no-op). (Slice 4a.)
                         self.llvm_type(ty).into_array_type().const_zero().into()
-                    } else if (matches!(ty, Ty::Option(_) | Ty::Result(..))
-                        && drop_plan(ty, self.structs, self.enums).needs_drop())
-                        || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..))
+                    } else if (matches!(ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+                        && drop_plan(ty, self.structs, self.enums, self.tagged_defs).needs_drop())
+                        || matches!(
+                            ty,
+                            Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..)
+                        )
                     {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
@@ -6040,15 +6424,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let field_ptr = self
                         .builder
-                        .build_struct_gep(self.struct_types[sid as usize], self.slots[slot], self.pfield(sid, *idx), "nullstructfld")
+                        .build_struct_gep(
+                            self.struct_types[sid as usize],
+                            self.slots[slot],
+                            self.pfield(sid, *idx),
+                            "nullstructfld",
+                        )
                         .map_err(|e| self.err(e))?;
                     let zero: inkwell::values::BasicValueEnum = match self.structs[sid as usize].fields[*idx as usize].ty {
                         Ty::Enum(eid) => self.enum_types[eid as usize].const_zero().into(),
                         Ty::Option(payload) => {
-                            option_struct_type(self.ctx, payload, self.struct_types, self.enum_types)
+                            option_struct_type(
+                                self.ctx,
+                                payload,
+                                self.struct_types,
+                                self.enum_types,
+                                self.tagged_types,
+                            )
                                 .const_zero()
                                 .into()
                         }
+                        ty @ (Ty::Result(..) | Ty::Tagged(_)) => self
+                            .llvm_type(ty)
+                            .into_struct_type()
+                            .const_zero()
+                            .into(),
                         // A Move **handle** field is a single opaque POINTER, not a `{ptr,len}` —
                         // zeroing it with a 16-byte slice struct would clobber the next field.
                         // `handle_free_fn` is the same predicate that decides its drop is a pointer
@@ -6122,8 +6522,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Option(_) | Ty::Result(..))
-                        && drop_plan(ty, self.structs, self.enums).needs_drop()
+                    } else if matches!(ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+                        && drop_plan(ty, self.structs, self.enums, self.tagged_defs).needs_drop()
                     {
                         // Tagged Drop is tag-switched and recursive. Only the active payload is
                         // inspected, and that payload uses the same destructor as a standalone value.
@@ -6221,7 +6621,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // A Move sum type (J2): tag-switched drop — free the live variant's owned
                         // `array<Struct>` payload buffer (null-safe on a moved-out / unconstructed slot).
                         self.drop_enum(self.slots[slot], eid)?;
-                    } else if matches!(ty, Ty::DynStructArray(eid, _) if struct_is_move(eid, self.structs, self.enums)) {
+                    } else if matches!(ty, Ty::DynStructArray(eid, _) if struct_is_move(eid, self.structs, self.enums, self.tagged_defs))
+                    {
                         // An owned `array<Move-struct>` standalone local (J3b) — e.g.
                         // `ms: array<Message> := json.decode(...)`. Deep-free each element's owned buffers
                         // then the AoS, via the same helper the struct-*field* drop uses (a flat free
@@ -6365,10 +6766,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             return Err(self.err("checked result is not an Option"));
                         };
                         let name = format!("llvm.{sign}{opname}.with.overflow");
-                        let agg = self.call_overflow_intrinsic(&name, llvm_int, av, bv)?.into_struct_value();
-                        let res = self.builder.build_extract_value(agg, 0, "res").map_err(|e| self.err(e))?;
-                        let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
-                        let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
+                        let agg = self
+                            .call_overflow_intrinsic(&name, llvm_int, av, bv)?
+                            .into_struct_value();
+                        let res = self
+                            .builder
+                            .build_extract_value(agg, 0, "res")
+                            .map_err(|e| self.err(e))?;
+                        let ovf = self
+                            .builder
+                            .build_extract_value(agg, 1, "of")
+                            .map_err(|e| self.err(e))?
+                            .into_int_value();
+                        let oty = option_struct_type(
+                            self.ctx,
+                            s,
+                            self.struct_types,
+                            self.enum_types,
+                            self.tagged_types,
+                        );
                         let some_tag = self.ctx.i8_type().const_int(1, false);
                         let none_tag = self.ctx.i8_type().const_int(0, false);
                         let tag = self
@@ -6399,9 +6815,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 let is_float = matches!(elem, Ty::Float(_));
                 let signed = is_signed(elem);
-                let overload = scalar_type(self.ctx, *ty, self.struct_types, self.enum_types);
-                let ops: Vec<BasicValueEnum> =
-                    operands.iter().map(|o| self.operand(o)).collect::<Result<_, _>>()?;
+                let overload = scalar_type(
+                    self.ctx,
+                    *ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                let ops: Vec<BasicValueEnum> = operands
+                    .iter()
+                    .map(|o| self.operand(o))
+                    .collect::<Result<_, _>>()?;
                 match fn_ {
                     align_sema::MathFn::Abs => {
                         if is_float {
@@ -6459,7 +6883,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::Field(slot, path) => {
-                let fty = abi_type(self.ctx, self.field_path_ty(*slot, path), self.struct_types, self.enum_types);
+                let fty = abi_type(
+                    self.ctx,
+                    self.field_path_ty(*slot, path),
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let field_ptr = self.field_path_ptr(*slot, path)?;
                 self.builder
                     .build_load(fty, field_ptr, "fld")
@@ -6493,7 +6923,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Option(s) = result_ty else {
                     return Err(self.err("Some result is not an Option"));
                 };
-                let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
+                let oty = option_struct_type(
+                    self.ctx,
+                    s,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let payload = self.operand(op)?;
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Start zeroed (not poison): an owned (Move) payload's drop frees the payload field
@@ -6514,7 +6950,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Err(self.err("None result is not an Option"));
                 };
                 // All-zero aggregate → tag 0 (None).
-                option_struct_type(self.ctx, s, self.struct_types, self.enum_types).const_zero().into()
+                option_struct_type(
+                    self.ctx,
+                    s,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                )
+                .const_zero()
+                .into()
             }
             Rvalue::OptionIsSome(op) => {
                 let agg = self.operand(op)?.into_struct_value();
@@ -6538,7 +6982,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Ok result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
+                let rty = result_struct_type(
+                    self.ctx,
+                    o,
+                    e,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let tag = self.ctx.i8_type().const_int(0, false);
                 // Zeroed base (see OptionSome): the inactive `err` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -6557,7 +7008,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Err result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
+                let rty = result_struct_type(
+                    self.ctx,
+                    o,
+                    e,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Zeroed base (see OptionSome): the inactive `ok` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -6656,7 +7114,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let env: BasicValueEnum = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                 } else {
-                    let fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, self.enum_types)).collect();
+                    let fields: Vec<BasicTypeEnum> = capture_tys
+                        .iter()
+                        .map(|t| {
+                            abi_type(
+                                self.ctx,
+                                *t,
+                                self.struct_types,
+                                self.enum_types,
+                                self.tagged_types,
+                            )
+                        })
+                        .collect();
                     let env_struct = self.ctx.struct_type(&fields, false);
                     let size = self.target_data.get_store_size(&env_struct);
                     let align = self.target_data.get_abi_alignment(&env_struct) as u64;
@@ -6673,12 +7142,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
                 let rbytes = match r {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit => {
-                        let t = scalar_type(self.ctx, *r, self.struct_types, self.enum_types);
+                        let t = scalar_type(
+                            self.ctx,
+                            *r,
+                            self.struct_types,
+                            self.enum_types,
+                            self.tagged_types,
+                        );
                         self.target_data.get_store_size(&t)
                     }
                     _ => return Err(self.err("a spawned task result must be a primitive scalar")),
                 };
-                let ralign = self.target_data.get_abi_alignment(&scalar_type(self.ctx, *r, self.struct_types, self.enum_types)) as u64;
+                let ralign = self.target_data.get_abi_alignment(&scalar_type(
+                    self.ctx,
+                    *r,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                )) as u64;
                 let slot = self
                     .builder
                     .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
@@ -6722,8 +7203,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let Ty::Result(o, e) = result_ty else {
                         return Err(self.err("wait result is not a Result"));
                     };
-                    let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
-                    let ety = scalar_type(self.ctx, scalar_to_ty(e), self.struct_types, self.enum_types);
+                    let rty = result_struct_type(
+                        self.ctx,
+                        o,
+                        e,
+                        self.struct_types,
+                        self.enum_types,
+                        self.tagged_types,
+                    );
+                    let ety = scalar_type(
+                        self.ctx,
+                        scalar_to_ty(e),
+                        self.struct_types,
+                        self.enum_types,
+                        self.tagged_types,
+                    );
                     let rslot = self.alloca_at_entry(rty.into(), "waitr")?;
                     let is_err = self
                         .builder
@@ -6804,8 +7298,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // then load `scalar_type(scalar)`. An arbitrary byte offset may be misaligned for the
                 // scalar, so force alignment 1 (an unaligned load) — always correct, never LLVM-UB.
                 let ep = self.raw_elem_ptr(ptr, offset)?;
-                let lty = scalar_type(self.ctx, align_sema::scalar_to_ty(*scalar), self.struct_types, self.enum_types);
-                let loaded = self.builder.build_load(lty, ep, "rawval").map_err(|e| self.err(e))?;
+                let lty = scalar_type(
+                    self.ctx,
+                    align_sema::scalar_to_ty(*scalar),
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                let loaded = self
+                    .builder
+                    .build_load(lty, ep, "rawval")
+                    .map_err(|e| self.err(e))?;
                 // The loaded type is a raw scalar (int/bool/char or float) or a `layout(C)` struct;
                 // set the load's alignment to 1 (an arbitrary byte offset may be misaligned) via the
                 // concrete value's instruction.
@@ -6824,7 +7327,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.raw_elem_ptr(ptr, offset)?.into()
             }
             Rvalue::BoxGet(op) => {
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
+                let ty = scalar_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let ptr = self.operand(op)?.into_pointer_value();
                 self.builder
                     .build_load(ty, ptr, "boxget")
@@ -6832,13 +7341,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
+                let ty = scalar_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                self.builder
+                    .build_load(ty, ep, "idx")
+                    .map_err(|e| self.err(e))?
             }
             Rvalue::IndexField(slot, idx, path) => {
                 let ep = self.elem_field_ptr(*slot, idx, path)?;
-                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
+                let ty = abi_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                self.builder
+                    .build_load(ty, ep, "idxfld")
+                    .map_err(|e| self.err(e))?
             }
             // Build `<n x elem>` via an insertelement chain over a poison vector (M6).
             Rvalue::MakeVec { elems, elem, n } => {
@@ -6908,7 +7433,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sv = self.operand(slice)?.into_struct_value();
                 let buf = self.builder.build_extract_value(sv, 0, "vlbuf").map_err(|e| self.err(e))?.into_pointer_value();
                 let index = self.operand(index)?.into_int_value();
-                let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                let elem_lt = scalar_type(
+                    self.ctx,
+                    *elem,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let ep = unsafe {
                     self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vloadgep").map_err(|e| self.err(e))?
                 };
@@ -6936,8 +7467,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_in_bounds_gep(st, buf, &[index, f], "aosfield")
                         .map_err(|e| self.err(e))?
                 };
-                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                self.builder.build_load(ty, ep, "idxfldp").map_err(|e| self.err(e))?
+                let ty = abi_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                self.builder
+                    .build_load(ty, ep, "idxfldp")
+                    .map_err(|e| self.err(e))?
             }
             Rvalue::IndexColumn { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` column-major soa buffer. Each column j occupies
@@ -6953,13 +7492,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let col_base = unsafe {
                     self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
                 };
-                let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[*field as usize].ty, self.struct_types, self.enum_types);
+                let fty = scalar_type(
+                    self.ctx,
+                    self.structs[*struct_id as usize].fields[*field as usize].ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let index = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder.build_in_bounds_gep(fty, col_base, &[index], "colelem").map_err(|e| self.err(e))?
                 };
-                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                self.builder.build_load(ty, ep, "idxcol").map_err(|e| self.err(e))?
+                let ty = abi_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                self.builder
+                    .build_load(ty, ep, "idxcol")
+                    .map_err(|e| self.err(e))?
             }
             // `s[index]` — gather a whole struct from a soa: load every column's element at `index`
             // and build the struct aggregate (the multi-column counterpart of `IndexColumn`).
@@ -6977,7 +7530,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let col_base = unsafe {
                         self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "gcolbase").map_err(|e| self.err(e))?
                     };
-                    let fty = scalar_type(self.ctx, field.ty, self.struct_types, self.enum_types);
+                    let fty = scalar_type(
+                        self.ctx,
+                        field.ty,
+                        self.struct_types,
+                        self.enum_types,
+                        self.tagged_types,
+                    );
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[index], "gcolelem").map_err(|e| self.err(e))?
                     };
@@ -7621,7 +8180,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
                     Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
                     Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-                    _ => return Err(self.err("par_map reduction source shape could not be resolved")),
+                    _ => {
+                        return Err(
+                            self.err("par_map reduction source shape could not be resolved")
+                        );
+                    }
                 };
                 if source_elem_ty != *elem_in {
                     return Err(self.err(format!(
@@ -7815,7 +8378,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_select(found, idx, i64t.const_zero(), "fpayload")
                             .map_err(|e| self.err(e))?;
-                        let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
+                        let oty = option_struct_type(
+                            self.ctx,
+                            s,
+                            self.struct_types,
+                            self.enum_types,
+                            self.tagged_types,
+                        );
                         let agg = self
                             .builder
                             .build_insert_value(oty.const_zero(), tag, 0, "ftag")
@@ -9285,8 +9854,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::SliceIndex(s, idx) => {
                 let agg = self.operand(s)?.into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
+                let ptr = self
+                    .builder
+                    .build_extract_value(agg, 0, "ptr")
+                    .map_err(|e| self.err(e))?
+                    .into_pointer_value();
+                let ty = scalar_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -9300,8 +9879,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // knows this source load can't overlap the (`out`-scoped) `dst` store.
                 // `alias.scope = {in}`, `noalias = {out}`.
                 let agg = self.operand(slice)?.into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
+                let ptr = self
+                    .builder
+                    .build_extract_value(agg, 0, "ptr")
+                    .map_err(|e| self.err(e))?
+                    .into_pointer_value();
+                let ty = scalar_type(
+                    self.ctx,
+                    result_ty,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let idx = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -9324,8 +9913,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `i8` bytes for a `str`) and pair it with the precomputed `len`, yielding a borrowed
                 // `{ptr,len}` view of the same backing storage (no allocation).
                 let agg = self.operand(base)?.into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "subptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let ety = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                let ptr = self
+                    .builder
+                    .build_extract_value(agg, 0, "subptr")
+                    .map_err(|e| self.err(e))?
+                    .into_pointer_value();
+                let ety = scalar_type(
+                    self.ctx,
+                    *elem,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let start_v = self.operand(start)?.into_int_value();
                 let newptr = unsafe {
                     self.builder
@@ -9349,7 +9948,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
                 };
-                let ty = scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types);
+                let ty = scalar_type(
+                    self.ctx,
+                    scalar_to_ty(s),
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);
                 // Allocate a fresh box, then copy the value over.
@@ -9463,8 +10068,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A capturing closure: copy the captures into a frame-local env, then build
                 // `{ thunk_ptr, env_ptr }` where the thunk unpacks the env into the lifted fn's
                 // trailing capture parameters.
-                let env_fields: Vec<BasicTypeEnum> =
-                    capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, self.enum_types)).collect();
+                let env_fields: Vec<BasicTypeEnum> = capture_tys
+                    .iter()
+                    .map(|t| {
+                        abi_type(
+                            self.ctx,
+                            *t,
+                            self.struct_types,
+                            self.enum_types,
+                            self.tagged_types,
+                        )
+                    })
+                    .collect();
                 let env_struct = self.ctx.struct_type(&env_fields, false);
                 let env_ptr = self.alloca_at_entry(env_struct.into(), "clos_env")?;
                 for (i, op) in captures.iter().enumerate() {
@@ -9531,11 +10146,50 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
-            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
-            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Option(s) => option_struct_type(
+                self.ctx,
+                s,
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            )
+            .into(),
+            Ty::Result(o, e) => result_struct_type(
+                self.ctx,
+                o,
+                e,
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            )
+            .into(),
+            Ty::Tagged(id) => self.tagged_types[id as usize].into(),
+            Ty::Box(_)
+            | Ty::ArenaHandle
+            | Ty::Builder
+            | Ty::StrFinder
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::ArrayBuilder(_)
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::File
+            | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
-            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
+            Ty::Array(s, n) => scalar_type(
+                self.ctx,
+                scalar_to_ty(s),
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            )
+            .array_type(n)
+            .into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
@@ -9543,7 +10197,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
             // `rng` — the Xoshiro256++ state, `[4 x i64]` (a Copy by-value aggregate).
             Ty::Rng => rng_llvm_type(self.ctx),
-            _ => scalar_type(self.ctx, ty, self.struct_types, self.enum_types),
+            _ => scalar_type(
+                self.ctx,
+                ty,
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            ),
         }
     }
 
@@ -9684,20 +10344,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A tagged field owns only its active payload. Reuse the canonical recursive
                 // destructor so `Option<MoveStruct>` and later nested owned shapes cannot diverge
                 // from standalone Option/Result cleanup.
-                Ty::Option(payload)
+                ty @ (Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
                     if drop_plan(
-                        Ty::Option(payload),
+                        ty,
                         self.structs,
                         self.enums,
+                        self.tagged_defs,
                     )
                     .needs_drop() =>
                 {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropopt").map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, Ty::Option(payload))?;
+                    self.drop_ty_at(fp, ty)?;
                 }
                 // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
-                Ty::Struct(nid) if struct_is_move(nid, self.structs, self.enums) => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropnest").map_err(|e| self.err(e))?;
+                Ty::Struct(nid)
+                    if struct_is_move(nid, self.structs, self.enums, self.tagged_defs) =>
+                {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropnest")
+                        .map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
                 }
                 // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
@@ -9705,16 +10371,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // owned buffer via `drop_enum` (a non-Move enum owns nothing → not a Move struct field →
                 // never reaches here). `DropFlagInit` zeroes the aggregate, so a moved-out / unconstructed
                 // enum field reads tag 0 and frees `null` — null-safe, single-free every path.
-                Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums) => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropenumfld").map_err(|e| self.err(e))?;
+                Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_defs) => {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropenumfld")
+                        .map_err(|e| self.err(e))?;
                     self.drop_enum(fp, eid)?;
                 }
                 // An owned `array<Move-struct>` field (J3b) — the `Chat { messages: array<Message> }`
                 // shape, where each element owns a buffer (a `string`/owned-array field, or a Move-enum
                 // field like `Message`'s `content`). Deep-free each element then the AoS (`free(null)` is
                 // a no-op for an empty array) via the shared helper.
-                Ty::DynStructArray(eid, _) if struct_is_move(eid, self.structs, self.enums) => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropdeeparr").map_err(|e| self.err(e))?;
+                Ty::DynStructArray(eid, _)
+                    if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
+                {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropdeeparr")
+                        .map_err(|e| self.err(e))?;
                     self.deep_free_struct_array(fp, eid)?;
                 }
                 // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
@@ -9736,8 +10410,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A nested Move-struct *array* field — drop each element (defensive: struct fields
                 // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
                 // owned case here means a future array-valued field can't silently fail-open and leak).
-                Ty::StructArray(eid, n) if struct_is_move(eid, self.structs, self.enums) => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropnestarr").map_err(|e| self.err(e))?;
+                Ty::StructArray(eid, n)
+                    if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
+                {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropnestarr")
+                        .map_err(|e| self.err(e))?;
                     let arr_ty = self.struct_types[eid as usize].array_type(n);
                     let zero = self.ctx.i64_type().const_zero();
                     for e in 0..n {
@@ -9783,9 +10462,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match ty {
             Ty::Option(payload) => self.drop_option_at(base, payload),
             Ty::Result(ok, err) => self.drop_result_at(base, ok, err),
+            Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
+                Some(hir::TaggedType::Option(payload)) => self.drop_option_at(base, *payload),
+                Some(hir::TaggedType::Result(ok, err)) => self.drop_result_at(base, *ok, *err),
+                None => Err(self.err(format!("nested tagged type id {id} is missing"))),
+            },
             Ty::Struct(id) => self.drop_struct_fields(base, id),
             Ty::Enum(id) => self.drop_enum(base, id),
-            Ty::DynStructArray(id, _) if struct_is_move(id, self.structs, self.enums) => {
+            Ty::DynStructArray(id, _)
+                if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
+            {
                 self.deep_free_struct_array(base, id)
             }
             Ty::DynArray(Scalar::String) => {
@@ -9849,8 +10535,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
         base: inkwell::values::PointerValue<'c>,
         payload: Scalar,
     ) -> Result<(), CodegenError> {
-        let option_ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types);
-        let tag_ptr = self.builder.build_struct_gep(option_ty, base, 0, "dropopttagp").map_err(|e| self.err(e))?;
+        let option_ty = option_struct_type(
+            self.ctx,
+            payload,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(option_ty, base, 0, "dropopttagp")
+            .map_err(|e| self.err(e))?;
         let tag = self
             .builder
             .build_load(self.ctx.i8_type(), tag_ptr, "dropopttag")
@@ -9890,16 +10585,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
         ok: Scalar,
         err: Scalar,
     ) -> Result<(), CodegenError> {
-        let result_ty = result_struct_type(self.ctx, ok, err, self.struct_types, self.enum_types);
-        let tag_ptr = self.builder.build_struct_gep(result_ty, base, 0, "droprestagp").map_err(|e| self.err(e))?;
+        let result_ty = result_struct_type(
+            self.ctx,
+            ok,
+            err,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(result_ty, base, 0, "droprestagp")
+            .map_err(|e| self.err(e))?;
         let tag = self
             .builder
             .build_load(self.ctx.i8_type(), tag_ptr, "droprestag")
             .map_err(|e| self.err(e))?
             .into_int_value();
         let cont = self.ctx.append_basic_block(self.func, "drop.result.cont");
-        let ok_plan = drop_plan(scalar_to_ty(ok), self.structs, self.enums);
-        let err_plan = drop_plan(scalar_to_ty(err), self.structs, self.enums);
+        let ok_plan = drop_plan(scalar_to_ty(ok), self.structs, self.enums, self.tagged_defs);
+        let err_plan = drop_plan(
+            scalar_to_ty(err),
+            self.structs,
+            self.enums,
+            self.tagged_defs,
+        );
         let ok_bb = ok_plan
             .needs_drop()
             .then(|| self.ctx.append_basic_block(self.func, "drop.result.ok"));
@@ -10007,6 +10717,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             scalar_to_ty(**s),
                             self.structs,
                             self.enums,
+                            self.tagged_defs,
                         )
                         .needs_drop()
                     })
@@ -10375,8 +11086,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// The byte offset of an `Option<s>`'s payload within its `{ i8 tag, payload }` LLVM layout
     /// (`option_struct_type` element 1) — where the decoder writes the `Some` value.
     fn option_payload_offset(&self, s: Scalar) -> u64 {
-        let opt_ty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
-        self.target_data.offset_of_element(&opt_ty, 1).expect("Option payload is element 1")
+        let opt_ty = option_struct_type(
+            self.ctx,
+            s,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        self.target_data
+            .offset_of_element(&opt_ty, 1)
+            .expect("Option payload is element 1")
     }
 
     /// The LLVM type of a nested-struct field's sub-schema, matching the runtime `JsonSubTable`
@@ -11962,9 +12681,157 @@ mod tests {
             link_libs: vec![],
             structs,
             enums,
+            tagged_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+    }
+
+    #[test]
+    fn malformed_nested_tagged_id_is_a_codegen_error_not_a_panic() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![Ty::Tagged(7)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![],
+        };
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a missing nested tagged id must fail closed");
+        assert!(
+            err.to_string().contains("nested tagged type id 7 is missing"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn direct_tagged_slot_uses_its_recursive_drop_plan() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![Ty::Tagged(0)],
+                slot_align: vec![None],
+                value_tys: vec![],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                    stmt_lines: vec![(0, 0); 2],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![hir::TaggedType::Option(Scalar::String)],
+            tuples: vec![],
+        };
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect("a valid direct nested-tagged slot must lower");
+        assert!(
+            ir.contains("dropoptissome"),
+            "Ty::Tagged Drop must dispatch through the expanded Option plan:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn noncanonical_nested_tagged_tables_fail_closed() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys,
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types,
+            tuples: vec![],
+        };
+        let cases = [
+            (
+                "unreachable",
+                program(
+                    vec![hir::TaggedType::Option(i64_scalar)],
+                    vec![],
+                ),
+            ),
+            (
+                "duplicate",
+                program(
+                    vec![
+                        hir::TaggedType::Option(i64_scalar),
+                        hir::TaggedType::Option(i64_scalar),
+                    ],
+                    vec![Ty::Tagged(0), Ty::Tagged(1)],
+                ),
+            ),
+            (
+                "source-ordered",
+                program(
+                    vec![
+                        hir::TaggedType::Result(i64_scalar, Scalar::Bool),
+                        hir::TaggedType::Option(i64_scalar),
+                    ],
+                    vec![Ty::Tagged(0), Ty::Tagged(1)],
+                ),
+            ),
+        ];
+        for (name, program) in cases {
+            let err = emit_llvm_ir(
+                &program,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("a malformed nested tagged table must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("not compact, unique, and canonical"),
+                "{name} table produced an unexpected diagnostic: {err}"
+            );
+        }
     }
 
     /// `print` of a value that is not an int / float / str / bool / char. Sema's `print_kind` gate
@@ -12636,6 +13503,7 @@ mod tests {
             link_libs: vec![],
             structs,
             enums: vec![],
+            tagged_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
@@ -12682,6 +13550,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            tagged_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
@@ -12725,6 +13594,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![row],
             enums: vec![],
+            tagged_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
@@ -12922,6 +13792,24 @@ mod tests {
             sdef("BothPtrs", false, &[Ty::HttpRequestCtx, Ty::Bool, Ty::HttpHeaders]), // (24, 8)
             sdef("FnField", false, &[Ty::Bool, Ty::Fn(0)]),                 // { {ptr,ptr}, i8 } → (24, 8)
             sdef("SliceField", false, &[Ty::Bool, Ty::Slice(align_sema::Scalar::Str)]), // (24, 8)
+            sdef(
+                "ResultField",
+                false,
+                &[
+                    Ty::Bool,
+                    Ty::Result(sc_int(64, true), align_sema::Scalar::String),
+                ],
+            ),
+            sdef(
+                "NestedTaggedField",
+                false,
+                &[Ty::Bool, Ty::Option(align_sema::Scalar::Tagged(0))],
+            ),
+            sdef(
+                "DirectTaggedField",
+                false,
+                &[Ty::Tagged(1), i(8, true)],
+            ),
             // The pkg.web `Ctx` shape itself: four `str` views + a `slice<u8>` + the header view.
             sdef(
                 "WebCtx",
@@ -12960,6 +13848,15 @@ mod tests {
             edef("EStr", &[&[align_sema::Scalar::Str], &[sc_int(64, true)]]),     // { i32, {ptr,len}, i64 }
             edef("EObj", &[&[align_sema::Scalar::Struct(2)], &[sc_int(32, true)]]), // { i32, Pair, i32 }
         ];
+        let tagged_defs = vec![
+            align_sema::hir::TaggedType::Result(
+                sc_int(64, true),
+                align_sema::Scalar::Bool,
+            ),
+            align_sema::hir::TaggedType::Option(
+                align_sema::Scalar::Tagged(0),
+            ),
+        ];
 
         let ctx = Context::create();
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).expect("target machine");
@@ -12975,22 +13872,78 @@ mod tests {
                 let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
                 for v in &e.variants {
                     for &s in &v.payload {
-                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[]));
+                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[], &[]));
                     }
                 }
                 ctx.struct_type(&fields, false)
             })
             .collect();
+        let tagged_types: Vec<StructType> = tagged_defs
+            .iter()
+            .enumerate()
+            .map(|(id, _)| ctx.opaque_struct_type(&format!("test.tagged.{id}")))
+            .collect();
+        for (tagged, tagged_type) in tagged_defs.iter().zip(&tagged_types) {
+            let fields = match *tagged {
+                align_sema::hir::TaggedType::Option(payload) => vec![
+                    ctx.i8_type().into(),
+                    scalar_type(
+                        &ctx,
+                        scalar_to_ty(payload),
+                        &struct_types,
+                        &enum_types,
+                        &tagged_types,
+                    ),
+                ],
+                align_sema::hir::TaggedType::Result(ok, err) => vec![
+                    ctx.i8_type().into(),
+                    scalar_type(
+                        &ctx,
+                        scalar_to_ty(ok),
+                        &struct_types,
+                        &enum_types,
+                        &tagged_types,
+                    ),
+                    scalar_type(
+                        &ctx,
+                        scalar_to_ty(err),
+                        &struct_types,
+                        &enum_types,
+                        &tagged_types,
+                    ),
+                ],
+            };
+            tagged_type.set_body(&fields, false);
+        }
         for (s, st) in structs.iter().zip(&struct_types) {
-            let perm = logical_to_physical(s, &structs, &enums);
-            set_struct_body(&ctx, *st, s, &perm, &struct_types, &enum_types, &td);
+            let perm =
+                logical_to_physical(s, &structs, &enums, &tagged_defs);
+            set_struct_body(
+                &ctx,
+                *st,
+                s,
+                &perm,
+                &struct_types,
+                &enum_types,
+                &tagged_types,
+                &td,
+            );
         }
 
         for (id, s) in structs.iter().enumerate() {
             let st = struct_types[id];
             let llvm = (td.get_abi_size(&st), td.get_abi_alignment(&st) as u64);
-            let sema = align_sema::struct_abi_layout(id as u32, &structs, &enums);
-            assert_eq!(sema, llvm, "layout parity mismatch on `{}` (sema {sema:?} vs LLVM {llvm:?})", s.name);
+            let sema = align_sema::struct_abi_layout(
+                id as u32,
+                &structs,
+                &enums,
+                &tagged_defs,
+            );
+            assert_eq!(
+                sema, llvm,
+                "layout parity mismatch on `{}` (sema {sema:?} vs LLVM {llvm:?})",
+                s.name
+            );
         }
     }
 
