@@ -5102,9 +5102,23 @@ impl EffectScan<'_> {
                 .get(field as usize)
                 .map(|value| self.projected_fn_effect(value, rest))
                 .unwrap_or(FnEffect::Unknown),
+            ExprKind::ArrayLit { elems, .. } => elems
+                .iter()
+                .map(|value| self.projected_fn_effect(value, path))
+                .reduce(FnEffect::join)
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::ArrayToArray { source, stages, .. } if stages.is_empty() => {
+                self.projected_fn_effect(source, path)
+            }
             ExprKind::Local(local) => {
                 let Some(mut ty) = self.locals.get(*local as usize).map(|local| local.ty) else {
                     return FnEffect::Unknown;
+                };
+                ty = match ty {
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                        Ty::Struct(id)
+                    }
+                    other => other,
                 };
                 for &index in path {
                     let Ty::Struct(id) = ty else {
@@ -5151,16 +5165,8 @@ impl EffectScan<'_> {
         };
         match ty {
             Ty::Struct(id) => self.join_concrete_struct_id_effects(id, incoming),
-            Ty::StructArray(id, _) => {
-                if let ExprKind::ArrayLit { elems, .. } = &incoming.kind {
-                    for elem in elems {
-                        self.join_concrete_struct_id_effects(id, elem);
-                    }
-                } else {
-                    // Fixed arrays are normally initialized by a literal. Preserve a fail-closed
-                    // fallback if another HIR producer is added before it gets precise projection.
-                    self.join_concrete_struct_id_effects(id, incoming);
-                }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                self.join_concrete_struct_id_effects(id, incoming);
             }
             _ => {}
         }

@@ -645,6 +645,27 @@ fn main() -> Result<(), Error> {
         check_errs("parmap-joined-generic-fn-array-literal", array_literal),
         "source-compatible generic wrapper array elements must join their concrete effects"
     );
+    let dynamic_array = array_literal.replace(
+        "  ]\n  return holders[0].callback(x)",
+        "  ].to_array()\n  return holders[x % 2].callback(x)",
+    );
+    assert!(
+        check_diagnostics("parmap-joined-generic-fn-dynamic-array", &dynamic_array)
+            .contains("has an observable side effect"),
+        "dynamic materialization must preserve the joined effects of its generic struct elements"
+    );
+    let replaced_dynamic_array = dynamic_array.replace(
+        "  holders := [\n    Holder { callback: quiet },\n    Holder { callback: loud },\n  ].to_array()",
+        "  mut holders := [\n    Holder { callback: quiet },\n    Holder { callback: quiet },\n  ].to_array()\n  holders = [\n    Holder { callback: quiet },\n    Holder { callback: loud },\n  ].to_array()",
+    );
+    assert!(
+        check_diagnostics(
+            "parmap-reassigned-generic-fn-dynamic-array",
+            &replaced_dynamic_array,
+        )
+        .contains("has an observable side effect"),
+        "dynamic array replacement must join the effects of every replacement element"
+    );
 }
 
 #[test]

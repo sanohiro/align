@@ -1515,12 +1515,12 @@ diagnostics, and LLVM named-type reuse use the latter; generic-function analysis
 former. Every pair sharing a source nominal name must have the same recursively id-free ABI shape
 or codegen rejects it before creating LLVM types. This prevents an inferred
 `Holder { callback: f }` from becoming incompatible with `Holder<fn(T) -> R>` while retaining
-separate Pure/Impure cells. Reassignment, field replacement, control-flow joins, and source-compatible
-struct-array formation into an origin-aware generic aggregate join the affected private effect cells;
-an explicitly annotated source-only aggregate has no concrete target and remains fail-closed
-`Unknown`. Splitting any one layer or either summary into a separately mergeable PR would temporarily
-permit two incompatible identities or require a compatibility path that this pre-release repository
-forbids.
+separate Pure/Impure cells. Reassignment, field replacement, control-flow joins, and
+source-compatible fixed or dynamic struct-array formation and materialization into an origin-aware
+generic aggregate join the affected private effect cells; an explicitly annotated source-only
+aggregate has no concrete target and remains fail-closed `Unknown`. Splitting any one layer or either
+summary into a separately mergeable PR would temporarily permit two incompatible identities or
+require a compatibility path that this pre-release repository forbids.
 
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the
