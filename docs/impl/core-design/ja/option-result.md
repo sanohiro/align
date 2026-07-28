@@ -52,7 +52,7 @@ Pure な機構である。`?` は制御フローであってエフェクトで�
 ## 仕様先行(未実装)
 
 - **コンビネータメソッドは存在しない**: `.map`、`.and_then`、`.unwrap_or`、`.ok()`、`.is_some` / `.is_none` / `.is_ok` / `.is_err` などのメソッドは存在しない — メソッドテーブルは `map_err` だけで打ち止めとなっている。これは現時点では実装漏れではなく、意図的な *設計上のスタンス* である。`match`、`else`、`?` が揃っていれば、コンビネータ風の第 2 の制御フロー言語（方言）を増やすことなく用途はまかなえる。これらのいずれかを追加する場合は設計上の判断（一方向の One-way レビュー）を伴うため、実装の前に `open-questions.md` で議論・記録すること。
-- **再帰的なタグ付き Move ペイロード（必須 L1a/L1b）**: Move エラーに対する `else` は捨てる `Err` を Drop し、`?` はそれを移動して伝播し、`match` は束縛した活性ペイロードを移動してコンテナを無効化しなければならない。`Option<Move>` フィールドと `Result` 内の Move sum も同じ計画を使う。これは残っているAPI判断ではなく、確定した実装作業である。任意の Move 要素を持つ配列と再帰型は別の課題として残る。
+- **残る再帰的なタグ付き Move の実装スライス**: L1b-a は、タグ付き arm ごとに既存の `Scalar` で直接表現できる Move ペイロードを1個まで受け入れ、再帰的な `Drop`、`match`、`else`、`?`、`map_err` を実装する。複数 Move ペイロードの部分構築と一様な所有モードは L1b-b、`Result<Option<T>, E>` のようなタグ付き型を入れ子にする表現は L1b-c が引き続き所有する。これらは残っているAPI判断ではなく、確定した実装スライスである。任意の新しい Move 要素レイアウトを持つ配列と再帰型は別の課題として残る。
 
 ## Pitfalls
 
@@ -63,5 +63,5 @@ Pure な機構である。`?` は制御フローであってエフェクトで�
 
 ## Test anchors
 
-`crates/align_driver/tests/enum_match.rs`（Error の variant、`error(c)` → exit code、`map_err` の変換、no-implicit-`?`-coercion、網羅性）。`m1.rs` / `m2.rs` での Option / Result の基本および `?`。`generics.rs:229`（ジェネリックな関数内での `o else d`）。`else_result.rs`（`Result` への `else` — Ok の素通り / Err のフォールバック / ネストした連鎖 / Move-Ok の二重解放なし / Move エラーの先送り制限）。`lint_unhandled_result.rs`。#308 における main-error の制限テスト。
+`crates/align_driver/tests/enum_match.rs`（Error の variant、`error(c)` → exit code、`map_err` の変換、no-implicit-`?`-coercion、網羅性）。`m1.rs` / `m2.rs` での Option / Result の基本および `?`。`generics.rs:229`（ジェネリックな関数内での `o else d`）。`else_result.rs`（`Result` への `else` — Ok の素通り / Err のフォールバック / ネストした連鎖 / Move-Ok の二重解放なし / Move Err の再帰 Drop）。`owned_tagged_payloads.rs`（Move struct/sum/string/handle、全制御経路、per-unit parity）。`lint_unhandled_result.rs`。#308 における main-error の制限テスト。
 例として `option.align`、`result.align`、`match_option_result.align`、`error_enum.align`。

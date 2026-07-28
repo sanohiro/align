@@ -5,7 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-28. `main` includes the shipped wave through #666.
+_Last updated: 2026-07-28. `main` includes the shipped wave through #667.
+#667 adds the canonical recursive Drop plan and sound `Option<string>` fields.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -83,6 +84,7 @@ facts must live in this repository.
 #660  chunk-source range kernels and direct integer chunk transform-reduce
 #662  measure-only chunks header allocation probe
 #664  parallelize compiler-recognised invariant string filters
+#667  recursive Drop plans and Option<string> owned fields
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -243,13 +245,14 @@ canonical recursive Drop plan and sound `Option<string>` struct fields are imple
 tag-tested Drop, move/null handling, focused analysis coverage, and an alloc-count benchmark.
 Partial Move-leaf replacement fails closed without an exact drop-old lowering, and fixed-array
 field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
-larger Move leaves. A recursive Move `Result` Ok producer is accepted only when `?` consumes it
-immediately; its Err payload must stay shallow because `?` propagates it, and retaining or returning
-the raw tagged value—or declaring it in a parameter/return type—is an L1b diagnostic. Bound shallow
-Move errors transfer out before `?` runs exit cleanup, and an arena-owned Err is rejected before
-that implicit return. The next
-implementation slice is L1b only: Move tagged payloads through
-Option/Result/user sums. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+larger Move leaves. L1b is split by the authoritative §8.3 closure matrix into three independently
+mergeable PRs: L1b-a admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b owns
+multiple Move payload partial construction and uniform ownership; L1b-c owns tagged-in-tagged type
+representation and the exact `Result<Option<Output>, DbError>` acceptance. L1b-a keeps multiple
+Move payload variants and nested tagged payloads fail-closed with diagnostics naming their owning
+follow-up. Dynamic path-selected return cleanup bits remain L2; L1b accepts only values proven
+free-standing by the current ABI rules. The next implementation slice is L1b-a only. Do not begin a
+SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The remaining required order is L1b Move tagged payloads
 through Result, L2 borrow
 summaries, L3 package-defined/dependent

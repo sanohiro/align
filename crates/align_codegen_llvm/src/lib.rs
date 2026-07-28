@@ -3128,30 +3128,6 @@ fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
     }
 }
 
-/// Field indices of an `Option`/`Result` aggregate whose payload is an owned (Move) type and
-/// must be freed when the aggregate is dropped (MMv2 slice 8a). Some/Ok = field 1, Err = field 2.
-/// Allocation-free (≤ 2 indices).
-/// The payload [`Scalar`] at aggregate field `idx` of an `Option`/`Result` (Some/Ok = field 1,
-/// Err = field 2) — so a drop can pick the right destructor (`reader`/`writer` handles close their
-/// fd; every other Move payload frees a `{ptr,len}` buffer).
-fn payload_field_scalar(ty: Ty, idx: u32) -> Option<Scalar> {
-    match (ty, idx) {
-        (Ty::Option(s), 1) => Some(s),
-        (Ty::Result(o, _), 1) => Some(o),
-        (Ty::Result(_, e), 2) => Some(e),
-        _ => None,
-    }
-}
-
-fn move_payload_fields(ty: Ty) -> impl Iterator<Item = u32> {
-    let (ok, err) = match ty {
-        Ty::Option(s) => (s.is_move().then_some(1), None),
-        Ty::Result(o, e) => (o.is_move().then_some(1), e.is_move().then_some(2)),
-        _ => (None, None),
-    };
-    ok.into_iter().chain(err)
-}
-
 /// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
 fn option_struct_type<'c>(ctx: &'c Context, s: Scalar, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> StructType<'c> {
     ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s), sx, ex)], false)
@@ -6149,68 +6125,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     } else if matches!(ty, Ty::Option(_) | Ty::Result(..))
                         && drop_plan(ty, self.structs, self.enums).needs_drop()
                     {
-                        // An Option/Result owning a Move payload: free each owned payload field
-                        // (null-safe — the inactive arm reads {null,0}/null, and a moved-out aggregate
-                        // was nulled at the move site). A `reader`/`writer` payload is a bare handle
-                        // pointer closed by its own `*_free`; every other Move payload is a `{ptr,len}`
-                        // whose buffer pointer is `free`d.
-                        let aty = self.llvm_type(ty).into_struct_type();
-                        let agg = self
-                            .builder
-                            .build_load(aty, self.slots[slot], "drop")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
-                        for idx in move_payload_fields(ty) {
-                            let field = self
-                                .builder
-                                .build_extract_value(agg, idx, "droppl")
-                                .map_err(|e| self.err(e))?;
-                            match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::Regex) | Some(Scalar::Captures) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) | Some(Scalar::RunOutput) => {
-                                    // The field is the handle pointer itself; each `*_free` is null-safe
-                                    // (the inactive arm / a moved-out aggregate reads a null handle).
-                                    let free_fn = match payload_field_scalar(ty, idx) {
-                                        Some(Scalar::Writer) => "io_writer_free",
-                                        Some(Scalar::Reader) => "io_reader_free",
-                                        Some(Scalar::Buffer) => "buffer_free",
-                                        Some(Scalar::File) => "io_file_free",
-                                        Some(Scalar::Regex) => "regex_free",
-                                        Some(Scalar::Captures) => "regex_captures_free",
-                                        Some(Scalar::TcpConn) => "tcp_conn_free",
-                                        Some(Scalar::TcpListener) => "tcp_listener_free",
-                                        Some(Scalar::UdpSocket) => "udp_socket_free",
-                                        Some(Scalar::Child) => "child_free",
-                                        Some(Scalar::HttpResponse) => "http_resp_free",
-                                        Some(Scalar::HttpServer) => "http_server_free",
-                                        Some(Scalar::HttpRequestCtx) => "http_ctx_free",
-                                        Some(Scalar::HttpStream) => "http_stream_free",
-                                        Some(Scalar::ResponseBuilder) => "http_response_free",
-                                        Some(Scalar::RunOutput) => "run_output_free",
-                                        _ => "cli_parsed_free",
-                                    };
-                                    self.builder
-                                        .build_call(self.funcs[free_fn], &[field.into_pointer_value().into()], "")
-                                        .map_err(|e| self.err(e))?;
-                                }
-                                Some(Scalar::DynArray(align_sema::PrimScalar::String)) => {
-                                    // `Result<array<string>, Error>` (`fs.read_dir`): the field is a
-                                    // `{ptr,len}` owned string-array — deep free (each element buffer,
-                                    // then the header), null-safe.
-                                    let sv = field.into_struct_value();
-                                    let ptr = self.builder.build_extract_value(sv, 0, "dropplptr").map_err(|e| self.err(e))?;
-                                    let len = self.builder.build_extract_value(sv, 1, "droppllen").map_err(|e| self.err(e))?;
-                                    self.builder
-                                        .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
-                                        .map_err(|e| self.err(e))?;
-                                }
-                                _ => {
-                                    let ptr = self.builder.build_extract_value(field.into_struct_value(), 0, "dropplptr").map_err(|e| self.err(e))?;
-                                    self.builder
-                                        .build_call(self.funcs["free"], &[ptr.into()], "")
-                                        .map_err(|e| self.err(e))?;
-                                }
-                            }
-                        }
+                        // Tagged Drop is tag-switched and recursive. Only the active payload is
+                        // inspected, and that payload uses the same destructor as a standalone value.
+                        self.drop_ty_at(self.slots[slot], ty)?;
                     } else if let Ty::Tuple(tid) = ty {
                         // A Move tuple: free each owned element's buffer pointer (null-safe — a
                         // moved-out tuple was zeroed, and Copy elements are skipped).
@@ -6327,22 +6244,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 Stmt::DropValue(op) => {
                     let ty = self.f.operand_ty(op);
-                    let agg = self.operand(op)?.into_struct_value();
-                    if ty == Ty::Option(Scalar::String) {
-                        self.drop_option_string_aggregate(agg)?;
-                    } else {
-                        // Free the buffer of an owned `{ptr, len}` value (an unbound temporary). An
-                        // `array<string>` temporary would need the deep free, but none is produced
-                        // today (`fs.read_dir` is always bound via `?`), so the shallow free stays
-                        // correct here.
-                        let ptr = self
-                            .builder
-                            .build_extract_value(agg, 0, "dropvalptr")
-                            .map_err(|e| self.err(e))?;
-                        self.builder
-                            .build_call(self.funcs["free"], &[ptr.into()], "")
-                            .map_err(|e| self.err(e))?;
-                    }
+                    // Materialize the SSA aggregate in an entry-hoisted scratch slot, then use the
+                    // canonical pointer-based recursive destructor. This covers tagged, nominal,
+                    // and deep collection temporaries without duplicating their layout assumptions.
+                    let value = self.operand(op)?;
+                    let scratch = self.alloca_at_entry(self.llvm_type(ty), "drop.value")?;
+                    self.builder.build_store(scratch, value).map_err(|e| self.err(e))?;
+                    self.drop_ty_at(scratch, ty)?;
                 }
             }
         }
@@ -9773,19 +9681,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ptr = self.builder.build_extract_value(agg, 0, "dropfldptr").map_err(|e| self.err(e))?;
                     self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
-                // L1a's first conditional owned leaf. Test the tag before loading/freeing the
-                // payload: `None` leaves its payload storage semantically uninitialized, while
-                // `Some` owns exactly one string buffer. Construction currently zero-initializes
-                // the aggregate as an additional defense, but Drop correctness does not rely on it.
-                Ty::Option(Scalar::String) => {
+                // A tagged field owns only its active payload. Reuse the canonical recursive
+                // destructor so `Option<MoveStruct>` and later nested owned shapes cannot diverge
+                // from standalone Option/Result cleanup.
+                Ty::Option(payload)
+                    if drop_plan(
+                        Ty::Option(payload),
+                        self.structs,
+                        self.enums,
+                    )
+                    .needs_drop() =>
+                {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropopt").map_err(|e| self.err(e))?;
-                    let oty = option_struct_type(self.ctx, Scalar::String, self.struct_types, self.enum_types);
-                    let option = self
-                        .builder
-                        .build_load(oty, fp, "dropoptv")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    self.drop_option_string_aggregate(option)?;
+                    self.drop_ty_at(fp, Ty::Option(payload))?;
                 }
                 // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
                 Ty::Struct(nid) if struct_is_move(nid, self.structs, self.enums) => {
@@ -9862,16 +9770,90 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(())
     }
 
-    /// Drop an `Option<string>` aggregate by testing its live tag before reading the payload.
-    /// Shared by recursive struct Drop and field-replacement `DropValue`, so both paths have the
-    /// same inactive-storage rule and LLVM CFG.
-    fn drop_option_string_aggregate(
+    /// Recursively drop the owned value stored at `base`.
+    ///
+    /// This is the codegen counterpart of sema's canonical [`drop_plan`]: tagged containers inspect
+    /// only their live arm, nominal values recurse, deep arrays run their element destructor, and
+    /// leaves use the same null-safe runtime free as standalone locals.
+    fn drop_ty_at(
         &self,
-        option: inkwell::values::StructValue<'c>,
+        base: inkwell::values::PointerValue<'c>,
+        ty: Ty,
     ) -> Result<(), CodegenError> {
+        match ty {
+            Ty::Option(payload) => self.drop_option_at(base, payload),
+            Ty::Result(ok, err) => self.drop_result_at(base, ok, err),
+            Ty::Struct(id) => self.drop_struct_fields(base, id),
+            Ty::Enum(id) => self.drop_enum(base, id),
+            Ty::DynStructArray(id, _) if struct_is_move(id, self.structs, self.enums) => {
+                self.deep_free_struct_array(base, id)
+            }
+            Ty::DynArray(Scalar::String) => {
+                let agg = self
+                    .builder
+                    .build_load(slice_struct_type(self.ctx), base, "dropstrarr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "dropstrarrptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(())
+            }
+            Ty::DynResponseArray => {
+                let agg = self
+                    .builder
+                    .build_load(slice_struct_type(self.ctx), base, "droprsparr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "droprsparrptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "droprsparrlen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(())
+            }
+            ty if let Some(free_fn) = handle_free_fn(ty) => {
+                let ptr = self
+                    .builder
+                    .build_load(self.ctx.ptr_type(AddressSpace::default()), base, "drophandlev")
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs[free_fn], &[ptr.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(())
+            }
+            Ty::String
+            | Ty::DynArray(_)
+            | Ty::DynStructArray(..)
+            | Ty::DynSliceArray(_) => {
+                let agg = self
+                    .builder
+                    .build_load(slice_struct_type(self.ctx), base, "dropslicev")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "dropsliceptr").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["free"], &[ptr.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drop an `Option<T>` by testing the tag before reading or recursively dropping its payload.
+    fn drop_option_at(
+        &self,
+        base: inkwell::values::PointerValue<'c>,
+        payload: Scalar,
+    ) -> Result<(), CodegenError> {
+        let option_ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types);
+        let tag_ptr = self.builder.build_struct_gep(option_ty, base, 0, "dropopttagp").map_err(|e| self.err(e))?;
         let tag = self
             .builder
-            .build_extract_value(option, 0, "dropopttag")
+            .build_load(self.ctx.i8_type(), tag_ptr, "dropopttag")
             .map_err(|e| self.err(e))?
             .into_int_value();
         let some = self.ctx.append_basic_block(self.func, "drop.opt.some");
@@ -9889,21 +9871,61 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_conditional_branch(is_some, some, cont)
             .map_err(|e| self.err(e))?;
         self.builder.position_at_end(some);
-        let payload = self
+        let payload_ptr = self
             .builder
-            .build_extract_value(option, 1, "dropoptpayload")
-            .map_err(|e| self.err(e))?
-            .into_struct_value();
-        let ptr = self
-            .builder
-            .build_extract_value(payload, 0, "dropoptptr")
+            .build_struct_gep(option_ty, base, 1, "dropoptpayload")
             .map_err(|e| self.err(e))?;
-        self.builder
-            .build_call(self.funcs["free"], &[ptr.into()], "")
-            .map_err(|e| self.err(e))?;
+        self.drop_ty_at(payload_ptr, scalar_to_ty(payload))?;
         self.builder
             .build_unconditional_branch(cont)
             .map_err(|e| self.err(e))?;
+        self.builder.position_at_end(cont);
+        Ok(())
+    }
+
+    /// Drop a `Result<T,E>` by selecting exactly the active Ok/Err payload.
+    fn drop_result_at(
+        &self,
+        base: inkwell::values::PointerValue<'c>,
+        ok: Scalar,
+        err: Scalar,
+    ) -> Result<(), CodegenError> {
+        let result_ty = result_struct_type(self.ctx, ok, err, self.struct_types, self.enum_types);
+        let tag_ptr = self.builder.build_struct_gep(result_ty, base, 0, "droprestagp").map_err(|e| self.err(e))?;
+        let tag = self
+            .builder
+            .build_load(self.ctx.i8_type(), tag_ptr, "droprestag")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let cont = self.ctx.append_basic_block(self.func, "drop.result.cont");
+        let ok_plan = drop_plan(scalar_to_ty(ok), self.structs, self.enums);
+        let err_plan = drop_plan(scalar_to_ty(err), self.structs, self.enums);
+        let ok_bb = ok_plan
+            .needs_drop()
+            .then(|| self.ctx.append_basic_block(self.func, "drop.result.ok"));
+        let err_bb = err_plan
+            .needs_drop()
+            .then(|| self.ctx.append_basic_block(self.func, "drop.result.err"));
+        let mut cases = Vec::with_capacity(2);
+        if let Some(bb) = ok_bb {
+            cases.push((self.ctx.i8_type().const_zero(), bb));
+        }
+        if let Some(bb) = err_bb {
+            cases.push((self.ctx.i8_type().const_int(1, false), bb));
+        }
+        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
+        if let Some(bb) = ok_bb {
+            self.builder.position_at_end(bb);
+            let payload = self.builder.build_struct_gep(result_ty, base, 1, "dropresok").map_err(|e| self.err(e))?;
+            self.drop_ty_at(payload, scalar_to_ty(ok))?;
+            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
+        }
+        if let Some(bb) = err_bb {
+            self.builder.position_at_end(bb);
+            let payload = self.builder.build_struct_gep(result_ty, base, 2, "droprese").map_err(|e| self.err(e))?;
+            self.drop_ty_at(payload, scalar_to_ty(err))?;
+            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
+        }
         self.builder.position_at_end(cont);
         Ok(())
     }
@@ -9969,8 +9991,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn drop_enum(&self, base: inkwell::values::PointerValue<'c>, enum_id: u32) -> Result<(), CodegenError> {
         let ety = self.enum_types[enum_id as usize];
         // (variant tag, LLVM field indices + scalar kinds of its owned payloads) for every variant
-        // that owns storage. Arrays are `{ptr,len}` buffers; Move handles are opaque pointers with
-        // their own null-safe free routine.
+        // that owns storage. Each selected payload is recursively dropped through `drop_ty_at`.
         // A variant's payload `k` lives at flat field index `field_base + k` (`field_base` includes the
         // tag slot — see `MakeEnum`). Snapshot into owned `Vec`s so no borrow of `self.enums` is held
         // across the builder calls below.
@@ -9983,7 +10004,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .payload
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.is_move())
+                    .filter(|(_, s)| {
+                        drop_plan(
+                            scalar_to_ty(**s),
+                            self.structs,
+                            self.enums,
+                        )
+                        .needs_drop()
+                    })
                     .map(|(k, s)| (v.field_base + k as u32, *s))
                     .collect();
                 (!fields.is_empty()).then_some((vi as u64, fields))
@@ -10008,21 +10036,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.builder.position_at_end(*bb);
             for &(fi, scalar) in fields {
                 let fp = self.builder.build_struct_gep(ety, base, fi, "dropev").map_err(|e| self.err(e))?;
-                if let Some(free_fn) = handle_free_fn(scalar_to_ty(scalar)) {
-                    let ptr = self
-                        .builder
-                        .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "dropevh")
-                        .map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs[free_fn], &[ptr.into()], "").map_err(|e| self.err(e))?;
-                } else {
-                    let agg = self
-                        .builder
-                        .build_load(slice_struct_type(self.ctx), fp, "dropevv")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "dropevptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
-                }
+                self.drop_ty_at(fp, scalar_to_ty(scalar))?;
             }
             self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
         }

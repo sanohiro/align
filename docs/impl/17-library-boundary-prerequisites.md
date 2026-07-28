@@ -1148,15 +1148,63 @@ This is one recursive `DropPlan`/`MovePlan` classification shared by structs, su
 
 ### 8.2 ABI and interface
 
-The ABI stays the existing tagged aggregate shape. A payload's physical fields are unioned/aligned
-as today; the extension is semantic cleanup and move-out, not pointer boxing. `DropPlan` is derived
-from canonical type definitions after generic monomorphization. Public interfaces already carry
-the structural type definitions; their canonical hash changes when a payload type or ownership
-shape changes. A corrupt or cyclic imported definition fails closed before a plan is built.
+The ABI stays the existing tagged aggregate shape. A user sum remains the current non-union
+aggregate `{ tag, every variant payload flattened in declaration order }`; `Option` and `Result`
+retain their current tagged aggregate layouts. The extension is semantic cleanup and move-out, not
+pointer boxing or a union-layout change. `DropPlan` is derived from canonical type definitions after
+generic monomorphization. Public interfaces already carry the structural type definitions; their
+canonical hash changes when a payload type or ownership shape changes. A corrupt or cyclic imported
+definition fails closed before a plan is built.
 
 Success paths do not allocate merely because the error type is Move. Owned strings are allocated
 only when the program constructs the error payload. Returning `Ok` initializes no error-owned
 field, and Drop consults the tag before touching payload storage.
+
+### 8.3 L1b implementation closure matrix
+
+This matrix is the implementation gate for L1b. L1b is delivered as three independently correct
+vertical PRs, each expected to stay under 1,000 changed hand-written lines:
+
+```text
+L1b-a  one direct existing-Scalar Move payload per tagged arm
+L1b-b  multiple Move payloads, partial construction, and uniform ownership mode
+L1b-c  tagged-in-tagged type representation and exact Result<Option<Output>, DbError>
+```
+
+L1b-a fails closed on multiple Move payloads in one user-sum variant and on nested
+`Option`/`Result` payloads. L1b-b removes the first diagnostic only after partial construction and
+mixed-provenance rules close. L1b-c removes the second after type representation, generic
+substitution, HIR/MIR, LLVM layout, interface round-trip, and malformed-interface validation agree.
+Arbitrary new Move-element collection layouts, resources, and borrowed-parameter modes remain in
+their later milestones. L1b-a may slightly exceed 1,000 total added-plus-removed lines because the
+safe vertical unit must remove obsolete sema rejection paths, add MIR ownership, add LLVM recursive
+Drop, and convert the same owner tests together; splitting type admission from cleanup would create
+an unsound intermediate commit. Its net new hand-written surface is approximately 1,000 lines,
+including the closure-matrix regressions and benchmark rows.
+
+| Contract path | Required implementation | Owner regression |
+|---|---|---|
+| type formation | L1b-a admits direct Move struct/sum/string payloads already representable by `Scalar`; combined struct/sum inline cycles, multiple Move payloads, nested tagged payloads, and unsupported Move-element collections fail closed. L1b-b/L1b-c remove their respective diagnostics. | sema declaration and generic-monomorph tests |
+| classification | Derive one finite recursive `DropPlan`; container is Move iff an active payload may be Move | sema DropPlan unit tests |
+| leaf closure | One dispatcher covers owned string, flat allocation, opaque Move handle, nested Move struct, nested Move enum, and every already-supported deep collection leaf; any unimplemented leaf is rejected during type formation | dispatcher unit tests plus one runtime representative per leaf class |
+| construction / move-in | Move one payload into `Some`, `Ok`, `Err`, or a user variant and clear the source cleanup bit | MIR source-nulling tests plus runtime use-after-move cases |
+| multiple payload construction (L1b-b) | Keep each earlier Move payload owned while evaluating later payloads; clean it on `?`/`return`; accept all-heap/all-arena and deterministically reject mixed heap/arena ownership | early-exit, all-heap, all-arena, and mixed-mode diagnostics |
+| Drop | Switch on `Option`, `Result`, or user-sum tag and recursively drop only the active payload | LLVM tag-guard assertions and allocation/free parity |
+| `match` move-out | Transfer every bound live payload, clear the container, and drop a fresh discarded active payload before an arm may diverge | bound/fresh/wildcard/or-pattern and L1b-b multiple-binding runtime cases |
+| `else` move-out/discard | Transfer `Some`/`Ok`; recursively drop an active discarded `Err` before evaluating fallback | success, error, and diverging-fallback runtime cases |
+| `?` propagation | Transfer `Ok` forward or `Err` into the returned `Result`; clear the consumed source before exit cleanup | bound/fresh success/error and early-exit cases |
+| `map_err` | Pass `Ok` ownership unchanged; transfer old `Err` exactly once into the mapper and clear its container. A receiver already evaluated before a mapper expression that returns or propagates remains owned and is cleaned. | fresh/bound both-arm cases, mapper-expression `return`/`?`, mapper call, and arena-owned call-boundary rejection |
+| replacement | Drop the old tagged value once and install the selected cleanup bit | all tag transitions |
+| return / call boundary | L1b accepts only results proven free-standing by the current ABI rules and rejects arena/path-dependent cleanup-bit returns. L2 owns dynamic path-selected return cleanup bits. | direct/imported free-standing parity plus arena/path-dependent rejection |
+| branch / loop joins | Carry the selected path-local cleanup bit without deriving it from the static type or region | `if`, `match`, and value-carrying `loop` cases |
+| borrow provenance | Preserve existing recursive region roots independently from cleanup ownership | borrowed payload invalidation tests |
+| generic / interface | Recompute the same plan after monomorphization; whole-program and per-unit builds agree | generic payload plus two-unit executable parity |
+| malformed interface | Reject unresolved type references, struct↔enum and enum↔enum cycles, illegal payload shapes, generic-substitution cycles, hash mismatch, and truncation before MIR/codegen | interface decoder corruption tests |
+| allocation contract | `Ok`/`None` hot paths allocate no error payload; every constructed owned payload is freed exactly once | benchmark rows for all acceptance edges |
+
+Author-side closure requires every applicable row to point to both code and a passing test before
+preflight. A review finding reopens its entire row and all other consumers of the same ownership
+fact; it is not closed by patching only the reported expression.
 
 ## 9. MIR and ABI ownership
 
@@ -1302,7 +1350,10 @@ host-sensitive.
 
 ### L1b — Move sum/Option/Result payload completion
 
-Scope:
+Ship this milestone as the L1b-a/L1b-b/L1b-c sequence fixed in §8.3; do not combine the three
+closure boundaries into one review diff.
+
+Milestone scope:
 
 - allow Move structs and Move sums as user-sum, `Option`, and `Result` payloads;
 - recursively classify the enclosing tagged value as Move;
