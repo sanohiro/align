@@ -1517,10 +1517,39 @@ or codegen rejects it before creating LLVM types. This prevents an inferred
 `Holder { callback: f }` from becoming incompatible with `Holder<fn(T) -> R>` while retaining
 separate Pure/Impure cells. Reassignment, field replacement, control-flow joins, and
 source-compatible fixed or dynamic struct-array formation and materialization into an origin-aware
-generic aggregate join the affected private effect cells; an explicitly annotated source-only
-aggregate has no concrete target and remains fail-closed `Unknown`. Splitting any one layer or either
-summary into a separately mergeable PR would temporarily permit two incompatible identities or
-require a compatibility path that this pre-release repository forbids.
+generic aggregate join the affected private effect cells. An explicitly annotated source aggregate
+has no intrinsic concrete target: private function parameter, return, local, and loop-result
+boundaries therefore use function- or expression-owned projection cells and join every reachable
+same-program producer. A closed-world boundary may become `Pure` only after all of those producers
+are known. An exportable callback-bearing parameter remains seeded `Unknown` while building its
+interface effect summary, regardless of provider-local call sites, because a dependent unit may pass
+an unseen callback. Each export is solved independently so its Unknown input cannot contaminate an
+unrelated Pure export through a shared private helper; producer-owned exported returns may retain
+their inferred origin. Splitting any
+one layer or either summary into a separately mergeable PR would temporarily permit two incompatible
+identities or require a compatibility path that this pre-release repository forbids. Every callable
+signature consumer—including indirect calls, named stages, and terminals—compares recursive
+source-visible identity rather than origin-specific internal ids. Pipeline stage and terminal
+boundaries join the effective element, accumulator, mapped-result, and capture producers into the
+same per-function parameter cells as an explicit call. A direct `Result.map_err` likewise transfers
+the error producer into the converter parameter and its converter result back into the mapped error
+origin. Static indirect and `map_err` targets also enter the named call graph, so open-world
+reachability validates any parallel boundary inside them. L2a does not retain a named target after
+a function value is bound, moved, or joined:
+an indirect call or `map_err` with a callback-bearing actual remains legal in sequential code but
+fails closed when its enclosing function must prove `Pure`. The same unresolved dispatch is rejected
+when reachable from an exportable callback-bearing root if it carries a callback-bearing actual or
+the erased target can be an internally constructed function value. The latter covers zero-argument
+closures whose captures feed an internal parallel boundary even when unrelated side effects make
+both the closed and open-world effects `Impure`; a direct external callback parameter or parameter
+field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
+provenance through function-value joins.
+Every `?` occurrence joins only its operand's `Result.Err` projection into the enclosing function's
+`Result.Err` return boundary before control returns early; its `Ok` projection continues through the
+ordinary expression and explicit/implicit return paths.
+Pattern bindings select the corresponding source projection: user sums use their variant/payload
+ordinal, while builtin `Option.Some`, `Result.Ok`, and `Result.Err` use their distinct tagged
+projections. Pure and Impure origins therefore survive the same match-binding path.
 
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the

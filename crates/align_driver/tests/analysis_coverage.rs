@@ -460,6 +460,390 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn explicit_generic_callback_boundaries_preserve_origins() {
+    let returned = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn make() -> Holder<fn(i64) -> i64> {
+  return Holder { callback: quiet }
+}
+fn worker(x: i64) -> i64 {
+  holder := make()
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let returned_diagnostics =
+        check_diagnostics("parmap-explicit-generic-fn-return-pure", returned);
+    assert!(
+        returned_diagnostics.is_empty(),
+        "an explicit callback-bearing return must retain its known-Pure origin:\n{returned_diagnostics}"
+    );
+    let impure_returned = returned.replace(
+        "return Holder { callback: quiet }",
+        "return Holder { callback: loud }",
+    );
+    assert!(
+        check_diagnostics(
+            "parmap-explicit-generic-fn-return-impure",
+            &impure_returned,
+        )
+        .contains("has an observable side effect"),
+        "an explicit callback-bearing return must retain its Impure origin"
+    );
+
+    let parameter = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn apply(holder: Holder<fn(i64) -> i64>, x: i64) -> i64 {
+  return holder.callback(x)
+}
+fn worker(x: i64) -> i64 {
+  return apply(Holder { callback: quiet }, x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let parameter_diagnostics =
+        check_diagnostics("parmap-explicit-generic-fn-param-pure", parameter);
+    assert!(
+        parameter_diagnostics.is_empty(),
+        "an explicit callback-bearing parameter must retain its known-Pure origin:\n{parameter_diagnostics}"
+    );
+    let impure_parameter = parameter.replace(
+        "apply(Holder { callback: quiet }, x)",
+        "apply(Holder { callback: loud }, x)",
+    );
+    assert!(
+        check_diagnostics(
+            "parmap-explicit-generic-fn-param-impure",
+            &impure_parameter,
+        )
+        .contains("has an observable side effect"),
+        "an explicit callback-bearing parameter must retain its Impure origin"
+    );
+
+    let isolated_parameters = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn apply_quiet(holder: Holder<fn(i64) -> i64>, x: i64) -> i64 {
+  return holder.callback(x)
+}
+fn apply_loud(holder: Holder<fn(i64) -> i64>, x: i64) -> i64 {
+  return holder.callback(x)
+}
+fn quiet_worker(x: i64) -> i64 {
+  return apply_quiet(Holder { callback: quiet }, x)
+}
+fn loud_worker(x: i64) -> i64 {
+  return apply_loud(Holder { callback: loud }, x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(quiet_worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let isolated_diagnostics = check_diagnostics(
+        "parmap-explicit-generic-fn-param-isolated",
+        isolated_parameters,
+    );
+    assert!(
+        isolated_diagnostics.is_empty(),
+        "an Impure peer with the same written signature must not poison a Pure parameter:\n{isolated_diagnostics}"
+    );
+    let isolated_impure = isolated_parameters.replace(
+        "par_map(quiet_worker)",
+        "par_map(loud_worker)",
+    );
+    assert!(
+        check_diagnostics(
+            "parmap-explicit-generic-fn-param-isolated-impure",
+            &isolated_impure,
+        )
+        .contains("has an observable side effect"),
+        "per-function parameter isolation must still reject the Impure peer"
+    );
+
+    let loop_returned = returned.replace(
+        "return Holder { callback: quiet }",
+        "return loop {\n    break Holder { callback: quiet }\n  }",
+    );
+    let loop_returned_diagnostics = check_diagnostics(
+        "parmap-explicit-generic-fn-loop-return-pure",
+        &loop_returned,
+    );
+    assert!(
+        loop_returned_diagnostics.is_empty(),
+        "a callback-bearing loop result must retain its known-Pure origin across an explicit return:\n{loop_returned_diagnostics}"
+    );
+    let impure_loop_returned =
+        loop_returned.replace("callback: quiet", "callback: loud");
+    assert!(
+        check_diagnostics(
+            "parmap-explicit-generic-fn-loop-return-impure",
+            &impure_loop_returned,
+        )
+        .contains("has an observable side effect"),
+        "a callback-bearing loop result must retain its Impure origin across an explicit return"
+    );
+
+    let loop_parameter = parameter.replace(
+        "return apply(Holder { callback: quiet }, x)",
+        "holder := loop {\n    break Holder { callback: quiet }\n  }\n  return apply(holder, x)",
+    );
+    let loop_parameter_diagnostics = check_diagnostics(
+        "parmap-explicit-generic-fn-loop-param-pure",
+        &loop_parameter,
+    );
+    assert!(
+        loop_parameter_diagnostics.is_empty(),
+        "a callback-bearing loop result must retain its known-Pure origin across an explicit parameter:\n{loop_parameter_diagnostics}"
+    );
+    let impure_loop_parameter =
+        loop_parameter.replace("callback: quiet", "callback: loud");
+    assert!(
+        check_diagnostics(
+            "parmap-explicit-generic-fn-loop-param-impure",
+            &impure_loop_parameter,
+        )
+        .contains("has an observable side effect"),
+        "a callback-bearing loop result must retain its Impure origin across an explicit parameter"
+    );
+
+    let nested_loop_parameter = parameter.replace(
+        "return apply(Holder { callback: quiet }, x)",
+        "holder := loop {\n    unused := loop {\n      break Holder { callback: loud }\n    }\n    break Holder { callback: quiet }\n  }\n  return apply(holder, x)",
+    );
+    let nested_loop_diagnostics = check_diagnostics(
+        "parmap-explicit-generic-fn-nested-loop-isolation",
+        &nested_loop_parameter,
+    );
+    assert!(
+        nested_loop_diagnostics.is_empty(),
+        "an unused inner Impure loop result must not contaminate the outer Pure loop boundary:\n{nested_loop_diagnostics}"
+    );
+}
+
+#[test]
+fn source_compatible_callback_signatures_and_pipeline_inputs() {
+    let pure = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn invoke(holder: Holder<fn(i64) -> i64>, x: i64) -> i64 {
+  return holder.callback(x)
+}
+fn keep(holder: Holder<fn(i64) -> i64>) -> bool = true
+fn identity(
+  holder: Holder<fn(i64) -> i64>,
+) -> Holder<fn(i64) -> i64> = holder
+fn apply(holder: Holder<fn(i64) -> i64>) -> i64 {
+  return holder.callback(1)
+}
+fn main() -> Result<(), Error> {
+  indirect := invoke
+  print(indirect(Holder { callback: quiet }, 41))
+  holders: array<Holder<fn(i64) -> i64>> :=
+    [Holder { callback: quiet }].to_array()
+  ys := holders.where(keep).map(identity).par_map(apply)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let explicit_diagnostics = check_diagnostics(
+        "source-compatible-callback-signatures-explicit",
+        pure,
+    );
+    assert!(
+        explicit_diagnostics.is_empty(),
+        "source-compatible indirect and pipeline signatures must accept matching callback aggregates:\n{explicit_diagnostics}"
+    );
+
+    let inferred = pure.replace(
+        "holders: array<Holder<fn(i64) -> i64>> :=",
+        "holders :=",
+    );
+    let inferred_diagnostics = check_diagnostics(
+        "source-compatible-callback-signatures-inferred",
+        &inferred,
+    );
+    assert!(
+        inferred_diagnostics.is_empty(),
+        "origin-aware inferred pipeline inputs must remain source-compatible and preserve Pure callback origins:\n{inferred_diagnostics}"
+    );
+
+    let impure = inferred.replace("callback: quiet", "callback: loud");
+    assert!(
+        check_diagnostics(
+            "source-compatible-callback-signatures-impure",
+            &impure,
+        )
+        .contains("has an observable side effect"),
+        "pipeline parameter propagation must still reject an Impure callback origin"
+    );
+}
+
+#[test]
+fn callback_bearing_indirect_consumers_transfer_or_fail_closed() {
+    let indirect = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn apply(holder: Holder<fn(i64) -> i64>, x: i64) -> i64 {
+  return holder.callback(x)
+}
+fn seed() -> i64 = apply(Holder { callback: quiet }, 0)
+fn worker(x: i64) -> i64 {
+  indirect := apply
+  return indirect(Holder { callback: loud }, x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let indirect_diagnostics = check_diagnostics(
+        "parmap-callback-bearing-indirect-fail-closed",
+        indirect,
+    );
+    assert!(
+        indirect_diagnostics.contains(
+            "calls a function value whose effect is not statically known"
+        ),
+        "a callback-bearing actual passed through an unresolved function-value target must fail closed at a parallel boundary:\n{indirect_diagnostics}"
+    );
+
+    let map_err = "\
+Wrap<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn convert(wrap: Wrap<fn(i64) -> i64>) -> Error {
+  wrap.callback(1)
+  return Error.Invalid
+}
+fn seed() -> Result<i64, Error> {
+  result: Result<i64, Wrap<fn(i64) -> i64>> :=
+    Err(Wrap { callback: quiet })
+  return result.map_err(convert)
+}
+fn worker(x: i64) -> i64 {
+  result: Result<i64, Wrap<fn(i64) -> i64>> :=
+    Err(Wrap { callback: loud })
+  mapped := result.map_err(convert)
+  return x
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let map_err_diagnostics = check_diagnostics(
+        "parmap-callback-bearing-map-err-transfer",
+        map_err,
+    );
+    assert!(
+        map_err_diagnostics.contains("has an observable side effect"),
+        "map_err must transfer its Result error producer into the named conversion boundary:\n{map_err_diagnostics}"
+    );
+
+    let question = "\
+Wrap<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn convert(wrap: Wrap<fn(i64) -> i64>) -> Error {
+  wrap.callback(1)
+  return Error.Invalid
+}
+fn pass(
+  result: Result<i64, Wrap<fn(i64) -> i64>>,
+) -> Result<i64, Wrap<fn(i64) -> i64>> {
+  value := result?
+  return Ok(value)
+}
+fn seed_convert() -> Error {
+  return convert(Wrap { callback: quiet })
+}
+fn worker(x: i64) -> i64 {
+  result: Result<i64, Wrap<fn(i64) -> i64>> :=
+    Err(Wrap { callback: loud })
+  mapped := pass(result).map_err(convert)
+  return x
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let question_diagnostics = check_diagnostics(
+        "parmap-callback-bearing-question-err-transfer",
+        question,
+    );
+    assert!(
+        question_diagnostics.contains("has an observable side effect"),
+        "a question-mark early return must transfer its Err origin into the enclosing Result boundary:\n{question_diagnostics}"
+    );
+}
+
+#[test]
+fn map_err_accepts_source_compatible_callback_aggregates() {
+    let src = "\
+Wrap<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn keep_error(
+  wrap: Wrap<fn(i64) -> i64>,
+) -> Wrap<fn(i64) -> i64> = wrap
+fn fail<E>(error: E) -> Result<i64, E> = Err(error)
+fn main() -> Result<(), Error> {
+  mapped := fail(Wrap { callback: quiet }).map_err(keep_error)
+  return Ok(())
+}
+";
+    let diagnostics = check_diagnostics(
+        "map-err-source-compatible-callback-aggregate",
+        src,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "map_err must compare its callback-bearing error parameter by source identity:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn generic_fn_wrapper_matches_an_explicit_source_signature() {
     if !backend_available() {
         return;
@@ -842,6 +1226,71 @@ fn main() -> Result<(), Error> {
     assert!(
         !check_errs("parmap-pure-result-try-fn-wrapper", result),
         "`?` and Result else-unwrap must preserve a known-Pure nested callback"
+    );
+
+    let option_match = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  maybe := Some(Holder { callback: quiet })
+  return match maybe {
+    Some(holder) => holder.callback(x),
+    None => x,
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let option_match_diagnostics = check_diagnostics(
+        "parmap-pure-option-match-fn-wrapper",
+        option_match,
+    );
+    assert!(
+        option_match_diagnostics.is_empty(),
+        "an Option match payload must preserve its known-Pure callback origin:\n{option_match_diagnostics}"
+    );
+    let impure_option_match =
+        option_match.replace("callback: quiet", "callback: loud");
+    assert!(
+        check_diagnostics(
+            "parmap-impure-option-match-fn-wrapper",
+            &impure_option_match,
+        )
+        .contains("has an observable side effect"),
+        "an Option match payload must preserve its Impure callback origin"
+    );
+
+    let result_match = option_match.replace(
+        "maybe := Some(Holder { callback: quiet })",
+        "maybe: Result<Holder<fn(i64) -> i64>, Error> :=\n    Ok(Holder { callback: quiet })",
+    ).replace(
+        "Some(holder) => holder.callback(x),\n    None => x,",
+        "Ok(holder) => holder.callback(x),\n    Err(err) => x,",
+    );
+    let result_match_diagnostics = check_diagnostics(
+        "parmap-pure-result-match-fn-wrapper",
+        &result_match,
+    );
+    assert!(
+        result_match_diagnostics.is_empty(),
+        "a Result match payload must preserve its known-Pure callback origin:\n{result_match_diagnostics}"
+    );
+    let impure_result_match =
+        result_match.replace("callback: quiet", "callback: loud");
+    assert!(
+        check_diagnostics(
+            "parmap-impure-result-match-fn-wrapper",
+            &impure_result_match,
+        )
+        .contains("has an observable side effect"),
+        "a Result match payload must preserve its Impure callback origin"
     );
 }
 
