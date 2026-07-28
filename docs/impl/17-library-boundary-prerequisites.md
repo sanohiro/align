@@ -1490,14 +1490,67 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
+L2 ships through five closed implementation slices. A slice may add dormant representation or
+tighten existing provenance, but it must not accept source syntax whose complete safety contract
+belongs to a later slice.
+
+| Slice | Exact closure | Public exposure at merge | Required gate |
+|---|---|---|---|
+| L2a | Replace `is_out`/bare parameter-type lists with `ParamMode`; add span-free return-borrow and return-region records to `FnTy`, named/imported signatures, HIR/MIR, interface codecs, hashes, and ABI fingerprints | Existing `ByValue` and `Out` behavior only; `borrow` and `borrow mut` remain identifiers outside parameter-mode lookahead and are rejected as modes | codec byte/hash goldens, corrupt-tag rejection, whole/per-unit identity, and an exhaustive consumer audit |
+| L2b | Infer recursive parameter/capture roots for existing by-value views and view-bearing aggregates; preserve them across named functions, closures, function-value joins/moves, synthetic selectors, direct/indirect/imported calls, and unresolved higher-order targets | No new borrow mode; existing programs only gain fail-closed lifetime rejection where provenance was previously lost | direct/indirect/imported/captured/joined nested-view matrix and summary-size evidence |
+| L2c | Add `ReturnCleanupAbi` to function and interface identity and implement `DynamicBit` for every recursively Move direct, indirect, and imported return; forward the selected bit on every return edge and store it in the caller slot | No borrow syntax; metadata and physical ABI land atomically before borrowed mutation can construct path-selected values | codec/hash goldens, `Result<Option<MoveStruct>, Error>` None/Some/Err matrix, ABI mismatch rejection, per-unit parity, and return-cost evidence |
+| L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
+| L2e | Contextually accept `borrow mut`; complete existing `Out` and new `BorrowMut` under one all-peer recursive exclusivity engine; implement generation invalidation, writable Copy/Move replacement, drop-old/cleanup-bit update, and Pure exclusive-state shaping | Full L2 surface | all-peer alias matrix, stale-view rejection, changed/unchanged pointee Drop counts, effect matrix, and per-unit parity |
+
+The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
+imported, and function-value signature even when their values are `None`; L2c then records the
+cleanup ABI for every such signature in the same change that implements it. Interface decode rejects
+unknown mode/summary/cleanup tags, unsorted or duplicate root indices, capture roots in exported
+named signatures, out-of-range roots, and a cleanup ABI inconsistent with the resolved return type.
+Before L2d, semantic import rejects a decoded `Borrow` mode; before L2e it rejects `BorrowMut`.
+Recognizing a codec tag does not enable its source or imported-call semantics. No slice reconstructs
+ownership from region provenance.
+
+The following closure matrix is authoritative for implementation and review. “All call forms” means
+same-unit named, imported, bound function value, indirect call, and generic monomorph where the
+current type restrictions admit that form.
+
+| Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
+|---|---|---|---|---|
+| Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, equality, mangling, structural cache identity, and ABI fingerprints | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None` | duplicate, unsorted, out-of-range, or exported capture roots reject before consumer-visible side effects | L2b computes non-empty roots |
+| Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
+| Existing return provenance | L2b | recursively walk scalar, struct, tuple, fixed-array, tagged, and function-value returns; preserve exact parameter/capture roots through assignment, move, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, and explicit/implicit/early return | unresolved higher-order targets use all compatible roots; incompatible joins and escaping unbound captures reject | L3 adds resource/dependent roots; L4 adds explicit region owners |
+| Closure/function-value provenance | L2b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
+| Cleanup ABI formation | L2c | Copy returns record `None`; every recursively Move return records `DynamicBit` in `FnTy`, named/imported signatures, MIR, interface, mangling, cache identity, and LLVM ABI | metadata/type disagreement, missing bit, extra bit, unknown tag, and caller/callee fingerprint mismatch reject | none |
+| Cleanup-bit production | L2c | normal expression return, explicit return, `if`, `match`, `else`, `?`, `map_err`, branch/loop join, and early exit forward the selected path-local bit and clear a moved source exactly once | malformed MIR bit source/destination, missing local, invalid tag, and uninitialized/duplicate transfer reject without panic | L4 adds explicit-region clear-bit values |
+| Cleanup-bit consumption | L2c | all call forms store the returned bit in the caller result slot; move-out/null, reassignment drop-old, wildcard discard, and scope/early cleanup consult that bit exactly once | no caller may infer the bit from type, tag, or region; ABI mismatch fails before call emission | L2e reuses the same slot through mutable replacement |
+| Shared-borrow formation | L2d | contextual `borrow name: T` works for named functions and function types; `borrow: T` and `out: region` remain parameter names; stable addressable immutable or mutable local/field places of Move type whose root is a bound local are accepted | temporary/rvalue, moved place, shared Copy, mode mismatch, move/drop/replace through callee binding, and unbound storage reject | L3 admits resource owners |
+| Shared-borrow calls/results | L2d | all call forms pass non-null caller storage without ownership transfer; caller owner remains usable; completed summaries attach returned views to the exact owner generation | use after owner move/drop, wrong indirect mode, stale returned view, corrupt imported summary, any ByValue peer that moves/consumes the same root, and any overlapping existing `Out` peer reject identically in either argument order, including rooted fields and aggregate holders | none |
+| Exclusive-borrow formation | L2e | contextual `borrow mut`, existing `Out`, writable Copy/Move local and field places, and function-value modes share one place classifier | immutable, temporary/rvalue, moved, overlapping field/whole-place, unbound storage, wrong mode, and unsupported partial Move leaf reject | L3 admits resource owners |
+| Exclusive alias/invalidation | L2e | recursively scan every `ByValue`/`Borrow`/`BorrowMut`/`Out` peer, including distinct aggregate holders; end the old generation at the call; preserve branch/loop state | any direct or nested overlap and any older view use reject before callee effects, with identical local/imported diagnostics | L3 adds resource/dependent overlap classes |
+| Exclusive replacement/effect | L2e | changed owned pointee runs guarded drop-old once, stores value and cleanup bit, and later caller Drop sees only the replacement; unchanged pointee emits no callee-exit cleanup; exclusive-input-only mutation is Pure | double Drop, callee function-exit Drop of unchanged pointee, captured/global mutation classified Pure, and unsafe/I/O classified Pure all reject | none |
+| End-to-end parity | each slice | focused owner tests, whole/per-unit builds, direct/indirect/imported behavior, generic/interface/cache identity, runtime provenance, Drop/allocation counts, and the slice benchmark agree | malformed interfaces/MIR fail closed and no disabled later mode is accepted | later rows add cases without weakening earlier gates |
+
+Each closure-matrix row is owned by the following exact focused targets. New targets are created by
+their first owning slice and remain cumulative gates afterward.
+
+| Slice | Exact owner tests | Exact benchmark command and required rows |
+|---|---|---|
+| L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
+| L2b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
+| L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
+| L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call` |
+| L2e | `cargo test -p align_driver --test borrowed_params exclusive_`; `cargo test -p align_driver --test out_params --test analysis_coverage` | `bench/library_boundary/run.sh exclusive-borrow`: `exclusive-copy-control`, `exclusive-copy-call`, `exclusive-move-replace` |
+
 Acceptance:
 
 - a Move owner remains usable after a shared borrow;
 - moving from a borrowed binding is rejected;
 - a returned view dies when the caller owner moves/drops;
 - `borrow mut` rejects later use of an older view;
-- a call rejects an overlapping by-value Copy view/resource reference or view-bearing aggregate
-  beside `borrow mut` of its owner;
+- a call rejects an overlapping by-value `str`/slice or recursively view-bearing aggregate beside
+  `borrow mut` of its owner; L3 applies the same completed alias engine to `resource_ref`;
 - the same recursive rejection covers every peer mode (`ByValue`, `Borrow`, `BorrowMut`, and
   `Out`), including distinct aggregate holders rooted in the invalidated generation;
 - mutable borrowing a writable Copy aggregate updates caller state; shared borrowing Copy is
@@ -1506,18 +1559,21 @@ Acceptance:
 - function-value binding and indirect calls retain all four parameter modes exactly;
 - borrow-returning function-value joins union return-borrow/region summaries, and an unresolved
   higher-order parameter uses the all-compatible-input summary;
-- a zero-argument capturing closure may return a captured `str`, `resource_ref`, or region-owned
-  value only while its environment and captured owner live; direct/indirect calls, target joins,
-  and moved function values preserve those exact roots;
+- a zero-argument capturing closure may return a captured `str` or slice only while its environment
+  and captured owner live; direct/indirect calls, target joins, and moved function values preserve
+  those exact roots. L3 adds `resource_ref` and L4 adds explicitly region-owned values to this
+  already-shipped capture-root engine;
 - a synthetic field selector returning a struct, tuple, fixed array, or sum that contains a nested
   view records its receiver parameter root recursively rather than treating the outer non-view type
   as owner-free;
-- direct, indirect, and imported `Result<array<R>, Error>` returns preserve the selected dynamic
-  cleanup bit on both arena-owned `Ok` and individually owned `Err` paths;
+- direct, indirect, and imported `Result<Option<MoveStruct>, Error>` returns preserve the selected
+  dynamic cleanup bit on `Ok(None)`, `Ok(Some(...))`, and owned `Err` paths; L4 adds caller-selected
+  region-owned success values without changing this ABI;
 - replacing an owned pointee through `borrow mut` drops the old value exactly once and installs the
   new cleanup bit; leaving an unchanged pointee does not drop it in the callee;
-- an indirect identity over a by-value dependent child/Move view aggregate transfers its embedded
-  parent provenance to the result; the parent cannot drop early;
+- an indirect identity over a by-value recursively view-bearing Copy aggregate transfers its
+  embedded owner provenance to the result; the owner cannot drop early. L3 extends the same summary
+  to dependent children and Move view aggregates once those types exist;
 - a deterministic exclusive-state shaper is Pure, while captured mutation and unsafe/I/O remain
   Impure;
 - imported and same-unit functions produce identical diagnostics;
@@ -1544,6 +1600,12 @@ Acceptance:
 - null/native failure is handled before construction;
 - a ref cannot survive owner move/drop/mutable borrow;
 - a dependent resource prevents parent move/drop/mutable borrow until the child drops;
+- `resource_ref` hidden recursively in each `ByValue`/`Borrow`/`BorrowMut`/`Out` peer or in a
+  distinct aggregate holder rejects overlap with mutable borrowing of its owner;
+- a captured `resource_ref` remains tied to its owner generation through direct/indirect calls,
+  target joins, and moved function values;
+- an indirect identity over a dependent child or Move view aggregate transfers the embedded parent
+  provenance to its result and prevents early parent move/drop;
 - a raw-derived `str`/slice cannot outlive the supplied resource generation;
 - emitted MIR contains `ResourceFromRawBorrowed` with the exact parent generation and
   `ResourceViewFromRaw` with the complete validation plan; no generic raw cast substitutes for
@@ -1567,6 +1629,8 @@ Acceptance:
 
 - ordinary functions allocate into the exact caller-selected arena;
 - region/result escapes are rejected across direct, branch, loop, `?`, closure, and module paths;
+- a captured explicitly region-owned value remains tied to that region through direct/indirect
+  calls, target joins, and moved function values;
 - anonymous and named arena cleanup are byte-identical except for the bound handle;
 - no thread-local ambient allocator is introduced.
 
