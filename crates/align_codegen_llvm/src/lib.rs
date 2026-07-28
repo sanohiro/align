@@ -3839,6 +3839,9 @@ fn align_up(n: u64, a: u64) -> u64 {
 /// alloca / global), never as a member alignment, so the aggregate type's ABI *alignment* stays
 /// natural — the padding field is `align 1`. Shared by `emit_llvm` and the layout-parity test so the
 /// two can never diverge.
+// Layout construction keeps each nominal/tagged LLVM table and target layout explicit at the
+// single struct-body seam; combining them would add a second, partially initialized context type.
+#[allow(clippy::too_many_arguments)]
 fn set_struct_body<'c>(
     ctx: &'c Context,
     st: StructType<'c>,
