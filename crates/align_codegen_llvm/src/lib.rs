@@ -3034,28 +3034,40 @@ fn build_module<'c>(
 fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     fn check_scalar(
         scalar: Scalar,
-        table: &[hir::TaggedType],
+        program: &Program,
         active: &mut Vec<u32>,
     ) -> Result<(), CodegenError> {
         match scalar {
             Scalar::Param(id) => Err(CodegenError::Lowering(format!(
                 "abstract tagged payload parameter {id} survived into MIR"
             ))),
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id)
+                if program.structs.get(id as usize).is_none() =>
+            {
+                Err(CodegenError::Lowering(format!(
+                    "tagged payload struct type id {id} is missing"
+                )))
+            }
+            Scalar::Enum(id) if program.enums.get(id as usize).is_none() => {
+                Err(CodegenError::Lowering(format!(
+                    "tagged payload sum type id {id} is missing"
+                )))
+            }
             Scalar::Tagged(id) => {
                 if active.contains(&id) {
                     return Err(CodegenError::Lowering(format!(
                         "recursive nested tagged type id {id} survived into MIR"
                     )));
                 }
-                let entry = table.get(id as usize).ok_or_else(|| {
+                let entry = program.tagged_types.get(id as usize).ok_or_else(|| {
                     CodegenError::Lowering(format!("nested tagged type id {id} is missing"))
                 })?;
                 active.push(id);
                 match *entry {
-                    hir::TaggedType::Option(payload) => check_scalar(payload, table, active)?,
+                    hir::TaggedType::Option(payload) => check_scalar(payload, program, active)?,
                     hir::TaggedType::Result(ok, err) => {
-                        check_scalar(ok, table, active)?;
-                        check_scalar(err, table, active)?;
+                        check_scalar(ok, program, active)?;
+                        check_scalar(err, program, active)?;
                     }
                 }
                 active.pop();
@@ -3064,24 +3076,26 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             _ => Ok(()),
         }
     }
-    fn check_ty(ty: Ty, table: &[hir::TaggedType]) -> Result<(), CodegenError> {
+    fn check_ty(ty: Ty, program: &Program) -> Result<(), CodegenError> {
         let mut active = Vec::new();
         match ty {
             Ty::Param(id) => Err(CodegenError::Lowering(format!(
                 "abstract type parameter {id} survived into MIR"
             ))),
-            Ty::Tagged(id) => check_scalar(Scalar::Tagged(id), table, &mut active),
+            Ty::Tagged(id) => check_scalar(Scalar::Tagged(id), program, &mut active),
             Ty::Option(s)
             | Ty::Box(s)
             | Ty::Slice(s)
             | Ty::DynArray(s)
             | Ty::ArrayBuilder(s)
-            | Ty::Task(s) => check_scalar(s, table, &mut active),
+            | Ty::Task(s) => check_scalar(s, program, &mut active),
             Ty::Result(ok, err) => {
-                check_scalar(ok, table, &mut active)?;
-                check_scalar(err, table, &mut active)
+                check_scalar(ok, program, &mut active)?;
+                check_scalar(err, program, &mut active)
             }
-            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => check_scalar(s, table, &mut active),
+            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => {
+                check_scalar(s, program, &mut active)
+            }
             _ => Ok(()),
         }
     }
@@ -3090,48 +3104,44 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
     // does not narrow a valid program.
     for id in 0..program.tagged_types.len() {
-        check_scalar(
-            Scalar::Tagged(id as u32),
-            &program.tagged_types,
-            &mut Vec::new(),
-        )?;
+        check_scalar(Scalar::Tagged(id as u32), program, &mut Vec::new())?;
     }
     for def in &program.structs {
         for field in &def.fields {
-            check_ty(field.ty, &program.tagged_types)?;
+            check_ty(field.ty, program)?;
         }
     }
     for def in &program.enums {
         for variant in &def.variants {
             for &payload in &variant.payload {
-                check_scalar(payload, &program.tagged_types, &mut Vec::new())?;
+                check_scalar(payload, program, &mut Vec::new())?;
             }
         }
     }
     for tuple in &program.tuples {
         for &elem in &tuple.elems {
-            check_scalar(elem, &program.tagged_types, &mut Vec::new())?;
+            check_scalar(elem, program, &mut Vec::new())?;
         }
     }
     for f in &program.fns {
-        check_ty(f.ret, &program.tagged_types)?;
+        check_ty(f.ret, program)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {
-            check_ty(ty, &program.tagged_types)?;
+            check_ty(ty, program)?;
         }
         for ty in align_mir::function_embedded_types(f) {
-            check_ty(ty, &program.tagged_types)?;
+            check_ty(ty, program)?;
         }
     }
     for ext in &program.externs {
-        check_ty(ext.ret, &program.tagged_types)?;
+        check_ty(ext.ret, program)?;
         for &ty in &ext.params {
-            check_ty(ty, &program.tagged_types)?;
+            check_ty(ty, program)?;
         }
     }
     for import in &program.imported_fns {
-        check_ty(import.ret, &program.tagged_types)?;
+        check_ty(import.ret, program)?;
         for &ty in &import.params {
-            check_ty(ty, &program.tagged_types)?;
+            check_ty(ty, program)?;
         }
     }
     if !align_mir::tagged_types_are_canonical(program) {
@@ -12767,6 +12777,97 @@ mod tests {
             err.to_string().contains("nested tagged type id 7 is missing"),
             "unexpected diagnostic: {err}"
         );
+    }
+
+    #[test]
+    fn malformed_raw_load_nested_tagged_id_is_a_codegen_error_not_a_panic() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let zero = Operand::Const(Const::Int(0, i32_ty));
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![i32_ty],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::RawLoad {
+                            ptr: zero.clone(),
+                            offset: zero,
+                            scalar: Scalar::Tagged(7),
+                        },
+                    )],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![],
+        };
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a RawLoad missing nested tagged id must fail closed");
+        assert!(
+            err.to_string().contains("nested tagged type id 7 is missing"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_nested_tagged_nominal_ids_are_codegen_errors_not_panics() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = |payload| Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![Ty::Tagged(0)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![hir::TaggedType::Option(payload)],
+            tuples: vec![],
+        };
+        for (payload, expected) in [
+            (Scalar::Struct(7), "tagged payload struct type id 7 is missing"),
+            (Scalar::Enum(7), "tagged payload sum type id 7 is missing"),
+        ] {
+            let err = emit_llvm_ir(
+                &program(payload),
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("a missing tagged nominal payload id must fail closed");
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected diagnostic: {err}"
+            );
+        }
     }
 
     #[test]

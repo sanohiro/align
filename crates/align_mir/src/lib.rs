@@ -1597,6 +1597,9 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                         types.extend(capture_tys.iter().copied());
                         types.push(*r);
                     }
+                    Rvalue::RawLoad { scalar, .. } => {
+                        types.push(align_sema::scalar_to_ty(*scalar))
+                    }
                     Rvalue::MakeVec { elem, .. }
                     | Rvalue::VecExtract { elem, .. }
                     | Rvalue::VecSumWhere { elem, .. }
@@ -1934,6 +1937,13 @@ fn remap_function_embedded_types(
                     Rvalue::SpawnTask { capture_tys, r, .. } => {
                         remap_vec(capture_tys);
                         remap_ty(r, remap);
+                    }
+                    Rvalue::RawLoad { scalar, .. } => {
+                        let mut ty = align_sema::scalar_to_ty(*scalar);
+                        remap_ty(&mut ty, remap);
+                        if let Some(remapped) = align_sema::ty_to_scalar(ty) {
+                            *scalar = remapped;
+                        }
                     }
                     Rvalue::MakeVec { elem, .. }
                     | Rvalue::VecExtract { elem, .. }
