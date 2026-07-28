@@ -48,10 +48,15 @@
 mod codec;
 mod hash;
 
-pub use codec::{deserialize, serialize, DecodeError, FORMAT_VERSION};
+pub use codec::{
+    deserialize, encode_interface_surface, serialize, DecodeError, FORMAT_VERSION,
+};
 pub use hash::Hash128;
 
 use std::collections::HashMap;
+
+pub use align_ast::ParamMode;
+pub use align_sema::hir::{ReturnBorrowSummary, ReturnRegionSummary};
 
 /// The three-valued effect bit of a `pub` fn (mirrors [`align_sema::FnEffect`]): `Pure` = provably no
 /// observable side effect; `Impure` = transitively performs I/O; `Unknown` = the analysis cannot prove
@@ -85,16 +90,20 @@ pub enum IType {
     /// An anonymous tuple type `(T, U, ...)`.
     Tuple(Vec<IType>),
     /// A function-value type `fn(params) -> ret`.
-    Fn { params: Vec<IType>, ret: Box<IType> },
+    Fn {
+        params: Vec<IParam>,
+        ret: Box<IType>,
+        return_borrow: ReturnBorrowSummary,
+        return_region: ReturnRegionSummary,
+    },
 }
 
 /// One parameter of a `pub` signature. **Names are intentionally excluded** (Align calls are
-/// positional — renaming a parameter is not an interface change); only the `out` marker and the type
+/// positional — renaming a parameter is not an interface change); only the parameter mode and type
 /// are ABI-relevant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IParam {
-    /// The `out` marker (`fn f(out dst: slice<i64>, ...)`), the noalias-writeback ABI bit.
-    pub is_out: bool,
+    pub mode: ParamMode,
     pub ty: IType,
 }
 
@@ -113,6 +122,8 @@ pub struct IFnSig {
     pub type_params: Vec<ITypeParam>,
     pub params: Vec<IParam>,
     pub ret: IType,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
     /// For a generic `pub` template: the declaration's source text (the body is part of the
@@ -209,9 +220,18 @@ fn convert_type(t: &align_ast::Type) -> IType {
             IType::Named { path: path_to_string(path), args: args.iter().map(convert_type).collect() }
         }
         align_ast::Type::Tuple { elems, .. } => IType::Tuple(elems.iter().map(convert_type).collect()),
-        align_ast::Type::Fn { params, ret, .. } => {
-            IType::Fn { params: params.iter().map(convert_type).collect(), ret: Box::new(convert_type(ret)) }
-        }
+        align_ast::Type::Fn { params, ret, .. } => IType::Fn {
+            params: params
+                .iter()
+                .map(|p| IParam {
+                    mode: p.mode,
+                    ty: convert_type(&p.ty),
+                })
+                .collect(),
+            ret: Box::new(convert_type(ret)),
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+        },
     }
 }
 
@@ -317,9 +337,14 @@ pub fn build_summaries_with_effects(
                             params: fd
                                 .params
                                 .iter()
-                                .map(|p| IParam { is_out: p.is_out, ty: convert_type(&p.ty) })
+                                .map(|p| IParam {
+                                    mode: p.mode,
+                                    ty: convert_type(&p.ty),
+                                })
                                 .collect(),
                             ret: convert_ret(&fd.ret),
+                            return_borrow: ReturnBorrowSummary::None,
+                            return_region: ReturnRegionSummary::None,
                             effect,
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -558,8 +583,24 @@ fn render_itype(t: &IType) -> String {
             let e = elems.iter().map(render_itype).collect::<Vec<_>>().join(", ");
             format!("({e})")
         }
-        IType::Fn { params, ret } => {
-            let p = params.iter().map(render_itype).collect::<Vec<_>>().join(", ");
+        IType::Fn {
+            params,
+            ret,
+            ..
+        } => {
+            let p = params
+                .iter()
+                .map(|p| {
+                    let mode = match p.mode {
+                        ParamMode::ByValue => "",
+                        ParamMode::Out => "out ",
+                        ParamMode::Borrow => "borrow ",
+                        ParamMode::BorrowMut => "borrow mut ",
+                    };
+                    format!("{mode}{}", render_itype(&p.ty))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("fn({p}) -> {}", render_itype(ret))
         }
     }
@@ -622,6 +663,114 @@ fn render_enum(e: &IEnumDef) -> String {
     out
 }
 
+/// A decoded interface may contain mode/summary tags reserved for a later compiler slice. The
+/// codec recognizes those stable tags, but an L2a consumer rejects their semantics before
+/// reconstructing or checking imported source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportCompatibilityError {
+    UnsupportedParamMode(ParamMode),
+    UnsupportedReturnBorrow,
+    UnsupportedReturnRegion,
+}
+
+impl std::fmt::Display for ImportCompatibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportCompatibilityError::UnsupportedParamMode(mode) => {
+                write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
+            }
+            ImportCompatibilityError::UnsupportedReturnBorrow => {
+                write!(f, "non-empty return-borrow interface summaries require L2b")
+            }
+            ImportCompatibilityError::UnsupportedReturnRegion => {
+                write!(f, "non-empty return-region interface summaries require L2b")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImportCompatibilityError {}
+
+fn validate_import_param(param: &IParam) -> Result<(), ImportCompatibilityError> {
+    if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
+        return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
+    }
+    validate_import_type(&param.ty)
+}
+
+fn validate_import_summaries(
+    borrow: &ReturnBorrowSummary,
+    region: &ReturnRegionSummary,
+) -> Result<(), ImportCompatibilityError> {
+    if !matches!(borrow, ReturnBorrowSummary::None) {
+        return Err(ImportCompatibilityError::UnsupportedReturnBorrow);
+    }
+    if !matches!(region, ReturnRegionSummary::None) {
+        return Err(ImportCompatibilityError::UnsupportedReturnRegion);
+    }
+    Ok(())
+}
+
+fn validate_import_type(ty: &IType) -> Result<(), ImportCompatibilityError> {
+    match ty {
+        IType::Named { args, .. } => {
+            for arg in args {
+                validate_import_type(arg)?;
+            }
+        }
+        IType::Tuple(elems) => {
+            for elem in elems {
+                validate_import_type(elem)?;
+            }
+        }
+        IType::Fn {
+            params,
+            ret,
+            return_borrow,
+            return_region,
+        } => {
+            for param in params {
+                validate_import_param(param)?;
+            }
+            validate_import_type(ret)?;
+            validate_import_summaries(return_borrow, return_region)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a decoded interface uses only the L2a-enabled semantic subset. This is distinct
+/// from codec validation: known future tags round-trip canonically but must not enable their ABI.
+pub fn validate_for_import(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        for param in &function.params {
+            validate_import_param(param)?;
+        }
+        validate_import_type(&function.ret)?;
+        validate_import_summaries(&function.return_borrow, &function.return_region)?;
+    }
+    for structure in &summary.structs {
+        for (_, ty) in &structure.fields {
+            validate_import_type(ty)?;
+        }
+    }
+    for enumeration in &summary.enums {
+        for (_, payload) in &enumeration.variants {
+            for ty in payload {
+                validate_import_type(ty)?;
+            }
+        }
+    }
+    for constant in &summary.consts {
+        if let Some(ty) = &constant.ty {
+            validate_import_type(ty)?;
+        }
+    }
+    Ok(())
+}
+
 fn render_fn(f: &IFnSig) -> String {
     if let Some(body) = &f.generic_body {
         // A generic `pub` template ships its full declaration (incl. body) as source — the consumer
@@ -641,8 +790,13 @@ fn render_fn(f: &IFnSig) -> String {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let out = if p.is_out { "out " } else { "" };
-            format!("{out}arg{i}: {}", render_itype(&p.ty))
+            let mode = match p.mode {
+                ParamMode::ByValue => "",
+                ParamMode::Out => "out ",
+                ParamMode::Borrow => "borrow ",
+                ParamMode::BorrowMut => "borrow mut ",
+            };
+            format!("{mode}arg{i}: {}", render_itype(&p.ty))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -655,7 +809,11 @@ fn render_fn(f: &IFnSig) -> String {
 /// the other units in the transitive dependency set; each is `import`ed so any module reference in a
 /// generic template body (which is opaque here) still resolves. Interface-only modules emit no
 /// diagnostics in sema, so the (possibly unused) imports are silent.
-pub fn summary_to_source(summary: &InterfaceSummary, dep_units: &[&str]) -> String {
+pub fn summary_to_source(
+    summary: &InterfaceSummary,
+    dep_units: &[&str],
+) -> Result<String, ImportCompatibilityError> {
+    validate_for_import(summary)?;
     let mut out = String::new();
     for dep in dep_units {
         if *dep != summary.unit {
@@ -682,7 +840,7 @@ pub fn summary_to_source(summary: &InterfaceSummary, dep_units: &[&str]) -> Stri
     for f in &summary.fns {
         out.push_str(&render_fn(f));
     }
-    out
+    Ok(out)
 }
 
 /// The cross-unit effect seeds an importer needs: the 3-valued effect bit of every **non-generic**

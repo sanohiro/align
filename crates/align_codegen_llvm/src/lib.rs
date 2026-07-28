@@ -2757,7 +2757,7 @@ fn build_module<'c>(
     for f in &program.fns {
         for b in &f.blocks {
             for s in &b.stmts {
-                if let Stmt::Let(_, Rvalue::FnAddr(name)) = s {
+                if let Stmt::Let(_, Rvalue::FnAddr { name, .. }) = s {
                     thunk_names.insert(name.clone());
                 }
             }
@@ -3032,6 +3032,99 @@ fn build_module<'c>(
 /// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
 /// `CodegenError`, never an out-of-bounds panic or the scalar `i32` fallback.
 fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
+    fn check_signature_facts(
+        owner: &str,
+        param_count: usize,
+        modes: &[align_ast::ParamMode],
+        borrow: &hir::ReturnBorrowSummary,
+        region: &hir::ReturnRegionSummary,
+        allow_out: bool,
+    ) -> Result<(), CodegenError> {
+        if modes.len() != param_count {
+            return Err(CodegenError::Lowering(format!(
+                "{owner} has {} parameter modes for {param_count} parameters",
+                modes.len()
+            )));
+        }
+        for mode in modes {
+            match mode {
+                align_ast::ParamMode::ByValue => {}
+                align_ast::ParamMode::Out if allow_out => {}
+                align_ast::ParamMode::Out => {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} uses `out` in a function-value ABI"
+                    )));
+                }
+                align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} uses parameter mode {mode:?} before its ABI is enabled"
+                    )));
+                }
+            }
+        }
+        if !matches!(borrow, hir::ReturnBorrowSummary::None) {
+            return Err(CodegenError::Lowering(format!(
+                "{owner} has return-borrow roots before L2b"
+            )));
+        }
+        if !matches!(region, hir::ReturnRegionSummary::None) {
+            return Err(CodegenError::Lowering(format!(
+                "{owner} has return-region roots before L2b"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_mode_types(
+        owner: &str,
+        modes: &[align_ast::ParamMode],
+        types: &[Ty],
+    ) -> Result<(), CodegenError> {
+        for (index, (mode, ty)) in modes.iter().zip(types).enumerate() {
+            if *mode == align_ast::ParamMode::Out && !matches!(ty, Ty::Slice(_)) {
+                return Err(CodegenError::Lowering(format!(
+                    "{owner} parameter {index} has mode Out but type {ty:?}, not a slice"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn named_signature<'a>(
+        program: &'a Program,
+        name: &str,
+    ) -> Option<(
+        usize,
+        &'a [align_ast::ParamMode],
+        &'a hir::ReturnBorrowSummary,
+        &'a hir::ReturnRegionSummary,
+    )> {
+        if let Some(function) = program.fns.iter().find(|function| function.name == name) {
+            return Some((
+                function.params.len(),
+                &function.param_modes,
+                &function.return_borrow,
+                &function.return_region,
+            ));
+        }
+        if let Some(function) = program.imported_fns.iter().find(|function| function.name == name) {
+            return Some((
+                function.params.len(),
+                &function.param_modes,
+                &function.return_borrow,
+                &function.return_region,
+            ));
+        }
+        program.externs.iter().find(|function| function.name == name).map(|function| {
+            (
+                function.params.len(),
+                function.param_modes.as_slice(),
+                &function.return_borrow,
+                &function.return_region,
+            )
+        })
+    }
+
     fn check_scalar(
         scalar: Scalar,
         program: &Program,
@@ -3136,6 +3229,27 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         }
     }
     for f in &program.fns {
+        let param_types = f
+            .params
+            .iter()
+            .map(|slot| {
+                f.slots.get(*slot as usize).copied().ok_or_else(|| {
+                    CodegenError::Lowering(format!(
+                        "function `{}` parameter slot {slot} is missing",
+                        f.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        check_signature_facts(
+            &format!("function `{}`", f.name),
+            f.params.len(),
+            &f.param_modes,
+            &f.return_borrow,
+            &f.return_region,
+            true,
+        )?;
+        check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
         check_ty(f.ret, program)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {
             check_ty(ty, program)?;
@@ -3143,14 +3257,162 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         for ty in align_mir::function_embedded_types(f) {
             check_ty(ty, program)?;
         }
+        for block in &f.blocks {
+            for statement in &block.stmts {
+                let Stmt::Let(_, rvalue) = statement else {
+                    continue;
+                };
+                match rvalue {
+                    Rvalue::FnAddr { name, signature } => {
+                        let Some((count, modes, borrow, region)) =
+                            named_signature(program, name)
+                        else {
+                            return Err(CodegenError::Lowering(format!(
+                                "function address refers to unknown target `{name}`"
+                            )));
+                        };
+                        check_signature_facts(
+                            "function address",
+                            count,
+                            &signature.param_modes,
+                            &signature.return_borrow,
+                            &signature.return_region,
+                            false,
+                        )?;
+                        if signature.param_modes != modes
+                            || &signature.return_borrow != borrow
+                            || &signature.return_region != region
+                        {
+                            return Err(CodegenError::Lowering(format!(
+                                "function address signature facts disagree with target `{name}`"
+                            )));
+                        }
+                    }
+                    Rvalue::Closure {
+                        lifted,
+                        captures,
+                        capture_tys,
+                        signature,
+                        ..
+                    } => {
+                        let Some(target) =
+                            program.fns.iter().find(|function| function.name == *lifted)
+                        else {
+                            return Err(CodegenError::Lowering(format!(
+                                "closure refers to unknown lifted target `{lifted}`"
+                            )));
+                        };
+                        let explicit = target.params.len().checked_sub(capture_tys.len()).ok_or_else(
+                            || {
+                                CodegenError::Lowering(format!(
+                                    "closure `{lifted}` has more captures than target parameters"
+                                ))
+                            },
+                        )?;
+                        let target_modes = target.param_modes.get(..explicit).ok_or_else(|| {
+                            CodegenError::Lowering(format!(
+                                "closure `{lifted}` target parameter modes are malformed"
+                            ))
+                        })?;
+                        let capture_modes =
+                            target.param_modes.get(explicit..).ok_or_else(|| {
+                                CodegenError::Lowering(format!(
+                                    "closure `{lifted}` target capture modes are malformed"
+                                ))
+                            })?;
+                        if capture_modes
+                            .iter()
+                            .any(|mode| *mode != align_ast::ParamMode::ByValue)
+                        {
+                            return Err(CodegenError::Lowering(format!(
+                                "closure `{lifted}` target capture parameters must be ByValue"
+                            )));
+                        }
+                        if captures.len() != capture_tys.len() {
+                            return Err(CodegenError::Lowering(format!(
+                                "closure `{lifted}` has {} capture operands but {} capture types",
+                                captures.len(),
+                                capture_tys.len()
+                            )));
+                        }
+                        let target_capture_tys = target.params[explicit..]
+                            .iter()
+                            .map(|slot| {
+                                target.slots.get(*slot as usize).copied().ok_or_else(|| {
+                                    CodegenError::Lowering(format!(
+                                        "closure `{lifted}` target capture slot {slot} is missing"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if target_capture_tys != *capture_tys {
+                            return Err(CodegenError::Lowering(format!(
+                                "closure `{lifted}` capture types disagree with its target"
+                            )));
+                        }
+                        check_signature_facts(
+                            "closure",
+                            explicit,
+                            &signature.param_modes,
+                            &signature.return_borrow,
+                            &signature.return_region,
+                            false,
+                        )?;
+                        if signature.param_modes != target_modes
+                            || signature.return_borrow != target.return_borrow
+                            || signature.return_region != target.return_region
+                        {
+                            return Err(CodegenError::Lowering(format!(
+                                "closure signature facts disagree with lifted target `{lifted}`"
+                            )));
+                        }
+                    }
+                    Rvalue::CallIndirect {
+                        param_tys,
+                        signature,
+                        ..
+                    } => check_signature_facts(
+                        "indirect call",
+                        param_tys.len(),
+                        &signature.param_modes,
+                        &signature.return_borrow,
+                        &signature.return_region,
+                        false,
+                    )?,
+                    _ => {}
+                }
+            }
+        }
     }
     for ext in &program.externs {
+        check_signature_facts(
+            &format!("extern function `{}`", ext.name),
+            ext.params.len(),
+            &ext.param_modes,
+            &ext.return_borrow,
+            &ext.return_region,
+            false,
+        )?;
+        check_mode_types(&format!("extern function `{}`", ext.name), &ext.param_modes, &ext.params)?;
         check_ty(ext.ret, program)?;
         for &ty in &ext.params {
             check_ty(ty, program)?;
         }
     }
     for import in &program.imported_fns {
+        check_signature_facts(
+            &format!("imported function `{}`", import.name),
+            import.params.len(),
+            &import.param_modes,
+            &import.return_borrow,
+            &import.return_region,
+            true,
+        )?;
+        check_mode_types(
+            &format!("imported function `{}`", import.name),
+            &import.param_modes,
+            &import.params,
+        )?;
         check_ty(import.ret, program)?;
         for &ty in &import.params {
             check_ty(ty, program)?;
@@ -10072,7 +10334,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 return Ok(cs.try_as_basic_value().basic());
             }
-            Rvalue::FnAddr(name) => {
+            Rvalue::FnAddr { name, .. } => {
                 // A non-capturing function value: `{ thunk_ptr, null_env }`.
                 let thunk = self
                     .funcs
@@ -10092,7 +10354,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
-            Rvalue::Closure { lifted, captures, capture_tys } => {
+            Rvalue::Closure { lifted, captures, capture_tys, .. } => {
                 // A capturing closure: copy the captures into a frame-local env, then build
                 // `{ thunk_ptr, env_ptr }` where the thunk unpacks the env into the lifted fn's
                 // trailing capture parameters.
@@ -10135,7 +10397,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
-            Rvalue::CallIndirect { callee, args, param_tys, ret_ty } => {
+            Rvalue::CallIndirect { callee, args, param_tys, ret_ty, .. } => {
                 // Extract `{ fn_ptr, env_ptr }` and call with the env-ABI `fn(env, args)`.
                 let clos = self.operand(callee)?.into_struct_value();
                 let fn_ptr = self.builder.build_extract_value(clos, 0, "cf").map_err(|e| self.err(e))?.into_pointer_value();
@@ -12688,6 +12950,9 @@ mod tests {
         let mut fns = vec![Function {
             name: "main".to_string(),
             params: vec![],
+            param_modes: vec![],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i32_ty,
             slots,
             slot_align,
@@ -12722,6 +12987,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -12758,6 +13026,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -12770,6 +13041,11 @@ mod tests {
                             lifted: "unused".to_string(),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(7)],
+                            signature: align_mir::FnSignatureFacts {
+                                param_modes: vec![],
+                                return_borrow: hir::ReturnBorrowSummary::None,
+                                return_region: hir::ReturnRegionSummary::None,
+                            },
                         },
                     )],
                     stmt_lines: vec![(0, 0)],
@@ -12802,6 +13078,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -12845,6 +13124,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -12892,6 +13174,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -12962,6 +13247,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![Ty::Tagged(0)],
                 slot_align: vec![None],
@@ -12999,6 +13287,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -13113,6 +13404,9 @@ mod tests {
         let unit_fn = Function {
             name: "u".to_string(),
             params: vec![],
+            param_modes: vec![],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Unit,
             slots: vec![],
             slot_align: vec![],
@@ -13146,6 +13440,9 @@ mod tests {
         let return_str = Function {
             name: "return_str".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Str,
             slots: vec![i64_ty],
             slot_align: vec![None],
@@ -13195,6 +13492,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![i64_ty],
             slot_align: vec![None],
@@ -13249,6 +13549,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![string_ty],
             slot_align: vec![None],
@@ -13300,6 +13603,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![i64_ty],
             slot_align: vec![None],
@@ -13342,6 +13648,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![i64_ty],
             slot_align: vec![None],
@@ -13385,6 +13694,9 @@ mod tests {
         let keep = Function {
             name: "keep".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Bool,
             slots: vec![input_ty],
             slot_align: vec![None],
@@ -13396,6 +13708,9 @@ mod tests {
         let finish = Function {
             name: "finish".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![wrong_output_ty],
             slot_align: vec![None],
@@ -13446,6 +13761,9 @@ mod tests {
         let finish = Function {
             name: "finish".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![str_ty],
             slot_align: vec![None],
@@ -13500,6 +13818,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![i64_ty],
             slot_align: vec![None],
@@ -13538,6 +13859,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_i64".to_string(),
             params: vec![0, 1],
+            param_modes: vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![i64_ty, i64_ty],
             slot_align: vec![None, None],
@@ -13580,6 +13904,9 @@ mod tests {
         let return_i64 = Function {
             name: "return_u64".to_string(),
             params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
             slots: vec![u64_ty],
             slot_align: vec![None],
@@ -13714,6 +14041,9 @@ mod tests {
             fns: vec![Function {
                 name: if count_arg { "allocation_probe" } else { "main" }.to_string(),
                 params: if count_arg { vec![0] } else { vec![] },
+                param_modes: if count_arg { vec![align_ast::ParamMode::ByValue] } else { vec![] },
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
                 slots: if count_arg { vec![Ty::Int(IntTy { bits: 64, signed: true })] } else { vec![] },
                 slot_align: if count_arg { vec![None] } else { vec![] },
@@ -13755,6 +14085,9 @@ mod tests {
             fns: vec![Function {
                 name: "arena_allocation_probe".to_string(),
                 params: vec![0],
+                param_modes: vec![align_ast::ParamMode::ByValue],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
                 slots: vec![i64_ty],
                 slot_align: vec![None],
@@ -13795,6 +14128,9 @@ mod tests {
             fns: vec![Function {
                 name: if dynamic { "soa_allocation_probe" } else { "main" }.to_string(),
                 params: if dynamic { vec![0] } else { vec![] },
+                param_modes: if dynamic { vec![align_ast::ParamMode::ByValue] } else { vec![] },
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
                 slots: if dynamic { vec![i64_ty] } else { vec![] },
                 slot_align: if dynamic { vec![None] } else { vec![] },
@@ -14305,6 +14641,9 @@ mod tests {
         let f = Function {
             name: "future_wrapper".into(),
             params: vec![],
+            param_modes: vec![],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Unit,
             slots: vec![Ty::Builder],
             slot_align: vec![None],

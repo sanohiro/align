@@ -46,9 +46,18 @@ fn fn_to_string(out: &mut String, f: &Function) {
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|s| format!("_{s}: {}", ty_name(f.slots[*s as usize])))
+        .zip(&f.param_modes)
+        .map(|(s, mode)| format!("{mode:?} _{s}: {}", ty_name(f.slots[*s as usize])))
         .collect();
-    let _ = writeln!(out, "fn {}({}) -> {} {{", f.name, params.join(", "), ty_name(f.ret));
+    let _ = writeln!(
+        out,
+        "fn {}({}) -> {} borrow={:?} region={:?} {{",
+        f.name,
+        params.join(", "),
+        ty_name(f.ret),
+        f.return_borrow,
+        f.return_region
+    );
     for b in &f.blocks {
         block_to_string(out, b);
     }
@@ -210,14 +219,30 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call {name}({})", a.join(", "))
         }
-        Rvalue::FnAddr(name) => format!("fn_addr {name}"),
-        Rvalue::Closure { lifted, captures, .. } => {
-            let c: Vec<String> = captures.iter().map(operand_str).collect();
-            format!("closure {lifted} [{}]", c.join(", "))
+        Rvalue::FnAddr { name, signature } => {
+            format!("fn_addr {name} signature={signature:?}")
         }
-        Rvalue::CallIndirect { callee, args, .. } => {
+        Rvalue::Closure {
+            lifted,
+            captures,
+            signature,
+            ..
+        } => {
+            let c: Vec<String> = captures.iter().map(operand_str).collect();
+            format!("closure {lifted} [{}] signature={signature:?}", c.join(", "))
+        }
+        Rvalue::CallIndirect {
+            callee,
+            args,
+            signature,
+            ..
+        } => {
             let a: Vec<String> = args.iter().map(operand_str).collect();
-            format!("call_indirect {}({})", operand_str(callee), a.join(", "))
+            format!(
+                "call_indirect {}({}) signature={signature:?}",
+                operand_str(callee),
+                a.join(", ")
+            )
         }
         Rvalue::Field(slot, path) => format!("_{slot}.{}", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")),
         Rvalue::Select { cond, a, b } => format!("select({}, {}, {})", operand_str(cond), operand_str(a), operand_str(b)),

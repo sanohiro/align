@@ -104,6 +104,10 @@ bench/task_group/run.sh  # task-group split vs packed-record/cache-line probe
   `serde_json` (full ≈1.03×, projecting ≈1.09×); a validated `work/` probe (SIMD structural index +
   projecting two-stage) reaches **~3.4–4.1×** over `serde_json` (~3.2–3.9× into soa columns). The
   rewrite lands that here — watch the `align/serde` ratios climb per slice.
+- **Library-boundary prerequisites (`bench/library_boundary/`):** the cumulative L2a–L7 regression
+  harness named by `docs/impl/17-library-boundary-prerequisites.md`. L2a's `interface` group records
+  canonical interface bytes and checked decode throughput; later slices add provenance, cleanup ABI,
+  borrow-call, resource, region, static-artifact, and builder rows without replacing earlier gates.
 - **Grouped aggregation (`bench/group_by/`): Align beats the *default* `std::HashMap` everywhere
   (≈5–6×) and beats `ahash` on dense integer-key analytics (≈2–3×).** `s.group_by(.k).sum(.v)` now
   takes a dense-id direct-index path when the key range is tight (`acc[key - min]`, no hashing), which

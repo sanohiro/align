@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    build_summaries, deserialize, serialize, DecodeError, Effect, IType, InterfaceSummary, FORMAT_VERSION,
+    build_summaries, deserialize, encode_interface_surface, serialize, validate_for_import,
+    DecodeError, Effect, Hash128, IType, ImportCompatibilityError, InterfaceSummary, ParamMode,
+    ReturnBorrowSummary, ReturnRegionSummary, FORMAT_VERSION,
 };
 
 /// One in-memory source module for a test program.
@@ -51,6 +53,10 @@ fn one(src: impl Into<String>) -> Vec<InterfaceSummary> {
 
 fn find<'a>(sums: &'a [InterfaceSummary], unit: &str) -> &'a InterfaceSummary {
     sums.iter().find(|s| s.unit == unit).unwrap_or_else(|| panic!("no unit `{unit}`"))
+}
+
+fn rehash(summary: &mut InterfaceSummary) {
+    summary.interface_hash = Hash128::of(&encode_interface_surface(summary));
 }
 
 // ---- 1. determinism -----------------------------------------------------------------------------
@@ -265,10 +271,135 @@ fn out_param_marker_is_recorded() {
     let sums = one("pub fn put(out dst: slice<i64>, k: i64) {\n  dst[k] = 42\n}\nfn main() -> i32 = 0\n");
     let put = find(&sums, "main").fns.iter().find(|f| f.name == "put").unwrap();
     assert_eq!(put.params.len(), 2);
-    assert!(put.params[0].is_out, "first param is `out`");
-    assert!(!put.params[1].is_out, "second param is not `out`");
+    assert_eq!(put.params[0].mode, ParamMode::Out);
+    assert_eq!(put.params[1].mode, ParamMode::ByValue);
+    assert_eq!(put.return_borrow, ReturnBorrowSummary::None);
+    assert_eq!(put.return_region, ReturnRegionSummary::None);
     // And the out-param's type survived.
     assert!(matches!(&put.params[0].ty, IType::Named { path, .. } if path == "slice"));
+}
+
+#[test]
+fn parameter_mode_and_return_summaries_have_canonical_codec_identity() {
+    let base = one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n");
+    let mut mode = base[0].clone();
+    mode.fns[0].params[0].mode = ParamMode::Out;
+    rehash(&mut mode);
+    assert_ne!(base[0].interface_hash, mode.interface_hash, "parameter mode is hash identity");
+
+    let mut roots = base[0].clone();
+    roots.fns[0].return_borrow =
+        ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] };
+    rehash(&mut roots);
+    assert_ne!(base[0].interface_hash, roots.interface_hash, "return-borrow roots are hash identity");
+    assert_ne!(mode.interface_hash, roots.interface_hash, "mode and summary encode independently");
+    let decoded = deserialize(&serialize(&roots)).expect("known canonical summary tag round-trips");
+    assert_eq!(decoded, roots);
+    assert_eq!(
+        validate_for_import(&decoded),
+        Err(ImportCompatibilityError::UnsupportedReturnBorrow),
+        "codec recognition must not enable L2b semantics"
+    );
+}
+
+#[test]
+fn known_future_parameter_mode_round_trips_but_semantic_import_rejects() {
+    for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
+        let mut summary =
+            one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+        summary.fns[0].params[0].mode = mode;
+        rehash(&mut summary);
+        let decoded = deserialize(&serialize(&summary)).expect("known future mode tag round-trips");
+        assert_eq!(decoded, summary);
+        assert_eq!(
+            validate_for_import(&decoded),
+            Err(ImportCompatibilityError::UnsupportedParamMode(mode))
+        );
+    }
+}
+
+#[test]
+fn malformed_return_roots_fail_closed_during_decode() {
+    let mut duplicate =
+        one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    duplicate.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![0, 0], captures: vec![] };
+    rehash(&mut duplicate);
+    assert_eq!(
+        deserialize(&serialize(&duplicate)),
+        Err(DecodeError::InvalidSummary("parameter roots must be strictly increasing"))
+    );
+
+    let mut out_of_range = duplicate.clone();
+    out_of_range.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![1], captures: vec![] };
+    rehash(&mut out_of_range);
+    assert_eq!(
+        deserialize(&serialize(&out_of_range)),
+        Err(DecodeError::InvalidSummary("parameter root is outside the signature"))
+    );
+
+    let mut capture = duplicate;
+    capture.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![], captures: vec![0] };
+    rehash(&mut capture);
+    assert_eq!(
+        deserialize(&serialize(&capture)),
+        Err(DecodeError::InvalidSummary(
+            "capture roots are forbidden in exported interfaces"
+        ))
+    );
+
+    let mut empty = capture;
+    empty.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![], captures: vec![] };
+    rehash(&mut empty);
+    assert_eq!(
+        deserialize(&serialize(&empty)),
+        Err(DecodeError::InvalidSummary(
+            "an empty root set must use the canonical None tag"
+        ))
+    );
+}
+
+#[test]
+fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
+    let summary =
+        one("pub fn inspect(out value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    let surface = encode_interface_surface(&summary);
+    let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    assert_eq!(
+        hex,
+        "02000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000000000000000000000000000000"
+    );
+
+    let mut artifact = serialize(&summary);
+    let mode_offset = 4 // format
+        + 4 + summary.unit.len()
+        + 4 // fn sequence
+        + 4 + summary.fns[0].name.len()
+        + 4 // type-parameter sequence
+        + 4; // parameter sequence
+    artifact[mode_offset] = 0xff;
+    assert_eq!(
+        deserialize(&artifact),
+        Err(DecodeError::BadTag { what: "parameter mode", tag: 0xff })
+    );
+
+    // This one-function surface ends with the function's borrow tag, region tag, effect, generic
+    // body option, then the three empty top-level type/const sequences (16 bytes total).
+    let mut bad_borrow = serialize(&summary);
+    bad_borrow[surface.len() - 16] = 0xff;
+    assert_eq!(
+        deserialize(&bad_borrow),
+        Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
+    );
+    let mut bad_region = serialize(&summary);
+    bad_region[surface.len() - 15] = 0xff;
+    assert_eq!(
+        deserialize(&bad_region),
+        Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
+    );
 }
 
 // ---- 5. capability set ---------------------------------------------------------------------------

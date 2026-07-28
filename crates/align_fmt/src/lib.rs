@@ -201,7 +201,7 @@ impl Annotations {
             }
             Type::Fn { params, ret, .. } => {
                 for p in params {
-                    self.visit_type(p);
+                    self.visit_type(&p.ty);
                 }
                 self.visit_type(ret);
             }

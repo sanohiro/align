@@ -1502,6 +1502,13 @@ belongs to a later slice.
 | L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
 | L2e | Contextually accept `borrow mut`; complete existing `Out` and new `BorrowMut` under one all-peer recursive exclusivity engine; implement generation invalidation, writable Copy/Move replacement, drop-old/cleanup-bit update, and Pure exclusive-state shaping | Full L2 surface | all-peer alias matrix, stale-view rejection, changed/unchanged pointee Drop counts, effect matrix, and per-unit parity |
 
+L2a is one intentionally unsplit vertical PR even when its hand-written diff exceeds roughly 1,000
+lines. Parameter modes and both summary records participate in one function-signature identity and
+must change atomically across AST/HIR/MIR, whole-program and per-unit lowering, interface
+serialization, structural mangling, LLVM validation, and malformed-input tests. Splitting any one
+layer or either summary into a separately mergeable PR would temporarily permit two incompatible
+signature identities or require a compatibility path that this pre-release repository forbids.
+
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the
 cleanup ABI for every such signature in the same change that implements it. Interface decode rejects

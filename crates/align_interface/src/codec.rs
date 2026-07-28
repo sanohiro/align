@@ -10,12 +10,15 @@
 //! * **Length-prefixed, little-endian, self-delimiting.** Every read is bounds-checked; a truncated
 //!   or malformed buffer returns [`DecodeError`], never a panic.
 
-use crate::{Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IStructDef, ITypeParam, IType, InterfaceSummary};
+use crate::{
+    Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IStructDef, IType, ITypeParam,
+    InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary,
+};
 
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -91,10 +94,52 @@ fn write_type(w: &mut Writer, t: &IType) {
             w.u8(1);
             w.seq(elems, write_type);
         }
-        IType::Fn { params, ret } => {
+        IType::Fn {
+            params,
+            ret,
+            return_borrow,
+            return_region,
+        } => {
             w.u8(2);
-            w.seq(params, write_type);
+            w.seq(params, write_param);
             write_type(w, ret);
+            write_return_borrow(w, return_borrow);
+            write_return_region(w, return_region);
+        }
+    }
+}
+
+fn write_param(w: &mut Writer, p: &IParam) {
+    w.u8(match p.mode {
+        ParamMode::ByValue => 0,
+        ParamMode::Out => 1,
+        ParamMode::Borrow => 2,
+        ParamMode::BorrowMut => 3,
+    });
+    write_type(w, &p.ty);
+}
+
+fn write_roots(w: &mut Writer, params: &[u32], captures: &[u32]) {
+    w.seq(params, |w, root| w.u32(*root));
+    w.seq(captures, |w, root| w.u32(*root));
+}
+
+fn write_return_borrow(w: &mut Writer, summary: &ReturnBorrowSummary) {
+    match summary {
+        ReturnBorrowSummary::None => w.u8(0),
+        ReturnBorrowSummary::Roots { params, captures } => {
+            w.u8(1);
+            write_roots(w, params, captures);
+        }
+    }
+}
+
+fn write_return_region(w: &mut Writer, summary: &ReturnRegionSummary) {
+    match summary {
+        ReturnRegionSummary::None => w.u8(0),
+        ReturnRegionSummary::Roots { params, captures } => {
+            w.u8(1);
+            write_roots(w, params, captures);
         }
     }
 }
@@ -117,11 +162,10 @@ fn write_effect(w: &mut Writer, e: Effect) {
 fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.str(&f.name);
     write_type_params(w, &f.type_params);
-    w.seq(&f.params, |w, p: &IParam| {
-        w.bool(p.is_out);
-        write_type(w, &p.ty);
-    });
+    w.seq(&f.params, write_param);
     write_type(w, &f.ret);
+    write_return_borrow(w, &f.return_borrow);
+    write_return_region(w, &f.return_region);
     write_effect(w, f.effect);
     w.opt_str(&f.generic_body);
 }
@@ -211,6 +255,9 @@ pub enum DecodeError {
     /// The decoded public surface does not match the fingerprint stored in the artifact.
     /// This catches a stale or modified effect bit/signature/layout before a consumer can trust it.
     InterfaceHashMismatch,
+    /// A return-provenance summary was not canonical or referenced a root unavailable in an
+    /// exported interface.
+    InvalidSummary(&'static str),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -224,6 +271,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::BadUtf8 => write!(f, "interface artifact contains invalid UTF-8"),
             DecodeError::TrailingBytes => write!(f, "interface artifact has trailing bytes"),
             DecodeError::InterfaceHashMismatch => write!(f, "interface artifact surface does not match its stored hash"),
+            DecodeError::InvalidSummary(reason) => {
+                write!(f, "invalid interface return-provenance summary: {reason}")
+            }
         }
     }
 }
@@ -302,8 +352,91 @@ fn read_type(r: &mut Reader<'_>) -> Result<IType, DecodeError> {
     match r.u8()? {
         0 => Ok(IType::Named { path: r.str()?, args: r.seq(read_type)? }),
         1 => Ok(IType::Tuple(r.seq(read_type)?)),
-        2 => Ok(IType::Fn { params: r.seq(read_type)?, ret: Box::new(read_type(r)?) }),
+        2 => {
+            let params = r.seq(read_param)?;
+            let ret = Box::new(read_type(r)?);
+            let return_borrow = read_return_borrow(r, params.len())?;
+            let return_region = read_return_region(r, params.len())?;
+            Ok(IType::Fn { params, ret, return_borrow, return_region })
+        }
         tag => Err(DecodeError::BadTag { what: "type", tag }),
+    }
+}
+
+fn read_param(r: &mut Reader<'_>) -> Result<IParam, DecodeError> {
+    let mode = match r.u8()? {
+        0 => ParamMode::ByValue,
+        1 => ParamMode::Out,
+        2 => ParamMode::Borrow,
+        3 => ParamMode::BorrowMut,
+        tag => return Err(DecodeError::BadTag { what: "parameter mode", tag }),
+    };
+    Ok(IParam { mode, ty: read_type(r)? })
+}
+
+fn validate_roots(
+    params: &[u32],
+    captures: &[u32],
+    param_count: usize,
+) -> Result<(), DecodeError> {
+    if params.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(DecodeError::InvalidSummary(
+            "parameter roots must be strictly increasing",
+        ));
+    }
+    if params.iter().any(|root| *root as usize >= param_count) {
+        return Err(DecodeError::InvalidSummary(
+            "parameter root is outside the signature",
+        ));
+    }
+    if !captures.is_empty() {
+        return Err(DecodeError::InvalidSummary(
+            "capture roots are forbidden in exported interfaces",
+        ));
+    }
+    if params.is_empty() {
+        return Err(DecodeError::InvalidSummary(
+            "an empty root set must use the canonical None tag",
+        ));
+    }
+    Ok(())
+}
+
+fn read_roots(
+    r: &mut Reader<'_>,
+    param_count: usize,
+) -> Result<(Vec<u32>, Vec<u32>), DecodeError> {
+    let params = r.seq(|r| r.u32())?;
+    let captures = r.seq(|r| r.u32())?;
+    validate_roots(&params, &captures, param_count)?;
+    Ok((params, captures))
+}
+
+fn read_return_borrow(
+    r: &mut Reader<'_>,
+    param_count: usize,
+) -> Result<ReturnBorrowSummary, DecodeError> {
+    match r.u8()? {
+        0 => Ok(ReturnBorrowSummary::None),
+        1 => {
+            let (params, captures) = read_roots(r, param_count)?;
+            Ok(ReturnBorrowSummary::Roots { params, captures })
+        }
+        tag => Err(DecodeError::BadTag { what: "return-borrow summary", tag }),
+    }
+}
+
+fn read_return_region(
+    r: &mut Reader<'_>,
+    param_count: usize,
+) -> Result<ReturnRegionSummary, DecodeError> {
+    match r.u8()? {
+        0 => Ok(ReturnRegionSummary::None),
+        1 => {
+            let (params, captures) = read_roots(r, param_count)?;
+            Ok(ReturnRegionSummary::Roots { params, captures })
+        }
+        tag => Err(DecodeError::BadTag { what: "return-region summary", tag }),
     }
 }
 
@@ -321,13 +454,23 @@ fn read_effect(r: &mut Reader<'_>) -> Result<Effect, DecodeError> {
 }
 
 fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
+    let name = r.str()?;
+    let type_params = read_type_params(r)?;
+    let params = r.seq(read_param)?;
+    let ret = read_type(r)?;
+    let return_borrow = read_return_borrow(r, params.len())?;
+    let return_region = read_return_region(r, params.len())?;
+    let effect = read_effect(r)?;
+    let generic_body = r.opt_str()?;
     Ok(IFnSig {
-        name: r.str()?,
-        type_params: read_type_params(r)?,
-        params: r.seq(|r| Ok(IParam { is_out: r.bool()?, ty: read_type(r)? }))?,
-        ret: read_type(r)?,
-        effect: read_effect(r)?,
-        generic_body: r.opt_str()?,
+        name,
+        type_params,
+        params,
+        ret,
+        return_borrow,
+        return_region,
+        effect,
+        generic_body,
     })
 }
 

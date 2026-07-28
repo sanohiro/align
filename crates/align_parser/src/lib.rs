@@ -768,12 +768,16 @@ impl<'a> Parser<'a> {
         self.expect(&TokKind::LParen, "'('");
         let mut params = Vec::new();
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
-            let is_out = self.eat_ident_keyword("out");
+            let mode = if self.eat_ident_keyword("out") {
+                ParamMode::Out
+            } else {
+                ParamMode::ByValue
+            };
             let pname = self.parse_ident("parameter name")?;
             self.expect(&TokKind::Colon, "':'");
             let ty = self.parse_type()?;
             params.push(Param {
-                is_out,
+                mode,
                 name: pname,
                 ty,
             });
@@ -892,7 +896,7 @@ impl<'a> Parser<'a> {
             let pname = self.parse_ident("parameter name")?;
             self.expect(&TokKind::Colon, "':'");
             let ty = self.parse_type()?;
-            params.push(Param { is_out: false, name: pname, ty });
+            params.push(Param { mode: ParamMode::ByValue, name: pname, ty });
             if !self.eat(&TokKind::Comma) {
                 break;
             }
@@ -1808,7 +1812,12 @@ impl<'a> Parser<'a> {
             self.expect(&TokKind::LParen, "'('");
             let mut params = Vec::new();
             while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
-                params.push(self.parse_type()?);
+                let mode = if self.eat_ident_keyword("out") {
+                    ParamMode::Out
+                } else {
+                    ParamMode::ByValue
+                };
+                params.push(FnTypeParam { mode, ty: self.parse_type()? });
                 if !self.eat(&TokKind::Comma) {
                     break;
                 }

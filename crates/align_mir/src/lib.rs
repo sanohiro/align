@@ -106,7 +106,14 @@ pub struct Function {
     pub name: String,
     /// Slots holding the incoming parameters, in order.
     pub params: Vec<Slot>,
+    /// Source-level parameter modes. This is signature identity even while L2a lowers only the
+    /// existing `ByValue` and `Out` physical ABI.
+    pub param_modes: Vec<align_ast::ParamMode>,
     pub ret: Ty,
+    /// Span-free return provenance carried through MIR for interface and ABI identity. L2a emits
+    /// only `None`; L2b computes roots.
+    pub return_borrow: hir::ReturnBorrowSummary,
+    pub return_region: hir::ReturnRegionSummary,
     /// Type of every slot, indexed by [`Slot`].
     pub slots: Vec<Ty>,
     /// Declared over-alignment of every slot (bytes, a validated power of two), indexed by
@@ -345,6 +352,16 @@ pub struct ParMapStage {
     pub elem_out: Ty,
 }
 
+/// Non-type signature facts attached to function values and indirect calls. The parameter and
+/// return types remain in their existing MIR fields; these facts make the complete logical
+/// signature explicit without relying on a sema-local function-type interner id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FnSignatureFacts {
+    pub param_modes: Vec<align_ast::ParamMode>,
+    pub return_borrow: hir::ReturnBorrowSummary,
+    pub return_region: hir::ReturnRegionSummary,
+}
+
 #[derive(Clone, Debug)]
 pub enum Rvalue {
     Use(Operand),
@@ -366,16 +383,27 @@ pub enum Rvalue {
     MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
     Call(String, Vec<Operand>),
     /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
-    FnAddr(String),
+    FnAddr { name: String, signature: FnSignatureFacts },
     /// A capturing closure value: the lifted function `lifted` (which takes the captures as
     /// trailing parameters) plus the captured values. Codegen copies the captures into a
     /// frame-local environment and builds `{ thunk_ptr, env_ptr }`, where the thunk unpacks the
     /// env and forwards to `lifted`. `capture_tys` give the env layout.
-    Closure { lifted: String, captures: Vec<Operand>, capture_tys: Vec<Ty> },
+    Closure {
+        lifted: String,
+        captures: Vec<Operand>,
+        capture_tys: Vec<Ty>,
+        signature: FnSignatureFacts,
+    },
     /// An indirect call through a function-value `callee` (a `Ty::Fn` pointer). `param_tys`/`ret_ty`
     /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
     /// result type — no signature table needed).
-    CallIndirect { callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty },
+    CallIndirect {
+        callee: Operand,
+        args: Vec<Operand>,
+        param_tys: Vec<Ty>,
+        ret_ty: Ty,
+        signature: FnSignatureFacts,
+    },
     /// Load a (possibly nested) field from the struct in `slot`, addressed by the index `path`
     /// (length ≥ 1) — a GEP `[0, *path]` then a load.
     Field(Slot, Vec<u32>),
@@ -1509,6 +1537,9 @@ pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) ->
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
+    // Function signature facts are immutable during MIR lowering. Materialize the shared table once
+    // so lowering F functions does not deep-clone all T entries F times.
+    let fn_types: Rc<[hir::FnTy]> = program.fn_types.clone().into();
     let mut fns: Vec<Function> = program
         .fns
         .iter()
@@ -1519,6 +1550,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
                 &program.structs,
                 &program.enums,
                 &program.tagged_types,
+                &fn_types,
                 lines.as_ref(),
             );
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
@@ -2399,6 +2431,9 @@ struct BuilderCtx {
     slot_borrow_owners: std::collections::HashMap<Slot, Vec<Slot>>,
     /// Optional source-line tracking state.
     dbg: Option<Box<LineCtx>>,
+    /// Sema function-type facts used to make function-value and indirect-call signatures explicit
+    /// in MIR. Kept behind the existing box to preserve recursive lowering stack headroom.
+    fn_types: Rc<[hir::FnTy]>,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -2625,6 +2660,7 @@ fn lower_fn(
     structs: &[hir::StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
+    fn_types: &Rc<[hir::FnTy]>,
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
     let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
@@ -2663,6 +2699,7 @@ fn lower_fn(
             value_borrow_owners: Vec::new(),
             slot_borrow_owners: std::collections::HashMap::new(),
             dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
+            fn_types: Rc::clone(fn_types),
         }),
     };
     let entry = b.new_block();
@@ -2740,7 +2777,10 @@ fn lower_fn(
     Function {
         name: f.name.clone(),
         params,
+        param_modes: f.param_modes.clone(),
         ret: f.ret,
+        return_borrow: f.return_borrow.clone(),
+        return_region: f.return_region.clone(),
         slots: b.slots,
         slot_align: b.slot_align,
         value_tys: b.value_tys,
@@ -4248,14 +4288,28 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::FnValue(name) => {
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::FnAddr(name.clone())));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::FnAddr {
+                    name: name.clone(),
+                    signature: fn_signature_facts(b, e.ty),
+                },
+            ));
             Operand::Value(v)
         }
         hir::ExprKind::Closure { lifted, captures } => {
             let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
             let ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Closure { lifted: lifted.clone(), captures: ops, capture_tys }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::Closure {
+                    lifted: lifted.clone(),
+                    captures: ops,
+                    capture_tys,
+                    signature: fn_signature_facts(b, e.ty),
+                },
+            ));
             Operand::Value(v)
         }
         hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
@@ -5052,6 +5106,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     let hir::ExprKind::CallFnValue { callee, args } = &e.kind else {
         unreachable!("lower_call_fn_value on a non-call expression");
     };
+    let signature = fn_signature_facts(b, callee.ty);
     let c = lower_expr(b, callee);
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
@@ -5085,7 +5140,14 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     for owner in arg_owners.into_iter().flatten() {
         b.set_drop_flag(owner, false);
     }
-    let result = emit_indirect_call(b, c.clone(), ops.clone(), param_tys, e.ty);
+    let result = emit_indirect_call(
+        b,
+        c.clone(),
+        ops.clone(),
+        param_tys,
+        e.ty,
+        signature,
+    );
     if let Operand::Value(v) = &result {
         inherit_borrow_owners(b, *v, std::iter::once(&c).chain(ops.iter()));
     } else {
@@ -5101,12 +5163,44 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
 
 /// The indirect-call counterpart of [`emit_named_call`]. Function-value calls and the specialized
 /// `Result.map_err` lowering must share the same LLVM-void / source-Unit normalization.
-fn emit_indirect_call(b: &mut Builder, callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty) -> Operand {
+fn emit_indirect_call(
+    b: &mut Builder,
+    callee: Operand,
+    args: Vec<Operand>,
+    param_tys: Vec<Ty>,
+    ret_ty: Ty,
+    signature: FnSignatureFacts,
+) -> Operand {
     let v = b.fresh_value(ret_ty);
-    b.push(Stmt::Let(v, Rvalue::CallIndirect { callee, args, param_tys, ret_ty }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::CallIndirect {
+            callee,
+            args,
+            param_tys,
+            ret_ty,
+            signature,
+        },
+    ));
     // Align Unit is a value, but its function ABI is LLVM `void`. Keep the call statement for its
     // effects while giving every enclosing value context the canonical MIR Unit operand.
     if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+}
+
+fn fn_signature_facts(b: &Builder, ty: Ty) -> FnSignatureFacts {
+    let Ty::Fn(id) = ty else {
+        unreachable!("function signature facts requested for non-function type {ty:?}");
+    };
+    let signature = b
+        .ctx
+        .fn_types
+        .get(id as usize)
+        .unwrap_or_else(|| panic!("missing function type {id} during MIR lowering"));
+    FnSignatureFacts {
+        param_modes: signature.params.iter().map(|(mode, _)| *mode).collect(),
+        return_borrow: signature.return_borrow.clone(),
+        return_region: signature.return_region.clone(),
+    }
 }
 
 /// Emit a named call and return its source-language value. Align represents Unit as an ordinary
@@ -11659,12 +11753,14 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     b.cur = err_bb;
     let errp = b.fresh_value(align_sema::scalar_to_ty(e_s));
     b.push(Stmt::Let(errp, Rvalue::ResultUnwrapErr(rv)));
+    let mapper_signature = fn_signature_facts(b, f.ty);
     let conv = emit_indirect_call(
         b,
         fv,
         vec![Operand::Value(errp)],
         vec![align_sema::scalar_to_ty(e_s)],
         e2_ty,
+        mapper_signature,
     );
     let errr = b.fresh_value(out_ty);
     b.push(Stmt::Let(errr, Rvalue::ResultErr(conv)));
@@ -11965,6 +12061,9 @@ mod tests {
             fns: vec![Function {
                 name: "main".to_string(),
                 params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -11979,6 +12078,11 @@ mod tests {
                             lifted: "unused".to_string(),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(1)],
+                            signature: FnSignatureFacts {
+                                param_modes: vec![],
+                                return_borrow: hir::ReturnBorrowSummary::None,
+                                return_region: hir::ReturnRegionSummary::None,
+                            },
                         },
                     )],
                     stmt_lines: vec![(0, 0)],

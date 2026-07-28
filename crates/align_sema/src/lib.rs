@@ -2031,9 +2031,11 @@ impl Bound {
 #[derive(Clone)]
 struct FnSig {
     params: Vec<Ty>,
-    /// `out[i]` — whether parameter `i` is an `out` (writable, no-alias) output buffer.
-    out: Vec<bool>,
+    /// Parameter access modes, parallel to `params`.
+    param_modes: Vec<ast::ParamMode>,
     ret: Ty,
+    return_borrow: hir::ReturnBorrowSummary,
+    return_region: hir::ReturnRegionSummary,
     /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
     /// The `params`/`ret` types may contain `Ty::Param(i)` indexing into this list.
     type_params: Vec<String>,
@@ -2296,7 +2298,7 @@ fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics
         }
         ast::Type::Fn { params, ret, .. } => {
             for p in params {
-                check_type_exposure(p, cx, diags);
+                check_type_exposure(&p.ty, cx, diags);
             }
             check_type_exposure(ret, cx, diags);
         }
@@ -2422,7 +2424,7 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
             }
             ast::Type::Fn { params, ret, .. } => {
                 for p in params {
-                    self.walk_type(p);
+                    self.walk_type(&p.ty);
                 }
                 self.walk_type(ret);
             }
@@ -4102,8 +4104,20 @@ pub fn check_program_with_effects(
             }
             None => Ty::Unit,
         };
-        let out = f.params.iter().map(|p| p.is_out).collect();
-        sigs.insert(mangled, FnSig { params, out, ret, type_params: tparams, bounds, is_extern: false });
+        let param_modes = f.params.iter().map(|p| p.mode).collect();
+        sigs.insert(
+            mangled,
+            FnSig {
+                params,
+                param_modes,
+                ret,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                type_params: tparams,
+                bounds,
+                is_extern: false,
+            },
+        );
     }
 
     // Extern (`extern "C"`) declarations: resolve + FFI-validate each foreign signature, register it
@@ -4217,12 +4231,31 @@ pub fn check_program_with_effects(
                         diags.error(format!("extern '{cname}' re-declared with a different signature"), sig.span);
                     }
                 } else {
-                    sigs.insert(cname.clone(), FnSig { params: params.clone(), out: vec![false; params.len()], ret, type_params: Vec::new(), bounds: Vec::new(), is_extern: true });
+                    sigs.insert(
+                        cname.clone(),
+                        FnSig {
+                            param_modes: vec![ast::ParamMode::ByValue; params.len()],
+                            params: params.clone(),
+                            ret,
+                            return_borrow: hir::ReturnBorrowSummary::None,
+                            return_region: hir::ReturnRegionSummary::None,
+                            type_params: Vec::new(),
+                            bounds: Vec::new(),
+                            is_extern: true,
+                        },
+                    );
                     // Make the C symbol resolvable as a bare call from every module.
                     for info in mod_table.values_mut() {
                         info.fns.entry(cname.clone()).or_insert((cname.clone(), true));
                     }
-                    externs.push(hir::ExternFn { name: cname, params, ret });
+                    externs.push(hir::ExternFn {
+                        name: cname,
+                        param_modes: vec![ast::ParamMode::ByValue; params.len()],
+                        params,
+                        ret,
+                        return_borrow: hir::ReturnBorrowSummary::None,
+                        return_region: hir::ReturnRegionSummary::None,
+                    });
                 }
             }
         }
@@ -4272,7 +4305,10 @@ pub fn check_program_with_effects(
                     imported_fns.push(hir::ImportedFn {
                         name: mangled,
                         params: sig.params.clone(),
+                        param_modes: sig.param_modes.clone(),
                         ret: sig.ret,
+                        return_borrow: sig.return_borrow.clone(),
+                        return_region: sig.return_region.clone(),
                     });
                 }
             }
@@ -4343,7 +4379,8 @@ pub fn check_program_with_effects(
     // rewrote every call target to the mangled name, so nothing else needs renaming.
     let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some((oname, targs)) = worklist.pop_front() {
-        let mangled = mangle_mono(&oname, &targs, &tagged_types, &structs, &enums);
+        let mangled =
+            mangle_mono(&oname, &targs, &tagged_types, &structs, &enums, &fn_types);
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
         }
@@ -11975,7 +12012,7 @@ impl<'a, 't> Checker<'a, 't> {
                     .fn_types
                     .get(aid as usize)
                     .zip(self.fn_types.get(bid as usize))
-                    .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret) =>
+                    .is_some_and(|(a, b)| a == b) =>
             {
                 Ty::Fn(aid)
             }
@@ -12221,14 +12258,14 @@ impl<'a, 't> Checker<'a, 't> {
         for (p, ty) in f.params.iter().zip(param_tys) {
             // An `out` parameter is a writable output buffer — only a `slice<T>` (a borrow the
             // callee writes back through). Mark its local mutable so `dst[i] = v` is allowed.
-            if p.is_out && !matches!(ty, Ty::Slice(_) | Ty::Error) {
+            if p.mode.is_out() && !matches!(ty, Ty::Slice(_) | Ty::Error) {
                 self.diags.error(
                     format!("an `out` parameter must be a slice (a writable output buffer), got {}", ty_name(ty)),
                     p.ty.span(),
                 );
             }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
-            let id = self.declare(&p.name.name, ty, p.is_out);
+            let id = self.declare(&p.name.name, ty, p.mode.is_out());
             self.locals[id as usize].is_param = true;
             params.push(id);
         }
@@ -12259,7 +12296,10 @@ impl<'a, 't> Checker<'a, 't> {
         Fn {
             name: f.name.name.clone(),
             params,
+            param_modes: f.params.iter().map(|p| p.mode).collect(),
             ret: self.finalize(ret),
+            return_borrow: sig.return_borrow.clone(),
+            return_region: sig.return_region.clone(),
             locals,
             body,
             span: f.span,
@@ -13217,8 +13257,9 @@ impl<'a, 't> Checker<'a, 't> {
         let ret_ok = fn_value_ret_ok(sig.ret);
         let sig_ret = sig.ret;
         match (params, ret_ok) {
-            (Some(ps), true) if !sig.out.iter().any(|o| *o) => {
-                let fid = fresh_fn_type(self.fn_types, ps, sig_ret, FnEffect::Unknown);
+            (Some(ps), true) if !sig.param_modes.iter().any(|m| m.is_out()) => {
+                let params = sig.param_modes.iter().copied().zip(ps).collect();
+                let fid = fresh_fn_type(self.fn_types, params, sig_ret, FnEffect::Unknown);
                 let ty = Ty::Fn(fid);
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::FnValue(mangled), ty, span }
@@ -14105,6 +14146,10 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("a lambda value supports only scalar parameters, and a scalar or `Result` return".to_string(), span);
             return err;
         };
+        let ps = ps
+            .into_iter()
+            .map(|p| (ast::ParamMode::ByValue, p))
+            .collect();
         let fid = fresh_fn_type(self.fn_types, ps, rty, FnEffect::Unknown);
         let ty = Ty::Fn(fid);
         self.constrain(ty, expected, span);
@@ -14239,7 +14284,15 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let mut checked = Vec::with_capacity(args.len());
-        for (a, p) in args.iter().zip(&params) {
+        for (a, (mode, p)) in args.iter().zip(&params) {
+            if *mode != ast::ParamMode::ByValue {
+                self.diags.error(
+                    "this function-value parameter mode is not callable until its borrow slice lands"
+                        .to_string(),
+                    span,
+                );
+                return err;
+            }
             let pt = scalar_to_ty(*p);
             let e = self.check_expr(a, Some(pt));
             if e.ty != Ty::Error && self.resolve(e.ty) != pt {
@@ -14360,7 +14413,8 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
         }
-        let (param_tys, ret, out) = (sig.params.clone(), sig.ret, sig.out.clone());
+        let (param_tys, ret, param_modes) =
+            (sig.params.clone(), sig.ret, sig.param_modes.clone());
         // A generic function: infer the concrete type arguments from the call, then take its own
         // dedicated path (the result type and `type_args` come from the substitution).
         if !sig.type_params.is_empty() {
@@ -14387,8 +14441,8 @@ impl<'a, 't> Checker<'a, 't> {
         // (range analysis is a separate follow-up). A fresh array-literal argument is stack storage
         // disjoint from any other buffer, so it is allowed; only slice-typed parameters can share
         // storage, so scalar arguments are never compared.
-        for (i, is_out) in out.iter().enumerate() {
-            if !is_out {
+        for (i, mode) in param_modes.iter().enumerate() {
+            if !mode.is_out() {
                 continue;
             }
             let Some(arg_i) = args.get(i) else { continue };
@@ -14438,8 +14492,8 @@ impl<'a, 't> Checker<'a, 't> {
         // `constant` rodata global — passing it as `out` would have the callee store into read-only
         // memory. Reject it (the call-site half of the read-only-view rule; the element-write half is
         // in `check_place`).
-        for (i, &is_out) in out.iter().enumerate() {
-            if is_out
+        for (i, mode) in param_modes.iter().enumerate() {
+            if mode.is_out()
                 && matches!(param_tys.get(i).map(|t| self.resolve(*t)), Some(Ty::Slice(_)))
                 && checked.get(i).is_some_and(|a| self.hir_is_readonly_view(a))
             {
@@ -16381,7 +16435,13 @@ impl<'a, 't> Checker<'a, 't> {
         self.lifted.push(hir::Fn {
             name: name.clone(),
             params: param_ids,
+            param_modes: vec![
+                ast::ParamMode::ByValue;
+                params.len() + captured.len()
+            ],
             ret,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
             locals,
             body: body_fin,
             span,
@@ -18067,7 +18127,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        if params.as_slice() != [e] {
+        if params.as_slice() != [(ast::ParamMode::ByValue, e)] {
             self.diags.error(
                 format!("'map_err' function must take the error type {} (got {})", scalar_name(e), ty_name(f.ty)),
                 args[0].span,
@@ -22929,7 +22989,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .fn_types
                 .get(aid as usize)
                 .zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret),
+                .is_some_and(|(a, b)| a == b),
             _ => false,
         }
     }
@@ -23557,6 +23617,7 @@ impl<'a, 't> Checker<'a, 't> {
                             self.tagged_types,
                             self.structs,
                             self.enums,
+                            self.fn_types,
                         );
                     }
                 }
@@ -24210,7 +24271,7 @@ fn walk_type(t: &ast::Type, out: &mut std::collections::HashSet<String>) {
         }
         ast::Type::Tuple { elems, .. } => elems.iter().for_each(|e| walk_type(e, out)),
         ast::Type::Fn { params, ret, .. } => {
-            params.iter().for_each(|p| walk_type(p, out));
+            params.iter().for_each(|p| walk_type(&p.ty, out));
             walk_type(ret, out);
         }
     }
@@ -24780,11 +24841,12 @@ fn mangle_mono(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    fn_types: &[hir::FnTy],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
         s.push('$');
-        s.push_str(&ty_mangle(*a, tagged_types, structs, enums));
+        s.push_str(&ty_mangle(*a, tagged_types, structs, enums, fn_types));
     }
     s
 }
@@ -24795,16 +24857,29 @@ fn ty_mangle(
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    fn_types: &[hir::FnTy],
 ) -> String {
     fn key(
         ty: Ty,
         tagged_types: &[hir::TaggedType],
         structs: &[StructDef],
         enums: &[hir::EnumDef],
-        visiting: &mut HashSet<u32>,
+        fn_types: &[hir::FnTy],
+        tagged_visiting: &mut HashSet<u32>,
+        fn_visiting: &mut HashSet<u32>,
     ) -> String {
-        let scalar = |s: Scalar, visiting: &mut HashSet<u32>| {
-            key(scalar_to_ty(s), tagged_types, structs, enums, visiting)
+        let scalar = |s: Scalar,
+                      tagged_visiting: &mut HashSet<u32>,
+                      fn_visiting: &mut HashSet<u32>| {
+            key(
+                scalar_to_ty(s),
+                tagged_types,
+                structs,
+                enums,
+                fn_types,
+                tagged_visiting,
+                fn_visiting,
+            )
         };
         match ty {
             Ty::Struct(id) => structs.get(id as usize).map_or_else(
@@ -24815,47 +24890,165 @@ fn ty_mangle(
                 || "E_invalid".to_string(),
                 |e| format!("E{}_{}", e.name.len(), e.name),
             ),
-            Ty::Tagged(id) if visiting.insert(id) => {
+            Ty::Tagged(id) if tagged_visiting.insert(id) => {
                 let result = match tagged_types.get(id as usize) {
                     Some(hir::TaggedType::Option(payload)) => {
-                        format!("O_{}", scalar(*payload, visiting))
+                        format!("O_{}", scalar(*payload, tagged_visiting, fn_visiting))
                     }
                     Some(hir::TaggedType::Result(ok, err)) => {
-                        format!("R_{}_{}", scalar(*ok, visiting), scalar(*err, visiting))
+                        format!(
+                            "R_{}_{}",
+                            scalar(*ok, tagged_visiting, fn_visiting),
+                            scalar(*err, tagged_visiting, fn_visiting)
+                        )
                     }
                     None => "T_invalid".to_string(),
                 };
-                visiting.remove(&id);
+                tagged_visiting.remove(&id);
                 result
             }
             Ty::Tagged(_) => "T_cycle".to_string(),
-            Ty::Option(payload) => format!("O_{}", scalar(payload, visiting)),
-            Ty::Result(ok, err) => {
-                format!("R_{}_{}", scalar(ok, visiting), scalar(err, visiting))
+            Ty::Option(payload) => {
+                format!("O_{}", scalar(payload, tagged_visiting, fn_visiting))
             }
-            Ty::Box(payload) => format!("B_{}", scalar(payload, visiting)),
-            Ty::Array(payload, n) => format!("A{n}_{}", scalar(payload, visiting)),
-            Ty::Slice(payload) => format!("V_{}", scalar(payload, visiting)),
-            Ty::DynArray(payload) => format!("D_{}", scalar(payload, visiting)),
-            Ty::Task(payload) => format!("K_{}", scalar(payload, visiting)),
+            Ty::Result(ok, err) => {
+                format!(
+                    "R_{}_{}",
+                    scalar(ok, tagged_visiting, fn_visiting),
+                    scalar(err, tagged_visiting, fn_visiting)
+                )
+            }
+            Ty::Box(payload) => {
+                format!("B_{}", scalar(payload, tagged_visiting, fn_visiting))
+            }
+            Ty::Array(payload, n) => {
+                format!("A{n}_{}", scalar(payload, tagged_visiting, fn_visiting))
+            }
+            Ty::Slice(payload) => {
+                format!("V_{}", scalar(payload, tagged_visiting, fn_visiting))
+            }
+            Ty::DynArray(payload) => {
+                format!("D_{}", scalar(payload, tagged_visiting, fn_visiting))
+            }
+            Ty::Task(payload) => {
+                format!("K_{}", scalar(payload, tagged_visiting, fn_visiting))
+            }
             Ty::StructArray(id, n) => format!(
                 "A{n}_{}",
-                key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+                key(
+                    Ty::Struct(id),
+                    tagged_types,
+                    structs,
+                    enums,
+                    fn_types,
+                    tagged_visiting,
+                    fn_visiting
+                )
             ),
             Ty::DynStructArray(id, _) => {
                 format!(
                     "D_{}",
-                    key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+                    key(
+                        Ty::Struct(id),
+                        tagged_types,
+                        structs,
+                        enums,
+                        fn_types,
+                        tagged_visiting,
+                        fn_visiting
+                    )
                 )
             }
             Ty::Soa(id) => format!(
                 "Q_{}",
-                key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+                key(
+                    Ty::Struct(id),
+                    tagged_types,
+                    structs,
+                    enums,
+                    fn_types,
+                    tagged_visiting,
+                    fn_visiting
+                )
             ),
+            Ty::Fn(id) if fn_visiting.insert(id) => {
+                let result = fn_types.get(id as usize).map_or_else(
+                    || "F_invalid".to_string(),
+                    |function| {
+                        let params = function
+                            .params
+                            .iter()
+                            .map(|(mode, ty)| {
+                                let mode = match mode {
+                                    ast::ParamMode::ByValue => "v",
+                                    ast::ParamMode::Out => "o",
+                                    ast::ParamMode::Borrow => "b",
+                                    ast::ParamMode::BorrowMut => "m",
+                                };
+                                format!(
+                                    "{mode}{}",
+                                    scalar(*ty, tagged_visiting, fn_visiting)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("_");
+                        let roots = |params: &[u32], captures: &[u32]| {
+                            format!(
+                                "p{}_c{}",
+                                params
+                                    .iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                captures
+                                    .iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                            )
+                        };
+                        let borrow = match &function.return_borrow {
+                            hir::ReturnBorrowSummary::None => "n".to_string(),
+                            hir::ReturnBorrowSummary::Roots { params, captures } => {
+                                roots(params, captures)
+                            }
+                        };
+                        let region = match &function.return_region {
+                            hir::ReturnRegionSummary::None => "n".to_string(),
+                            hir::ReturnRegionSummary::Roots { params, captures } => {
+                                roots(params, captures)
+                            }
+                        };
+                        format!(
+                            "F_{params}_{}_b{borrow}_r{region}",
+                            key(
+                                function.ret,
+                                tagged_types,
+                                structs,
+                                enums,
+                                fn_types,
+                                tagged_visiting,
+                                fn_visiting
+                            )
+                        )
+                    },
+                );
+                fn_visiting.remove(&id);
+                result
+            }
+            Ty::Fn(_) => "F_cycle".to_string(),
             other => ty_name(other),
         }
     }
-    key(ty, tagged_types, structs, enums, &mut HashSet::new())
+    key(
+        ty,
+        tagged_types,
+        structs,
+        enums,
+        fn_types,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect()
@@ -24973,8 +25166,18 @@ fn intern_tuple(tuples: &mut Vec<hir::TupleDef>, elems: Vec<Scalar>) -> u32 {
     (tuples.len() - 1) as u32
 }
 
-fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Ty) -> u32 {
-    let ft = hir::FnTy { params, ret, effect: std::cell::Cell::new(FnEffect::Unknown) };
+fn intern_fn_type(
+    fn_types: &mut Vec<hir::FnTy>,
+    params: Vec<(ast::ParamMode, Scalar)>,
+    ret: Ty,
+) -> u32 {
+    let ft = hir::FnTy {
+        params,
+        ret,
+        return_borrow: hir::ReturnBorrowSummary::None,
+        return_region: hir::ReturnRegionSummary::None,
+        effect: std::cell::Cell::new(FnEffect::Unknown),
+    };
     if let Some(i) = fn_types.iter().position(|t| *t == ft) {
         return i as u32;
     }
@@ -24985,8 +25188,19 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Ty) -
 /// Allocate a distinct function-value type for one concrete origin. Its signature remains
 /// structurally compatible with a source `fn(T) -> R` annotation, while its effect cell can be
 /// refined independently from unrelated functions with the same ABI.
-fn fresh_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Ty, effect: FnEffect) -> u32 {
-    fn_types.push(hir::FnTy { params, ret, effect: std::cell::Cell::new(effect) });
+fn fresh_fn_type(
+    fn_types: &mut Vec<hir::FnTy>,
+    params: Vec<(ast::ParamMode, Scalar)>,
+    ret: Ty,
+    effect: FnEffect,
+) -> u32 {
+    fn_types.push(hir::FnTy {
+        params,
+        ret,
+        return_borrow: hir::ReturnBorrowSummary::None,
+        return_region: hir::ReturnRegionSummary::None,
+        effect: std::cell::Cell::new(effect),
+    });
     (fn_types.len() - 1) as u32
 }
 
@@ -25055,14 +25269,40 @@ fn resolve_type(
         ast::Type::Fn { params, ret, span: _ } => {
             let mut pscalars = Vec::with_capacity(params.len());
             for p in params {
-                let pty = resolve_type(p, cx, type_params, diags);
+                let pty = resolve_type(&p.ty, cx, type_params, diags);
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
+                if p.mode.is_out() && !matches!(pty, Ty::Slice(_)) {
+                    diags.error(
+                        format!(
+                            "an `out` function-type parameter must be a slice, got {}",
+                            ty_name(pty)
+                        ),
+                        p.ty.span(),
+                    );
+                    return Ty::Error;
+                }
+                if matches!(p.mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+                    diags.error(
+                        format!(
+                            "function-type parameter mode {:?} is not enabled in L2a",
+                            p.mode
+                        ),
+                        p.ty.span(),
+                    );
+                    return Ty::Error;
+                }
                 match ty_to_scalar(pty) {
-                    Some(s) => pscalars.push(s),
+                    Some(s) => pscalars.push((p.mode, s)),
                     None => {
-                        diags.error(format!("a function-type parameter must be a scalar for now, got {}", ty_name(pty)), p.span());
+                        diags.error(
+                            format!(
+                                "a function-type parameter must be a scalar for now, got {}",
+                                ty_name(pty)
+                            ),
+                            p.ty.span(),
+                        );
                         return Ty::Error;
                     }
                 }
@@ -26072,7 +26312,8 @@ fn instantiate_struct(
     span: Span,
     diags: &mut Diagnostics,
 ) -> u32 {
-    let mangled = mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums);
+    let mangled =
+        mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
     }
@@ -26134,7 +26375,8 @@ fn instantiate_enum(
     span: Span,
     diags: &mut Diagnostics,
 ) -> u32 {
-    let mangled = mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums);
+    let mangled =
+        mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
     }
@@ -28081,5 +28323,29 @@ mod tests {
             !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
         );
+    }
+
+    #[test]
+    fn function_type_mangling_is_structural_and_includes_l2a_signature_facts() {
+        let function = |mode, borrow| hir::FnTy {
+            params: vec![(mode, Scalar::Int(IntTy { bits: 64, signed: true }))],
+            ret: Ty::Int(IntTy { bits: 64, signed: true }),
+            return_borrow: borrow,
+            return_region: hir::ReturnRegionSummary::None,
+            effect: std::cell::Cell::new(FnEffect::Pure),
+        };
+        let functions = vec![
+            function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None),
+            function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None),
+            function(ast::ParamMode::Out, hir::ReturnBorrowSummary::None),
+            function(
+                ast::ParamMode::ByValue,
+                hir::ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] },
+            ),
+        ];
+        let mangle = |id| ty_mangle(Ty::Fn(id), &[], &[], &[], &functions);
+        assert_eq!(mangle(0), mangle(1), "interner ids and effect cells are not ABI identity");
+        assert_ne!(mangle(0), mangle(2), "parameter mode is ABI identity");
+        assert_ne!(mangle(0), mangle(3), "return provenance is ABI identity");
     }
 }

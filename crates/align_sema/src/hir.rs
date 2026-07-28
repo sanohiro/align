@@ -57,8 +57,13 @@ pub struct ExternFn {
     /// The literal C symbol (never mangled).
     pub name: String,
     pub params: Vec<crate::Ty>,
+    /// Foreign declarations currently admit only by-value parameters, but still carry the same
+    /// explicit logical signature facts as every other named function.
+    pub param_modes: Vec<align_ast::ParamMode>,
     /// The return type; [`crate::Ty::Unit`] for a `void` return.
     pub ret: crate::Ty,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -111,19 +116,29 @@ pub struct ImportedFn {
     pub name: String,
     /// Parameter types, in declaration order (this unit's `Ty` universe).
     pub params: Vec<Ty>,
+    /// Parameter access modes, parallel to [`Self::params`].
+    pub param_modes: Vec<align_ast::ParamMode>,
     /// The return type; [`crate::Ty::Unit`] for a `()` return.
     pub ret: Ty,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
 }
 
 #[derive(Clone, Debug)]
 pub struct FnTy {
-    /// Parameter types (scalar-only for now).
-    pub params: Vec<crate::Scalar>,
+    /// Parameter modes and types (scalar-only for now).
+    pub params: Vec<(align_ast::ParamMode, crate::Scalar)>,
     /// Return type. A full [`crate::Ty`] rather than a `Scalar` so a function value can carry a
     /// `Result<T, E>` return — the shape every fallible handler has (`pkg.web`'s
     /// `fn(Ctx) -> Result<(), Error>`). Parameters stay `Scalar` (a struct parameter is
     /// `Scalar::Struct`, which already covers the handler's `Ctx`).
     pub ret: crate::Ty,
+    /// Inputs/captures whose owner generation may back the returned value. L2a records `None`;
+    /// L2b computes roots.
+    pub return_borrow: ReturnBorrowSummary,
+    /// Inputs/captures whose allocation region may own the returned value. L2a records `None`;
+    /// L2b computes roots.
+    pub return_region: ReturnRegionSummary,
     /// Inferred observable effect of invoking a value of this type. This is internal type
     /// information: source annotations remain `fn(T) -> R`, while the checker refines the bit from
     /// each value's origin and conservatively joins mutable assignments. `Unknown` is fail-closed
@@ -131,10 +146,11 @@ pub struct FnTy {
     pub effect: std::cell::Cell<crate::FnEffect>,
 }
 
-// Effects are inferred mutable facts, not part of source-level signature identity. Keeping them out
-// of equality makes annotation interning stable after a concrete value has been refined. Concrete
-// value types are deliberately allocated with `fresh_fn_type`, so equal signatures may still have
-// independent effect cells.
+// Effects and return summaries are inferred facts, not part of written source-level function-type
+// equality. Keeping them out makes annotation interning stable after a concrete value has been
+// refined; exact ABI/interface identity compares or serializes the facts separately. Concrete value
+// types are deliberately allocated with `fresh_fn_type`, so equal source signatures may still have
+// independent inferred cells and summaries.
 impl PartialEq for FnTy {
     fn eq(&self, other: &Self) -> bool {
         self.params == other.params && self.ret == other.ret
@@ -142,6 +158,20 @@ impl PartialEq for FnTy {
 }
 
 impl Eq for FnTy {}
+
+/// Span-free return owner-generation provenance. Root vectors are canonical sorted unique indices.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReturnBorrowSummary {
+    None,
+    Roots { params: Vec<u32>, captures: Vec<u32> },
+}
+
+/// Span-free return allocation-region provenance. Root vectors are canonical sorted unique indices.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReturnRegionSummary {
+    None,
+    Roots { params: Vec<u32>, captures: Vec<u32> },
+}
 
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
 /// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's
@@ -213,7 +243,11 @@ pub struct Fn {
     pub name: String,
     /// Parameter locals, in declaration order. Each is also present in `locals`.
     pub params: Vec<LocalId>,
+    /// Parameter access modes, parallel to [`Self::params`].
+    pub param_modes: Vec<align_ast::ParamMode>,
     pub ret: Ty,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,
