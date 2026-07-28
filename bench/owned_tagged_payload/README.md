@@ -9,7 +9,9 @@ after the first owned field was initialized. A bound `Result<T,string>` row veri
 edge of `?` transfers the owned error before exit cleanup. `run.sh` also records the raw LLVM
 tag-guard count. L1b rows cover the allocation-free `Ok` hot path plus recursive native/decode
 errors through `match`, discarded `else`, and `map_err`; every constructed nested owned leaf must
-have one matching free.
+have one matching free. L1b-b rows cover a live variant with two owned payloads, intact wildcard
+discard through the enum's tag-switched Drop, and partial construction whose second payload exits
+through `?`.
 
 ```text
 bench/owned_tagged_payload/run.sh [native|baseline]

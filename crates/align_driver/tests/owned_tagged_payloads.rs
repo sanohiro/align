@@ -1038,6 +1038,197 @@ fn recursive_move_results_replace_and_join_with_one_live_owner() {
 }
 
 #[test]
+fn multiple_move_payloads_construct_bind_and_drop() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "PairError { Both(string, string), One(string), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  pair := PairError.Both(\"left\".clone(), \"right\".clone())\n",
+        "  return match pair {\n",
+        "    Both(left, right) => (left.len() + right.len()) as i32\n",
+        "    One(value) => value.len() as i32\n",
+        "    Empty => 90\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("multiple-move-payload-bind", src)
+            .status
+            .code(),
+        Some(9)
+    );
+}
+
+#[test]
+fn multiple_move_payload_construction_consumes_every_source() {
+    for source in ["left", "right"] {
+        let src = format!(
+            "PairError {{ Both(string, string), Empty }}\n\
+             fn main() -> i32 {{\n\
+               left := \"left\".clone()\n\
+               right := \"right\".clone()\n\
+               error := PairError.Both(left, right)\n\
+               return {source}.len() as i32\n\
+             }}\n"
+        );
+        let mut sm = SourceMap::new();
+        let checked = check(
+            &mut sm,
+            &format!("multiple-move-payload-consume-{source}.align"),
+            &src,
+        );
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(checked.diags.has_errors());
+        assert!(
+            rendered.contains(&format!("use of moved value '{source}'")),
+            "each payload source must be consumed:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn multiple_move_payload_construction_keeps_earlier_owner_on_early_exit() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "PairError { Both(string, string), Empty }\n",
+        "fn fail() -> Result<string, string> = Err(\"later\".clone())\n",
+        "fn build() -> Result<PairError, string> {\n",
+        "  pair := PairError.Both(\"first\".clone(), fail()?)\n",
+        "  return Ok(pair)\n",
+        "}\n",
+        "fn build_return() -> Result<PairError, string> {\n",
+        "  pair := PairError.Both(\"first\".clone(), { return Err(\"later\".clone()) })\n",
+        "  return Ok(pair)\n",
+        "}\n",
+        "fn score(result: Result<PairError, string>) -> i32 = match result {\n",
+        "  Ok(pair) => 90\n",
+        "  Err(message) => message.len() as i32\n",
+        "}\n",
+        "fn main() -> i32 = score(build()) + score(build_return())\n",
+    );
+    assert_eq!(
+        build_and_run("multiple-move-payload-early-exit", src)
+            .status
+            .code(),
+        Some(10)
+    );
+}
+
+#[test]
+fn multiple_move_payloads_require_one_allocation_mode() {
+    if backend_available() {
+        let uniform = concat!(
+            "PairError { Both(array<i64>, array<i64>), Empty }\n",
+            "fn main() -> i32 {\n",
+            "  return arena {\n",
+            "    pair := PairError.Both([1, 2].to_array(), [3, 4, 5].to_array())\n",
+            "    match pair { Both(left, right) => (left.len() + right.len()) as i32, Empty => 90 }\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_eq!(
+            build_and_run("multiple-move-payload-arena", uniform)
+                .status
+                .code(),
+            Some(5)
+        );
+    }
+
+    let mixed = concat!(
+        "PairError { Both(array<i64>, array<i64>), Empty }\n",
+        "fn heap_value() -> array<i64> = [1, 2].to_array()\n",
+        "fn main() -> i32 {\n",
+        "  return arena {\n",
+        "    pair := PairError.Both(heap_value(), [3, 4, 5].to_array())\n",
+        "    match pair { Both(left, right) => (left.len() + right.len()) as i32, Empty => 90 }\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "multiple-move-payload-mixed.align", mixed);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(checked.diags.has_errors());
+    assert!(
+        rendered.contains("cannot mix free-standing and arena-owned"),
+        "mixed ownership diagnostic must be deterministic:\n{rendered}"
+    );
+
+    let path_dependent = concat!(
+        "PairError { Both(array<i64>, array<i64>), Empty }\n",
+        "fn heap_value() -> array<i64> = [1, 2].to_array()\n",
+        "fn run(use_arena: bool) -> i32 {\n",
+        "  return arena {\n",
+        "    mut selected := heap_value()\n",
+        "    if use_arena { selected = [3, 4].to_array() }\n",
+        "    pair := PairError.Both(selected, [5].to_array())\n",
+        "    match pair { Both(left, right) => (left.len() + right.len()) as i32, Empty => 90 }\n",
+        "  }\n",
+        "}\n",
+        "fn main() -> i32 = run(false)\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(
+        &mut sm,
+        "multiple-move-payload-path-dependent.align",
+        path_dependent,
+    );
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(checked.diags.has_errors());
+    assert!(
+        rendered.contains("cannot mix free-standing and arena-owned"),
+        "path-dependent ownership must fail closed:\n{rendered}"
+    );
+}
+
+#[test]
+fn multiple_move_payloads_drop_through_wildcard_and_or_patterns() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "PairError { Both(string, string), One(string), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  wildcard := match PairError.Both(\"left\".clone(), \"right\".clone()) { _ => 3 }\n",
+        "  grouped := match PairError.Both(\"a\".clone(), \"b\".clone()) {\n",
+        "    Both | One => 4\n",
+        "    Empty => 90\n",
+        "  }\n",
+        "  return wildcard + grouped\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("multiple-move-payload-discard", src)
+            .status
+            .code(),
+        Some(7)
+    );
+}
+
+#[test]
+fn generic_sum_allows_multiple_move_payloads_after_substitution() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Pair<T> { Both(T, T), Empty }\n",
+        "fn main() -> i32 {\n",
+        "  pair := Pair.Both(\"left\".clone(), \"right\".clone())\n",
+        "  return match pair { Both(left, right) => (left.len() + right.len()) as i32, Empty => 90 }\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("generic-multiple-move-payload", src)
+            .status
+            .code(),
+        Some(9)
+    );
+}
+
+#[test]
 fn else_drops_a_recursive_move_error_before_fallback() {
     if !backend_available() {
         return;
@@ -1115,39 +1306,26 @@ fn recursive_inline_sum_layouts_are_rejected() {
 }
 
 #[test]
-fn later_l1b_payload_shapes_fail_closed_at_type_formation() {
-    for (name, src, expected) in [
-        (
-            "multiple-move-payloads.align",
-            concat!(
-                "PairError { Both(string, string), Empty }\n",
-                "fn main() -> i32 = 0\n",
-            ),
-            "implemented in L1b-b",
-        ),
-        (
-            "nested-tagged-payload.align",
-            concat!(
-                "Output { text: string }\n",
-                "DbError { Decode(string) }\n",
-                "fn run() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n",
-                "fn main() -> i32 = 0\n",
-            ),
-            "implemented in L1b-c",
-        ),
-    ] {
-        let mut sm = SourceMap::new();
-        let checked = check(&mut sm, name, src);
-        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-        assert!(
-            checked.diags.has_errors(),
-            "later L1b payload shape must fail closed: {name}"
-        );
-        assert!(
-            rendered.contains(expected),
-            "diagnostic must name its owning L1b slice in {name}:\n{rendered}"
-        );
-    }
+fn nested_tagged_payload_fails_closed_at_type_formation() {
+    let name = "nested-tagged-payload.align";
+    let src = concat!(
+        "Output { text: string }\n",
+        "DbError { Decode(string) }\n",
+        "fn run() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let expected = "implemented in L1b-c";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "later L1b payload shape must fail closed: {name}"
+    );
+    assert!(
+        rendered.contains(expected),
+        "diagnostic must name its owning L1b slice in {name}:\n{rendered}"
+    );
 }
 
 #[test]
@@ -1159,12 +1337,14 @@ fn recursive_move_payloads_match_whole_program_and_per_unit_builds() {
         "module types\n",
         "pub NativeError { code: Option<string>, message: string }\n",
         "pub DbError { Native(NativeError), Decode(string) }\n",
+        "pub PairError { Both(string, string), Empty }\n",
         "pub fn fail(native: bool) -> Result<i64, DbError> {\n",
         "  if native {\n",
         "    return Err(DbError.Native(NativeError { code: Some(\"7\".clone()), message: \"native\".clone() }))\n",
         "  }\n",
         "  return Err(DbError.Decode(\"decode\".clone()))\n",
         "}\n",
+        "pub fn pair_error() -> PairError = PairError.Both(\"left\".clone(), \"right\".clone())\n",
     );
     let main = concat!(
         "module main\n",
@@ -1173,13 +1353,17 @@ fn recursive_move_payloads_match_whole_program_and_per_unit_builds() {
         "  Ok(value) => 90,\n",
         "  Err(err) => match err { Native(value) => 3, Decode(message) => 4 },\n",
         "}\n",
-        "fn main() -> i32 = (score(types.fail(true)) + score(types.fail(false))) as i32\n",
+        "fn pair_score(error: types.PairError) -> i64 = match error {\n",
+        "  Both(left, right) => left.len() + right.len(),\n",
+        "  Empty => 90,\n",
+        "}\n",
+        "fn main() -> i32 = (score(types.fail(true)) + score(types.fail(false)) + pair_score(types.pair_error())) as i32\n",
     );
     let files = [("types.align", types), ("main.align", main)];
     let whole = build_and_run_multi("owned-tagged-whole", &files, "main.align");
-    assert_eq!(whole.status.code(), Some(7));
+    assert_eq!(whole.status.code(), Some(16));
     let per_unit = build_per_unit_multi("owned-tagged-per-unit", &files, "main.align");
-    assert_eq!(per_unit.link_and_run().status.code(), Some(7));
+    assert_eq!(per_unit.link_and_run().status.code(), Some(16));
 }
 
 #[test]

@@ -201,8 +201,8 @@ fn struct_variant_payload() {
 #[test]
 fn str_field_struct_payload_accepted() {
     // J1 lifted the old restriction: a `str`-bearing plain-data struct is now a legal variant
-    // payload (the enum tracks its region — see `enum_str_bearing_struct_payload`). An OWNED (Move)
-    // struct payload stays rejected (that is J2), covered by `non_primitive_payload_rejected`.
+    // payload (the enum tracks its region — see `enum_str_bearing_struct_payload`). L1b also
+    // admits recursively Move struct payloads; both use the same finite type graph.
     assert!(!check_errs("str-struct-payload", "Name { s: str }\nTag { Named(Name) }\nfn main() -> i32 { return 0 }\n"));
 }
 
@@ -218,9 +218,12 @@ fn enum_box_payload_rejected() {
 }
 
 #[test]
-fn non_primitive_payload_rejected() {
-    // S1b: payloads are primitive scalars only — `string` (owned) is rejected for now.
-    assert!(check_errs("enum-strpayload", "Wrap { S(string) }\nfn main() -> i32 { return 0 }\n"));
+fn owned_string_payload_is_supported() {
+    // L1b: a user sum may carry an owned payload and recursively drops only the active arm.
+    assert!(!check_errs(
+        "enum-string-payload",
+        "Wrap { S(string) }\nfn main() -> i32 { return 0 }\n",
+    ));
 }
 
 #[test]
@@ -855,22 +858,26 @@ fn array_string_and_move_struct_enum_payloads_rejected() {
 }
 
 #[test]
-fn move_enum_option_result_payload_rejected() {
-    // A Move sum type as an `Option`/`Result` payload is deferred. The recursive DropPlan sees the
-    // owned enum shape, but nested tagged lowering and move-out/null-container semantics land in
-    // L1b. Rejected at the `Some`/`Ok`/`Err` wrap site — the sole origin of such a value. (A
-    // scalar-only enum payload stays allowed.)
-    assert!(check_errs(
-        "moveenum-some",
-        "Content { Text(str), Nums(array<i64>) }\n\
-         fn main() -> i32 {\n  o := Some(Content.Nums([1].to_array()))\n  return match o { Some(_) => 0, None => 1 }\n}\n"
-    ));
-    assert!(check_errs(
-        "moveenum-err",
-        "Content { Text(str), Nums(array<i64>) }\n\
-         fn f() -> Result<i64, Content> = Err(Content.Nums([1].to_array()))\n\
-         fn main() -> i32 = 0\n"
-    ));
+fn move_enum_option_result_payloads_drop_recursively() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "fn fail() -> Result<i64, Content> = Err(Content.Nums([4, 5].to_array()))\n",
+        "fn main() -> i32 {\n",
+        "  option := Some(Content.Nums([1, 2].to_array()))\n",
+        "  a := match option { Some(content) => match content { Text(t) => 90, Nums(ns) => ns.sum() }, None => 91 }\n",
+        "  b := match fail() { Ok(value) => 92, Err(content) => match content { Text(t) => 93, Nums(ns) => ns.sum() } }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("move-enum-option-result", src)
+            .status
+            .code(),
+        Some(12)
+    );
 }
 
 #[test]

@@ -70,12 +70,13 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
   *stance*, not a gap-by-accident: `match` + `else` + `?` cover the uses without growing a
   second, combinator-flavored control-flow dialect. Adding any of them is a design decision
   (One-way review) — record in `open-questions.md` before implementing.
-- **Remaining recursive tagged Move slices:** L1b-a implements one direct existing-`Scalar` Move
-  payload per tagged arm, including recursive `Drop`, `match`, `else`, `?`, and `map_err`.
-  L1b-b still owns multiple Move payload partial construction/uniform ownership; L1b-c owns nested
-  tagged payload representation such as `Result<Option<T>, E>`. These are settled implementation
-  slices, not remaining API decisions. Arrays of arbitrary new Move-element layouts and recursive
-  types remain separate.
+- **Remaining recursive tagged Move slices:** L1b-a implements direct existing-`Scalar` Move
+  payloads per tagged arm, including recursive `Drop`, `match`, `else`, `?`, and `map_err`.
+  L1b-b additionally implements multiple Move payload partial construction and requires one
+  uniform allocation mode across those payloads. L1b-c still owns nested tagged payload
+  representation such as `Result<Option<T>, E>`. These are settled implementation slices, not
+  remaining API decisions. Arrays of arbitrary new Move-element layouts and recursive types remain
+  separate.
 
 ## Pitfalls
 
