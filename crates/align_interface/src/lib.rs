@@ -699,6 +699,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryCaptureRoot,
     ReturnSummaryDisagreement,
     ReturnSummaryOnUnsupportedSignature,
+    ReturnSummaryGenerativeCapabilityGraph,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
@@ -735,6 +736,12 @@ impl std::fmt::Display for ImportCompatibilityError {
                 write!(
                     f,
                     "return provenance is not enabled on generic or nested function-value signatures"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph => {
+                write!(
+                    f,
+                    "return provenance capability validation found a generative recursive type graph"
                 )
             }
         }
@@ -803,19 +810,19 @@ fn validate_import_summaries(
     .into_iter()
     .flatten()
     {
-        if !itype_may_borrow(ret, summary, type_params) {
+        if !itype_may_borrow(ret, summary, type_params)? {
             return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
         }
         if !roots.1.is_empty() {
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            if !params
-                .get(index as usize)
-                .is_some_and(|param| {
-                    itype_may_borrow(&param.ty, summary, type_params)
-                })
-            {
+            let Some(param) = params.get(index as usize) else {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            };
+            if !itype_may_borrow(&param.ty, summary, type_params)? {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
@@ -829,7 +836,7 @@ fn itype_may_borrow(
     ty: &IType,
     summary: &InterfaceSummary,
     type_params: &[ITypeParam],
-) -> bool {
+) -> Result<bool, ImportCompatibilityError> {
     fn substitute(
         ty: &IType,
         bindings: &[(String, IType)],
@@ -883,18 +890,150 @@ fn itype_may_borrow(
         }
     }
 
+    // Each lineage entry mirrors the current type relative to the most recent occurrence of one
+    // local nominal. A marker denotes a whole actual argument. Seeing that marker below a new
+    // constructor when the same nominal recurs proves parameter-driven, unbounded type growth.
+    #[derive(Clone)]
+    enum SymbolicType {
+        Marker,
+        Named(Vec<SymbolicType>),
+        Tuple(Vec<SymbolicType>),
+        Fn {
+            params: Vec<SymbolicType>,
+            ret: Box<SymbolicType>,
+        },
+    }
+
+    fn substitute_symbolic(
+        ty: &IType,
+        bindings: &[(String, SymbolicType)],
+    ) -> SymbolicType {
+        match ty {
+            IType::Named { path, args } if args.is_empty() => {
+                let Some((_, bound)) =
+                    bindings.iter().rev().find(|(name, _)| name == path)
+                else {
+                    return SymbolicType::Named(Vec::new());
+                };
+                bound.clone()
+            }
+            IType::Named { args, .. } => SymbolicType::Named(
+                args.iter()
+                    .map(|argument| substitute_symbolic(argument, bindings))
+                    .collect(),
+            ),
+            IType::Tuple(elements) => SymbolicType::Tuple(
+                elements
+                    .iter()
+                    .map(|element| substitute_symbolic(element, bindings))
+                    .collect(),
+            ),
+            IType::Fn { params, ret, .. } => SymbolicType::Fn {
+                params: params
+                    .iter()
+                    .map(|parameter| substitute_symbolic(&parameter.ty, bindings))
+                    .collect(),
+                ret: Box::new(substitute_symbolic(ret, bindings)),
+            },
+        }
+    }
+
+    fn has_wrapped_marker(args: &[SymbolicType]) -> bool {
+        args.iter().any(|argument| {
+            if matches!(argument, SymbolicType::Marker) {
+                return false;
+            }
+            let mut work = vec![argument];
+            while let Some(ty) = work.pop() {
+                match ty {
+                    SymbolicType::Marker => return true,
+                    SymbolicType::Named(args) | SymbolicType::Tuple(args) => {
+                        work.extend(args);
+                    }
+                    SymbolicType::Fn { params, ret } => {
+                        work.extend(params);
+                        work.push(ret);
+                    }
+                }
+            }
+            false
+        })
+    }
+
+    type Lineage = HashMap<String, SymbolicType>;
+
+    fn split_lineage(
+        lineage: &Lineage,
+        count: usize,
+        named: bool,
+    ) -> Result<Vec<Lineage>, ImportCompatibilityError> {
+        let mut children = vec![Lineage::new(); count];
+        for (key, ty) in lineage {
+            let args = match (named, ty) {
+                (true, SymbolicType::Named(args))
+                | (false, SymbolicType::Tuple(args)) => args,
+                (_, SymbolicType::Marker) => continue,
+                _ => {
+                    return Err(
+                        ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
+                    );
+                }
+            };
+            if args.len() != count {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            }
+            for (index, argument) in args.iter().cloned().enumerate() {
+                children[index].insert(key.clone(), argument);
+            }
+        }
+        Ok(children)
+    }
+
+    fn expand_lineage(
+        lineage: &Lineage,
+        parameters: &[ITypeParam],
+        value: &IType,
+    ) -> Result<Lineage, ImportCompatibilityError> {
+        let mut expanded = Lineage::new();
+        for (key, ty) in lineage {
+            let SymbolicType::Named(args) = ty else {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            };
+            if args.len() != parameters.len() {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            }
+            let bindings = parameters
+                .iter()
+                .zip(args.iter().cloned())
+                .map(|(parameter, argument)| (parameter.name.clone(), argument))
+                .collect::<Vec<_>>();
+            expanded.insert(
+                key.clone(),
+                substitute_symbolic(value, &bindings),
+            );
+        }
+        Ok(expanded)
+    }
+
     let is_local_nominal =
         |path: &str, name: &str| path == name || path == format!("{}.{}", summary.unit, name);
-    let mut work = vec![ty.clone()];
+    let mut work = vec![(ty.clone(), Lineage::new())];
     let mut visited = HashSet::new();
-    while let Some(ty) = work.pop() {
+    let mut may_borrow = false;
+    while let Some((ty, lineage)) = work.pop() {
         match ty {
-            IType::Tuple(elements) => work.extend(elements),
-            IType::Fn { .. } => return true,
+            IType::Tuple(elements) => {
+                let child_lineages = split_lineage(&lineage, elements.len(), false)?;
+                work.extend(elements.into_iter().zip(child_lineages));
+            }
+            IType::Fn { .. } => may_borrow = true,
             IType::Named { path, args } => match path.as_str() {
                 "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
-                | "json.doc" | "json.scanner" => return true,
-                "Option" | "Result" | "array" => work.extend(args),
+                | "json.doc" | "json.scanner" => may_borrow = true,
+                "Option" | "Result" | "array" => {
+                    let child_lineages = split_lineage(&lineage, args.len(), true)?;
+                    work.extend(args.into_iter().zip(child_lineages));
+                }
                 "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
                 | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
                 | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
@@ -917,6 +1056,14 @@ fn itype_may_borrow(
                         if definition.type_params.len() != args.len() {
                             continue;
                         }
+                        let key = format!("struct:{}", definition.name);
+                        if lineage.get(&key).is_some_and(|ty| {
+                            matches!(ty, SymbolicType::Named(args) if has_wrapped_marker(args))
+                        }) {
+                            return Err(
+                                ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
+                            );
+                        }
                         let concrete = IType::Named {
                             path: definition.name.clone(),
                             args: args.clone(),
@@ -927,19 +1074,28 @@ fn itype_may_borrow(
                         let bindings = definition
                             .type_params
                             .iter()
-                            .zip(args)
+                            .zip(args.iter().cloned())
                             .map(|(parameter, argument)| {
                                 (parameter.name.clone(), argument)
                             })
                             .collect::<Vec<_>>();
-                        work.extend(
-                            definition
-                                .fields
-                                .iter()
-                                .map(|(_, field)| {
-                                    substitute(field, &bindings, &mut Vec::new())
-                                }),
+                        let mut next_lineage = lineage;
+                        next_lineage.insert(
+                            key,
+                            SymbolicType::Named(
+                                args.iter().map(|_| SymbolicType::Marker).collect(),
+                            ),
                         );
+                        for (_, field) in &definition.fields {
+                            work.push((
+                                substitute(field, &bindings, &mut Vec::new()),
+                                expand_lineage(
+                                    &next_lineage,
+                                    &definition.type_params,
+                                    field,
+                                )?,
+                            ));
+                        }
                     } else if let Some(definition) = summary
                         .enums
                         .iter()
@@ -947,6 +1103,14 @@ fn itype_may_borrow(
                     {
                         if definition.type_params.len() != args.len() {
                             continue;
+                        }
+                        let key = format!("enum:{}", definition.name);
+                        if lineage.get(&key).is_some_and(|ty| {
+                            matches!(ty, SymbolicType::Named(args) if has_wrapped_marker(args))
+                        }) {
+                            return Err(
+                                ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
+                            );
                         }
                         let concrete = IType::Named {
                             path: definition.name.clone(),
@@ -958,20 +1122,32 @@ fn itype_may_borrow(
                         let bindings = definition
                             .type_params
                             .iter()
-                            .zip(args)
+                            .zip(args.iter().cloned())
                             .map(|(parameter, argument)| {
                                 (parameter.name.clone(), argument)
                             })
                             .collect::<Vec<_>>();
-                        work.extend(
-                            definition
-                                .variants
-                                .iter()
-                                .flat_map(|(_, payload)| payload)
-                                .map(|value| {
-                                    substitute(value, &bindings, &mut Vec::new())
-                                }),
+                        let mut next_lineage = lineage;
+                        next_lineage.insert(
+                            key,
+                            SymbolicType::Named(
+                                args.iter().map(|_| SymbolicType::Marker).collect(),
+                            ),
                         );
+                        for value in definition
+                            .variants
+                            .iter()
+                            .flat_map(|(_, payload)| payload)
+                        {
+                            work.push((
+                                substitute(value, &bindings, &mut Vec::new()),
+                                expand_lineage(
+                                    &next_lineage,
+                                    &definition.type_params,
+                                    value,
+                                )?,
+                            ));
+                        }
                     } else if type_params
                         .iter()
                         .any(|parameter| parameter.name == path.as_str())
@@ -979,13 +1155,13 @@ fn itype_may_borrow(
                     {
                         // A declared generic parameter or a qualified imported nominal may carry
                         // a view. An unresolved bare name is malformed at this boundary.
-                        return true;
+                        may_borrow = true;
                     }
                 }
-            }
+            },
         }
     }
-    false
+    Ok(may_borrow)
 }
 
 fn validate_import_type(

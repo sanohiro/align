@@ -820,6 +820,7 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
 fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
     let mut summary = one(
         "pub Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
          pub fn identity(value: str) -> str = value\n\
          fn main() -> i32 = 0\n",
     )
@@ -861,6 +862,161 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         validate_for_import(&summary),
         Ok(()),
         "`B<i64>` and `B<str>` are distinct concrete capability nodes; the latter exposes the reachable `str` leaf"
+    );
+
+    let mut finite = summary.clone();
+    let mut shift = finite
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    shift.name = "FiniteShift".to_string();
+    let mut second_parameter = shift.type_params[0].clone();
+    second_parameter.name = "U".to_string();
+    shift.type_params.push(second_parameter);
+    shift.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "FiniteShift",
+                vec![
+                    named("T", vec![]),
+                    named("Option", vec![named("str", vec![])]),
+                ],
+            ),
+        ),
+        ("value".to_string(), named("U", vec![])),
+    ];
+    finite.structs.push(shift);
+    let root = named(
+        "FiniteShift",
+        vec![named("i64", vec![]), named("bool", vec![])],
+    );
+    finite.fns[0].params[0].ty = root.clone();
+    finite.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&finite),
+        Ok(()),
+        "preserving one argument while replacing another with a larger constant type reaches an exact finite cycle"
+    );
+
+    let mut finite_constant = summary.clone();
+    let mut constant = finite_constant
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    constant.name = "FiniteConstant".to_string();
+    constant.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "FiniteConstant",
+                vec![named("Option", vec![named("i64", vec![])])],
+            ),
+        ),
+        ("view".to_string(), named("str", vec![])),
+    ];
+    finite_constant.structs.push(constant);
+    let root = named("FiniteConstant", vec![named("i64", vec![])]);
+    finite_constant.fns[0].params[0].ty = root.clone();
+    finite_constant.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&finite_constant),
+        Ok(()),
+        "a larger constant actual that happens to contain the prior concrete type is not parameter-driven growth"
+    );
+
+    let mut generative = summary.clone();
+    let mut grow = generative
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    grow.name = "Grow".to_string();
+    grow.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "Grow",
+                vec![named("Option", vec![named("T", vec![])])],
+            ),
+        ),
+        ("view".to_string(), named("str", vec![])),
+    ];
+    generative.structs.push(grow);
+    let root = named("Grow", vec![named("i64", vec![])]);
+    generative.fns[0].params[0].ty = root.clone();
+    generative.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a struct argument that embeds and grows its prior actual must reject even after a borrowing leaf is found"
+    );
+
+    let mut generative_pair = summary.clone();
+    let mut grow = generative_pair
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    grow.name = "GrowPair".to_string();
+    let mut second_parameter = grow.type_params[0].clone();
+    second_parameter.name = "U".to_string();
+    grow.type_params.push(second_parameter);
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "GrowPair",
+            vec![
+                named("Option", vec![named("U", vec![])]),
+                named("T", vec![]),
+            ],
+        ),
+    )];
+    generative_pair.structs.push(grow);
+    let root = named(
+        "GrowPair",
+        vec![named("i64", vec![]), named("bool", vec![])],
+    );
+    generative_pair.fns[0].params[0].ty = root.clone();
+    generative_pair.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative_pair),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a growing permutation of all prior arguments must reject"
+    );
+
+    let mut generative_enum = summary;
+    let mut grow = generative_enum
+        .enums
+        .iter()
+        .find(|definition| definition.name == "Choice")
+        .expect("Choice definition")
+        .clone();
+    grow.name = "GrowChoice".to_string();
+    grow.variants = vec![
+        (
+            "Next".to_string(),
+            vec![named(
+                "GrowChoice",
+                vec![named("Option", vec![named("T", vec![])])],
+            )],
+        ),
+        ("View".to_string(), vec![named("str", vec![])]),
+    ];
+    generative_enum.enums.push(grow);
+    let root = named("GrowChoice", vec![named("i64", vec![])]);
+    generative_enum.fns[0].params[0].ty = root.clone();
+    generative_enum.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative_enum),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an enum argument that embeds and grows its prior actual must reject even after a borrowing leaf is found"
     );
 }
 
