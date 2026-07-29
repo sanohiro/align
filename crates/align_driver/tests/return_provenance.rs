@@ -167,6 +167,91 @@ pub fn odd(first: str, second: str, depth: i64) -> str {
 }
 
 #[test]
+fn unreachable_return_and_break_edges_do_not_taint_provenance() {
+    let direct = "\
+fn fixed_return(value: str) -> str {
+  return \"fixed\"
+  return value
+}
+fn fixed_break(value: str) -> str = loop {
+  break \"fixed\"
+  break value
+}
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"return owner\".clone()
+  returned := fixed_return(first)
+  consume(first)
+  print(returned.len())
+
+  second := \"break owner\".clone()
+  broken := fixed_break(second)
+  consume(second)
+  return broken.len() as i32
+}
+";
+    assert!(
+        !check_errs("l2b-unreachable-exits-direct", direct),
+        "dead returns and breaks must not retain an otherwise-unselected owner"
+    );
+
+    let files = &[
+        (
+            "dep.align",
+            "\
+module dep
+pub fn fixed_return(value: str) -> str {
+  return \"fixed\"
+  return value
+}
+pub fn fixed_break(value: str) -> str = loop {
+  break \"fixed\"
+  break value
+}
+",
+        ),
+        (
+            "main.align",
+            "\
+import dep
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"return owner\".clone()
+  returned := dep.fixed_return(first)
+  consume(first)
+  print(returned.len())
+
+  second := \"break owner\".clone()
+  broken := dep.fixed_break(second)
+  consume(second)
+  return broken.len() as i32
+}
+",
+        ),
+    ];
+    let checked =
+        assert_same_verdict("l2b-unreachable-exits-imported", files, "main.align");
+    assert!(
+        !checked.diags.has_errors(),
+        "whole-program and per-unit summaries must exclude dead exits"
+    );
+    let dependency = checked
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "dep")
+        .expect("dependency summary");
+    for name in ["fixed_return", "fixed_break"] {
+        let function = dependency
+            .fns
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} signature"));
+        assert_eq!(function.return_borrow, ReturnBorrowSummary::None);
+        assert_eq!(function.return_region, ReturnRegionSummary::None);
+    }
+}
+
+#[test]
 fn ordinary_exported_lambda_suffix_is_not_a_lifted_function() {
     let files = &[
         (

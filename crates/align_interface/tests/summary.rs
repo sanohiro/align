@@ -1449,6 +1449,44 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
         args,
     };
 
+    for reserved in ["Error", "argon2_params", "regex_match"] {
+        let mut reserved_struct = base.clone();
+        reserved_struct.structs[0].name = reserved.to_string();
+        assert_eq!(
+            validate_for_import(&reserved_struct),
+            Err(ImportCompatibilityError::ReservedLocalType(
+                reserved.to_string()
+            )),
+            "producer-reserved struct name `{reserved}` must reject before type-shape validation"
+        );
+
+        let mut reserved_enum = base.clone();
+        let mut enumeration =
+            one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
+        enumeration.name = reserved.to_string();
+        reserved_enum.enums.push(enumeration);
+        assert_eq!(
+            validate_for_import(&reserved_enum),
+            Err(ImportCompatibilityError::ReservedLocalType(
+                reserved.to_string()
+            )),
+            "producer-reserved sum-type name `{reserved}` must reject before type-shape validation"
+        );
+    }
+
+    let mut reserved_before_duplicate = base.clone();
+    reserved_before_duplicate.structs[0].name = "Error".to_string();
+    reserved_before_duplicate
+        .structs
+        .push(reserved_before_duplicate.structs[0].clone());
+    assert_eq!(
+        validate_for_import(&reserved_before_duplicate),
+        Err(ImportCompatibilityError::ReservedLocalType(
+            "Error".to_string()
+        )),
+        "reserved-local validation precedes duplicate-local validation"
+    );
+
     let mut duplicate_local = base.clone();
     duplicate_local.structs.push(duplicate_local.structs[0].clone());
     duplicate_local.fns[0].params[0].ty = named("Missing", vec![]);

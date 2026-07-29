@@ -12069,12 +12069,18 @@ fn hir_block_diverges(b: &hir::Block) -> bool {
 }
 
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
-/// arms do; a block-wrapping expr (`{…}` / `arena {…}` / `task_group {…}`) defers to its block.
-/// (A `match` / `?` may fall through, so they are conservatively non-diverging here.)
+/// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
+/// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
 fn hir_expr_diverges(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
-        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => hir_block_diverges(b),
+        ExprKind::Block(b)
+        | ExprKind::Arena(b)
+        | ExprKind::TaskGroup(b)
+        | ExprKind::Unsafe(b) => hir_block_diverges(b),
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| hir_expr_diverges(&arm.body))
+        }
         // A `loop` with no `break` never yields and control never reaches past it (it either loops
         // forever or exits the function via `return`/`?`). A loop *with* a `break` may fall through.
         ExprKind::Loop { diverges, .. } => *diverges,
@@ -12289,8 +12295,10 @@ impl<'a> MoveCheck<'a> {
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
         let ret_is_move = self.is_move_ty(self.f.ret);
-        self.block(&self.f.body, &mut moved, ret_is_move, true);
-        if let Some(value) = &self.f.body.value {
+        let falls_through = self.block(&self.f.body, &mut moved, ret_is_move, true);
+        if falls_through
+            && let Some(value) = &self.f.body.value
+        {
             self.return_roots.extend(self.borrow_sources(value));
         }
         self.return_roots
@@ -13063,8 +13071,12 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         tail_consuming: bool,
         tail_direct: bool,
-    ) {
+    ) -> bool {
+        let mut falls_through = true;
         for s in &b.stmts {
+            if !falls_through {
+                break;
+            }
             match s {
                 Stmt::Let { local, init } => {
                     self.expr(init, moved, true, true);
@@ -13205,10 +13217,15 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
+            falls_through = !hir_stmt_diverges(s);
         }
-        if let Some(v) = &b.value {
+        if falls_through
+            && let Some(v) = &b.value
+        {
             self.expr(v, moved, tail_consuming, tail_direct);
+            falls_through = !hir_expr_diverges(v);
         }
+        falls_through
     }
 
     /// `consuming` = this position takes a Move value by value (so it moves it). `direct` = the
@@ -13644,7 +13661,9 @@ impl<'a> MoveCheck<'a> {
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => {
+                self.block(b, moved, consuming, direct);
+            }
             // `arena { … }` is transparent the same way, but the walk must know it is inside one:
             // MIR mints no hidden `string` owner for a `template` there, so no per-iteration borrow
             // root is recorded (see [`owns_hidden_string`] and `Self::template_owner_root`).

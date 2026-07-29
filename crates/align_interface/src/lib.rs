@@ -693,6 +693,7 @@ fn render_enum(e: &IEnumDef) -> String {
 /// consumes canonical return summaries, while `Borrow`/`BorrowMut` remain disabled until L2d/L2e.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
+    ReservedLocalType(String),
     DuplicateLocalType(String),
     DuplicateTypeParameter(String),
     TypeParameterShadowsLocalType(String),
@@ -715,6 +716,9 @@ pub enum ImportCompatibilityError {
 impl std::fmt::Display for ImportCompatibilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ImportCompatibilityError::ReservedLocalType(name) => {
+                write!(f, "interface declares producer-reserved local type `{name}`")
+            }
             ImportCompatibilityError::DuplicateLocalType(name) => {
                 write!(f, "interface contains duplicate or ambiguous local type `{name}`")
             }
@@ -829,6 +833,11 @@ impl<'a> LocalDefinitionIndex<'a> {
         let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
         let mut by_name = HashMap::new();
         for definition in &summary.structs {
+            if is_reserved_local_type_name(&definition.name) {
+                return Err(ImportCompatibilityError::ReservedLocalType(
+                    definition.name.clone(),
+                ));
+            }
             if by_name
                 .insert(definition.name.as_str(), definitions.len())
                 .is_some()
@@ -840,6 +849,11 @@ impl<'a> LocalDefinitionIndex<'a> {
             definitions.push(LocalDefinition::Struct(definition));
         }
         for definition in &summary.enums {
+            if is_reserved_local_type_name(&definition.name) {
+                return Err(ImportCompatibilityError::ReservedLocalType(
+                    definition.name.clone(),
+                ));
+            }
             if by_name
                 .insert(definition.name.as_str(), definitions.len())
                 .is_some()
@@ -884,6 +898,10 @@ impl<'a> LocalDefinitionIndex<'a> {
     fn total_params(&self) -> usize {
         self.total_params
     }
+}
+
+fn is_reserved_local_type_name(name: &str) -> bool {
+    matches!(name, "Error" | "argon2_params" | "regex_match")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
