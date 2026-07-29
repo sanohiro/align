@@ -14410,7 +14410,7 @@ impl<'a> MoveCheck<'a> {
 /// loop entry so a `break` inside a nested region can be rejected (deferred — see `check_break`).
 struct LoopCtx {
     break_ty: Option<Ty>,
-    saw_break: bool,
+    accepted_breaks: std::collections::HashSet<Span>,
     region_depth: u32,
 }
 
@@ -14502,6 +14502,10 @@ struct Checker<'a, 't> {
     /// the top; its value type is unified into the frame's `break_ty` (like `match` arms). Reset to
     /// empty at a lambda boundary (a `break` cannot cross a lambda). `draft.md` §4.
     loops: Vec<LoopCtx>,
+    /// Loop expressions already checked as having a reachable, semantically accepted `break`.
+    /// Enclosing loop classification consumes this checker-owned result instead of re-interpreting
+    /// an inner loop's target and region gates.
+    loop_fallthrough: std::collections::HashSet<Span>,
     /// The enclosing function's name — used to generate unique names for lifted lambdas.
     cur_fn: String,
     /// The enclosing function's generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty
@@ -14626,6 +14630,7 @@ impl<'a, 't> Checker<'a, 't> {
             readonly_locals: std::collections::HashSet::new(),
             buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
+            loop_fallthrough: std::collections::HashSet::new(),
             cur_fn: String::new(),
             type_params,
             param_bounds,
@@ -26106,10 +26111,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// whose arms all diverge — it satisfies any expected type, and the code after it is unreachable.
     /// The body's trailing value is discarded each iteration (checked with no expected type).
     fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
-        let has_reachable_break = ast_loop_block_flow(b).reaches_break;
         self.loops.push(LoopCtx {
             break_ty: expected,
-            saw_break: false,
+            accepted_breaks: std::collections::HashSet::new(),
             region_depth: self.arena_depth + self.task_group_depth,
         });
         // The body is a per-iteration statement sequence: its tail value is discarded, so no
@@ -26123,12 +26127,16 @@ impl<'a, 't> Checker<'a, 't> {
         let hi = self.locals.len() as LocalId;
         let body_locals = lo..hi;
         let ctx = self.loops.pop().expect("loop context balanced");
+        let has_reachable_break =
+            ast_loop_block_flow(b, &ctx.accepted_breaks, &self.loop_fallthrough)
+                .reaches_break;
         if has_reachable_break {
-            debug_assert!(ctx.saw_break);
+            self.loop_fallthrough.insert(span);
             let ty = ctx.break_ty.unwrap_or(Ty::Unit);
             self.constrain(ty, expected, span);
             Expr { kind: ExprKind::Loop { body, diverges: false, body_locals }, ty, span }
         } else {
+            self.loop_fallthrough.remove(&span);
             // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
             // a diverging `match`) — the code after it is unreachable.
             let ty = expected.unwrap_or(Ty::Unit);
@@ -26160,13 +26168,20 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return value.map(|e| self.check_expr(e, None));
         }
+        // This break is a control edge accepted for the current target loop. Record checker-owned
+        // evidence after target/region validation but before checking the payload: payload errors
+        // do not retarget the edge, while a region-rejected break above records no evidence.
+        self.loops
+            .last_mut()
+            .expect("enclosing loop checked above")
+            .accepted_breaks
+            .insert(span);
         // A bare array literal materializes only as a `let` initializer, slice borrow, or pipeline
         // source — MIR has no lowering for one in a free value position and would panic.
         let expected = self.loops.last().unwrap().break_ty;
         if let Some(v) = value
             && self.reject_bare_array_value(v, expected, "a `break` value")
         {
-            self.loops.last_mut().unwrap().saw_break = true;
             return Some(self.check_expr(v, None));
         }
         let v = value.map(|e| self.check_expr(e, expected));
@@ -26187,7 +26202,6 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        self.loops.last_mut().unwrap().saw_break = true;
         v
     }
 
@@ -26961,57 +26975,89 @@ impl AstLoopFlow {
     }
 }
 
-fn ast_loop_block_flow(block: &ast::Block) -> AstLoopFlow {
+fn ast_loop_block_flow(
+    block: &ast::Block,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
     let mut flow = AstLoopFlow::FALLTHROUGH;
     for statement in &block.stmts {
         if !flow.falls_through {
             break;
         }
-        flow = flow.sequence(ast_loop_stmt_flow(statement));
+        flow = flow.sequence(ast_loop_stmt_flow(
+            statement,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
     }
     if flow.falls_through
         && let Some(tail) = &block.tail
     {
-        flow = flow.sequence(ast_loop_expr_flow(tail));
+        flow = flow.sequence(ast_loop_expr_flow(
+            tail,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
     }
     flow
 }
 
-fn ast_loop_stmt_flow(statement: &ast::Stmt) -> AstLoopFlow {
+fn ast_loop_stmt_flow(
+    statement: &ast::Stmt,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
     match statement {
         ast::Stmt::Let { init, .. } | ast::Stmt::LetTuple { init, .. } => {
-            ast_loop_expr_flow(init)
+            ast_loop_expr_flow(init, accepted_breaks, loop_fallthrough)
         }
-        ast::Stmt::Assign { place, value } => ast_loop_expr_flow(place)
-            .sequence(ast_loop_expr_flow(value)),
+        ast::Stmt::Assign { place, value } => {
+            ast_loop_expr_flow(place, accepted_breaks, loop_fallthrough).sequence(
+                ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough),
+            )
+        }
         ast::Stmt::Return(value) => {
             let value_flow = value
                 .as_ref()
-                .map_or(AstLoopFlow::FALLTHROUGH, ast_loop_expr_flow);
+                .map_or(AstLoopFlow::FALLTHROUGH, |value| {
+                    ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough)
+                });
             AstLoopFlow {
                 falls_through: false,
                 reaches_break: value_flow.reaches_break,
             }
         }
-        ast::Stmt::Break { value, .. } => {
+        ast::Stmt::Break { value, span } => {
             let value_flow = value
                 .as_ref()
-                .map_or(AstLoopFlow::FALLTHROUGH, ast_loop_expr_flow);
+                .map_or(AstLoopFlow::FALLTHROUGH, |value| {
+                    ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough)
+                });
             AstLoopFlow {
                 falls_through: false,
-                reaches_break: value_flow.falls_through || value_flow.reaches_break,
+                reaches_break: value_flow.reaches_break
+                    || (value_flow.falls_through && accepted_breaks.contains(span)),
             }
         }
-        ast::Stmt::Expr(expression) => ast_loop_expr_flow(expression),
+        ast::Stmt::Expr(expression) => {
+            ast_loop_expr_flow(expression, accepted_breaks, loop_fallthrough)
+        }
     }
 }
 
 fn ast_loop_expr_sequence<'a>(
     expressions: impl IntoIterator<Item = &'a ast::Expr>,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
 ) -> AstLoopFlow {
     let mut flow = AstLoopFlow::FALLTHROUGH;
     for expression in expressions {
-        flow = flow.sequence(ast_loop_expr_flow(expression));
+        flow = flow.sequence(ast_loop_expr_flow(
+            expression,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
         if !flow.falls_through {
             break;
         }
@@ -27019,7 +27065,11 @@ fn ast_loop_expr_sequence<'a>(
     flow
 }
 
-fn ast_loop_expr_flow(expression: &ast::Expr) -> AstLoopFlow {
+fn ast_loop_expr_flow(
+    expression: &ast::Expr,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
     use ast::ExprKind as K;
     match &expression.kind {
         K::Unit
@@ -27033,31 +27083,51 @@ fn ast_loop_expr_flow(expression: &ast::Expr) -> AstLoopFlow {
         K::Unary { expr, .. }
         | K::Try(expr)
         | K::FieldAccess { recv: expr, .. }
-        | K::TupleIndex { recv: expr, .. } => ast_loop_expr_flow(expr),
-        K::Cast { expr, .. } => ast_loop_expr_flow(expr),
+        | K::TupleIndex { recv: expr, .. } => {
+            ast_loop_expr_flow(expr, accepted_breaks, loop_fallthrough)
+        }
+        K::Cast { expr, .. } => {
+            ast_loop_expr_flow(expr, accepted_breaks, loop_fallthrough)
+        }
         K::Binary { op, lhs, rhs } => {
-            let left = ast_loop_expr_flow(lhs);
+            let left =
+                ast_loop_expr_flow(lhs, accepted_breaks, loop_fallthrough);
             if !left.falls_through {
                 return left;
             }
-            let right = ast_loop_expr_flow(rhs);
+            let right =
+                ast_loop_expr_flow(rhs, accepted_breaks, loop_fallthrough);
             AstLoopFlow {
                 falls_through: matches!(op, BinOp::And | BinOp::Or)
                     || right.falls_through,
                 reaches_break: left.reaches_break || right.reaches_break,
             }
         }
-        K::Call { callee, args } => ast_loop_expr_flow(callee)
-            .sequence(ast_loop_expr_sequence(args)),
+        K::Call { callee, args } => {
+            ast_loop_expr_flow(callee, accepted_breaks, loop_fallthrough)
+                .sequence(ast_loop_expr_sequence(
+                    args,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ))
+        }
         K::If { cond, then, els } => {
-            let condition = ast_loop_expr_flow(cond);
+            let condition =
+                ast_loop_expr_flow(cond, accepted_breaks, loop_fallthrough);
             if !condition.falls_through {
                 return condition;
             }
-            let then_flow = ast_loop_block_flow(then);
+            let then_flow =
+                ast_loop_block_flow(then, accepted_breaks, loop_fallthrough);
             let else_flow = els
                 .as_deref()
-                .map_or(AstLoopFlow::FALLTHROUGH, ast_loop_expr_flow);
+                .map_or(AstLoopFlow::FALLTHROUGH, |els| {
+                    ast_loop_expr_flow(
+                        els,
+                        accepted_breaks,
+                        loop_fallthrough,
+                    )
+                });
             AstLoopFlow {
                 falls_through: then_flow.falls_through || else_flow.falls_through,
                 reaches_break: condition.reaches_break
@@ -27066,55 +27136,90 @@ fn ast_loop_expr_flow(expression: &ast::Expr) -> AstLoopFlow {
             }
         }
         K::Block(block) | K::Arena(block) | K::Unsafe(block) | K::TaskGroup(block) => {
-            ast_loop_block_flow(block)
+            ast_loop_block_flow(block, accepted_breaks, loop_fallthrough)
         }
         K::StructLit { fields, .. } => {
-            ast_loop_expr_sequence(fields.iter().map(|field| &field.value))
+            ast_loop_expr_sequence(
+                fields.iter().map(|field| &field.value),
+                accepted_breaks,
+                loop_fallthrough,
+            )
         }
         K::ElseUnwrap { opt, fallback } => {
-            let option = ast_loop_expr_flow(opt);
+            let option =
+                ast_loop_expr_flow(opt, accepted_breaks, loop_fallthrough);
             if !option.falls_through {
                 return option;
             }
-            let fallback = ast_loop_expr_flow(fallback);
+            let fallback = ast_loop_expr_flow(
+                fallback,
+                accepted_breaks,
+                loop_fallthrough,
+            );
             AstLoopFlow {
                 // The present/success edge bypasses the fallback.
                 falls_through: true,
                 reaches_break: option.reaches_break || fallback.reaches_break,
             }
         }
-        K::Loop(body) => AstLoopFlow {
+        K::Loop(_) => AstLoopFlow {
             // Breaks in this nested loop target it, not the loop currently being classified.
-            falls_through: ast_loop_block_flow(body).reaches_break,
+            falls_through: loop_fallthrough.contains(&expression.span),
             reaches_break: false,
         },
         K::ArrayLit(elements) | K::Tuple(elements) => {
-            ast_loop_expr_sequence(elements)
+            ast_loop_expr_sequence(
+                elements,
+                accepted_breaks,
+                loop_fallthrough,
+            )
         }
         K::Index { recv, index } => {
-            ast_loop_expr_flow(recv).sequence(ast_loop_expr_flow(index))
+            ast_loop_expr_flow(recv, accepted_breaks, loop_fallthrough)
+                .sequence(ast_loop_expr_flow(
+                    index,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ))
         }
         K::SliceRange { recv, start, end } => {
-            let mut flow = ast_loop_expr_flow(recv);
+            let mut flow =
+                ast_loop_expr_flow(recv, accepted_breaks, loop_fallthrough);
             if let Some(start) = start {
-                flow = flow.sequence(ast_loop_expr_flow(start));
+                flow = flow.sequence(ast_loop_expr_flow(
+                    start,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ));
             }
             if let Some(end) = end {
-                flow = flow.sequence(ast_loop_expr_flow(end));
+                flow = flow.sequence(ast_loop_expr_flow(
+                    end,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ));
             }
             flow
         }
         // A lambda body is not evaluated while the function value is formed.
         K::Lambda { .. } => AstLoopFlow::FALLTHROUGH,
         K::Match { scrutinee, arms } => {
-            let scrutinee = ast_loop_expr_flow(scrutinee);
+            let scrutinee = ast_loop_expr_flow(
+                scrutinee,
+                accepted_breaks,
+                loop_fallthrough,
+            );
             if !scrutinee.falls_through {
                 return scrutinee;
             }
             let mut any_fallthrough = false;
             let mut reaches_break = scrutinee.reaches_break;
             for arm in arms {
-                let arm = ast_loop_expr_flow(&arm.body);
+                let arm = ast_loop_expr_flow(
+                    &arm.body,
+                    accepted_breaks,
+                    loop_fallthrough,
+                );
                 any_fallthrough |= arm.falls_through;
                 reaches_break |= arm.reaches_break;
             }
@@ -27123,12 +27228,16 @@ fn ast_loop_expr_flow(expression: &ast::Expr) -> AstLoopFlow {
                 reaches_break,
             }
         }
-        K::Template(parts) => ast_loop_expr_sequence(parts.iter().filter_map(|part| {
-            let ast::TemplatePart::Hole(expression) = part else {
-                return None;
-            };
-            Some(expression)
-        })),
+        K::Template(parts) => ast_loop_expr_sequence(
+            parts.iter().filter_map(|part| {
+                let ast::TemplatePart::Hole(expression) = part else {
+                    return None;
+                };
+                Some(expression)
+            }),
+            accepted_breaks,
+            loop_fallthrough,
+        ),
     }
 }
 

@@ -167,8 +167,114 @@ pub fn odd(first: str, second: str, depth: i64) -> str {
 }
 
 #[test]
+fn loop_break_recovery_uses_checked_target_and_region_evidence() {
+    let accepted = "\
+fn inner_break_stays_inner() -> str = loop {
+  loop { break }
+}
+fn arena_baseline() -> i64 = arena {
+  loop { break 1 }
+}
+fn task_group_baseline() -> i64 = task_group {
+  loop { break 2 }
+}
+fn block_break() -> str = loop {
+  { break \"block\" }
+}
+fn unsafe_break() -> str = loop {
+  unsafe { break \"unsafe\" }
+}
+fn main() -> i32 {
+  print(arena_baseline())
+  print(task_group_baseline())
+  print(block_break())
+  print(unsafe_break())
+  return 0
+}
+";
+    assert!(
+        !check_errs("l2b-loop-break-checked-evidence-positive", accepted),
+        "inner-loop targeting, active-region baselines, block, and unsafe breaks must check"
+    );
+
+    for (name, source) in [
+        (
+            "arena",
+            "fn bad(value: str) -> str = loop {\n  arena { break }\n  break value\n}\nfn main() -> i32 = 0\n",
+        ),
+        (
+            "task-group",
+            "fn bad(value: str) -> str = loop {\n  task_group { break }\n  break value\n}\nfn main() -> i32 = 0\n",
+        ),
+    ] {
+        let mut source_map = SourceMap::new();
+        let checked = check(
+            &mut source_map,
+            &format!("l2b-loop-break-rejected-{name}"),
+            source,
+        );
+        let diagnostics =
+            align_driver::format_diagnostics(&source_map, &checked.diags);
+        assert!(
+            diagnostics.contains(
+                "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet"
+            ),
+            "a rejected {name} break must diagnose without panicking:\n{diagnostics}"
+        );
+        let bad = checked
+            .hir
+            .fns
+            .iter()
+            .find(|function| function.name == "bad")
+            .expect("checked bad function");
+        let loop_value = bad.body.value.as_deref().expect("loop body value");
+        assert!(
+            matches!(
+                loop_value.kind,
+                align_sema::ExprKind::Loop { diverges: true, .. }
+            ),
+            "a rejected {name} break must not combine with the unreachable later break to make the loop fall through:\n{diagnostics}"
+        );
+    }
+
+    let lambda = check_diagnostics(
+        "l2b-loop-break-lambda-isolation",
+        "fn bad() -> str = loop {\n  f := fn { break }\n}\nfn main() -> i32 = 0\n",
+    );
+    assert!(
+        lambda.contains("`break` outside of a `loop`"),
+        "a lambda break must not target its enclosing source loop:\n{lambda}"
+    );
+
+    let invalid_payload = check_diagnostics(
+        "l2b-loop-break-invalid-payload",
+        "fn bad() -> i64 = loop { break \"wrong\" }\nfn main() -> i32 = 0\n",
+    );
+    assert!(
+        invalid_payload.contains("type mismatch"),
+        "an accepted break must retain its control edge while diagnosing its payload:\n{invalid_payload}"
+    );
+
+    let ordered = check_diagnostics(
+        "l2b-loop-break-region-diagnostic-order",
+        "fn bad() -> str = loop {\n  arena { break missing }\n}\nfn main() -> i32 = 0\n",
+    );
+    let region = ordered
+        .find("a `break` inside an `arena`/`task_group` nested in the loop is not supported yet")
+        .expect("region-scoped break diagnostic");
+    let payload = ordered
+        .find("undefined name: 'missing'")
+        .expect("nested payload diagnostic");
+    assert!(
+        region < payload,
+        "region rejection must precede nested payload diagnostics:\n{ordered}"
+    );
+}
+
+#[test]
 fn unreachable_return_and_break_edges_do_not_taint_provenance() {
     let direct = "\
+Numbers { first: i64, second: i64 }
 fn fixed_return(value: str) -> str {
   return \"fixed\"
   return value
@@ -182,11 +288,42 @@ fn fixed_argument(value: str) -> str {
   add({ return \"fixed\"; 0 }, { return value; 1 })
   return value
 }
+fn fixed_operand(value: str) -> str {
+  { return \"fixed\"; 0 } + { return value; 1 }
+  return value
+}
+fn fixed_member(value: str) -> str {
+  pair := Numbers {
+    first: { return \"fixed\"; 0 }
+    second: { return value; 1 }
+  }
+  return value
+}
+fn fixed_bound(value: str) -> str {
+  \"abc\"[{ return \"fixed\"; 0 }..{ return value; 1 }]
+  return value
+}
+fn fixed_index(value: str) -> str {
+  values := [1, 2]
+  view: slice<i64> := values
+  { return \"fixed\"; view }[{ return value; 0 }]
+  return value
+}
 fn fixed_branch(value: str, choose: bool) -> str =
   if choose { return \"fixed\"; value } else { \"fixed\" }
+fn fixed_match(value: str, selected: Option<i64>) -> str =
+  match selected {
+    Some(_) => { return \"fixed\"; value }
+    None => \"fixed\"
+  }
+fn fixed_else(value: str) -> str =
+  Some(\"fixed\") else { return \"fixed\"; value }
 fn fixed_loop(value: str) -> str = loop {
   return \"fixed\"
   break value
+}
+fn fixed_break_payload(value: str) -> str = loop {
+  break { return \"fixed\"; value }
 }
 fn consume(value: string) -> i64 = value.len()
 fn main() -> i32 {
@@ -205,20 +342,57 @@ fn main() -> i32 {
   consume(third)
   print(argument.len())
 
-  fourth := \"branch owner\".clone()
-  branched := fixed_branch(fourth, true)
+  fourth := \"operand owner\".clone()
+  operand := fixed_operand(fourth)
   consume(fourth)
+  print(operand.len())
+
+  fifth := \"member owner\".clone()
+  member := fixed_member(fifth)
+  consume(fifth)
+  print(member.len())
+
+  sixth := \"bound owner\".clone()
+  bound := fixed_bound(sixth)
+  consume(sixth)
+  print(bound.len())
+
+  seventh := \"index owner\".clone()
+  indexed := fixed_index(seventh)
+  consume(seventh)
+  print(indexed.len())
+
+  eighth := \"branch owner\".clone()
+  branched := fixed_branch(eighth, true)
+  consume(eighth)
   print(branched.len())
 
-  fifth := \"loop owner\".clone()
-  looped := fixed_loop(fifth)
-  consume(fifth)
-  return looped.len() as i32
+  ninth := \"match owner\".clone()
+  matched := fixed_match(ninth, Some(1))
+  consume(ninth)
+  print(matched.len())
+
+  tenth := \"else owner\".clone()
+  unwrapped := fixed_else(tenth)
+  consume(tenth)
+  print(unwrapped.len())
+
+  eleventh := \"loop owner\".clone()
+  looped := fixed_loop(eleventh)
+  consume(eleventh)
+  print(looped.len())
+
+  twelfth := \"break payload owner\".clone()
+  payload := fixed_break_payload(twelfth)
+  consume(twelfth)
+  return payload.len() as i32
 }
 ";
+    let direct_diagnostics =
+        check_diagnostics("l2b-unreachable-exits-direct", direct);
     assert!(
         !check_errs("l2b-unreachable-exits-direct", direct),
-        "dead returns and breaks must not retain an otherwise-unselected owner"
+        "dead returns and breaks must not retain an otherwise-unselected owner:\n{direct_diagnostics}"
     );
 
     let files = &[
@@ -226,6 +400,7 @@ fn main() -> i32 {
             "dep.align",
             "\
 module dep
+pub Numbers { first: i64, second: i64 }
 pub fn fixed_return(value: str) -> str {
   return \"fixed\"
   return value
@@ -239,11 +414,42 @@ pub fn fixed_argument(value: str) -> str {
   add({ return \"fixed\"; 0 }, { return value; 1 })
   return value
 }
+pub fn fixed_operand(value: str) -> str {
+  { return \"fixed\"; 0 } + { return value; 1 }
+  return value
+}
+pub fn fixed_member(value: str) -> str {
+  pair := Numbers {
+    first: { return \"fixed\"; 0 }
+    second: { return value; 1 }
+  }
+  return value
+}
+pub fn fixed_bound(value: str) -> str {
+  \"abc\"[{ return \"fixed\"; 0 }..{ return value; 1 }]
+  return value
+}
+pub fn fixed_index(value: str) -> str {
+  values := [1, 2]
+  view: slice<i64> := values
+  { return \"fixed\"; view }[{ return value; 0 }]
+  return value
+}
 pub fn fixed_branch(value: str, choose: bool) -> str =
   if choose { return \"fixed\"; value } else { \"fixed\" }
+pub fn fixed_match(value: str, selected: Option<i64>) -> str =
+  match selected {
+    Some(_) => { return \"fixed\"; value }
+    None => \"fixed\"
+  }
+pub fn fixed_else(value: str) -> str =
+  Some(\"fixed\") else { return \"fixed\"; value }
 pub fn fixed_loop(value: str) -> str = loop {
   return \"fixed\"
   break value
+}
+pub fn fixed_break_payload(value: str) -> str = loop {
+  break { return \"fixed\"; value }
 }
 ",
         ),
@@ -268,15 +474,50 @@ fn main() -> i32 {
   consume(third)
   print(argument.len())
 
-  fourth := \"branch owner\".clone()
-  branched := dep.fixed_branch(fourth, true)
+  fourth := \"operand owner\".clone()
+  operand := dep.fixed_operand(fourth)
   consume(fourth)
+  print(operand.len())
+
+  fifth := \"member owner\".clone()
+  member := dep.fixed_member(fifth)
+  consume(fifth)
+  print(member.len())
+
+  sixth := \"bound owner\".clone()
+  bound := dep.fixed_bound(sixth)
+  consume(sixth)
+  print(bound.len())
+
+  seventh := \"index owner\".clone()
+  indexed := dep.fixed_index(seventh)
+  consume(seventh)
+  print(indexed.len())
+
+  eighth := \"branch owner\".clone()
+  branched := dep.fixed_branch(eighth, true)
+  consume(eighth)
   print(branched.len())
 
-  fifth := \"loop owner\".clone()
-  looped := dep.fixed_loop(fifth)
-  consume(fifth)
-  return looped.len() as i32
+  ninth := \"match owner\".clone()
+  matched := dep.fixed_match(ninth, Some(1))
+  consume(ninth)
+  print(matched.len())
+
+  tenth := \"else owner\".clone()
+  unwrapped := dep.fixed_else(tenth)
+  consume(tenth)
+  print(unwrapped.len())
+
+  eleventh := \"loop owner\".clone()
+  looped := dep.fixed_loop(eleventh)
+  consume(eleventh)
+  print(looped.len())
+
+  twelfth := \"break payload owner\".clone()
+  payload := dep.fixed_break_payload(twelfth)
+  consume(twelfth)
+  return payload.len() as i32
 }
 ",
         ),
@@ -296,8 +537,15 @@ fn main() -> i32 {
         "fixed_return",
         "fixed_break",
         "fixed_argument",
+        "fixed_operand",
+        "fixed_member",
+        "fixed_bound",
+        "fixed_index",
         "fixed_branch",
+        "fixed_match",
+        "fixed_else",
         "fixed_loop",
+        "fixed_break_payload",
     ] {
         let function = dependency
             .fns
