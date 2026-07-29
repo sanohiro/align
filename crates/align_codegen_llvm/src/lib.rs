@@ -3067,6 +3067,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     fn check_signature_facts(
         facts: SignatureFacts<'_>,
         program: &Program,
+        type_graph: &mut TypeGraph<'_>,
     ) -> Result<(), CodegenError> {
         let SignatureFacts {
             owner,
@@ -3085,9 +3086,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 param_types.len()
             )));
         }
-        check_type_graph(ret, program)?;
+        type_graph.check_ty(ret)?;
         for &ty in param_types {
-            check_type_graph(ty, program)?;
+            type_graph.check_ty(ty)?;
         }
         for mode in modes {
             match mode {
@@ -3536,10 +3537,6 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         }
     }
 
-    fn check_type_graph(ty: Ty, program: &Program) -> Result<(), CodegenError> {
-        TypeGraph::new(program).check_ty(ty)
-    }
-
     fn check_scalar(
         scalar: Scalar,
         program: &Program,
@@ -3584,8 +3581,12 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             _ => Ok(()),
         }
     }
-    fn check_ty(ty: Ty, program: &Program) -> Result<(), CodegenError> {
-        check_type_graph(ty, program)?;
+    fn check_ty(
+        ty: Ty,
+        program: &Program,
+        type_graph: &mut TypeGraph<'_>,
+    ) -> Result<(), CodegenError> {
+        type_graph.check_ty(ty)?;
         let mut active = Vec::new();
         match ty {
             Ty::Param(id) => Err(CodegenError::Lowering(format!(
@@ -3707,19 +3708,21 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
 
     // Validate every retained entry, including an otherwise-unused corrupt one from a decoded
     // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
-    // does not narrow a valid program.
+    // does not narrow a valid program. One graph instance retains completed nodes across every
+    // root; each successful root leaves the active paths empty.
+    let mut type_graph = TypeGraph::new(program);
     for id in 0..program.tagged_types.len() {
-        check_ty(Ty::Tagged(id as u32), program)?;
+        check_ty(Ty::Tagged(id as u32), program, &mut type_graph)?;
         check_scalar(Scalar::Tagged(id as u32), program, &mut Vec::new())?;
     }
     for (id, def) in program.structs.iter().enumerate() {
-        check_ty(Ty::Struct(id as u32), program)?;
+        check_ty(Ty::Struct(id as u32), program, &mut type_graph)?;
         for field in &def.fields {
-            check_ty(field.ty, program)?;
+            check_ty(field.ty, program, &mut type_graph)?;
         }
     }
     for (id, def) in program.enums.iter().enumerate() {
-        check_ty(Ty::Enum(id as u32), program)?;
+        check_ty(Ty::Enum(id as u32), program, &mut type_graph)?;
         for variant in &def.variants {
             for &payload in &variant.payload {
                 check_scalar(payload, program, &mut Vec::new())?;
@@ -3771,7 +3774,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         }
     }
     for (id, tuple) in program.tuples.iter().enumerate() {
-        check_ty(Ty::Tuple(id as u32), program)?;
+        check_ty(Ty::Tuple(id as u32), program, &mut type_graph)?;
         for &elem in &tuple.elems {
             check_scalar(elem, program, &mut Vec::new())?;
         }
@@ -3801,14 +3804,15 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 allow_return_roots: true,
             },
             program,
+            &mut type_graph,
         )?;
         check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
-        check_ty(f.ret, program)?;
+        check_ty(f.ret, program, &mut type_graph)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {
-            check_ty(ty, program)?;
+            check_ty(ty, program, &mut type_graph)?;
         }
         for ty in align_mir::function_embedded_types(f) {
-            check_ty(ty, program)?;
+            check_ty(ty, program, &mut type_graph)?;
         }
         for block in &f.blocks {
             for statement in &block.stmts {
@@ -3836,6 +3840,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 allow_return_roots: false,
                             },
                             program,
+                            &mut type_graph,
                         )?;
                         // L2b-a1 deliberately leaves function-value return summaries at `None`;
                         // indirect calls retain the all-compatible-input fallback. L2b-b attaches
@@ -3930,6 +3935,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 allow_return_roots: false,
                             },
                             program,
+                            &mut type_graph,
                         )?;
                         if signature.param_modes != target_modes
                             || signature.return_borrow != target.return_borrow
@@ -3957,6 +3963,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                             allow_return_roots: false,
                         },
                         program,
+                        &mut type_graph,
                     )?,
                     _ => {}
                 }
@@ -3976,11 +3983,12 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 allow_return_roots: false,
             },
             program,
+            &mut type_graph,
         )?;
         check_mode_types(&format!("extern function `{}`", ext.name), &ext.param_modes, &ext.params)?;
-        check_ty(ext.ret, program)?;
+        check_ty(ext.ret, program, &mut type_graph)?;
         for &ty in &ext.params {
-            check_ty(ty, program)?;
+            check_ty(ty, program, &mut type_graph)?;
         }
     }
     for import in &program.imported_fns {
@@ -3996,15 +4004,16 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 allow_return_roots: true,
             },
             program,
+            &mut type_graph,
         )?;
         check_mode_types(
             &format!("imported function `{}`", import.name),
             &import.param_modes,
             &import.params,
         )?;
-        check_ty(import.ret, program)?;
+        check_ty(import.ret, program, &mut type_graph)?;
         for &ty in &import.params {
-            check_ty(ty, program)?;
+            check_ty(ty, program, &mut type_graph)?;
         }
     }
     if !align_mir::tagged_types_are_canonical(program) {

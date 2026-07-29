@@ -817,6 +817,54 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
 }
 
 #[test]
+fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
+    let mut summary = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let template = summary
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    let named = |path: &str, args: Vec<IType>| IType::Named {
+        path: path.to_string(),
+        args,
+    };
+    let parameter = || named("T", vec![]);
+
+    let mut a = template.clone();
+    a.name = "A".to_string();
+    a.fields = vec![(
+        "bs".to_string(),
+        named("array", vec![named("B", vec![parameter()])]),
+    )];
+
+    let mut b = template;
+    b.name = "B".to_string();
+    b.fields = vec![
+        (
+            "as".to_string(),
+            named("array", vec![named("A", vec![named("str", vec![])])]),
+        ),
+        ("value".to_string(), parameter()),
+    ];
+    summary.structs.extend([a, b]);
+
+    let root = named("A", vec![named("i64", vec![])]);
+    summary.fns[0].params[0].ty = root.clone();
+    summary.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&summary),
+        Ok(()),
+        "`B<i64>` and `B<str>` are distinct concrete capability nodes; the latter exposes the reachable `str` leaf"
+    );
+}
+
+#[test]
 fn semantic_import_validates_nested_function_type_summaries() {
     let mut summary = one("pub Holder { value: i64 }\nfn main() -> i32 = 0\n").remove(0);
     summary.structs[0].fields[0].1 = IType::Fn {

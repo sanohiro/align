@@ -53,7 +53,7 @@ pub use codec::{
 };
 pub use hash::Hash128;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use align_ast::ParamMode;
 pub use align_sema::hir::{ReturnBorrowSummary, ReturnRegionSummary};
@@ -803,7 +803,7 @@ fn validate_import_summaries(
     .into_iter()
     .flatten()
     {
-        if !itype_may_borrow(ret, summary, type_params, &mut Vec::new()) {
+        if !itype_may_borrow(ret, summary, type_params) {
             return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
         }
         if !roots.1.is_empty() {
@@ -813,7 +813,7 @@ fn validate_import_summaries(
             if !params
                 .get(index as usize)
                 .is_some_and(|param| {
-                    itype_may_borrow(&param.ty, summary, type_params, &mut Vec::new())
+                    itype_may_borrow(&param.ty, summary, type_params)
                 })
             {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
@@ -829,17 +829,16 @@ fn itype_may_borrow(
     ty: &IType,
     summary: &InterfaceSummary,
     type_params: &[ITypeParam],
-    visiting: &mut Vec<String>,
 ) -> bool {
     fn substitute(
         ty: &IType,
-        bindings: &[(String, IType, usize)],
+        bindings: &[(String, IType)],
         resolving: &mut Vec<String>,
     ) -> IType {
         match ty {
             IType::Named { path, args } if args.is_empty() => {
-                let Some((_, bound, _)) =
-                    bindings.iter().rev().find(|(name, _, _)| name == path)
+                let Some((_, bound)) =
+                    bindings.iter().rev().find(|(name, _)| name == path)
                 else {
                     return ty.clone();
                 };
@@ -884,167 +883,109 @@ fn itype_may_borrow(
         }
     }
 
-    fn visit(
-        ty: &IType,
-        summary: &InterfaceSummary,
-        type_params: &[ITypeParam],
-        visiting: &mut Vec<String>,
-        bindings: &mut Vec<(String, IType, usize)>,
-    ) -> bool {
-        let is_local_nominal = |path: &str, name: &str| {
-            path == name || path == format!("{}.{}", summary.unit, name)
-        };
+    let is_local_nominal =
+        |path: &str, name: &str| path == name || path == format!("{}.{}", summary.unit, name);
+    let mut work = vec![ty.clone()];
+    let mut visited = HashSet::new();
+    while let Some(ty) = work.pop() {
         match ty {
-            IType::Tuple(elements) => elements
-                .iter()
-                .any(|element| visit(element, summary, type_params, visiting, bindings)),
-            IType::Fn { .. } => true,
-            IType::Named { path, args } => {
-                if args.is_empty()
-                    && let Some((_, bound, outer_len)) =
-                        bindings.iter().rev().find(|(name, _, _)| name == path)
-                {
-                    let bound = bound.clone();
-                    let mut outer_bindings = bindings[..*outer_len].to_vec();
-                    return visit(
-                        &bound,
-                        summary,
-                        type_params,
-                        visiting,
-                        &mut outer_bindings,
-                    );
-                }
-                match path.as_str() {
-                    "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
-                    | "json.doc" | "json.scanner" => true,
-                    "Option" | "Result" | "array" => args
+            IType::Tuple(elements) => work.extend(elements),
+            IType::Fn { .. } => return true,
+            IType::Named { path, args } => match path.as_str() {
+                "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
+                | "json.doc" | "json.scanner" => return true,
+                "Option" | "Result" | "array" => work.extend(args),
+                "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
+                | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
+                | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
+                | "Error" | "argon2_params" | "regex_match" | "()" | "bool" | "char"
+                | "string" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32"
+                | "u64" | "f32" | "f64" | "raw" => {}
+                _ => {
+                    if path
+                        .strip_prefix("vec")
+                        .or_else(|| path.strip_prefix("mask"))
+                        .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"))
+                    {
+                        continue;
+                    }
+                    if let Some(definition) = summary
+                        .structs
                         .iter()
-                        .any(|arg| visit(arg, summary, type_params, visiting, bindings)),
-                    "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
-                    | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
-                    | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
-                    | "Error" | "argon2_params" | "regex_match" => false,
-                    "()" | "bool" | "char" | "string" | "i8" | "i16" | "i32" | "i64"
-                    | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "raw" => false,
-                    _ => {
-                        if path
-                            .strip_prefix("vec")
-                            .or_else(|| path.strip_prefix("mask"))
-                            .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"))
-                        {
-                            return false;
+                        .find(|definition| is_local_nominal(&path, &definition.name))
+                    {
+                        if definition.type_params.len() != args.len() {
+                            continue;
                         }
-                        let visit_key = render_itype(ty);
-                        if visiting.contains(&visit_key) {
-                            return false;
-                        }
-                        visiting.push(visit_key);
-                        let from_struct = summary
-                            .structs
-                            .iter()
-                            .find(|definition| is_local_nominal(path, &definition.name));
-                        let result = if let Some(definition) = from_struct {
-                            if definition.type_params.len() != args.len() {
-                                false
-                            } else {
-                                let resolved_args = args
-                                    .iter()
-                                    .map(|argument| {
-                                        substitute(argument, bindings, &mut Vec::new())
-                                    })
-                                    .collect::<Vec<_>>();
-                                let binding_base = bindings.len();
-                                bindings.extend(
-                                    definition
-                                        .type_params
-                                        .iter()
-                                        .zip(resolved_args)
-                                        .map(|(parameter, argument)| {
-                                            (
-                                                parameter.name.clone(),
-                                                argument,
-                                                binding_base,
-                                            )
-                                        }),
-                                );
-                                let result = definition.fields.iter().any(|(_, field)| {
-                                    visit(
-                                        field,
-                                        summary,
-                                        type_params,
-                                        visiting,
-                                        bindings,
-                                    )
-                                });
-                                bindings.truncate(binding_base);
-                                result
-                            }
-                        } else if let Some(definition) = summary
-                            .enums
-                            .iter()
-                            .find(|definition| is_local_nominal(path, &definition.name))
-                        {
-                            if definition.type_params.len() != args.len() {
-                                false
-                            } else {
-                                let resolved_args = args
-                                    .iter()
-                                    .map(|argument| {
-                                        substitute(argument, bindings, &mut Vec::new())
-                                    })
-                                    .collect::<Vec<_>>();
-                                let binding_base = bindings.len();
-                                bindings.extend(
-                                    definition
-                                        .type_params
-                                        .iter()
-                                        .zip(resolved_args)
-                                        .map(|(parameter, argument)| {
-                                            (
-                                                parameter.name.clone(),
-                                                argument,
-                                                binding_base,
-                                            )
-                                        }),
-                                );
-                                let result = definition.variants.iter().any(|(_, payload)| {
-                                    payload.iter().any(|value| {
-                                        visit(
-                                            value,
-                                            summary,
-                                            type_params,
-                                            visiting,
-                                            bindings,
-                                        )
-                                    })
-                                });
-                                bindings.truncate(binding_base);
-                                result
-                            }
-                        } else {
-                            // A declared generic parameter or a qualified imported nominal may
-                            // carry a view. An unresolved bare name is malformed at this boundary;
-                            // treating it as borrow-capable could hide a recursive substitution
-                            // such as `Wrapper<T>` in a non-generic signature.
-                            type_params
-                                .iter()
-                                .any(|parameter| parameter.name == path.as_str())
-                                || path.contains('.')
+                        let concrete = IType::Named {
+                            path: definition.name.clone(),
+                            args: args.clone(),
                         };
-                        visiting.pop();
-                        result
+                        if !visited.insert(format!("struct:{}", render_itype(&concrete))) {
+                            continue;
+                        }
+                        let bindings = definition
+                            .type_params
+                            .iter()
+                            .zip(args)
+                            .map(|(parameter, argument)| {
+                                (parameter.name.clone(), argument)
+                            })
+                            .collect::<Vec<_>>();
+                        work.extend(
+                            definition
+                                .fields
+                                .iter()
+                                .map(|(_, field)| {
+                                    substitute(field, &bindings, &mut Vec::new())
+                                }),
+                        );
+                    } else if let Some(definition) = summary
+                        .enums
+                        .iter()
+                        .find(|definition| is_local_nominal(&path, &definition.name))
+                    {
+                        if definition.type_params.len() != args.len() {
+                            continue;
+                        }
+                        let concrete = IType::Named {
+                            path: definition.name.clone(),
+                            args: args.clone(),
+                        };
+                        if !visited.insert(format!("enum:{}", render_itype(&concrete))) {
+                            continue;
+                        }
+                        let bindings = definition
+                            .type_params
+                            .iter()
+                            .zip(args)
+                            .map(|(parameter, argument)| {
+                                (parameter.name.clone(), argument)
+                            })
+                            .collect::<Vec<_>>();
+                        work.extend(
+                            definition
+                                .variants
+                                .iter()
+                                .flat_map(|(_, payload)| payload)
+                                .map(|value| {
+                                    substitute(value, &bindings, &mut Vec::new())
+                                }),
+                        );
+                    } else if type_params
+                        .iter()
+                        .any(|parameter| parameter.name == path.as_str())
+                        || path.contains('.')
+                    {
+                        // A declared generic parameter or a qualified imported nominal may carry
+                        // a view. An unresolved bare name is malformed at this boundary.
+                        return true;
                     }
                 }
             }
         }
     }
-    visit(
-        ty,
-        summary,
-        type_params,
-        visiting,
-        &mut Vec::new(),
-    )
+    false
 }
 
 fn validate_import_type(
