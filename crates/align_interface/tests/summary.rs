@@ -7,7 +7,8 @@ use align_interface::{
     DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ITypeParam,
     ImportCompatibilityError,
     InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
-    deserialize, encode_interface_surface, serialize, validate_for_import,
+    deserialize, encode_interface_surface, serialize, summary_to_source,
+    validate_for_import,
 };
 
 /// One in-memory source module for a test program.
@@ -19,6 +20,105 @@ struct Unit {
 
 fn unit(path: &'static str, is_entry: bool, src: impl Into<String>) -> Unit {
     Unit { path, is_entry, src: src.into() }
+}
+
+fn render_test_type(ty: &IType) -> String {
+    match ty {
+        IType::Named { path, args } => {
+            if args.is_empty() {
+                path.clone()
+            } else {
+                format!(
+                    "{path}<{}>",
+                    args.iter()
+                        .map(render_test_type)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        IType::Tuple(elements) => format!(
+            "({})",
+            elements
+                .iter()
+                .map(render_test_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        IType::Fn { params, ret, .. } => {
+            let params = params
+                .iter()
+                .map(|param| {
+                    let mode = match param.mode {
+                        ParamMode::ByValue => "",
+                        ParamMode::Out => "out ",
+                        ParamMode::Borrow => "borrow ",
+                        ParamMode::BorrowMut => "borrow mut ",
+                    };
+                    format!("{mode}{}", render_test_type(&param.ty))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("fn({params}) -> {}", render_test_type(ret))
+        }
+    }
+}
+
+fn render_test_type_params(params: &[ITypeParam]) -> String {
+    let params = params
+        .iter()
+        .map(|param| match &param.bound {
+            Some(bound) => format!("{}: {bound}", param.name),
+            None => param.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{params}>")
+}
+
+fn sync_generic_type_bodies(summary: &mut InterfaceSummary) {
+    for structure in &mut summary.structs {
+        if structure.type_params.is_empty() {
+            continue;
+        }
+        let mut body = format!(
+            "{}{} {{\n",
+            structure.name,
+            render_test_type_params(&structure.type_params)
+        );
+        for (name, ty) in &structure.fields {
+            body.push_str(&format!("  {name}: {},\n", render_test_type(ty)));
+        }
+        body.push('}');
+        structure.generic_body = Some(body);
+    }
+    for enumeration in &mut summary.enums {
+        if enumeration.type_params.is_empty() {
+            continue;
+        }
+        let mut body = format!(
+            "{}{} {{\n",
+            enumeration.name,
+            render_test_type_params(&enumeration.type_params)
+        );
+        for (name, payload) in &enumeration.variants {
+            body.push_str(&format!("  {name}"));
+            if !payload.is_empty() {
+                body.push('(');
+                body.push_str(
+                    &payload
+                        .iter()
+                        .map(render_test_type)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                body.push(')');
+            }
+            body.push_str(",\n");
+        }
+        body.push('}');
+        enumeration.generic_body = Some(body);
+    }
 }
 
 /// Parse + check + lower the given units and build their interface summaries. Asserts the program
@@ -775,6 +875,7 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
         }],
     };
     base.structs.extend([inner, outer]);
+    sync_generic_type_bodies(&mut base);
     let named = |path: &str, argument: &str| IType::Named {
         path: path.to_string(),
         args: vec![IType::Named {
@@ -849,12 +950,13 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
     b.name = "B".to_string();
     b.fields = vec![
         (
-            "as".to_string(),
+            "links".to_string(),
             named("array", vec![named("A", vec![named("str", vec![])])]),
         ),
         ("value".to_string(), parameter()),
     ];
     summary.structs.extend([a, b]);
+    sync_generic_type_bodies(&mut summary);
 
     let root = named("A", vec![named("i64", vec![])]);
     summary.fns[0].params[0].ty = root.clone();
@@ -890,6 +992,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         ("value".to_string(), named("U", vec![])),
     ];
     finite.structs.push(shift);
+    sync_generic_type_bodies(&mut finite);
     let root = named(
         "FiniteShift",
         vec![named("i64", vec![]), named("bool", vec![])],
@@ -921,6 +1024,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         ("view".to_string(), named("str", vec![])),
     ];
     finite_constant.structs.push(constant);
+    sync_generic_type_bodies(&mut finite_constant);
     let root = named("FiniteConstant", vec![named("i64", vec![])]);
     finite_constant.fns[0].params[0].ty = root.clone();
     finite_constant.fns[0].ret = root;
@@ -949,6 +1053,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         ("view".to_string(), named("str", vec![])),
     ];
     generative.structs.push(grow);
+    sync_generic_type_bodies(&mut generative);
     let root = named("Grow", vec![named("i64", vec![])]);
     generative.fns[0].params[0].ty = root.clone();
     generative.fns[0].ret = root;
@@ -1000,6 +1105,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         ),
     )];
     generative_pair.structs.push(grow);
+    sync_generic_type_bodies(&mut generative_pair);
     let root = named(
         "GrowPair",
         vec![named("i64", vec![]), named("bool", vec![])],
@@ -1031,6 +1137,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         ("View".to_string(), vec![named("str", vec![])]),
     ];
     generative_enum.enums.push(grow);
+    sync_generic_type_bodies(&mut generative_enum);
     let root = named("GrowChoice", vec![named("i64", vec![])]);
     generative_enum.fns[0].params[0].ty = root.clone();
     generative_enum.fns[0].ret = root;
@@ -1089,6 +1196,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         ),
     )];
     converge.structs.push(definition);
+    sync_generic_type_bodies(&mut converge);
     assert_eq!(
         validate_for_import(&converge),
         Ok(()),
@@ -1111,6 +1219,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         ),
     )];
     exposed.structs.extend([identity, grow]);
+    sync_generic_type_bodies(&mut exposed);
     assert_eq!(
         validate_for_import(&exposed),
         Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
@@ -1134,6 +1243,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         ),
     )];
     hidden.structs.extend([sink, grow]);
+    sync_generic_type_bodies(&mut hidden);
     assert_eq!(
         validate_for_import(&hidden),
         Ok(()),
@@ -1151,6 +1261,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         ),
     )];
     direct_opaque_growth.structs.push(grow);
+    sync_generic_type_bodies(&mut direct_opaque_growth);
     assert_eq!(
         validate_for_import(&direct_opaque_growth),
         Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
@@ -1199,6 +1310,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
             ),
         )];
         composed.structs.extend([identity, shield, consumer]);
+        sync_generic_type_bodies(&mut composed);
         assert_eq!(
             validate_for_import(&composed),
             Ok(()),
@@ -1222,6 +1334,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         ),
     )];
     nested_opaque.structs.extend([identity, cycle]);
+    sync_generic_type_bodies(&mut nested_opaque);
     assert_eq!(
         validate_for_import(&nested_opaque),
         Ok(()),
@@ -1255,6 +1368,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         ),
     )];
     borrow_free.structs.push(grow);
+    sync_generic_type_bodies(&mut borrow_free);
     assert_eq!(
         validate_for_import(&borrow_free),
         Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
@@ -1279,6 +1393,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         named("MutualLeft", vec![parameter("U")]),
     )];
     mutual.structs.extend([left, right]);
+    sync_generic_type_bodies(&mut mutual);
     assert_eq!(
         validate_for_import(&mutual),
         Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
@@ -1300,6 +1415,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         named("ZeroLeft", vec![parameter("U")]),
     )];
     zero_cycle.structs.extend([left, right]);
+    sync_generic_type_bodies(&mut zero_cycle);
     assert_eq!(
         validate_for_import(&zero_cycle),
         Ok(()),
@@ -1317,6 +1433,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         named("Swap", vec![parameter("U"), parameter("T")]),
     )];
     permutation.structs.push(swap);
+    sync_generic_type_bodies(&mut permutation);
     assert_eq!(
         validate_for_import(&permutation),
         Ok(()),
@@ -1334,6 +1451,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         named("Duplicate", vec![parameter("T"), parameter("T")]),
     )];
     duplication.structs.push(duplicate);
+    sync_generic_type_bodies(&mut duplication);
     assert_eq!(
         validate_for_import(&duplication),
         Ok(()),
@@ -1357,6 +1475,7 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
         ),
     ];
     parallel.structs.push(grow);
+    sync_generic_type_bodies(&mut parallel);
     assert_eq!(
         validate_for_import(&parallel),
         Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
@@ -1485,6 +1604,22 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
             "Error".to_string()
         )),
         "reserved-local validation precedes duplicate-local validation"
+    );
+
+    let mut later_reserved_after_duplicate = base.clone();
+    later_reserved_after_duplicate
+        .structs
+        .push(later_reserved_after_duplicate.structs[0].clone());
+    let mut reserved_enum =
+        one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
+    reserved_enum.name = "Error".to_string();
+    later_reserved_after_duplicate.enums.push(reserved_enum);
+    assert_eq!(
+        validate_for_import(&later_reserved_after_duplicate),
+        Err(ImportCompatibilityError::ReservedLocalType(
+            "Error".to_string()
+        )),
+        "the complete definition set must be scanned for reserved names before an earlier duplicate"
     );
 
     let mut duplicate_local = base.clone();
@@ -1669,7 +1804,9 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
     missing_definition_body.structs[0].generic_body = None;
     assert_eq!(
         validate_for_import(&missing_definition_body),
-        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        )),
         "generic definition parameters require their transported generic body"
     );
 
@@ -1693,6 +1830,118 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
             "MissingConstType".to_string()
         )),
         "constant annotations participate in the complete shape walk"
+    );
+}
+
+#[test]
+fn semantic_import_generic_fragments_match_their_structured_records() {
+    let valid = one(
+        "pub fn identity<T: Eq>(value: T) -> T = value\n\
+         pub align(16) Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert_eq!(validate_for_import(&valid), Ok(()));
+    let rendered = summary_to_source(&valid, &[]).expect("valid generic fragments render");
+    assert!(rendered.contains("pub fn identity<T: Eq>"));
+    assert!(rendered.contains("pub align(16) Wrapper<T>"));
+    assert!(rendered.contains("pub Choice<T>"));
+
+    let mut generic_c_layout = valid.clone();
+    generic_c_layout.structs[0].c_repr = true;
+    generic_c_layout.structs[0].generic_body = Some("not valid".to_string());
+    assert_eq!(
+        validate_for_import(&generic_c_layout),
+        Err(ImportCompatibilityError::GenericCLayoutUnsupported(
+            "Wrapper".to_string()
+        )),
+        "producer-forbidden generic C layout precedes fragment syntax"
+    );
+
+    for (case, body) in [
+        (
+            "extra-pub",
+            "pub fn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "module",
+            "module forged\nfn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "import",
+            "import forged\nfn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "second-item",
+            "fn identity<T: Eq>(value: T) -> T = value\nfn other() -> i64 = 0",
+        ),
+        (
+            "trailing-token",
+            "fn identity<T: Eq>(value: T) -> T = value @",
+        ),
+        ("malformed", "fn identity<T: Eq>("),
+    ] {
+        let mut forged = valid.clone();
+        forged.fns[0].generic_body = Some(body.to_string());
+        assert_eq!(
+            validate_for_import(&forged),
+            Err(ImportCompatibilityError::GenericBodySyntax(
+                "identity".to_string()
+            )),
+            "{case} must reject as fragment syntax before structured comparison"
+        );
+    }
+
+    let mut wrong_function = valid.clone();
+    wrong_function.fns[0].generic_body =
+        Some("fn renamed<T: Eq>(value: T) -> T = value".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_function),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        ))
+    );
+
+    let mut wrong_function_header = valid.clone();
+    wrong_function_header.fns[0].generic_body =
+        Some("fn identity<T: Ord>(out value: T) -> i64 = 0".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_function_header),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        ))
+    );
+
+    let mut wrong_struct = valid.clone();
+    wrong_struct.structs[0].generic_body =
+        Some("Wrapper<T> { other: T }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_struct),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut wrong_kind = valid.clone();
+    wrong_kind.structs[0].align = None;
+    wrong_kind.structs[0].generic_body =
+        Some("Wrapper<T> { Some(T) }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_kind),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut wrong_enum = valid;
+    wrong_enum.enums[0].generic_body =
+        Some("Choice<T> { Other(T), None }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_enum),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Choice".to_string()
+        ))
     );
 }
 
@@ -1754,7 +2003,9 @@ fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
     missing_generic_body.fns[0].generic_body = None;
     assert_eq!(
         validate_for_import(&missing_generic_body),
-        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        )),
         "declared type parameters require the generic body transported by their interface"
     );
 

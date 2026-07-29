@@ -75,8 +75,11 @@ name = "align_interface"
 version = "0.4.0"
 dependencies = [
  "align_ast",
+ "align_diag",
  "align_hash",
+ "align_lexer",
  "align_mir",
+ "align_parser",
  "align_sema",
  "align_span",
 ]

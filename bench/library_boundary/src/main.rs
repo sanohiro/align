@@ -108,13 +108,16 @@ fn import_validation_fixture() -> InterfaceSummary {
     };
     let mut structures = Vec::with_capacity(128);
     for index in 0..128 {
-        let field_type = if index == 127 {
-            named("T")
+        let (field_type, field_source) = if index == 127 {
+            (named("T"), "T".to_string())
         } else {
-            IType::Named {
-                path: format!("Layer_{:04}", index + 1),
-                args: vec![named("T")],
-            }
+            (
+                IType::Named {
+                    path: format!("Layer_{:04}", index + 1),
+                    args: vec![named("T")],
+                },
+                format!("Layer_{:04}<T>", index + 1),
+            )
         };
         structures.push(IStructDef {
             name: format!("Layer_{index:04}"),
@@ -123,7 +126,7 @@ fn import_validation_fixture() -> InterfaceSummary {
             align: None,
             c_repr: false,
             generic_body: Some(format!(
-                "pub Layer_{index:04}<T> {{ value: T }}"
+                "Layer_{index:04}<T> {{ value: {field_source} }}"
             )),
         });
     }

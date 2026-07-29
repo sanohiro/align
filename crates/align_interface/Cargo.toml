@@ -12,11 +12,9 @@ license.workspace = true
 [dependencies]
 align_span = { path = "../align_span" }
 align_ast = { path = "../align_ast" }
-align_sema = { path = "../align_sema" }
-align_mir = { path = "../align_mir" }
-align_hash = { path = "../align_hash" }
-
-[dev-dependencies]
 align_diag = { path = "../align_diag" }
 align_lexer = { path = "../align_lexer" }
 align_parser = { path = "../align_parser" }
+align_sema = { path = "../align_sema" }
+align_mir = { path = "../align_mir" }
+align_hash = { path = "../align_hash" }

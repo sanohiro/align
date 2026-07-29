@@ -654,13 +654,14 @@ fn render_type_params(tps: &[ITypeParam]) -> String {
 }
 
 fn render_struct(s: &IStructDef) -> String {
-    // `pub` first, then attributes (parser order): `pub layout(C) align(16) Name { ... }`.
+    // `pub` first, then one canonical attribute order. The producer's stored generic fragment
+    // starts at the type name, so these structured fields are the only source of layout prefixes.
     let mut out = String::from("pub ");
-    if s.c_repr {
-        out.push_str("layout(C) ");
-    }
     if let Some(a) = s.align {
         out.push_str(&format!("align({a}) "));
+    }
+    if s.c_repr {
+        out.push_str("layout(C) ");
     }
     out.push_str(&s.name);
     out.push_str(&render_type_params(&s.type_params));
@@ -704,6 +705,9 @@ pub enum ImportCompatibilityError {
         actual: usize,
     },
     UnresolvedBareType(String),
+    GenericCLayoutUnsupported(String),
+    GenericBodySyntax(String),
+    GenericBodyMismatch(String),
     UnsupportedParamMode(ParamMode),
     ReturnSummaryOnNonBorrowingType,
     ReturnSummaryRootCannotBorrow(u32),
@@ -746,6 +750,24 @@ impl std::fmt::Display for ImportCompatibilityError {
             }
             ImportCompatibilityError::UnresolvedBareType(name) => {
                 write!(f, "interface contains unresolved bare type `{name}`")
+            }
+            ImportCompatibilityError::GenericCLayoutUnsupported(name) => {
+                write!(
+                    f,
+                    "generic interface struct `{name}` cannot use `layout(C)` before concrete instantiation"
+                )
+            }
+            ImportCompatibilityError::GenericBodySyntax(name) => {
+                write!(
+                    f,
+                    "generic interface declaration `{name}` is not one valid declaration fragment"
+                )
+            }
+            ImportCompatibilityError::GenericBodyMismatch(name) => {
+                write!(
+                    f,
+                    "generic interface declaration `{name}` disagrees with its structured record"
+                )
             }
             ImportCompatibilityError::UnsupportedParamMode(mode) => {
                 write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
@@ -830,14 +852,26 @@ struct LocalDefinitionIndex<'a> {
 
 impl<'a> LocalDefinitionIndex<'a> {
     fn new(summary: &'a InterfaceSummary) -> Result<Self, ImportCompatibilityError> {
+        for name in summary
+            .structs
+            .iter()
+            .map(|definition| &definition.name)
+            .chain(
+                summary
+                    .enums
+                    .iter()
+                    .map(|definition| &definition.name),
+            )
+        {
+            if is_reserved_local_type_name(name) {
+                return Err(ImportCompatibilityError::ReservedLocalType(
+                    name.clone(),
+                ));
+            }
+        }
         let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
         let mut by_name = HashMap::new();
         for definition in &summary.structs {
-            if is_reserved_local_type_name(&definition.name) {
-                return Err(ImportCompatibilityError::ReservedLocalType(
-                    definition.name.clone(),
-                ));
-            }
             if by_name
                 .insert(definition.name.as_str(), definitions.len())
                 .is_some()
@@ -849,11 +883,6 @@ impl<'a> LocalDefinitionIndex<'a> {
             definitions.push(LocalDefinition::Struct(definition));
         }
         for definition in &summary.enums {
-            if is_reserved_local_type_name(&definition.name) {
-                return Err(ImportCompatibilityError::ReservedLocalType(
-                    definition.name.clone(),
-                ));
-            }
             if by_name
                 .insert(definition.name.as_str(), definitions.len())
                 .is_some()
@@ -1450,9 +1479,6 @@ fn validate_import_headers(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
-        if function.type_params.is_empty() != function.generic_body.is_none() {
-            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
-        }
         for param in &function.params {
             validate_import_param_mode(param)?;
             validate_import_type_headers(&param.ty)?;
@@ -1465,17 +1491,11 @@ fn validate_import_headers(
         )?;
     }
     for structure in &summary.structs {
-        if structure.type_params.is_empty() != structure.generic_body.is_none() {
-            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
-        }
         for (_, ty) in &structure.fields {
             validate_import_type_headers(ty)?;
         }
     }
     for enumeration in &summary.enums {
-        if enumeration.type_params.is_empty() != enumeration.generic_body.is_none() {
-            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
-        }
         for (_, payload) in &enumeration.variants {
             for ty in payload {
                 validate_import_type_headers(ty)?;
@@ -1486,6 +1506,179 @@ fn validate_import_headers(
         if let Some(ty) = &constant.ty {
             validate_import_type_headers(ty)?;
         }
+    }
+    Ok(())
+}
+
+fn parse_generic_fragment(
+    name: &str,
+    body: &str,
+    attributes: &str,
+) -> Result<align_ast::Item, ImportCompatibilityError> {
+    let source = format!("pub {attributes}{}", body.trim_start());
+    let mut diags = align_diag::Diagnostics::new();
+    let tokens = align_lexer::tokenize(0, &source, &mut diags);
+    let mut file = align_parser::parse_file(tokens, &mut diags);
+    if diags.has_errors()
+        || file.module.is_some()
+        || !file.imports.is_empty()
+        || file.items.len() != 1
+    {
+        return Err(ImportCompatibilityError::GenericBodySyntax(
+            name.to_string(),
+        ));
+    }
+    Ok(file.items.remove(0))
+}
+
+fn validate_generic_function(function: &IFnSig) -> Result<(), ImportCompatibilityError> {
+    let Some(body) = &function.generic_body else {
+        return if function.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                function.name.clone(),
+            ))
+        };
+    };
+    if function.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    }
+    let align_ast::Item::Fn(parsed) =
+        parse_generic_fragment(&function.name, body, "")?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    };
+    let params = parsed
+        .params
+        .iter()
+        .map(|param| IParam {
+            mode: param.mode,
+            ty: convert_type(&param.ty),
+        })
+        .collect::<Vec<_>>();
+    if parsed.name.name != function.name
+        || convert_type_params(&parsed.type_params) != function.type_params
+        || params != function.params
+        || convert_ret(&parsed.ret) != function.ret
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_struct(structure: &IStructDef) -> Result<(), ImportCompatibilityError> {
+    if !structure.type_params.is_empty() && structure.c_repr {
+        return Err(ImportCompatibilityError::GenericCLayoutUnsupported(
+            structure.name.clone(),
+        ));
+    }
+    let Some(body) = &structure.generic_body else {
+        return if structure.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                structure.name.clone(),
+            ))
+        };
+    };
+    if structure.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    }
+    let mut attributes = String::new();
+    if let Some(align) = structure.align {
+        attributes.push_str(&format!("align({align}) "));
+    }
+    if structure.c_repr {
+        attributes.push_str("layout(C) ");
+    }
+    let align_ast::Item::Struct(parsed) =
+        parse_generic_fragment(&structure.name, body, &attributes)?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    };
+    let fields = parsed
+        .fields
+        .iter()
+        .map(|field| (field.name.name.clone(), convert_type(&field.ty)))
+        .collect::<Vec<_>>();
+    if parsed.name.name != structure.name
+        || convert_type_params(&parsed.type_params) != structure.type_params
+        || fields != structure.fields
+        || parsed.align != structure.align
+        || parsed.c_repr != structure.c_repr
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_enum(enumeration: &IEnumDef) -> Result<(), ImportCompatibilityError> {
+    let Some(body) = &enumeration.generic_body else {
+        return if enumeration.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                enumeration.name.clone(),
+            ))
+        };
+    };
+    if enumeration.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    }
+    let align_ast::Item::Enum(parsed) =
+        parse_generic_fragment(&enumeration.name, body, "")?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    };
+    let variants = parsed
+        .variants
+        .iter()
+        .map(|variant| {
+            (
+                variant.name.name.clone(),
+                variant.payload.iter().map(convert_type).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if parsed.name.name != enumeration.name
+        || convert_type_params(&parsed.type_params) != enumeration.type_params
+        || variants != enumeration.variants
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_import_generic_bodies(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        validate_generic_function(function)?;
+    }
+    for structure in &summary.structs {
+        validate_generic_struct(structure)?;
+    }
+    for enumeration in &summary.enums {
+        validate_generic_enum(enumeration)?;
     }
     Ok(())
 }
@@ -1553,6 +1746,7 @@ pub fn validate_for_import(
 ) -> Result<(), ImportCompatibilityError> {
     let index = LocalDefinitionIndex::new(summary)?;
     validate_import_shapes(summary, &index)?;
+    validate_import_generic_bodies(summary)?;
     validate_import_headers(summary)?;
     let analysis = CapabilityAnalysis::new(index)?;
 
@@ -1573,11 +1767,7 @@ fn render_fn(f: &IFnSig) -> String {
     if let Some(body) = &f.generic_body {
         // A generic `pub` template ships its full declaration (incl. body) as source — the consumer
         // monomorphizes it. `fd.span` starts at `fn`, so re-add the `pub` the slice omitted.
-        let trimmed = body.trim_start();
-        if trimmed.starts_with("pub") {
-            return format!("{body}\n");
-        }
-        return format!("pub {trimmed}\n");
+        return format!("pub {}\n", body.trim_start());
     }
     // A non-generic `pub` fn: signature only, with an empty body. The body is never type-checked (the
     // module is interface-only) and the function is never emitted into the consumer's program; the

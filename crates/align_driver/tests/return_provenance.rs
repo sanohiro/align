@@ -177,6 +177,17 @@ fn fixed_break(value: str) -> str = loop {
   break \"fixed\"
   break value
 }
+fn add(first: i64, second: i64) -> i64 = first + second
+fn fixed_argument(value: str) -> str {
+  add({ return \"fixed\"; 0 }, { return value; 1 })
+  return value
+}
+fn fixed_branch(value: str, choose: bool) -> str =
+  if choose { return \"fixed\"; value } else { \"fixed\" }
+fn fixed_loop(value: str) -> str = loop {
+  return \"fixed\"
+  break value
+}
 fn consume(value: string) -> i64 = value.len()
 fn main() -> i32 {
   first := \"return owner\".clone()
@@ -187,7 +198,22 @@ fn main() -> i32 {
   second := \"break owner\".clone()
   broken := fixed_break(second)
   consume(second)
-  return broken.len() as i32
+  print(broken.len())
+
+  third := \"argument owner\".clone()
+  argument := fixed_argument(third)
+  consume(third)
+  print(argument.len())
+
+  fourth := \"branch owner\".clone()
+  branched := fixed_branch(fourth, true)
+  consume(fourth)
+  print(branched.len())
+
+  fifth := \"loop owner\".clone()
+  looped := fixed_loop(fifth)
+  consume(fifth)
+  return looped.len() as i32
 }
 ";
     assert!(
@@ -208,6 +234,17 @@ pub fn fixed_break(value: str) -> str = loop {
   break \"fixed\"
   break value
 }
+fn add(first: i64, second: i64) -> i64 = first + second
+pub fn fixed_argument(value: str) -> str {
+  add({ return \"fixed\"; 0 }, { return value; 1 })
+  return value
+}
+pub fn fixed_branch(value: str, choose: bool) -> str =
+  if choose { return \"fixed\"; value } else { \"fixed\" }
+pub fn fixed_loop(value: str) -> str = loop {
+  return \"fixed\"
+  break value
+}
 ",
         ),
         (
@@ -224,7 +261,22 @@ fn main() -> i32 {
   second := \"break owner\".clone()
   broken := dep.fixed_break(second)
   consume(second)
-  return broken.len() as i32
+  print(broken.len())
+
+  third := \"argument owner\".clone()
+  argument := dep.fixed_argument(third)
+  consume(third)
+  print(argument.len())
+
+  fourth := \"branch owner\".clone()
+  branched := dep.fixed_branch(fourth, true)
+  consume(fourth)
+  print(branched.len())
+
+  fifth := \"loop owner\".clone()
+  looped := dep.fixed_loop(fifth)
+  consume(fifth)
+  return looped.len() as i32
 }
 ",
         ),
@@ -240,7 +292,13 @@ fn main() -> i32 {
         .iter()
         .find(|summary| summary.unit == "dep")
         .expect("dependency summary");
-    for name in ["fixed_return", "fixed_break"] {
+    for name in [
+        "fixed_return",
+        "fixed_break",
+        "fixed_argument",
+        "fixed_branch",
+        "fixed_loop",
+    ] {
         let function = dependency
             .fns
             .iter()
@@ -248,6 +306,67 @@ fn main() -> i32 {
             .unwrap_or_else(|| panic!("{name} signature"));
         assert_eq!(function.return_borrow, ReturnBorrowSummary::None);
         assert_eq!(function.return_region, ReturnRegionSummary::None);
+    }
+}
+
+#[test]
+fn reachable_conditional_returns_and_breaks_retain_provenance() {
+    let files = &[
+        (
+            "dep.align",
+            "\
+module dep
+pub fn conditional_return(value: str, choose: bool) -> str {
+  choose || { return value; false }
+  return \"fixed\"
+}
+pub fn conditional_break(value: str, choose: bool) -> str = loop {
+  if choose { break value }
+  break \"fixed\"
+}
+",
+        ),
+        (
+            "main.align",
+            "\
+import dep
+fn main() -> i32 = 0
+",
+        ),
+    ];
+    let differential =
+        diff_check_multi("l2b-reachable-conditional-edges", files, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(
+        !differential.per_unit.diags.has_errors(),
+        "reachable conditional edges must check:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    let dependency = differential
+        .per_unit
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "dep")
+        .expect("dependency summary");
+    for name in ["conditional_return", "conditional_break"] {
+        let function = dependency
+            .fns
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} signature"));
+        assert_eq!(function.return_borrow, roots(&[0], &[]));
+        assert_eq!(
+            function.return_region,
+            ReturnRegionSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            }
+        );
     }
 }
 
