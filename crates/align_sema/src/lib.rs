@@ -1388,12 +1388,11 @@ fn ty_mentions_slice(
     }
 }
 
-/// Whether a value may borrow storage owned by another local. This is intentionally narrower than
-/// Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`, a
-/// borrowed reader/writer, and aggregates containing those views carry borrow provenance.
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
-/// same recursive classification when deciding whether an indexed result retains a synthetic
-/// temporary owner or can release it immediately after a scalar load.
+/// same cycle-safe graph classification when deciding whether an indexed result retains a
+/// synthetic temporary owner or can release it immediately after a scalar load. This is narrower
+/// than Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`,
+/// a borrowed reader/writer, and aggregates containing those views carry borrow provenance.
 pub fn ty_may_borrow(
     ty: Ty,
     structs: &[StructDef],
@@ -1401,69 +1400,75 @@ pub fn ty_may_borrow(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    match ty {
-        Ty::Str
-        | Ty::Slice(_)
-        | Ty::Reader
-        | Ty::Writer
-        | Ty::Soa(_)
-        // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
-        // buffer, so a `Let` binding it must record the ctx's borrow provenance. Without this arm no
-        // provenance is recorded at all and `ctx.respond(rb)` never invalidates the view (http.md
-        // item 10 ⑤ — one half of the fatal pair, with `borrow_sources_inner`).
-        | Ty::HttpHeaders
-        // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view (J4).
-        | Ty::JsonDoc
-        // A `json.scanner<Row>` borrows the JSON input view it streams over (J5).
-        | Ty::JsonScanner(_)
-        | Ty::DictEncoded(..)
-        | Ty::DynSliceArray(_)
-        | Ty::Fn(_) => true,
-        Ty::Tagged(id) => ty_may_borrow(
-            expand_tagged_ty(Ty::Tagged(id), tagged_types),
-            structs,
-            tuples,
-            enums,
-            tagged_types,
-        ),
-        Ty::Array(s, _) | Ty::DynArray(s) => {
-            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Str
+            | Ty::Slice(_)
+            | Ty::Reader
+            | Ty::Writer
+            | Ty::Soa(_)
+            // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
+            // buffer, so a `Let` binding it must record the ctx's borrow provenance.
+            | Ty::HttpHeaders
+            // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view.
+            | Ty::JsonDoc
+            // A `json.scanner<Row>` borrows the JSON input view it streams over.
+            | Ty::JsonScanner(_)
+            | Ty::DictEncoded(..)
+            | Ty::DynSliceArray(_)
+            | Ty::Fn(_) => return true,
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(ok));
+                            work.push(scalar_to_ty(err));
+                        }
+                    }
+                }
+            }
+            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s) => {
+                work.push(scalar_to_ty(s));
+            }
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(ok));
+                work.push(scalar_to_ty(err));
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id)
+                if visited_structs.insert(id) =>
+            {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().copied().map(scalar_to_ty));
+                }
+            }
+            // A sum type may borrow iff a variant payload does (J1: a `str`-view /
+            // `str`-bearing-struct payload).
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(enumeration) = enums.get(id as usize) {
+                    work.extend(
+                        enumeration
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter().copied())
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
+            _ => {}
         }
-        Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id) => structs
-            .get(id as usize)
-            .is_some_and(|s| {
-                s.fields
-                    .iter()
-                    .any(|f| ty_may_borrow(f.ty, structs, tuples, enums, tagged_types))
-            }),
-        Ty::Option(s) => {
-            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
-        }
-        Ty::Result(ok, err) => {
-            ty_may_borrow(scalar_to_ty(ok), structs, tuples, enums, tagged_types)
-                || ty_may_borrow(scalar_to_ty(err), structs, tuples, enums, tagged_types)
-        }
-        Ty::Tuple(id) => tuples
-            .get(id as usize)
-            .is_some_and(|t| {
-                t.elems.iter().any(|s| {
-                    ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
-                })
-            }),
-        // A sum type may borrow iff a variant payload does (J1: a `str`-view / `str`-bearing-struct
-        // payload — `Content.Text(view)` borrows the view's storage, so its owner must stay live).
-        Ty::Enum(id) => enums
-            .get(id as usize)
-            .is_some_and(|e| {
-                e.variants.iter().any(|v| {
-                    v.payload.iter().any(|s| {
-                        ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
-                    })
-                })
-            }),
-        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types),
-        _ => false,
     }
+    false
 }
 
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
@@ -31047,6 +31052,73 @@ mod tests {
         assert!(
             !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
+        );
+    }
+
+    #[test]
+    fn ty_may_borrow_is_cycle_safe_for_header_mediated_nominals() {
+        for field_ty in [
+            Ty::DynArray(Scalar::Struct(0)),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::Task(Scalar::Struct(0)),
+        ] {
+            let structures = vec![StructDef {
+                name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
+                fields: vec![FieldDef {
+                    name: "next".to_string(),
+                    ty: field_ty,
+                }],
+                align: None,
+                c_repr: false,
+            }];
+            assert!(
+                !ty_may_borrow(Ty::Struct(0), &structures, &[], &[], &[]),
+                "a header-only recursive graph has no borrowing leaf: {field_ty:?}"
+            );
+        }
+
+        let mixed_structures = vec![StructDef {
+            name: "MixedCycle".to_string(),
+            source_name: "MixedCycle".to_string(),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: Ty::DynArray(Scalar::Tagged(0)),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        let mixed_tagged = vec![hir::TaggedType::Option(Scalar::Struct(0))];
+        assert!(
+            !ty_may_borrow(
+                Ty::Struct(0),
+                &mixed_structures,
+                &[],
+                &[],
+                &mixed_tagged
+            ),
+            "mixed header/tagged cycles must terminate without inventing a borrow"
+        );
+
+        let borrowing_cycle = vec![StructDef {
+            name: "BorrowingCycle".to_string(),
+            source_name: "BorrowingCycle".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "next".to_string(),
+                    ty: Ty::DynStructArray(0, Layout::Aos),
+                },
+                FieldDef {
+                    name: "view".to_string(),
+                    ty: Ty::Str,
+                },
+            ],
+            align: None,
+            c_repr: false,
+        }];
+        assert!(
+            ty_may_borrow(Ty::Struct(0), &borrowing_cycle, &[], &[], &[]),
+            "a reachable borrowing leaf must survive a header-mediated cycle"
         );
     }
 

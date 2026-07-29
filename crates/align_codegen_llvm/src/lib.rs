@@ -13963,6 +13963,39 @@ mod tests {
             );
         }
 
+        let mut header_cycle = base();
+        let cyclic_ty = Ty::DynStructArray(0, Layout::Aos);
+        header_cycle.structs.push(StructDef {
+            name: "HeaderCycle".to_string(),
+            source_name: "HeaderCycle".to_string(),
+            fields: vec![align_sema::FieldDef {
+                name: "next".to_string(),
+                ty: cyclic_ty,
+            }],
+            align: None,
+            c_repr: false,
+        });
+        header_cycle.fns[0].params.push(0);
+        header_cycle.fns[0]
+            .param_modes
+            .push(align_ast::ParamMode::ByValue);
+        header_cycle.fns[0].slots.push(cyclic_ty);
+        header_cycle.fns[0].ret = cyclic_ty;
+        header_cycle.fns[0].return_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        header_cycle.fns[0].return_region = hir::ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        let err = validate_tagged_program(&header_cycle)
+            .expect_err("a header-only recursive graph cannot supply return provenance");
+        assert!(
+            err.to_string().contains("cannot borrow"),
+            "header-mediated capability recursion produced an unexpected diagnostic: {err}"
+        );
+
         let mut shared = base();
         shared.structs.push(StructDef {
             name: "Shared0".to_string(),
