@@ -1156,6 +1156,55 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
         "a direct actual measures its complete syntax even when its outer constructor is opaque"
     );
 
+    for (name, suffix, opaque) in [
+        (
+            "box",
+            "Box",
+            named("box", vec![parameter("T")]),
+        ),
+        (
+            "function type",
+            "Fn",
+            IType::Fn {
+                params: vec![IParam {
+                    mode: ParamMode::ByValue,
+                    ty: parameter("T"),
+                }],
+                ret: Box::new(parameter("T")),
+                return_borrow: ReturnBorrowSummary::None,
+                return_region: ReturnRegionSummary::None,
+            },
+        ),
+    ] {
+        let mut composed = base.clone();
+        let mut identity = template.clone();
+        identity.name = format!("IdThrough{suffix}");
+        let mut shield = template.clone();
+        shield.name = format!("ShieldThrough{suffix}");
+        shield.fields = vec![(
+            "value".to_string(),
+            named(&identity.name, vec![opaque]),
+        )];
+        let mut consumer = template.clone();
+        consumer.name = format!("ConsumerThrough{suffix}");
+        consumer.fields = vec![(
+            "next".to_string(),
+            named(
+                &shield.name,
+                vec![named(
+                    &consumer.name,
+                    vec![named("Option", vec![parameter("T")])],
+                )],
+            ),
+        )];
+        composed.structs.extend([identity, shield, consumer]);
+        assert_eq!(
+            validate_for_import(&composed),
+            Ok(()),
+            "{name} below an exposed local actual must stop transport before an enclosing consumer"
+        );
+    }
+
     let mut nested_opaque = base;
     let mut identity = template.clone();
     identity.name = "OpaqueId".to_string();

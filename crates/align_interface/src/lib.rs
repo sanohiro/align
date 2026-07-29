@@ -1042,11 +1042,7 @@ impl<'a> CapabilityAnalysis<'a> {
                             if exposed
                                 && let Some(argument) = args.get(position)
                             {
-                                self.mark_syntactic_params(
-                                    argument,
-                                    type_params,
-                                    &mut result,
-                                );
+                                work.push(argument);
                             }
                         }
                     }
@@ -1054,35 +1050,6 @@ impl<'a> CapabilityAnalysis<'a> {
             }
         }
         result
-    }
-
-    fn mark_syntactic_params(
-        &self,
-        ty: &IType,
-        type_params: &[ITypeParam],
-        result: &mut [bool],
-    ) {
-        let mut work = vec![ty];
-        while let Some(current) = work.pop() {
-            match current {
-                IType::Named { path, args } => {
-                    if args.is_empty()
-                        && let Some(index) = type_params
-                            .iter()
-                            .position(|parameter| parameter.name == *path)
-                    {
-                        result[index] = true;
-                    } else {
-                        work.extend(args);
-                    }
-                }
-                IType::Tuple(elements) => work.extend(elements),
-                IType::Fn { params, ret, .. } => {
-                    work.extend(params.iter().map(|parameter| &parameter.ty));
-                    work.push(ret);
-                }
-            }
-        }
     }
 
     fn solve_borrow(&mut self) {
@@ -1195,20 +1162,15 @@ impl<'a> CapabilityAnalysis<'a> {
                     let Some(target) = self.index.local(path) else {
                         continue;
                     };
-                    for (position, exposed) in
-                        self.growth[target].iter().copied().enumerate()
-                    {
-                        if !exposed {
-                            continue;
-                        }
-                        if let Some(argument) = args.get(position) {
-                            self.add_occurrence_edges(
-                                source,
-                                target,
-                                position,
-                                argument,
-                                edges,
-                            );
+                    for (position, argument) in args.iter().enumerate() {
+                        self.add_occurrence_edges(
+                            source,
+                            target,
+                            position,
+                            argument,
+                            edges,
+                        );
+                        if self.growth[target][position] {
                             work.push(argument);
                         }
                     }

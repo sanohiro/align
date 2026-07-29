@@ -1627,14 +1627,21 @@ return types still enter the complete semantic walk and their summaries are inde
 
 The completed growth-transport summaries own the termination proof. Semantic import builds a
 declaration-level dependency graph whose nodes are `(definition kind, name, type-parameter index)`.
-For a local target it follows only actual positions exposed by that target's completed
-growth-transport summary, recursively following capability-transparent local nominals inside those
-exposed actuals.
-An edge records whether the source parameter reaches the target actual directly (weight zero) or
-below one or more type constructors (positive weight). Measuring a direct target actual counts its
-complete syntax, so `A<T>` to `A<box<T>>` is positive; discovery inside an exposed
-`Id<box<A<T>>>` stops at the opaque `box`. A positive edge in a dependency cycle is generative
-(`A<T>` to `A<Option<T>>`) and rejects. Positive acyclic edges and zero-weight cycles are finite.
+Growth transport and dependency-edge measurement are separate operations. Computing whether an
+enclosing definition transports one of its parameters evaluates each target-exposed actual through
+the ordinary capability-transparent rules: transparent builtins and completed local growth
+positions continue, while `box`, function types, and every other opaque constructor stop. After a
+local reference itself has been reached, dependency construction records every source-parameter
+occurrence in each of that reference's direct actuals, including occurrences below an opaque
+constructor; it then discovers further local references inside only those actual positions exposed
+by the target's completed growth summary, using the same opaque stops. Thus direct
+`A<T> -> A<box<T>>` records a positive edge and rejects, but
+`Shield<T> { value: Id<box<T>> }` does not expose `T` to an enclosing consumer and discovery inside
+`Id<box<A<T>>>` does not reach `A`.
+An edge records whether the source parameter is the whole direct target actual (weight zero) or
+occurs below one or more type constructors (positive weight). A positive edge in a dependency cycle
+is generative (`A<T>` to `A<Option<T>>`) and rejects. Positive acyclic edges and zero-weight cycles
+are finite.
 `Converge<T, U>` to `Converge<Option<U>, str>` converges because the wrapped `U` moves to `T` and
 the next transition replaces it. `Id<U> { value: U }` exposes an actual and therefore reveals
 growth hidden through `Id<A<Option<T>>>`; `Sink<U> { value: i64 }` does not expose it.
@@ -1652,15 +1659,32 @@ root order; hash-map iteration never selects an error. With `S` interface type-s
 local-definition references, `F` possible intrinsic/parameter summary facts, and `E` emitted
 weighted dependency edges including parallel edges, the finite scan-based solve is bounded by
 `O(S × F + S × R + E)` time and `O(S + F + E)` memory. Every fact changes at most once in its
-lattice direction, each local-reference actual is scanned at most once per containing reference
-during dependency construction, and no definition is recursively instantiated. Each shape failure
+lattice direction, direct-actual measurement is independent of nested-reference discovery, each
+local-reference actual is scanned at most once per containing reference during dependency
+construction, and no definition is recursively instantiated. Each shape failure
 maps to one public import error: duplicate local definition, duplicate type parameter,
 type-parameter-with-arguments, wrong known/local arity, or unresolved bare type. The generativity
 gate alone returns `ReturnSummaryGenerativeCapabilityGraph`; it never substitutes for a preceding
 shape error. Codegen likewise retains one
 type-graph validator and its completed-node sets across every retained definition and signature root
-in the program; per-root active paths still distinguish a real inline cycle from a previously
-validated DAG.
+in the program. It preserves the existing stored root order and depth-first child order: an Enter
+validates the current id and active-path state, marks the node active, then pushes its Exit followed
+by its children in reverse stored order so the LIFO walk observes fields, variants/payloads, tuple
+elements, and tagged `Result` `Ok` then `Err` in stored order. Exit removes the active mark and adds
+the completed mark. Header/pointer references validate their id at the current position without an
+Enter. Per-kind active sets therefore distinguish a real inline cycle from a previously validated
+DAG without consuming the compiler call stack. The MIR canonical-table reachability/key walkers and
+the source-ABI key walker over the same tagged and tuple syntax are iterative as well; validation
+does not hand a deep accepted graph to a recursive post-check. The first `CodegenError` for
+multi-invalid MIR is independent of hash-set iteration.
+
+Named-return inference likewise uses the checked-HIR direct-call graph rather than repeated
+whole-program rescans. Every function is analyzed once initially; when its monotone parameter-root
+summary grows, only its direct callers are queued again. A call chain therefore advances by
+dependency worklist edges rather than one whole-program round per link. Lifted lambdas and
+function-value targets remain deferred exactly as above. Owner tests place callers before callees
+and cover a mutually recursive pair so correctness and convergence cannot come from declaration
+order or an in-place single pass; the benchmark chain uses the same caller-before-callee order.
 
 The following closure matrix is authoritative for implementation and review. “All call forms” means
 same-unit named, imported, bound function value, indirect call, and generic monomorph where the
@@ -1669,7 +1693,7 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, duplicate/ambiguous local definitions or type parameters, parameter-with-arguments, wrong local/builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with actual types evaluated without recursive instantiation; layout validation shares completed nodes across the program; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, duplicate/ambiguous local definitions or type parameters, parameter-with-arguments, wrong local/builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; an a1 `?` edge may union the flattened operand roots only when the enclosing return type can recursively carry a borrow, so a borrow-capable `Ok` payload cannot put provenance on a scalar/error-only return; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
 | Closure/function-value provenance | L2b-b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
@@ -1702,7 +1726,13 @@ Acceptance:
   the `Sink` twin, the documented convergent transform, constant replacement, a whole local nominal
   actual, and zero-weight permutation/duplication;
 - direct `A<box<T>>` identity growth rejects while local nominals below an exposed opaque actual do
-  not create dependency edges; parallel zero and positive edges still reject;
+  not create dependency edges; composed `Id<box<T>>` and `Id<fn(T) -> T>` wrappers do not expose
+  `T` to an enclosing local consumer; parallel zero and positive edges still reject;
+- a deep acyclic MIR type chain validates and a deep malformed inline cycle rejects with
+  `CodegenError`, both through the iterative graph walker rather than the process stack; a
+  multi-invalid graph reports the first stored child before later siblings;
+- caller-before-callee chains and mutual named recursion converge to the same canonical return roots
+  in whole-program and per-unit checking, and only changed callees requeue their direct callers;
 - duplicate local/type-parameter keys, parameter-with-arguments, wrong local/builtin arity,
   unresolved bare names, exact qualified-local names, foreign-qualified leaves, malformed nested
   function types, and multi-invalid precedence have exact semantic-import tests;

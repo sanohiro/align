@@ -106,6 +106,67 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
 }
 
 #[test]
+fn caller_before_callee_and_mutual_recursion_converge_independently_of_declaration_order() {
+    let files = &[
+        (
+            "views.align",
+            "\
+module views
+pub fn caller(first: str, second: str, depth: i64) -> str =
+  even(first, second, depth)
+pub fn even(first: str, second: str, depth: i64) -> str {
+  if depth == 0 { return first }
+  return odd(first, second, depth - 1)
+}
+pub fn odd(first: str, second: str, depth: i64) -> str {
+  if depth == 0 { return second }
+  return even(first, second, depth - 1)
+}
+",
+        ),
+        ("main.align", "import views\nfn main() -> i32 = 0\n"),
+    ];
+    let differential =
+        diff_check_multi("l2b-return-summary-worklist", files, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(
+        !differential.per_unit.diags.has_errors(),
+        "worklist fixture must check:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    let summary = differential
+        .per_unit
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "views")
+        .expect("views summary");
+    for name in ["caller", "even", "odd"] {
+        let function = summary
+            .fns
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} signature"));
+        assert_eq!(
+            function.return_borrow,
+            roots(&[0, 1], &[]),
+            "{name} must converge to both mutually reachable parameter roots"
+        );
+        assert_eq!(
+            function.return_region,
+            ReturnRegionSummary::Roots {
+                params: vec![0, 1],
+                captures: vec![],
+            }
+        );
+    }
+}
+
+#[test]
 fn loop_break_value_roots_drive_direct_and_imported_liveness() {
     let direct = "\
 fn loop_identity(value: str) -> str = loop { break value }

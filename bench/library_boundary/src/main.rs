@@ -88,14 +88,15 @@ fn run_interface() {
 }
 
 fn provenance_fixture() -> String {
-    let mut source = String::from("pub fn select_0000(first: str, second: str) -> str = second\n");
-    for index in 1..256 {
+    let mut source = String::new();
+    for index in (1..256).rev() {
         source.push_str(&format!(
             "pub fn select_{index:04}(first: str, second: str) -> str = \
              select_{previous:04}(first, second)\n",
             previous = index - 1,
         ));
     }
+    source.push_str("pub fn select_0000(first: str, second: str) -> str = second\n");
     source.push_str("fn main() -> i32 = 0\n");
     source
 }

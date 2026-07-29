@@ -1695,15 +1695,18 @@ fn canonicalize_tagged_types(program: &mut Program) {
         table: &[hir::TaggedType],
         reachable: &mut std::collections::BTreeSet<u32>,
     ) {
-        if let Scalar::Tagged(id) = scalar
-            && reachable.insert(id)
-            && let Some(entry) = table.get(id as usize)
-        {
-            match *entry {
-                hir::TaggedType::Option(payload) => collect_scalar(payload, table, reachable),
-                hir::TaggedType::Result(ok, err) => {
-                    collect_scalar(ok, table, reachable);
-                    collect_scalar(err, table, reachable);
+        let mut work = vec![scalar];
+        while let Some(scalar) = work.pop() {
+            if let Scalar::Tagged(id) = scalar
+                && reachable.insert(id)
+                && let Some(entry) = table.get(id as usize)
+            {
+                match *entry {
+                    hir::TaggedType::Option(payload) => work.push(payload),
+                    hir::TaggedType::Result(ok, err) => {
+                        work.push(err);
+                        work.push(ok);
+                    }
                 }
             }
         }
@@ -1771,43 +1774,75 @@ fn canonicalize_tagged_types(program: &mut Program) {
         }
     }
 
+    enum ScalarKeyWork {
+        Scalar(Scalar),
+        Text(&'static str),
+        ExitTagged(u32),
+    }
+
     fn scalar_key(
         scalar: Scalar,
         table: &[hir::TaggedType],
         structs: &[hir::StructDef],
         enums: &[hir::EnumDef],
-        active: &mut Vec<u32>,
     ) -> Option<String> {
-        Some(match scalar {
-            Scalar::Struct(id) => format!("struct:{}", structs.get(id as usize)?.name),
-            Scalar::DynStructArray(id) => {
-                format!("dyn-struct-array:{}", structs.get(id as usize)?.name)
-            }
-            Scalar::Soa(id) => format!("soa:{}", structs.get(id as usize)?.name),
-            Scalar::Enum(id) => format!("enum:{}", enums.get(id as usize)?.name),
-            Scalar::Tagged(id) => {
-                if active.contains(&id) {
-                    return None;
+        let mut key = String::new();
+        let mut active = std::collections::HashSet::new();
+        let mut work = vec![ScalarKeyWork::Scalar(scalar)];
+        while let Some(next) = work.pop() {
+            match next {
+                ScalarKeyWork::Text(text) => key.push_str(text),
+                ScalarKeyWork::ExitTagged(id) => {
+                    if !active.remove(&id) {
+                        return None;
+                    }
                 }
-                active.push(id);
-                let key = match *table.get(id as usize)? {
-                    hir::TaggedType::Option(payload) => format!(
-                        "option<{}>",
-                        scalar_key(payload, table, structs, enums, active)?
-                    ),
-                    hir::TaggedType::Result(ok, err) => format!(
-                        "result<{},{}>",
-                        scalar_key(ok, table, structs, enums, active)?,
-                        scalar_key(err, table, structs, enums, active)?
-                    ),
-                };
-                active.pop();
-                key
+                ScalarKeyWork::Scalar(scalar) => match scalar {
+                    Scalar::Struct(id) => {
+                        key.push_str("struct:");
+                        key.push_str(&structs.get(id as usize)?.name);
+                    }
+                    Scalar::DynStructArray(id) => {
+                        key.push_str("dyn-struct-array:");
+                        key.push_str(&structs.get(id as usize)?.name);
+                    }
+                    Scalar::Soa(id) => {
+                        key.push_str("soa:");
+                        key.push_str(&structs.get(id as usize)?.name);
+                    }
+                    Scalar::Enum(id) => {
+                        key.push_str("enum:");
+                        key.push_str(&enums.get(id as usize)?.name);
+                    }
+                    Scalar::Tagged(id) => {
+                        if !active.insert(id) {
+                            return None;
+                        }
+                        let entry = table.get(id as usize)?;
+                        work.push(ScalarKeyWork::ExitTagged(id));
+                        match *entry {
+                            hir::TaggedType::Option(payload) => {
+                                key.push_str("option<");
+                                work.push(ScalarKeyWork::Text(">"));
+                                work.push(ScalarKeyWork::Scalar(payload));
+                            }
+                            hir::TaggedType::Result(ok, err) => {
+                                key.push_str("result<");
+                                work.push(ScalarKeyWork::Text(">"));
+                                work.push(ScalarKeyWork::Scalar(err));
+                                work.push(ScalarKeyWork::Text(","));
+                                work.push(ScalarKeyWork::Scalar(ok));
+                            }
+                        }
+                    }
+                    // Abstract entries and function-table ids are not a concrete, id-independent
+                    // ABI key.
+                    Scalar::Param(_) | Scalar::Fn(_) => return None,
+                    other => key.push_str(&format!("{other:?}")),
+                },
             }
-            // Abstract entries and function-table ids are not a concrete, id-independent ABI key.
-            Scalar::Param(_) | Scalar::Fn(_) => return None,
-            other => format!("{other:?}"),
-        })
+        }
+        Some(key)
     }
 
     let mut keyed = Vec::with_capacity(reachable.len());
@@ -1817,7 +1852,6 @@ fn canonicalize_tagged_types(program: &mut Program) {
             &program.tagged_types,
             &program.structs,
             &program.enums,
-            &mut Vec::new(),
         ) else {
             // Keep malformed compiler-internal state intact. The LLVM boundary validates every id
             // and returns CodegenError; it must never guess a representation or panic.

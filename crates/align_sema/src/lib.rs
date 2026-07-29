@@ -4612,6 +4612,7 @@ pub fn check_program_with_interface_facts(
             f,
             diags,
             named_return_borrow: &named_return_borrow,
+            summary_dependencies: None,
             tuples,
             structs,
             enums,
@@ -4742,44 +4743,70 @@ fn infer_return_provenance(
         )
         .collect();
 
-    loop {
-        let mut next = named.clone();
-        let mut changed = false;
-        for function in &program.fns {
-            // Lifted lambda parameters append captures after explicit arguments. Treating those
-            // slots as ordinary named parameters would publish the wrong domain and disagree with
-            // the closure's explicit-parameter signature. L2b-b infers both domains atomically.
-            if is_lifted_lambda_name(&function.name) {
-                continue;
-            }
-            let mut sink = Diagnostics::new();
-            let roots = MoveCheck {
-                f: function,
-                diags: &mut sink,
-                named_return_borrow: &named,
-                tuples: &program.tuples,
-                structs: &program.structs,
-                enums: &program.enums,
-                tagged_types: &program.tagged_types,
-                loop_breaks: Vec::new(),
-                borrows: BorrowState::default(),
-                loop_borrow_breaks: Vec::new(),
-                loop_value_breaks: Vec::new(),
-                loop_value_roots: std::collections::HashMap::new(),
-                loop_iter_drops: Vec::new(),
-                arena_depth: 0,
-                return_roots: BorrowRoots::new(),
-            }
-            .check();
-            let summary = summary_from_roots(&roots);
-            if next.get(&function.name) != Some(&summary) {
-                next.insert(function.name.clone(), summary);
-                changed = true;
-            }
+    // Process each function once, then only revisit direct callers of a summary that grew. Call
+    // dependencies are collected by MoveCheck's exhaustive expression walk on the first visit, so
+    // declaration order cannot turn a long forwarding chain into repeated whole-program scans.
+    let function_count = program.fns.len();
+    let mut reverse_callers:
+        std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut dependencies_recorded = vec![false; function_count];
+    let mut queued = vec![true; function_count];
+    let mut worklist: std::collections::VecDeque<usize> =
+        (0..function_count).collect();
+    while let Some(index) = worklist.pop_front() {
+        queued[index] = false;
+        let function = &program.fns[index];
+        // Lifted lambda parameters append captures after explicit arguments. Treating those slots
+        // as ordinary named parameters would publish the wrong domain and disagree with the
+        // closure's explicit-parameter signature. L2b-b infers both domains atomically.
+        if is_lifted_lambda_name(&function.name) {
+            continue;
         }
-        named = next;
-        if !changed {
-            break;
+
+        let mut dependencies = std::collections::HashSet::new();
+        let collect_dependencies =
+            (!dependencies_recorded[index]).then_some(&mut dependencies);
+        let mut sink = Diagnostics::new();
+        let roots = MoveCheck {
+            f: function,
+            diags: &mut sink,
+            named_return_borrow: &named,
+            summary_dependencies: collect_dependencies,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            loop_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_roots: std::collections::HashMap::new(),
+            loop_iter_drops: Vec::new(),
+            arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+        }
+        .check();
+        if !dependencies_recorded[index] {
+            let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+            dependencies.sort();
+            for callee in dependencies {
+                reverse_callers.entry(callee).or_default().push(index);
+            }
+            dependencies_recorded[index] = true;
+        }
+
+        let summary = summary_from_roots(&roots);
+        if named.get(&function.name) == Some(&summary) {
+            continue;
+        }
+        named.insert(function.name.clone(), summary);
+        if let Some(callers) = reverse_callers.get(&function.name) {
+            for &caller in callers {
+                if !queued[caller] {
+                    queued[caller] = true;
+                    worklist.push_back(caller);
+                }
+            }
         }
     }
 
@@ -12022,6 +12049,9 @@ struct MoveCheck<'a> {
     /// Settled same-program/imported return summaries for mapping call results back to their exact
     /// caller-side inputs. The map is recomputed to a fixpoint before the diagnostic pass.
     named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    /// Direct named calls observed by the exhaustive expression walk. Present only while building
+    /// the reverse worklist for named-return inference.
+    summary_dependencies: Option<&'a mut std::collections::HashSet<String>>,
     /// Tuple defs — so a Move tuple (one with an owned element) is recognised as a Move type and
     /// its consumption (pass / destructure / return) is tracked for use-after-move.
     tuples: &'a [hir::TupleDef],
@@ -13364,6 +13394,9 @@ impl<'a> MoveCheck<'a> {
             // read-only builtin, so it *borrows* its argument (a `string` printed once is still
             // usable — `print(s); s.len()`); it never takes ownership.
             ExprKind::Call { func, args, .. } => {
+                if let Some(dependencies) = self.summary_dependencies.as_deref_mut() {
+                    dependencies.insert(func.clone());
+                }
                 let consuming = func != "print";
                 for a in args {
                     self.expr(a, moved, consuming, consuming);
