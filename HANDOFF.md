@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-29. `main` includes the shipped wave through #672.
+_Last updated: 2026-07-30. `main` includes the shipped wave through #672.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -266,8 +266,10 @@ validation, whole/per-unit serialization parity, source-order reachability, and 
 form one compatibility boundary: splitting them would either publish unvalidated provenance or
 consume provenance whose producer semantics are not yet closed. The closure matrix therefore
 keeps this as the smallest independently correct vertical slice. The final local provenance
-benchmark on Apple Silicon reports 1.857 ms/check and 22,848 interface bytes for summary inference,
-plus 1.820 ms/import for semantic import validation. Do not begin a
+preflight also carries checker-owned break acceptance into HIR so region-rejected recovery syntax
+cannot manufacture an effect, escape, ownership, provenance, or MIR loop-exit edge. The final local
+provenance benchmark on Apple Silicon reports 1.936 ms/check and 22,848 interface bytes for summary
+inference, plus 1.999 ms/import for semantic import validation. Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
 borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b

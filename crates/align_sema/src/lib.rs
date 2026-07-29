@@ -6410,9 +6410,13 @@ impl EffectScan<'_> {
                         self.join_return_effects(e);
                     }
                 }
-                Stmt::Break(Some(e)) => {
+                Stmt::Break {
+                    value: Some(e),
+                    accepted,
+                } => {
                     self.expr(e);
-                    if self.known_effects.is_some()
+                    if *accepted
+                        && self.known_effects.is_some()
                         && let Some((loop_ty, loop_key)) =
                             self.loop_results.last().copied()
                     {
@@ -6426,7 +6430,7 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::Expr(e) => self.expr(e),
-                Stmt::Return(None) | Stmt::Break(None) => {}
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
             }
         }
         if let Some(v) = &b.value {
@@ -8391,11 +8395,6 @@ impl<'a> EscapeFlowCfg<'a> {
         }
     }
 
-    fn has_predecessor(&self, block: EscapeFlowBlockId) -> bool {
-        self.blocks
-            .iter()
-            .any(|candidate| candidate.successors.contains(&block))
-    }
 }
 
 /// Arena escape checking (`03-types.md` §7, generalized per `impl/08-memory-model-v2.md`):
@@ -10283,22 +10282,24 @@ impl<'a> EscapeCheck<'a> {
             | Stmt::AssignField { value, .. } => self.walk(value, depth),
             Stmt::Return(Some(value)) | Stmt::Expr(value) => self.walk(value, depth),
             Stmt::Return(None) => {}
-            Stmt::Break(value) => {
+            Stmt::Break { value, .. } => {
                 if let Some(value) = value {
                     self.walk(value, depth);
                 }
             }
         }
         self.push_flow_op(EscapeFlowOp::Stmt(stmt, depth));
-        if matches!(stmt, Stmt::Break(_)) {
+        if let Stmt::Break { accepted, .. } = stmt {
             let break_block = self.flow_current;
-            if let Some(exit) = self.loop_exit_blocks.last().copied() {
+            if *accepted
+                && let Some(exit) = self.loop_exit_blocks.last().copied()
+            {
                 self.flow.add_edge(break_block, exit);
             }
             // Keep lowering unreachable syntax for diagnostics, but isolate it from the break edge:
-            // successors observe the state exactly at `break`, never mutations written afterward.
+            // the CFG solver never replays this predecessor-less block, so successors observe the
+            // state exactly at an accepted `break`, never mutations written afterward.
             let unreachable = self.flow.new_block();
-            self.flow.add_edge(break_block, unreachable);
             self.flow_current = unreachable;
         }
     }
@@ -10534,8 +10535,10 @@ impl<'a> EscapeCheck<'a> {
             // would dangle — a per-iteration owned local is dropped at the `break`). Same rule and
             // check as a return; `.clone()` copies a view out. (Loosening this to let an
             // enclosing-arena / outer-frame view escape the loop is a future refinement.)
-            Stmt::Break(value) => {
-                if let Some(e) = value {
+            Stmt::Break { value, accepted } => {
+                if *accepted
+                    && let Some(e) = value
+                {
                     self.check_break_escape(e, depth);
                 }
             }
@@ -10691,11 +10694,8 @@ impl<'a> EscapeCheck<'a> {
                 if !hir_block_diverges(body) {
                     self.flow.add_edge(self.flow_current, head);
                 }
-                // Preserve the old analysis's benign input state after a syntactically break-less
-                // loop, even though runtime continuation is unreachable.
-                if !self.flow.has_predecessor(exit) {
-                    self.flow.add_edge(before, exit);
-                }
+                // Only a semantically accepted `break` adds a predecessor to `exit`. A rejected or
+                // break-less loop leaves it unreachable, so later syntax receives no escape state.
                 self.flow_current = exit;
             }
             // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
@@ -11429,8 +11429,10 @@ impl UnnecessaryHeapScan {
             // Destructure binds fresh locals (definitions, and never `box` — no producer yields a
             // tuple of boxes); just visit the init.
             Stmt::LetTuple { init, .. } => self.visit(init),
-            Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.visit(e),
-            Stmt::Return(None) | Stmt::Break(None) => {}
+            Stmt::Return(Some(e))
+            | Stmt::Break { value: Some(e), .. }
+            | Stmt::Expr(e) => self.visit(e),
+            Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
         }
     }
 
@@ -12044,7 +12046,7 @@ fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
     match s {
         // `return` leaves the function; `break` leaves the loop — either way control never falls
         // through to the next statement in this block.
-        hir::Stmt::Return(_) | hir::Stmt::Break(_) => true,
+        hir::Stmt::Return(_) | hir::Stmt::Break { .. } => true,
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
         hir::Stmt::AssignIndex { index, value, .. }
@@ -12502,7 +12504,7 @@ impl<'a> MoveCheck<'a> {
             !self.non_fallthrough.contains(&expression.span)
         };
         match statement {
-            Stmt::Return(_) | Stmt::Break(_) => false,
+            Stmt::Return(_) | Stmt::Break { .. } => false,
             Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
                 expression_falls(init)
             }
@@ -13226,29 +13228,33 @@ impl<'a> MoveCheck<'a> {
                 // `break e` moves `e` out of the loop, exactly like `return` moves a value out of the
                 // function (a direct, consuming move site). Then snapshot the move state for the
                 // loop's post-state union (`break` is the only way control reaches past the loop).
-                Stmt::Break(value) => {
+                Stmt::Break { value, accepted } => {
                     if let Some(e) = value {
                         move_expr!(self, e, moved, true, true);
-                        let roots = self.borrow_sources(e);
-                        if let Some(frame) = self.loop_value_breaks.last_mut() {
-                            frame.extend(roots);
+                        if *accepted {
+                            let roots = self.borrow_sources(e);
+                            if let Some(frame) = self.loop_value_breaks.last_mut() {
+                                frame.extend(roots);
+                            }
                         }
                     }
-                    if let Some(frame) = self.loop_breaks.last_mut() {
-                        frame.push(moved.clone());
-                    }
-                    // This edge leaves the innermost loop, which drops its per-iteration owned
-                    // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them is
-                    // dead in the code that follows the loop. The invalidation applies to the
-                    // break snapshot only; the block walk stops before every unreachable later
-                    // statement.
-                    let mut at_break = self.borrows.clone();
-                    if let Some(drops) = self.loop_iter_drops.last() {
-                        let depth = self.loop_iter_drops.len() as u32;
-                        Self::invalidate_iteration_drops(&mut at_break, drops, depth);
-                    }
-                    if let Some(frame) = self.loop_borrow_breaks.last_mut() {
-                        frame.push(at_break);
+                    if *accepted {
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(moved.clone());
+                        }
+                        // This edge leaves the innermost loop, which drops its per-iteration owned
+                        // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them
+                        // is dead in the code that follows the loop. The invalidation applies to the
+                        // break snapshot only; the block walk stops before every unreachable later
+                        // statement.
+                        let mut at_break = self.borrows.clone();
+                        if let Some(drops) = self.loop_iter_drops.last() {
+                            let depth = self.loop_iter_drops.len() as u32;
+                            Self::invalidate_iteration_drops(&mut at_break, drops, depth);
+                        }
+                        if let Some(frame) = self.loop_borrow_breaks.last_mut() {
+                            frame.push(at_break);
+                        }
                     }
                 }
                 Stmt::Expr(e) => {
@@ -13269,7 +13275,8 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            falls_through = !matches!(s, Stmt::Return(_) | Stmt::Break(_));
+            falls_through =
+                !matches!(s, Stmt::Return(_) | Stmt::Break { .. });
         }
         if falls_through
             && let Some(v) = &b.value
@@ -15266,8 +15273,9 @@ impl<'a, 't> Checker<'a, 't> {
                 ast::Stmt::Break { value, span } => {
                     // `break` binds to the innermost enclosing `loop`; its value type unifies into
                     // the loop's value (`check_break`). Rejected outside a loop / across a lambda.
-                    let v = self.check_break(value.as_ref(), *span);
-                    stmts.push(Stmt::Break(v));
+                    let (value, accepted) =
+                        self.check_break(value.as_ref(), *span);
+                    stmts.push(Stmt::Break { value, accepted });
                 }
                 ast::Stmt::Expr(e) => {
                     let te = self.check_expr(e, None);
@@ -26148,14 +26156,18 @@ impl<'a, 't> Checker<'a, 't> {
     /// its `break_ty` (running-unify like `match` arms; a bare `break` contributes `()`). Rejected
     /// outside a loop, or when it would cross a lambda boundary (the `loops` stack is reset at each
     /// lambda), or when it sits inside an `arena`/`task_group` nested within the loop (deferred).
-    fn check_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Option<Expr> {
+    fn check_break(
+        &mut self,
+        value: Option<&ast::Expr>,
+        span: Span,
+    ) -> (Option<Expr>, bool) {
         if self.loops.is_empty() {
             self.diags.error(
                 "`break` outside of a `loop` (it cannot cross a lambda boundary; `?`/`return` exit the function instead)".to_string(),
                 span,
             );
             // Still check the value so nested errors surface; discard the result.
-            return value.map(|e| self.check_expr(e, None));
+            return (value.map(|e| self.check_expr(e, None)), false);
         }
         // Deferred: a `break` inside an `arena {}` / `task_group {}` that is itself inside the loop
         // would have to unwind (bulk-free) those regions on the jump to the loop exit — the scoped
@@ -26166,7 +26178,7 @@ impl<'a, 't> Checker<'a, 't> {
                 "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet; move the `break` out of the region (restructure so the region ends before the `break`)".to_string(),
                 span,
             );
-            return value.map(|e| self.check_expr(e, None));
+            return (value.map(|e| self.check_expr(e, None)), false);
         }
         // This break is a control edge accepted for the current target loop. Record checker-owned
         // evidence after target/region validation but before checking the payload: payload errors
@@ -26182,7 +26194,7 @@ impl<'a, 't> Checker<'a, 't> {
         if let Some(v) = value
             && self.reject_bare_array_value(v, expected, "a `break` value")
         {
-            return Some(self.check_expr(v, None));
+            return (Some(self.check_expr(v, None)), true);
         }
         let v = value.map(|e| self.check_expr(e, expected));
         let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);
@@ -26202,7 +26214,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        v
+        (v, true)
     }
 
     // --- finalize ---
@@ -26239,8 +26251,10 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(value);
                 }
                 Stmt::AssignVecLane { value, .. } => self.finalize_expr(value),
-                Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
-                Stmt::Return(None) | Stmt::Break(None) => {}
+                Stmt::Return(Some(e))
+                | Stmt::Break { value: Some(e), .. }
+                | Stmt::Expr(e) => self.finalize_expr(e),
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),
             }
         }
@@ -29778,6 +29792,153 @@ fn main() -> i32 {
         assert_eq!(pure, impure, "effect mutations must not destabilize signature equality");
         assert_eq!(pure.effect.get(), FnEffect::Pure);
         assert_eq!(impure.effect.get(), FnEffect::Impure);
+    }
+
+    #[test]
+    fn checked_break_acceptance_is_preserved_in_hir() {
+        let (program, diagnostics) = check(
+            "\
+fn accepted() -> i64 = loop { break 7 }
+fn rejected_region() -> i64 = loop {
+  arena { break 9 }
+}
+fn rejected_outside() -> i64 {
+  break 11
+}
+fn rejected_lambda() -> fn() -> i64 = fn { break 13 }
+fn rejected_heap_scan() -> i64 = loop {
+  arena {
+    break {
+      boxed := heap.new(17)
+      boxed.get()
+    }
+  }
+}
+",
+        );
+        assert!(
+            diagnostics.has_errors(),
+            "the three rejected breaks must diagnose"
+        );
+
+        let function = |name: &str| {
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"))
+        };
+        let loop_body = |name: &str| {
+            let value = function(name)
+                .body
+                .value
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} body value"));
+            let ExprKind::Loop { body, .. } = &value.kind else {
+                panic!("{name} must have a loop body");
+            };
+            body
+        };
+        let int_break = |statement: &Stmt| {
+            let Stmt::Break {
+                value: Some(Expr {
+                    kind: ExprKind::Int(value),
+                    ..
+                }),
+                accepted,
+            } = statement
+            else {
+                panic!("integer break");
+            };
+            (*value, *accepted)
+        };
+
+        let accepted = &loop_body("accepted").stmts[0];
+        assert_eq!(int_break(accepted), (7, true));
+        assert!(hir_stmt_diverges(accepted));
+
+        let region_value = loop_body("rejected_region")
+            .value
+            .as_deref()
+            .expect("region loop tail");
+        let Expr {
+            kind: ExprKind::Arena(region),
+            ..
+        } = region_value
+        else {
+            panic!("region wrapper");
+        };
+        let rejected_region = &region.stmts[0];
+        assert_eq!(int_break(rejected_region), (9, false));
+        assert!(hir_stmt_diverges(rejected_region));
+
+        let rejected_outside = &function("rejected_outside").body.stmts[0];
+        assert_eq!(int_break(rejected_outside), (11, false));
+        assert!(hir_stmt_diverges(rejected_outside));
+
+        let lambda = program
+            .fns
+            .iter()
+            .find(|function| function.lifted_capture_count == Some(0))
+            .expect("lifted rejected lambda");
+        let rejected_lambda = &lambda.body.stmts[0];
+        assert_eq!(int_break(rejected_lambda), (13, false));
+        assert!(hir_stmt_diverges(rejected_lambda));
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
+                "unnecessary heap allocation"
+            )),
+            "the structural heap scan must still visit a rejected break payload"
+        );
+    }
+
+    #[test]
+    fn rejected_break_effect_payload_is_visited_without_loop_result_join() {
+        let (program, diagnostics) = check(
+            "\
+fn impure() -> i64 {
+  print(1)
+  return 1
+}
+fn rejected() -> fn() -> i64 = loop {
+  arena {
+    break {
+      print(2)
+      impure
+    }
+  }
+}
+",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(
+                    "a `break` inside an `arena`/`task_group` nested in the loop"
+                )),
+            "the fixture must contain a region-rejected break"
+        );
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new())
+                .get("rejected"),
+            Some(&FnEffect::Impure),
+            "the payload's direct print effect must still be visited"
+        );
+
+        let rejected = program
+            .fns
+            .iter()
+            .find(|function| function.name == "rejected")
+            .expect("rejected function");
+        let loop_value = rejected.body.value.as_deref().expect("loop value");
+        let Ty::Fn(loop_fn_id) = loop_value.ty else {
+            panic!("loop result must retain its function type");
+        };
+        assert_ne!(
+            program.fn_types[loop_fn_id as usize].effect.get(),
+            FnEffect::Impure,
+            "the rejected impure function value must not join the loop-result effect boundary"
+        );
     }
 
     #[test]

@@ -269,6 +269,116 @@ fn main() -> i32 {
         region < payload,
         "region rejection must precede nested payload diagnostics:\n{ordered}"
     );
+
+    let mut source_map = SourceMap::new();
+    let checked = check(
+        &mut source_map,
+        "l2b-loop-break-rejected-provenance",
+        "\
+pub fn bad(value: str) -> str = loop {
+  arena { break value }
+}
+fn main() -> i32 = 0
+",
+    );
+    let diagnostics =
+        align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(
+        diagnostics.contains(
+            "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet"
+        ),
+        "the rejected-provenance fixture must diagnose its region edge:\n{diagnostics}"
+    );
+    let bad = checked
+        .hir
+        .fns
+        .iter()
+        .find(|function| function.name == "bad")
+        .expect("checked bad provenance function");
+    assert_eq!(
+        bad.return_borrow,
+        ReturnBorrowSummary::None,
+        "a rejected break payload must not become a return-borrow root"
+    );
+    assert_eq!(
+        bad.return_region,
+        ReturnRegionSummary::None,
+        "a rejected break payload must not become a return-region root"
+    );
+
+    let nested_effect = check_diagnostics(
+        "l2b-loop-break-rejected-nested-effect",
+        "\
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn bad() -> i64 = loop {
+  arena {
+    break {
+      values := [1, 2]
+      values.par_map(impure).sum()
+    }
+  }
+}
+fn main() -> i32 = 0
+",
+    );
+    assert!(
+        nested_effect.contains("'par_map' requires a Pure function"),
+        "a nested payload effect error must survive rejection:\n{nested_effect}"
+    );
+
+    let nested_ownership = check_diagnostics(
+        "l2b-loop-break-rejected-nested-ownership",
+        "\
+fn consume(value: string) -> i64 = value.len()
+fn bad(value: string) -> i64 {
+  loop {
+    arena {
+      break {
+        consume(value)
+        consume(value)
+      }
+    }
+  }
+  return consume(value)
+}
+fn main() -> i32 = 0
+",
+    );
+    assert_eq!(
+        nested_ownership
+            .matches("use of moved value 'value'")
+            .count(),
+        1,
+        "the payload-internal second move must diagnose, but rejected break state must not reach the post-loop return:\n{nested_ownership}"
+    );
+
+    let nested_escape = check_diagnostics(
+        "l2b-loop-break-rejected-nested-escape",
+        "\
+fn bad() -> slice<i64> = loop {
+  arena {
+    break {
+      local := [1, 2]
+      return local[0..1]
+    }
+  }
+}
+fn main() -> i32 = 0
+",
+    );
+    assert!(
+        nested_escape.contains(
+            "cannot return a slice that views a local array"
+        ),
+        "a payload-internal return escape must survive rejection:\n{nested_escape}"
+    );
+    assert!(
+        !nested_escape.contains("cannot `break` a view"),
+        "the rejected outer break must not run the accepted-edge escape check:\n{nested_escape}"
+    );
 }
 
 #[test]

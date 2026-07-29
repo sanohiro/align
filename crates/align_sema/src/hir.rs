@@ -357,8 +357,10 @@ pub enum Stmt {
     AssignElem { base: LocalId, index: Expr, struct_id: u32, soa: bool, value: Expr },
     Return(Option<Expr>),
     /// `break expr` — end the innermost enclosing `loop`, yielding `expr` (a bare `break` yields
-    /// `()`). Diverges (control leaves to the loop's exit); the only loop exit.
-    Break(Option<Expr>),
+    /// `()`). `accepted` is checker-owned target/region evidence: a rejected recovery node still
+    /// retains its payload for nested diagnostics and is non-fallthrough, but no later analysis or
+    /// lowering may treat it as a loop-exit edge.
+    Break { value: Option<Expr>, accepted: bool },
     Expr(Expr),
 }
 

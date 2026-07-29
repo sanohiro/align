@@ -3228,7 +3228,7 @@ fn stmt_span(s: &hir::Stmt) -> Option<Span> {
         hir::Stmt::AssignElemField { value, .. } => Some(value.span),
         hir::Stmt::AssignElem { value, .. } => Some(value.span),
         hir::Stmt::Return(e) => e.as_ref().map(|e| e.span),
-        hir::Stmt::Break(e) => e.as_ref().map(|e| e.span),
+        hir::Stmt::Break { value, .. } => value.as_ref().map(|e| e.span),
         hir::Stmt::Expr(e) => Some(e.span),
     }
 }
@@ -3560,7 +3560,19 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
         }
-        hir::Stmt::Break(value) => {
+        hir::Stmt::Break {
+            value: _,
+            accepted: false,
+        } => {
+            // Invalid checked HIR is not lowered by the driver, but direct/malformed callers must
+            // still fail closed: a rejected recovery break has no runtime payload evaluation and
+            // must never inspect a loop frame or manufacture a loop-result/cleanup/exit edge.
+            b.terminate(Term::Unreachable);
+        }
+        hir::Stmt::Break {
+            value,
+            accepted: true,
+        } => {
             // `break e` ends the innermost loop: evaluate `e`, store it into the loop's result slot,
             // then jump to the loop's exit. A moved-out owned value has its source slot nulled so the
             // per-iteration drops below (and the exit cleanup) free null, not the transferred buffer.
@@ -12061,6 +12073,63 @@ mod tests {
         let f = &p.fns[0];
         // entry stores the literal into x's slot; a later block returns the loaded value.
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Return(Some(_)))));
+    }
+
+    #[test]
+    fn rejected_checked_break_lowers_to_unreachable() {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "\
+fn payload() -> i64 {
+  print(9)
+  return 9
+}
+fn bad() -> i32 {
+  break payload()
+  print(10)
+  return 0
+}
+",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let hir = check_file(&file, &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
+                "`break` outside of a `loop`"
+            )),
+            "the malformed-HIR fixture must contain a rejected checked break"
+        );
+
+        // Force malformed checked HIR across the ordinary driver diagnostic gate. The rejected
+        // break is outside every loop, so any accidental loop-frame lookup panics this owner test.
+        let program = lower_program(&hir);
+        let bad = program
+            .fns
+            .iter()
+            .find(|function| function.name == "bad")
+            .expect("bad function");
+        let entry = bad
+            .blocks
+            .iter()
+            .find(|block| block.id == 0)
+            .expect("bad entry block");
+        assert!(
+            matches!(entry.term, Term::Unreachable),
+            "a rejected checked break must terminate with Unreachable"
+        );
+        assert!(
+            bad.blocks
+                .iter()
+                .all(|block| block.stmts.is_empty()),
+            "the rejected payload and following print/return must emit no MIR statements, stores, nulling, drops, cleanup, calls, or exit edges: {bad:#?}"
+        );
+        assert_eq!(
+            bad.blocks.len(),
+            1,
+            "the rejected break must not manufacture a loop exit or unreachable continuation"
+        );
     }
 
     #[test]
