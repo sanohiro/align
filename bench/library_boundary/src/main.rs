@@ -2,8 +2,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use align_interface::{
-    Effect, Hash128, IFnSig, IParam, IType, InterfaceSummary, ParamMode, ReturnBorrowSummary,
-    ReturnRegionSummary, deserialize, encode_interface_surface, serialize,
+    Effect, Hash128, IFnSig, IParam, IStructDef, IType, ITypeParam, InterfaceSummary, ParamMode,
+    ReturnBorrowSummary, ReturnRegionSummary, deserialize, encode_interface_surface, serialize,
+    validate_for_import,
 };
 
 fn named(path: &str) -> IType {
@@ -99,6 +100,69 @@ fn provenance_fixture() -> String {
     source
 }
 
+fn import_validation_fixture() -> InterfaceSummary {
+    let parameter = ITypeParam {
+        name: "T".to_string(),
+        bound: None,
+    };
+    let mut structures = Vec::with_capacity(128);
+    for index in 0..128 {
+        let field_type = if index == 127 {
+            named("T")
+        } else {
+            IType::Named {
+                path: format!("Layer_{:04}", index + 1),
+                args: vec![named("T")],
+            }
+        };
+        structures.push(IStructDef {
+            name: format!("Layer_{index:04}"),
+            type_params: vec![parameter.clone()],
+            fields: vec![("value".to_string(), field_type)],
+            align: None,
+            c_repr: false,
+            generic_body: Some(format!(
+                "pub Layer_{index:04}<T> {{ value: T }}"
+            )),
+        });
+    }
+    let root = IType::Named {
+        path: "Layer_0000".to_string(),
+        args: vec![named("str")],
+    };
+    let functions = (0..256)
+        .map(|index| IFnSig {
+            name: format!("borrow_{index:04}"),
+            type_params: Vec::new(),
+            params: vec![IParam {
+                mode: ParamMode::ByValue,
+                ty: root.clone(),
+            }],
+            ret: root.clone(),
+            return_borrow: ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: Vec::new(),
+            },
+            return_region: ReturnRegionSummary::Roots {
+                params: vec![0],
+                captures: Vec::new(),
+            },
+            effect: Effect::Pure,
+            generic_body: None,
+        })
+        .collect();
+    InterfaceSummary {
+        unit: "bench.provenance".to_string(),
+        fns: functions,
+        structs: structures,
+        enums: Vec::new(),
+        consts: Vec::new(),
+        capabilities: Vec::new(),
+        interface_hash: Hash128 { lo: 0, hi: 0 },
+        impl_hash: Hash128 { lo: 0, hi: 0 },
+    }
+}
+
 fn run_provenance() {
     let source = provenance_fixture();
     let mut source_map = align_span::SourceMap::new();
@@ -136,6 +200,18 @@ fn run_provenance() {
     let elapsed = start.elapsed();
     let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
     println!("summary-inference\t{milliseconds:.3}\tms/check\t{artifact_bytes}\tbytes");
+
+    let import_summary = import_validation_fixture();
+    validate_for_import(&import_summary).expect("import-validation fixture");
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        validate_for_import(black_box(&import_summary)).expect("benchmark semantic import");
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!("import-validation\t{milliseconds:.3}\tms/import");
 }
 
 fn main() {

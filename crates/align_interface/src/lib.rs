@@ -693,6 +693,15 @@ fn render_enum(e: &IEnumDef) -> String {
 /// consumes canonical return summaries, while `Borrow`/`BorrowMut` remain disabled until L2d/L2e.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
+    DuplicateLocalType(String),
+    DuplicateTypeParameter(String),
+    TypeParameterWithArguments(String),
+    InvalidTypeArity {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
+    UnresolvedBareType(String),
     UnsupportedParamMode(ParamMode),
     ReturnSummaryOnNonBorrowingType,
     ReturnSummaryRootCannotBorrow(u32),
@@ -705,6 +714,28 @@ pub enum ImportCompatibilityError {
 impl std::fmt::Display for ImportCompatibilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ImportCompatibilityError::DuplicateLocalType(name) => {
+                write!(f, "interface contains duplicate or ambiguous local type `{name}`")
+            }
+            ImportCompatibilityError::DuplicateTypeParameter(name) => {
+                write!(f, "interface contains duplicate type parameter `{name}`")
+            }
+            ImportCompatibilityError::TypeParameterWithArguments(name) => {
+                write!(f, "interface type parameter `{name}` cannot take type arguments")
+            }
+            ImportCompatibilityError::InvalidTypeArity {
+                name,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "interface type `{name}` expects {expected} type arguments, got {actual}"
+                )
+            }
+            ImportCompatibilityError::UnresolvedBareType(name) => {
+                write!(f, "interface contains unresolved bare type `{name}`")
+            }
             ImportCompatibilityError::UnsupportedParamMode(mode) => {
                 write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
             }
@@ -750,24 +781,624 @@ impl std::fmt::Display for ImportCompatibilityError {
 
 impl std::error::Error for ImportCompatibilityError {}
 
-fn validate_import_param(
-    param: &IParam,
-    summary: &InterfaceSummary,
+#[derive(Clone, Copy)]
+enum LocalDefinition<'a> {
+    Struct(&'a IStructDef),
+    Enum(&'a IEnumDef),
+}
+
+impl<'a> LocalDefinition<'a> {
+    fn type_params(self) -> &'a [ITypeParam] {
+        match self {
+            LocalDefinition::Struct(definition) => &definition.type_params,
+            LocalDefinition::Enum(definition) => &definition.type_params,
+        }
+    }
+
+    fn values(self) -> Vec<&'a IType> {
+        match self {
+            LocalDefinition::Struct(definition) => {
+                definition.fields.iter().map(|(_, ty)| ty).collect()
+            }
+            LocalDefinition::Enum(definition) => definition
+                .variants
+                .iter()
+                .flat_map(|(_, payload)| payload)
+                .collect(),
+        }
+    }
+}
+
+struct LocalDefinitionIndex<'a> {
+    unit: &'a str,
+    definitions: Vec<LocalDefinition<'a>>,
+    by_name: HashMap<&'a str, usize>,
+    param_offsets: Vec<usize>,
+    total_params: usize,
+}
+
+impl<'a> LocalDefinitionIndex<'a> {
+    fn new(summary: &'a InterfaceSummary) -> Result<Self, ImportCompatibilityError> {
+        let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
+        let mut by_name = HashMap::new();
+        for definition in &summary.structs {
+            if builtin_capability(&definition.name).is_some()
+                || by_name.insert(definition.name.as_str(), definitions.len()).is_some()
+            {
+                return Err(ImportCompatibilityError::DuplicateLocalType(
+                    definition.name.clone(),
+                ));
+            }
+            definitions.push(LocalDefinition::Struct(definition));
+        }
+        for definition in &summary.enums {
+            if builtin_capability(&definition.name).is_some()
+                || by_name.insert(definition.name.as_str(), definitions.len()).is_some()
+            {
+                return Err(ImportCompatibilityError::DuplicateLocalType(
+                    definition.name.clone(),
+                ));
+            }
+            definitions.push(LocalDefinition::Enum(definition));
+        }
+        let mut total_params = 0usize;
+        let mut param_offsets = Vec::with_capacity(definitions.len());
+        for definition in &definitions {
+            param_offsets.push(total_params);
+            total_params += definition.type_params().len();
+        }
+        Ok(Self {
+            unit: &summary.unit,
+            definitions,
+            by_name,
+            param_offsets,
+            total_params,
+        })
+    }
+
+    fn local(&self, path: &str) -> Option<usize> {
+        if let Some(name) = path.strip_prefix(self.unit).and_then(|rest| rest.strip_prefix('.')) {
+            return self.by_name.get(name).copied();
+        }
+        if path.contains('.') {
+            return None;
+        }
+        self.by_name.get(path).copied()
+    }
+
+    fn is_missing_qualified_local(&self, path: &str) -> bool {
+        path.strip_prefix(self.unit)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some()
+            && self.local(path).is_none()
+    }
+
+    fn total_params(&self) -> usize {
+        self.total_params
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinCapability {
+    BorrowLeaf,
+    Transparent,
+    Opaque,
+}
+
+fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
+    let result = match path {
+        "str" | "reader" | "writer" | "http_headers" | "json.doc" => {
+            (0, BuiltinCapability::BorrowLeaf)
+        }
+        "slice" | "soa" | "json.scanner" => (1, BuiltinCapability::BorrowLeaf),
+        "Option" | "array" | "Task" => (1, BuiltinCapability::Transparent),
+        "Result" => (2, BuiltinCapability::Transparent),
+        "box" | "array_builder" => (1, BuiltinCapability::Opaque),
+        "buffer" | "file" | "rng" | "regex" | "captures" | "tcp_conn"
+        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
+        | "response_builder" | "http_stream" | "json.kind" | "Error"
+        | "argon2_params" | "regex_match" | "()" | "bool" | "char" | "string"
+        | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+        | "f32" | "f64" | "raw" => (0, BuiltinCapability::Opaque),
+        _ => {
+            let vector = path
+                .strip_prefix("vec")
+                .or_else(|| path.strip_prefix("mask"))
+                .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"));
+            return vector.then_some((1, BuiltinCapability::Opaque));
+        }
+    };
+    Some(result)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct BorrowFacts {
+    intrinsic: bool,
+    params: Vec<bool>,
+}
+
+impl BorrowFacts {
+    fn empty(param_count: usize) -> Self {
+        Self {
+            intrinsic: false,
+            params: vec![false; param_count],
+        }
+    }
+
+    fn union(&mut self, other: &Self) {
+        self.intrinsic |= other.intrinsic;
+        for (current, incoming) in self.params.iter_mut().zip(&other.params) {
+            *current |= *incoming;
+        }
+    }
+}
+
+struct CapabilityAnalysis<'a> {
+    index: LocalDefinitionIndex<'a>,
+    borrow: Vec<BorrowFacts>,
+    growth: Vec<Vec<bool>>,
+}
+
+impl<'a> CapabilityAnalysis<'a> {
+    fn new(index: LocalDefinitionIndex<'a>) -> Result<Self, ImportCompatibilityError> {
+        let borrow = index
+            .definitions
+            .iter()
+            .map(|definition| BorrowFacts::empty(definition.type_params().len()))
+            .collect();
+        let growth = index
+            .definitions
+            .iter()
+            .map(|definition| vec![true; definition.type_params().len()])
+            .collect();
+        let mut analysis = Self {
+            index,
+            borrow,
+            growth,
+        };
+        analysis.solve_borrow();
+        analysis.solve_growth();
+        analysis.reject_generative_cycles()?;
+        Ok(analysis)
+    }
+
+    fn eval_borrow(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        summaries: &[BorrowFacts],
+    ) -> BorrowFacts {
+        let mut result = BorrowFacts::empty(type_params.len());
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => result.intrinsic = true,
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result.params[index] = true;
+                        continue;
+                    }
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        match capability {
+                            BuiltinCapability::BorrowLeaf => result.intrinsic = true,
+                            BuiltinCapability::Transparent => work.extend(args),
+                            BuiltinCapability::Opaque => {}
+                        }
+                        continue;
+                    }
+                    if let Some(index) = self.index.local(path) {
+                        let summary = &summaries[index];
+                        result.intrinsic |= summary.intrinsic;
+                        for (position, dependent) in summary.params.iter().copied().enumerate() {
+                            if dependent
+                                && let Some(argument) = args.get(position)
+                            {
+                                work.push(argument);
+                            }
+                        }
+                    } else if path.contains('.') {
+                        result.intrinsic = true;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn eval_growth(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        summaries: &[Vec<bool>],
+    ) -> Vec<bool> {
+        let mut result = vec![false; type_params.len()];
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result[index] = true;
+                        continue;
+                    }
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        if capability == BuiltinCapability::Transparent {
+                            work.extend(args);
+                        }
+                        continue;
+                    }
+                    if let Some(index) = self.index.local(path) {
+                        for (position, exposed) in summaries[index].iter().copied().enumerate() {
+                            if exposed
+                                && let Some(argument) = args.get(position)
+                            {
+                                self.mark_syntactic_params(
+                                    argument,
+                                    type_params,
+                                    &mut result,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn mark_syntactic_params(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        result: &mut [bool],
+    ) {
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result[index] = true;
+                    } else {
+                        work.extend(args);
+                    }
+                }
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { params, ret, .. } => {
+                    work.extend(params.iter().map(|parameter| &parameter.ty));
+                    work.push(ret);
+                }
+            }
+        }
+    }
+
+    fn solve_borrow(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.index.definitions.len() {
+                let definition = self.index.definitions[index];
+                let mut next = self.borrow[index].clone();
+                for value in definition.values() {
+                    next.union(&self.eval_borrow(
+                        value,
+                        definition.type_params(),
+                        &self.borrow,
+                    ));
+                }
+                if next != self.borrow[index] {
+                    self.borrow[index] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn solve_growth(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.index.definitions.len() {
+                let definition = self.index.definitions[index];
+                let mut next = vec![false; definition.type_params().len()];
+                for value in definition.values() {
+                    let facts = self.eval_growth(
+                        value,
+                        definition.type_params(),
+                        &self.growth,
+                    );
+                    for (current, incoming) in next.iter_mut().zip(facts) {
+                        *current |= incoming;
+                    }
+                }
+                if next != self.growth[index] {
+                    self.growth[index] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn add_occurrence_edges(
+        &self,
+        source: usize,
+        target: usize,
+        target_param: usize,
+        actual: &IType,
+        edges: &mut Vec<(usize, usize, bool)>,
+    ) {
+        let source_params = self.index.definitions[source].type_params();
+        let mut work = vec![(actual, false)];
+        while let Some((current, wrapped)) = work.pop() {
+            match current {
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(source_param) = source_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        edges.push((
+                            self.index.param_offsets[source] + source_param,
+                            self.index.param_offsets[target] + target_param,
+                            wrapped,
+                        ));
+                        continue;
+                    }
+                    work.extend(args.iter().map(|argument| (argument, true)));
+                }
+                IType::Tuple(elements) => {
+                    work.extend(elements.iter().map(|element| (element, true)));
+                }
+                IType::Fn { params, ret, .. } => {
+                    work.extend(params.iter().map(|parameter| (&parameter.ty, true)));
+                    work.push((ret, true));
+                }
+            }
+        }
+    }
+
+    fn collect_edges(
+        &self,
+        source: usize,
+        root: &IType,
+        edges: &mut Vec<(usize, usize, bool)>,
+    ) {
+        let mut work = vec![root];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        if capability == BuiltinCapability::Transparent {
+                            work.extend(args);
+                        }
+                        continue;
+                    }
+                    let Some(target) = self.index.local(path) else {
+                        continue;
+                    };
+                    for (position, exposed) in
+                        self.growth[target].iter().copied().enumerate()
+                    {
+                        if !exposed {
+                            continue;
+                        }
+                        if let Some(argument) = args.get(position) {
+                            self.add_occurrence_edges(
+                                source,
+                                target,
+                                position,
+                                argument,
+                                edges,
+                            );
+                            work.push(argument);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reject_generative_cycles(&self) -> Result<(), ImportCompatibilityError> {
+        let node_count = self.index.total_params();
+        let mut edges = Vec::new();
+        for source in 0..self.index.definitions.len() {
+            for value in self.index.definitions[source].values() {
+                self.collect_edges(source, value, &mut edges);
+            }
+        }
+        let mut forward = vec![Vec::new(); node_count];
+        let mut reverse = vec![Vec::new(); node_count];
+        for &(from, to, _) in &edges {
+            let Some(outgoing) = forward.get_mut(from) else {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            };
+            outgoing.push(to);
+            let Some(incoming) = reverse.get_mut(to) else {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            };
+            incoming.push(from);
+        }
+
+        let mut seen = vec![false; node_count];
+        let mut order = Vec::with_capacity(node_count);
+        for start in 0..node_count {
+            if seen[start] {
+                continue;
+            }
+            seen[start] = true;
+            let mut stack = vec![(start, 0usize)];
+            while let Some((node, edge_index)) = stack.pop() {
+                if let Some(&next) = forward[node].get(edge_index) {
+                    stack.push((node, edge_index + 1));
+                    if !seen[next] {
+                        seen[next] = true;
+                        stack.push((next, 0));
+                    }
+                } else {
+                    order.push(node);
+                }
+            }
+        }
+
+        let mut component = vec![usize::MAX; node_count];
+        let mut component_id = 0usize;
+        while let Some(start) = order.pop() {
+            if component[start] != usize::MAX {
+                continue;
+            }
+            component[start] = component_id;
+            let mut stack = vec![start];
+            while let Some(node) = stack.pop() {
+                for &next in &reverse[node] {
+                    if component[next] == usize::MAX {
+                        component[next] = component_id;
+                        stack.push(next);
+                    }
+                }
+            }
+            component_id += 1;
+        }
+        if edges
+            .iter()
+            .any(|&(from, to, positive)| positive && component[from] == component[to])
+        {
+            return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+        }
+        Ok(())
+    }
+
+    fn may_borrow(&self, ty: &IType, type_params: &[ITypeParam]) -> bool {
+        let facts = self.eval_borrow(ty, type_params, &self.borrow);
+        facts.intrinsic || facts.params.into_iter().any(|dependent| dependent)
+    }
+}
+
+fn validate_unique_type_params(
     type_params: &[ITypeParam],
 ) -> Result<(), ImportCompatibilityError> {
+    let mut seen = HashSet::new();
+    for parameter in type_params {
+        if !seen.insert(parameter.name.as_str()) {
+            return Err(ImportCompatibilityError::DuplicateTypeParameter(
+                parameter.name.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_type_shape(
+    ty: &IType,
+    index: &LocalDefinitionIndex<'_>,
+    type_params: &[ITypeParam],
+) -> Result<(), ImportCompatibilityError> {
+    let mut work = vec![ty];
+    while let Some(current) = work.pop() {
+        match current {
+            IType::Tuple(elements) => work.extend(elements.iter().rev()),
+            IType::Fn { params, ret, .. } => {
+                work.push(ret);
+                work.extend(params.iter().rev().map(|parameter| &parameter.ty));
+            }
+            IType::Named { path, args } => {
+                if let Some(parameter) = type_params
+                    .iter()
+                    .find(|parameter| parameter.name == *path)
+                {
+                    if !args.is_empty() {
+                        return Err(ImportCompatibilityError::TypeParameterWithArguments(
+                            parameter.name.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                let expected = if let Some((arity, _)) = builtin_capability(path) {
+                    Some(arity)
+                } else {
+                    index
+                        .local(path)
+                        .map(|definition| index.definitions[definition].type_params().len())
+                };
+                if let Some(expected) = expected {
+                    if args.len() != expected {
+                        return Err(ImportCompatibilityError::InvalidTypeArity {
+                            name: path.clone(),
+                            expected,
+                            actual: args.len(),
+                        });
+                    }
+                } else if !path.contains('.') || index.is_missing_qualified_local(path) {
+                    return Err(ImportCompatibilityError::UnresolvedBareType(path.clone()));
+                }
+                work.extend(args.iter().rev());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_shapes(
+    summary: &InterfaceSummary,
+    index: &LocalDefinitionIndex<'_>,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        validate_unique_type_params(&function.type_params)?;
+        for parameter in &function.params {
+            validate_import_type_shape(&parameter.ty, index, &function.type_params)?;
+        }
+        validate_import_type_shape(&function.ret, index, &function.type_params)?;
+    }
+    for structure in &summary.structs {
+        validate_unique_type_params(&structure.type_params)?;
+        for (_, ty) in &structure.fields {
+            validate_import_type_shape(ty, index, &structure.type_params)?;
+        }
+    }
+    for enumeration in &summary.enums {
+        validate_unique_type_params(&enumeration.type_params)?;
+        for (_, payload) in &enumeration.variants {
+            for ty in payload {
+                validate_import_type_shape(ty, index, &enumeration.type_params)?;
+            }
+        }
+    }
+    for constant in &summary.consts {
+        if let Some(ty) = &constant.ty {
+            validate_import_type_shape(ty, index, &[])?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_param_mode(param: &IParam) -> Result<(), ImportCompatibilityError> {
     if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
         return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
     }
-    validate_import_type(&param.ty, summary, type_params)
+    Ok(())
 }
 
-fn validate_import_summaries(
-    params: &[IParam],
-    ret: &IType,
+fn validate_import_summary_header(
     borrow: &ReturnBorrowSummary,
     region: &ReturnRegionSummary,
-    summary: &InterfaceSummary,
-    type_params: &[ITypeParam],
     allow_return_roots: bool,
 ) -> Result<(), ImportCompatibilityError> {
     let summaries_agree = match (borrow, region) {
@@ -793,11 +1424,90 @@ fn validate_import_summaries(
     {
         return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
     }
-    let ret_may_borrow = itype_may_borrow(ret, summary, type_params)?;
+    Ok(())
+}
+
+fn validate_import_type_headers(ty: &IType) -> Result<(), ImportCompatibilityError> {
+    let mut work = vec![ty];
+    while let Some(current) = work.pop() {
+        match current {
+            IType::Named { args, .. } => work.extend(args.iter().rev()),
+            IType::Tuple(elements) => work.extend(elements.iter().rev()),
+            IType::Fn {
+                params,
+                ret,
+                return_borrow,
+                return_region,
+            } => {
+                for param in params {
+                    validate_import_param_mode(param)?;
+                }
+                validate_import_summary_header(return_borrow, return_region, false)?;
+                work.push(ret);
+                work.extend(params.iter().rev().map(|param| &param.ty));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_headers(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        if function.type_params.is_empty() != function.generic_body.is_none() {
+            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+        }
+        for param in &function.params {
+            validate_import_param_mode(param)?;
+            validate_import_type_headers(&param.ty)?;
+        }
+        validate_import_type_headers(&function.ret)?;
+        validate_import_summary_header(
+            &function.return_borrow,
+            &function.return_region,
+            function.generic_body.is_none(),
+        )?;
+    }
+    for structure in &summary.structs {
+        if structure.type_params.is_empty() != structure.generic_body.is_none() {
+            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+        }
+        for (_, ty) in &structure.fields {
+            validate_import_type_headers(ty)?;
+        }
+    }
+    for enumeration in &summary.enums {
+        if enumeration.type_params.is_empty() != enumeration.generic_body.is_none() {
+            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+        }
+        for (_, payload) in &enumeration.variants {
+            for ty in payload {
+                validate_import_type_headers(ty)?;
+            }
+        }
+    }
+    for constant in &summary.consts {
+        if let Some(ty) = &constant.ty {
+            validate_import_type_headers(ty)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_summaries(
+    params: &[IParam],
+    ret: &IType,
+    borrow: &ReturnBorrowSummary,
+    region: &ReturnRegionSummary,
+    analysis: &CapabilityAnalysis<'_>,
+    type_params: &[ITypeParam],
+) -> Result<(), ImportCompatibilityError> {
+    let ret_may_borrow = analysis.may_borrow(ret, type_params);
     let param_may_borrow = params
         .iter()
-        .map(|param| itype_may_borrow(&param.ty, summary, type_params))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|param| analysis.may_borrow(&param.ty, type_params))
+        .collect::<Vec<_>>();
     for roots in [
         match borrow {
             ReturnBorrowSummary::None => None,
@@ -840,421 +1550,26 @@ fn validate_import_summaries(
     Ok(())
 }
 
-fn itype_may_borrow(
-    ty: &IType,
-    summary: &InterfaceSummary,
-    type_params: &[ITypeParam],
-) -> Result<bool, ImportCompatibilityError> {
-    fn substitute(
-        ty: &IType,
-        bindings: &[(String, IType)],
-        resolving: &mut Vec<String>,
-    ) -> IType {
-        match ty {
-            IType::Named { path, args } if args.is_empty() => {
-                let Some((_, bound)) =
-                    bindings.iter().rev().find(|(name, _)| name == path)
-                else {
-                    return ty.clone();
-                };
-                if resolving.contains(path) {
-                    return ty.clone();
-                }
-                resolving.push(path.clone());
-                let substituted = substitute(bound, bindings, resolving);
-                resolving.pop();
-                substituted
-            }
-            IType::Named { path, args } => IType::Named {
-                path: path.clone(),
-                args: args
-                    .iter()
-                    .map(|argument| substitute(argument, bindings, resolving))
-                    .collect(),
-            },
-            IType::Tuple(elements) => IType::Tuple(
-                elements
-                    .iter()
-                    .map(|element| substitute(element, bindings, resolving))
-                    .collect(),
-            ),
-            IType::Fn {
-                params,
-                ret,
-                return_borrow,
-                return_region,
-            } => IType::Fn {
-                params: params
-                    .iter()
-                    .map(|parameter| IParam {
-                        mode: parameter.mode,
-                        ty: substitute(&parameter.ty, bindings, resolving),
-                    })
-                    .collect(),
-                ret: Box::new(substitute(ret, bindings, resolving)),
-                return_borrow: return_borrow.clone(),
-                return_region: return_region.clone(),
-            },
-        }
-    }
-
-    // Each lineage entry mirrors the current type relative to the most recent occurrence of one
-    // local nominal. A marker denotes a whole actual argument. Seeing that marker below a new
-    // constructor when the same nominal recurs proves parameter-driven, unbounded type growth.
-    #[derive(Clone)]
-    enum SymbolicType {
-        Marker,
-        Named(Vec<SymbolicType>),
-        Tuple(Vec<SymbolicType>),
-        Fn {
-            params: Vec<SymbolicType>,
-            ret: Box<SymbolicType>,
-        },
-    }
-
-    fn substitute_symbolic(
-        ty: &IType,
-        bindings: &[(String, SymbolicType)],
-    ) -> SymbolicType {
-        match ty {
-            IType::Named { path, args } if args.is_empty() => {
-                let Some((_, bound)) =
-                    bindings.iter().rev().find(|(name, _)| name == path)
-                else {
-                    return SymbolicType::Named(Vec::new());
-                };
-                bound.clone()
-            }
-            IType::Named { args, .. } => SymbolicType::Named(
-                args.iter()
-                    .map(|argument| substitute_symbolic(argument, bindings))
-                    .collect(),
-            ),
-            IType::Tuple(elements) => SymbolicType::Tuple(
-                elements
-                    .iter()
-                    .map(|element| substitute_symbolic(element, bindings))
-                    .collect(),
-            ),
-            IType::Fn { params, ret, .. } => SymbolicType::Fn {
-                params: params
-                    .iter()
-                    .map(|parameter| substitute_symbolic(&parameter.ty, bindings))
-                    .collect(),
-                ret: Box::new(substitute_symbolic(ret, bindings)),
-            },
-        }
-    }
-
-    fn has_wrapped_marker(args: &[SymbolicType]) -> bool {
-        args.iter().any(|argument| {
-            if matches!(argument, SymbolicType::Marker) {
-                return false;
-            }
-            let mut work = vec![argument];
-            while let Some(ty) = work.pop() {
-                match ty {
-                    SymbolicType::Marker => return true,
-                    SymbolicType::Named(args) | SymbolicType::Tuple(args) => {
-                        work.extend(args);
-                    }
-                    SymbolicType::Fn { params, ret } => {
-                        work.extend(params);
-                        work.push(ret);
-                    }
-                }
-            }
-            false
-        })
-    }
-
-    type Lineage = HashMap<String, SymbolicType>;
-
-    fn split_lineage(
-        lineage: &Lineage,
-        count: usize,
-        named: bool,
-    ) -> Result<Vec<Lineage>, ImportCompatibilityError> {
-        let mut children = vec![Lineage::new(); count];
-        for (key, ty) in lineage {
-            let args = match (named, ty) {
-                (true, SymbolicType::Named(args))
-                | (false, SymbolicType::Tuple(args)) => args,
-                (_, SymbolicType::Marker) => continue,
-                _ => {
-                    return Err(
-                        ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
-                    );
-                }
-            };
-            if args.len() != count {
-                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
-            }
-            for (index, argument) in args.iter().cloned().enumerate() {
-                children[index].insert(key.clone(), argument);
-            }
-        }
-        Ok(children)
-    }
-
-    fn expand_lineage(
-        lineage: &Lineage,
-        parameters: &[ITypeParam],
-        value: &IType,
-    ) -> Result<Lineage, ImportCompatibilityError> {
-        let mut expanded = Lineage::new();
-        for (key, ty) in lineage {
-            let SymbolicType::Named(args) = ty else {
-                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
-            };
-            if args.len() != parameters.len() {
-                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
-            }
-            let bindings = parameters
-                .iter()
-                .zip(args.iter().cloned())
-                .map(|(parameter, argument)| (parameter.name.clone(), argument))
-                .collect::<Vec<_>>();
-            expanded.insert(
-                key.clone(),
-                substitute_symbolic(value, &bindings),
-            );
-        }
-        Ok(expanded)
-    }
-
-    let is_local_nominal =
-        |path: &str, name: &str| path == name || path == format!("{}.{}", summary.unit, name);
-    let mut work = vec![(ty.clone(), Lineage::new())];
-    let mut visited = HashSet::new();
-    let mut may_borrow = false;
-    while let Some((ty, lineage)) = work.pop() {
-        match ty {
-            IType::Tuple(elements) => {
-                let child_lineages = split_lineage(&lineage, elements.len(), false)?;
-                work.extend(elements.into_iter().zip(child_lineages));
-            }
-            IType::Fn { .. } => may_borrow = true,
-            IType::Named { path, args } => match path.as_str() {
-                "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
-                | "json.doc" | "json.scanner" => may_borrow = true,
-                "Option" | "Result" | "array" => {
-                    let child_lineages = split_lineage(&lineage, args.len(), true)?;
-                    work.extend(args.into_iter().zip(child_lineages));
-                }
-                "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
-                | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
-                | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
-                | "Error" | "argon2_params" | "regex_match" | "()" | "bool" | "char"
-                | "string" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32"
-                | "u64" | "f32" | "f64" | "raw" => {}
-                _ => {
-                    if path
-                        .strip_prefix("vec")
-                        .or_else(|| path.strip_prefix("mask"))
-                        .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"))
-                    {
-                        continue;
-                    }
-                    if let Some(definition) = summary
-                        .structs
-                        .iter()
-                        .find(|definition| is_local_nominal(&path, &definition.name))
-                    {
-                        if definition.type_params.len() != args.len() {
-                            continue;
-                        }
-                        let key = format!("struct:{}", definition.name);
-                        if lineage.get(&key).is_some_and(|ty| {
-                            matches!(ty, SymbolicType::Named(args) if has_wrapped_marker(args))
-                        }) {
-                            return Err(
-                                ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
-                            );
-                        }
-                        let concrete = IType::Named {
-                            path: definition.name.clone(),
-                            args: args.clone(),
-                        };
-                        if !visited.insert(format!("struct:{}", render_itype(&concrete))) {
-                            continue;
-                        }
-                        let bindings = definition
-                            .type_params
-                            .iter()
-                            .zip(args.iter().cloned())
-                            .map(|(parameter, argument)| {
-                                (parameter.name.clone(), argument)
-                            })
-                            .collect::<Vec<_>>();
-                        let mut next_lineage = lineage;
-                        next_lineage.insert(
-                            key,
-                            SymbolicType::Named(
-                                args.iter().map(|_| SymbolicType::Marker).collect(),
-                            ),
-                        );
-                        for (_, field) in &definition.fields {
-                            work.push((
-                                substitute(field, &bindings, &mut Vec::new()),
-                                expand_lineage(
-                                    &next_lineage,
-                                    &definition.type_params,
-                                    field,
-                                )?,
-                            ));
-                        }
-                    } else if let Some(definition) = summary
-                        .enums
-                        .iter()
-                        .find(|definition| is_local_nominal(&path, &definition.name))
-                    {
-                        if definition.type_params.len() != args.len() {
-                            continue;
-                        }
-                        let key = format!("enum:{}", definition.name);
-                        if lineage.get(&key).is_some_and(|ty| {
-                            matches!(ty, SymbolicType::Named(args) if has_wrapped_marker(args))
-                        }) {
-                            return Err(
-                                ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph,
-                            );
-                        }
-                        let concrete = IType::Named {
-                            path: definition.name.clone(),
-                            args: args.clone(),
-                        };
-                        if !visited.insert(format!("enum:{}", render_itype(&concrete))) {
-                            continue;
-                        }
-                        let bindings = definition
-                            .type_params
-                            .iter()
-                            .zip(args.iter().cloned())
-                            .map(|(parameter, argument)| {
-                                (parameter.name.clone(), argument)
-                            })
-                            .collect::<Vec<_>>();
-                        let mut next_lineage = lineage;
-                        next_lineage.insert(
-                            key,
-                            SymbolicType::Named(
-                                args.iter().map(|_| SymbolicType::Marker).collect(),
-                            ),
-                        );
-                        for value in definition
-                            .variants
-                            .iter()
-                            .flat_map(|(_, payload)| payload)
-                        {
-                            work.push((
-                                substitute(value, &bindings, &mut Vec::new()),
-                                expand_lineage(
-                                    &next_lineage,
-                                    &definition.type_params,
-                                    value,
-                                )?,
-                            ));
-                        }
-                    } else if type_params
-                        .iter()
-                        .any(|parameter| parameter.name == path.as_str())
-                        || path.contains('.')
-                    {
-                        // A declared generic parameter or a qualified imported nominal may carry
-                        // a view. An unresolved bare name is malformed at this boundary.
-                        may_borrow = true;
-                    }
-                }
-            },
-        }
-    }
-    Ok(may_borrow)
-}
-
-fn validate_import_type(
-    ty: &IType,
-    summary: &InterfaceSummary,
-    type_params: &[ITypeParam],
-) -> Result<(), ImportCompatibilityError> {
-    match ty {
-        IType::Named { args, .. } => {
-            for arg in args {
-                validate_import_type(arg, summary, type_params)?;
-            }
-        }
-        IType::Tuple(elems) => {
-            for elem in elems {
-                validate_import_type(elem, summary, type_params)?;
-            }
-        }
-        IType::Fn {
-            params,
-            ret,
-            return_borrow,
-            return_region,
-        } => {
-            for param in params {
-                validate_import_param(param, summary, type_params)?;
-            }
-            validate_import_type(ret, summary, type_params)?;
-            validate_import_summaries(
-                params,
-                ret,
-                return_borrow,
-                return_region,
-                summary,
-                type_params,
-                false,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 /// Validate that a decoded interface uses only the currently enabled semantic subset. Codec
 /// validation has already proved canonical return summaries; this gate still rejects later borrow
 /// parameter modes before reconstructing imported source.
 pub fn validate_for_import(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
+    let index = LocalDefinitionIndex::new(summary)?;
+    validate_import_shapes(summary, &index)?;
+    validate_import_headers(summary)?;
+    let analysis = CapabilityAnalysis::new(index)?;
+
     for function in &summary.fns {
-        if function.type_params.is_empty() != function.generic_body.is_none() {
-            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
-        }
-        for param in &function.params {
-            validate_import_param(param, summary, &function.type_params)?;
-        }
-        validate_import_type(&function.ret, summary, &function.type_params)?;
         validate_import_summaries(
             &function.params,
             &function.ret,
             &function.return_borrow,
             &function.return_region,
-            summary,
+            &analysis,
             &function.type_params,
-            function.generic_body.is_none(),
         )?;
-    }
-    for structure in &summary.structs {
-        for (_, ty) in &structure.fields {
-            validate_import_type(ty, summary, &structure.type_params)?;
-            itype_may_borrow(ty, summary, &structure.type_params)?;
-        }
-    }
-    for enumeration in &summary.enums {
-        for (_, payload) in &enumeration.variants {
-            for ty in payload {
-                validate_import_type(ty, summary, &enumeration.type_params)?;
-                itype_may_borrow(ty, summary, &enumeration.type_params)?;
-            }
-        }
-    }
-    for constant in &summary.consts {
-        if let Some(ty) = &constant.ty {
-            validate_import_type(ty, summary, &[])?;
-            itype_may_borrow(ty, summary, &[])?;
-        }
     }
     Ok(())
 }
