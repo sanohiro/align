@@ -1022,6 +1022,15 @@ values are passed as ordinary arguments — so it fuses into the same loop and a
 (Consistent with *Nothing hidden*: a lambda that escaped and outlived its captures would need a
 visible heap environment; the in-loop case never does.)
 
+Pipeline construction follows written order. The receiver/source is evaluated first. Each stage
+then snapshots its captured Copy values once at that stage's written position. A terminal evaluates
+its explicit arguments next; therefore `reduce(init, fn ...)` and `scan(init, fn ...)` snapshot
+stage captures before `init`, then evaluate `init`, then snapshot reducer captures. The fused loop
+reuses those snapshots; it does not reload enclosing locals per element. A capture containing a
+view remains tied to its owner, so an intervening terminal argument cannot move, replace, or drop
+that owner before the callback action. If any earlier operand does not continue, no later snapshot
+or pipeline callback executes.
+
 A field selector is shorthand for a one-field lambda — `where(.active)` is `where(fn u { u.active })`,
 and `.score` projects a field out of each element.
 

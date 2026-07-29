@@ -272,8 +272,23 @@ review then reopened the closure matrix for termination inside an accepted break
 effect inference now stops every eager/source-order boundary action after termination, and MIR
 emits an outer result/cleanup edge only from a reachable continuation. Copy `str`, owned `string`,
 mixed control-flow, process termination, and malformed-HIR owners cover the correction. The final
-local provenance benchmark on Apple Silicon reports 1.929 ms/check and 22,848 interface bytes for
-summary inference, plus 1.893 ms/import for semantic import validation. Do not begin a
+independent review found one further pipeline timing gap, so the matrix was reopened before more
+code: pipeline sources now form first, stage Copy captures snapshot once at their written
+positions, explicit terminal arguments follow, terminal captures snapshot last, and callback
+actions begin only after every operand falls through. Sequential, parallel, zip, and JSON-scanner
+lowering reuse the preheader operands; an owned temporary source is hidden-owner guarded so a
+later terminating operand still cleans it exactly once. MoveCheck retains captured-view owner
+dependencies across `init`, EffectScan separates formation from action, and structural
+EscapeCheck/finalization still visit dead HIR without joining reachable state. Focused sema/MIR,
+lambda, borrow-liveness, map_into, zip, and JSON scan-reduce owners are clean. The refreshed local
+provenance benchmark on Apple Silicon reports 1.916 ms/check and 22,848 interface bytes for
+summary inference, plus 1.878 ms/import for semantic import validation. The final owner review
+also closed source snapshots across later terminal arguments: direct, zip, scanner, and
+borrow-preserving `if`/`match` sources retain selected owner roots until action; a Move-`else`
+success payload and a value-producing loop instead transfer and null their old container/source.
+Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
+states.
+Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
 borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b

@@ -1834,9 +1834,6 @@ fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
     })
 }
 
-/// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
-/// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
-/// these like stage captures.
 /// Peel a `arr[i].f0.f1…` chain (an AST `FieldAccess` spine bottoming out at an `Index`) into the
 /// array expression, the index expression, and the field-name path in order. `None` if the receiver
 /// is not rooted at an index (ordinary local/field-path access then handles it). Used to route a
@@ -1853,6 +1850,9 @@ fn peel_index_field_chain(e: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr, Vec<
     }
 }
 
+/// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
+/// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
+/// these like stage captures.
 fn node_captures(kind: &ExprKind) -> &[Expr] {
     match kind {
         ExprKind::ArrayReduce { captures, .. }
@@ -2088,6 +2088,7 @@ enum RawStage {
     Where(StageFn),
     WhereField(ast::Ident),
     Project(ast::Ident),
+    Invalid { name: String, span: Span },
 }
 
 /// An assignable location resolved by [`Checker::check_place`].
@@ -4667,6 +4668,7 @@ pub fn check_program_with_interface_facts(
             tagged_types,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
             loop_borrow_breaks: Vec::new(),
             loop_value_breaks: Vec::new(),
             loop_value_roots: std::collections::HashMap::new(),
@@ -4821,6 +4823,7 @@ fn infer_return_provenance(
             tagged_types: &program.tagged_types,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
             loop_borrow_breaks: Vec::new(),
             loop_value_breaks: Vec::new(),
             loop_value_roots: std::collections::HashMap::new(),
@@ -6230,21 +6233,44 @@ impl EffectScan<'_> {
         }
     }
 
-    fn walk_node_capture_effects(&mut self, kind: &ExprKind) -> bool {
+    fn form_node_captures(&mut self, kind: &ExprKind) -> bool {
         for capture in node_captures(kind) {
             if !self.expr(capture) {
                 return false;
             }
         }
-        self.join_node_capture_effects(kind);
         true
     }
 
-    fn stage_funcs<'a>(
+    fn form_stage_captures(&mut self, stages: &[Stage]) -> bool {
+        for stage in stages {
+            match &stage.kind {
+                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
+                    for capture in captures {
+                        if !self.expr(capture) {
+                            return false;
+                        }
+                    }
+                }
+                StageKind::WhereStrContains { needle } => {
+                    if !self.expr(needle) {
+                        return false;
+                    }
+                }
+                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
+            }
+        }
+        true
+    }
+
+    /// Join the callback actions only after every source/stage/terminal operand has formed.
+    /// Capture expressions were already walked by `form_stage_captures`, so this must never
+    /// re-evaluate them.
+    fn join_stage_actions<'a>(
         &mut self,
         source: &'a Expr,
         stages: &'a [Stage],
-    ) -> Option<PipelineEffectOrigin<'a>> {
+    ) -> PipelineEffectOrigin<'a> {
         let mut origin = PipelineEffectOrigin::Expression {
             value: source,
             path: vec![FnEffectProjection::ArrayElement],
@@ -6253,13 +6279,6 @@ impl EffectScan<'_> {
             match &s.kind {
                 StageKind::Map { func, captures }
                 | StageKind::Where { func, captures } => {
-                    // Capture operands are reads of enclosing locals — walk them so no call edge /
-                    // effect they might contain is missed (exhaustiveness).
-                    for c in captures {
-                        if !self.expr(c) {
-                            return None;
-                        }
-                    }
                     self.calls.push(func.clone());
                     self.join_named_capture_effects(func, captures);
                     if self.known_effects.is_some() {
@@ -6276,20 +6295,14 @@ impl EffectScan<'_> {
                         };
                     }
                 }
-                // No lifted function (the whole point of hoisting): the needle is an expression
-                // evaluated once before the loop, so walk it for any call edge / effect it contains.
-                StageKind::WhereStrContains { needle } => {
-                    if !self.expr(needle) {
-                        return None;
-                    }
-                }
+                StageKind::WhereStrContains { .. } => {}
                 StageKind::Project { field } => {
                     origin.project(FnEffectProjection::StructField(*field));
                 }
                 StageKind::WhereField { .. } => {}
             }
         }
-        Some(origin)
+        origin
     }
 
     /// Scan one block in source order and report whether control can reach its end. A terminating
@@ -7982,38 +7995,43 @@ impl EffectScan<'_> {
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 walk!(source);
-                if self.stage_funcs(source, stages).is_none() {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
+                self.join_stage_actions(source, stages);
             }
             ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } => {
                 walk!(source);
-                if self.stage_funcs(source, stages).is_none() {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
+                self.join_stage_actions(source, stages);
             }
             // `map_into` writes each post-stage element into caller-provided storage. It is an
             // observable view write even when the destination expression itself is just a local
             // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 walk!(source);
-                if self.stage_funcs(source, stages).is_none() {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
                 walk!(dst);
+                self.join_stage_actions(source, stages);
                 self.impure_direct = true;
             }
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
                 walk!(source);
-                let Some(origin) = self.stage_funcs(source, stages) else {
-                    return false;
-                };
-                if !self.walk_node_capture_effects(&e.kind) {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -8038,13 +8056,15 @@ impl EffectScan<'_> {
                 ..
             } => {
                 walk!(source);
-                walk!(init);
-                let Some(origin) = self.stage_funcs(source, stages) else {
-                    return false;
-                };
-                if !self.walk_node_capture_effects(&e.kind) {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
+                walk!(init);
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary(func, 0, init);
@@ -8067,12 +8087,14 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayParMap { source, stages, func, .. } => {
                 walk!(source);
-                let Some(origin) = self.stage_funcs(source, stages) else {
-                    return false;
-                };
-                if !self.walk_node_capture_effects(&e.kind) {
+                if !self.form_stage_captures(stages) {
                     return false;
                 }
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -10817,16 +10839,6 @@ impl<'a> EscapeCheck<'a> {
         if let Some(region) = self.allocation_regions.last().copied() {
             self.allocation_region_by_expr.insert(Self::expr_key(e), region);
         }
-        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
-        // enclosing locals); walk them so a captured value escaping its region is caught.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                self.walk(c, depth);
-            }
-        }
-        for c in node_captures(&e.kind) {
-            self.walk(c, depth);
-        }
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
@@ -11015,8 +11027,25 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
+                for capture in node_captures(&e.kind) {
+                    self.walk(capture, depth);
+                }
+            }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
                 self.walk(index, depth);
@@ -11044,14 +11073,24 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(needle, depth);
             }
             ExprKind::StrTrim { recv, .. } => self.walk(recv, depth),
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
                 self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
                 self.walk(init, depth);
+                for capture in node_captures(&e.kind) {
+                    self.walk(capture, depth);
+                }
             }
             // `map_into` reads its source and writes `dst` — recurse into both (the destination
             // is a place read of the `out`/`mut` slice; nothing is moved out of it).
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
                 self.walk(dst, depth);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -11647,16 +11686,6 @@ impl UnnecessaryHeapScan {
     }
 
     fn visit(&mut self, e: &Expr) {
-        // Capture operands (a lifted lambda's captured enclosing locals) live outside the normal child
-        // recursion — a captured box is an "other" use, so classify them too.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                self.visit(c);
-            }
-        }
-        for c in node_captures(&e.kind) {
-            self.visit(c);
-        }
         match &e.kind {
             // `p.get()` — the one occurrence that does *not* need a heap box. When the receiver is a
             // bare local, record it as a get and do NOT recurse into the receiver (so the inner
@@ -11737,8 +11766,25 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.visit(i),
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
+                for capture in node_captures(&e.kind) {
+                    self.visit(capture);
+                }
+            }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.visit(recv);
                 self.visit(index);
@@ -11766,12 +11812,22 @@ impl UnnecessaryHeapScan {
                 self.visit(needle);
             }
             ExprKind::StrTrim { recv, .. } => self.visit(recv),
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
                 self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
                 self.visit(init);
+                for capture in node_captures(&e.kind) {
+                    self.visit(capture);
+                }
             }
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
                 self.visit(dst);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -12292,6 +12348,10 @@ struct MoveCheck<'a> {
     /// Intra-frame borrow provenance and invalidation state. This shares MoveCheck's evaluation
     /// order and control-flow joins, so every consuming position has one source of truth.
     borrows: BorrowState,
+    /// Stable identities for pipeline-source snapshots that must remain valid across a later
+    /// terminal argument. Snapshot roots live in `BorrowState`, so branch joins and owner
+    /// invalidation use the same machinery as ordinary view locals.
+    next_pipeline_snapshot: usize,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
     /// Roots carried by value-bearing `break` edges for each active loop.
@@ -12377,6 +12437,8 @@ type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
     invalid: std::collections::HashMap<LocalId, EndedRoots>,
+    pipeline_sources: std::collections::HashMap<usize, BorrowRoots>,
+    invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
 }
 
 impl BorrowState {
@@ -12389,6 +12451,18 @@ impl BorrowState {
         }
     }
 
+    fn begin_pipeline_source(&mut self, snapshot: usize, roots: BorrowRoots) {
+        self.invalid_pipeline_sources.remove(&snapshot);
+        self.pipeline_sources.insert(snapshot, roots);
+    }
+
+    fn finish_pipeline_source(&mut self, snapshot: usize) -> EndedRoots {
+        self.pipeline_sources.remove(&snapshot);
+        self.invalid_pipeline_sources
+            .remove(&snapshot)
+            .unwrap_or_default()
+    }
+
     /// End every source generation matching `ended`. One entry point for both endings: a named
     /// local being consumed, and a whole class of roots (a loop depth's temporaries plus its owned
     /// locals) being dropped at an iteration edge.
@@ -12396,6 +12470,17 @@ impl BorrowState {
         for (&borrower, roots) in &self.sources {
             for &root in roots.iter().filter(|&&r| ended(r)) {
                 let entry = self.invalid.entry(borrower).or_default().entry(root).or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
+        for (&snapshot, roots) in &self.pipeline_sources {
+            for &root in roots.iter().filter(|&&r| ended(r)) {
+                let entry = self
+                    .invalid_pipeline_sources
+                    .entry(snapshot)
+                    .or_default()
+                    .entry(root)
+                    .or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
@@ -12412,6 +12497,22 @@ impl BorrowState {
         }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
+            for (&owner, &how) in roots {
+                let entry = into.entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
+        for (&snapshot, roots) in &b.pipeline_sources {
+            out.pipeline_sources
+                .entry(snapshot)
+                .or_default()
+                .extend(roots);
+        }
+        for (&snapshot, roots) in &b.invalid_pipeline_sources {
+            let into = out
+                .invalid_pipeline_sources
+                .entry(snapshot)
+                .or_default();
             for (&owner, &how) in roots {
                 let entry = into.entry(owner).or_insert(how);
                 *entry = (*entry).min(how);
@@ -13160,6 +13261,146 @@ impl<'a> MoveCheck<'a> {
         self.diags.error(msg, span);
     }
 
+    /// Pipeline capture values are copied into preheader temporaries at their written stage
+    /// positions. A later terminal argument may invalidate storage borrowed by that copied view;
+    /// validate the already-formed capture at the action boundary without re-walking (and thus
+    /// without pretending the source expression is evaluated twice).
+    fn validate_pipeline_capture_use(&mut self, capture: &Expr) {
+        if let ExprKind::Local(local) = capture.kind {
+            self.check_borrow_use(local, capture.span);
+        }
+    }
+
+    fn pipeline_block_source_roots(&self, block: &Block) -> BorrowRoots {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block
+                .value
+                .as_deref()
+                .map_or_else(BorrowRoots::new, |value| {
+                    self.pipeline_source_roots(value)
+                })
+        } else {
+            BorrowRoots::new()
+        }
+    }
+
+    /// Storage retained by an already-evaluated pipeline source. Unlike ordinary result
+    /// provenance, an owned source place is borrowed by the terminal loop, so control-flow joins
+    /// must retain the union of the places selected by their continuing alternatives.
+    fn pipeline_source_roots(&self, source: &Expr) -> BorrowRoots {
+        let mut roots = BorrowRoots::new();
+        match &source.kind {
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    roots.extend(self.pipeline_source_roots(source));
+                }
+            }
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => {
+                roots.extend(self.pipeline_block_source_roots(block));
+            }
+            ExprKind::If { then, els, .. } => {
+                roots.extend(self.pipeline_block_source_roots(then));
+                roots.extend(self.pipeline_block_source_roots(els));
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    if !self.non_fallthrough.contains(&arm.body.span) {
+                        roots.extend(self.pipeline_source_roots(&arm.body));
+                    }
+                }
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                // An owned Some/Ok payload is transferred out and the old container is nulled
+                // before the enclosing pipeline sees it. Copy borrow-carrying payloads instead
+                // retain the success side's flattened provenance.
+                if !self.is_move_ty(source.ty) {
+                    roots.extend(self.pipeline_source_roots(opt));
+                }
+                if !self.non_fallthrough.contains(&fallback.span) {
+                    roots.extend(self.pipeline_source_roots(fallback));
+                }
+            }
+            // A loop transfers each accepted `break` value into its result slot. Unlike the
+            // borrow-preserving control joins above, its source places have already been moved and
+            // nulled before the enclosing pipeline observes the result.
+            ExprKind::Loop { .. } => {}
+            _ => roots.extend(self.storage_roots(source)),
+        }
+        roots
+    }
+
+    /// Record the owner generations retained by MIR's already-evaluated source operand. Unlike a
+    /// named view local, this snapshot has no HIR local id, so BorrowState tracks it in a separate
+    /// namespace while sharing the same invalidation and branch-join operations.
+    fn begin_pipeline_source_snapshot(&mut self, source: &Expr) -> Option<usize> {
+        let roots = self.pipeline_source_roots(source);
+        if roots.is_empty() {
+            return None;
+        }
+        let snapshot = self.next_pipeline_snapshot;
+        self.next_pipeline_snapshot += 1;
+        self.borrows.begin_pipeline_source(snapshot, roots);
+        Some(snapshot)
+    }
+
+    fn finish_pipeline_source_snapshot(
+        &mut self,
+        snapshot: Option<usize>,
+        span: Span,
+        validate: bool,
+    ) {
+        let Some(snapshot) = snapshot else { return };
+        let invalid = self.borrows.finish_pipeline_source(snapshot);
+        // An accepted `break` in a terminal operand has already copied the current borrow state
+        // into its enclosing loop frame. That edge never reaches the terminal action, so erase the
+        // analysis-only snapshot there as well; otherwise loop joins/fixpoints can resurrect it.
+        for frame in &mut self.loop_borrow_breaks {
+            for state in frame {
+                state.finish_pipeline_source(snapshot);
+            }
+        }
+        if !validate {
+            return;
+        }
+        let Some((root, how)) = invalid.into_iter().next() else {
+            return;
+        };
+        let message = match root {
+            BorrowRoot::Local(owner) => {
+                let owner = self
+                    .f
+                    .locals
+                    .get(owner as usize)
+                    .map_or("<source>", |local| local.name.as_str());
+                let why = match how {
+                    BorrowEnd::Consumed => {
+                        "was moved, reassigned, or reallocated by a later terminal argument"
+                    }
+                    BorrowEnd::Dropped => {
+                        "was dropped before the terminal action"
+                    }
+                };
+                format!(
+                    "pipeline source snapshot was invalidated before terminal action: owner '{owner}' {why}"
+                )
+            }
+            BorrowRoot::IterTemp(_) => {
+                "pipeline source snapshot was invalidated before terminal action: its temporary owner was dropped".to_string()
+            }
+            BorrowRoot::Param(_) => {
+                "pipeline source snapshot was invalidated before terminal action: its external owner ended unexpectedly".to_string()
+            }
+        };
+        self.diags.error(message, span);
+    }
+
     /// Loop-back use-after-move analysis for `loop { body }`. See the call site in `expr` for the
     /// full rationale. Kept `#[inline(never)]` so its large locals do not enlarge the recursive
     /// `expr` stack frame.
@@ -13584,16 +13825,6 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
-        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
-        // enclosing locals); walk them as borrows so use-after-move of a captured value is caught.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                move_expr!(self, c, moved, false, false);
-            }
-        }
-        for c in node_captures(&e.kind) {
-            move_expr!(self, c, moved, false, false);
-        }
         match &e.kind {
             ExprKind::Local(id) => {
                 if whole_moved(moved, *id) {
@@ -13867,9 +14098,26 @@ impl<'a> MoveCheck<'a> {
             // The receiver is borrowed (the trimmed view aliases its bytes), never consumed.
             ExprKind::StrTrim { recv, .. } => move_expr!(self, recv, moved, false, false),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 move_expr!(self, i, moved, false, false)
+            }
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                move_expr!(self, source, moved, false, false);
+                for capture in stage_capture_exprs(stages) {
+                    move_expr!(self, capture, moved, false, false);
+                }
+                for capture in node_captures(&e.kind) {
+                    move_expr!(self, capture, moved, false, false);
+                }
             }
             // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
             // the index.
@@ -13883,16 +14131,81 @@ impl<'a> MoveCheck<'a> {
                 if let Some(s) = start { move_expr!(self, s, moved, false, false); }
                 if let Some(e) = end { move_expr!(self, e, moved, false, false); }
             }
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
                 move_expr!(self, source, moved, false, false);
-                move_expr!(self, init, moved, false, false);
+                let source_snapshot =
+                    self.begin_pipeline_source_snapshot(source);
+                for capture in stage_capture_exprs(stages) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                if !self.expr(init, moved, false, false) {
+                    self.finish_pipeline_source_snapshot(
+                        source_snapshot,
+                        e.span,
+                        false,
+                    );
+                    return false;
+                }
+                for capture in node_captures(&e.kind) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                for capture in stage_capture_exprs(stages) {
+                    self.validate_pipeline_capture_use(capture);
+                }
+                self.finish_pipeline_source_snapshot(
+                    source_snapshot,
+                    e.span,
+                    true,
+                );
             }
             // `map_into`: the source is borrowed (read per element, never consumed) and `dst` is a
             // borrowed writable slice place (a Copy `{ptr,len}` view — the buffer is written, but the
             // slice value itself is not moved).
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 move_expr!(self, source, moved, false, false);
-                move_expr!(self, dst, moved, false, false);
+                let source_snapshot =
+                    self.begin_pipeline_source_snapshot(source);
+                for capture in stage_capture_exprs(stages) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                if !self.expr(dst, moved, false, false) {
+                    self.finish_pipeline_source_snapshot(
+                        source_snapshot,
+                        e.span,
+                        false,
+                    );
+                    return false;
+                }
+                for capture in stage_capture_exprs(stages) {
+                    self.validate_pipeline_capture_use(capture);
+                }
+                self.finish_pipeline_source_snapshot(
+                    source_snapshot,
+                    e.span,
+                    true,
+                );
             }
             ExprKind::ArrayDot { a, b, .. } => {
                 move_expr!(self, a, moved, false, false);
@@ -19578,10 +19891,10 @@ impl<'a, 't> Checker<'a, 't> {
                         match stage_fn {
                             Some(f) if is_map => stages.push(RawStage::Map(f)),
                             Some(f) => stages.push(RawStage::Where(f)),
-                            None => self.diags.error(
-                                format!("'.{}()' needs a function (named or `fn … {{ … }}`) or `.field`", field.name),
-                                e.span,
-                            ),
+                            None => stages.push(RawStage::Invalid {
+                                name: field.name.clone(),
+                                span: e.span,
+                            }),
                         }
                         return (src, stages);
                     }
@@ -19728,6 +20041,15 @@ impl<'a, 't> Checker<'a, 't> {
         let mut mapped = false;
         for raw in raw_stages {
             match raw {
+                RawStage::Invalid { name, span } => {
+                    self.diags.error(
+                        format!(
+                            "'.{name}()' needs a function (named or `fn … {{ … }}`) or `.field`"
+                        ),
+                        span,
+                    );
+                    return None;
+                }
                 RawStage::Project(field) => {
                     if !slot_backed {
                         self.diags.error(
@@ -20417,6 +20739,20 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        // A named destination's already-declared type may seed an inline literal source without
+        // evaluating the destination expression before the receiver/stage operands.
+        let dst_hint = self
+            .place_local(dst_arg)
+            .and_then(|(local, _)| self.locals.get(local as usize))
+            .and_then(|local| match self.resolve(local.ty) {
+                Ty::Slice(scalar) => Some(scalar_to_ty(scalar)),
+                _ => None,
+            });
+        // Type-check/evaluate the source pipeline first. Capture formation follows the source in
+        // written order; the explicit destination operand comes after every stage capture.
+        let Some((source, stages, elem)) = self.check_pipeline(recv, dst_hint, span) else {
+            return err;
+        };
         // The destination must be a writable slice place: a `mut` local slice or an `out` parameter.
         let dst = self.check_expr(dst_arg, None);
         if dst.ty == Ty::Error {
@@ -20444,10 +20780,8 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_readonly_dst(dst_id, dst_arg.span, "write into") {
             return err;
         }
-        // Type-check the pipeline; a stageless inline literal source infers its element from `dst`.
-        let Some((source, stages, elem)) = self.check_pipeline(recv, Some(scalar_to_ty(dst_es)), span) else {
-            return err;
-        };
+        // A stageless inline literal source used the quiet declaration hint above; the checked
+        // destination type is authoritative for the exact element equality below.
         // v1: length-preserving stages only — a filtering `where` (a dynamic survivor count) is deferred.
         if stages.iter().any(|s| matches!(s.kind, StageKind::Where { .. } | StageKind::WhereField { .. } | StageKind::WhereStrContains { .. })) {
             self.diags.error(
@@ -20790,12 +21124,9 @@ impl<'a, 't> Checker<'a, 't> {
         // The accumulator type + element hint: a named fold fixes both from its signature; a
         // lambda infers the accumulator from the initial value (and the element from the source).
         let named_sig = self.named_sig(fn_arg);
-        let (acc_ty, elem_hint, init) = match &named_sig {
-            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
-            None => {
-                let init = self.check_expr(init_arg, expected);
-                (self.finalize(init.ty), None, init)
-            }
+        let (acc_hint, elem_hint) = match &named_sig {
+            Some(sig) => (Some(sig.ret), sig.params.get(1).copied()),
+            None => (expected, None),
         };
         // `reduce` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
         let prev_scan = self.scan_terminal;
@@ -20805,6 +21136,10 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = piped else {
             return err;
         };
+        let init = self.check_expr(init_arg, acc_hint);
+        let acc_ty = named_sig
+            .as_ref()
+            .map_or_else(|| self.finalize(init.ty), |sig| sig.ret);
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
         // so it doesn't cascade into the lambda body / signature check (matching `scan`).
         if acc_ty == Ty::Error {
@@ -20862,16 +21197,17 @@ impl<'a, 't> Checker<'a, 't> {
         // Accumulator type + element hint: a named fold fixes both from its signature; a lambda
         // infers the accumulator from the initial value (and the element from the source).
         let named_sig = self.named_sig(fn_arg);
-        let (acc_ty, elem_hint, init) = match &named_sig {
-            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
-            None => {
-                let init = self.check_expr(init_arg, None);
-                (self.finalize(init.ty), None, init)
-            }
+        let (acc_hint, elem_hint) = match &named_sig {
+            Some(sig) => (Some(sig.ret), sig.params.get(1).copied()),
+            None => (None, None),
         };
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        let init = self.check_expr(init_arg, acc_hint);
+        let acc_ty = named_sig
+            .as_ref()
+            .map_or_else(|| self.finalize(init.ty), |sig| sig.ret);
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before the scalar check so it
         // doesn't cascade into a confusing "accumulator must be a scalar" diagnostic (matching reduce).
         if acc_ty == Ty::Error {
@@ -26473,6 +26809,21 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn finalize_pipeline_stages(&mut self, stages: &mut [Stage]) {
+        for stage in stages {
+            match &mut stage.kind {
+                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
+                    for capture in captures {
+                        self.finalize_expr(capture);
+                    }
+                }
+                StageKind::WhereStrContains { needle } => self.finalize_expr(needle),
+                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
+            }
+            stage.out_ty = self.finalize(stage.out_ty);
+        }
+    }
+
     fn finalize_expr(&mut self, e: &mut Expr) {
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
@@ -26680,9 +27031,33 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
+            }
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+            }
+            ExprKind::ArrayAnyAll { source, stages, captures, .. }
+            | ExprKind::ArrayPartition { source, stages, captures, .. }
+            | ExprKind::ArrayParMap { source, stages, captures, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
+            }
+            ExprKind::ArraySortBy { source, stages, captures, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
             }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.finalize_expr(recv);
@@ -26697,12 +27072,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(builder);
                 self.finalize_expr(arg);
             }
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, captures, init, .. }
+            | ExprKind::ArrayScan { source, stages, captures, init, .. } => {
                 self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
                 self.finalize_expr(init);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
             }
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
                 self.finalize_expr(dst);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -29942,6 +30323,280 @@ fn main() -> i32 {
             lifted,
             vec![0, 1],
             "non-capturing and one-capture lambdas keep distinct explicit metadata"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_diagnostic_order() {
+        let (_, diagnostics) = check(
+            "\
+fn main() -> i32 {
+  missing.map().reduce(also_missing, fn acc, x { acc + x })
+  return 0
+}
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("undefined name: 'missing'")),
+            "the receiver/source diagnostic must be retained: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("needs a function")
+                    && !message.contains("also_missing")),
+            "the earliest invalid source suppresses later malformed-stage and terminal-init diagnostics: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_snapshot_action_order_matrix() {
+        let (program, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  return [1].map(fn x {
+    print(x)
+    x
+  }).reduce({
+    return 7
+    0
+  }, fn acc, x { acc + x })
+}
+fn live() -> i64 {
+  return [1].map(fn x {
+    print(x)
+    x
+  }).reduce(0, fn acc, x { acc + x })
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let effects = fn_effects(&program, &std::collections::HashMap::new());
+        assert_eq!(
+            effects.get("stopped"),
+            Some(&FnEffect::Pure),
+            "a terminating init must prevent the earlier stage callback action"
+        );
+        assert_eq!(
+            effects.get("live"),
+            Some(&FnEffect::Impure),
+            "the all-fallthrough twin must join the stage callback action"
+        );
+    }
+
+    #[test]
+    fn pipeline_capture_owner_invalidation_is_rejected() {
+        let (_, diagnostics) = check(
+            "\
+fn main() -> i32 {
+  mut storage := \"hello\".clone()
+  view: str := storage
+  value := [1].map(fn x { x + view.len() }).reduce({
+    storage = \"replacement\".clone()
+    0
+  }, fn acc, x { acc + x })
+  return value as i32
+}
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("use of invalidated borrow 'view'")),
+            "stage snapshot must retain its owner dependency through init: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_source_snapshot_owner_invalidation_matrix() {
+        let (_, diagnostics) = check(
+            "\
+import core.json
+Row { score: i64 }
+fn make() -> array<i64> = [1, 2].to_array()
+fn add(acc: i64, value: i64) -> i64 = acc + value
+fn direct(flag: bool) -> i64 {
+  mut values := make()
+  return values.reduce({
+    if flag { values = make() }
+    0
+  }, add)
+}
+fn zipped(flag: bool) -> i64 {
+  mut left := make()
+  right := make()
+  return zip(left, right)
+    .map(fn pair { pair.0 + pair.1 })
+    .reduce({
+      if flag { left = make() }
+      0
+    }, add)
+}
+fn scanned(flag: bool) -> Result<i64, Error> {
+  mut input := \"[{\\\"score\\\":1}]\".clone()
+  rows: json.scanner<Row> := json.scan(input)
+  return rows.score.reduce({
+    if flag { input = \"[{\\\"score\\\":2}]\".clone() }
+    0
+  }, add)
+}
+fn stopped() -> i64 {
+  mut stopped_values := make()
+  return stopped_values.reduce({
+    stopped_values = make()
+    return 7
+    0
+  }, add)
+}
+fn broke() -> i64 {
+  mut broke_values := make()
+  return loop {
+    broke_values.reduce({
+      broke_values = make()
+      break 9
+      0
+    }, add)
+  }
+}
+fn selected(flag: bool, mutate: bool) -> i64 {
+  mut selected_values := make()
+  other := make()
+  return (if flag {
+    if mutate { selected_values } else { other }
+  } else {
+    other
+  }).reduce({
+    if mutate { selected_values = make() }
+    0
+  }, add)
+}
+fn transferred(flag: bool) -> i64 {
+  mut transferred_opt: Option<array<i64>> := Some(make())
+  fallback := make()
+  return (transferred_opt else fallback).reduce({
+    if flag { transferred_opt = Some(make()) }
+    0
+  }, add)
+}
+fn main() -> i32 = 0
+",
+        );
+        let snapshot_errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("pipeline source snapshot was invalidated")
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_errors.len(),
+            4,
+            "direct, zip, scanner, and selected-control-source mixed-branch invalidation must reject, while terminating init paths have no action boundary: {snapshot_errors:?}; all={:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'values'")),
+            "direct source owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'left'")),
+            "zipped constituent owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'input'")),
+            "scanner backing owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'selected_values'")),
+            "selected control-flow source owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors.iter().all(|message| {
+                !message.contains("stopped_values")
+                    && !message.contains("broke_values")
+                    && !message.contains("transferred_opt")
+            }),
+            "terminating paths and transferred else-success containers must not remain source owners: {snapshot_errors:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_dead_state_isolated_across_analyses() {
+        let (_, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  mut storage := \"hello\".clone()
+  view: str := storage
+  return [1].reduce({
+    storage = \"replacement\".clone()
+    return 7
+    0
+  }, fn acc, x { acc + x + view.len() })
+}
+fn main() -> i32 = 0
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("invalidated borrow")),
+            "a terminal capture after a terminating init must not join reachable borrow state: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_dead_hir_is_finalized_and_linted() {
+        let (_, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  return [1].reduce(arena {
+    return 7
+    heap.new(1).get()
+  }, fn acc, x { acc + x })
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("unnecessary heap allocation")),
+            "finalization/lints must still traverse dead checked HIR"
         );
     }
 

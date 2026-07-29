@@ -3111,6 +3111,14 @@ fn drop_borrow_owners(b: &mut Builder, operand: &Operand) {
     }
 }
 
+/// Transfer a hidden temporary owner's buffer into another MIR value without dropping it. The
+/// receiving value now owns the same allocation and its ordinary Drop is the single release.
+fn disarm_borrow_owners(b: &mut Builder, operand: &Operand) {
+    for owner in b.borrow_owners(operand) {
+        b.set_drop_flag(owner, false);
+    }
+}
+
 fn inherit_borrow_owners<'a>(b: &mut Builder, value: ValueId, operands: impl IntoIterator<Item = &'a Operand>) {
     let mut owners = Vec::new();
     for operand in operands {
@@ -4721,59 +4729,98 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
             // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Sum, None)
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, ReducerSpec::Sum, ReduceInit::Identity)
             } else {
-                let init = zero_of(e.ty);
-                lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
+                lower_array_reduce(b, source, stages, e.ty, ReduceInit::Identity, ReducerSpec::Sum)
             }
         }
         hir::ExprKind::ArrayCount { source, stages } => {
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Count, None)
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, ReducerSpec::Count, ReduceInit::Identity)
             } else {
-                // i64 accumulator seeded at 0; each surviving element adds 1.
-                let init = Operand::Const(Const::Int(0, i64_ty()));
-                lower_array_reduce(b, source, stages, i64_ty(), init, Reducer::Count)
+                lower_array_reduce(b, source, stages, i64_ty(), ReduceInit::Identity, ReducerSpec::Count)
             }
         }
         hir::ExprKind::ArrayReduce { source, stages, func, captures, init } => {
-            let init_op = lower_expr(b, init);
-            let reducer = Reducer::Fold { func: func.clone(), captures: captures.clone() };
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, Some(init_op))
+                lower_json_scan_reduce(
+                    b,
+                    source,
+                    stages,
+                    sid,
+                    e.ty,
+                    ReducerSpec::Fold { func, captures },
+                    ReduceInit::Expr(init),
+                )
             } else {
-                lower_array_reduce(b, source, stages, e.ty, init_op, reducer)
+                lower_array_reduce(
+                    b,
+                    source,
+                    stages,
+                    e.ty,
+                    ReduceInit::Expr(init),
+                    ReducerSpec::Fold { func, captures },
+                )
             }
         }
         hir::ExprKind::ArrayAnyAll { source, stages, func, captures, all } => {
-            let reducer = Reducer::AnyAll { func: func.clone(), captures: captures.clone(), all: *all };
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, None)
+                lower_json_scan_reduce(
+                    b,
+                    source,
+                    stages,
+                    sid,
+                    e.ty,
+                    ReducerSpec::AnyAll { func, captures, all: *all },
+                    ReduceInit::Identity,
+                )
             } else {
-                // bool accumulator: `all` seeds true (&&-fold), `any` seeds false (||-fold).
-                let init = Operand::Const(Const::Bool(*all));
-                lower_array_reduce(b, source, stages, Ty::Bool, init, reducer)
+                lower_array_reduce(
+                    b,
+                    source,
+                    stages,
+                    Ty::Bool,
+                    ReduceInit::Identity,
+                    ReducerSpec::AnyAll { func, captures, all: *all },
+                )
             }
         }
         hir::ExprKind::ArrayMinMax { source, stages, is_max } => {
-            let reducer = Reducer::MinMax { is_max: *is_max };
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, None)
+                lower_json_scan_reduce(
+                    b,
+                    source,
+                    stages,
+                    sid,
+                    e.ty,
+                    ReducerSpec::MinMax { is_max: *is_max },
+                    ReduceInit::Identity,
+                )
             } else {
-                // Seed with the element type's extreme so the running `min`/`max` is replaced by the
-                // first element and an empty pipeline yields that extreme (the fold identity).
-                let init = extreme_of(e.ty, *is_max);
-                lower_array_reduce(b, source, stages, e.ty, init, reducer)
+                lower_array_reduce(
+                    b,
+                    source,
+                    stages,
+                    e.ty,
+                    ReduceInit::Identity,
+                    ReducerSpec::MinMax { is_max: *is_max },
+                )
             }
         }
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
-            lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
+            lower_array_collect(b, source, stages, *elem, CollectKind::Collect, &[]).0
         }
         hir::ExprKind::ArrayToSoa { source, struct_id } => lower_array_to_soa(b, source, *struct_id),
         hir::ExprKind::ArrayMapInto { source, stages, dst, elem } => lower_array_map_into(b, source, stages, dst, *elem),
         hir::ExprKind::ArrayScan { source, stages, func, captures, init, elem } => {
-            let init_op = lower_expr(b, init);
-            lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op, captures: captures.clone() })
+            lower_array_collect(
+                b,
+                source,
+                stages,
+                *elem,
+                CollectKind::Scan { func, init, captures },
+                &[],
+            ).0
         }
         hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
         hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem, None),
@@ -4831,8 +4878,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 &b.tagged_types,
             ) && let Some(elem_in) = elem_in
             {
+                    let free_src =
+                        pipeline_source_needs_drop(b, source, b.arenas.is_empty());
                     let src = match source.ty {
-                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
+                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
+                            lower_borrowed_owned(b, source)
+                        }
                         _ => {
                             let (slot, n) = array_source_slot(b, source);
                             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
@@ -4840,6 +4891,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             Operand::Value(sv)
                         }
                     };
+                    if !lowering_continues(b) {
+                        return Operand::Const(Const::Unit);
+                    }
                     let mut stage_records = Vec::with_capacity(stages.len());
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
@@ -4853,7 +4907,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             }
                         };
                         let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
-                        let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
+                        let mut capture_ops = Vec::with_capacity(captures.len());
+                        for capture in captures {
+                            capture_ops.push(lower_expr(b, capture));
+                            if !lowering_continues(b) {
+                                return Operand::Const(Const::Unit);
+                            }
+                        }
                         stage_records.push(ParMapStage {
                             kind,
                             func,
@@ -4865,10 +4925,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         stage_elem_in = stage.out_ty;
                     }
                     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
-                    let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
+                    let mut capture_ops = Vec::with_capacity(captures.len());
+                    for capture in captures {
+                        capture_ops.push(lower_expr(b, capture));
+                        if !lowering_continues(b) {
+                            return Operand::Const(Const::Unit);
+                        }
+                    }
                     // Free the source buffer if it is an owned temporary the runtime just consumed.
                     // A call returning `slice<T>` is a borrow and must never be classified as one.
-                    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
                     let v = b.fresh_value(e.ty);
                     b.push(Stmt::Let(v, Rvalue::ParMapParallel {
                         src: src.clone(),
@@ -4881,7 +4946,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
                     }));
                     if free_src {
-                        b.push(Stmt::DropValue(src));
+                        drop_borrow_owners(b, &src);
                     }
                     return Operand::Value(v);
                 }
@@ -4889,7 +4954,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // via the collect loop.
             let mut stages2 = stages.clone();
             stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone(), captures: captures.clone() }, out_ty: *elem });
-            lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)
+            lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect, &[]).0
         }
         hir::ExprKind::ArrayChunks { source, n, elem } => {
             // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
@@ -6511,11 +6576,51 @@ enum Reducer {
     Count,
     /// `reduce(init, f)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
     /// passed after the `(acc, element)` arguments.
-    Fold { func: String, captures: Vec<hir::Expr> },
+    Fold { func: String, captures: Vec<Operand> },
     /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`. `captures` as `Fold`.
-    AnyAll { func: String, captures: Vec<hir::Expr>, all: bool },
+    AnyAll { func: String, captures: Vec<Operand>, all: bool },
     /// `min` / `max`: keep `element` when it is smaller / larger than `acc`.
     MinMax { is_max: bool },
+}
+
+enum ReducerSpec<'a> {
+    Sum,
+    Count,
+    Fold { func: &'a str, captures: &'a [hir::Expr] },
+    AnyAll { func: &'a str, captures: &'a [hir::Expr], all: bool },
+    MinMax { is_max: bool },
+}
+
+enum ReduceInit<'a> {
+    Identity,
+    Expr(&'a hir::Expr),
+}
+
+fn prepare_reducer(b: &mut Builder, spec: ReducerSpec<'_>) -> Option<Reducer> {
+    let lower_captures = |b: &mut Builder, expressions: &[hir::Expr]| {
+        let mut captures = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            captures.push(lower_expr(b, expression));
+            if !lowering_continues(b) {
+                return None;
+            }
+        }
+        Some(captures)
+    };
+    Some(match spec {
+        ReducerSpec::Sum => Reducer::Sum,
+        ReducerSpec::Count => Reducer::Count,
+        ReducerSpec::Fold { func, captures } => Reducer::Fold {
+            func: func.to_string(),
+            captures: lower_captures(b, captures)?,
+        },
+        ReducerSpec::AnyAll { func, captures, all } => Reducer::AnyAll {
+            func: func.to_string(),
+            captures: lower_captures(b, captures)?,
+            all,
+        },
+        ReducerSpec::MinMax { is_max } => Reducer::MinMax { is_max },
+    })
 }
 
 /// The set-up of a pipeline source: a stack array (slot + const length), a struct array
@@ -6553,16 +6658,31 @@ struct ZipInputSetup {
     elem: Ty,
 }
 
-/// The arguments for a stage function call: the element, then any captured values (a lifted
-/// lambda's captured enclosing locals, passed by value). Captures are lowered each iteration —
-/// they reference loop-invariant enclosing locals, so LLVM hoists the loads out of the loop.
-fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec<Operand> {
+/// The arguments for a stage function call: the element, then the preheader snapshots of any
+/// captured values (a lifted lambda's captured enclosing locals, passed by value). The loop body
+/// clones operands that were lowered once at the stage's written position; it never reloads an
+/// enclosing local per iteration.
+fn stage_call_args(arg: Operand, captures: &[Operand]) -> Vec<Operand> {
     let mut args = Vec::with_capacity(1 + captures.len());
     args.push(arg);
-    for c in captures {
-        args.push(lower_expr(b, c));
-    }
+    args.extend(captures.iter().cloned());
     args
+}
+
+struct PreparedStage {
+    captures: Vec<Operand>,
+    needle: Option<NeedleLower>,
+}
+
+fn lowering_continues(b: &mut Builder) -> bool {
+    if b.is_terminated() {
+        return false;
+    }
+    if !b.current_is_reachable() {
+        b.terminate(Term::Unreachable);
+        return false;
+    }
+    true
 }
 
 /// Whether an unbound pipeline source owns a buffer that its consumer must release. In particular,
@@ -6599,12 +6719,12 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
     always_heap || (arena_if_in_arena && outside_arena)
 }
 
-fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
+fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
     if let hir::ExprKind::ArrayZip { sources, tuple_id } = &source.kind {
         let mut inputs = Vec::with_capacity(sources.len());
         let mut bound: Option<Operand> = None;
         for source in sources {
-            let setup = setup_source(b, source);
+            let setup = setup_source(b, source)?;
             debug_assert!(setup.zip.is_none(), "nested zip is rejected in sema");
             debug_assert!(setup.temp_free.is_none(), "zip v1 sources are borrowed places/literals");
             if let Some(want) = &bound {
@@ -6618,7 +6738,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             };
             inputs.push(ZipInputSetup { slot: setup.slot, slice_val: setup.slice_val, elem });
         }
-        return SrcSetup {
+        return Some(SrcSetup {
             slot: 0,
             slice_val: None,
             bound: bound.expect("zip has at least two sources"),
@@ -6626,13 +6746,22 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             struct_view: None,
             temp_free: None,
             zip: Some(ZipSetup { tuple_id: *tuple_id, inputs }),
-        };
+        });
     }
     match source.ty {
         // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
         // `slice<T>`) all share the `{ptr,len}` layout and runtime length.
         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
-            let sv = lower_expr(b, source);
+            let needs_drop =
+                pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+            // A pipeline reads its source through the terminal loop. Preserve bound ownership
+            // through `if`/`match`/`else` joins and register a hidden owner for a selected fresh
+            // value before evaluating later operands. Their early return/`?`/divergence then
+            // cleans an owned source exactly once.
+            let sv = lower_borrowed_owned(b, source);
+            if !lowering_continues(b) {
+                return None;
+            }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             // A source that *owns* a fresh free-standing buffer nothing else holds must be freed
@@ -6648,29 +6777,38 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // doesn't cover them). A function returning `slice<T>` only lends a view and is never
             // freed here. Materializing terminals instead arena-allocate inside an arena, so the loop
             // frees those only outside one.
-            let temp_free = pipeline_source_needs_drop(b, source, b.arenas.is_empty()).then(|| sv.clone());
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free, zip: None }
+            let temp_free = needs_drop.then(|| sv.clone());
+            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free, zip: None })
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
         // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
         // so nothing is freed by the loop — the owner's exit `Drop` frees the buffer.
         Ty::DynStructArray(id, layout) => {
             let sv = lower_expr(b, source);
+            if !lowering_continues(b) {
+                return None;
+            }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None, zip: None }
+            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None, zip: None })
         }
         // A `soa<Struct>` view: a `{ptr,len}` column-major buffer. Same `{ptr,len}` handling as an
         // owned struct array, but the `Layout::Soa` struct-view makes field access column-addressed.
         Ty::Soa(id) => {
             let sv = lower_expr(b, source);
+            if !lowering_continues(b) {
+                return None;
+            }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None, zip: None }
+            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None, zip: None })
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
-            SrcSetup {
+            if !lowering_continues(b) {
+                return None;
+            }
+            Some(SrcSetup {
                 slot,
                 slice_val: None,
                 bound: Operand::Const(Const::Int(n, i64_ty())),
@@ -6678,7 +6816,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
                 struct_view: None,
                 temp_free: None,
                 zip: None,
-            }
+            })
         }
     }
 }
@@ -6792,7 +6930,7 @@ fn lower_struct_elem(
 }
 
 /// How a recognised `WhereStrContains` stage lowers its per-element predicate. Chosen once in the
-/// preheader by [`hoist_str_finder_plans`] from the `ALIGN_NEEDLE_HOIST` toggle (doc-13 §6.6). Both
+/// preheader by [`prepare_pipeline_stages`] from the `ALIGN_NEEDLE_HOIST` toggle (doc-13 §6.6). Both
 /// variants lower the needle **once** before the loop, so the two pipelines are byte-for-byte
 /// identical except for searcher reuse — the honest before/after the adoption probe compiles.
 enum NeedleLower {
@@ -6815,16 +6953,33 @@ enum NeedleLower {
 /// and `CacheContext::from_env` force-disables the object cache when it is set) the plan is NOT built
 /// and the body reconstructs the searcher per element — same fused loop, differing only in reuse.
 /// Must be called after `setup_source` and before the loop header is emitted.
-fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<NeedleLower>> {
+fn prepare_pipeline_stages(
+    b: &mut Builder,
+    stages: &[hir::Stage],
+) -> Option<Vec<PreparedStage>> {
     // Read the toggle at MIR lowering (never in codegen): the object cache key fingerprints the
     // structural MIR program, so reading it here makes the two shapes cache-distinct, and
     // `CacheContext::from_env` additionally forces the cache off whenever this var is set.
     let hoist = std::env::var("ALIGN_NEEDLE_HOIST").ok().as_deref() != Some("off");
-    stages
-        .iter()
-        .map(|stage| match &stage.kind {
+    let mut prepared = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let mut captures = Vec::new();
+        let needle = match &stage.kind {
+            hir::StageKind::Map { captures: expressions, .. }
+            | hir::StageKind::Where { captures: expressions, .. } => {
+                for expression in expressions {
+                    captures.push(lower_expr(b, expression));
+                    if !lowering_continues(b) {
+                        return None;
+                    }
+                }
+                None
+            }
             hir::StageKind::WhereStrContains { needle } => {
                 let needle_val = lower_expr(b, needle);
+                if !lowering_continues(b) {
+                    return None;
+                }
                 if hoist {
                     let owner = b.new_synthetic_owner(Ty::StrFinder);
                     let plan = b.fresh_value(Ty::StrFinder);
@@ -6837,12 +6992,14 @@ fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<
                 }
             }
             _ => None,
-        })
-        .collect()
+        };
+        prepared.push(PreparedStage { captures, needle });
+    }
+    Some(prepared)
 }
 
 /// Lower a `WhereStrContains` predicate inside a pipeline loop body over the current `str` element
-/// `elem`, per the preheader decision `nl` (from [`hoist_str_finder_plans`]). Returns the `bool`
+/// `elem`, per the preheader decision `nl` (from [`prepare_pipeline_stages`]). Returns the `bool`
 /// predicate value — the branchless/maskable counterpart of a `str.contains`, reproducing `contains`
 /// (index `>= 0`) bit-identically. The hoisted form reuses the plan; the toggle-off form emits the
 /// same per-element `str_contains` the unhoisted pipeline would.
@@ -6894,8 +7051,11 @@ fn lower_array_par_map_reduce(
     elem_in: Ty,
     elem_out: Ty,
 ) -> Operand {
+    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
     let src = match source.ty {
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
+            lower_borrowed_owned(b, source)
+        }
         Ty::Array(_, _) => {
             let (slot, n) = array_source_slot(b, source);
             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
@@ -6904,9 +7064,17 @@ fn lower_array_par_map_reduce(
         }
         other => unreachable!("direct par_map reduction source has unsupported type {other:?}"),
     };
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
-    let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
-    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+    let mut capture_ops = Vec::with_capacity(captures.len());
+    for capture in captures {
+        capture_ops.push(lower_expr(b, capture));
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+    }
     let v = b.fresh_value(elem_out);
     b.push(Stmt::Let(v, Rvalue::ParMapReduce {
         src: src.clone(),
@@ -6919,7 +7087,7 @@ fn lower_array_par_map_reduce(
     }));
     if free_src {
         // The reduction has consumed the source bytes before returning its scalar result.
-        b.push(Stmt::DropValue(src));
+        drop_borrow_owners(b, &src);
     }
     Operand::Value(v)
 }
@@ -6929,13 +7097,33 @@ fn lower_array_reduce(
     source: &hir::Expr,
     stages: &[hir::Stage],
     acc_ty: Ty,
-    init: Operand,
-    reducer: Reducer,
+    init: ReduceInit<'_>,
+    reducer: ReducerSpec<'_>,
 ) -> Operand {
     let elem_ty = acc_ty;
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
-    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
-    let finder_plans = hoist_str_finder_plans(b, stages);
+    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+        return Operand::Const(Const::Unit);
+    };
+    let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
+        return Operand::Const(Const::Unit);
+    };
+    let init = match init {
+        ReduceInit::Expr(expression) => {
+            let value = lower_expr(b, expression);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
+            value
+        }
+        ReduceInit::Identity => match &reducer {
+            ReducerSpec::AnyAll { all, .. } => Operand::Const(Const::Bool(*all)),
+            ReducerSpec::MinMax { is_max } => extreme_of(acc_ty, *is_max),
+            _ => zero_of(acc_ty),
+        },
+    };
+    let Some(reducer) = prepare_reducer(b, reducer) else {
+        return Operand::Const(Const::Unit);
+    };
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -7022,7 +7210,7 @@ fn lower_array_reduce(
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func, captures } => {
+            hir::StageKind::Map { func, .. } => {
                 // A scalar element is already loaded; a struct element consumed whole (a
                 // `map(f)` with no prior `.field`) is loaded here by index.
                 let arg = match cur.take() {
@@ -7035,10 +7223,10 @@ fn lower_array_reduce(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
-            hir::StageKind::Where { func, captures } => {
+            hir::StageKind::Where { func, .. } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
                 // predicate, no prior projection) is loaded here by index. `where` keeps the
                 // element, so `cur` is left unchanged either way.
@@ -7052,7 +7240,7 @@ fn lower_array_reduce(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 if guard_rejected {
@@ -7069,7 +7257,7 @@ fn lower_array_reduce(
                 // non-trapping, so it masks branchlessly like `WhereField` (or branches under a
                 // guarded suffix). `where` keeps the element, so `cur` is unchanged.
                 let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem);
                 if guard_rejected {
                     let accepted = b.new_block();
@@ -7137,9 +7325,7 @@ fn lower_array_reduce(
             debug_assert!(mask.is_none(), "a callable reducer after where must use control flow");
             let cur = cur.expect("reduce needs a scalar element");
             let mut args = vec![Operand::Value(a), cur];
-            for c in captures {
-                args.push(lower_expr(b, c));
-            }
+            args.extend(captures.iter().cloned());
             emit_named_call(b, func.clone(), args, acc_ty)
         }
         // `any`/`all` are likewise guarded after `where`. They deliberately remain a full fold (no
@@ -7148,7 +7334,7 @@ fn lower_array_reduce(
             debug_assert!(mask.is_none(), "a callable predicate after where must use control flow");
             let cur = cur.expect("any/all needs a scalar element");
             let t = b.fresh_value(Ty::Bool);
-            let args = stage_call_args(b, cur, captures);
+            let args = stage_call_args(cur, captures);
             b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
@@ -7199,7 +7385,7 @@ fn lower_array_reduce(
     // Free a free-standing `.to_array()` temporary now that the fold has consumed it. The
     // result `r` is a scalar accumulator independent of the buffer, so this is safe.
     if let Some(tmp) = temp_free {
-        b.push(Stmt::DropValue(tmp));
+        drop_borrow_owners(b, &tmp);
     }
     Operand::Value(r)
 }
@@ -7220,10 +7406,8 @@ fn lower_json_scan_reduce(
     stages: &[hir::Stage],
     struct_id: u32,
     result_ty: Ty,
-    reducer: Reducer,
-    // `reduce`'s explicit initial accumulator (already lowered); `None` for every other reducer, whose
-    // seed is derived from the reducer + accumulator type below.
-    init_override: Option<Operand>,
+    reducer: ReducerSpec<'_>,
+    init: ReduceInit<'_>,
 ) -> Operand {
     // The `Ok` payload scalar of the `Result<T, Error>` terminal is the accumulator type.
     let acc_ty = match result_ty {
@@ -7231,6 +7415,29 @@ fn lower_json_scan_reduce(
         _ => unreachable!("a json.scan terminal is Result-typed"),
     };
     let scanner = lower_expr(b, source);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
+        return Operand::Const(Const::Unit);
+    };
+    let init = match init {
+        ReduceInit::Expr(expression) => {
+            let value = lower_expr(b, expression);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
+            value
+        }
+        ReduceInit::Identity => match &reducer {
+            ReducerSpec::AnyAll { all, .. } => Operand::Const(Const::Bool(*all)),
+            ReducerSpec::MinMax { is_max } => extreme_of(acc_ty, *is_max),
+            _ => zero_of(acc_ty),
+        },
+    };
+    let Some(reducer) = prepare_reducer(b, reducer) else {
+        return Operand::Const(Const::Unit);
+    };
     let cursor = b.new_slot(i64_ty());
     b.push(Stmt::Store(cursor, Operand::Const(Const::Int(0, i64_ty()))));
     // The per-step row: a 1-element struct-array slot, so `IndexField(row, 0, …)` / `Index(row, 0)`
@@ -7241,18 +7448,8 @@ fn lower_json_scan_reduce(
     // `count`/`sum`, the bool fold seed (`all` → true, `any` → false) for `any`/`all`, the type
     // extreme for `min`/`max` (so an empty stream yields the fold identity), exactly as the array
     // reducers seed.
-    let init = match (&reducer, init_override) {
-        (_, Some(iv)) => iv,
-        (Reducer::Count, _) => Operand::Const(Const::Int(0, i64_ty())),
-        (Reducer::AnyAll { all, .. }, _) => Operand::Const(Const::Bool(*all)),
-        (Reducer::MinMax { is_max }, _) => extreme_of(acc_ty, *is_max),
-        _ => zero_of(acc_ty),
-    };
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
-
-    // A repeated-needle `where(str.contains)` plan is hoisted once before the loop, as for arrays.
-    let finder_plans = hoist_str_finder_plans(b, stages);
 
     let header = b.new_block();
     let body = b.new_block();
@@ -7287,17 +7484,17 @@ fn lower_json_scan_reduce(
                 let v = lower_field_access(b, None, &None, row, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func, captures } => {
+            hir::StageKind::Map { func, .. } => {
                 let arg = cur.take().unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
-            hir::StageKind::Where { func, captures } => {
+            hir::StageKind::Where { func, .. } => {
                 let arg = match &cur {
                     Some(a) => a.clone(),
                     None => Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)),
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let accepted = b.new_block();
@@ -7312,7 +7509,7 @@ fn lower_json_scan_reduce(
             }
             hir::StageKind::WhereStrContains { .. } => {
                 let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem);
                 let accepted = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -7341,9 +7538,7 @@ fn lower_json_scan_reduce(
         Reducer::Fold { func, captures } => {
             let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
             let mut args = vec![Operand::Value(a), cur];
-            for c in captures {
-                args.push(lower_expr(b, c));
-            }
+            args.extend(captures.iter().cloned());
             emit_named_call(b, func.clone(), args, acc_ty)
         }
         // `any(p)`/`all(p)`: `acc = acc || p(cur)` / `acc && p(cur)` — a full fold (no early exit),
@@ -7352,7 +7547,7 @@ fn lower_json_scan_reduce(
         Reducer::AnyAll { func, captures, all } => {
             let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
             let t = b.fresh_value(Ty::Bool);
-            let args = stage_call_args(b, cur, captures);
+            let args = stage_call_args(cur, captures);
             b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
@@ -7408,37 +7603,79 @@ fn lower_json_scan_reduce(
 }
 
 /// What a materializing collect loop appends per surviving element.
-enum CollectKind {
+enum CollectKind<'a> {
     /// `to_array`: append the element itself.
     Collect,
     /// `scan(init, f)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
     /// append the running accumulator. `captures` are a lifted lambda's captured values, passed
     /// after the `(acc, element)` arguments.
-    Scan { func: String, init: Operand, captures: Vec<hir::Expr> },
+    Scan { func: &'a str, init: &'a hir::Expr, captures: &'a [hir::Expr] },
+}
+
+enum PreparedCollectKind {
+    Collect,
+    Scan { func: String, init: Operand, captures: Vec<Operand> },
 }
 
 /// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
 /// appended to a freshly allocated buffer (arena-bump inside an arena, else heap) instead of
 /// folded into a scalar. Yields an owned `array<T>` value `{ ptr, len }` where `len` is the
 /// survivor count. (MMv2 slice 3 `to_array`; slice 5 adds `scan`.)
-fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, kind: CollectKind) -> Operand {
+fn lower_array_collect(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    elem: Ty,
+    kind: CollectKind<'_>,
+    terminal_captures: &[hir::Expr],
+) -> (Operand, Vec<Operand>) {
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
     // A collect source can itself be a fresh unbound owned temporary (`make().map(f).to_array()`
     // — `make()` returns an owned array nothing else holds). The copy loop consumes it into the
     // new output buffer, so free that source temporary at the exit (the result is a separate
     // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
-    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
-    let finder_plans = hoist_str_finder_plans(b, stages);
+    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+        return (Operand::Const(Const::Unit), Vec::new());
+    };
+    let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
+        return (Operand::Const(Const::Unit), Vec::new());
+    };
+    let kind = match kind {
+        CollectKind::Collect => PreparedCollectKind::Collect,
+        CollectKind::Scan { func, init, captures } => {
+            let init = lower_expr(b, init);
+            if !lowering_continues(b) {
+                return (Operand::Const(Const::Unit), Vec::new());
+            }
+            let mut lowered = Vec::with_capacity(captures.len());
+            for capture in captures {
+                lowered.push(lower_expr(b, capture));
+                if !lowering_continues(b) {
+                    return (Operand::Const(Const::Unit), Vec::new());
+                }
+            }
+            PreparedCollectKind::Scan {
+                func: func.to_string(),
+                init,
+                captures: lowered,
+            }
+        }
+    };
+    let mut lowered_terminal_captures = Vec::with_capacity(terminal_captures.len());
+    for capture in terminal_captures {
+        lowered_terminal_captures.push(lower_expr(b, capture));
+        if !lowering_continues(b) {
+            return (Operand::Const(Const::Unit), Vec::new());
+        }
+    }
 
     // Unique-buffer donation (doc-10 §8.1 / doc-13 §8.5): when the source is a uniquely owned,
-    // provably-dead heap temporary (`temp_free` present ⇒ this collect is its *sole* free — the
-    // source was lowered with a plain `lower_expr`, so no synthetic owner or other drop exists),
+    // provably-dead heap temporary (`temp_free` present ⇒ a hidden owner guards its one release),
     // sitting outside any arena, over a scalar `{ptr,len}` buffer whose element layout is identical
     // to the result's, and running only donation-safe stages, its storage is DONATED as the output
     // instead of allocating a fresh buffer + freeing the source. Ownership transfers to the result
-    // array (its own drop is then the single free); the collect emits no source `drop_value`. This
+    // array (its own drop is then the single free); the collect disarms the source owner. This
     // removes one allocator call + one free and one buffer's worth of peak RSS. Fail-closed: any
     // other shape (borrowed source, arena value, `chunks`/struct/`str` element, mismatched layout,
     // value used after the call — which would keep `temp_free` clear) allocates and frees as before.
@@ -7480,12 +7717,12 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
     // `scan` threads an accumulator (output element type) seeded with `init`.
     let scan_acc = match &kind {
-        CollectKind::Scan { init, .. } => {
+        PreparedCollectKind::Scan { init, .. } => {
             let s = b.new_slot(elem);
             b.push(Stmt::Store(s, init.clone()));
             Some(s)
         }
-        CollectKind::Collect => None,
+        PreparedCollectKind::Collect => None,
     };
 
     let header = b.new_block();
@@ -7539,7 +7776,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func, captures } => {
+            hir::StageKind::Map { func, .. } => {
                 // A scalar element is already loaded; a struct element consumed whole (a
                 // `map(f)` with no prior `.field`) is loaded here by index.
                 let arg = match cur.take() {
@@ -7552,10 +7789,10 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
-            hir::StageKind::Where { func, captures } => {
+            hir::StageKind::Where { func, .. } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
                 // predicate, no prior projection) is loaded here by index. `where` keeps the
                 // element, so `cur` is left unchanged either way.
@@ -7569,7 +7806,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let keep = b.new_block();
@@ -7580,7 +7817,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
                 let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
@@ -7611,13 +7848,11 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         }
     };
     let value = match (&kind, scan_acc) {
-        (CollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
+        (PreparedCollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
             let prev = b.fresh_value(elem);
             b.push(Stmt::Let(prev, Rvalue::Load(acc_slot)));
             let mut args = vec![Operand::Value(prev), cur];
-            for c in captures {
-                args.push(lower_expr(b, c));
-            }
+            args.extend(captures.iter().cloned());
             let folded = emit_named_call(b, func.clone(), args, elem);
             b.push(Stmt::Store(acc_slot, folded.clone()));
             folded
@@ -7654,10 +7889,14 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // Free the source temporary now its elements have been copied into the new buffer — UNLESS its
     // storage was donated to `arr` above, in which case the result array now owns that buffer and is
     // its single free (dropping the source here would be a double-free of the donated allocation).
-    if let Some(tmp) = temp_free.filter(|_| !donate) {
-        b.push(Stmt::DropValue(tmp));
+    if let Some(tmp) = temp_free {
+        if donate {
+            disarm_borrow_owners(b, &tmp);
+        } else {
+            drop_borrow_owners(b, &tmp);
+        }
     }
-    Operand::Value(arr)
+    (Operand::Value(arr), lowered_terminal_captures)
 }
 
 /// Abort unless `have == want` — the cold-edge guard `map_into` emits so `dst.len() == source.len()`
@@ -7685,7 +7924,12 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
 /// ([`Rvalue::SliceIndexNoalias`]/[`Stmt::PtrStoreNoalias`]) — sema proved `dst` is disjoint from the
 /// source — so the vectorizer drops its runtime overlap guard. Yields `()`.
 fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], dst: &hir::Expr, elem: Ty) -> Operand {
-    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free, zip } = setup_source(b, source);
+    let Some(SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free, zip }) = setup_source(b, source) else {
+        return Operand::Const(Const::Unit);
+    };
+    let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
+        return Operand::Const(Const::Unit);
+    };
     // `map_into` reads its source (never consumes it), so there is never a fresh owned source
     // buffer to free here. Sema's alias gate restricts the source to a named array/slice, a
     // sub-slice of one, or a fixed array literal — never a fn-returned owned `array<T>` or a nested
@@ -7700,6 +7944,9 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
 
     // Destination `{ptr,len}`: its buffer pointer (store target) and length (for the guard).
     let dst_val = lower_expr(b, dst);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let dst_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
     b.push(Stmt::Let(dst_ptr, Rvalue::SlicePtr(dst_val.clone())));
     let dst_len = b.fresh_value(i64_ty());
@@ -7760,13 +8007,13 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     };
 
     // Apply the length-preserving stages (sema rejects `where`, so there is no skip branch).
-    for stage in stages {
+    for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func, captures } => {
+            hir::StageKind::Map { func, .. } => {
                 let arg = match cur.take() {
                     Some(a) => a,
                     None => {
@@ -7777,7 +8024,7 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. } => {
@@ -7812,7 +8059,9 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
 fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Operand {
     // The source is a whole-struct array (no stages), so `struct_view`/`slot` address its elements;
     // `bound` is the row count `len` (a constant for a fixed array, a runtime value otherwise).
-    let SrcSetup { slot, slice_val, bound, struct_view, .. } = setup_source(b, source);
+    let Some(SrcSetup { slot, slice_val, bound, struct_view, .. }) = setup_source(b, source) else {
+        return Operand::Const(Const::Unit);
+    };
     transpose_to_soa(b, struct_view, &slice_val, slot, bound, struct_id)
 }
 
@@ -8237,9 +8486,19 @@ fn lower_array_partition(
     tuple_id: u32,
 ) -> Operand {
     let arena = b.arenas.last().copied();
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
-    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
-    let finder_plans = hoist_str_finder_plans(b, stages);
+    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+        return Operand::Const(Const::Unit);
+    };
+    let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
+        return Operand::Const(Const::Unit);
+    };
+    let mut prepared_pred_captures = Vec::with_capacity(pred_captures.len());
+    for capture in pred_captures {
+        prepared_pred_captures.push(lower_expr(b, capture));
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+    }
 
     // Two output buffers, each an upper-bound `bound` elements (a split never grows the count).
     let alloc_buf = |b: &mut Builder| {
@@ -8313,7 +8572,7 @@ fn lower_array_partition(
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func, captures } => {
+            hir::StageKind::Map { func, .. } => {
                 let arg = match cur.take() {
                     Some(a) => a,
                     None => {
@@ -8324,10 +8583,10 @@ fn lower_array_partition(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
-            hir::StageKind::Where { func, captures } => {
+            hir::StageKind::Where { func, .. } => {
                 let arg = match &cur {
                     Some(a) => a.clone(),
                     None => {
@@ -8338,7 +8597,7 @@ fn lower_array_partition(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
-                let call_args = stage_call_args(b, arg, captures);
+                let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let keep = b.new_block();
@@ -8349,7 +8608,7 @@ fn lower_array_partition(
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
                 let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
@@ -8367,7 +8626,7 @@ fn lower_array_partition(
     // Split: pred = p(element); true → out_a[acc_a++] = element, false → out_b[acc_b++] = element.
     let cur = cur.expect("partition needs a scalar element");
     let pred = b.fresh_value(Ty::Bool);
-    let pred_args = stage_call_args(b, cur.clone(), pred_captures);
+    let pred_args = stage_call_args(cur.clone(), &prepared_pred_captures);
     b.push(Stmt::Let(pred, Rvalue::Call(pred_func.to_string(), pred_args)));
     let to_a = b.new_block();
     let to_b = b.new_block();
@@ -8407,7 +8666,7 @@ fn lower_array_partition(
     let arr_b = b.fresh_value(Ty::DynArray(scalar_of(elem)));
     b.push(Stmt::Let(arr_b, Rvalue::MakeDynArray { ptr: Operand::Value(out_b), len: Operand::Value(lb) }));
     if let Some(tmp) = temp_free {
-        b.push(Stmt::DropValue(tmp));
+        drop_borrow_owners(b, &tmp);
     }
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
     b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(arr_a), Operand::Value(arr_b)] }));
@@ -8633,17 +8892,20 @@ fn sort_copy_step(
 /// a `len > 32` gate, so a `len <= 32` sort — handled entirely by the insertion base case — makes
 /// zero ping-buffer allocations. Worst case stays a stable O(n log n) merge.
 fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
-    let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
+    let terminal_captures = sort_key
+        .as_ref()
+        .map_or(&[][..], |key| key.captures.as_slice());
+    let (arr, lowered_captures) =
+        lower_array_collect(b, source, stages, elem, CollectKind::Collect, terminal_captures);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let has_keys = sort_key.is_some();
     // The comparison-key type: the key type for `sort_by_key`, else the element type itself.
     let kty = sort_key.as_ref().map(|sk| sk.key_ty).unwrap_or(elem);
 
     // Lower the key function's captures ONCE (loop-invariant); `key_of` reuses them, so a
     // `sort_by_key` key is computed exactly N times (decorate), never per comparison.
-    let lowered_captures: Vec<Operand> = match &sort_key {
-        Some(sk) => sk.captures.iter().map(|c| lower_expr(b, c)).collect(),
-        None => Vec::new(),
-    };
     let key_of = |b: &mut Builder, v: Operand| -> Operand {
         match &sort_key {
             Some(sk) => {
@@ -11389,7 +11651,11 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     if let Some(owner) = opt_owner {
         b.emit_drop_if_live(owner);
     }
-    let fb = lower_expr(b, fallback);
+    let fb = if borrow_result {
+        lower_expr_for_borrow(b, fallback)
+    } else {
+        lower_expr(b, fallback)
+    };
     if !b.is_terminated() {
         store_control_result(b, result_slot, result_flag, result_temp_flag, fallback, fb, borrow_result);
         b.terminate(Term::Goto(join_bb));
@@ -11778,7 +12044,11 @@ fn finish_arm(
     join_bb: BlockId,
     borrow_result: bool,
 ) {
-    let av = lower_expr(b, body);
+    let av = if borrow_result {
+        lower_expr_for_borrow(b, body)
+    } else {
+        lower_expr(b, body)
+    };
     if !b.is_terminated() {
         store_control_result(b, result_slot, result_flag, result_temp_flag, body, av, borrow_result);
         b.terminate(Term::Goto(join_bb));
@@ -11995,7 +12265,11 @@ fn lower_if(
     b.terminate(Term::Branch(c, then_bb, else_bb));
 
     b.cur = then_bb;
-    let tv = lower_block(b, then);
+    let tv = if borrow_result {
+        lower_block_for_borrow(b, then)
+    } else {
+        lower_block(b, then)
+    };
     if !b.is_terminated() {
         if let Some(op) = tv
             && let Some(value) = &then.value
@@ -12006,7 +12280,11 @@ fn lower_if(
     }
 
     b.cur = else_bb;
-    let ev = lower_block(b, els);
+    let ev = if borrow_result {
+        lower_block_for_borrow(b, els)
+    } else {
+        lower_block(b, els)
+    };
     if !b.is_terminated() {
         if let Some(op) = ev
             && let Some(value) = &els.value
@@ -12115,6 +12393,219 @@ mod tests {
         let f = &p.fns[0];
         // entry stores the literal into x's slot; a later block returns the loaded value.
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Return(Some(_)))));
+    }
+
+    #[test]
+    fn pipeline_terminal_snapshot_action_order_matrix() {
+        let program = lower(
+            "\
+fn main() -> i32 {
+  mut k := 2
+  return [1].map(fn x { x * k }).reduce({
+    k = 3
+    0
+  }, fn acc, x { acc + x + k }) as i32
+}
+",
+        );
+        let main = program
+            .fns
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main function");
+        let mut captures = Vec::new();
+        for block in &main.blocks {
+            for statement in &block.stmts {
+                let Stmt::Let(_, Rvalue::Call(name, args)) = statement else {
+                    continue;
+                };
+                if !name.starts_with("main$lambda") {
+                    continue;
+                }
+                let Operand::Value(capture) = args.last().expect("lifted lambda capture") else {
+                    panic!("lifted capture must be a preheader SSA value: {statement:?}");
+                };
+                captures.push((name.as_str(), *capture, block.id));
+            }
+        }
+        captures.sort_by_key(|(name, _, _)| *name);
+        assert_eq!(captures.len(), 2, "stage and reducer calls: {main:#?}");
+        assert!(
+            captures[0].1 < captures[1].1,
+            "the stage snapshot must form before init and the reducer snapshot after it: {captures:?}"
+        );
+        for (_, capture, action_block) in captures {
+            let definition_block = main
+                .blocks
+                .iter()
+                .find(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|statement| matches!(statement, Stmt::Let(value, _) if value == &capture))
+                })
+                .map(|block| block.id)
+                .expect("capture definition");
+            assert_eq!(
+                definition_block, 0,
+                "each capture must be snapshotted once in the preheader"
+            );
+            assert_ne!(
+                action_block, 0,
+                "callback actions must remain in the fused loop body"
+            );
+        }
+    }
+
+    #[test]
+    fn terminating_pipeline_operand_emits_no_terminal_state() {
+        let program = lower(
+            "\
+fn main() -> i32 {
+  return [1].reduce({
+    return 7
+    0
+  }, fn acc, x {
+    print(99)
+    acc + x
+  }) as i32
+}
+",
+        );
+        let main = program
+            .fns
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main function");
+        assert!(
+            main.blocks.iter().all(|block| {
+                !matches!(block.term, Term::Branch(..))
+                    && block
+                        .stmts
+                        .iter()
+                        .all(|statement| !matches!(statement, Stmt::Let(_, Rvalue::Call(..))))
+            }),
+            "a terminating init must emit no reducer action or loop state: {main:#?}"
+        );
+        assert!(
+            main.blocks.iter().any(|block| {
+                matches!(
+                    block.term,
+                    Term::Return(Some(Operand::Const(Const::Int(7, _))))
+                )
+            }),
+            "the init return edge must be preserved: {main:#?}"
+        );
+
+        let owned_program = lower(
+            "\
+fn main() -> i32 {
+  return [1].to_array().reduce({
+    return 7
+    0
+  }, fn acc, x { acc + x }) as i32
+}
+",
+        );
+        let owned_main = owned_program
+            .fns
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("owned-source main");
+        assert!(
+            owned_main
+                .blocks
+                .iter()
+                .any(|block| block.stmts.iter().any(|statement| matches!(statement, Stmt::Drop(_)))),
+            "a completed owned source must be cleaned when a later init terminates: {owned_main:#?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_source_shape_parity() {
+        let program = lower(
+            "\
+import core.json
+Row { value: i64 }
+fn fixed() -> i64 {
+  k := 2
+  return [1].map(fn x { x + k }).sum()
+}
+fn dynamic(xs: slice<i64>) -> i64 {
+  k := 2
+  return xs.map(fn x { x + k }).sum()
+}
+fn zipped(a: slice<i64>, b: slice<i64>) -> i64 {
+  k := 2
+  return zip(a, b).map(fn pair { pair.0 + pair.1 + k }).sum()
+}
+fn streamed() -> Result<i64, Error> {
+  k := 2
+  rows: json.scanner<Row> := json.scan(\"[{\\\"value\\\":1}]\")
+  return rows.value.map(fn x { x + k }).sum()
+}
+fn selected(flag: bool) -> i64 {
+  xs := [1].to_array()
+  ys := [2].to_array()
+  return (if flag { if flag { xs } else { ys } } else { ys }).sum()
+}
+fn main() -> i32 = 0
+",
+        );
+        for name in ["fixed", "dynamic", "zipped", "streamed"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            let (capture, action_block) = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block.stmts.iter().filter_map(move |statement| {
+                        let Stmt::Let(_, Rvalue::Call(callee, args)) = statement else {
+                            return None;
+                        };
+                        if !callee.starts_with(&format!("{name}$lambda")) {
+                            return None;
+                        }
+                        let Operand::Value(capture) = args.last()? else {
+                            return None;
+                        };
+                        Some((*capture, block.id))
+                    })
+                })
+                .next()
+                .unwrap_or_else(|| panic!("{name} lifted stage call"));
+            let definition_block = function
+                .blocks
+                .iter()
+                .find(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|statement| matches!(statement, Stmt::Let(value, _) if value == &capture))
+                })
+                .map(|block| block.id)
+                .expect("capture definition");
+            assert_ne!(
+                definition_block, action_block,
+                "{name} capture must snapshot in a preheader before its loop action"
+            );
+        }
+        let selected = program
+            .fns
+            .iter()
+            .find(|function| function.name == "selected")
+            .expect("selected function");
+        assert!(
+            selected.blocks.iter().filter(|block| block.id != selected.entry).all(|block| {
+                block.stmts.iter().all(|statement| {
+                    !matches!(statement, Stmt::DropFlagInit(slot) if *slot == 1 || *slot == 2)
+                })
+            }),
+            "a borrowing pipeline source must not move/null either selected local: {selected:#?}"
+        );
     }
 
     #[test]

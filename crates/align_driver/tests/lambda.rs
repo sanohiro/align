@@ -212,6 +212,33 @@ fn lambda_captures_in_reduce() {
 }
 
 #[test]
+fn pipeline_captures_snapshot_in_written_operand_order() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn main() -> Result<(), Error> {
+  mut k := 2
+  reduced := [1].map(fn x { x * k }).reduce({
+    k = 3
+    0
+  }, fn acc, x { acc + x + k })
+  print(reduced)
+  k = 2
+  scanned := [1].map(fn x { x * k }).scan({
+    k = 3
+    0
+  }, fn acc, x { acc + x + k }).sum()
+  print(scanned)
+  return Ok(())
+}
+";
+    let out = build_and_run("lam-pipeline-snapshot-order", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n5\n");
+}
+
+#[test]
 fn lambda_captures_in_partition_and_any_all() {
     if !backend_available() {
         return;
@@ -237,7 +264,11 @@ fn lambda_captures_in_par_map_uses_parallel_context() {
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(text.contains("par_map[") && text.contains("captures=["), "a capturing par_map must carry its context:\n{text}");
+    assert!(
+        (text.contains("par_map[") || text.contains("par_map_reduce["))
+            && text.contains("captures=[%"),
+        "a capturing par_map (including the directly consumed reduction form) must carry its context:\n{text}"
+    );
 }
 
 #[test]

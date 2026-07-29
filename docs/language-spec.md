@@ -350,6 +350,13 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+Pipeline operands are evaluated in written order: receiver/source, each stage and its one-time
+Copy-capture snapshot, then terminal arguments and their captures. In `reduce(init, fn ...)` and
+`scan(init, fn ...)`, stage captures are snapshotted before `init`, while reducer captures are
+snapshotted after `init`. The loop reuses those snapshots rather than reloading enclosing locals.
+An intervening argument may not invalidate the owner of a captured view. A non-continuing operand
+suppresses every later snapshot and callback.
+
 Sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may be
 Impure. They run in input-index and stage order, exactly once for each element that reaches them; a
 false `where` suppresses every later stage and reducer for that element. `any` / `all` do not

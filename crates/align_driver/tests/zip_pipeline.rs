@@ -5,6 +5,29 @@
 mod common;
 use common::*;
 
+#[test]
+fn pipeline_terminal_source_order() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn mark(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn main() -> Result<(), Error> {
+  total := zip([mark(1)], [mark(2)])
+    .map(fn pair { pair.0 + pair.1 })
+    .sum()
+  print(total)
+  return Ok(())
+}
+";
+    let out = build_and_run("zip-pipeline-source-order", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n");
+}
+
 fn mir_text(src: &str) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "zip-pipeline.align", src);
