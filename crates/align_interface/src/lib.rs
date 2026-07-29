@@ -1094,6 +1094,9 @@ pub fn validate_for_import(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
+        if function.type_params.is_empty() != function.generic_body.is_none() {
+            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+        }
         for param in &function.params {
             validate_import_param(param, summary, &function.type_params)?;
         }
@@ -1105,7 +1108,7 @@ pub fn validate_for_import(
             &function.return_region,
             summary,
             &function.type_params,
-            function.type_params.is_empty(),
+            function.generic_body.is_none(),
         )?;
     }
     for structure in &summary.structs {

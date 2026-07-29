@@ -863,6 +863,20 @@ fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
         Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
         "generic template roots have no imported side-channel before L2b-b"
     );
+    let mut mismatched_generic_shape = generic.clone();
+    mismatched_generic_shape.fns[0].type_params.clear();
+    assert_eq!(
+        validate_for_import(&mismatched_generic_shape),
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        "generic bodies and type-parameter declarations must agree before transport classification"
+    );
+    let mut missing_generic_body = generic.clone();
+    missing_generic_body.fns[0].generic_body = None;
+    assert_eq!(
+        validate_for_import(&missing_generic_body),
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        "declared type parameters require the generic body transported by their interface"
+    );
 
     let mut recursive = one(
         "pub Wrapper<T> { value: T }\n\

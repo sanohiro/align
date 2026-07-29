@@ -3085,6 +3085,10 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 param_types.len()
             )));
         }
+        check_type_graph(ret, program)?;
+        for &ty in param_types {
+            check_type_graph(ty, program)?;
+        }
         for mode in modes {
             match mode {
                 align_ast::ParamMode::ByValue => {}
@@ -3239,6 +3243,303 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         })
     }
 
+    /// Validate every MIR type reference and the complete inline layout graph before any semantic
+    /// classifier or LLVM type constructor sees it. Pointer/header wrappers still validate their
+    /// referenced ids, but they break the inline-cycle path; fixed arrays, tuples, tagged values,
+    /// structs, and sums preserve it.
+    struct TypeGraph<'a> {
+        program: &'a Program,
+        structs: Vec<u32>,
+        completed_structs: HashSet<u32>,
+        enums: Vec<u32>,
+        completed_enums: HashSet<u32>,
+        tuples: Vec<u32>,
+        completed_tuples: HashSet<u32>,
+        tagged: Vec<u32>,
+        completed_tagged: HashSet<u32>,
+    }
+
+    impl<'a> TypeGraph<'a> {
+        fn new(program: &'a Program) -> Self {
+            Self {
+                program,
+                structs: Vec::new(),
+                completed_structs: HashSet::new(),
+                enums: Vec::new(),
+                completed_enums: HashSet::new(),
+                tuples: Vec::new(),
+                completed_tuples: HashSet::new(),
+                tagged: Vec::new(),
+                completed_tagged: HashSet::new(),
+            }
+        }
+
+        fn invalid(message: String) -> CodegenError {
+            CodegenError::Lowering(message)
+        }
+
+        fn require_struct(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.structs.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tagged payload struct type id {id} is missing"))
+            })
+        }
+
+        fn require_enum(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.enums.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tagged payload sum type id {id} is missing"))
+            })
+        }
+
+        fn require_tuple(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.tuples.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tuple type id {id} is missing"))
+            })
+        }
+
+        fn require_tagged(&self, id: u32) -> Result<(), CodegenError> {
+            self.program
+                .tagged_types
+                .get(id as usize)
+                .map(|_| ())
+                .ok_or_else(|| Self::invalid(format!("nested tagged type id {id} is missing")))
+        }
+
+        fn check_struct(&mut self, id: u32) -> Result<(), CodegenError> {
+            self.require_struct(id)?;
+            if self.completed_structs.contains(&id) {
+                return Ok(());
+            }
+            if self.structs.contains(&id) {
+                return Err(Self::invalid(format!(
+                    "struct type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            self.structs.push(id);
+            let fields = self.program.structs[id as usize]
+                .fields
+                .iter()
+                .map(|field| field.ty)
+                .collect::<Vec<_>>();
+            for field in fields {
+                self.check_ty(field)?;
+            }
+            self.structs.pop();
+            self.completed_structs.insert(id);
+            Ok(())
+        }
+
+        fn check_enum(&mut self, id: u32) -> Result<(), CodegenError> {
+            self.require_enum(id)?;
+            if self.completed_enums.contains(&id) {
+                return Ok(());
+            }
+            if self.enums.contains(&id) {
+                return Err(Self::invalid(format!(
+                    "sum type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            self.enums.push(id);
+            let payloads = self.program.enums[id as usize]
+                .variants
+                .iter()
+                .flat_map(|variant| variant.payload.iter().copied())
+                .collect::<Vec<_>>();
+            for payload in payloads {
+                self.check_scalar_inline(payload)?;
+            }
+            self.enums.pop();
+            self.completed_enums.insert(id);
+            Ok(())
+        }
+
+        fn check_tuple(&mut self, id: u32) -> Result<(), CodegenError> {
+            self.require_tuple(id)?;
+            if self.completed_tuples.contains(&id) {
+                return Ok(());
+            }
+            if self.tuples.contains(&id) {
+                return Err(Self::invalid(format!(
+                    "tuple type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            self.tuples.push(id);
+            let elements = self.program.tuples[id as usize].elems.clone();
+            for element in elements {
+                self.check_scalar_inline(element)?;
+            }
+            self.tuples.pop();
+            self.completed_tuples.insert(id);
+            Ok(())
+        }
+
+        fn check_tagged(&mut self, id: u32) -> Result<(), CodegenError> {
+            self.require_tagged(id)?;
+            if self.completed_tagged.contains(&id) {
+                return Ok(());
+            }
+            if self.tagged.contains(&id) {
+                return Err(Self::invalid(format!(
+                    "nested tagged type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            self.tagged.push(id);
+            match self.program.tagged_types[id as usize] {
+                hir::TaggedType::Option(payload) => self.check_scalar_inline(payload)?,
+                hir::TaggedType::Result(ok, err) => {
+                    self.check_scalar_inline(ok)?;
+                    self.check_scalar_inline(err)?;
+                }
+            }
+            self.tagged.pop();
+            self.completed_tagged.insert(id);
+            Ok(())
+        }
+
+        fn check_scalar_reference(&self, scalar: Scalar) -> Result<(), CodegenError> {
+            match scalar {
+                Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                    self.require_struct(id)
+                }
+                Scalar::Enum(id) => self.require_enum(id),
+                Scalar::Tagged(id) => self.require_tagged(id),
+                Scalar::Param(id) => Err(Self::invalid(format!(
+                    "abstract tagged payload parameter {id} survived into MIR"
+                ))),
+                Scalar::Int(_)
+                | Scalar::Float(_)
+                | Scalar::Bool
+                | Scalar::Char
+                | Scalar::Unit
+                | Scalar::String
+                | Scalar::DynArray(_)
+                | Scalar::DynResponseArray
+                | Scalar::Str
+                | Scalar::Slice(_)
+                | Scalar::JsonDoc
+                | Scalar::Reader
+                | Scalar::Writer
+                | Scalar::Buffer
+                | Scalar::Regex
+                | Scalar::Captures
+                | Scalar::CliParsed
+                | Scalar::TcpConn
+                | Scalar::TcpListener
+                | Scalar::UdpSocket
+                | Scalar::Child
+                | Scalar::File
+                | Scalar::HttpResponse
+                | Scalar::HttpServer
+                | Scalar::HttpRequestCtx
+                | Scalar::ResponseBuilder
+                | Scalar::HttpStream
+                | Scalar::RunOutput
+                // MIR carries no function-type table; the embedded signature facts are validated
+                // at every function-value producer/consumer, and the physical closure ABI is
+                // independent of this sema-local identity.
+                | Scalar::Fn(_) => Ok(()),
+            }
+        }
+
+        fn check_scalar_inline(&mut self, scalar: Scalar) -> Result<(), CodegenError> {
+            match scalar {
+                Scalar::Struct(id) => self.check_struct(id),
+                Scalar::Enum(id) => self.check_enum(id),
+                Scalar::Tagged(id) => self.check_tagged(id),
+                Scalar::DynStructArray(id) | Scalar::Soa(id) => self.require_struct(id),
+                other => self.check_scalar_reference(other),
+            }
+        }
+
+        fn check_ty(&mut self, ty: Ty) -> Result<(), CodegenError> {
+            match ty {
+                Ty::Param(id) => Err(Self::invalid(format!(
+                    "abstract type parameter {id} survived into MIR"
+                ))),
+                Ty::IntVar(id) => Err(Self::invalid(format!(
+                    "unresolved integer type variable {id} survived into MIR"
+                ))),
+                Ty::FloatVar(id) => Err(Self::invalid(format!(
+                    "unresolved float type variable {id} survived into MIR"
+                ))),
+                Ty::Error => Err(Self::invalid(
+                    "error-sentinel type survived into MIR".to_string(),
+                )),
+                Ty::Struct(id) => self.check_struct(id),
+                Ty::Enum(id) => self.check_enum(id),
+                Ty::Tuple(id) => self.check_tuple(id),
+                Ty::Tagged(id) => self.check_tagged(id),
+                Ty::Option(payload)
+                | Ty::Array(payload, _)
+                | Ty::Vec(payload, _)
+                | Ty::Mask(payload, _) => self.check_scalar_inline(payload),
+                Ty::Result(ok, err) => {
+                    self.check_scalar_inline(ok)?;
+                    self.check_scalar_inline(err)
+                }
+                Ty::StructArray(id, _) => self.check_struct(id),
+                Ty::Box(payload)
+                | Ty::Slice(payload)
+                | Ty::DynArray(payload)
+                | Ty::ArrayBuilder(payload)
+                | Ty::Task(payload) => self.check_scalar_reference(payload),
+                Ty::DynStructArray(id, _)
+                | Ty::Soa(id)
+                | Ty::JsonScanner(id) => self.require_struct(id),
+                Ty::DictEncoded(id, field) => {
+                    self.require_struct(id)?;
+                    if field as usize >= self.program.structs[id as usize].fields.len() {
+                        return Err(Self::invalid(format!(
+                            "dictionary-encoded type refers to missing field {field} on struct type id {id}"
+                        )));
+                    }
+                    Ok(())
+                }
+                Ty::Int(_)
+                | Ty::Float(_)
+                | Ty::Bool
+                | Ty::Char
+                | Ty::DynSliceArray(_)
+                | Ty::DynResponseArray
+                | Ty::Str
+                | Ty::String
+                | Ty::ArenaHandle
+                | Ty::Raw
+                | Ty::Builder
+                | Ty::Writer
+                | Ty::Reader
+                | Ty::Buffer
+                | Ty::StrFinder
+                | Ty::File
+                | Ty::Rng
+                | Ty::Regex
+                | Ty::Captures
+                | Ty::CliCommand
+                | Ty::CliParsed
+                | Ty::TcpConn
+                | Ty::TcpListener
+                | Ty::UdpSocket
+                | Ty::Child
+                | Ty::Command
+                | Ty::RunOutput
+                | Ty::HttpRequest
+                | Ty::HttpResponse
+                | Ty::HttpClient
+                | Ty::HttpServer
+                | Ty::HttpRequestCtx
+                | Ty::ResponseBuilder
+                | Ty::HttpStream
+                | Ty::HttpHeaders
+                | Ty::JsonDoc
+                | Ty::Fn(_)
+                | Ty::Unit => Ok(()),
+            }
+        }
+    }
+
+    fn check_type_graph(ty: Ty, program: &Program) -> Result<(), CodegenError> {
+        TypeGraph::new(program).check_ty(ty)
+    }
+
     fn check_scalar(
         scalar: Scalar,
         program: &Program,
@@ -3284,6 +3585,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         }
     }
     fn check_ty(ty: Ty, program: &Program) -> Result<(), CodegenError> {
+        check_type_graph(ty, program)?;
         let mut active = Vec::new();
         match ty {
             Ty::Param(id) => Err(CodegenError::Lowering(format!(
@@ -3407,50 +3709,17 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
     // does not narrow a valid program.
     for id in 0..program.tagged_types.len() {
+        check_ty(Ty::Tagged(id as u32), program)?;
         check_scalar(Scalar::Tagged(id as u32), program, &mut Vec::new())?;
-        if !drop_plan(
-            Ty::Tagged(id as u32),
-            &program.structs,
-            &program.enums,
-            &program.tagged_types,
-        )
-        .is_valid()
-        {
-            return Err(CodegenError::Lowering(format!(
-                "nested tagged type id {id} has a missing or recursive by-value definition"
-            )));
-        }
     }
     for (id, def) in program.structs.iter().enumerate() {
-        if !drop_plan(
-            Ty::Struct(id as u32),
-            &program.structs,
-            &program.enums,
-            &program.tagged_types,
-        )
-        .is_valid()
-        {
-            return Err(CodegenError::Lowering(format!(
-                "struct type id {id} has a missing or recursive by-value definition"
-            )));
-        }
+        check_ty(Ty::Struct(id as u32), program)?;
         for field in &def.fields {
             check_ty(field.ty, program)?;
         }
     }
     for (id, def) in program.enums.iter().enumerate() {
-        if !drop_plan(
-            Ty::Enum(id as u32),
-            &program.structs,
-            &program.enums,
-            &program.tagged_types,
-        )
-        .is_valid()
-        {
-            return Err(CodegenError::Lowering(format!(
-                "sum type id {id} has a missing or recursive by-value definition"
-            )));
-        }
+        check_ty(Ty::Enum(id as u32), program)?;
         for variant in &def.variants {
             for &payload in &variant.payload {
                 check_scalar(payload, program, &mut Vec::new())?;
@@ -3501,7 +3770,8 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             )));
         }
     }
-    for tuple in &program.tuples {
+    for (id, tuple) in program.tuples.iter().enumerate() {
+        check_ty(Ty::Tuple(id as u32), program)?;
         for &elem in &tuple.elems {
             check_scalar(elem, program, &mut Vec::new())?;
         }
@@ -13595,6 +13865,137 @@ mod tests {
                 "{name} cycle produced an unexpected diagnostic: {err}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_mir_type_graphs_fail_before_llvm_construction() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let base = || Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![],
+        };
+
+        for (name, ty, expected) in [
+            (
+                "struct",
+                Ty::Struct(7),
+                "tagged payload struct type id 7 is missing",
+            ),
+            (
+                "sum",
+                Ty::Enum(7),
+                "tagged payload sum type id 7 is missing",
+            ),
+            ("tuple", Ty::Tuple(7), "tuple type id 7 is missing"),
+            (
+                "struct-array",
+                Ty::StructArray(7, 2),
+                "tagged payload struct type id 7 is missing",
+            ),
+        ] {
+            let mut malformed = base();
+            malformed.fns[0].value_tys.push(ty);
+            let err = emit_llvm_ir(
+                &malformed,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("a direct missing MIR type id must fail closed");
+            assert!(
+                err.to_string().contains(expected),
+                "{name} produced an unexpected diagnostic: {err}"
+            );
+        }
+
+        for (name, field_ty) in [
+            ("array", Ty::Array(Scalar::Struct(0), 1)),
+            ("struct-array", Ty::StructArray(0, 1)),
+        ] {
+            let mut malformed = base();
+            malformed.structs.push(StructDef {
+                name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "next".to_string(),
+                    ty: field_ty,
+                }],
+                align: None,
+                c_repr: false,
+            });
+            let err = emit_llvm_ir(
+                &malformed,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("an array-mediated inline MIR cycle must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("missing or recursive by-value definition"),
+                "{name} cycle produced an unexpected diagnostic: {err}"
+            );
+        }
+
+        let mut shared = base();
+        shared.structs.push(StructDef {
+            name: "Shared0".to_string(),
+            source_name: "Shared0".to_string(),
+            fields: vec![align_sema::FieldDef {
+                name: "value".to_string(),
+                ty: Ty::Bool,
+            }],
+            align: None,
+            c_repr: false,
+        });
+        for depth in 1..40 {
+            let child = (depth - 1) as u32;
+            shared.structs.push(StructDef {
+                name: format!("Shared{depth}"),
+                source_name: format!("Shared{depth}"),
+                fields: vec![
+                    align_sema::FieldDef {
+                        name: "left".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                    align_sema::FieldDef {
+                        name: "right".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            });
+        }
+        shared.fns[0].value_tys.push(Ty::Struct(39));
+        validate_tagged_program(&shared)
+            .expect("shared acyclic MIR type subgraphs must be memoized and accepted");
     }
 
     #[test]
