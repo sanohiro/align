@@ -5211,9 +5211,12 @@ fn refine_fn_value_types(
                 boundaries,
                 loop_results: Vec::new(),
                 initialized_capture_params: std::collections::HashSet::new(),
+                fallthrough_expressions: std::collections::HashSet::new(),
             };
-            scan.block(&f.body);
-            if let Some(value) = f.body.value.as_deref() {
+            let body_falls_through = scan.block(&f.body);
+            if body_falls_through
+                && let Some(value) = f.body.value.as_deref()
+            {
                 scan.join_return_effects(value);
             }
         }
@@ -5309,6 +5312,7 @@ fn compute_effect_sets(
             boundaries,
             loop_results: Vec::new(),
             initialized_capture_params: std::collections::HashSet::new(),
+            fallthrough_expressions: std::collections::HashSet::new(),
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -5526,6 +5530,10 @@ struct EffectScan<'a> {
     /// initializes the cell; later closure constructions join into it. This distinguishes the
     /// uninitialized sentinel from a real Unknown capture, which must remain fail-closed.
     initialized_capture_params: std::collections::HashSet<u32>,
+    /// Expressions whose evaluation has at least one continuation in this structural pass. Value
+    /// projection queries consult this set so a dead block tail or all-diverging branch cannot be
+    /// reintroduced after the source-order walk excluded it.
+    fallthrough_expressions: std::collections::HashSet<usize>,
 }
 
 /// One source-value projection on the path to a concrete function-valued leaf.  Unlike the former
@@ -6222,11 +6230,21 @@ impl EffectScan<'_> {
         }
     }
 
+    fn walk_node_capture_effects(&mut self, kind: &ExprKind) -> bool {
+        for capture in node_captures(kind) {
+            if !self.expr(capture) {
+                return false;
+            }
+        }
+        self.join_node_capture_effects(kind);
+        true
+    }
+
     fn stage_funcs<'a>(
         &mut self,
         source: &'a Expr,
         stages: &'a [Stage],
-    ) -> PipelineEffectOrigin<'a> {
+    ) -> Option<PipelineEffectOrigin<'a>> {
         let mut origin = PipelineEffectOrigin::Expression {
             value: source,
             path: vec![FnEffectProjection::ArrayElement],
@@ -6235,12 +6253,14 @@ impl EffectScan<'_> {
             match &s.kind {
                 StageKind::Map { func, captures }
                 | StageKind::Where { func, captures } => {
-                    self.calls.push(func.clone());
                     // Capture operands are reads of enclosing locals — walk them so no call edge /
                     // effect they might contain is missed (exhaustiveness).
                     for c in captures {
-                        self.expr(c);
+                        if !self.expr(c) {
+                            return None;
+                        }
                     }
+                    self.calls.push(func.clone());
                     self.join_named_capture_effects(func, captures);
                     if self.known_effects.is_some() {
                         self.join_named_param_boundary_from_origin(
@@ -6258,21 +6278,30 @@ impl EffectScan<'_> {
                 }
                 // No lifted function (the whole point of hoisting): the needle is an expression
                 // evaluated once before the loop, so walk it for any call edge / effect it contains.
-                StageKind::WhereStrContains { needle } => self.expr(needle),
+                StageKind::WhereStrContains { needle } => {
+                    if !self.expr(needle) {
+                        return None;
+                    }
+                }
                 StageKind::Project { field } => {
                     origin.project(FnEffectProjection::StructField(*field));
                 }
                 StageKind::WhereField { .. } => {}
             }
         }
-        origin
+        Some(origin)
     }
 
-    fn block(&mut self, b: &Block) {
+    /// Scan one block in source order and report whether control can reach its end. A terminating
+    /// initializer/payload retains effects produced before its terminator but prevents the
+    /// statement's own boundary transfer and every later statement/tail.
+    fn block(&mut self, b: &Block) -> bool {
         for s in &b.stmts {
             match s {
                 Stmt::Let { local, init } => {
-                    self.expr(init);
+                    if !self.expr(init) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *local,
@@ -6285,7 +6314,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::Assign { local, value, .. } => {
-                    self.expr(value);
+                    if !self.expr(value) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *local,
@@ -6298,7 +6329,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignField { root, path, value } => {
-                    self.expr(value);
+                    if !self.expr(value) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         let destination: Vec<FnEffectProjection> = path
                             .iter()
@@ -6315,7 +6348,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::LetTuple { locals, init, .. } => {
-                    self.expr(init);
+                    if !self.expr(init) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         for (index, local) in locals.iter().enumerate() {
                             let Some(local) = *local
@@ -6350,9 +6385,10 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignIndex { base, index, value } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                 }
                 Stmt::AssignElemField {
                     base,
@@ -6362,9 +6398,10 @@ impl EffectScan<'_> {
                     value,
                     ..
                 } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                     if self.known_effects.is_some() {
                         let mut destination =
                             Vec::with_capacity(path.len() + 1);
@@ -6390,9 +6427,10 @@ impl EffectScan<'_> {
                     value,
                     ..
                 } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *base,
@@ -6403,18 +6441,27 @@ impl EffectScan<'_> {
                         self.join_concrete_struct_id_effects(*struct_id, value);
                     }
                 }
-                Stmt::AssignVecLane { value, .. } => self.expr(value),
+                Stmt::AssignVecLane { value, .. } => {
+                    if !self.expr(value) {
+                        return false;
+                    }
+                }
                 Stmt::Return(Some(e)) => {
-                    self.expr(e);
+                    if !self.expr(e) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_return_effects(e);
                     }
+                    return false;
                 }
                 Stmt::Break {
                     value: Some(e),
                     accepted,
                 } => {
-                    self.expr(e);
+                    if !self.expr(e) {
+                        return false;
+                    }
                     if *accepted
                         && self.known_effects.is_some()
                         && let Some((loop_ty, loop_key)) =
@@ -6428,14 +6475,22 @@ impl EffectScan<'_> {
                             &mut Vec::new(),
                         );
                     }
+                    return false;
                 }
-                Stmt::Expr(e) => self.expr(e),
-                Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
+                Stmt::Expr(e) => {
+                    if !self.expr(e) {
+                        return false;
+                    }
+                }
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {
+                    return false;
+                }
             }
         }
         if let Some(v) = &b.value {
-            self.expr(v);
+            return self.expr(v);
         }
+        true
     }
 
     fn named_effect(&self, name: &str) -> FnEffect {
@@ -6456,12 +6511,15 @@ impl EffectScan<'_> {
             .unwrap_or(FnEffect::Unknown)
     }
 
-    fn block_value_effect(&self, block: &Block) -> FnEffect {
+    fn block_value_effect(&self, block: &Block) -> Option<FnEffect> {
         block
             .value
             .as_deref()
+            .filter(|value| {
+                self.fallthrough_expressions
+                    .contains(&effect_expression_key(value))
+            })
             .map(|value| self.fn_value_effect(value))
-            .unwrap_or(FnEffect::Unknown)
     }
 
     /// Effect of invoking the function value produced by `expr`. Origins are resolved only in the
@@ -6551,14 +6609,54 @@ impl EffectScan<'_> {
                     &[FnEffectProjection::TupleElement(*index)],
                 )
                 .unwrap_or(FnEffect::Unknown),
-            ExprKind::If { then, els, .. } => self.block_value_effect(then).join(self.block_value_effect(els)),
+            ExprKind::If { then, els, .. } => Self::join_optional_effect(
+                self.block_value_effect(then),
+                self.block_value_effect(els),
+            )
+            .unwrap_or(FnEffect::Unknown),
             ExprKind::Match { arms, .. } => arms
                 .iter()
+                .filter(|arm| {
+                    self.fallthrough_expressions
+                        .contains(&effect_expression_key(&arm.body))
+                })
                 .map(|arm| self.fn_value_effect(&arm.body))
                 .reduce(FnEffect::join)
                 .unwrap_or(FnEffect::Unknown),
+            ExprKind::Loop { .. } => self
+                .boundary_expression_effect(
+                    effect_expression_key(expr),
+                    &[],
+                )
+                .flatten()
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
+                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                    _ => None,
+                };
+                let from_success = success
+                    .map(|projection| {
+                        self.projected_fn_effect(opt, &[projection])
+                    })
+                    .unwrap_or(Some(FnEffect::Unknown));
+                let from_fallback = self
+                    .fallthrough_expressions
+                    .contains(&effect_expression_key(fallback))
+                    .then(|| self.fn_value_effect(fallback));
+                Self::join_optional_effect(from_success, from_fallback)
+                    .unwrap_or(FnEffect::Unknown)
+            }
+            ExprKind::Try(result) => self
+                .projected_fn_effect(
+                    result,
+                    &[FnEffectProjection::ResultOk],
+                )
+                .unwrap_or(FnEffect::Unknown),
             ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) | ExprKind::TaskGroup(block) => {
                 self.block_value_effect(block)
+                    .unwrap_or(FnEffect::Unknown)
             }
             _ => self.type_effect(expr.ty),
         }
@@ -6816,7 +6914,9 @@ impl EffectScan<'_> {
                         self.projected_fn_effect(opt, &wrapped)
                     })
                     .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = (!hir_expr_diverges(fallback))
+                let from_fallback = self
+                    .fallthrough_expressions
+                    .contains(&effect_expression_key(fallback))
                     .then(|| self.projected_fn_effect(fallback, path))
                     .flatten();
                 Self::join_optional_effect(from_success, from_fallback)
@@ -6858,6 +6958,10 @@ impl EffectScan<'_> {
             ),
             (ExprKind::Match { arms, .. }, _) => arms
                 .iter()
+                .filter(|arm| {
+                    self.fallthrough_expressions
+                        .contains(&effect_expression_key(&arm.body))
+                })
                 .map(|arm| self.projected_fn_effect(&arm.body, path))
                 .fold(None, Self::join_optional_effect),
             (
@@ -6884,6 +6988,10 @@ impl EffectScan<'_> {
         block
             .value
             .as_deref()
+            .filter(|value| {
+                self.fallthrough_expressions
+                    .contains(&effect_expression_key(value))
+            })
             .and_then(|value| self.projected_fn_effect(value, path))
     }
 
@@ -7183,37 +7291,34 @@ impl EffectScan<'_> {
     /// Effect of a `file` op (`pread`/`pwrite`/`len`, A4): each is a syscall → Impure. Split out
     /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn effect_file_op(&mut self, kind: &ExprKind) {
-        self.impure_direct = true;
-        match kind {
+    fn effect_file_op(&mut self, kind: &ExprKind) -> bool {
+        let falls_through = match kind {
             ExprKind::FilePread { file, buffer, offset } => {
-                self.expr(file);
-                self.expr(buffer);
-                self.expr(offset);
+                self.expr(file) && self.expr(buffer) && self.expr(offset)
             }
             ExprKind::FilePwrite { file, data, offset } => {
-                self.expr(file);
-                self.expr(data);
-                self.expr(offset);
+                self.expr(file) && self.expr(data) && self.expr(offset)
             }
             ExprKind::FileLen { file } => self.expr(file),
             _ => unreachable!("effect_file_op on a non-file op"),
+        };
+        if falls_through {
+            self.impure_direct = true;
         }
+        falls_through
     }
 
     /// Walk an `array_builder` op's sub-exprs for the effect check (all pure). `#[inline(never)]` so
     /// its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn effect_array_builder(&mut self, kind: &ExprKind) {
+    fn effect_array_builder(&mut self, kind: &ExprKind) -> bool {
         match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderNew { .. } => true,
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.expr(builder);
-                self.expr(value);
+                self.expr(builder) && self.expr(value)
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.expr(builder);
-                self.expr(data);
+                self.expr(builder) && self.expr(data)
             }
             ExprKind::ArrayBuilderBuild(i) => self.expr(i),
             _ => unreachable!("effect_array_builder on a non-array_builder op"),
@@ -7273,24 +7378,34 @@ impl EffectScan<'_> {
         self.loop_results.pop();
     }
 
-    fn expr(&mut self, e: &Expr) {
-        // A reducer node may carry capture operands (a lifted lambda's captured enclosing locals);
-        // walk them so no call edge / effect they contain is missed. (Stage captures are walked by
-        // `stage_funcs`.)
-        for c in node_captures(&e.kind) {
-            self.expr(c);
+    fn expr(&mut self, e: &Expr) -> bool {
+        let falls_through = self.expr_inner(e);
+        if falls_through {
+            self.fallthrough_expressions
+                .insert(effect_expression_key(e));
         }
-        self.join_node_capture_effects(&e.kind);
+        falls_through
+    }
+
+    fn expr_inner(&mut self, e: &Expr) -> bool {
+        macro_rules! walk {
+            ($child:expr) => {
+                if !self.expr($child) {
+                    return false;
+                }
+            };
+        }
+
         match &e.kind {
             // Observable side effects.
             ExprKind::Call { func, args, .. } => {
+                for a in args {
+                    walk!(a);
+                }
                 if func == "print" {
                     self.impure_direct = true;
                 } else {
                     self.calls.push(func.clone());
-                }
-                for a in args {
-                    self.expr(a);
                 }
                 if self.known_effects.is_some()
                     && let Some(params) = self
@@ -7322,23 +7437,23 @@ impl EffectScan<'_> {
                 }
             }
             ExprKind::Closure { lifted, captures } => {
+                for c in captures {
+                    walk!(c);
+                }
                 if self.known_effects.is_some()
                     && let Ty::Fn(fid) = e.ty
                     && let Some(ft) = self.fn_types.get(fid as usize)
                 {
                     ft.effect.set(self.named_effect(lifted));
                 }
-                for c in captures {
-                    self.expr(c);
-                }
                 self.join_named_capture_effects(lifted, captures);
             }
             ExprKind::CallFnValue { callee, args } => {
-                self.expr(callee);
-                self.consume_fn_value(callee);
+                walk!(callee);
                 for a in args {
-                    self.expr(a);
+                    walk!(a);
                 }
+                self.consume_fn_value(callee);
                 let target = self.static_fn_target(callee);
                 let callback_actual = args
                     .iter()
@@ -7391,404 +7506,416 @@ impl EffectScan<'_> {
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin | ExprKind::BufferNew { .. } => {}
             ExprKind::WriterWrite { writer, arg, .. } => {
+                walk!(writer);
+                walk!(arg);
                 self.impure_direct = true;
-                self.expr(writer);
-                self.expr(arg);
             }
             ExprKind::WriterFlush { writer } => {
+                walk!(writer);
                 self.impure_direct = true;
-                self.expr(writer);
             }
             ExprKind::ReaderRead { reader, buffer } => {
+                walk!(reader);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(buffer);
             }
             // `r.read_line(b)` reads the fd — Impure, like `reader.read`. `r.buffered()` only
             // allocates a lookahead (no I/O) — pure, like `BufferNew`.
             ExprKind::ReaderReadLine { reader, buffer } => {
+                walk!(reader);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(buffer);
             }
-            ExprKind::ReaderBuffered { reader } => self.expr(reader),
+            ExprKind::ReaderBuffered { reader } => walk!(reader),
             // `bytes.as_str()` validates UTF-8 in memory (no I/O) — pure, like `BufferBytes`.
-            ExprKind::BytesAsStr { bytes } => self.expr(bytes),
+            ExprKind::BytesAsStr { bytes } => walk!(bytes),
             ExprKind::IoCopy { reader, writer } => {
+                walk!(reader);
+                walk!(writer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(writer);
             }
             // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
             // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
             // (the #296 expr-depth lesson).
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.effect_file_op(&e.kind),
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => {
+                if !self.effect_file_op(&e.kind) {
+                    return false;
+                }
+            }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
             // a field read.
-            ExprKind::StrBytes { inner } => self.expr(inner),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
+            ExprKind::StrBytes { inner } => walk!(inner),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
             ExprKind::BytesRead { bytes, offset, .. } => {
-                self.expr(bytes);
-                self.expr(offset);
+                walk!(bytes);
+                walk!(offset);
             }
             ExprKind::BufferPut { buffer, value, .. } => {
-                self.expr(buffer);
-                self.expr(value);
+                walk!(buffer);
+                walk!(value);
             }
             ExprKind::BufferAppend { buffer, data } => {
-                self.expr(buffer);
-                self.expr(data);
+                walk!(buffer);
+                walk!(data);
             }
             // `array_builder` new/push/append/build are all pure in-memory growth; walk the sub-exprs
             // in an `#[inline(never)]` helper so the arm locals stay out of this recursive frame (#296).
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.effect_array_builder(k),
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => {
+                if !self.effect_array_builder(k) {
+                    return false;
+                }
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
+                walk!(path);
                 self.impure_direct = true;
-                self.expr(path);
             }
             // `dns.resolve(host)` is impure (a name-resolution syscall) — excluded from `par_map`.
             ExprKind::DnsResolve { host } => {
+                walk!(host);
                 self.impure_direct = true;
-                self.expr(host);
             }
             // `tcp.connect(host, port)` is impure (DNS + connect syscalls) — excluded from `par_map`.
             ExprKind::TcpConnect { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             // `c.reader()` / `c.writer()` just wrap the conn's fd (no syscall — the I/O happens on the
             // returned reader/writer's `read`/`write`, already impure), like `io.stdout`: walk `conn`.
-            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.expr(conn),
+            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => walk!(conn),
             // `tcp.listen(host, port)` is impure (DNS + bind/listen syscalls) — excluded from `par_map`.
             ExprKind::TcpListen { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             // `l.accept()` is impure (a blocking accept syscall) — excluded from `par_map`.
             ExprKind::TcpAccept { listener } => {
+                walk!(listener);
                 self.impure_direct = true;
-                self.expr(listener);
             }
             // `udp.bind` / `u.send_to` / `u.recv_from` are impure (bind/sendto/recvfrom syscalls) —
             // excluded from `par_map`.
             ExprKind::UdpBind { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::UdpSendTo { sock, data, host, port } => {
+                walk!(sock);
+                walk!(data);
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(sock);
-                self.expr(data);
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::UdpRecvFrom { sock, buffer } => {
+                walk!(sock);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(sock);
-                self.expr(buffer);
             }
             ExprKind::FsWriteFile { path, data, .. } => {
+                walk!(path);
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(path);
-                self.expr(data);
             }
             // `std.path` ops are pure lexical string manipulation (no OS access) — like a field read.
-            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path),
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => walk!(path),
             ExprKind::PathJoin { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             // `std.env` / `std.time` observe/mutate external state — Impure.
             ExprKind::EnvGet { name } => {
+                walk!(name);
                 self.impure_direct = true;
-                self.expr(name);
             }
             ExprKind::EnvSet { name, value } => {
+                walk!(name);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(name);
-                self.expr(value);
             }
             ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(ns);
             }
             // `std.process` — `exit`/`abort` terminate the process (observable external effect), so
             // both are Impure: an `exit`/`abort` inside a `par_map` closure is rejected (not Pure).
             ExprKind::ProcessExit { code } => {
+                walk!(code);
                 self.impure_direct = true;
-                self.expr(code);
+                return false;
             }
-            ExprKind::ProcessAbort => self.impure_direct = true,
+            ExprKind::ProcessAbort => {
+                self.impure_direct = true;
+                return false;
+            }
             // `process.spawn` (fork+exec) / `ch.wait()` (waitpid) are impure — excluded from `par_map`.
             ExprKind::ProcessSpawn { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             ExprKind::ChildWait { child } => {
+                walk!(child);
                 self.impure_direct = true;
-                self.expr(child);
             }
             // `ch.kill(sig)` (signal delivery) / `process.exec` (execvp) are impure — excluded from
             // `par_map`.
             ExprKind::ChildKill { child, sig } => {
+                walk!(child);
+                walk!(sig);
                 self.impure_direct = true;
-                self.expr(child);
-                self.expr(sig);
             }
             ExprKind::ProcessExec { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             // `std.process` Slice 4 — `process.command`/`c.cwd(dir)`/`c.run()` fork or observe the
             // machine → **Impure** (excluded from `par_map`). The `run_output` accessors read owned
             // memory → **Pure** (like `resp.status()`/`resp.body()`). Recurse into the operands either
             // way so an effect *inside* them is still counted.
             ExprKind::ProcessCommand { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             ExprKind::CommandCwd { command, dir } => {
+                walk!(command);
+                walk!(dir);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(dir);
             }
             ExprKind::CommandTimeout { command, ns } => {
+                walk!(command);
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(ns);
             }
             // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` do a `setsockopt` syscall — Impure,
             // like `c.timeout_ns(ns)` on a command (the conn is borrowed, the ns is Copy).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                walk!(conn);
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(conn);
-                self.expr(ns);
             }
             ExprKind::CommandEnv { command, name, value } => {
+                walk!(command);
+                walk!(name);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(name);
-                self.expr(value);
             }
             ExprKind::CommandEnvClear { command } => {
+                walk!(command);
                 self.impure_direct = true;
-                self.expr(command);
             }
             ExprKind::CommandRun { command } => {
+                walk!(command);
                 self.impure_direct = true;
-                self.expr(command);
             }
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                self.expr(out);
+                walk!(out);
             }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
-            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
-            ExprKind::EncodingDecode { input, .. } => self.expr(input),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => walk!(data),
+            ExprKind::EncodingDecode { input, .. } => walk!(input),
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
             ExprKind::Compress { data, level, .. } => {
+                walk!(data);
+                walk!(level);
                 self.impure_direct = true;
-                self.expr(data);
-                self.expr(level);
             }
             ExprKind::Decompress { data, .. } => {
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(data);
             }
             // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
             // `shuffle`/`sample` produce or advance mutable RNG state. So an rng-using closure is
             // never `Pure` and is excluded from `par_map` (each thread would need its own generator).
             ExprKind::RandSeed => self.impure_direct = true,
             ExprKind::RandSeedWith { seed } => {
+                walk!(seed);
                 self.impure_direct = true;
-                self.expr(seed);
             }
             ExprKind::RandNext { rng } => {
+                walk!(rng);
                 self.impure_direct = true;
-                self.expr(rng);
             }
             ExprKind::RandRange { rng, lo, hi } => {
+                walk!(rng);
+                walk!(lo);
+                walk!(hi);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(lo);
-                self.expr(hi);
             }
             ExprKind::RandShuffle { rng, xs, .. } => {
+                walk!(rng);
+                walk!(xs);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(xs);
             }
             ExprKind::RandSample { rng, xs, k, .. } => {
+                walk!(rng);
+                walk!(xs);
+                walk!(k);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(xs);
-                self.expr(k);
             }
-            ExprKind::RegexCompile { pattern } => self.expr(pattern),
+            ExprKind::RegexCompile { pattern } => walk!(pattern),
             ExprKind::RegexIsMatch { regex, text }
             | ExprKind::RegexFindAll { regex, text }
             | ExprKind::RegexSplit { regex, text } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
             }
             ExprKind::RegexFind { regex, text, start } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
                 if let Some(s) = start {
-                    self.expr(s);
+                    walk!(s);
                 }
             }
             ExprKind::RegexReplace { regex, text, repl, .. } => {
-                self.expr(regex);
-                self.expr(text);
-                self.expr(repl);
+                walk!(regex);
+                walk!(text);
+                walk!(repl);
             }
             ExprKind::RegexCaptures { regex, text } | ExprKind::RegexGroupIndex { regex, name: text } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
             }
-            ExprKind::RegexGroupCount { regex } => self.expr(regex),
+            ExprKind::RegexGroupCount { regex } => walk!(regex),
             ExprKind::CapturesGroup { caps, index } => {
-                self.expr(caps);
-                self.expr(index);
+                walk!(caps);
+                walk!(index);
             }
             // `std.cli` — **all pure** (no I/O; argv is already captured by `main(args)`): just
             // recurse into the operands so any effect *inside* them is still counted.
-            ExprKind::CliCommand { name } => self.expr(name),
+            ExprKind::CliCommand { name } => walk!(name),
             ExprKind::CliFlag { cmd, name, default, .. } => {
-                self.expr(cmd);
-                self.expr(name);
+                walk!(cmd);
+                walk!(name);
                 if let Some(d) = default {
-                    self.expr(d);
+                    walk!(d);
                 }
             }
             ExprKind::CliParse { cmd, args } => {
-                self.expr(cmd);
-                self.expr(args);
+                walk!(cmd);
+                walk!(args);
             }
             ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
-                self.expr(parsed);
-                self.expr(name);
+                walk!(parsed);
+                walk!(name);
             }
-            ExprKind::CliUsage { cmd } => self.expr(cmd),
+            ExprKind::CliUsage { cmd } => walk!(cmd),
             // `std.http` (Slice 1) — **all pure** (no I/O; serialize/parse operate on owned/borrowed
             // memory — the network client is Slice 2): recurse so an effect *inside* the operands is
             // still counted.
             ExprKind::HttpRequest { method, url } => {
-                self.expr(method);
-                self.expr(url);
+                walk!(method);
+                walk!(url);
             }
             ExprKind::HttpHeader { req, name, value } => {
-                self.expr(req);
-                self.expr(name);
-                self.expr(value);
+                walk!(req);
+                walk!(name);
+                walk!(value);
             }
             ExprKind::HttpBody { req, data } => {
-                self.expr(req);
-                self.expr(data);
+                walk!(req);
+                walk!(data);
             }
             // `r.timeout(ns)` / `cl.timeout(ns)` store a field on the handle — no I/O (the deadline is
             // applied at perform time), so like `HttpHeader`/`HttpBody` they are Pure; just recurse.
             ExprKind::HttpRequestTimeout { req, ns } => {
-                self.expr(req);
-                self.expr(ns);
+                walk!(req);
+                walk!(ns);
             }
             ExprKind::HttpClientTimeout { client, ns } => {
-                self.expr(client);
-                self.expr(ns);
+                walk!(client);
+                walk!(ns);
             }
-            ExprKind::HttpParse { data } => self.expr(data),
-            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp),
+            ExprKind::HttpParse { data } => walk!(data),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => walk!(resp),
             ExprKind::HttpRespHeader { resp, name } => {
-                self.expr(resp);
-                self.expr(name);
+                walk!(resp);
+                walk!(name);
             }
             // `std.http` (Slice 2) — `http.client()` allocates a handle (no I/O — **Pure**), but every
             // request op (`get`/`post`/`request`) hits the network (connect/write/read syscalls), so it
             // is **Impure** — excluded from `par_map`, like `tcp.connect` / `io`.
             ExprKind::HttpClient => {}
             ExprKind::HttpClientGet { client, url } => {
+                walk!(client);
+                walk!(url);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(url);
             }
             ExprKind::HttpClientPost { client, url, body } => {
+                walk!(client);
+                walk!(url);
+                walk!(body);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(url);
-                self.expr(body);
             }
             ExprKind::HttpClientRequest { client, req } => {
+                walk!(client);
+                walk!(req);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(req);
             }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                walk!(client);
+                walk!(urls);
+                walk!(max_concurrency);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(urls);
-                self.expr(max_concurrency);
             }
             // `std.http` (Slice 4) — the server primitive. `serve`/`accept`/`respond` hit the network
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
             // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
             // so an effect *inside* the operands is still counted.
             ExprKind::HttpServe { host, port, .. } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::HttpAccept { server } => {
+                walk!(server);
                 self.impure_direct = true;
-                self.expr(server);
             }
             ExprKind::HttpRespond { ctx, rb } => {
+                walk!(ctx);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(ctx);
-                self.expr(rb);
             }
             ExprKind::HttpRespondStream { ctx, rb } => {
+                walk!(ctx);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(ctx);
-                self.expr(rb);
             }
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
+                walk!(stream);
+                walk!(chunk);
                 self.impure_direct = true;
-                self.expr(stream);
-                self.expr(chunk);
             }
             ExprKind::HttpStreamFinish { stream } => {
+                walk!(stream);
                 self.impure_direct = true;
-                self.expr(stream);
             }
             ExprKind::HttpStreamReject { stream, rb } => {
+                walk!(stream);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(stream);
-                self.expr(rb);
             }
-            ExprKind::HttpResponseBuilder { status } => self.expr(status),
+            ExprKind::HttpResponseBuilder { status } => walk!(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
-                self.expr(rb);
-                self.expr(name);
-                self.expr(value);
+                walk!(rb);
+                walk!(name);
+                walk!(value);
             }
             ExprKind::HttpRbBody { rb, data } => {
-                self.expr(rb);
-                self.expr(data);
+                walk!(rb);
+                walk!(data);
             }
             // `ctx.headers()` is a pointer copy and `hs.get(name)` a read-only scan of an immutable
             // buffer, so both stay **Pure** (http.md item 10 ⑥) — which is what lets a handler that
@@ -7796,86 +7923,97 @@ impl EffectScan<'_> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.expr(ctx),
+            | ExprKind::HttpCtxHeaders { ctx } => walk!(ctx),
             ExprKind::HttpCtxHeader { headers, name } => {
-                self.expr(headers);
-                self.expr(name);
+                walk!(headers);
+                walk!(name);
             }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
             // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
             ExprKind::CryptoCtEqual { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             // `crypto.random` reads OS entropy → **Impure**: an rng-filling closure is never `Pure`,
             // so it is excluded from `par_map`.
             ExprKind::CryptoRandom { out } => {
+                walk!(out);
                 self.impure_direct = true;
-                self.expr(out);
             }
             // `crypto.sha256`/`sha512` — a C-engine (libcrypto) call, inferred **Impure** (draft §15:
             // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
             ExprKind::CryptoHash { data, .. } => {
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(data);
             }
             // `crypto.hmac_sha256` / `crypto.hkdf_sha256` — libcrypto calls, inferred **Impure**
             // (never `Pure`, so excluded from `par_map`, matching `crypto.sha256`). Recurse operands.
             ExprKind::CryptoHmac { key, data } => {
+                walk!(key);
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(key);
-                self.expr(data);
             }
             ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                walk!(salt);
+                walk!(ikm);
+                walk!(info);
+                walk!(len);
                 self.impure_direct = true;
-                self.expr(salt);
-                self.expr(ikm);
-                self.expr(info);
-                self.expr(len);
             }
             // `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}` — libcrypto AEAD, inferred **Impure**
             // (never `Pure`, so excluded from `par_map`). Recurse the four byte-view operands.
             ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                walk!(key);
+                walk!(nonce);
+                walk!(input);
+                walk!(aad);
                 self.impure_direct = true;
-                self.expr(key);
-                self.expr(nonce);
-                self.expr(input);
-                self.expr(aad);
             }
             // `crypto.argon2id` — a libcrypto call, inferred **Impure** (never `Pure`, so excluded
             // from `par_map`). Recurse into all three operands (`params` is a Copy struct literal).
             ExprKind::CryptoArgon2 { password, salt, params } => {
+                walk!(password);
+                walk!(salt);
+                walk!(params);
                 self.impure_direct = true;
-                self.expr(password);
-                self.expr(salt);
-                self.expr(params);
             }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
-                self.expr(source);
-                self.stage_funcs(source, stages);
+                walk!(source);
+                if self.stage_funcs(source, stages).is_none() {
+                    return false;
+                }
             }
             ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } => {
-                self.expr(source);
-                self.stage_funcs(source, stages);
+                walk!(source);
+                if self.stage_funcs(source, stages).is_none() {
+                    return false;
+                }
             }
             // `map_into` writes each post-stage element into caller-provided storage. It is an
             // observable view write even when the destination expression itself is just a local
             // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
+                walk!(source);
+                if self.stage_funcs(source, stages).is_none() {
+                    return false;
+                }
+                walk!(dst);
                 self.impure_direct = true;
-                self.expr(source);
-                self.stage_funcs(source, stages);
-                self.expr(dst);
             }
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
-                self.expr(source);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                let Some(origin) = self.stage_funcs(source, stages) else {
+                    return false;
+                };
+                if !self.walk_node_capture_effects(&e.kind) {
+                    return false;
+                }
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -7899,9 +8037,14 @@ impl EffectScan<'_> {
                 init,
                 ..
             } => {
-                self.expr(source);
-                self.expr(init);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                walk!(init);
+                let Some(origin) = self.stage_funcs(source, stages) else {
+                    return false;
+                };
+                if !self.walk_node_capture_effects(&e.kind) {
+                    return false;
+                }
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary(func, 0, init);
@@ -7923,8 +8066,13 @@ impl EffectScan<'_> {
                 }
             }
             ExprKind::ArrayParMap { source, stages, func, .. } => {
-                self.expr(source);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                let Some(origin) = self.stage_funcs(source, stages) else {
+                    return false;
+                };
+                if !self.walk_node_capture_effects(&e.kind) {
+                    return false;
+                }
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -7949,126 +8097,145 @@ impl EffectScan<'_> {
                 }
             }
             // `to_soa` transposes its source array — no stage/reducer functions of its own.
-            ExprKind::ArrayToSoa { source, .. } => self.expr(source),
+            ExprKind::ArrayToSoa { source, .. } => walk!(source),
             ExprKind::ArrayDot { a, b, .. } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             ExprKind::ArrayChunks { source, n, .. } => {
-                self.expr(source);
-                self.expr(n);
+                walk!(source);
+                walk!(n);
             }
             // Structural recursion (no effect of their own).
-            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.expr(expr),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => walk!(expr),
+            ExprKind::Binary {
+                op: BinOp::And | BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                walk!(lhs);
+                // The RHS is conditionally reachable, but the short path remains a continuation
+                // even when the RHS terminates.
+                let _ = self.expr(rhs);
+                return true;
+            }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
+                walk!(lhs);
+                walk!(rhs);
             }
             ExprKind::If { cond, then, els } => {
-                self.expr(cond);
-                self.block(then);
-                self.block(els);
+                walk!(cond);
+                let then_falls_through = self.block(then);
+                let else_falls_through = self.block(els);
+                return then_falls_through || else_falls_through;
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
-                    self.expr(f);
+                    walk!(f);
                 }
             }
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
-                    self.expr(el);
+                    walk!(el);
                 }
             }
             ExprKind::MathOp { operands, .. } => {
                 for o in operands {
-                    self.expr(o);
+                    walk!(o);
                 }
             }
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for el in elems {
-                    self.expr(el);
+                    walk!(el);
                 }
             }
             ExprKind::ArrayZip { sources, .. } => {
                 for source in sources {
-                    self.expr(source);
+                    walk!(source);
                 }
             }
             ExprKind::Select { mask, a, b } => {
-                self.expr(mask);
-                self.expr(a);
-                self.expr(b);
+                walk!(mask);
+                walk!(a);
+                walk!(b);
             }
             ExprKind::VecSumWhere { vec, mask } => {
-                self.expr(vec);
-                self.expr(mask);
+                walk!(vec);
+                walk!(mask);
             }
             ExprKind::VecDot { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
-            ExprKind::VecMinMax { vec, .. } => self.expr(vec),
-            ExprKind::VecSum { vec } => self.expr(vec),
+            ExprKind::VecMinMax { vec, .. } => walk!(vec),
+            ExprKind::VecSum { vec } => walk!(vec),
             ExprKind::VecLoad { src, index, .. } => {
-                self.expr(src);
-                self.expr(index);
+                walk!(src);
+                walk!(index);
             }
             ExprKind::VecStore { dst, index, value, .. } => {
                 // `dst` is a writable slice place; the vector store mutates its backing buffer.
+                walk!(dst);
+                walk!(index);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(dst);
-                self.expr(index);
-                self.expr(value);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.expr(opt);
-                self.expr(fallback);
+                walk!(opt);
+                // The fallback is conditionally reachable. Its effects remain reachable, while the
+                // successful unwrap edge keeps the expression fallthrough even if fallback exits.
+                let _ = self.expr(fallback);
+                return true;
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
-                self.expr(builder);
-                self.expr(arg);
+                walk!(builder);
+                walk!(arg);
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
-                self.block(b)
+                return self.block(b);
             }
-            ExprKind::Loop { body, .. } => self.loop_body(e, body),
+            ExprKind::Loop { body, diverges, .. } => {
+                self.loop_body(e, body);
+                return !*diverges;
+            }
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
             ExprKind::Unsafe(b) => {
                 self.impure_direct = true;
-                self.block(b);
+                return self.block(b);
             }
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
+                walk!(e);
                 self.impure_direct = true;
-                self.expr(e);
             }
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
+                walk!(ptr);
+                walk!(offset);
                 self.impure_direct = true;
-                self.expr(ptr);
-                self.expr(offset);
             }
             ExprKind::RawStore { ptr, offset, value } => {
+                walk!(ptr);
+                walk!(offset);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(ptr);
-                self.expr(offset);
-                self.expr(value);
             }
             // Spawning / joining concurrent work is an observable effect (the enclosing function
             // is not pure); the spawned closure's own effects live in its lifted function.
             ExprKind::Spawn { closure, .. } => {
+                walk!(closure);
                 self.impure_direct = true;
-                self.expr(closure);
             }
-            ExprKind::TaskGet(inner) => self.expr(inner),
+            ExprKind::TaskGet(inner) => walk!(inner),
             ExprKind::Wait => self.impure_direct = true,
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
-                    self.expr(p);
+                    walk!(p);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.expr(scrutinee);
+                walk!(scrutinee);
+                let mut any_fallthrough = false;
                 for a in arms {
                     if self.known_effects.is_some()
                         && let [variant] = a.variants.as_slice()
@@ -8105,12 +8272,13 @@ impl EffectScan<'_> {
                             );
                         }
                     }
-                    self.expr(&a.body);
+                    any_fallthrough |= self.expr(&a.body);
                 }
+                return any_fallthrough;
             }
             ExprKind::ResultMapErr { result, f } => {
-                self.expr(result);
-                self.expr(f);
+                walk!(result);
+                walk!(f);
                 self.consume_fn_value(f);
                 let error_ty = match expand_tagged_ty(
                     result.ty,
@@ -8144,40 +8312,42 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::TupleIndex { recv, .. } => self.expr(recv),
+            ExprKind::TupleIndex { recv, .. } => walk!(recv),
             ExprKind::Index { recv, index } => {
-                self.expr(recv);
-                self.expr(index);
+                walk!(recv);
+                walk!(index);
             }
             ExprKind::SliceRange { recv, start, end } => {
-                self.expr(recv);
-                if let Some(s) = start { self.expr(s); }
-                if let Some(e) = end { self.expr(e); }
+                walk!(recv);
+                if let Some(s) = start { walk!(s); }
+                if let Some(e) = end { walk!(e); }
             }
             ExprKind::ElemField { recv, index, .. } => {
-                self.expr(recv);
-                self.expr(index);
+                walk!(recv);
+                walk!(index);
             }
             ExprKind::Try(result) => {
-                self.expr(result);
+                walk!(result);
                 if self.known_effects.is_some() {
                     self.join_try_error_effects(result);
                 }
+                // The Err edge returns, while the Ok edge continues.
+                return true;
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i)
             | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::Len(i)
-            | ExprKind::ArrayToSlice(i) => self.expr(i),
+            | ExprKind::ArrayToSlice(i) => walk!(i),
             ExprKind::StrPredicate { haystack, needle, .. } => {
-                self.expr(haystack);
-                self.expr(needle);
+                walk!(haystack);
+                walk!(needle);
             }
-            ExprKind::StrTrim { recv, .. } => self.expr(recv),
+            ExprKind::StrTrim { recv, .. } => walk!(recv),
             ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -8185,23 +8355,23 @@ impl EffectScan<'_> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
-            | ExprKind::JsonScan { input, .. } => self.expr(input),
+            | ExprKind::JsonScan { input, .. } => walk!(input),
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
-            ExprKind::JsonDoc { input } => self.expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.expr(doc),
+            ExprKind::JsonDoc { input } => walk!(input),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => walk!(doc),
             ExprKind::JsonDocGet { doc, key } => {
-                self.expr(doc);
-                self.expr(key);
+                walk!(doc);
+                walk!(key);
             }
             ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
-                self.expr(doc);
-                self.expr(index);
+                walk!(doc);
+                walk!(index);
             }
             // `builder(capacity)` — the capacity expr may itself have effects.
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
-                    self.expr(c);
+                    walk!(c);
                 }
             }
             // Leaves. A `ConstArray`'s elements are already-folded pure literals — no effects.
@@ -8212,6 +8382,7 @@ impl EffectScan<'_> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
         }
+        true
     }
 }
 
@@ -29938,6 +30109,64 @@ fn rejected() -> fn() -> i64 = loop {
             program.fn_types[loop_fn_id as usize].effect.get(),
             FnEffect::Impure,
             "the rejected impure function value must not join the loop-result effect boundary"
+        );
+    }
+
+    #[test]
+    fn effect_source_order_closure_matrix() {
+        let (program, diagnostics) = check(
+            "\
+fn pure(value: i64) -> i64 = value + 1
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn wrapper(value: i64) -> i64 {
+  f: fn(i64) -> i64 := loop {
+    break { break pure; impure }
+  }
+  return f(value)
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let callback = wrapper
+            .locals
+            .iter()
+            .find(|local| local.name == "f")
+            .expect("callback local");
+        let Ty::Fn(callback_id) = callback.ty else {
+            panic!("callback local must retain a function type");
+        };
+        let Stmt::Let { init, .. } = &wrapper.body.stmts[0] else {
+            panic!("wrapper callback binding");
+        };
+        let Ty::Fn(loop_id) = init.ty else {
+            panic!("loop result function type");
+        };
+        assert_eq!(
+            program.fn_types[callback_id as usize].effect.get(),
+            FnEffect::Pure,
+            "the inner accepted break must join pure while the dead outer payload tail stays excluded; loop={:?}, all={:?}",
+            program.fn_types[loop_id as usize].effect.get(),
+            program
+                .fn_types
+                .iter()
+                .map(|function| function.effect.get())
+                .collect::<Vec<_>>()
         );
     }
 

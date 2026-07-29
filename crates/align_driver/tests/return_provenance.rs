@@ -944,6 +944,83 @@ fn main() -> i32 {
 }
 
 #[test]
+fn terminating_and_mixed_break_payloads_preserve_typed_runtime_values() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+Choice { Left, Right }
+fn mixed_if(flag: bool) -> str = loop {
+  break if flag { break \"inner\"; \"dead\" } else { \"outer\" }
+}
+fn mixed_match(choice: Choice) -> str = loop {
+  break match choice {
+    Left => { break \"inner\"; \"dead\" }
+    Right => \"outer\"
+  }
+}
+fn mixed_else(value: Option<str>) -> str = loop {
+  break value else { break \"fallback\"; \"dead\" }
+}
+fn mixed_try(value: Result<str, Error>) -> Result<str, Error> {
+  result := loop { break value? }
+  return Ok(result)
+}
+fn mixed_short(flag: bool) -> bool = loop {
+  break flag || { break false; true }
+}
+fn main() -> i32 {
+  tried := mixed_try(Ok(\"try\")) else { return 99 }
+  short_score := if mixed_short(true) { 1 } else { 0 }
+  mut total := mixed_if(true).len()
+  total = total + mixed_if(false).len()
+  total = total + mixed_match(Choice.Left).len()
+  total = total + mixed_match(Choice.Right).len()
+  total = total + mixed_else(Some(\"some\")).len()
+  total = total + mixed_else(None).len()
+  total = total + tried.len()
+  total = total + short_score
+  return total as i32
+}
+";
+    let output = build_and_run("l2b-a1-terminating-break-copy", src);
+    assert_eq!(
+        output.status.code(),
+        Some(36),
+        "typed Copy loop results must survive inner termination: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn mixed_owned_break_payload_transfers_and_drops_once() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn select_owned(flag: bool) -> string = loop {
+  current := \"outer\".clone()
+  break {
+    if flag { break \"inner\".clone() }
+    current
+  }
+}
+fn main() -> i32 {
+  first := select_owned(true)
+  second := select_owned(false)
+  return (first.len() + second.len()) as i32
+}
+";
+    let output = build_and_run("l2b-a1-terminating-break-owned", src);
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "each selected owned loop result must transfer once and drop once: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn unrelated_direct_argument_no_longer_taints_call_result() {
     let src = "\
 fn fixed(input: str) -> str = \"fixed\"

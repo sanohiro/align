@@ -2686,6 +2686,33 @@ impl Builder {
     fn is_terminated(&self) -> bool {
         self.blocks[self.cur as usize].term.is_some()
     }
+
+    /// Whether the current block has a path from the function entry through terminators emitted so
+    /// far. Value-carrying control flow deliberately creates its join before lowering every arm;
+    /// when all arms terminate that join has no predecessor but also no terminator. Looking only at
+    /// `is_terminated` would therefore treat its placeholder Unit operand as a real continuation.
+    fn current_is_reachable(&self) -> bool {
+        let mut pending = vec![0];
+        let mut seen = vec![false; self.blocks.len()];
+        while let Some(block) = pending.pop() {
+            let index = block as usize;
+            if index >= self.blocks.len() || std::mem::replace(&mut seen[index], true) {
+                continue;
+            }
+            if block == self.cur {
+                return true;
+            }
+            match self.blocks[index].term.as_ref() {
+                Some(Term::Goto(target)) => pending.push(*target),
+                Some(Term::Branch(_, then_bb, else_bb)) => {
+                    pending.push(*then_bb);
+                    pending.push(*else_bb);
+                }
+                Some(Term::Return(_) | Term::Unreachable) | None => {}
+            }
+        }
+        false
+    }
 }
 
 fn lower_fn(
@@ -3576,9 +3603,25 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // `break e` ends the innermost loop: evaluate `e`, store it into the loop's result slot,
             // then jump to the loop's exit. A moved-out owned value has its source slot nulled so the
             // per-iteration drops below (and the exit cleanup) free null, not the transferred buffer.
+            let Some(frame) = b.loops.last() else {
+                // Checked HIR never marks an out-of-loop break accepted, but malformed direct
+                // callers must fail closed before evaluating its payload or inspecting a frame.
+                b.terminate(Term::Unreachable);
+                return;
+            };
+            let (result_slot, iter_drops, exit) =
+                (frame.result_slot, frame.iter_drops.clone(), frame.exit);
             let op = value.as_ref().map(|e| lower_expr(b, e));
-            let frame = b.loops.last().expect("`break` inside a `loop` (sema-checked)");
-            let (result_slot, iter_drops) = (frame.result_slot, frame.iter_drops.clone());
+            if b.is_terminated() {
+                return;
+            }
+            if !b.current_is_reachable() {
+                // An all-diverging `if`/`match` payload selects its zero-predecessor join after
+                // lowering. Mark that synthetic continuation unreachable so `lower_block` stops;
+                // the inner break/return/process edge remains the only real exit.
+                b.terminate(Term::Unreachable);
+                return;
+            }
             if let (Some(slot), Some(op)) = (result_slot, op) {
                 b.push(Stmt::Store(slot, op));
             }
@@ -3592,7 +3635,6 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             for s in &iter_drops {
                 b.emit_drop_if_live(*s);
             }
-            let exit = b.loops.last().unwrap().exit;
             b.terminate(Term::Goto(exit));
         }
         hir::Stmt::LetTuple { locals, init, .. } => {
@@ -12094,7 +12136,7 @@ fn bad() -> i32 {
             &mut diagnostics,
         );
         let file = parse_file(tokens, &mut diagnostics);
-        let hir = check_file(&file, &mut diagnostics);
+        let mut hir = check_file(&file, &mut diagnostics);
         assert!(
             diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
                 "`break` outside of a `loop`"
@@ -12130,6 +12172,217 @@ fn bad() -> i32 {
             1,
             "the rejected break must not manufacture a loop exit or unreachable continuation"
         );
+
+        let malformed_bad = hir
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "bad")
+            .expect("malformed bad function");
+        let hir::Stmt::Break { accepted, .. } = &mut malformed_bad.body.stmts[0] else {
+            panic!("bad first statement must remain a checked break");
+        };
+        *accepted = true;
+        let malformed = lower_program(&hir);
+        let malformed_bad = malformed
+            .fns
+            .iter()
+            .find(|function| function.name == "bad")
+            .expect("lowered malformed bad function");
+        assert_eq!(
+            malformed_bad.blocks.len(),
+            1,
+            "an accepted out-of-loop break must not create a frame or continuation"
+        );
+        assert!(
+            malformed_bad.blocks[0].stmts.is_empty()
+                && matches!(malformed_bad.blocks[0].term, Term::Unreachable),
+            "an accepted out-of-loop break must fail closed before evaluating its payload: {malformed_bad:#?}"
+        );
+    }
+
+    #[test]
+    fn terminating_break_payload_emits_no_outer_edge() {
+        let program = lower(
+            "\
+import std.process
+fn nested_break() -> str = loop {
+  break { break \"inner\"; \"outer\" }
+}
+fn returned() -> str = loop {
+  break { return \"returned\"; \"outer\" }
+}
+fn exited() -> str = loop {
+  break { process.exit(0); \"outer\" }
+}
+fn aborted() -> str = loop {
+  break { process.abort(); \"outer\" }
+}
+fn all_diverging(flag: bool) -> str = loop {
+  break if flag {
+    break \"left\"
+    \"dead-left\"
+  } else {
+    break \"right\"
+    \"dead-right\"
+  }
+}
+Choice { Left, Right }
+fn all_diverging_match(choice: Choice) -> str = loop {
+  break match choice {
+    Left => { break \"left\"; \"dead-left\" }
+    Right => { break \"right\"; \"dead-right\" }
+  }
+}
+fn diverging_loop() -> str = loop {
+  break loop { process.abort() }
+}
+fn unsafe_payload() -> str = loop {
+  break unsafe { process.abort(); \"dead\" }
+}
+fn arena_payload() -> str = loop {
+  break arena { process.abort(); \"dead\" }
+}
+fn task_group_payload() -> str = loop {
+  break task_group { process.abort(); \"dead\" }
+}
+fn main() -> i32 = 0
+",
+        );
+        for name in [
+            "nested_break",
+            "returned",
+            "exited",
+            "aborted",
+            "all_diverging",
+            "all_diverging_match",
+            "diverging_loop",
+            "unsafe_payload",
+            "arena_payload",
+            "task_group_payload",
+        ] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            assert!(
+                function.blocks.iter().flat_map(|block| &block.stmts).all(
+                    |statement| !matches!(
+                        statement,
+                        Stmt::Store(_, Operand::Const(Const::Unit))
+                    )
+                ),
+                "{name} must not store a placeholder Unit after its payload terminated: {function:#?}"
+            );
+        }
+        let nested = program
+            .fns
+            .iter()
+            .find(|function| function.name == "nested_break")
+            .expect("nested_break function");
+        let str_stores = nested
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Store(slot, _)
+                        if nested.slots.get(*slot as usize) == Some(&Ty::Str)
+                )
+            })
+            .count();
+        assert_eq!(
+            str_stores, 1,
+            "only the inner accepted break may store the loop result: {nested:#?}"
+        );
+    }
+
+    #[test]
+    fn mixed_break_payload_preserves_outer_edge() {
+        let program = lower(
+            "\
+fn mixed_if(flag: bool) -> str = loop {
+  break if flag {
+    break \"inner\"
+    \"dead\"
+  } else {
+    \"outer\"
+  }
+}
+Choice { Left, Right }
+fn mixed_match(choice: Choice) -> str = loop {
+  break match choice {
+    Left => { break \"inner\"; \"dead\" }
+    Right => \"outer\"
+  }
+}
+fn mixed_else(value: Option<str>) -> str = loop {
+  break value else { break \"fallback\"; \"dead\" }
+}
+fn mixed_try(value: Result<str, Error>) -> Result<str, Error> {
+  result := loop { break value? }
+  return Ok(result)
+}
+fn nested_loop() -> str = loop {
+  break loop { break \"nested\" }
+}
+fn short_path(flag: bool) -> bool = loop {
+  break flag || { break false; true }
+}
+fn main() -> i32 = 0
+",
+        );
+        let mixed = program
+            .fns
+            .iter()
+            .find(|function| function.name == "mixed_if")
+            .expect("mixed_if function");
+        let mut str_stores = mixed
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| **ty == Ty::Str)
+            .map(|(slot, _)| {
+                mixed
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .filter(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Store(target, _) if *target as usize == slot
+                        )
+                    })
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        str_stores.sort_unstable();
+        assert_eq!(
+            str_stores,
+            vec![1, 2],
+            "the branch join stores its fallthrough value once, while the outer loop slot receives the inner and outer selected edges: {mixed:#?}"
+        );
+        for name in [
+            "mixed_match",
+            "mixed_else",
+            "mixed_try",
+            "nested_loop",
+            "short_path",
+        ] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.term, Term::Return(Some(_)))),
+                "{name} must retain a real continuation to its function return: {function:#?}"
+            );
+        }
     }
 
     #[test]

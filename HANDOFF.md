@@ -268,8 +268,12 @@ consume provenance whose producer semantics are not yet closed. The closure matr
 keeps this as the smallest independently correct vertical slice. The final local provenance
 preflight also carries checker-owned break acceptance into HIR so region-rejected recovery syntax
 cannot manufacture an effect, escape, ownership, provenance, or MIR loop-exit edge. The final local
-provenance benchmark on Apple Silicon reports 1.936 ms/check and 22,848 interface bytes for summary
-inference, plus 1.999 ms/import for semantic import validation. Do not begin a
+review then reopened the closure matrix for termination inside an accepted break payload:
+effect inference now stops every eager/source-order boundary action after termination, and MIR
+emits an outer result/cleanup edge only from a reachable continuation. Copy `str`, owned `string`,
+mixed control-flow, process termination, and malformed-HIR owners cover the correction. The final
+local provenance benchmark on Apple Silicon reports 1.929 ms/check and 22,848 interface bytes for
+summary inference, plus 1.893 ms/import for semantic import validation. Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
 borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b
