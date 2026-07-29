@@ -365,7 +365,12 @@ The load-bearing decision is **how capture works**. A lambda that captures an en
 does *not* allocate a hidden closure environment: it is lifted to an ordinary function whose
 captured values become extra parameters, passed at the call site. So a captured pipeline lambda
 fuses into the same counted loop as a named function and carries zero allocation — the capture is
-just a loop-invariant argument the backend hoists. This keeps lambdas inside the existing
+just a loop-invariant argument. The compiler snapshots each stage capture once when that written
+stage is formed, evaluates later terminal arguments, then snapshots terminal/reducer captures; the
+fused loop reuses those SSA operands. It never delegates capture timing to an optimizer by emitting
+an enclosing-local reload per iteration. A view snapshot keeps its owner dependency across the
+intervening arguments, so an ownership-changing `init` is rejected rather than leaving a dangling
+callback argument. This keeps lambdas inside the existing
 guarantees rather than introducing a new cost class: **Nothing hidden** (no silent heap
 environment), **Predictable performance** (a lambda is never secretly slower than the named
 equivalent), and **Compiler-friendly** (the optimizer sees a direct call, not an indirect one

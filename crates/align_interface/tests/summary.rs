@@ -4,9 +4,11 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    build_summaries, deserialize, encode_interface_surface, serialize, validate_for_import,
-    DecodeError, Effect, Hash128, IType, ImportCompatibilityError, InterfaceSummary, ParamMode,
-    ReturnBorrowSummary, ReturnRegionSummary, FORMAT_VERSION,
+    DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ITypeParam,
+    ImportCompatibilityError,
+    InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
+    deserialize, encode_interface_surface, serialize, summary_to_source,
+    validate_for_import,
 };
 
 /// One in-memory source module for a test program.
@@ -18,6 +20,105 @@ struct Unit {
 
 fn unit(path: &'static str, is_entry: bool, src: impl Into<String>) -> Unit {
     Unit { path, is_entry, src: src.into() }
+}
+
+fn render_test_type(ty: &IType) -> String {
+    match ty {
+        IType::Named { path, args } => {
+            if args.is_empty() {
+                path.clone()
+            } else {
+                format!(
+                    "{path}<{}>",
+                    args.iter()
+                        .map(render_test_type)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        IType::Tuple(elements) => format!(
+            "({})",
+            elements
+                .iter()
+                .map(render_test_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        IType::Fn { params, ret, .. } => {
+            let params = params
+                .iter()
+                .map(|param| {
+                    let mode = match param.mode {
+                        ParamMode::ByValue => "",
+                        ParamMode::Out => "out ",
+                        ParamMode::Borrow => "borrow ",
+                        ParamMode::BorrowMut => "borrow mut ",
+                    };
+                    format!("{mode}{}", render_test_type(&param.ty))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("fn({params}) -> {}", render_test_type(ret))
+        }
+    }
+}
+
+fn render_test_type_params(params: &[ITypeParam]) -> String {
+    let params = params
+        .iter()
+        .map(|param| match &param.bound {
+            Some(bound) => format!("{}: {bound}", param.name),
+            None => param.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{params}>")
+}
+
+fn sync_generic_type_bodies(summary: &mut InterfaceSummary) {
+    for structure in &mut summary.structs {
+        if structure.type_params.is_empty() {
+            continue;
+        }
+        let mut body = format!(
+            "{}{} {{\n",
+            structure.name,
+            render_test_type_params(&structure.type_params)
+        );
+        for (name, ty) in &structure.fields {
+            body.push_str(&format!("  {name}: {},\n", render_test_type(ty)));
+        }
+        body.push('}');
+        structure.generic_body = Some(body);
+    }
+    for enumeration in &mut summary.enums {
+        if enumeration.type_params.is_empty() {
+            continue;
+        }
+        let mut body = format!(
+            "{}{} {{\n",
+            enumeration.name,
+            render_test_type_params(&enumeration.type_params)
+        );
+        for (name, payload) in &enumeration.variants {
+            body.push_str(&format!("  {name}"));
+            if !payload.is_empty() {
+                body.push('(');
+                body.push_str(
+                    &payload
+                        .iter()
+                        .map(render_test_type)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                body.push(')');
+            }
+            body.push_str(",\n");
+        }
+        body.push('}');
+        enumeration.generic_body = Some(body);
+    }
 }
 
 /// Parse + check + lower the given units and build their interface summaries. Asserts the program
@@ -611,24 +712,1335 @@ fn out_param_marker_is_recorded() {
 
 #[test]
 fn parameter_mode_and_return_summaries_have_canonical_codec_identity() {
-    let base = one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n");
+    let base = one(
+        "pub fn inspect(first: slice<i64>, second: slice<i64>) -> slice<i64> = first\nfn main() -> i32 = 0\n",
+    );
+    assert_eq!(
+        base[0].fns[0].return_borrow,
+        ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+        "the producer records the selected parameter root"
+    );
     let mut mode = base[0].clone();
     mode.fns[0].params[0].mode = ParamMode::Out;
     rehash(&mut mode);
     assert_ne!(base[0].interface_hash, mode.interface_hash, "parameter mode is hash identity");
 
     let mut roots = base[0].clone();
-    roots.fns[0].return_borrow =
-        ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] };
+    roots.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![1],
+        captures: vec![],
+    };
+    roots.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![1],
+        captures: vec![],
+    };
     rehash(&mut roots);
-    assert_ne!(base[0].interface_hash, roots.interface_hash, "return-borrow roots are hash identity");
+    assert_ne!(base[0].interface_hash, roots.interface_hash, "return roots are hash identity");
     assert_ne!(mode.interface_hash, roots.interface_hash, "mode and summary encode independently");
     let decoded = deserialize(&serialize(&roots)).expect("known canonical summary tag round-trips");
     assert_eq!(decoded, roots);
     assert_eq!(
         validate_for_import(&decoded),
-        Err(ImportCompatibilityError::UnsupportedReturnBorrow),
-        "codec recognition must not enable L2b semantics"
+        Ok(()),
+        "L2b consumes canonical return summaries"
+    );
+}
+
+#[test]
+fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
+    let mut non_borrowing_return =
+        one("pub fn inspect(value: str) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    non_borrowing_return.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    non_borrowing_return.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_return),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut non_borrowing_root =
+        one("pub fn inspect(value: i64) -> str = \"fixed\"\nfn main() -> i32 = 0\n").remove(0);
+    non_borrowing_root.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    non_borrowing_root.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_root),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0))
+    );
+
+    non_borrowing_root.fns[0].params[0].ty = IType::Named {
+        path: "buffer".to_string(),
+        args: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_root),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "owned builtin handles must not be mistaken for generic nominal types"
+    );
+
+    for builtin in ["Error", "argon2_params", "regex_match"] {
+        let mut builtin_root = non_borrowing_root.clone();
+        builtin_root.fns[0].params[0].ty = IType::Named {
+            path: builtin.to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            validate_for_import(&builtin_root),
+            Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+            "compiler-known non-borrowing builtin parameter `{builtin}` must reject provenance"
+        );
+
+        let mut builtin_return = non_borrowing_return.clone();
+        builtin_return.fns[0].ret = IType::Named {
+            path: builtin.to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            validate_for_import(&builtin_return),
+            Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType),
+            "compiler-known non-borrowing builtin return `{builtin}` must reject provenance"
+        );
+    }
+}
+
+#[test]
+fn semantic_import_rejects_disagreeing_l2b_a1_summaries() {
+    let mut summary =
+        one("pub fn inspect(value: str) -> str = value\nfn main() -> i32 = 0\n").remove(0);
+    summary.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::ReturnSummaryDisagreement)
+    );
+}
+
+#[test]
+fn semantic_import_does_not_resolve_foreign_qualified_nominals_as_local() {
+    let mut summary = one(
+        "pub Payload { value: i64 }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let foreign = IType::Named {
+        path: "dep.Payload".to_string(),
+        args: vec![],
+    };
+    summary.fns[0].params[0].ty = foreign.clone();
+    summary.fns[0].ret = foreign;
+    assert_eq!(
+        validate_for_import(&summary),
+        Ok(()),
+        "an unresolved foreign nominal remains conservatively borrow-capable even when this interface defines a scalar local type with the same bare name"
+    );
+}
+
+#[test]
+fn semantic_import_substitutes_local_generic_nominal_arguments() {
+    let mut base = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let wrapper = base
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    let mut inner = wrapper.clone();
+    inner.name = "Inner".to_string();
+    let mut outer = wrapper;
+    outer.name = "Outer".to_string();
+    outer.fields[0].1 = IType::Named {
+        path: "Inner".to_string(),
+        args: vec![IType::Named {
+            path: "T".to_string(),
+            args: vec![],
+        }],
+    };
+    base.structs.extend([inner, outer]);
+    sync_generic_type_bodies(&mut base);
+    let named = |path: &str, argument: &str| IType::Named {
+        path: path.to_string(),
+        args: vec![IType::Named {
+            path: argument.to_string(),
+            args: vec![],
+        }],
+    };
+
+    let mut scalar_parameter = base.clone();
+    scalar_parameter.fns[0].params[0].ty = named("Wrapper", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_parameter),
+        Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0))
+    );
+
+    let mut scalar_struct_return = base.clone();
+    scalar_struct_return.fns[0].ret = named("Wrapper", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_struct_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut scalar_enum_return = base.clone();
+    scalar_enum_return.fns[0].ret = named("Choice", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_enum_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut nested_scalar_return = base.clone();
+    nested_scalar_return.fns[0].ret = named("Outer", "i64");
+    assert_eq!(
+        validate_for_import(&nested_scalar_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut borrowing = base;
+    borrowing.fns[0].params[0].ty = named("Outer", "str");
+    borrowing.fns[0].ret = named("Choice", "str");
+    assert_eq!(validate_for_import(&borrowing), Ok(()));
+}
+
+#[test]
+fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
+    let mut summary = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let template = summary
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    let named = |path: &str, args: Vec<IType>| IType::Named {
+        path: path.to_string(),
+        args,
+    };
+    let parameter = || named("T", vec![]);
+
+    let mut a = template.clone();
+    a.name = "A".to_string();
+    a.fields = vec![(
+        "bs".to_string(),
+        named("array", vec![named("B", vec![parameter()])]),
+    )];
+
+    let mut b = template;
+    b.name = "B".to_string();
+    b.fields = vec![
+        (
+            "links".to_string(),
+            named("array", vec![named("A", vec![named("str", vec![])])]),
+        ),
+        ("value".to_string(), parameter()),
+    ];
+    summary.structs.extend([a, b]);
+    sync_generic_type_bodies(&mut summary);
+
+    let root = named("A", vec![named("i64", vec![])]);
+    summary.fns[0].params[0].ty = root.clone();
+    summary.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&summary),
+        Ok(()),
+        "`B<i64>` and `B<str>` are distinct concrete capability nodes; the latter exposes the reachable `str` leaf"
+    );
+
+    let mut finite = summary.clone();
+    let mut shift = finite
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    shift.name = "FiniteShift".to_string();
+    let mut second_parameter = shift.type_params[0].clone();
+    second_parameter.name = "U".to_string();
+    shift.type_params.push(second_parameter);
+    shift.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "FiniteShift",
+                vec![
+                    named("T", vec![]),
+                    named("Option", vec![named("str", vec![])]),
+                ],
+            ),
+        ),
+        ("value".to_string(), named("U", vec![])),
+    ];
+    finite.structs.push(shift);
+    sync_generic_type_bodies(&mut finite);
+    let root = named(
+        "FiniteShift",
+        vec![named("i64", vec![]), named("bool", vec![])],
+    );
+    finite.fns[0].params[0].ty = root.clone();
+    finite.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&finite),
+        Ok(()),
+        "preserving one argument while replacing another with a larger constant type reaches an exact finite cycle"
+    );
+
+    let mut finite_constant = summary.clone();
+    let mut constant = finite_constant
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    constant.name = "FiniteConstant".to_string();
+    constant.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "FiniteConstant",
+                vec![named("Option", vec![named("i64", vec![])])],
+            ),
+        ),
+        ("view".to_string(), named("str", vec![])),
+    ];
+    finite_constant.structs.push(constant);
+    sync_generic_type_bodies(&mut finite_constant);
+    let root = named("FiniteConstant", vec![named("i64", vec![])]);
+    finite_constant.fns[0].params[0].ty = root.clone();
+    finite_constant.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&finite_constant),
+        Ok(()),
+        "a larger constant actual that happens to contain the prior concrete type is not parameter-driven growth"
+    );
+
+    let mut generative = summary.clone();
+    let mut grow = generative
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    grow.name = "Grow".to_string();
+    grow.fields = vec![
+        (
+            "next".to_string(),
+            named(
+                "Grow",
+                vec![named("Option", vec![named("T", vec![])])],
+            ),
+        ),
+        ("view".to_string(), named("str", vec![])),
+    ];
+    generative.structs.push(grow);
+    sync_generic_type_bodies(&mut generative);
+    let root = named("Grow", vec![named("i64", vec![])]);
+    generative.fns[0].params[0].ty = root.clone();
+    generative.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a struct argument that embeds and grows its prior actual must reject even after a borrowing leaf is found"
+    );
+
+    let mut empty_summary = generative.clone();
+    empty_summary.fns[0].return_borrow = ReturnBorrowSummary::None;
+    empty_summary.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&empty_summary),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an empty provenance summary must not skip signature type-graph validation"
+    );
+
+    let mut unreferenced = generative;
+    unreferenced.fns[0].params[0].ty = named("str", vec![]);
+    unreferenced.fns[0].ret = named("str", vec![]);
+    unreferenced.fns[0].return_borrow = ReturnBorrowSummary::None;
+    unreferenced.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&unreferenced),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an unreferenced public definition must still have a finite capability graph"
+    );
+
+    let mut generative_pair = summary.clone();
+    let mut grow = generative_pair
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    grow.name = "GrowPair".to_string();
+    let mut second_parameter = grow.type_params[0].clone();
+    second_parameter.name = "U".to_string();
+    grow.type_params.push(second_parameter);
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "GrowPair",
+            vec![
+                named("Option", vec![named("U", vec![])]),
+                named("T", vec![]),
+            ],
+        ),
+    )];
+    generative_pair.structs.push(grow);
+    sync_generic_type_bodies(&mut generative_pair);
+    let root = named(
+        "GrowPair",
+        vec![named("i64", vec![]), named("bool", vec![])],
+    );
+    generative_pair.fns[0].params[0].ty = root.clone();
+    generative_pair.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative_pair),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a growing permutation of all prior arguments must reject"
+    );
+
+    let mut generative_enum = summary;
+    let mut grow = generative_enum
+        .enums
+        .iter()
+        .find(|definition| definition.name == "Choice")
+        .expect("Choice definition")
+        .clone();
+    grow.name = "GrowChoice".to_string();
+    grow.variants = vec![
+        (
+            "Next".to_string(),
+            vec![named(
+                "GrowChoice",
+                vec![named("Option", vec![named("T", vec![])])],
+            )],
+        ),
+        ("View".to_string(), vec![named("str", vec![])]),
+    ];
+    generative_enum.enums.push(grow);
+    sync_generic_type_bodies(&mut generative_enum);
+    let root = named("GrowChoice", vec![named("i64", vec![])]);
+    generative_enum.fns[0].params[0].ty = root.clone();
+    generative_enum.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&generative_enum),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an enum argument that embeds and grows its prior actual must reject even after a borrowing leaf is found"
+    );
+}
+
+#[test]
+fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
+    let base = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub Leaf { view: str }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let template = base
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    let named = |path: &str, args: Vec<IType>| IType::Named {
+        path: path.to_string(),
+        args,
+    };
+    let parameter = |name: &str| named(name, vec![]);
+
+    let mut whole_actual = base.clone();
+    let root = named("Wrapper", vec![named("Leaf", vec![])]);
+    whole_actual.fns[0].params[0].ty = root.clone();
+    whole_actual.fns[0].ret = root;
+    assert_eq!(
+        validate_for_import(&whole_actual),
+        Ok(()),
+        "an ordinary whole local nominal actual is finite and borrow-capable"
+    );
+
+    let mut converge = base.clone();
+    let mut definition = template.clone();
+    definition.name = "Converge".to_string();
+    let mut second = definition.type_params[0].clone();
+    second.name = "U".to_string();
+    definition.type_params.push(second);
+    definition.fields = vec![(
+        "next".to_string(),
+        named(
+            "Converge",
+            vec![
+                named("Option", vec![parameter("U")]),
+                named("str", vec![]),
+            ],
+        ),
+    )];
+    converge.structs.push(definition);
+    sync_generic_type_bodies(&mut converge);
+    assert_eq!(
+        validate_for_import(&converge),
+        Ok(()),
+        "the wrapped parameter moves into a slot that the next transition replaces"
+    );
+
+    let mut exposed = base.clone();
+    let mut identity = template.clone();
+    identity.name = "Id".to_string();
+    let mut grow = template.clone();
+    grow.name = "GrowThroughId".to_string();
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "Id",
+            vec![named(
+                "GrowThroughId",
+                vec![named("Option", vec![parameter("T")])],
+            )],
+        ),
+    )];
+    exposed.structs.extend([identity, grow]);
+    sync_generic_type_bodies(&mut exposed);
+    assert_eq!(
+        validate_for_import(&exposed),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "Id exposes its whole actual and reveals the positive recursive edge"
+    );
+
+    let mut hidden = base.clone();
+    let mut sink = template.clone();
+    sink.name = "Sink".to_string();
+    sink.fields[0].1 = named("i64", vec![]);
+    let mut grow = template.clone();
+    grow.name = "HiddenBySink".to_string();
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "Sink",
+            vec![named(
+                "HiddenBySink",
+                vec![named("Option", vec![parameter("T")])],
+            )],
+        ),
+    )];
+    hidden.structs.extend([sink, grow]);
+    sync_generic_type_bodies(&mut hidden);
+    assert_eq!(
+        validate_for_import(&hidden),
+        Ok(()),
+        "Sink removes its actual from capability traversal"
+    );
+
+    let mut direct_opaque_growth = base.clone();
+    let mut grow = template.clone();
+    grow.name = "OpaqueGrow".to_string();
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "OpaqueGrow",
+            vec![named("box", vec![parameter("T")])],
+        ),
+    )];
+    direct_opaque_growth.structs.push(grow);
+    sync_generic_type_bodies(&mut direct_opaque_growth);
+    assert_eq!(
+        validate_for_import(&direct_opaque_growth),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a direct actual measures its complete syntax even when its outer constructor is opaque"
+    );
+
+    for (name, suffix, opaque) in [
+        (
+            "box",
+            "Box",
+            named("box", vec![parameter("T")]),
+        ),
+        (
+            "function type",
+            "Fn",
+            IType::Fn {
+                params: vec![IParam {
+                    mode: ParamMode::ByValue,
+                    ty: parameter("T"),
+                }],
+                ret: Box::new(parameter("T")),
+                return_borrow: ReturnBorrowSummary::None,
+                return_region: ReturnRegionSummary::None,
+            },
+        ),
+    ] {
+        let mut composed = base.clone();
+        let mut identity = template.clone();
+        identity.name = format!("IdThrough{suffix}");
+        let mut shield = template.clone();
+        shield.name = format!("ShieldThrough{suffix}");
+        shield.fields = vec![(
+            "value".to_string(),
+            named(&identity.name, vec![opaque]),
+        )];
+        let mut consumer = template.clone();
+        consumer.name = format!("ConsumerThrough{suffix}");
+        consumer.fields = vec![(
+            "next".to_string(),
+            named(
+                &shield.name,
+                vec![named(
+                    &consumer.name,
+                    vec![named("Option", vec![parameter("T")])],
+                )],
+            ),
+        )];
+        composed.structs.extend([identity, shield, consumer]);
+        sync_generic_type_bodies(&mut composed);
+        assert_eq!(
+            validate_for_import(&composed),
+            Ok(()),
+            "{name} below an exposed local actual must stop transport before an enclosing consumer"
+        );
+    }
+
+    let mut nested_opaque = base;
+    let mut identity = template.clone();
+    identity.name = "OpaqueId".to_string();
+    let mut cycle = template;
+    cycle.name = "OpaqueBoundary".to_string();
+    cycle.fields = vec![(
+        "next".to_string(),
+        named(
+            "OpaqueId",
+            vec![named(
+                "box",
+                vec![named("OpaqueBoundary", vec![parameter("T")])],
+            )],
+        ),
+    )];
+    nested_opaque.structs.extend([identity, cycle]);
+    sync_generic_type_bodies(&mut nested_opaque);
+    assert_eq!(
+        validate_for_import(&nested_opaque),
+        Ok(()),
+        "dependency discovery stops below an exposed opaque actual"
+    );
+}
+
+#[test]
+fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
+    let base = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let template = base.structs[0].clone();
+    let named = |path: &str, args: Vec<IType>| IType::Named {
+        path: path.to_string(),
+        args,
+    };
+    let parameter = |name: &str| named(name, vec![]);
+
+    let mut borrow_free = base.clone();
+    let mut grow = template.clone();
+    grow.name = "BorrowFreeGrow".to_string();
+    grow.fields = vec![(
+        "next".to_string(),
+        named(
+            "BorrowFreeGrow",
+            vec![named("Option", vec![parameter("T")])],
+        ),
+    )];
+    borrow_free.structs.push(grow);
+    sync_generic_type_bodies(&mut borrow_free);
+    assert_eq!(
+        validate_for_import(&borrow_free),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "growth transport remains live even when the borrow summary is empty"
+    );
+
+    let mut mutual = base.clone();
+    let mut left = template.clone();
+    left.name = "MutualLeft".to_string();
+    left.fields = vec![(
+        "next".to_string(),
+        named(
+            "MutualRight",
+            vec![named("Option", vec![parameter("T")])],
+        ),
+    )];
+    let mut right = template.clone();
+    right.name = "MutualRight".to_string();
+    right.type_params[0].name = "U".to_string();
+    right.fields = vec![(
+        "next".to_string(),
+        named("MutualLeft", vec![parameter("U")]),
+    )];
+    mutual.structs.extend([left, right]);
+    sync_generic_type_bodies(&mut mutual);
+    assert_eq!(
+        validate_for_import(&mutual),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a positive edge in a mutual dependency SCC rejects"
+    );
+
+    let mut zero_cycle = base.clone();
+    let mut left = template.clone();
+    left.name = "ZeroLeft".to_string();
+    left.fields = vec![(
+        "next".to_string(),
+        named("ZeroRight", vec![parameter("T")]),
+    )];
+    let mut right = template.clone();
+    right.name = "ZeroRight".to_string();
+    right.type_params[0].name = "U".to_string();
+    right.fields = vec![(
+        "next".to_string(),
+        named("ZeroLeft", vec![parameter("U")]),
+    )];
+    zero_cycle.structs.extend([left, right]);
+    sync_generic_type_bodies(&mut zero_cycle);
+    assert_eq!(
+        validate_for_import(&zero_cycle),
+        Ok(()),
+        "a zero-weight mutual cycle is finite"
+    );
+
+    let mut permutation = base.clone();
+    let mut swap = template.clone();
+    swap.name = "Swap".to_string();
+    let mut second = swap.type_params[0].clone();
+    second.name = "U".to_string();
+    swap.type_params.push(second);
+    swap.fields = vec![(
+        "next".to_string(),
+        named("Swap", vec![parameter("U"), parameter("T")]),
+    )];
+    permutation.structs.push(swap);
+    sync_generic_type_bodies(&mut permutation);
+    assert_eq!(
+        validate_for_import(&permutation),
+        Ok(()),
+        "a zero-weight parameter permutation is finite"
+    );
+
+    let mut duplication = base.clone();
+    let mut duplicate = template.clone();
+    duplicate.name = "Duplicate".to_string();
+    let mut second = duplicate.type_params[0].clone();
+    second.name = "U".to_string();
+    duplicate.type_params.push(second);
+    duplicate.fields = vec![(
+        "next".to_string(),
+        named("Duplicate", vec![parameter("T"), parameter("T")]),
+    )];
+    duplication.structs.push(duplicate);
+    sync_generic_type_bodies(&mut duplication);
+    assert_eq!(
+        validate_for_import(&duplication),
+        Ok(()),
+        "zero-weight duplication into a slot removed by the greatest fixed point is finite"
+    );
+
+    let mut parallel = base;
+    let mut grow = template;
+    grow.name = "ParallelEdges".to_string();
+    grow.fields = vec![
+        (
+            "same".to_string(),
+            named("ParallelEdges", vec![parameter("T")]),
+        ),
+        (
+            "larger".to_string(),
+            named(
+                "ParallelEdges",
+                vec![named("Option", vec![parameter("T")])],
+            ),
+        ),
+    ];
+    parallel.structs.push(grow);
+    sync_generic_type_bodies(&mut parallel);
+    assert_eq!(
+        validate_for_import(&parallel),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "a positive parallel edge must not be deduplicated behind a zero edge"
+    );
+}
+
+#[test]
+fn compiler_produced_builtin_name_collisions_follow_source_resolution_precedence() {
+    let units = [
+        unit(
+            "names",
+            false,
+            "\
+module names
+pub Option { value: i64 }
+pub Task { value: i64 }
+pub Combined {
+  builtin_value: Option<str>,
+  local_option: names.Option,
+  local_task: Task,
+}
+",
+        ),
+        unit(
+            "params",
+            false,
+            "\
+module params
+pub BuiltinHolder<Option> { value: Option<str> }
+pub BuiltinChoice<Option> { Some(Option<str>) }
+pub fn builtin<Option>(value: Option<str>) -> Option<str> = value
+",
+        ),
+        unit(
+            "main",
+            true,
+            "import names\nimport params\nfn main() -> i32 = 0\n",
+        ),
+    ];
+    let produced = summaries(&units);
+    let names = find(&produced, "names");
+    assert_eq!(
+        validate_for_import(names),
+        Ok(()),
+        "every compiler-produced public name collision must remain importable"
+    );
+    assert_eq!(
+        validate_for_import(find(&produced, "params")),
+        Ok(()),
+        "a non-shadowing type parameter may reuse a source-builtin spelling"
+    );
+
+    let json_units = [
+        unit(
+            "json",
+            false,
+            "\
+module json
+pub doc { value: i64 }
+pub Row { value: i64 }
+pub fn local(value: doc) -> doc = value
+pub fn builtins(
+  document: json.doc,
+  kind: json.kind,
+  scanner: json.scanner<Row>,
+) -> i64 = 0
+",
+        ),
+        unit("main", true, "import json\nfn main() -> i32 = 0\n"),
+    ];
+    let produced = summaries(&json_units);
+    assert_eq!(
+        validate_for_import(find(&produced, "json")),
+        Ok(()),
+        "qualified json builtins must retain precedence over a same-unit local `doc`"
+    );
+}
+
+#[test]
+fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
+    let base = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let named = |path: &str, args: Vec<IType>| IType::Named {
+        path: path.to_string(),
+        args,
+    };
+
+    for reserved in ["Error", "argon2_params", "regex_match"] {
+        let mut reserved_struct = base.clone();
+        reserved_struct.structs[0].name = reserved.to_string();
+        assert_eq!(
+            validate_for_import(&reserved_struct),
+            Err(ImportCompatibilityError::ReservedLocalType(
+                reserved.to_string()
+            )),
+            "producer-reserved struct name `{reserved}` must reject before type-shape validation"
+        );
+
+        let mut reserved_enum = base.clone();
+        let mut enumeration =
+            one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
+        enumeration.name = reserved.to_string();
+        reserved_enum.enums.push(enumeration);
+        assert_eq!(
+            validate_for_import(&reserved_enum),
+            Err(ImportCompatibilityError::ReservedLocalType(
+                reserved.to_string()
+            )),
+            "producer-reserved sum-type name `{reserved}` must reject before type-shape validation"
+        );
+    }
+
+    let mut reserved_before_duplicate = base.clone();
+    reserved_before_duplicate.structs[0].name = "Error".to_string();
+    reserved_before_duplicate
+        .structs
+        .push(reserved_before_duplicate.structs[0].clone());
+    assert_eq!(
+        validate_for_import(&reserved_before_duplicate),
+        Err(ImportCompatibilityError::ReservedLocalType(
+            "Error".to_string()
+        )),
+        "reserved-local validation precedes duplicate-local validation"
+    );
+
+    let mut later_reserved_after_duplicate = base.clone();
+    later_reserved_after_duplicate
+        .structs
+        .push(later_reserved_after_duplicate.structs[0].clone());
+    let mut reserved_enum =
+        one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
+    reserved_enum.name = "Error".to_string();
+    later_reserved_after_duplicate.enums.push(reserved_enum);
+    assert_eq!(
+        validate_for_import(&later_reserved_after_duplicate),
+        Err(ImportCompatibilityError::ReservedLocalType(
+            "Error".to_string()
+        )),
+        "the complete definition set must be scanned for reserved names before an earlier duplicate"
+    );
+
+    let mut duplicate_local = base.clone();
+    duplicate_local.structs.push(duplicate_local.structs[0].clone());
+    duplicate_local.fns[0].params[0].ty = named("Missing", vec![]);
+    assert_eq!(
+        validate_for_import(&duplicate_local),
+        Err(ImportCompatibilityError::DuplicateLocalType(
+            "Wrapper".to_string()
+        )),
+        "definition-index errors precede all type-shape errors"
+    );
+
+    let mut cross_kind_collision = base.clone();
+    let mut enumeration =
+        one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
+    enumeration.name = "Wrapper".to_string();
+    cross_kind_collision.enums.push(enumeration);
+    assert_eq!(
+        validate_for_import(&cross_kind_collision),
+        Err(ImportCompatibilityError::DuplicateLocalType(
+            "Wrapper".to_string()
+        )),
+        "struct and enum names share one exact local-definition namespace"
+    );
+
+    let mut duplicate_parameter = base.clone();
+    let duplicate = duplicate_parameter.structs[0].type_params[0].clone();
+    duplicate_parameter.structs[0].type_params.push(duplicate);
+    assert_eq!(
+        validate_for_import(&duplicate_parameter),
+        Err(ImportCompatibilityError::DuplicateTypeParameter(
+            "T".to_string()
+        ))
+    );
+
+    let type_parameter = |name: &str| ITypeParam {
+        name: name.to_string(),
+        bound: None,
+    };
+    let mut function_shadow = base.clone();
+    function_shadow.fns[0].type_params = vec![type_parameter("Wrapper")];
+    function_shadow.fns[0].generic_body =
+        Some("pub fn identity<Wrapper>(value: str) -> str = value".to_string());
+    assert_eq!(
+        validate_for_import(&function_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut struct_shadow = base.clone();
+    struct_shadow.structs[0].type_params = vec![type_parameter("Wrapper")];
+    assert_eq!(
+        validate_for_import(&struct_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut enum_shadow = base.clone();
+    let mut generic_enum =
+        one("pub Choice<T> { Some(T) }\nfn main() -> i32 = 0\n")
+            .remove(0)
+            .enums
+            .remove(0);
+    generic_enum.type_params = vec![type_parameter("Wrapper")];
+    enum_shadow.enums.push(generic_enum);
+    assert_eq!(
+        validate_for_import(&enum_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut duplicate_and_shadow = function_shadow;
+    duplicate_and_shadow.fns[0].type_params =
+        vec![type_parameter("Wrapper"), type_parameter("Wrapper")];
+    assert_eq!(
+        validate_for_import(&duplicate_and_shadow),
+        Err(ImportCompatibilityError::DuplicateTypeParameter(
+            "Wrapper".to_string()
+        )),
+        "duplicate type parameters precede local-type shadowing"
+    );
+
+    let mut parameter_arguments = base.clone();
+    parameter_arguments.structs[0].fields[0].1 =
+        named("T", vec![named("i64", vec![])]);
+    assert_eq!(
+        validate_for_import(&parameter_arguments),
+        Err(ImportCompatibilityError::TypeParameterWithArguments(
+            "T".to_string()
+        ))
+    );
+
+    let mut local_arity = base.clone();
+    local_arity.fns[0].params[0].ty = named("Wrapper", vec![]);
+    assert_eq!(
+        validate_for_import(&local_arity),
+        Err(ImportCompatibilityError::InvalidTypeArity {
+            name: "Wrapper".to_string(),
+            expected: 1,
+            actual: 0,
+        })
+    );
+
+    let mut builtin_arity = base.clone();
+    builtin_arity.fns[0].params[0].ty =
+        named("Result", vec![named("str", vec![])]);
+    assert_eq!(
+        validate_for_import(&builtin_arity),
+        Err(ImportCompatibilityError::InvalidTypeArity {
+            name: "Result".to_string(),
+            expected: 2,
+            actual: 1,
+        })
+    );
+
+    let mut unresolved = base.clone();
+    unresolved.fns[0].params[0].mode = ParamMode::Borrow;
+    unresolved.fns[0].params[0].ty = named("Missing", vec![]);
+    assert_eq!(
+        validate_for_import(&unresolved),
+        Err(ImportCompatibilityError::UnresolvedBareType(
+            "Missing".to_string()
+        )),
+        "complete type shape precedes the later unsupported-mode header gate"
+    );
+
+    let mut qualified_local = base.clone();
+    let qualified = named("main.Wrapper", vec![named("str", vec![])]);
+    qualified_local.fns[0].params[0].ty = qualified.clone();
+    qualified_local.fns[0].ret = qualified;
+    assert_eq!(validate_for_import(&qualified_local), Ok(()));
+
+    let mut unit_prefix_foreign = base.clone();
+    unit_prefix_foreign.fns[0].params[0].ty =
+        named("main.child.Foreign", vec![]);
+    assert_eq!(
+        validate_for_import(&unit_prefix_foreign),
+        Ok(()),
+        "a longer qualified module sharing the unit prefix is foreign, not a missing local"
+    );
+
+    let mut missing_qualified_local = base.clone();
+    missing_qualified_local.fns[0].params[0].ty =
+        named("main.Missing", vec![]);
+    assert_eq!(
+        validate_for_import(&missing_qualified_local),
+        Err(ImportCompatibilityError::UnresolvedBareType(
+            "main.Missing".to_string()
+        ))
+    );
+
+    let mut malformed_nested = base;
+    malformed_nested.structs[0].fields[0].1 = IType::Fn {
+        params: vec![IParam {
+            mode: ParamMode::Borrow,
+            ty: named("NestedMissing", vec![]),
+        }],
+        ret: Box::new(named("str", vec![])),
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+        return_region: ReturnRegionSummary::None,
+    };
+    assert_eq!(
+        validate_for_import(&malformed_nested),
+        Err(ImportCompatibilityError::UnresolvedBareType(
+            "NestedMissing".to_string()
+        )),
+        "nested function children participate in the complete shape walk before header errors"
+    );
+
+    let mut missing_definition_body = one(
+        "pub Wrapper<T> { value: T }\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    missing_definition_body.structs[0].generic_body = None;
+    assert_eq!(
+        validate_for_import(&missing_definition_body),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        )),
+        "generic definition parameters require their transported generic body"
+    );
+
+    let mut malformed_enum =
+        one("pub Choice<T> { Some(T), None }\nfn main() -> i32 = 0\n").remove(0);
+    malformed_enum.enums[0].variants[0].1[0] = named("MissingEnumType", vec![]);
+    assert_eq!(
+        validate_for_import(&malformed_enum),
+        Err(ImportCompatibilityError::UnresolvedBareType(
+            "MissingEnumType".to_string()
+        )),
+        "sum payloads participate in the complete shape walk"
+    );
+
+    let mut malformed_constant =
+        one("pub LIMIT: i64 := 1\nfn main() -> i32 = 0\n").remove(0);
+    malformed_constant.consts[0].ty = Some(named("MissingConstType", vec![]));
+    assert_eq!(
+        validate_for_import(&malformed_constant),
+        Err(ImportCompatibilityError::UnresolvedBareType(
+            "MissingConstType".to_string()
+        )),
+        "constant annotations participate in the complete shape walk"
+    );
+}
+
+#[test]
+fn semantic_import_generic_fragments_match_their_structured_records() {
+    let valid = one(
+        "pub fn identity<T: Eq>(value: T) -> T = value\n\
+         pub align(16) Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert_eq!(validate_for_import(&valid), Ok(()));
+    let rendered = summary_to_source(&valid, &[]).expect("valid generic fragments render");
+    assert!(rendered.contains("pub fn identity<T: Eq>"));
+    assert!(rendered.contains("pub align(16) Wrapper<T>"));
+    assert!(rendered.contains("pub Choice<T>"));
+
+    let mut generic_c_layout = valid.clone();
+    generic_c_layout.structs[0].c_repr = true;
+    generic_c_layout.structs[0].generic_body = Some("not valid".to_string());
+    assert_eq!(
+        validate_for_import(&generic_c_layout),
+        Err(ImportCompatibilityError::GenericCLayoutUnsupported(
+            "Wrapper".to_string()
+        )),
+        "producer-forbidden generic C layout precedes fragment syntax"
+    );
+
+    for (case, body) in [
+        (
+            "extra-pub",
+            "pub fn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "module",
+            "module forged\nfn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "import",
+            "import forged\nfn identity<T: Eq>(value: T) -> T = value",
+        ),
+        (
+            "second-item",
+            "fn identity<T: Eq>(value: T) -> T = value\nfn other() -> i64 = 0",
+        ),
+        (
+            "trailing-token",
+            "fn identity<T: Eq>(value: T) -> T = value @",
+        ),
+        ("malformed", "fn identity<T: Eq>("),
+    ] {
+        let mut forged = valid.clone();
+        forged.fns[0].generic_body = Some(body.to_string());
+        assert_eq!(
+            validate_for_import(&forged),
+            Err(ImportCompatibilityError::GenericBodySyntax(
+                "identity".to_string()
+            )),
+            "{case} must reject as fragment syntax before structured comparison"
+        );
+    }
+
+    let mut wrong_function = valid.clone();
+    wrong_function.fns[0].generic_body =
+        Some("fn renamed<T: Eq>(value: T) -> T = value".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_function),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        ))
+    );
+
+    let mut wrong_function_header = valid.clone();
+    wrong_function_header.fns[0].generic_body =
+        Some("fn identity<T: Ord>(out value: T) -> i64 = 0".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_function_header),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        ))
+    );
+
+    let mut wrong_struct = valid.clone();
+    wrong_struct.structs[0].generic_body =
+        Some("Wrapper<T> { other: T }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_struct),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut wrong_kind = valid.clone();
+    wrong_kind.structs[0].align = None;
+    wrong_kind.structs[0].generic_body =
+        Some("Wrapper<T> { Some(T) }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_kind),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut wrong_enum = valid;
+    wrong_enum.enums[0].generic_body =
+        Some("Choice<T> { Other(T), None }".to_string());
+    assert_eq!(
+        validate_for_import(&wrong_enum),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "Choice".to_string()
+        ))
+    );
+}
+
+#[test]
+fn semantic_import_validates_nested_function_type_summaries() {
+    let mut summary = one("pub Holder { value: i64 }\nfn main() -> i32 = 0\n").remove(0);
+    summary.structs[0].fields[0].1 = IType::Fn {
+        params: vec![IParam {
+            mode: ParamMode::ByValue,
+            ty: IType::Named {
+                path: "str".to_string(),
+                args: vec![],
+            },
+        }],
+        ret: Box::new(IType::Named {
+            path: "i64".to_string(),
+            args: vec![],
+        }),
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+    };
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature)
+    );
+}
+
+#[test]
+fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
+    let mut generic =
+        one("pub fn identity<T>(value: T) -> T = value\nfn main() -> i32 = 0\n").remove(0);
+    generic.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    generic.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&generic),
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        "generic template roots have no imported side-channel before L2b-b"
+    );
+    let mut mismatched_generic_shape = generic.clone();
+    mismatched_generic_shape.fns[0].type_params.clear();
+    assert_eq!(
+        validate_for_import(&mismatched_generic_shape),
+        Err(ImportCompatibilityError::UnresolvedBareType("T".to_string())),
+        "the complete type-shape walk precedes generic-body/header classification"
+    );
+    let mut missing_generic_body = generic.clone();
+    missing_generic_body.fns[0].generic_body = None;
+    assert_eq!(
+        validate_for_import(&missing_generic_body),
+        Err(ImportCompatibilityError::GenericBodyMismatch(
+            "identity".to_string()
+        )),
+        "declared type parameters require the generic body transported by their interface"
+    );
+
+    let mut recursive = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    recursive.fns[0].params[0].ty = IType::Named {
+        path: "Wrapper".to_string(),
+        args: vec![IType::Named {
+            path: "T".to_string(),
+            args: vec![],
+        }],
+    };
+    assert_eq!(
+        validate_for_import(&recursive),
+        Err(ImportCompatibilityError::UnresolvedBareType("T".to_string())),
+        "an undeclared type-parameter name is a malformed bare type"
+    );
+
+    let mut wrong_arity = recursive;
+    wrong_arity.fns[0].params[0].ty = IType::Named {
+        path: "Wrapper".to_string(),
+        args: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&wrong_arity),
+        Err(ImportCompatibilityError::InvalidTypeArity {
+            name: "Wrapper".to_string(),
+            expected: 1,
+            actual: 0,
+        }),
+        "a malformed local generic application reports its exact arity"
     );
 }
 

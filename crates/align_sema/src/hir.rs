@@ -251,6 +251,11 @@ pub struct FieldDef {
 #[derive(Clone, Debug)]
 pub struct Fn {
     pub name: String,
+    /// `None` for a source-named function or generic monomorph. A lifted lambda records
+    /// `Some(capture_count)`, including `Some(0)` for a non-capturing lambda. L2b-a1 uses the
+    /// explicit origin bit to defer the distinct capture-root domain; L2b-b will use the count to
+    /// split explicit parameters from trailing capture parameters.
+    pub lifted_capture_count: Option<usize>,
     /// Parameter locals, in declaration order. Each is also present in `locals`.
     pub params: Vec<LocalId>,
     /// Parameter access modes, parallel to [`Self::params`].
@@ -352,8 +357,10 @@ pub enum Stmt {
     AssignElem { base: LocalId, index: Expr, struct_id: u32, soa: bool, value: Expr },
     Return(Option<Expr>),
     /// `break expr` — end the innermost enclosing `loop`, yielding `expr` (a bare `break` yields
-    /// `()`). Diverges (control leaves to the loop's exit); the only loop exit.
-    Break(Option<Expr>),
+    /// `()`). `accepted` is checker-owned target/region evidence: a rejected recovery node still
+    /// retains its payload for nested diagnostics and is non-fallthrough, but no later analysis or
+    /// lowering may treat it as a loop-exit edge.
+    Break { value: Option<Expr>, accepted: bool },
     Expr(Expr),
 }
 

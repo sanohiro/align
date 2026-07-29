@@ -5,10 +5,12 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-28. `main` includes the shipped wave through #670.
+_Last updated: 2026-07-30. `main` includes the shipped wave through #672.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
+#672 carries L2a parameter modes and explicit empty return-provenance facts through AST, HIR, MIR,
+interfaces, caches, and separate compilation without enabling the borrow ABI.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -90,6 +92,7 @@ facts must live in this repository.
 #668  direct recursive Move tagged payloads
 #669  multiple Move payload partial construction
 #670  nested tagged payload representation and exact pkg.db L1b shape
+#672  L2a parameter modes and return-provenance representation
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -255,11 +258,42 @@ admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b (#669) ad
 payload partial construction and uniform ownership; L1b-c (#670) adds tagged-in-tagged type
 representation plus the exact `Result<Option<Output>, DbError>` acceptance. Dynamic
 path-selected return cleanup bits remain L2; L1b accepts only values proven free-standing by the
-current ABI rules. Do not begin a
+current ABI rules. L2a is complete in #672. L2b is split into L2b-a1 named/direct/imported
+parameter-root inference with conservative aggregate and indirect unions, L2b-a2 exact aggregate
+and control projection, and L2b-b closure/capture/function-value provenance. PR #673 carries
+L2b-a1. Its hand-written diff exceeds 1,000 lines because producer inference, consumer import
+validation, whole/per-unit serialization parity, source-order reachability, and their owner tests
+form one compatibility boundary: splitting them would either publish unvalidated provenance or
+consume provenance whose producer semantics are not yet closed. The closure matrix therefore
+keeps this as the smallest independently correct vertical slice. The final local provenance
+preflight also carries checker-owned break acceptance into HIR so region-rejected recovery syntax
+cannot manufacture an effect, escape, ownership, provenance, or MIR loop-exit edge. The final local
+review then reopened the closure matrix for termination inside an accepted break payload:
+effect inference now stops every eager/source-order boundary action after termination, and MIR
+emits an outer result/cleanup edge only from a reachable continuation. Copy `str`, owned `string`,
+mixed control-flow, process termination, and malformed-HIR owners cover the correction. The final
+independent review found one further pipeline timing gap, so the matrix was reopened before more
+code: pipeline sources now form first, stage Copy captures snapshot once at their written
+positions, explicit terminal arguments follow, terminal captures snapshot last, and callback
+actions begin only after every operand falls through. Sequential, parallel, zip, and JSON-scanner
+lowering reuse the preheader operands; an owned temporary source is hidden-owner guarded so a
+later terminating operand still cleans it exactly once. MoveCheck retains captured-view owner
+dependencies across `init`, EffectScan separates formation from action, and structural
+EscapeCheck/finalization still visit dead HIR without joining reachable state. Focused sema/MIR,
+lambda, borrow-liveness, map_into, zip, and JSON scan-reduce owners are clean. The refreshed local
+provenance benchmark on Apple Silicon reports 1.916 ms/check and 22,848 interface bytes for
+summary inference, plus 1.878 ms/import for semantic import validation. The final owner review
+also closed source snapshots across later terminal arguments: direct, zip, scanner, and
+borrow-preserving `if`/`match` sources retain selected owner roots until action; a Move-`else`
+success payload and a value-producing loop instead transfer and null their old container/source.
+Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
+states.
+Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as five closed slices so no incomplete
-borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b return
-provenance, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow, then L2e
+variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
+borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b
+return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
+then L2e
 mutable borrow/out and all-peer
 exclusivity. The remaining required order is L2,
 L3 package-defined/dependent

@@ -3053,19 +3053,42 @@ fn build_module<'c>(
 /// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
 /// `CodegenError`, never an out-of-bounds panic or the scalar `i32` fallback.
 fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
-    fn check_signature_facts(
-        owner: &str,
-        param_count: usize,
-        modes: &[align_ast::ParamMode],
-        borrow: &hir::ReturnBorrowSummary,
-        region: &hir::ReturnRegionSummary,
+    struct SignatureFacts<'a> {
+        owner: &'a str,
+        modes: &'a [align_ast::ParamMode],
+        param_types: &'a [Ty],
+        ret: Ty,
+        borrow: &'a hir::ReturnBorrowSummary,
+        region: &'a hir::ReturnRegionSummary,
         allow_out: bool,
+        allow_return_roots: bool,
+    }
+
+    fn check_signature_facts(
+        facts: SignatureFacts<'_>,
+        program: &Program,
+        type_graph: &mut TypeGraph<'_>,
     ) -> Result<(), CodegenError> {
-        if modes.len() != param_count {
+        let SignatureFacts {
+            owner,
+            modes,
+            param_types,
+            ret,
+            borrow,
+            region,
+            allow_out,
+            allow_return_roots,
+        } = facts;
+        if modes.len() != param_types.len() {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has {} parameter modes for {param_count} parameters",
-                modes.len()
+                "{owner} has {} parameter modes for {} parameters",
+                modes.len(),
+                param_types.len()
             )));
+        }
+        type_graph.check_ty(ret)?;
+        for &ty in param_types {
+            type_graph.check_ty(ty)?;
         }
         for mode in modes {
             match mode {
@@ -3083,15 +3106,94 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 }
             }
         }
-        if !matches!(borrow, hir::ReturnBorrowSummary::None) {
+        let validate_summary =
+            |kind: &str, params: &[u32], captures: &[u32]| -> Result<(), CodegenError> {
+                if params.is_empty() && captures.is_empty() {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has a non-canonical empty {kind} root set"
+                    )));
+                }
+                if params.windows(2).any(|pair| pair[0] >= pair[1])
+                    || captures.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has unsorted or duplicate {kind} roots"
+                    )));
+                }
+                if params
+                    .iter()
+                    .any(|root| *root as usize >= param_types.len())
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has an out-of-range {kind} parameter root"
+                    )));
+                }
+                if !captures.is_empty() {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has {kind} capture roots before L2b-b"
+                    )));
+                }
+                Ok(())
+            };
+        if let hir::ReturnBorrowSummary::Roots { params, captures } = borrow {
+            validate_summary("return-borrow", params, captures)?;
+        }
+        if let hir::ReturnRegionSummary::Roots { params, captures } = region {
+            validate_summary("return-region", params, captures)?;
+        }
+        let summaries_agree = match (borrow, region) {
+            (hir::ReturnBorrowSummary::None, hir::ReturnRegionSummary::None) => true,
+            (
+                hir::ReturnBorrowSummary::Roots {
+                    params: borrow_params,
+                    captures: borrow_captures,
+                },
+                hir::ReturnRegionSummary::Roots {
+                    params: region_params,
+                    captures: region_captures,
+                },
+            ) => borrow_params == region_params && borrow_captures == region_captures,
+            _ => false,
+        };
+        if !summaries_agree {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has return-borrow roots before L2b"
+                "{owner} has disagreeing return-borrow and return-region roots in L2b-a1"
             )));
         }
-        if !matches!(region, hir::ReturnRegionSummary::None) {
+        if !allow_return_roots
+            && (!matches!(borrow, hir::ReturnBorrowSummary::None)
+                || !matches!(region, hir::ReturnRegionSummary::None))
+        {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has return-region roots before L2b"
+                "{owner} has return roots before function-value provenance lands in L2b-b"
             )));
+        }
+        if let hir::ReturnBorrowSummary::Roots { params, .. } = borrow {
+            if !align_sema::ty_may_borrow(
+                ret,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                return Err(CodegenError::Lowering(format!(
+                    "{owner} has return provenance on type {ret:?}, which cannot borrow"
+                )));
+            }
+            for &root in params {
+                let ty = param_types[root as usize];
+                if !align_sema::ty_may_borrow(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ) {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} return provenance root {root} has type {ty:?}, which cannot supply a borrow"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -3114,231 +3216,535 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     fn named_signature<'a>(
         program: &'a Program,
         name: &str,
-    ) -> Option<(
-        usize,
-        &'a [align_ast::ParamMode],
-        &'a hir::ReturnBorrowSummary,
-        &'a hir::ReturnRegionSummary,
-    )> {
+    ) -> Option<(Vec<Ty>, Ty, &'a [align_ast::ParamMode])> {
         if let Some(function) = program.fns.iter().find(|function| function.name == name) {
             return Some((
-                function.params.len(),
+                function
+                    .params
+                    .iter()
+                    .map(|slot| function.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>()?,
+                function.ret,
                 &function.param_modes,
-                &function.return_borrow,
-                &function.return_region,
             ));
         }
         if let Some(function) = program.imported_fns.iter().find(|function| function.name == name) {
             return Some((
-                function.params.len(),
+                function.params.clone(),
+                function.ret,
                 &function.param_modes,
-                &function.return_borrow,
-                &function.return_region,
             ));
         }
         program.externs.iter().find(|function| function.name == name).map(|function| {
             (
-                function.params.len(),
+                function.params.clone(),
+                function.ret,
                 function.param_modes.as_slice(),
-                &function.return_borrow,
-                &function.return_region,
             )
         })
     }
 
-    fn check_scalar(
-        scalar: Scalar,
-        program: &Program,
-        active: &mut Vec<u32>,
-    ) -> Result<(), CodegenError> {
-        match scalar {
-            Scalar::Param(id) => Err(CodegenError::Lowering(format!(
-                "abstract tagged payload parameter {id} survived into MIR"
-            ))),
-            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id)
-                if program.structs.get(id as usize).is_none() =>
-            {
-                Err(CodegenError::Lowering(format!(
-                    "tagged payload struct type id {id} is missing"
-                )))
+    /// Validate every MIR type reference and the complete inline layout graph before any semantic
+    /// classifier or LLVM type constructor sees it. Pointer/header wrappers still validate their
+    /// referenced ids, but they break the inline-cycle path; fixed arrays, tuples, tagged values,
+    /// structs, and sums preserve it.
+    enum TypeGraphWork {
+        Ty(Ty),
+        InlineScalar(Scalar),
+        ExitStruct(u32),
+        ExitEnum(u32),
+        ExitTuple(u32),
+        ExitTagged(u32),
+    }
+
+    struct TypeGraph<'a> {
+        program: &'a Program,
+        active_structs: HashSet<u32>,
+        completed_structs: HashSet<u32>,
+        active_enums: HashSet<u32>,
+        completed_enums: HashSet<u32>,
+        active_tuples: HashSet<u32>,
+        completed_tuples: HashSet<u32>,
+        active_tagged: HashSet<u32>,
+        completed_tagged: HashSet<u32>,
+    }
+
+    impl<'a> TypeGraph<'a> {
+        fn new(program: &'a Program) -> Self {
+            Self {
+                program,
+                active_structs: HashSet::new(),
+                completed_structs: HashSet::new(),
+                active_enums: HashSet::new(),
+                completed_enums: HashSet::new(),
+                active_tuples: HashSet::new(),
+                completed_tuples: HashSet::new(),
+                active_tagged: HashSet::new(),
+                completed_tagged: HashSet::new(),
             }
-            Scalar::Enum(id) if program.enums.get(id as usize).is_none() => {
-                Err(CodegenError::Lowering(format!(
-                    "tagged payload sum type id {id} is missing"
-                )))
+        }
+
+        fn invalid(message: String) -> CodegenError {
+            CodegenError::Lowering(message)
+        }
+
+        fn require_struct(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.structs.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tagged payload struct type id {id} is missing"))
+            })
+        }
+
+        fn require_enum(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.enums.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tagged payload sum type id {id} is missing"))
+            })
+        }
+
+        fn require_tuple(&self, id: u32) -> Result<(), CodegenError> {
+            self.program.tuples.get(id as usize).map(|_| ()).ok_or_else(|| {
+                Self::invalid(format!("tuple type id {id} is missing"))
+            })
+        }
+
+        fn require_tagged(&self, id: u32) -> Result<(), CodegenError> {
+            self.program
+                .tagged_types
+                .get(id as usize)
+                .map(|_| ())
+                .ok_or_else(|| Self::invalid(format!("nested tagged type id {id} is missing")))
+        }
+
+        fn enter_struct(
+            &mut self,
+            id: u32,
+            work: &mut Vec<TypeGraphWork>,
+        ) -> Result<(), CodegenError> {
+            self.require_struct(id)?;
+            if self.completed_structs.contains(&id) {
+                return Ok(());
             }
-            Scalar::Tagged(id) => {
-                if active.contains(&id) {
-                    return Err(CodegenError::Lowering(format!(
-                        "recursive nested tagged type id {id} survived into MIR"
-                    )));
+            if !self.active_structs.insert(id) {
+                return Err(Self::invalid(format!(
+                    "struct type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            work.push(TypeGraphWork::ExitStruct(id));
+            for field in self.program.structs[id as usize].fields.iter().rev() {
+                work.push(TypeGraphWork::Ty(field.ty));
+            }
+            Ok(())
+        }
+
+        fn enter_enum(
+            &mut self,
+            id: u32,
+            work: &mut Vec<TypeGraphWork>,
+        ) -> Result<(), CodegenError> {
+            self.require_enum(id)?;
+            if self.completed_enums.contains(&id) {
+                return Ok(());
+            }
+            if !self.active_enums.insert(id) {
+                return Err(Self::invalid(format!(
+                    "sum type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            work.push(TypeGraphWork::ExitEnum(id));
+            for variant in self.program.enums[id as usize].variants.iter().rev() {
+                for &payload in variant.payload.iter().rev() {
+                    work.push(TypeGraphWork::InlineScalar(payload));
                 }
-                let entry = program.tagged_types.get(id as usize).ok_or_else(|| {
-                    CodegenError::Lowering(format!("nested tagged type id {id} is missing"))
-                })?;
-                active.push(id);
-                match *entry {
-                    hir::TaggedType::Option(payload) => check_scalar(payload, program, active)?,
-                    hir::TaggedType::Result(ok, err) => {
-                        check_scalar(ok, program, active)?;
-                        check_scalar(err, program, active)?;
+            }
+            Ok(())
+        }
+
+        fn enter_tuple(
+            &mut self,
+            id: u32,
+            work: &mut Vec<TypeGraphWork>,
+        ) -> Result<(), CodegenError> {
+            self.require_tuple(id)?;
+            if self.completed_tuples.contains(&id) {
+                return Ok(());
+            }
+            if !self.active_tuples.insert(id) {
+                return Err(Self::invalid(format!(
+                    "tuple type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            work.push(TypeGraphWork::ExitTuple(id));
+            for &element in self.program.tuples[id as usize].elems.iter().rev() {
+                work.push(TypeGraphWork::InlineScalar(element));
+            }
+            Ok(())
+        }
+
+        fn enter_tagged(
+            &mut self,
+            id: u32,
+            work: &mut Vec<TypeGraphWork>,
+        ) -> Result<(), CodegenError> {
+            self.require_tagged(id)?;
+            if self.completed_tagged.contains(&id) {
+                return Ok(());
+            }
+            if !self.active_tagged.insert(id) {
+                return Err(Self::invalid(format!(
+                    "nested tagged type id {id} has a missing or recursive by-value definition"
+                )));
+            }
+            work.push(TypeGraphWork::ExitTagged(id));
+            match self.program.tagged_types[id as usize] {
+                hir::TaggedType::Option(payload) => {
+                    work.push(TypeGraphWork::InlineScalar(payload));
+                }
+                hir::TaggedType::Result(ok, err) => {
+                    work.push(TypeGraphWork::InlineScalar(err));
+                    work.push(TypeGraphWork::InlineScalar(ok));
+                }
+            }
+            Ok(())
+        }
+
+        fn check_scalar_reference(&self, scalar: Scalar) -> Result<(), CodegenError> {
+            match scalar {
+                Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                    self.require_struct(id)
+                }
+                Scalar::Enum(id) => self.require_enum(id),
+                Scalar::Tagged(id) => self.require_tagged(id),
+                Scalar::Param(id) => Err(Self::invalid(format!(
+                    "abstract tagged payload parameter {id} survived into MIR"
+                ))),
+                Scalar::Int(_)
+                | Scalar::Float(_)
+                | Scalar::Bool
+                | Scalar::Char
+                | Scalar::Unit
+                | Scalar::String
+                | Scalar::DynArray(_)
+                | Scalar::DynResponseArray
+                | Scalar::Str
+                | Scalar::Slice(_)
+                | Scalar::JsonDoc
+                | Scalar::Reader
+                | Scalar::Writer
+                | Scalar::Buffer
+                | Scalar::Regex
+                | Scalar::Captures
+                | Scalar::CliParsed
+                | Scalar::TcpConn
+                | Scalar::TcpListener
+                | Scalar::UdpSocket
+                | Scalar::Child
+                | Scalar::File
+                | Scalar::HttpResponse
+                | Scalar::HttpServer
+                | Scalar::HttpRequestCtx
+                | Scalar::ResponseBuilder
+                | Scalar::HttpStream
+                | Scalar::RunOutput
+                // MIR carries no function-type table; the embedded signature facts are validated
+                // at every function-value producer/consumer, and the physical closure ABI is
+                // independent of this sema-local identity.
+                | Scalar::Fn(_) => Ok(()),
+            }
+        }
+
+        fn check_ty(&mut self, ty: Ty) -> Result<(), CodegenError> {
+            let mut work = vec![TypeGraphWork::Ty(ty)];
+            while let Some(next) = work.pop() {
+                match next {
+                    TypeGraphWork::Ty(ty) => match ty {
+                        Ty::Param(id) => {
+                            return Err(Self::invalid(format!(
+                                "abstract type parameter {id} survived into MIR"
+                            )));
+                        }
+                        Ty::IntVar(id) => {
+                            return Err(Self::invalid(format!(
+                                "unresolved integer type variable {id} survived into MIR"
+                            )));
+                        }
+                        Ty::FloatVar(id) => {
+                            return Err(Self::invalid(format!(
+                                "unresolved float type variable {id} survived into MIR"
+                            )));
+                        }
+                        Ty::Error => {
+                            return Err(Self::invalid(
+                                "error-sentinel type survived into MIR".to_string(),
+                            ));
+                        }
+                        Ty::Struct(id) => self.enter_struct(id, &mut work)?,
+                        Ty::Enum(id) => self.enter_enum(id, &mut work)?,
+                        Ty::Tuple(id) => self.enter_tuple(id, &mut work)?,
+                        Ty::Tagged(id) => self.enter_tagged(id, &mut work)?,
+                        Ty::Option(payload)
+                        | Ty::Array(payload, _)
+                        | Ty::Vec(payload, _)
+                        | Ty::Mask(payload, _) => {
+                            work.push(TypeGraphWork::InlineScalar(payload));
+                        }
+                        Ty::Result(ok, err) => {
+                            work.push(TypeGraphWork::InlineScalar(err));
+                            work.push(TypeGraphWork::InlineScalar(ok));
+                        }
+                        Ty::StructArray(id, _) => self.enter_struct(id, &mut work)?,
+                        Ty::Box(payload)
+                        | Ty::Slice(payload)
+                        | Ty::DynArray(payload)
+                        | Ty::ArrayBuilder(payload)
+                        | Ty::Task(payload) => self.check_scalar_reference(payload)?,
+                        Ty::DynStructArray(id, _)
+                        | Ty::Soa(id)
+                        | Ty::JsonScanner(id) => self.require_struct(id)?,
+                        Ty::DictEncoded(id, field) => {
+                            self.require_struct(id)?;
+                            if field as usize >= self.program.structs[id as usize].fields.len() {
+                                return Err(Self::invalid(format!(
+                                    "dictionary-encoded type refers to missing field {field} on struct type id {id}"
+                                )));
+                            }
+                        }
+                        Ty::Int(_)
+                        | Ty::Float(_)
+                        | Ty::Bool
+                        | Ty::Char
+                        | Ty::DynSliceArray(_)
+                        | Ty::DynResponseArray
+                        | Ty::Str
+                        | Ty::String
+                        | Ty::ArenaHandle
+                        | Ty::Raw
+                        | Ty::Builder
+                        | Ty::Writer
+                        | Ty::Reader
+                        | Ty::Buffer
+                        | Ty::StrFinder
+                        | Ty::File
+                        | Ty::Rng
+                        | Ty::Regex
+                        | Ty::Captures
+                        | Ty::CliCommand
+                        | Ty::CliParsed
+                        | Ty::TcpConn
+                        | Ty::TcpListener
+                        | Ty::UdpSocket
+                        | Ty::Child
+                        | Ty::Command
+                        | Ty::RunOutput
+                        | Ty::HttpRequest
+                        | Ty::HttpResponse
+                        | Ty::HttpClient
+                        | Ty::HttpServer
+                        | Ty::HttpRequestCtx
+                        | Ty::ResponseBuilder
+                        | Ty::HttpStream
+                        | Ty::HttpHeaders
+                        | Ty::JsonDoc
+                        | Ty::Fn(_)
+                        | Ty::Unit => {}
+                    },
+                    TypeGraphWork::InlineScalar(scalar) => match scalar {
+                        Scalar::Struct(id) => self.enter_struct(id, &mut work)?,
+                        Scalar::Enum(id) => self.enter_enum(id, &mut work)?,
+                        Scalar::Tagged(id) => self.enter_tagged(id, &mut work)?,
+                        Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                            self.require_struct(id)?;
+                        }
+                        other => self.check_scalar_reference(other)?,
+                    },
+                    TypeGraphWork::ExitStruct(id) => {
+                        if !self.active_structs.remove(&id) {
+                            return Err(Self::invalid(format!(
+                                "struct type id {id} exited validation without an active entry"
+                            )));
+                        }
+                        self.completed_structs.insert(id);
+                    }
+                    TypeGraphWork::ExitEnum(id) => {
+                        if !self.active_enums.remove(&id) {
+                            return Err(Self::invalid(format!(
+                                "sum type id {id} exited validation without an active entry"
+                            )));
+                        }
+                        self.completed_enums.insert(id);
+                    }
+                    TypeGraphWork::ExitTuple(id) => {
+                        if !self.active_tuples.remove(&id) {
+                            return Err(Self::invalid(format!(
+                                "tuple type id {id} exited validation without an active entry"
+                            )));
+                        }
+                        self.completed_tuples.insert(id);
+                    }
+                    TypeGraphWork::ExitTagged(id) => {
+                        if !self.active_tagged.remove(&id) {
+                            return Err(Self::invalid(format!(
+                                "nested tagged type id {id} exited validation without an active entry"
+                            )));
+                        }
+                        self.completed_tagged.insert(id);
                     }
                 }
-                active.pop();
-                Ok(())
             }
-            _ => Ok(()),
+            Ok(())
         }
     }
-    fn check_ty(ty: Ty, program: &Program) -> Result<(), CodegenError> {
-        let mut active = Vec::new();
-        match ty {
-            Ty::Param(id) => Err(CodegenError::Lowering(format!(
-                "abstract type parameter {id} survived into MIR"
-            ))),
-            Ty::Tagged(id) => check_scalar(Scalar::Tagged(id), program, &mut active),
-            Ty::Option(s)
-            | Ty::Box(s)
-            | Ty::Slice(s)
-            | Ty::DynArray(s)
-            | Ty::ArrayBuilder(s)
-            | Ty::Task(s) => check_scalar(s, program, &mut active),
-            Ty::Result(ok, err) => {
-                check_scalar(ok, program, &mut active)?;
-                check_scalar(err, program, &mut active)
-            }
-            Ty::Array(s, _) | Ty::Vec(s, _) | Ty::Mask(s, _) => {
-                check_scalar(s, program, &mut active)
-            }
-            _ => Ok(()),
-        }
+
+    fn check_ty(
+        ty: Ty,
+        type_graph: &mut TypeGraph<'_>,
+    ) -> Result<(), CodegenError> {
+        type_graph.check_ty(ty)
     }
+
+    enum SourceAbiKeyWork {
+        Ty(Ty),
+        Text(&'static str),
+        ExitTagged(u32),
+    }
+
     fn source_abi_key(
         ty: Ty,
         program: &Program,
-        tagged_active: &mut Vec<u32>,
     ) -> Result<String, CodegenError> {
-        let scalar = |value, tagged_active: &mut Vec<u32>| {
-            source_abi_key(scalar_to_ty(value), program, tagged_active)
-        };
-        Ok(match ty {
-            Ty::Struct(id) => format!(
-                "S{}",
-                program
-                    .structs
-                    .get(id as usize)
-                    .ok_or_else(|| CodegenError::Lowering(format!(
-                        "source ABI key refers to missing struct type id {id}"
-                    )))?
-                    .source_name
-            ),
-            Ty::Enum(id) => format!(
-                "E{}",
-                program
-                    .enums
-                    .get(id as usize)
-                    .ok_or_else(|| CodegenError::Lowering(format!(
-                        "source ABI key refers to missing sum type id {id}"
-                    )))?
-                    .source_name
-            ),
-            Ty::Fn(_) => "FnClosure".to_string(),
-            Ty::Tagged(id) => {
-                if tagged_active.contains(&id) {
-                    return Err(CodegenError::Lowering(format!(
-                        "recursive nested tagged type id {id} survived into a source ABI key"
-                    )));
-                }
-                let tagged = program.tagged_types.get(id as usize).ok_or_else(|| {
-                    CodegenError::Lowering(format!(
-                        "source ABI key refers to missing nested tagged type id {id}"
-                    ))
-                })?;
-                tagged_active.push(id);
-                let key = match *tagged {
-                    hir::TaggedType::Option(payload) => {
-                        format!("O{}", scalar(payload, tagged_active)?)
+        let mut key = String::new();
+        let mut active_tagged = HashSet::new();
+        let mut work = vec![SourceAbiKeyWork::Ty(ty)];
+        while let Some(next) = work.pop() {
+            match next {
+                SourceAbiKeyWork::Text(text) => key.push_str(text),
+                SourceAbiKeyWork::ExitTagged(id) => {
+                    if !active_tagged.remove(&id) {
+                        return Err(CodegenError::Lowering(format!(
+                            "nested tagged type id {id} exited source ABI key generation without an active entry"
+                        )));
                     }
-                    hir::TaggedType::Result(ok, err) => format!(
-                        "R{}_{}",
-                        scalar(ok, tagged_active)?,
-                        scalar(err, tagged_active)?
-                    ),
-                };
-                tagged_active.pop();
-                key
-            }
-            Ty::Option(payload) => format!("O{}", scalar(payload, tagged_active)?),
-            Ty::Result(ok, err) => format!(
-                "R{}_{}",
-                scalar(ok, tagged_active)?,
-                scalar(err, tagged_active)?
-            ),
-            Ty::Box(payload) => format!("B{}", scalar(payload, tagged_active)?),
-            Ty::Slice(payload) => format!("V{}", scalar(payload, tagged_active)?),
-            Ty::DynArray(payload) => format!("D{}", scalar(payload, tagged_active)?),
-            Ty::Array(payload, count) => {
-                format!("A{count}_{}", scalar(payload, tagged_active)?)
-            }
-            Ty::Task(payload) => format!("K{}", scalar(payload, tagged_active)?),
-            Ty::StructArray(id, count) => format!(
-                "A{count}_{}",
-                source_abi_key(Ty::Struct(id), program, tagged_active)?
-            ),
-            Ty::DynStructArray(id, layout) => format!(
-                "D{layout:?}_{}",
-                source_abi_key(Ty::Struct(id), program, tagged_active)?
-            ),
-            Ty::Soa(id) => format!(
-                "Q{}",
-                source_abi_key(Ty::Struct(id), program, tagged_active)?
-            ),
-            Ty::Tuple(id) => {
-                let tuple = program.tuples.get(id as usize).ok_or_else(|| {
-                    CodegenError::Lowering(format!(
-                        "source ABI key refers to missing tuple type id {id}"
-                    ))
-                })?;
-                let mut key = String::from("T");
-                for &elem in &tuple.elems {
-                    key.push('_');
-                    key.push_str(&scalar(elem, tagged_active)?);
                 }
-                key
+                SourceAbiKeyWork::Ty(ty) => match ty {
+                    Ty::Struct(id) => {
+                        let definition = program.structs.get(id as usize).ok_or_else(|| {
+                            CodegenError::Lowering(format!(
+                                "source ABI key refers to missing struct type id {id}"
+                            ))
+                        })?;
+                        key.push('S');
+                        key.push_str(&definition.source_name);
+                    }
+                    Ty::Enum(id) => {
+                        let definition = program.enums.get(id as usize).ok_or_else(|| {
+                            CodegenError::Lowering(format!(
+                                "source ABI key refers to missing sum type id {id}"
+                            ))
+                        })?;
+                        key.push('E');
+                        key.push_str(&definition.source_name);
+                    }
+                    Ty::Fn(_) => key.push_str("FnClosure"),
+                    Ty::Tagged(id) => {
+                        if !active_tagged.insert(id) {
+                            return Err(CodegenError::Lowering(format!(
+                                "recursive nested tagged type id {id} survived into a source ABI key"
+                            )));
+                        }
+                        let tagged = program.tagged_types.get(id as usize).ok_or_else(|| {
+                            CodegenError::Lowering(format!(
+                                "source ABI key refers to missing nested tagged type id {id}"
+                            ))
+                        })?;
+                        work.push(SourceAbiKeyWork::ExitTagged(id));
+                        match *tagged {
+                            hir::TaggedType::Option(payload) => {
+                                key.push('O');
+                                work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                            }
+                            hir::TaggedType::Result(ok, err) => {
+                                key.push('R');
+                                work.push(SourceAbiKeyWork::Ty(scalar_to_ty(err)));
+                                work.push(SourceAbiKeyWork::Text("_"));
+                                work.push(SourceAbiKeyWork::Ty(scalar_to_ty(ok)));
+                            }
+                        }
+                    }
+                    Ty::Option(payload) => {
+                        key.push('O');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::Result(ok, err) => {
+                        key.push('R');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(err)));
+                        work.push(SourceAbiKeyWork::Text("_"));
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(ok)));
+                    }
+                    Ty::Box(payload) => {
+                        key.push('B');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::Slice(payload) => {
+                        key.push('V');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::DynArray(payload) => {
+                        key.push('D');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::Array(payload, count) => {
+                        key.push_str(&format!("A{count}_"));
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::Task(payload) => {
+                        key.push('K');
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::StructArray(id, count) => {
+                        key.push_str(&format!("A{count}_"));
+                        work.push(SourceAbiKeyWork::Ty(Ty::Struct(id)));
+                    }
+                    Ty::DynStructArray(id, layout) => {
+                        key.push_str(&format!("D{layout:?}_"));
+                        work.push(SourceAbiKeyWork::Ty(Ty::Struct(id)));
+                    }
+                    Ty::Soa(id) => {
+                        key.push('Q');
+                        work.push(SourceAbiKeyWork::Ty(Ty::Struct(id)));
+                    }
+                    Ty::Tuple(id) => {
+                        let tuple = program.tuples.get(id as usize).ok_or_else(|| {
+                            CodegenError::Lowering(format!(
+                                "source ABI key refers to missing tuple type id {id}"
+                            ))
+                        })?;
+                        key.push('T');
+                        for &element in tuple.elems.iter().rev() {
+                            work.push(SourceAbiKeyWork::Ty(scalar_to_ty(element)));
+                            work.push(SourceAbiKeyWork::Text("_"));
+                        }
+                    }
+                    other => key.push_str(&format!("{other:?}")),
+                },
             }
-            other => format!("{other:?}"),
-        })
+        }
+        Ok(key)
     }
 
     // Validate every retained entry, including an otherwise-unused corrupt one from a decoded
     // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
-    // does not narrow a valid program.
+    // does not narrow a valid program. One graph instance retains completed nodes across every
+    // root; each successful root leaves the active paths empty.
+    let mut type_graph = TypeGraph::new(program);
     for id in 0..program.tagged_types.len() {
-        check_scalar(Scalar::Tagged(id as u32), program, &mut Vec::new())?;
-        if !drop_plan(
-            Ty::Tagged(id as u32),
-            &program.structs,
-            &program.enums,
-            &program.tagged_types,
-        )
-        .is_valid()
-        {
-            return Err(CodegenError::Lowering(format!(
-                "nested tagged type id {id} has a missing or recursive by-value definition"
-            )));
-        }
+        check_ty(Ty::Tagged(id as u32), &mut type_graph)?;
     }
-    for def in &program.structs {
+    for (id, def) in program.structs.iter().enumerate() {
+        check_ty(Ty::Struct(id as u32), &mut type_graph)?;
         for field in &def.fields {
-            check_ty(field.ty, program)?;
+            check_ty(field.ty, &mut type_graph)?;
         }
     }
-    for def in &program.enums {
-        for variant in &def.variants {
-            for &payload in &variant.payload {
-                check_scalar(payload, program, &mut Vec::new())?;
-            }
-        }
+    for id in 0..program.enums.len() {
+        check_ty(Ty::Enum(id as u32), &mut type_graph)?;
     }
     let mut struct_source_shapes = HashMap::new();
     for def in &program.structs {
@@ -3346,7 +3752,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         for field in &def.fields {
             shape.push_str(&field.name);
             shape.push(':');
-            shape.push_str(&source_abi_key(field.ty, program, &mut Vec::new())?);
+            shape.push_str(&source_abi_key(field.ty, program)?);
             shape.push(';');
         }
         if let Some(previous) = struct_source_shapes.insert(def.source_name.as_str(), shape.clone())
@@ -3367,11 +3773,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             shape.push_str(&variant.field_base.to_string());
             for &payload in &variant.payload {
                 shape.push(':');
-                shape.push_str(&source_abi_key(
-                    scalar_to_ty(payload),
-                    program,
-                    &mut Vec::new(),
-                )?);
+                shape.push_str(&source_abi_key(scalar_to_ty(payload), program)?);
             }
             shape.push(';');
         }
@@ -3384,10 +3786,8 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             )));
         }
     }
-    for tuple in &program.tuples {
-        for &elem in &tuple.elems {
-            check_scalar(elem, program, &mut Vec::new())?;
-        }
+    for id in 0..program.tuples.len() {
+        check_ty(Ty::Tuple(id as u32), &mut type_graph)?;
     }
     for f in &program.fns {
         let param_types = f
@@ -3403,20 +3803,26 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         check_signature_facts(
-            &format!("function `{}`", f.name),
-            f.params.len(),
-            &f.param_modes,
-            &f.return_borrow,
-            &f.return_region,
-            true,
+            SignatureFacts {
+                owner: &format!("function `{}`", f.name),
+                modes: &f.param_modes,
+                param_types: &param_types,
+                ret: f.ret,
+                borrow: &f.return_borrow,
+                region: &f.return_region,
+                allow_out: true,
+                allow_return_roots: true,
+            },
+            program,
+            &mut type_graph,
         )?;
         check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
-        check_ty(f.ret, program)?;
+        check_ty(f.ret, &mut type_graph)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {
-            check_ty(ty, program)?;
+            check_ty(ty, &mut type_graph)?;
         }
         for ty in align_mir::function_embedded_types(f) {
-            check_ty(ty, program)?;
+            check_ty(ty, &mut type_graph)?;
         }
         for block in &f.blocks {
             for statement in &block.stmts {
@@ -3425,7 +3831,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 };
                 match rvalue {
                     Rvalue::FnAddr { name, signature } => {
-                        let Some((count, modes, borrow, region)) =
+                        let Some((param_types, ret, modes)) =
                             named_signature(program, name)
                         else {
                             return Err(CodegenError::Lowering(format!(
@@ -3433,17 +3839,23 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                             )));
                         };
                         check_signature_facts(
-                            "function address",
-                            count,
-                            &signature.param_modes,
-                            &signature.return_borrow,
-                            &signature.return_region,
-                            false,
+                            SignatureFacts {
+                                owner: "function address",
+                                modes: &signature.param_modes,
+                                param_types: &param_types,
+                                ret,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                allow_out: false,
+                                allow_return_roots: false,
+                            },
+                            program,
+                            &mut type_graph,
                         )?;
-                        if signature.param_modes != modes
-                            || &signature.return_borrow != borrow
-                            || &signature.return_region != region
-                        {
+                        // L2b-a1 deliberately leaves function-value return summaries at `None`;
+                        // indirect calls retain the all-compatible-input fallback. L2b-b attaches
+                        // target-relative roots and restores exact summary equality here.
+                        if signature.param_modes != modes {
                             return Err(CodegenError::Lowering(format!(
                                 "function address signature facts disagree with target `{name}`"
                             )));
@@ -3506,18 +3918,34 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
+                        let target_explicit_tys = target.params[..explicit]
+                            .iter()
+                            .map(|slot| {
+                                target.slots.get(*slot as usize).copied().ok_or_else(|| {
+                                    CodegenError::Lowering(format!(
+                                        "closure `{lifted}` target parameter slot {slot} is missing"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
                         if target_capture_tys != *capture_tys {
                             return Err(CodegenError::Lowering(format!(
                                 "closure `{lifted}` capture types disagree with its target"
                             )));
                         }
                         check_signature_facts(
-                            "closure",
-                            explicit,
-                            &signature.param_modes,
-                            &signature.return_borrow,
-                            &signature.return_region,
-                            false,
+                            SignatureFacts {
+                                owner: "closure",
+                                modes: &signature.param_modes,
+                                param_types: &target_explicit_tys,
+                                ret: target.ret,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                allow_out: false,
+                                allow_return_roots: false,
+                            },
+                            program,
+                            &mut type_graph,
                         )?;
                         if signature.param_modes != target_modes
                             || signature.return_borrow != target.return_borrow
@@ -3530,15 +3958,22 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     }
                     Rvalue::CallIndirect {
                         param_tys,
+                        ret_ty,
                         signature,
                         ..
                     } => check_signature_facts(
-                        "indirect call",
-                        param_tys.len(),
-                        &signature.param_modes,
-                        &signature.return_borrow,
-                        &signature.return_region,
-                        false,
+                        SignatureFacts {
+                            owner: "indirect call",
+                            modes: &signature.param_modes,
+                            param_types: param_tys,
+                            ret: *ret_ty,
+                            borrow: &signature.return_borrow,
+                            region: &signature.return_region,
+                            allow_out: false,
+                            allow_return_roots: false,
+                        },
+                        program,
+                        &mut type_graph,
                     )?,
                     _ => {}
                 }
@@ -3547,36 +3982,48 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     }
     for ext in &program.externs {
         check_signature_facts(
-            &format!("extern function `{}`", ext.name),
-            ext.params.len(),
-            &ext.param_modes,
-            &ext.return_borrow,
-            &ext.return_region,
-            false,
+            SignatureFacts {
+                owner: &format!("extern function `{}`", ext.name),
+                modes: &ext.param_modes,
+                param_types: &ext.params,
+                ret: ext.ret,
+                borrow: &ext.return_borrow,
+                region: &ext.return_region,
+                allow_out: false,
+                allow_return_roots: false,
+            },
+            program,
+            &mut type_graph,
         )?;
         check_mode_types(&format!("extern function `{}`", ext.name), &ext.param_modes, &ext.params)?;
-        check_ty(ext.ret, program)?;
+        check_ty(ext.ret, &mut type_graph)?;
         for &ty in &ext.params {
-            check_ty(ty, program)?;
+            check_ty(ty, &mut type_graph)?;
         }
     }
     for import in &program.imported_fns {
         check_signature_facts(
-            &format!("imported function `{}`", import.name),
-            import.params.len(),
-            &import.param_modes,
-            &import.return_borrow,
-            &import.return_region,
-            true,
+            SignatureFacts {
+                owner: &format!("imported function `{}`", import.name),
+                modes: &import.param_modes,
+                param_types: &import.params,
+                ret: import.ret,
+                borrow: &import.return_borrow,
+                region: &import.return_region,
+                allow_out: true,
+                allow_return_roots: true,
+            },
+            program,
+            &mut type_graph,
         )?;
         check_mode_types(
             &format!("imported function `{}`", import.name),
             &import.param_modes,
             &import.params,
         )?;
-        check_ty(import.ret, program)?;
+        check_ty(import.ret, &mut type_graph)?;
         for &ty in &import.params {
-            check_ty(ty, program)?;
+            check_ty(ty, &mut type_graph)?;
         }
     }
     if !align_mir::tagged_types_are_canonical(program) {
@@ -13437,6 +13884,254 @@ mod tests {
                 "{name} cycle produced an unexpected diagnostic: {err}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_mir_type_graphs_fail_before_llvm_construction() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let base = || Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![],
+        };
+
+        for (name, ty, expected) in [
+            (
+                "struct",
+                Ty::Struct(7),
+                "tagged payload struct type id 7 is missing",
+            ),
+            (
+                "sum",
+                Ty::Enum(7),
+                "tagged payload sum type id 7 is missing",
+            ),
+            ("tuple", Ty::Tuple(7), "tuple type id 7 is missing"),
+            (
+                "struct-array",
+                Ty::StructArray(7, 2),
+                "tagged payload struct type id 7 is missing",
+            ),
+        ] {
+            let mut malformed = base();
+            malformed.fns[0].value_tys.push(ty);
+            let err = emit_llvm_ir(
+                &malformed,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("a direct missing MIR type id must fail closed");
+            assert!(
+                err.to_string().contains(expected),
+                "{name} produced an unexpected diagnostic: {err}"
+            );
+        }
+
+        for (name, field_ty) in [
+            ("array", Ty::Array(Scalar::Struct(0), 1)),
+            ("struct-array", Ty::StructArray(0, 1)),
+        ] {
+            let mut malformed = base();
+            malformed.structs.push(StructDef {
+                name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "next".to_string(),
+                    ty: field_ty,
+                }],
+                align: None,
+                c_repr: false,
+            });
+            let err = emit_llvm_ir(
+                &malformed,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("an array-mediated inline MIR cycle must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("missing or recursive by-value definition"),
+                "{name} cycle produced an unexpected diagnostic: {err}"
+            );
+        }
+
+        let mut header_cycle = base();
+        let cyclic_ty = Ty::DynStructArray(0, Layout::Aos);
+        header_cycle.structs.push(StructDef {
+            name: "HeaderCycle".to_string(),
+            source_name: "HeaderCycle".to_string(),
+            fields: vec![align_sema::FieldDef {
+                name: "next".to_string(),
+                ty: cyclic_ty,
+            }],
+            align: None,
+            c_repr: false,
+        });
+        header_cycle.fns[0].params.push(0);
+        header_cycle.fns[0]
+            .param_modes
+            .push(align_ast::ParamMode::ByValue);
+        header_cycle.fns[0].slots.push(cyclic_ty);
+        header_cycle.fns[0].ret = cyclic_ty;
+        header_cycle.fns[0].return_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        header_cycle.fns[0].return_region = hir::ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        let err = validate_tagged_program(&header_cycle)
+            .expect_err("a header-only recursive graph cannot supply return provenance");
+        assert!(
+            err.to_string().contains("cannot borrow"),
+            "header-mediated capability recursion produced an unexpected diagnostic: {err}"
+        );
+
+        let mut shared = base();
+        shared.structs.push(StructDef {
+            name: "Shared0".to_string(),
+            source_name: "Shared0".to_string(),
+            fields: vec![align_sema::FieldDef {
+                name: "value".to_string(),
+                ty: Ty::Bool,
+            }],
+            align: None,
+            c_repr: false,
+        });
+        for depth in 1..40 {
+            let child = (depth - 1) as u32;
+            shared.structs.push(StructDef {
+                name: format!("Shared{depth}"),
+                source_name: format!("Shared{depth}"),
+                fields: vec![
+                    align_sema::FieldDef {
+                        name: "left".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                    align_sema::FieldDef {
+                        name: "right".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            });
+        }
+        shared.fns[0].value_tys.push(Ty::Struct(39));
+        validate_tagged_program(&shared)
+            .expect("shared acyclic MIR type subgraphs must be memoized and accepted");
+
+        let mut multi_invalid = base();
+        multi_invalid.structs.push(StructDef {
+            name: "MultiInvalid".to_string(),
+            source_name: "MultiInvalid".to_string(),
+            fields: vec![
+                align_sema::FieldDef {
+                    name: "first".to_string(),
+                    ty: Ty::Struct(7),
+                },
+                align_sema::FieldDef {
+                    name: "second".to_string(),
+                    ty: Ty::Enum(9),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        });
+        let err = validate_tagged_program(&multi_invalid)
+            .expect_err("multi-invalid MIR must fail on its first stored child");
+        assert!(
+            err.to_string()
+                .contains("tagged payload struct type id 7 is missing"),
+            "the iterative LIFO walk changed stored-child error precedence: {err}"
+        );
+
+        const DEEP_GRAPH_LEN: usize = 16_384;
+        let mut deep = base();
+        deep.structs.reserve(DEEP_GRAPH_LEN);
+        for index in 0..DEEP_GRAPH_LEN {
+            let ty = if index + 1 == DEEP_GRAPH_LEN {
+                Ty::Bool
+            } else {
+                Ty::Struct((index + 1) as u32)
+            };
+            deep.structs.push(StructDef {
+                name: format!("Deep{index}"),
+                source_name: format!("Deep{index}"),
+                fields: vec![align_sema::FieldDef {
+                    name: "next".to_string(),
+                    ty,
+                }],
+                align: None,
+                c_repr: false,
+            });
+        }
+        deep.fns[0].value_tys.push(Ty::Struct(0));
+        validate_tagged_program(&deep)
+            .expect("a deep acyclic MIR graph must validate without the process stack");
+
+        const DEEP_TAGGED_LEN: usize = 4_096;
+        let mut deep_tagged = base();
+        deep_tagged.tagged_types.reserve(DEEP_TAGGED_LEN);
+        for index in 0..DEEP_TAGGED_LEN {
+            let payload = if index == 0 {
+                Scalar::Bool
+            } else {
+                Scalar::Tagged((index - 1) as u32)
+            };
+            deep_tagged
+                .tagged_types
+                .push(hir::TaggedType::Option(payload));
+        }
+        deep_tagged.structs.push(StructDef {
+            name: "DeepTagged".to_string(),
+            source_name: "DeepTagged".to_string(),
+            fields: vec![align_sema::FieldDef {
+                name: "value".to_string(),
+                ty: Ty::Tagged((DEEP_TAGGED_LEN - 1) as u32),
+            }],
+            align: None,
+            c_repr: false,
+        });
+        validate_tagged_program(&deep_tagged)
+            .expect("a deep source-ABI tagged key must not consume the process stack");
+
+        deep.structs[DEEP_GRAPH_LEN - 1].fields[0].ty = Ty::Struct(0);
+        let err = validate_tagged_program(&deep)
+            .expect_err("a deep inline MIR cycle must return CodegenError");
+        assert!(
+            err.to_string()
+                .contains("missing or recursive by-value definition"),
+            "deep cycle produced an unexpected diagnostic: {err}"
+        );
     }
 
     #[test]

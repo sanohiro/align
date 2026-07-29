@@ -8,6 +8,44 @@ mod common;
 use common::*;
 
 #[test]
+fn terminating_break_payload_does_not_taint_parallel_callback_effect() {
+    let pure = "\
+fn pure(value: i64) -> i64 = value + 1
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn wrapper(value: i64) -> i64 {
+  f: fn(i64) -> i64 := loop {
+    break { break pure; impure }
+  }
+  return f(value)
+}
+fn main() -> i32 {
+  print([1, 2].par_map(wrapper).sum())
+  return 0
+}
+";
+    let pure_diagnostics =
+        check_diagnostics("effect-terminating-break-payload", pure);
+    assert!(
+        pure_diagnostics.is_empty(),
+        "a callback after an inner terminating break is dead and must not taint the outer loop result:\n{pure_diagnostics}"
+    );
+
+    let impure = pure.replace(
+        "break { break pure; impure }",
+        "break impure",
+    );
+    let diagnostics =
+        check_diagnostics("effect-fallthrough-break-payload", &impure);
+    assert!(
+        diagnostics.contains("'par_map' requires a Pure function"),
+        "an ordinary fallthrough break must still join its Impure callback into the loop result:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn recursive_drop_plan_is_cycle_safe() {
     let src = "\
 Node { next: Option<Node> }
@@ -20,32 +58,32 @@ fn main() -> i32 = 0
 }
 
 #[test]
-fn unsupported_owned_option_field_fails_closed() {
+fn owned_array_option_field_is_admitted_after_l1b() {
     let src = "\
 Holder { values: Option<array<i64>> }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("unsupported-owned-option-field", src),
-        "L1a must not silently admit another owned Option field"
+        !check_errs("owned-array-option-field", src),
+        "L1b must admit an owned array Option field through its recursive DropPlan"
     );
 }
 
 #[test]
-fn unsupported_move_enum_option_field_fails_closed() {
+fn move_enum_option_field_is_admitted_after_l1b() {
     let src = "\
 Content { Empty, Data(array<i64>) }
 Holder { value: Option<Content> }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("unsupported-move-enum-option-field", src),
-        "L1a must reject an Option payload whose resolved enum DropPlan owns storage"
+        !check_errs("move-enum-option-field", src),
+        "L1b must admit an Option payload whose resolved enum DropPlan owns storage"
     );
 }
 
 #[test]
-fn move_struct_enum_payload_is_rejected_independent_of_declaration_order() {
+fn move_struct_enum_payload_is_admitted_independent_of_declaration_order() {
     let src = "\
 Inner { content: Content }
 Wrapper { Wrapped(Inner) }
@@ -53,8 +91,8 @@ Content { Empty, Data(array<i64>) }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("late-enum-move-struct-payload", src),
-        "a later-resolved enum must not let a Move struct bypass the sum-type payload gate"
+        !check_errs("late-enum-move-struct-payload", src),
+        "a later-resolved enum must give its enclosing Move struct a valid recursive payload plan"
     );
 }
 
@@ -67,8 +105,8 @@ Holder { wrapped: Wrap<Owned> }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("generic-struct-direct-owned-option", direct),
-        "a generic struct monomorph must not admit Option<MoveStruct>"
+        !check_errs("generic-struct-direct-owned-option", direct),
+        "a generic struct monomorph must admit Option<MoveStruct>"
     );
 
     let transitive = "\
@@ -79,8 +117,8 @@ Content { Empty, Data(array<i64>) }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("generic-struct-enum-owned-option", transitive),
-        "a cached generic struct must be revalidated after its payload becomes Move through an enum"
+        !check_errs("generic-struct-enum-owned-option", transitive),
+        "a cached generic struct must retain a valid DropPlan when its payload becomes Move through an enum"
     );
 
     let array = "\
@@ -89,8 +127,8 @@ Holder { wrapped: Wrap<array<i64>> }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("generic-struct-array-owned-option", array),
-        "a generic struct monomorph must not admit another owned Option payload"
+        !check_errs("generic-struct-array-owned-option", array),
+        "a generic struct monomorph must admit another finite owned Option payload"
     );
 }
 
@@ -104,8 +142,8 @@ Content { Empty, Data(array<i64>) }
 fn main() -> i32 = 0
 ";
     assert!(
-        check_errs("generic-enum-move-struct-payload", direct),
-        "a cached generic enum must reject a struct that becomes Move after enum resolution"
+        !check_errs("generic-enum-move-struct-payload", direct),
+        "a cached generic enum must retain a valid DropPlan when its struct payload becomes Move"
     );
 
     let array = "\
@@ -117,7 +155,7 @@ fn main() -> i32 = 0
 ";
     assert!(
         check_errs("generic-enum-move-array-payload", array),
-        "a cached generic enum must reject an array whose struct element becomes Move later"
+        "a cached generic enum must still reject the separately deferred array-of-Move payload"
     );
 }
 

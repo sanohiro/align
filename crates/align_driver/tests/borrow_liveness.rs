@@ -272,6 +272,27 @@ fn main() -> i32 {
 }
 
 #[test]
+fn pipeline_capture_owner_invalidation_is_rejected() {
+    let src = "\
+fn main() -> i32 {
+  mut storage := \"hello\".clone()
+  view: str := storage
+  value := [1].map(fn x { x + view.len() }).reduce({
+    storage = \"replacement\".clone()
+    0
+  }, fn acc, x { acc + x })
+  return value as i32
+}
+";
+    let diagnostics = check_diagnostics("borrow-pipeline-capture-invalidation", src);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'view'")
+            && diagnostics.contains("source 'storage' was moved or reassigned"),
+        "a stage snapshot may not outlive storage invalidated by a later terminal operand:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn buffer_growth_invalidates_an_existing_view() {
     let src = "\
 fn main() -> i32 {

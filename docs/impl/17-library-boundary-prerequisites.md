@@ -1490,14 +1490,16 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-L2 ships through five closed implementation slices. A slice may add dormant representation or
+L2 ships through seven closed implementation slices. A slice may add dormant representation or
 tighten existing provenance, but it must not accept source syntax whose complete safety contract
 belongs to a later slice.
 
 | Slice | Exact closure | Public exposure at merge | Required gate |
 |---|---|---|---|
 | L2a | Replace `is_out`/bare parameter-type lists with `ParamMode`; add span-free return-borrow and return-region records to `FnTy`, named/imported signatures, HIR/MIR, interface codecs, hashes, and ABI fingerprints | Existing `ByValue` and `Out` behavior only; `borrow` and `borrow mut` remain identifiers outside parameter-mode lookahead and are rejected as modes | codec byte/hash goldens, corrupt-tag rejection, whole/per-unit identity, and an exhaustive consumer audit |
-| L2b | Infer recursive parameter/capture roots for existing by-value views and view-bearing aggregates; preserve them across named functions, closures, function-value joins/moves, synthetic selectors, direct/indirect/imported calls, and unresolved higher-order targets | No new borrow mode; existing programs only gain fail-closed lifetime rejection where provenance was previously lost | direct/indirect/imported/captured/joined nested-view matrix and summary-size evidence |
+| L2b-a1 | Infer parameter roots for named functions and preserve conservative flattened roots across recursion, direct/imported calls, control flow, and interfaces | No new borrow mode; aggregate projections and indirect calls retain all-compatible-input unions | scalar direct/imported matrix, semantic interface validation, and summary-inference size/time evidence |
+| L2b-a2 | Refine named summaries through struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, branch/loop, and synthetic-selector projections | No new borrow mode; indirect calls retain the pre-L2b all-compatible-input fallback | direct/imported nested-view projection matrix and per-unit parity |
+| L2b-b | Extend the same inference to capture roots, closures, function-value joins/moves, direct/indirect targets, and unresolved higher-order fallback | Complete L2b behavior; no borrow mode | indirect/captured/joined nested-view matrix, malformed capture-domain rejection, and indirect-return evidence |
 | L2c | Add `ReturnCleanupAbi` to function and interface identity and implement `DynamicBit` for every recursively Move direct, indirect, and imported return; forward the selected bit on every return edge and store it in the caller slot | No borrow syntax; metadata and physical ABI land atomically before borrowed mutation can construct path-selected values | codec/hash goldens, `Result<Option<MoveStruct>, Error>` None/Some/Err matrix, ABI mismatch rejection, per-unit parity, and return-cost evidence |
 | L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
 | L2e | Contextually accept `borrow mut`; complete existing `Out` and new `BorrowMut` under one all-peer recursive exclusivity engine; implement generation invalidation, writable Copy/Move replacement, drop-old/cleanup-bit update, and Pure exclusive-state shaping | Full L2 surface | all-peer alias matrix, stale-view rejection, changed/unchanged pointee Drop counts, effect matrix, and per-unit parity |
@@ -1544,9 +1546,31 @@ closures whose captures feed an internal parallel boundary even when unrelated s
 both the closed and open-world effects `Impure`; a direct external callback parameter or parameter
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
-Every `?` occurrence joins only its operand's `Result.Err` projection into the enclosing function's
-`Result.Err` return boundary before control returns early; its `Ok` projection continues through the
-ordinary expression and explicit/implicit return paths.
+
+L2b is implemented as three independently sound vertical PRs. L2b-a1 owns named/direct/imported
+parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
+flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
+targets. L2b-a2 refines named
+aggregate/control projections without weakening that fallback. L2b-b then adds
+target-relative capture roots and function-value target sets, validates the explicit-parameter and
+capture domains in MIR, removes the now-obsolete unresolved-internal-target effect restriction, and
+closes the indirect/captured benchmark row. This split keeps each hand-written diff near the
+repository review bound; none of these PRs exposes `borrow` syntax or depends on an incomplete
+physical ABI.
+L2b-a1 cannot split producer inference from interface validation, direct-call consumption, and
+whole/per-unit parity: shipping a non-empty public summary without any one of those seams would
+either ignore the fact in one compilation mode or trust an unvalidated artifact.
+Its semantic-import correction may exceed the usual 1,000 changed-hand-written-line expectation:
+the exact local-definition index, complete shape/header validation, borrow and growth fixed points,
+weighted-cycle rejection, closure-matrix owner tests, and import-validation benchmark are one
+fail-closed vertical. Splitting before the weighted-cycle gate would accept a malformed or
+non-terminating public type graph; splitting the gate from its shape/fixed-point prerequisites would
+reintroduce the same false accepts and false rejections that reopened this matrix.
+Through L2b-a1, a `?` occurrence conservatively joins its flattened operand roots into the
+enclosing function only when that function's return type can recursively carry a borrow; its `Ok`
+projection continues through the ordinary expression and explicit/implicit return paths. L2b-a2
+replaces that early-edge union with only the operand's `Result.Err` projection at the enclosing
+function's `Result.Err` return boundary.
 Pattern bindings select the corresponding source projection: user sums use their variant/payload
 ordinal, while builtin `Option.Some`, `Result.Ok`, and `Result.Err` use their distinct tagged
 projections. Pure and Impure origins therefore survive the same match-binding path.
@@ -1556,9 +1580,256 @@ imported, and function-value signature even when their values are `None`; L2c th
 cleanup ABI for every such signature in the same change that implements it. Interface decode rejects
 unknown mode/summary/cleanup tags, unsorted or duplicate root indices, capture roots in exported
 named signatures, out-of-range roots, and a cleanup ABI inconsistent with the resolved return type.
+Through L2b-a1, borrow and region summaries are the same canonical parameter-root set because both
+facts come from the same flattened provenance walker; interface import and MIR validation reject a
+disagreement, a root whose parameter type cannot borrow, or provenance on a non-borrowing return
+type. A foreign qualified nominal never resolves by bare-name suffix to a definition in the current
+interface; local generic definitions substitute every actual argument before recursive capability
+checking, including same-name nested parameters. Unresolved imported or generic nominals remain
+conservatively borrow-capable. An imported exact `None` is trusted only when the caller supplies a
+validated external-provenance record; compatibility-API omissions and unanalyzed extern targets
+retain the all-compatible-input fallback.
 Before L2d, semantic import rejects a decoded `Borrow` mode; before L2e it rejects `BorrowMut`.
 Recognizing a codec tag does not enable its source or imported-call semantics. No slice reconstructs
 ownership from region provenance.
+
+The L2b-a1 convergence review exposed one missed matrix axis: physical-layout recursion and
+borrow-capability reachability are distinct graphs. A pointer/header wrapper (`DynArray`,
+`DynStructArray`, or `Task`) breaks the LLVM inline-layout path but not the semantic path to a
+borrow-bearing element. The capability classifier therefore uses an iterative visited-ID traversal
+across structs, tuples, sums, and tagged records. A revisited header-mediated cycle contributes no
+new edge, while any reachable borrowing leaf still makes the root borrow-capable.
+The interface-side equivalent does not recursively instantiate concrete generic types. Semantic
+import first builds one structured `(kind, exact local name)` definition index; rendered type strings
+are never graph keys. The index rejects duplicate or ambiguous struct/enum names only among local
+definitions. A compiler-produced public definition may share the spelling of a source builtin:
+this is not a duplicate definition. Type resolution preserves sema's exact precedence:
+
+1. every generic function, struct, and sum type validates its declared type-parameter list after
+   the complete local type table exists. Stored parameter order is authoritative: a repeated
+   parameter reports `DuplicateTypeParameter`; if the duplicate pass fails, that item does not
+   enter the shadowing pass. Otherwise, the first parameter that shares a local declared-type name
+   reports `TypeParameterShadowsLocalType`;
+2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>` resolve before
+   every qualified user definition, including definitions in a unit literally named `json`;
+3. another declared type parameter wins only when used bare and without arguments;
+4. another bare source-builtin spelling resolves to that builtin;
+5. every remaining bare name resolves through the local-definition index; and
+6. exact `summary.unit.Name` resolves locally unless rule 2 applies. Another qualified name,
+   including `summary.unit.child.Name`, is a conservative foreign leaf and never prefix- or
+   suffix-resolves locally.
+
+If a non-shadowing type-parameter spelling is used with arguments, rules 2, 4, 5, and 6 still get
+their ordinary chance to resolve it. A generic function
+`fn f<Option>(value: Option<str>) -> Option<str>` in a unit with no local `Option` therefore uses the
+builtin `Option`; only an otherwise unresolved parameter spelling with arguments returns
+`TypeParameterWithArguments`. A type parameter may not use a local generic's spelling to reach
+that definition because producer sema rejects the shadowing declaration first. The same duplicate
+and shadowing checks apply to generic struct and sum-type parameters; importer validation never
+rejects a compiler-produced declaration that producer validation admitted.
+`Task` is an internal HIR type and is not a source-nameable interface builtin in L2b-a1, so a local
+definition named `Task` resolves locally. Before capability analysis, a complete semantic type walk
+rejects duplicate or ambiguous local struct/enum names, duplicate type-parameter names, a type
+parameter shadowing a local definition, an otherwise unresolved parameter used with arguments,
+wrong local or source-builtin arity, and an unresolved bare name.
+The walk validates children of every named, tuple, and function type even when capability evaluation
+later treats the outer type as opaque.
+
+Semantic import then solves two parametric summaries for each local definition over separate finite
+lattices:
+
+- the **borrow summary** is the least fixed point of an intrinsic-borrow bit plus the exact
+  type-parameter positions on which borrow capability depends; and
+- the **growth-transport summary** is the greatest fixed point of the parameter positions whose
+  whole actual can re-enter capability traversal, seeded at every direct parameter leaf and retained
+  through self or mutual local-reference cycles.
+
+The two monotone worklists are distinct. Borrow-free `A<T> { next: A<Option<T>> }` has an empty
+borrow summary but retains `T` in growth transport; `Id<U> { value: U }` retains `U`, while
+`Sink<U> { value: i64 }` removes it. Applying a completed borrow summary to a root evaluates finite
+type syntax only. This distinguishes `B<i64>` from `B<str>` while sharing all definition work across
+signature types, public struct fields, sum payloads, constant annotations, and nested function
+signatures. Function types are intrinsic opaque borrow-capability leaves; their parameter and
+return types still enter the complete semantic walk and their summaries are independently validated.
+
+The completed growth-transport summaries own the termination proof. Semantic import builds a
+declaration-level dependency graph whose nodes are `(definition kind, name, type-parameter index)`.
+Growth transport and dependency-edge measurement are separate operations. Computing whether an
+enclosing definition transports one of its parameters evaluates each target-exposed actual through
+the ordinary capability-transparent rules: transparent builtins and completed local growth
+positions continue, while `box`, function types, and every other opaque constructor stop. After a
+local reference itself has been reached, dependency construction records every source-parameter
+occurrence in each of that reference's direct actuals, including occurrences below an opaque
+constructor; it then discovers further local references inside only those actual positions exposed
+by the target's completed growth summary, using the same opaque stops. Thus direct
+`A<T> -> A<box<T>>` records a positive edge and rejects, but
+`Shield<T> { value: Id<box<T>> }` does not expose `T` to an enclosing consumer and discovery inside
+`Id<box<A<T>>>` does not reach `A`.
+An edge records whether the source parameter is the whole direct target actual (weight zero) or
+occurs below one or more type constructors (positive weight). A positive edge in a dependency cycle
+is generative (`A<T>` to `A<Option<T>>`) and rejects. Positive acyclic edges and zero-weight cycles
+are finite.
+`Converge<T, U>` to `Converge<Option<U>, str>` converges because the wrapped `U` moves to `T` and
+the next transition replaces it. `Id<U> { value: U }` exposes an actual and therefore reveals
+growth hidden through `Id<A<Option<T>>>`; `Sink<U> { value: i64 }` does not expose it.
+Parallel zero and positive edges are preserved; a positive edge may not be deduplicated behind a
+zero edge between the same nodes.
+
+Empty provenance summaries and definitions not referenced by a function receive the same
+validation without per-root definition expansion. Multi-invalid precedence is fixed: codec and
+canonical-summary decode errors precede import; import then checks the definition index and complete
+type shape, enabled parameter modes plus generic-body/nested-summary shape, the parametric capability
+solve, generative dependency cycles, and finally return capability, capture roots, and
+parameter-root capability. Within a group it uses stored function, struct, enum, and constant order,
+field/variant/payload order, depth-first type order, and canonical borrow-summary then region-summary
+root order; hash-map iteration never selects an error. With `S` interface type-syntax nodes, `R`
+local-definition references, `F` possible intrinsic/parameter summary facts, and `E` emitted
+weighted dependency edges including parallel edges, the finite scan-based solve is bounded by
+`O(S × F + S × R + E)` time and `O(S + F + E)` memory. Every fact changes at most once in its
+lattice direction, direct-actual measurement is independent of nested-reference discovery, each
+local-reference actual is scanned at most once per containing reference during dependency
+construction, and no definition is recursively instantiated. Each shape failure maps to one public
+import error: `ReservedLocalType`, `DuplicateLocalType`, `DuplicateTypeParameter`,
+`TypeParameterShadowsLocalType`, `TypeParameterWithArguments`, `InvalidTypeArity`, or
+`UnresolvedBareType`. After the complete structured shape succeeds, a transported generic
+declaration that does not parse as its specified single fragment returns `GenericBodySyntax`; one
+that parses but disagrees with its structured record returns `GenericBodyMismatch`. A structured
+generic `layout(C)` struct, which producer sema cannot emit before a concrete instantiation has one
+C type, returns `GenericCLayoutUnsupported`. Stored function, struct, then sum-type order selects
+the first body error; within a struct the C-layout gate precedes syntax, and syntax precedes
+mismatch. All three precede enabled-mode and return-summary header validation. The generativity
+gate alone returns `ReturnSummaryGenerativeCapabilityGraph`; it never substitutes for a preceding
+shape error. Codegen likewise retains one
+type-graph validator and its completed-node sets across every retained definition and signature root
+in the program. It preserves the existing stored root order and depth-first child order: an Enter
+validates the current id and active-path state, marks the node active, then pushes its Exit followed
+by its children in reverse stored order so the LIFO walk observes fields, variants/payloads, tuple
+elements, and tagged `Result` `Ok` then `Err` in stored order. Exit removes the active mark and adds
+the completed mark. Header/pointer references validate their id at the current position without an
+Enter. Per-kind active sets therefore distinguish a real inline cycle from a previously validated
+DAG without consuming the compiler call stack. The MIR canonical-table reachability/key walkers and
+the source-ABI key walker over the same tagged and tuple syntax are iterative as well; validation
+does not hand a deep accepted graph to a recursive post-check. The first `CodegenError` for
+multi-invalid MIR is independent of hash-set iteration.
+
+Named-return inference likewise uses the checked-HIR direct-call graph rather than repeated
+whole-program rescans. Every function is analyzed once initially; when its monotone parameter-root
+summary grows, only its direct callers are queued again. A call chain therefore advances by
+dependency worklist edges rather than one whole-program round per link. Checked HIR records lifted
+origin as `lifted_capture_count: Option<usize>`: `None` for every named function and monomorph, and
+`Some(capture_count)` for every lifted lambda, including a non-capturing lambda. L2b-a1 skips only
+the latter explicit metadata; it never classifies origin from a mangled-name suffix. This also fixes
+the exact explicit-parameter/capture boundary that L2b-b will consume. Lifted lambdas and
+function-value targets otherwise remain deferred exactly as above. Owner tests place callers before
+callees, cover a mutually recursive pair, and include an ordinary dependency function whose legal
+source name is `lambda0`, so correctness and convergence cannot come from declaration order, an
+in-place single pass, or synthetic-name guessing; the benchmark chain uses the same
+caller-before-callee order. A checked-HIR owner test directly covers all metadata states:
+`None` for an ordinary named function, `None` for a generic monomorph, `Some(0)` for a
+non-capturing lifted lambda, and `Some(n)` with the exact positive capture count for a capturing
+lifted lambda.
+
+The reopened-review corrections stay in L2b-a1 as one parity follow-up. Splitting any of them into a
+later PR would leave the current producer able to emit an interface that its consumer rejects,
+allow a forged generic fragment to reconstruct a different consumer declaration, or publish
+unreachable provenance that rejects a legal caller. The follow-up closes the shared
+producer/importer generic-parameter and local-name validation, semantic interface-name resolution,
+generic-fragment verification, checked-HIR function-origin metadata, and source-order return-flow
+reachability seams plus their owner tests. It does not widen L2b-a1 into function-value or
+capture-root inference.
+
+The second reopened review found that accepted-edge identity alone did not close termination inside
+the accepted payload. A payload can emit an inner `break`, explicit `return`, process termination,
+or another diverging control-flow expression before the enclosing `break` reaches its own edge.
+L2b-a1 therefore also closes MIR payload termination and effect-boundary source-order traversal in
+this PR. These are the same already-shipped control-flow surface, not a later provenance feature:
+deferring either would let sema publish a false Impure callback or let MIR overwrite a typed loop
+result and emit cleanup after a terminated block. The correction is approximately 1,300
+added-plus-removed hand-written lines across the source-order walker, MIR continuation gate,
+matrix, and owner tests. It cannot split the walker’s child traversal from each enclosing call,
+impurity, and boundary action: either intermediate would publish false effect state for a reachable
+subset of the same expression variants. It stays in this already-open vertical because both
+consumers must obey the same checked-HIR fallthrough contract; merging only MIR would retain false
+purity rejection, while merging only effect inference would retain typed-slot corruption and double
+cleanup.
+
+The third reopened review found one remaining source-order disagreement and one evidence overclaim.
+For a written pipeline terminal, Align evaluates the receiver/source first, then every explicit
+stage operand in written stage order, then the terminal's explicit arguments in written argument
+order, and finally enters the terminal operation. For `reduce(init, reducer)` and
+`scan(init, reducer)`, the reducer's lifted captures are part of entering the terminal operation
+after `init`; they are not evaluated before the source, stage operands, or `init`. The effect walker
+already visited `source` before `init` but visited `init` before stage operands, while MIR lowered
+`init` before both. That mismatch could hide an executed effect in `init` when the source terminated
+in the effect walk, or execute an `init` effect that the published summary omitted. L2b-a1 closes
+the whole shared seam in one vertical, with structural and reachable-state duties kept distinct.
+AST-to-HIR checking preserves deterministic written diagnostic precedence: type hints may be read
+from a named stage or reducer signature without evaluating an expression, then the first invalid
+source, stage operand, `init`, or reducer is reported in that order and suppresses diagnostics from
+later operands of the same terminal. Pipeline collection records malformed stages without emitting
+them before source checking. Once a pipeline has formed checked HIR, finalization and lints still
+traverse every child, including control-flow-dead syntax, so every retained type is concrete and
+every retained diagnostic remains available. EscapeCheck likewise lowers every
+child into its diagnostic CFG, but a non-fallthrough source/stage/`init` leaves every later child in
+predecessor-less state that cannot join reachable escape provenance. EffectScan and
+MoveCheck/return provenance stop reachable-state formation after the first non-fallthrough operand.
+Every stage-bearing array terminal and streaming JSON-scanner reducer MIR emits only the reachable
+prefix.
+
+Pipeline lambda capture remains the settled by-value-at-creation model. After the source falls
+through, MIR snapshots every stage lambda's Copy captures once at that stage's written position;
+after every stage operand falls through, it evaluates the terminal's explicit arguments and then
+snapshots terminal callable captures. In particular, `reduce`/`scan` evaluate `init` between stage
+and reducer snapshots, while `map_into` evaluates `dst` after stage snapshots. The fused loop reuses
+those operands and never reloads an enclosing local per iteration. Capture formation is not callback
+execution: EffectScan records reachable stage operand/capture formation before terminal arguments,
+but joins no stage call/dependency, callback parameter/result boundary, or terminal action until all
+terminal arguments and terminal-capture formation fall through and the operation is entered. Thus
+an argument mutation cannot retroactively change a stage capture, while a later terminal capture
+observes that mutation; a terminating argument retains the earlier snapshot/use diagnostics but
+makes every callback action dead. A terminating source/stage/argument creates no later snapshot. No
+accumulator/destination store, finder plan, output allocation, loop state, callback call, source
+cleanup transfer, or terminal result is formed after that boundary. JSON-scanner `scan` is not a
+supported surface and is not added by this correction.
+
+The pipeline source is also a preheader snapshot. MoveCheck records its owner roots at source
+formation and revalidates them after an intervening terminal argument, alongside already-formed
+stage-view captures. Direct, zipped, JSON-scanner, transparent-block, and recursively
+borrow-preserving `if`/`match` sources therefore retain the union of every reachable selected owner
+at arbitrary control-flow depth and reject before action when `init` replaces an owned source or an
+owner behind a view. `else` retains its fallback
+owner and retains success-side provenance only for a Copy borrow; a Move success payload transfers
+out of and nulls its Option/Result container. A value-producing loop likewise transfers each
+accepted `break` payload into its result slot, so its moved-and-nulled source place is not an owner
+dependency of the enclosing pipeline. A terminal argument that returns or breaks before action
+destroys the analysis snapshot in both the current state and every saved loop-break state; a dead
+snapshot cannot survive a loop join or fixpoint.
+Function-value effect state remains deliberately monotone across assignments: a later operand can
+retain or strengthen an earlier Impure/Unknown capture, but can never turn it Pure.
+
+This third correction is not a separable prerequisite PR. At the reopened gate,
+`main...HEAD` already contains 9,549 added-plus-removed lines across the independently reviewed
+L2b-a1 producer/importer/provenance vertical. The pipeline-order correction is expected to add
+roughly 1,200–1,600 hand-written lines across checker recovery, the shared analysis walkers, every
+stage-bearing array/scanner terminal, documentation, and owners. Merging the existing branch first
+would knowingly publish
+an unsound Pure summary and runtime order; merging checker/analysis first would leave MIR executing
+a different program, while merging MIR/capture snapshots first would leave sema certifying dead
+callbacks and reporting diagnostics in the wrong order. Capture formation and callback action also
+cannot split: the intermediate would either reload captures per iteration or join an action that
+`init` prevents. The smallest independently correct boundary is therefore the complete
+source→stage-formation→terminal-arguments→terminal-capture→action vertical on the existing L2b-a1
+PR.
+
+The earlier text also described one sema test and two MIR tests as though they directly inspected
+every cell in the complete Cartesian product. They did not: the sema owner directly proved the
+nested-accepted-break function-value boundary, and the MIR owners directly proved representative
+terminating and mixed payloads. The tables below remain the normative implementation inventory, but
+the evidence ledger now states only what a named test directly observes. L2b-a1 adds focused
+pipeline-terminal owners for the newly exposed source/stage/init seam. Broader expression-family
+coverage remains cumulative through the existing sema and driver suites; it is not represented as
+an internal call-set or allocation-count assertion unless the named owner actually makes that
+assertion.
 
 The following closure matrix is authoritative for implementation and review. “All call forms” means
 same-unit named, imported, bound function value, indirect call, and generic monomorph where the
@@ -1567,10 +1838,12 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None` | duplicate, unsorted, out-of-range, or exported capture roots reject before consumer-visible side effects | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; checked HIR carries `lifted_capture_count` and no name spelling decides whether inference runs | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, a local definition using the producer-reserved exact name `Error`, `argon2_params`, or `regex_match`, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; the complete struct/sum definition set is scanned for reserved names before duplicate detection; `generic_body` is precisely the producer's item-span fragment: it starts at `fn` for a function or the declared type name for a struct/sum, omits `pub` and every struct `align`/`layout` prefix, and contains exactly that full declaration/body; validation reconstructs `pub` plus canonical `align(N)` then `layout(C)` prefixes from the structured record, rejects a module/import, extra item, trailing non-END token, or syntax error, parses exactly one declaration, and compares its kind, name, ordered type parameters/bounds, ordered function parameter modes/types and return type, ordered struct fields plus reconstructed layout attributes, or ordered sum variants against the structured record; an extra `pub` in the fragment is a syntax error because visibility is reconstructed rather than compared; function parameter names and generic function implementation expressions are deliberately transported but are not separate structured interface fields; a structured generic `layout(C)` struct returns `GenericCLayoutUnsupported`, within a struct that gate precedes `GenericBodySyntax`, and syntax precedes `GenericBodyMismatch`; all three precede header validation; reserved-local-name rejection precedes duplicate-local-definition rejection and has the exact `ReservedLocalType(name)` import error; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; a local definition sharing any other source-builtin spelling is not a duplicate, and non-shadowing type-parameter, qualified `json.*` builtin, bare builtin, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
-| Existing return provenance | L2b | recursively walk scalar, struct, tuple, fixed-array, tagged, and function-value returns; preserve exact parameter/capture roots through assignment, move, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, and explicit/implicit/early return | unresolved higher-order targets use all compatible roots; incompatible joins and escaping unbound captures reject | L3 adds resource/dependent roots; L4 adds explicit region owners |
-| Closure/function-value provenance | L2b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
+| Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; only reachable explicit returns, loop breaks, and trailing values contribute roots or loop post-state: eager children follow source order and stop after the first non-fallthrough child; `&&`/`||`, `if`/`match` arms, and `else` fallback fork from their common incoming state, retain every reachable dependency/return edge, exclude a diverging alternative from post-state, and join only fallthrough alternatives; `?` evaluates its operand once, contributes its reachable implicit error-return roots only when the enclosing return can borrow, and continues post-state only through the success edge; a loop builds its back-edge only from body fallthrough, its post-state only from reachable breaks, and is non-fallthrough when none exist; checker-owned evidence records the exact statement span of each `break` accepted for its target loop after the target/lambda and newly nested `arena`/`task_group` gates but before payload validation, then a post-check source-order classifier counts only reachable spans from that per-loop set and consumes the separately recorded fallthrough result of each nested loop; HIR carries the same accepted-edge bit on every checked `break`, and effect inference, EscapeCheck, MoveCheck/return-provenance, and MIR lowering may form a loop-result join, escape edge, move/borrow post-state, provenance root, or loop-exit terminator only from an accepted edge; a region-rejected `break` emits its region diagnostic first, checks and preserves its payload only for nested type/effect/ownership/escape diagnostics, records no accepted edge, remains non-fallthrough for recovery in every consumer, lowers fail-closed to `Unreachable` if malformed HIR is forced into MIR, and can neither satisfy an assertion nor combine with an unreachable accepted break to make the loop fall through; statements and tails after a non-fallthrough statement are never visited, so no dead edge can taint a summary or caller liveness; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
+| Effect source-order closure | L2b-a1 | each structural pass visits every reachable eager child once in language order; loop refinement may repeat that pass but every call, impurity flag, and boundary join is monotone and idempotent across fixpoint passes; block traversal stops after the first non-fallthrough statement and visits a tail only when the block falls through; an accepted `break value` visits the reachable effects inside `value` but joins its function-value/concrete effect into the target loop result only when `value` itself falls through to that break edge; ordinary fallthrough accepted breaks still join; written pipelines evaluate source, stage operands, terminal arguments, then terminal captures/action; `if`, `match`, `else`, short-circuit, `?`, `map_err`, nested blocks/regions, loops, explicit return, inner break, calls, aggregates, assignments, captures, pipelines, and process termination use the exhaustive product below and the same fallthrough contract as return provenance | no dead eager sibling, statement, tail, operation, branch-result, terminal argument, stage, or outer break whose payload already terminated can taint a local/result/expression boundary, named-call dependency, direct/indirect impurity, unresolved dispatch, parallel-callback purity, or fixpoint; a rejected break still visits reachable payload diagnostics but never joins a loop result; projection queries cannot reintroduce a dead tail; no conservative default may turn a proven non-fallthrough payload into a result edge | L2b-b extends the same source-order walker to function-value/capture roots |
+| Pipeline terminal formation and MIR closure | L2b-a1 | type formation may inspect named stage/terminal signatures for hints without evaluating an expression, then validates source, stage operands, terminal arguments, and terminal callable in written order; the first invalid operand is reported and later operands of that terminal are not checked; finalization/lints still visit every child of successfully formed HIR, including control-flow-dead syntax; EscapeCheck isolates later syntax in predecessor-less diagnostic CFG state after termination; EffectScan and MoveCheck form state only from the reachable prefix; EffectScan separates stage capture/operand formation from callback action, and joins stage/terminal calls plus callback boundaries only after every pre-terminal operand and terminal capture falls through; function-value effect state joins assignments monotonically, so a later operand cannot make an earlier Impure/Unknown capture Pure; MIR snapshots each stage capture once after the source and at that stage's written position, evaluates explicit terminal arguments, then snapshots terminal callable captures once; the loop reuses those captured operands; MoveCheck snapshots the source's owner roots at source formation and revalidates them after terminal arguments, alongside already-formed stage-view captures; direct, zip, JSON-scanner, and control-flow-selected sources retain every reachable selected owner; return/break before action removes the analysis snapshot from current and saved loop-break states; `sum`, `count`, `any`, `all`, `min`, `max`, `sort`, `sort_by_key`, `to_array`, `map_into`, `partition`, `par_map`, `reduce`, and `scan` share that formation/action boundary; `map_into(dst)` evaluates `dst` after stage snapshots but before any stage action; `reduce`/`scan` evaluate `init` between stage and reducer snapshots; an accepted `break value` lowers `value` once and, only if the selected continuation has at least one reachable predecessor, reads the target loop frame, stores the result, nulls a moved source, emits iteration drops, transfers cleanup, and jumps to that loop's exit; a mixed `if`/`match`/`else`/`?`/short-circuit payload keeps the outer edge only for its fallthrough alternatives, and a nested loop's own break may yield a payload that then reaches the outer edge; when every reachable payload path terminates, the inner terminating construct owns the only result/return/process edge and its required cleanup; fixed, dynamic, and zipped sources share the same order; every JSON-scanner reducer follows it | multi-invalid terminal precedence is source before stage before terminal argument before terminal callable, with only the earliest invalid operand diagnosed; checked-HIR dead syntax still finalizes and lints; no dead child joins reachable effect, move, return, borrow, or escape state; a terminating terminal argument retains earlier stage-operand state but adds no stage/terminal action, call dependency, or callback boundary; capture loads are neither repeated per iteration nor moved across a later terminal argument; an owner invalidated after direct/zip/scanner/control-flow source formation rejects before action; no analysis snapshot survives a terminating return/break; an un-terminated zero-predecessor join is not fallthrough; after payload termination MIR emits no outer result store, Unit fallback, source nulling, iteration Drop, cleanup transfer, loop-frame lookup, or outer exit edge; after pipeline source/stage/terminal-argument termination MIR emits no later operand, capture snapshot, accumulator/output allocation or store, loop/control state, callback call, source cleanup transfer, or result; nested accepted break, explicit return, `process.exit`, `process.abort`, and fully diverging nested block/`if`/`match`/loop payloads preserve their typed result and cannot be overwritten or double-cleaned; malformed HIR remains fail-closed without panic; JSON-scanner `scan` remains rejected | L2c reuses the same post-lowering continuation gate before cleanup-bit transfer |
+| Closure/function-value provenance | L2b-b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
 | Cleanup ABI formation | L2c | Copy returns record `None`; every recursively Move return records `DynamicBit` in `FnTy`, named/imported signatures, MIR, interface, mangling, cache identity, and LLVM ABI | metadata/type disagreement, missing bit, extra bit, unknown tag, and caller/callee fingerprint mismatch reject | none |
 | Cleanup-bit production | L2c | normal expression return, explicit return, `if`, `match`, `else`, `?`, `map_err`, branch/loop join, and early exit forward the selected path-local bit and clear a moved source exactly once | malformed MIR bit source/destination, missing local, invalid tag, and uninitialized/duplicate transfer reject without panic | L4 adds explicit-region clear-bit values |
 | Cleanup-bit consumption | L2c | all call forms store the returned bit in the caller result slot; move-out/null, reassignment drop-old, wildcard discard, and scope/early cleanup consult that bit exactly once | no caller may infer the bit from type, tag, or region; ABI mismatch fails before call emission | L2e reuses the same slot through mutable replacement |
@@ -1587,13 +1860,173 @@ their first owning slice and remain cumulative gates afterward.
 | Slice | Exact owner tests | Exact benchmark command and required rows |
 |---|---|---|
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
-| L2b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
+| L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_sema ty_may_borrow_is_cycle_safe_for_header_mediated_nominals`; `cargo test -p align_sema lifted_function_origin_metadata_is_explicit`; `cargo test -p align_sema checked_break_acceptance_is_preserved_in_hir`; `cargo test -p align_sema rejected_break_effect_payload_is_visited_without_loop_result_join`; `cargo test -p align_sema effect_source_order_closure_matrix`; `cargo test -p align_sema pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_sema pipeline_terminal_diagnostic_order`; `cargo test -p align_sema pipeline_terminal_dead_state_isolated_across_analyses`; `cargo test -p align_sema pipeline_terminal_dead_hir_is_finalized_and_linted`; `cargo test -p align_sema pipeline_capture_owner_invalidation_is_rejected`; `cargo test -p align_sema pipeline_source_snapshot_owner_invalidation_matrix`; `cargo test -p align_codegen_llvm malformed_mir_type_graphs_fail_before_llvm_construction`; `cargo test -p align_mir rejected_checked_break_lowers_to_unreachable`; `cargo test -p align_mir terminating_break_payload_emits_no_outer_edge`; `cargo test -p align_mir mixed_break_payload_preserves_outer_edge`; `cargo test -p align_mir terminating_pipeline_operand_emits_no_terminal_state`; `cargo test -p align_mir pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_mir pipeline_terminal_source_shape_parity`; `cargo test -p align_driver --test return_provenance --test analysis_coverage --test interface_param_modes --test per_unit`; `cargo test -p align_driver --test m5 json_scan_reduce_fold`; `cargo test -p align_driver --test zip_pipeline pipeline_terminal_source_order` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `import-validation` |
+| L2b-a2 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
 | L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call` |
 | L2e | `cargo test -p align_driver --test borrowed_params exclusive_`; `cargo test -p align_driver --test out_params --test analysis_coverage` | `bench/library_boundary/run.sh exclusive-borrow`: `exclusive-copy-control`, `exclusive-copy-call`, `exclusive-move-replace` |
 
+The following table is the normative L2b-a1 effect-evaluation inventory, not a claim that one test
+directly exposes every private EffectScan cell. Every row requires fully terminating, mixed, and
+all-fallthrough behavior where the syntax admits them. A fully terminating case retains effects and
+diagnostics produced before termination, excludes the listed dead state, and reports
+non-fallthrough. A mixed branch visits every statically reachable alternative, excludes
+produced-value state from its terminating alternatives, and retains the continuation and
+produced-value state of every fallthrough alternative. The same-shape all-fallthrough twin retains
+all listed state and reports fallthrough. `effect_source_order_closure_matrix` directly inspects the
+nested accepted-break function-value boundary.
+`pipeline_terminal_snapshot_action_order_matrix` checks a terminating-`init`/all-fallthrough
+`reduce` pair through the final inferred Pure/Impure result: the stopped twin excludes its impure
+stage action while the live twin retains it. The shared formation/action helpers and exhaustive
+terminal match route every stage-bearing terminal through the same ordering seam.
+`analysis_coverage` separately proves the corresponding final Pure/Impure `par_map` decision.
+Other rows are observed through their existing focused sema/driver tests and the exhaustive match;
+no test claims direct inspection of private EffectScan cells.
+
+| Effect evaluation site | Terminating discriminator | Dead state excluded / fallthrough state retained |
+|---|---|---|
+| block statement and tail | an earlier statement returns, breaks, exits, aborts, or evaluates a diverging expression | every later statement and the tail, including their call and boundary state |
+| `Let`, `LetTuple`, `Assign`, and field/element assignment | initializer, earlier tuple/member/index, or assigned value terminates | later child evaluation, destination local/concrete boundary, and the assignment itself |
+| index/element/vector write | receiver/index/value terminates in source order | later operands and view-write impurity; the completed twin records the write |
+| direct call and arguments | an earlier argument terminates | later arguments, named-call dependency or `print` impurity, parameter/concrete boundary joins, and call result state |
+| indirect call and arguments | callee or an earlier argument terminates | later arguments, `consume_fn_value`, target dependency, unresolved-dispatch/Unknown, parameter joins, and call result state |
+| aggregate, constructor, index, range, builder, raw, and I/O expressions | an earlier eager child terminates | every later child and the enclosing operation's own call, impurity, or boundary state |
+| closure, node, reducer, and stage captures | an earlier capture terminates | later captures, lifted/stage dependency, capture join, and node result state |
+| pipeline source, stage formation/action, and terminal | the source, an earlier stage operand/capture, or an earlier terminal argument terminates; an intervening argument invalidates the owner of an already-formed source or view capture | later stage/terminal operands and snapshots plus terminal state are excluded; stage and terminal action, `parmaps`, named dependencies, callback-origin joins, and result boundary join only after all pre-terminal operands fall through; source/view owner invalidation rejects before action for direct, zip, and scanner shapes; function-value captures cannot become more Pure after formation because assignment joins effect state monotonically; the direct stopped/live pair covers `reduce(init, f)`, while the shared helpers and exhaustive match cover `sum`/`count`/`any`/`all`/`min`/`max`/`sort`/`sort_by_key`/`to_array`/`map_into`/`partition`/`par_map`/`scan` |
+| explicit `return value` | `value` terminates before the return edge | return boundary join; reachable payload effect remains |
+| accepted and rejected `break value` | the payload terminates before the break edge | accepted outer loop-result join; a rejected break never joins in either case but still visits its reachable payload |
+| `if` | condition terminates, both arms diverge, or exactly one arm diverges | a dead condition excludes both arms; both-diverging excludes a result; mixed arms retain only the fallthrough result |
+| `match` | scrutinee terminates, all arms diverge, or only some arms diverge | a dead scrutinee excludes bindings/arms; all-diverging excludes a result; mixed arms retain only fallthrough results |
+| `else` unwrap | operand terminates or fallback diverges | a dead operand excludes both edges; a diverging fallback remains diagnostically visited but only the success edge contributes a result |
+| short-circuit `&&`/`||` | LHS terminates or the conditional RHS diverges | a dead LHS excludes RHS; a diverging RHS contributes reachable effects while the short path still falls through |
+| `?` | operand terminates or its Err edge returns | a dead operand excludes both edges; otherwise Err joins the implicit return effect and only Ok continues |
+| `map_err` | receiver expression or mapper-value expression terminates | later mapper/call/boundary state is excluded in evaluation order; after both expressions fall through, unchanged Ok and mapped Err result joins remain conservatively reachable because L2b-a1 has no callee-divergence summary |
+| loop and projection queries | body statement/payload diverges, the loop has no reachable break, or a block/branch tail is dead | no dead backedge/break join or `fn_value_effect`/`projected_fn_effect` resurrection; reachable accepted breaks converge monotonically and repeated fixpoint passes are idempotent |
+
+The L2b-a1 MIR evidence ledger states the direct assertions made by each named owner:
+
+| MIR payload product | Direct MIR assertion | Driver/LLVM observation |
+|---|---|---|
+| same-target nested accepted break; explicit `return`; `process.exit`; `process.abort`; fully diverging transparent block/`unsafe`/`arena`/`task_group`; all-diverging `if` and `match`; diverging loop | `terminating_break_payload_emits_no_outer_edge` proves no outer store, Unit fallback, source null, iteration Drop, cleanup transfer, frame read, or goto | a Copy `str` case proves LLVM never stores Unit into the typed loop-result slot |
+| one terminating and one fallthrough `if` arm; the same `match` product | `mixed_break_payload_preserves_outer_edge` proves the join exists iff it has a reachable predecessor and only the fallthrough path emits the outer edge | both runtime selections return the typed value selected by the inner or outer edge |
+| inner loop break yields the outer payload; terminating `else` fallback with fallthrough success; returning `?` Err with fallthrough Ok; diverging short-circuit RHS with fallthrough short path | the same mixed owner proves the outer edge survives every positive continuation | runtime success/short selections return the outer value and return/termination selections preserve their inner edge |
+| owned `string` selected by a mixed payload with a live loop-iteration owner | the mixed MIR owner proves one result transfer, one source clear, one reachable iteration cleanup, and no cleanup statement after a terminated block | `return_provenance` observes the selected owned values through their returned lengths and successful process exit; it makes no allocator/leak-count claim |
+| stage-bearing array terminals and JSON-scanner reducers sharing the source/stage/terminal preparation seams | `terminating_pipeline_operand_emits_no_terminal_state` proves a terminating `reduce` init emits no reducer action/loop and that an already completed owned source is still cleaned; `pipeline_terminal_snapshot_action_order_matrix` proves the stage and reducer captures are distinct preheader SSA snapshots and neither is reloaded in the loop; `pipeline_terminal_source_shape_parity` applies the preheader/action classification to fixed, dynamic, zipped, and JSON-scanner sources | the sema stopped/live pair proves the corresponding effect boundary; `return_provenance` observes array reduce/scan values, and `m5::json_scan_reduce_fold` observes the scanner reduce value; no runtime allocation/drop-count claim is made |
+| source-owner snapshots across terminal arguments | `pipeline_source_snapshot_owner_invalidation_matrix` covers a direct owned source, a zipped constituent, a JSON-scanner backing owner, and an `if`-selected owner; each includes mixed-branch invalidation, while a Move-`else` success-container reassignment proves transfer does not create a false owner, and return- and outer-break-terminating argument twins prove no later action-boundary diagnostic or saved snapshot is manufactured | MoveCheck's analysis-only snapshot entries participate in the same invalidation, borrow-preserving control-result root union, branch joins, saved loop-break states, and fixpoints as local borrowers; Move `else` success and loop-result transfers deliberately contribute no old-container/source root; MIR source-shape parity alone cannot close this analysis invariant |
+| mutable local captured by a stage before `reduce`/`scan` `init`, and by the terminal callable afterward | the MIR snapshot test proves the stage snapshot precedes the terminal-argument mutation, the terminal snapshot follows it, and neither load appears in the loop body | `lambda::pipeline_captures_snapshot_in_written_operand_order` executes reduce/scan twins and observes the pre-argument stage value plus post-argument terminal value; the existing Copy-only pipeline-capture restriction means no hidden allocation or Drop is introduced |
+
+The remaining analysis cells have direct owners rather than being inferred from the MIR/runtime
+rows. `pipeline_terminal_dead_state_isolated_across_analyses` places an owner invalidation and a
+later reducer capture behind a terminating `init`, then proves the dead capture does not join
+reachable borrow state. `pipeline_terminal_dead_hir_is_finalized_and_linted` places the
+unnecessary-heap pattern in a dead `init` tail and proves finalization still emits the lint without
+contributing reachable flow state.
+`pipeline_capture_owner_invalidation_is_rejected` snapshots a borrowed `str` stage capture and
+replaces its owned `string` source in `init`; the exact borrow-owner diagnostic proves the snapshot
+cannot dangle before action. `pipeline_terminal_source_shape_parity` directly constructs fixed,
+dynamic, zipped, and JSON-scanner-reduce HIR twins and applies the same snapshot/action
+classification. `pipeline_terminal_snapshot_action_order_matrix` exercises the common sequential
+stage/reducer call-argument seam, so a helper that reloads either capture in the loop fails directly.
+`zip_pipeline::pipeline_terminal_source_order` and `m5::json_scan_reduce_fold` are the successful
+runtime observations for their source classes.
+
 Acceptance:
 
+- interface import rejects direct, mutual, permuted, and `Id`-exposed positive growth cycles; accepts
+  the `Sink` twin, the documented convergent transform, constant replacement, a whole local nominal
+  actual, and zero-weight permutation/duplication;
+- direct `A<box<T>>` identity growth rejects while local nominals below an exposed opaque actual do
+  not create dependency edges; composed `Id<box<T>>` and `Id<fn(T) -> T>` wrappers do not expose
+  `T` to an enclosing local consumer; parallel zero and positive edges still reject;
+- a deep acyclic MIR type chain validates and a deep malformed inline cycle rejects with
+  `CodegenError`, both through the iterative graph walker rather than the process stack; a
+  multi-invalid graph reports the first stored child before later siblings;
+- caller-before-callee chains and mutual named recursion converge to the same canonical return roots
+  in whole-program and per-unit checking, only changed callees requeue their direct callers, and a
+  dependency's ordinary exported `lambda0` function is inferred as named rather than skipped as a
+  lifted lambda;
+- duplicate local/type-parameter keys, function/struct/sum type-parameter local-definition
+  shadowing, duplicate-before-shadow multi-invalid precedence, unresolved
+  parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names,
+  exact qualified-local names,
+  unit-prefix-but-foreign names such as `foo.bar.Type`, other foreign-qualified leaves, malformed
+  nested function types, and multi-invalid precedence have exact semantic-import tests;
+- compiler-produced public `Option` and `Task` definitions validate for import; a bare
+  source-builtin spelling and an exact qualified local spelling resolve with the same precedence as
+  sema, while `Task` remains a local source name rather than an invented interface builtin;
+- forged public definitions named `Error`, `argon2_params`, or `regex_match` reject with
+  `ReservedLocalType` before duplicate-local and type-shape validation, matching the producer's exact
+  reserved set without rejecting any other source-builtin spelling; the precedence owner fixture
+  places an earlier same-kind duplicate before a later cross-kind reserved definition, so a
+  per-definition interleaved scan cannot pass;
+- a unit named `json` with a public local `doc` definition still resolves qualified `json.doc`,
+  `json.kind`, and `json.scanner<...>` as source builtins; a non-shadowing type-parameter spelling
+  reused by a resolvable builtin application follows that builtin, a type parameter matching a
+  local declared type rejects as forbidden shadowing, and a truly unresolved parameter application
+  reports `TypeParameterWithArguments`;
+- producer sema and semantic import both reject duplicate and local-shadowing type parameters on
+  generic functions, structs, and sum types in stored order; when one occurrence is both duplicate
+  and shadowing, `DuplicateTypeParameter` wins and no second shadow diagnostic is emitted for it;
+- semantic import rejects a generic body whose declaration kind, name, ordered type
+  parameters or bounds, function parameter modes/types, return type, struct fields/layout
+  attributes, or sum variants differs from its structured record, before rendering consumer source;
+- compiler-produced generic function, sum type, and over-aligned struct fragments all validate and
+  round-trip; a forged structured generic `layout(C)` struct rejects with
+  `GenericCLayoutUnsupported`; fragments containing an extra `pub`, module/import, second item,
+  trailing token, wrong declaration kind, or malformed syntax reject with the recorded
+  C-layout-before-syntax-before-mismatch precedence;
+- checked HIR records named and generic-monomorph functions as `lifted_capture_count == None`,
+  a non-capturing lifted lambda as `Some(0)`, and a capturing lifted lambda as `Some(n)` with the
+  exact capture count;
+- a reachable fixed return or loop break followed by an unreachable parameter-returning exit
+  produces `None`, keeps the caller owner usable, and contributes no dead loop post-state in either
+  whole-program or per-unit checking;
+- a diverging first child followed by an unreachable parameter-returning operand, call argument,
+  aggregate member, bound, or index contributes no parameter root, and a `return` followed by a
+  dead `break` does not make its loop fall through;
+- a reachable conditional return or direct-call dependency remains in the inferred summary; when
+  one short-circuit/`if`/`match`/`else` alternative diverges and its sibling falls through, only the
+  sibling post-state survives; a conditional reachable `break` contributes loop value/post-state
+  while a dead break contributes neither;
+- a syntactically reachable `break` rejected inside an `arena` or `task_group` nested in its loop
+  reports the region-scoped-break diagnostic without a debug assertion or panic and does not make
+  that loop produce a value; a same-function unreachable accepted break cannot combine with the
+  rejected edge to manufacture fallthrough. The exact recovery matrix also covers a nested loop
+  whose break belongs only to that inner loop, a rejected region-nested break that prevents a later
+  outer break from becoming reachable, a loop created inside an already-active arena/task-group
+  baseline, accepted breaks through a plain block and `unsafe`, lambda isolation, an accepted
+  control edge with an invalid payload, region-diagnostic-before-nested-payload-diagnostic ordering,
+  and a diverging break payload that never reaches its enclosing break. A rejected `break value`
+  additionally records `accepted == false` in HIR, contributes no effect-result join, EscapeCheck
+  loop-exit edge or break-escape diagnostic, MoveCheck loop post-state, return-provenance root, or
+  MIR loop-exit edge, leaves later syntax unreachable in every analysis, and still visits the
+  payload for independent nested diagnostics. The direct checked-HIR owner records payload identity
+  and `accepted == true` for an ordinary break plus payload identity and `accepted == false` for
+  region-, lambda-, and outside-loop-rejected breaks; type finalization and MIR statement-span
+  selection preserve that payload for either bit, `UnnecessaryHeapScan` visits it for either bit,
+  and both `hir_stmt_diverges` and MoveCheck's walked-statement classifier report non-fallthrough
+  for either bit. The effect owner proves that a rejected payload's own nested effect violation is
+  still visited while its function-value effect does not join the loop-result boundary. Driver
+  recovery fixtures separately retain a nested type error, a nested effect error, a payload-internal
+  ownership/use-after-move error, and a payload-internal escape error; they also prove that no outer
+  break-escape diagnostic, loop move/borrow post-state, post-loop use-after-move diagnostic, or
+  return root is manufactured. The direct malformed-HIR MIR owner lowers a rejected break without a
+  loop frame to exactly `Term::Unreachable`, emits no payload runtime statement or side effect,
+  result store, moved-source nulling, iteration drop, cleanup transfer, or exit edge, and does not
+  lower a following HIR statement. The accepted-break MIR owner separately proves that a payload
+  terminating through an inner accepted break, explicit return, `process.exit`, `process.abort`, or
+  a diverging nested block/`if`/`match`/loop emits no enclosing result store, Unit overwrite,
+  moved-source nulling, iteration drop, cleanup transfer, loop-frame lookup, or outer exit edge;
+  direct MIR assertions and a Copy `str` LLVM case prove that the typed result slot is never
+  overwritten by Unit. A separate mixed-path owned `string` runtime case observes the selected
+  values through their returned lengths and successful process exit. Its direct MIR owner proves
+  one selected result transfer, source clear, reachable iteration cleanup, and no cleanup statement
+  after a terminated block; no allocator/leak-count claim is made. The effect owner visits
+  reachable effects inside a terminating payload, stops before all later statements and the dead
+  tail, and joins no outer loop function-value boundary; an end-to-end `analysis_coverage` case
+  accepts the resulting Pure callback at `par_map`, while a paired ordinary accepted-break case
+  still joins and rejects an actually Impure callback;
 - a Move owner remains usable after a shared borrow;
 - moving from a borrowed binding is rejected;
 - a returned view dies when the caller owner moves/drops;

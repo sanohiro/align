@@ -776,12 +776,20 @@ shape instead would curve-fit to one cost-model cutoff, so that arm asserts noth
 
 ## 5. Closure representation and inlining
 
-### 5.1 SHIPPED / GOOD — non-escaping pipeline capture
+### 5.1 SHIPPED — non-escaping pipeline capture and L2b-a1 timing correction
 
 An inline pipeline lambda is lifted to an internal function. Its element is the first argument and
-captured Copy values are trailing value arguments. `stage_call_args` lowers capture reads in the loop
-([lines 3816-3825](../../crates/align_mir/src/lib.rs#L3816)); LLVM inlines the internal lifted function
-and hoists invariant capture loads.
+captured Copy values are trailing value arguments. Before the L2b-a1 correction, several sequential
+fused loops emitted enclosing-local capture reads inside the loop and relied on LLVM to hoist them.
+That preserved ordinary immutable-value results but did not implement the exact by-value creation
+point when a later terminal argument mutated a captured binding or invalidated a captured view's
+owner.
+
+The shipped L2b-a1 correction lowers each stage capture once
+at that stage's written position and each terminal/reducer capture once after the terminal's
+preceding arguments. The fused body reuses those SSA operands. Borrow provenance stays attached to
+a captured view across intervening terminal arguments, so an ownership-changing `init` or
+`map_into(dst)` expression that would invalidate the snapshot is rejected.
 
 A fresh optimized-IR probe of:
 

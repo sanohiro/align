@@ -53,7 +53,7 @@ pub use codec::{
 };
 pub use hash::Hash128;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use align_ast::ParamMode;
 pub use align_sema::hir::{ReturnBorrowSummary, ReturnRegionSummary};
@@ -302,6 +302,22 @@ pub fn build_summaries_with_effects(
         .into_iter()
         .map(|(k, v)| (k, v.into()))
         .collect();
+    let return_provenance: HashMap<&str, (&ReturnBorrowSummary, &ReturnRegionSummary)> = program
+        .fns
+        .iter()
+        .map(|function| {
+            (
+                function.name.as_str(),
+                (&function.return_borrow, &function.return_region),
+            )
+        })
+        .chain(program.imported_fns.iter().map(|function| {
+            (
+                function.name.as_str(),
+                (&function.return_borrow, &function.return_region),
+            )
+        }))
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
 
@@ -331,6 +347,15 @@ pub fn build_summaries_with_effects(
                             // Fail-closed: a non-generic pub fn missing from the effect map is Impure.
                             effects.get(&canonical).copied().unwrap_or(Effect::Impure)
                         };
+                        let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
+                        let (return_borrow, return_region) = if is_generic {
+                            (ReturnBorrowSummary::None, ReturnRegionSummary::None)
+                        } else {
+                            return_provenance
+                                .get(canonical.as_str())
+                                .map(|(borrow, region)| ((*borrow).clone(), (*region).clone()))
+                                .unwrap_or((ReturnBorrowSummary::None, ReturnRegionSummary::None))
+                        };
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -343,8 +368,8 @@ pub fn build_summaries_with_effects(
                                 })
                                 .collect(),
                             ret: convert_ret(&fd.ret),
-                            return_borrow: ReturnBorrowSummary::None,
-                            return_region: ReturnRegionSummary::None,
+                            return_borrow,
+                            return_region,
                             effect,
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -562,10 +587,11 @@ fn partition_impl_hashes(
 // The seam between the whole-program checker and per-unit checking is deliberately narrow: rather
 // than a second resolver over summaries, an imported unit's `InterfaceSummary` is rendered back to
 // Align source and re-parsed by the EXISTING parser into an `ast::File`, then fed to
-// `align_sema::check_program_with_effects` as an interface-only `Module`. Every table-building and
-// resolution pass in sema is thus reused unchanged — one resolution code path. Generic templates and
-// const values are stored as source text in the summary (they MUST be re-parsed regardless), so
-// render-to-source unifies the whole reconstruction into a single `parse_file` call in the driver.
+// `align_sema::check_program_with_interface_facts` as an interface-only `Module`. Every
+// table-building and resolution pass in sema is thus reused unchanged — one resolution code path.
+// Generic templates and const values are stored as source text in the summary (they MUST be
+// re-parsed regardless), so render-to-source unifies the whole reconstruction into a single
+// `parse_file` call in the driver.
 
 /// Render a UTF-8 type reference back to source. Every summary type is `Named`/`Tuple`/`Fn` (see
 /// [`convert_type`]); a named type with args is `path<a, b>`, the unit type is its sentinel `()`.
@@ -628,13 +654,14 @@ fn render_type_params(tps: &[ITypeParam]) -> String {
 }
 
 fn render_struct(s: &IStructDef) -> String {
-    // `pub` first, then attributes (parser order): `pub layout(C) align(16) Name { ... }`.
+    // `pub` first, then one canonical attribute order. The producer's stored generic fragment
+    // starts at the type name, so these structured fields are the only source of layout prefixes.
     let mut out = String::from("pub ");
-    if s.c_repr {
-        out.push_str("layout(C) ");
-    }
     if let Some(a) = s.align {
         out.push_str(&format!("align({a}) "));
+    }
+    if s.c_repr {
+        out.push_str("layout(C) ");
     }
     out.push_str(&s.name);
     out.push_str(&render_type_params(&s.type_params));
@@ -663,27 +690,123 @@ fn render_enum(e: &IEnumDef) -> String {
     out
 }
 
-/// A decoded interface may contain mode/summary tags reserved for a later compiler slice. The
-/// codec recognizes those stable tags, but an L2a consumer rejects their semantics before
-/// reconstructing or checking imported source.
+/// A decoded interface may contain parameter-mode tags reserved for later compiler slices. L2b
+/// consumes canonical return summaries, while `Borrow`/`BorrowMut` remain disabled until L2d/L2e.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
+    ReservedLocalType(String),
+    DuplicateLocalType(String),
+    DuplicateTypeParameter(String),
+    TypeParameterShadowsLocalType(String),
+    TypeParameterWithArguments(String),
+    InvalidTypeArity {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
+    UnresolvedBareType(String),
+    GenericCLayoutUnsupported(String),
+    GenericBodySyntax(String),
+    GenericBodyMismatch(String),
     UnsupportedParamMode(ParamMode),
-    UnsupportedReturnBorrow,
-    UnsupportedReturnRegion,
+    ReturnSummaryOnNonBorrowingType,
+    ReturnSummaryRootCannotBorrow(u32),
+    ReturnSummaryCaptureRoot,
+    ReturnSummaryDisagreement,
+    ReturnSummaryOnUnsupportedSignature,
+    ReturnSummaryGenerativeCapabilityGraph,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ImportCompatibilityError::ReservedLocalType(name) => {
+                write!(f, "interface declares producer-reserved local type `{name}`")
+            }
+            ImportCompatibilityError::DuplicateLocalType(name) => {
+                write!(f, "interface contains duplicate or ambiguous local type `{name}`")
+            }
+            ImportCompatibilityError::DuplicateTypeParameter(name) => {
+                write!(f, "interface contains duplicate type parameter `{name}`")
+            }
+            ImportCompatibilityError::TypeParameterShadowsLocalType(name) => {
+                write!(
+                    f,
+                    "interface type parameter `{name}` shadows a declared local type"
+                )
+            }
+            ImportCompatibilityError::TypeParameterWithArguments(name) => {
+                write!(f, "interface type parameter `{name}` cannot take type arguments")
+            }
+            ImportCompatibilityError::InvalidTypeArity {
+                name,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "interface type `{name}` expects {expected} type arguments, got {actual}"
+                )
+            }
+            ImportCompatibilityError::UnresolvedBareType(name) => {
+                write!(f, "interface contains unresolved bare type `{name}`")
+            }
+            ImportCompatibilityError::GenericCLayoutUnsupported(name) => {
+                write!(
+                    f,
+                    "generic interface struct `{name}` cannot use `layout(C)` before concrete instantiation"
+                )
+            }
+            ImportCompatibilityError::GenericBodySyntax(name) => {
+                write!(
+                    f,
+                    "generic interface declaration `{name}` is not one valid declaration fragment"
+                )
+            }
+            ImportCompatibilityError::GenericBodyMismatch(name) => {
+                write!(
+                    f,
+                    "generic interface declaration `{name}` disagrees with its structured record"
+                )
+            }
             ImportCompatibilityError::UnsupportedParamMode(mode) => {
                 write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
             }
-            ImportCompatibilityError::UnsupportedReturnBorrow => {
-                write!(f, "non-empty return-borrow interface summaries require L2b")
+            ImportCompatibilityError::ReturnSummaryOnNonBorrowingType => {
+                write!(
+                    f,
+                    "interface return provenance is present on a return type that cannot borrow"
+                )
             }
-            ImportCompatibilityError::UnsupportedReturnRegion => {
-                write!(f, "non-empty return-region interface summaries require L2b")
+            ImportCompatibilityError::ReturnSummaryRootCannotBorrow(index) => {
+                write!(
+                    f,
+                    "interface return provenance parameter root {index} names a type that cannot supply a borrow"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryCaptureRoot => {
+                write!(
+                    f,
+                    "an exported interface signature cannot contain a capture-root return summary"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryDisagreement => {
+                write!(
+                    f,
+                    "return-borrow and return-region summaries disagree in the L2b-a1 interface"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature => {
+                write!(
+                    f,
+                    "return provenance is not enabled on generic or nested function-value signatures"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph => {
+                write!(
+                    f,
+                    "return provenance capability validation found a generative recursive type graph"
+                )
             }
         }
     }
@@ -691,82 +814,951 @@ impl std::fmt::Display for ImportCompatibilityError {
 
 impl std::error::Error for ImportCompatibilityError {}
 
-fn validate_import_param(param: &IParam) -> Result<(), ImportCompatibilityError> {
-    if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
-        return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
-    }
-    validate_import_type(&param.ty)
+#[derive(Clone, Copy)]
+enum LocalDefinition<'a> {
+    Struct(&'a IStructDef),
+    Enum(&'a IEnumDef),
 }
 
-fn validate_import_summaries(
-    borrow: &ReturnBorrowSummary,
-    region: &ReturnRegionSummary,
+impl<'a> LocalDefinition<'a> {
+    fn type_params(self) -> &'a [ITypeParam] {
+        match self {
+            LocalDefinition::Struct(definition) => &definition.type_params,
+            LocalDefinition::Enum(definition) => &definition.type_params,
+        }
+    }
+
+    fn values(self) -> Vec<&'a IType> {
+        match self {
+            LocalDefinition::Struct(definition) => {
+                definition.fields.iter().map(|(_, ty)| ty).collect()
+            }
+            LocalDefinition::Enum(definition) => definition
+                .variants
+                .iter()
+                .flat_map(|(_, payload)| payload)
+                .collect(),
+        }
+    }
+}
+
+struct LocalDefinitionIndex<'a> {
+    unit: &'a str,
+    definitions: Vec<LocalDefinition<'a>>,
+    by_name: HashMap<&'a str, usize>,
+    param_offsets: Vec<usize>,
+    total_params: usize,
+}
+
+impl<'a> LocalDefinitionIndex<'a> {
+    fn new(summary: &'a InterfaceSummary) -> Result<Self, ImportCompatibilityError> {
+        for name in summary
+            .structs
+            .iter()
+            .map(|definition| &definition.name)
+            .chain(
+                summary
+                    .enums
+                    .iter()
+                    .map(|definition| &definition.name),
+            )
+        {
+            if is_reserved_local_type_name(name) {
+                return Err(ImportCompatibilityError::ReservedLocalType(
+                    name.clone(),
+                ));
+            }
+        }
+        let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
+        let mut by_name = HashMap::new();
+        for definition in &summary.structs {
+            if by_name
+                .insert(definition.name.as_str(), definitions.len())
+                .is_some()
+            {
+                return Err(ImportCompatibilityError::DuplicateLocalType(
+                    definition.name.clone(),
+                ));
+            }
+            definitions.push(LocalDefinition::Struct(definition));
+        }
+        for definition in &summary.enums {
+            if by_name
+                .insert(definition.name.as_str(), definitions.len())
+                .is_some()
+            {
+                return Err(ImportCompatibilityError::DuplicateLocalType(
+                    definition.name.clone(),
+                ));
+            }
+            definitions.push(LocalDefinition::Enum(definition));
+        }
+        let mut total_params = 0usize;
+        let mut param_offsets = Vec::with_capacity(definitions.len());
+        for definition in &definitions {
+            param_offsets.push(total_params);
+            total_params += definition.type_params().len();
+        }
+        Ok(Self {
+            unit: &summary.unit,
+            definitions,
+            by_name,
+            param_offsets,
+            total_params,
+        })
+    }
+
+    fn local(&self, path: &str) -> Option<usize> {
+        if let Some(name) = path.strip_prefix(self.unit).and_then(|rest| rest.strip_prefix('.')) {
+            return self.by_name.get(name).copied();
+        }
+        if path.contains('.') {
+            return None;
+        }
+        self.by_name.get(path).copied()
+    }
+
+    fn is_missing_qualified_local(&self, path: &str) -> bool {
+        path.strip_prefix(self.unit)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|name| !name.contains('.') && !self.by_name.contains_key(name))
+    }
+
+    fn total_params(&self) -> usize {
+        self.total_params
+    }
+}
+
+fn is_reserved_local_type_name(name: &str) -> bool {
+    matches!(name, "Error" | "argon2_params" | "regex_match")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinCapability {
+    BorrowLeaf,
+    Transparent,
+    Opaque,
+}
+
+fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
+    let result = match path {
+        "str" | "reader" | "writer" | "http_headers" | "json.doc" => {
+            (0, BuiltinCapability::BorrowLeaf)
+        }
+        "slice" | "soa" | "json.scanner" => (1, BuiltinCapability::BorrowLeaf),
+        "Option" | "array" => (1, BuiltinCapability::Transparent),
+        "Result" => (2, BuiltinCapability::Transparent),
+        "box" | "array_builder" => (1, BuiltinCapability::Opaque),
+        "buffer" | "file" | "rng" | "regex" | "captures" | "tcp_conn"
+        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
+        | "response_builder" | "http_stream" | "json.kind" | "Error"
+        | "argon2_params" | "regex_match" | "()" | "bool" | "char" | "string"
+        | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+        | "f32" | "f64" | "raw" => (0, BuiltinCapability::Opaque),
+        _ => {
+            let vector = path
+                .strip_prefix("vec")
+                .or_else(|| path.strip_prefix("mask"))
+                .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"));
+            return vector.then_some((1, BuiltinCapability::Opaque));
+        }
+    };
+    Some(result)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct BorrowFacts {
+    intrinsic: bool,
+    params: Vec<bool>,
+}
+
+impl BorrowFacts {
+    fn empty(param_count: usize) -> Self {
+        Self {
+            intrinsic: false,
+            params: vec![false; param_count],
+        }
+    }
+
+    fn union(&mut self, other: &Self) {
+        self.intrinsic |= other.intrinsic;
+        for (current, incoming) in self.params.iter_mut().zip(&other.params) {
+            *current |= *incoming;
+        }
+    }
+}
+
+struct CapabilityAnalysis<'a> {
+    index: LocalDefinitionIndex<'a>,
+    borrow: Vec<BorrowFacts>,
+    growth: Vec<Vec<bool>>,
+}
+
+impl<'a> CapabilityAnalysis<'a> {
+    fn new(index: LocalDefinitionIndex<'a>) -> Result<Self, ImportCompatibilityError> {
+        let borrow = index
+            .definitions
+            .iter()
+            .map(|definition| BorrowFacts::empty(definition.type_params().len()))
+            .collect();
+        let growth = index
+            .definitions
+            .iter()
+            .map(|definition| vec![true; definition.type_params().len()])
+            .collect();
+        let mut analysis = Self {
+            index,
+            borrow,
+            growth,
+        };
+        analysis.solve_borrow();
+        analysis.solve_growth();
+        analysis.reject_generative_cycles()?;
+        Ok(analysis)
+    }
+
+    fn eval_borrow(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        summaries: &[BorrowFacts],
+    ) -> BorrowFacts {
+        let mut result = BorrowFacts::empty(type_params.len());
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => result.intrinsic = true,
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result.params[index] = true;
+                        continue;
+                    }
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        match capability {
+                            BuiltinCapability::BorrowLeaf => result.intrinsic = true,
+                            BuiltinCapability::Transparent => work.extend(args),
+                            BuiltinCapability::Opaque => {}
+                        }
+                        continue;
+                    }
+                    if let Some(index) = self.index.local(path) {
+                        let summary = &summaries[index];
+                        result.intrinsic |= summary.intrinsic;
+                        for (position, dependent) in summary.params.iter().copied().enumerate() {
+                            if dependent
+                                && let Some(argument) = args.get(position)
+                            {
+                                work.push(argument);
+                            }
+                        }
+                    } else if path.contains('.') {
+                        result.intrinsic = true;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn eval_growth(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        summaries: &[Vec<bool>],
+    ) -> Vec<bool> {
+        let mut result = vec![false; type_params.len()];
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result[index] = true;
+                        continue;
+                    }
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        if capability == BuiltinCapability::Transparent {
+                            work.extend(args);
+                        }
+                        continue;
+                    }
+                    if let Some(index) = self.index.local(path) {
+                        for (position, exposed) in summaries[index].iter().copied().enumerate() {
+                            if exposed
+                                && let Some(argument) = args.get(position)
+                            {
+                                work.push(argument);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn solve_borrow(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.index.definitions.len() {
+                let definition = self.index.definitions[index];
+                let mut next = self.borrow[index].clone();
+                for value in definition.values() {
+                    next.union(&self.eval_borrow(
+                        value,
+                        definition.type_params(),
+                        &self.borrow,
+                    ));
+                }
+                if next != self.borrow[index] {
+                    self.borrow[index] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn solve_growth(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.index.definitions.len() {
+                let definition = self.index.definitions[index];
+                let mut next = vec![false; definition.type_params().len()];
+                for value in definition.values() {
+                    let facts = self.eval_growth(
+                        value,
+                        definition.type_params(),
+                        &self.growth,
+                    );
+                    for (current, incoming) in next.iter_mut().zip(facts) {
+                        *current |= incoming;
+                    }
+                }
+                if next != self.growth[index] {
+                    self.growth[index] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn add_occurrence_edges(
+        &self,
+        source: usize,
+        target: usize,
+        target_param: usize,
+        actual: &IType,
+        edges: &mut Vec<(usize, usize, bool)>,
+    ) {
+        let source_params = self.index.definitions[source].type_params();
+        let mut work = vec![(actual, false)];
+        while let Some((current, wrapped)) = work.pop() {
+            match current {
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(source_param) = source_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        edges.push((
+                            self.index.param_offsets[source] + source_param,
+                            self.index.param_offsets[target] + target_param,
+                            wrapped,
+                        ));
+                        continue;
+                    }
+                    work.extend(args.iter().map(|argument| (argument, true)));
+                }
+                IType::Tuple(elements) => {
+                    work.extend(elements.iter().map(|element| (element, true)));
+                }
+                IType::Fn { params, ret, .. } => {
+                    work.extend(params.iter().map(|parameter| (&parameter.ty, true)));
+                    work.push((ret, true));
+                }
+            }
+        }
+    }
+
+    fn collect_edges(
+        &self,
+        source: usize,
+        root: &IType,
+        edges: &mut Vec<(usize, usize, bool)>,
+    ) {
+        let mut work = vec![root];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if let Some((_, capability)) = builtin_capability(path) {
+                        if capability == BuiltinCapability::Transparent {
+                            work.extend(args);
+                        }
+                        continue;
+                    }
+                    let Some(target) = self.index.local(path) else {
+                        continue;
+                    };
+                    for (position, argument) in args.iter().enumerate() {
+                        self.add_occurrence_edges(
+                            source,
+                            target,
+                            position,
+                            argument,
+                            edges,
+                        );
+                        if self.growth[target][position] {
+                            work.push(argument);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reject_generative_cycles(&self) -> Result<(), ImportCompatibilityError> {
+        let node_count = self.index.total_params();
+        let mut edges = Vec::new();
+        for source in 0..self.index.definitions.len() {
+            for value in self.index.definitions[source].values() {
+                self.collect_edges(source, value, &mut edges);
+            }
+        }
+        let mut forward = vec![Vec::new(); node_count];
+        let mut reverse = vec![Vec::new(); node_count];
+        for &(from, to, _) in &edges {
+            let Some(outgoing) = forward.get_mut(from) else {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            };
+            outgoing.push(to);
+            let Some(incoming) = reverse.get_mut(to) else {
+                return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+            };
+            incoming.push(from);
+        }
+
+        let mut seen = vec![false; node_count];
+        let mut order = Vec::with_capacity(node_count);
+        for start in 0..node_count {
+            if seen[start] {
+                continue;
+            }
+            seen[start] = true;
+            let mut stack = vec![(start, 0usize)];
+            while let Some((node, edge_index)) = stack.pop() {
+                if let Some(&next) = forward[node].get(edge_index) {
+                    stack.push((node, edge_index + 1));
+                    if !seen[next] {
+                        seen[next] = true;
+                        stack.push((next, 0));
+                    }
+                } else {
+                    order.push(node);
+                }
+            }
+        }
+
+        let mut component = vec![usize::MAX; node_count];
+        let mut component_id = 0usize;
+        while let Some(start) = order.pop() {
+            if component[start] != usize::MAX {
+                continue;
+            }
+            component[start] = component_id;
+            let mut stack = vec![start];
+            while let Some(node) = stack.pop() {
+                for &next in &reverse[node] {
+                    if component[next] == usize::MAX {
+                        component[next] = component_id;
+                        stack.push(next);
+                    }
+                }
+            }
+            component_id += 1;
+        }
+        if edges
+            .iter()
+            .any(|&(from, to, positive)| positive && component[from] == component[to])
+        {
+            return Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph);
+        }
+        Ok(())
+    }
+
+    fn may_borrow(&self, ty: &IType, type_params: &[ITypeParam]) -> bool {
+        let facts = self.eval_borrow(ty, type_params, &self.borrow);
+        facts.intrinsic || facts.params.into_iter().any(|dependent| dependent)
+    }
+}
+
+fn validate_type_params(
+    type_params: &[ITypeParam],
+    index: &LocalDefinitionIndex<'_>,
 ) -> Result<(), ImportCompatibilityError> {
-    if !matches!(borrow, ReturnBorrowSummary::None) {
-        return Err(ImportCompatibilityError::UnsupportedReturnBorrow);
-    }
-    if !matches!(region, ReturnRegionSummary::None) {
-        return Err(ImportCompatibilityError::UnsupportedReturnRegion);
-    }
-    Ok(())
-}
-
-fn validate_import_type(ty: &IType) -> Result<(), ImportCompatibilityError> {
-    match ty {
-        IType::Named { args, .. } => {
-            for arg in args {
-                validate_import_type(arg)?;
-            }
+    let mut seen = HashSet::new();
+    for parameter in type_params {
+        if !seen.insert(parameter.name.as_str()) {
+            return Err(ImportCompatibilityError::DuplicateTypeParameter(
+                parameter.name.clone(),
+            ));
         }
-        IType::Tuple(elems) => {
-            for elem in elems {
-                validate_import_type(elem)?;
-            }
-        }
-        IType::Fn {
-            params,
-            ret,
-            return_borrow,
-            return_region,
-        } => {
-            for param in params {
-                validate_import_param(param)?;
-            }
-            validate_import_type(ret)?;
-            validate_import_summaries(return_borrow, return_region)?;
+    }
+    for parameter in type_params {
+        if index.local(&parameter.name).is_some() {
+            return Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+                parameter.name.clone(),
+            ));
         }
     }
     Ok(())
 }
 
-/// Validate that a decoded interface uses only the L2a-enabled semantic subset. This is distinct
-/// from codec validation: known future tags round-trip canonically but must not enable their ABI.
-pub fn validate_for_import(
+fn validate_import_type_shape(
+    ty: &IType,
+    index: &LocalDefinitionIndex<'_>,
+    type_params: &[ITypeParam],
+) -> Result<(), ImportCompatibilityError> {
+    let mut work = vec![ty];
+    while let Some(current) = work.pop() {
+        match current {
+            IType::Tuple(elements) => work.extend(elements.iter().rev()),
+            IType::Fn { params, ret, .. } => {
+                work.push(ret);
+                work.extend(params.iter().rev().map(|parameter| &parameter.ty));
+            }
+            IType::Named { path, args } => {
+                let parameter = type_params
+                    .iter()
+                    .find(|parameter| parameter.name == *path);
+                if args.is_empty() && parameter.is_some() {
+                    continue;
+                }
+                let expected = if let Some((arity, _)) = builtin_capability(path) {
+                    Some(arity)
+                } else {
+                    index
+                        .local(path)
+                        .map(|definition| index.definitions[definition].type_params().len())
+                };
+                if let Some(expected) = expected {
+                    if args.len() != expected {
+                        return Err(ImportCompatibilityError::InvalidTypeArity {
+                            name: path.clone(),
+                            expected,
+                            actual: args.len(),
+                        });
+                    }
+                } else if let Some(parameter) = parameter {
+                    return Err(ImportCompatibilityError::TypeParameterWithArguments(
+                        parameter.name.clone(),
+                    ));
+                } else if !path.contains('.') || index.is_missing_qualified_local(path) {
+                    return Err(ImportCompatibilityError::UnresolvedBareType(path.clone()));
+                }
+                work.extend(args.iter().rev());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_shapes(
     summary: &InterfaceSummary,
+    index: &LocalDefinitionIndex<'_>,
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
-        for param in &function.params {
-            validate_import_param(param)?;
+        validate_type_params(&function.type_params, index)?;
+        for parameter in &function.params {
+            validate_import_type_shape(&parameter.ty, index, &function.type_params)?;
         }
-        validate_import_type(&function.ret)?;
-        validate_import_summaries(&function.return_borrow, &function.return_region)?;
+        validate_import_type_shape(&function.ret, index, &function.type_params)?;
     }
     for structure in &summary.structs {
+        validate_type_params(&structure.type_params, index)?;
         for (_, ty) in &structure.fields {
-            validate_import_type(ty)?;
+            validate_import_type_shape(ty, index, &structure.type_params)?;
         }
     }
     for enumeration in &summary.enums {
+        validate_type_params(&enumeration.type_params, index)?;
         for (_, payload) in &enumeration.variants {
             for ty in payload {
-                validate_import_type(ty)?;
+                validate_import_type_shape(ty, index, &enumeration.type_params)?;
             }
         }
     }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
-            validate_import_type(ty)?;
+            validate_import_type_shape(ty, index, &[])?;
         }
+    }
+    Ok(())
+}
+
+fn validate_import_param_mode(param: &IParam) -> Result<(), ImportCompatibilityError> {
+    if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
+        return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
+    }
+    Ok(())
+}
+
+fn validate_import_summary_header(
+    borrow: &ReturnBorrowSummary,
+    region: &ReturnRegionSummary,
+    allow_return_roots: bool,
+) -> Result<(), ImportCompatibilityError> {
+    let summaries_agree = match (borrow, region) {
+        (ReturnBorrowSummary::None, ReturnRegionSummary::None) => true,
+        (
+            ReturnBorrowSummary::Roots {
+                params: borrow_params,
+                captures: borrow_captures,
+            },
+            ReturnRegionSummary::Roots {
+                params: region_params,
+                captures: region_captures,
+            },
+        ) => borrow_params == region_params && borrow_captures == region_captures,
+        _ => false,
+    };
+    if !summaries_agree {
+        return Err(ImportCompatibilityError::ReturnSummaryDisagreement);
+    }
+    if !allow_return_roots
+        && (!matches!(borrow, ReturnBorrowSummary::None)
+            || !matches!(region, ReturnRegionSummary::None))
+    {
+        return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+    }
+    Ok(())
+}
+
+fn validate_import_type_headers(ty: &IType) -> Result<(), ImportCompatibilityError> {
+    let mut work = vec![ty];
+    while let Some(current) = work.pop() {
+        match current {
+            IType::Named { args, .. } => work.extend(args.iter().rev()),
+            IType::Tuple(elements) => work.extend(elements.iter().rev()),
+            IType::Fn {
+                params,
+                ret,
+                return_borrow,
+                return_region,
+            } => {
+                for param in params {
+                    validate_import_param_mode(param)?;
+                }
+                validate_import_summary_header(return_borrow, return_region, false)?;
+                work.push(ret);
+                work.extend(params.iter().rev().map(|param| &param.ty));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_headers(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        for param in &function.params {
+            validate_import_param_mode(param)?;
+            validate_import_type_headers(&param.ty)?;
+        }
+        validate_import_type_headers(&function.ret)?;
+        validate_import_summary_header(
+            &function.return_borrow,
+            &function.return_region,
+            function.generic_body.is_none(),
+        )?;
+    }
+    for structure in &summary.structs {
+        for (_, ty) in &structure.fields {
+            validate_import_type_headers(ty)?;
+        }
+    }
+    for enumeration in &summary.enums {
+        for (_, payload) in &enumeration.variants {
+            for ty in payload {
+                validate_import_type_headers(ty)?;
+            }
+        }
+    }
+    for constant in &summary.consts {
+        if let Some(ty) = &constant.ty {
+            validate_import_type_headers(ty)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_generic_fragment(
+    name: &str,
+    body: &str,
+    attributes: &str,
+) -> Result<align_ast::Item, ImportCompatibilityError> {
+    let source = format!("pub {attributes}{}", body.trim_start());
+    let mut diags = align_diag::Diagnostics::new();
+    let tokens = align_lexer::tokenize(0, &source, &mut diags);
+    let mut file = align_parser::parse_file(tokens, &mut diags);
+    if diags.has_errors()
+        || file.module.is_some()
+        || !file.imports.is_empty()
+        || file.items.len() != 1
+    {
+        return Err(ImportCompatibilityError::GenericBodySyntax(
+            name.to_string(),
+        ));
+    }
+    Ok(file.items.remove(0))
+}
+
+fn validate_generic_function(function: &IFnSig) -> Result<(), ImportCompatibilityError> {
+    let Some(body) = &function.generic_body else {
+        return if function.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                function.name.clone(),
+            ))
+        };
+    };
+    if function.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    }
+    let align_ast::Item::Fn(parsed) =
+        parse_generic_fragment(&function.name, body, "")?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    };
+    let params = parsed
+        .params
+        .iter()
+        .map(|param| IParam {
+            mode: param.mode,
+            ty: convert_type(&param.ty),
+        })
+        .collect::<Vec<_>>();
+    if parsed.name.name != function.name
+        || convert_type_params(&parsed.type_params) != function.type_params
+        || params != function.params
+        || convert_ret(&parsed.ret) != function.ret
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            function.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_struct(structure: &IStructDef) -> Result<(), ImportCompatibilityError> {
+    if !structure.type_params.is_empty() && structure.c_repr {
+        return Err(ImportCompatibilityError::GenericCLayoutUnsupported(
+            structure.name.clone(),
+        ));
+    }
+    let Some(body) = &structure.generic_body else {
+        return if structure.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                structure.name.clone(),
+            ))
+        };
+    };
+    if structure.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    }
+    let mut attributes = String::new();
+    if let Some(align) = structure.align {
+        attributes.push_str(&format!("align({align}) "));
+    }
+    if structure.c_repr {
+        attributes.push_str("layout(C) ");
+    }
+    let align_ast::Item::Struct(parsed) =
+        parse_generic_fragment(&structure.name, body, &attributes)?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    };
+    let fields = parsed
+        .fields
+        .iter()
+        .map(|field| (field.name.name.clone(), convert_type(&field.ty)))
+        .collect::<Vec<_>>();
+    if parsed.name.name != structure.name
+        || convert_type_params(&parsed.type_params) != structure.type_params
+        || fields != structure.fields
+        || parsed.align != structure.align
+        || parsed.c_repr != structure.c_repr
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            structure.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_enum(enumeration: &IEnumDef) -> Result<(), ImportCompatibilityError> {
+    let Some(body) = &enumeration.generic_body else {
+        return if enumeration.type_params.is_empty() {
+            Ok(())
+        } else {
+            Err(ImportCompatibilityError::GenericBodyMismatch(
+                enumeration.name.clone(),
+            ))
+        };
+    };
+    if enumeration.type_params.is_empty() {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    }
+    let align_ast::Item::Enum(parsed) =
+        parse_generic_fragment(&enumeration.name, body, "")?
+    else {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    };
+    let variants = parsed
+        .variants
+        .iter()
+        .map(|variant| {
+            (
+                variant.name.name.clone(),
+                variant.payload.iter().map(convert_type).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if parsed.name.name != enumeration.name
+        || convert_type_params(&parsed.type_params) != enumeration.type_params
+        || variants != enumeration.variants
+    {
+        return Err(ImportCompatibilityError::GenericBodyMismatch(
+            enumeration.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_import_generic_bodies(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for function in &summary.fns {
+        validate_generic_function(function)?;
+    }
+    for structure in &summary.structs {
+        validate_generic_struct(structure)?;
+    }
+    for enumeration in &summary.enums {
+        validate_generic_enum(enumeration)?;
+    }
+    Ok(())
+}
+
+fn validate_import_summaries(
+    params: &[IParam],
+    ret: &IType,
+    borrow: &ReturnBorrowSummary,
+    region: &ReturnRegionSummary,
+    analysis: &CapabilityAnalysis<'_>,
+    type_params: &[ITypeParam],
+) -> Result<(), ImportCompatibilityError> {
+    let ret_may_borrow = analysis.may_borrow(ret, type_params);
+    let param_may_borrow = params
+        .iter()
+        .map(|param| analysis.may_borrow(&param.ty, type_params))
+        .collect::<Vec<_>>();
+    for roots in [
+        match borrow {
+            ReturnBorrowSummary::None => None,
+            ReturnBorrowSummary::Roots { params, captures } => {
+                Some((params.as_slice(), captures.as_slice()))
+            }
+        },
+        match region {
+            ReturnRegionSummary::None => None,
+            ReturnRegionSummary::Roots { params, captures } => {
+                Some((params.as_slice(), captures.as_slice()))
+            }
+        },
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ret_may_borrow {
+            return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
+        }
+        if !roots.1.is_empty() {
+            return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
+        }
+        for &index in roots.0 {
+            let Some((_, &may_borrow)) = params
+                .get(index as usize)
+                .zip(param_may_borrow.get(index as usize))
+            else {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            };
+            if !may_borrow {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a decoded interface uses only the currently enabled semantic subset. Codec
+/// validation has already proved canonical return summaries; this gate still rejects later borrow
+/// parameter modes before reconstructing imported source.
+pub fn validate_for_import(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    let index = LocalDefinitionIndex::new(summary)?;
+    validate_import_shapes(summary, &index)?;
+    validate_import_generic_bodies(summary)?;
+    validate_import_headers(summary)?;
+    let analysis = CapabilityAnalysis::new(index)?;
+
+    for function in &summary.fns {
+        validate_import_summaries(
+            &function.params,
+            &function.ret,
+            &function.return_borrow,
+            &function.return_region,
+            &analysis,
+            &function.type_params,
+        )?;
     }
     Ok(())
 }
@@ -775,11 +1767,7 @@ fn render_fn(f: &IFnSig) -> String {
     if let Some(body) = &f.generic_body {
         // A generic `pub` template ships its full declaration (incl. body) as source — the consumer
         // monomorphizes it. `fd.span` starts at `fn`, so re-add the `pub` the slice omitted.
-        let trimmed = body.trim_start();
-        if trimmed.starts_with("pub") {
-            return format!("{body}\n");
-        }
-        return format!("pub {trimmed}\n");
+        return format!("pub {}\n", body.trim_start());
     }
     // A non-generic `pub` fn: signature only, with an empty body. The body is never type-checked (the
     // module is interface-only) and the function is never emitted into the consumer's program; the
@@ -866,4 +1854,27 @@ pub fn summary_effects(
         m.insert(canonical, e);
     }
     m
+}
+
+/// The cross-unit return-provenance seeds an importer needs, keyed by canonical (mangled) function
+/// name. Generic functions are excluded because their bodies are instantiated in the consumer and
+/// their summaries are inferred there.
+pub fn summary_return_provenance(
+    summary: &InterfaceSummary,
+    is_entry: bool,
+) -> align_sema::ExternalReturnProvenance {
+    let mut facts = HashMap::new();
+    for function in &summary.fns {
+        if function.generic_body.is_some() {
+            continue;
+        }
+        facts.insert(
+            mangle(&summary.unit, is_entry, &function.name),
+            (
+                function.return_borrow.clone(),
+                function.return_region.clone(),
+            ),
+        );
+    }
+    facts
 }

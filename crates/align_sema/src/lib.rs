@@ -1388,12 +1388,11 @@ fn ty_mentions_slice(
     }
 }
 
-/// Whether a value may borrow storage owned by another local. This is intentionally narrower than
-/// Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`, a
-/// borrowed reader/writer, and aggregates containing those views carry borrow provenance.
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
-/// same recursive classification when deciding whether an indexed result retains a synthetic
-/// temporary owner or can release it immediately after a scalar load.
+/// same cycle-safe graph classification when deciding whether an indexed result retains a
+/// synthetic temporary owner or can release it immediately after a scalar load. This is narrower
+/// than Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`,
+/// a borrowed reader/writer, and aggregates containing those views carry borrow provenance.
 pub fn ty_may_borrow(
     ty: Ty,
     structs: &[StructDef],
@@ -1401,69 +1400,75 @@ pub fn ty_may_borrow(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    match ty {
-        Ty::Str
-        | Ty::Slice(_)
-        | Ty::Reader
-        | Ty::Writer
-        | Ty::Soa(_)
-        // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
-        // buffer, so a `Let` binding it must record the ctx's borrow provenance. Without this arm no
-        // provenance is recorded at all and `ctx.respond(rb)` never invalidates the view (http.md
-        // item 10 ⑤ — one half of the fatal pair, with `borrow_sources_inner`).
-        | Ty::HttpHeaders
-        // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view (J4).
-        | Ty::JsonDoc
-        // A `json.scanner<Row>` borrows the JSON input view it streams over (J5).
-        | Ty::JsonScanner(_)
-        | Ty::DictEncoded(..)
-        | Ty::DynSliceArray(_)
-        | Ty::Fn(_) => true,
-        Ty::Tagged(id) => ty_may_borrow(
-            expand_tagged_ty(Ty::Tagged(id), tagged_types),
-            structs,
-            tuples,
-            enums,
-            tagged_types,
-        ),
-        Ty::Array(s, _) | Ty::DynArray(s) => {
-            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Str
+            | Ty::Slice(_)
+            | Ty::Reader
+            | Ty::Writer
+            | Ty::Soa(_)
+            // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
+            // buffer, so a `Let` binding it must record the ctx's borrow provenance.
+            | Ty::HttpHeaders
+            // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view.
+            | Ty::JsonDoc
+            // A `json.scanner<Row>` borrows the JSON input view it streams over.
+            | Ty::JsonScanner(_)
+            | Ty::DictEncoded(..)
+            | Ty::DynSliceArray(_)
+            | Ty::Fn(_) => return true,
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(ok));
+                            work.push(scalar_to_ty(err));
+                        }
+                    }
+                }
+            }
+            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s) => {
+                work.push(scalar_to_ty(s));
+            }
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(ok));
+                work.push(scalar_to_ty(err));
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id)
+                if visited_structs.insert(id) =>
+            {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().copied().map(scalar_to_ty));
+                }
+            }
+            // A sum type may borrow iff a variant payload does (J1: a `str`-view /
+            // `str`-bearing-struct payload).
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(enumeration) = enums.get(id as usize) {
+                    work.extend(
+                        enumeration
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter().copied())
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
+            _ => {}
         }
-        Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id) => structs
-            .get(id as usize)
-            .is_some_and(|s| {
-                s.fields
-                    .iter()
-                    .any(|f| ty_may_borrow(f.ty, structs, tuples, enums, tagged_types))
-            }),
-        Ty::Option(s) => {
-            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
-        }
-        Ty::Result(ok, err) => {
-            ty_may_borrow(scalar_to_ty(ok), structs, tuples, enums, tagged_types)
-                || ty_may_borrow(scalar_to_ty(err), structs, tuples, enums, tagged_types)
-        }
-        Ty::Tuple(id) => tuples
-            .get(id as usize)
-            .is_some_and(|t| {
-                t.elems.iter().any(|s| {
-                    ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
-                })
-            }),
-        // A sum type may borrow iff a variant payload does (J1: a `str`-view / `str`-bearing-struct
-        // payload — `Content.Text(view)` borrows the view's storage, so its owner must stay live).
-        Ty::Enum(id) => enums
-            .get(id as usize)
-            .is_some_and(|e| {
-                e.variants.iter().any(|v| {
-                    v.payload.iter().any(|s| {
-                        ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
-                    })
-                })
-            }),
-        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types),
-        _ => false,
     }
+    false
 }
 
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
@@ -1829,9 +1834,6 @@ fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
     })
 }
 
-/// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
-/// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
-/// these like stage captures.
 /// Peel a `arr[i].f0.f1…` chain (an AST `FieldAccess` spine bottoming out at an `Index`) into the
 /// array expression, the index expression, and the field-name path in order. `None` if the receiver
 /// is not rooted at an index (ordinary local/field-path access then handles it). Used to route a
@@ -1848,6 +1850,9 @@ fn peel_index_field_chain(e: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr, Vec<
     }
 }
 
+/// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
+/// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
+/// these like stage captures.
 fn node_captures(kind: &ExprKind) -> &[Expr] {
     match kind {
         ExprKind::ArrayReduce { captures, .. }
@@ -2083,6 +2088,7 @@ enum RawStage {
     Where(StageFn),
     WhereField(ast::Ident),
     Project(ast::Ident),
+    Invalid { name: String, span: Span },
 }
 
 /// An assignable location resolved by [`Checker::check_place`].
@@ -2231,6 +2237,41 @@ fn canonical_type_name(
             return None;
         }
         Some(entry.canonical.clone())
+    }
+}
+
+/// Validate one generic declaration's type-parameter namespace after the module's complete local
+/// type table exists. Duplicates are one earlier error class than local-type shadowing: if the
+/// duplicate pass fails, do not cascade shadowing diagnostics for the same malformed declaration.
+fn validate_declared_type_parameters(
+    parameters: &[ast::TypeParam],
+    local_types: &HashMap<String, TypeEntry>,
+    diags: &mut Diagnostics,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicate = false;
+    for parameter in parameters {
+        if !seen.insert(parameter.name.name.as_str()) {
+            diags.error(
+                format!("duplicate type parameter '{}'", parameter.name.name),
+                parameter.name.span,
+            );
+            duplicate = true;
+        }
+    }
+    if duplicate {
+        return;
+    }
+    for parameter in parameters {
+        if local_types.contains_key(&parameter.name.name) {
+            diags.error(
+                format!(
+                    "type parameter '{}' shadows a declared type",
+                    parameter.name.name
+                ),
+                parameter.name.span,
+            );
+        }
     }
 }
 
@@ -3167,18 +3208,31 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     check_program_with_effects(modules, &HashMap::new(), diags)
 }
 
-/// M15 S1b per-unit checking: like [`check_program`], but any [`Module::interface_only`] module is a
-/// dependency reconstructed from its already-checked interface summary, and `external_effects` carries
-/// the 3-valued effect bit (keyed by **canonical / mangled** name) of every imported non-generic
-/// `pub` function. A cross-unit call to a function not present in the checked program (i.e. an
-/// interface-only dependency's non-generic `pub` fn) takes its effect from `external_effects`;
-/// **fail-closed** — a call target absent from the map is treated as `Impure` **and** unknown-indirect,
-/// so it is rejected at a `par_map`/parallel boundary and never optimistically Pure. Generic imported
-/// functions are NOT in `external_effects`: their monomorphs are instantiated into this program and
-/// their effects recomputed from the instantiated body.
+/// The imported return-provenance facts of non-generic public functions, keyed by canonical
+/// (mangled) name. The interface codec validates every root before constructing this map.
+pub type ExternalReturnProvenance =
+    std::collections::HashMap<String, (hir::ReturnBorrowSummary, hir::ReturnRegionSummary)>;
+
+/// M15 S1b compatibility entry point. L2b callers that reconstruct interface-only dependencies use
+/// [`check_program_with_interface_facts`] so imported return provenance is preserved as well.
 pub fn check_program_with_effects(
     modules: &[Module],
     external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) -> Program {
+    check_program_with_interface_facts(modules, external_effects, &HashMap::new(), diags)
+}
+
+/// Per-unit checking with semantic facts that synthesized interface source cannot express.
+///
+/// `external_effects` carries each imported non-generic public function's 3-valued effect bit.
+/// `external_return_provenance` carries its exact return-borrow and return-region roots. Both maps
+/// use canonical names. Generic imported functions are absent because their bodies are instantiated
+/// in the consumer and their facts are inferred from those bodies.
+pub fn check_program_with_interface_facts(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    external_return_provenance: &ExternalReturnProvenance,
     diags: &mut Diagnostics,
 ) -> Program {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
@@ -3262,6 +3316,25 @@ pub fn check_program_with_effects(
                 ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => unreachable!(),
             }
+        }
+    }
+
+    // The no-shadowing rule applies to every generic declaration, not only functions. Run after
+    // Pass 0a has collected the complete module type table so a later declaration is visible too.
+    // Stored module/item/parameter order determines diagnostics; duplicate parameters are checked
+    // as an earlier class and suppress shadowing diagnostics for that malformed item.
+    for module in modules {
+        let local_types = type_table
+            .get(&module.path)
+            .expect("Pass 0a creates every module type table");
+        for item in &module.file.items {
+            let parameters = match item {
+                ast::Item::Fn(function) => &function.type_params,
+                ast::Item::Struct(structure) => &structure.type_params,
+                ast::Item::Enum(enumeration) => &enumeration.type_params,
+                ast::Item::Const(_) | ast::Item::Extern(_) => continue,
+            };
+            validate_declared_type_parameters(parameters, local_types, diags);
         }
     }
 
@@ -4075,17 +4148,11 @@ pub fn check_program_with_effects(
     for &(module, is_entry, f) in &all_fns {
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let imports = mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&no_imports);
-        // Generic type-parameter names (`fn f<T, U: Ord>`). Reject duplicates and names that collide
-        // with a declared type, so `Param` resolution is unambiguous; resolve each builtin bound.
+        // Generic type-parameter names (`fn f<T, U: Ord>`). Pass 0a-1 already validates duplicates
+        // and local-type shadowing for functions, structs, and sums alike; resolve each builtin bound.
         let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let mut bounds: Vec<Bound> = Vec::with_capacity(f.type_params.len());
-        for (i, t) in f.type_params.iter().enumerate() {
-            if tparams[..i].contains(&t.name.name) {
-                diags.error(format!("duplicate type parameter '{}'", t.name.name), t.name.span);
-            }
-            if type_table.get(module).is_some_and(|m| m.contains_key(&t.name.name)) {
-                diags.error(format!("type parameter '{}' shadows a declared type", t.name.name), t.name.span);
-            }
+        for t in &f.type_params {
             let bound = match &t.bound {
                 None => Bound::Unconstrained,
                 Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
@@ -4150,6 +4217,16 @@ pub fn check_program_with_effects(
                 is_extern: false,
             },
         );
+    }
+
+    // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
+    // facts after signature collection. The driver supplies the complete transitive fact map, so
+    // entries outside the modules visible to this check are intentionally ignored.
+    for (name, (return_borrow, return_region)) in external_return_provenance {
+        if let Some(sig) = sigs.get_mut(name) {
+            sig.return_borrow = return_borrow.clone();
+            sig.return_region = return_region.clone();
+        }
     }
 
     // Extern (`extern "C"`) declarations: resolve + FFI-validate each foreign signature, register it
@@ -4538,6 +4615,31 @@ pub fn check_program_with_effects(
         fn_types,
         imported_fns,
     };
+    infer_return_provenance(&mut program, external_return_provenance);
+    let named_return_borrow: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.return_borrow.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_borrow.clone())),
+        )
+        .collect();
+    let named_return_region: std::collections::HashMap<String, hir::ReturnRegionSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.return_region.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_region.clone())),
+        )
+        .collect();
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -4558,21 +4660,29 @@ pub fn check_program_with_effects(
         MoveCheck {
             f,
             diags,
+            named_return_borrow: &named_return_borrow,
+            summary_dependencies: None,
             tuples,
             structs,
             enums,
             tagged_types,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
             loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_roots: std::collections::HashMap::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+            non_fallthrough: std::collections::HashSet::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
             let mut ec = EscapeCheck {
                 f,
                 diags,
+                named_return_region: &named_return_region,
                 tuples,
                 structs,
                 enums,
@@ -4626,6 +4736,135 @@ pub fn check_program_with_effects(
     // `external_effects`; FFI and absent targets fail closed.
     check_parallelism(&mut program, external_effects, diags);
     program
+}
+
+fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
+    let mut params = Vec::new();
+    for root in roots {
+        match root {
+            BorrowRoot::Param(index) => params.push(*index),
+            BorrowRoot::Local(_) | BorrowRoot::IterTemp(_) => {}
+        }
+    }
+    if params.is_empty() {
+        hir::ReturnBorrowSummary::None
+    } else {
+        hir::ReturnBorrowSummary::Roots {
+            params,
+            captures: Vec::new(),
+        }
+    }
+}
+
+fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRegionSummary {
+    match summary {
+        hir::ReturnBorrowSummary::None => hir::ReturnRegionSummary::None,
+        hir::ReturnBorrowSummary::Roots { params, captures } => hir::ReturnRegionSummary::Roots {
+            params: params.clone(),
+            captures: captures.clone(),
+        },
+    }
+}
+
+/// Infer the L2b-a1 named-function parameter roots before the ordinary move/escape diagnostic pass.
+/// Calls form a finite may-lattice over sorted root sets, so recursive functions converge
+/// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
+/// and function-value targets belong to L2b-b. The existing exhaustive borrow-provenance walker
+/// remains the single expression classifier.
+fn infer_return_provenance(
+    program: &mut Program,
+    external_return_provenance: &ExternalReturnProvenance,
+) {
+    let mut named: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), hir::ReturnBorrowSummary::None))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_borrow.clone())),
+        )
+        .collect();
+
+    // Process each function once, then only revisit direct callers of a summary that grew. Call
+    // dependencies are collected by MoveCheck's exhaustive expression walk on the first visit, so
+    // declaration order cannot turn a long forwarding chain into repeated whole-program scans.
+    let function_count = program.fns.len();
+    let mut reverse_callers:
+        std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut dependencies_recorded = vec![false; function_count];
+    let mut queued = vec![true; function_count];
+    let mut worklist: std::collections::VecDeque<usize> =
+        (0..function_count).collect();
+    while let Some(index) = worklist.pop_front() {
+        queued[index] = false;
+        let function = &program.fns[index];
+        // Lifted lambda parameters append captures after explicit arguments. Treating those slots
+        // as ordinary named parameters would publish the wrong domain and disagree with the
+        // closure's explicit-parameter signature. L2b-b infers both domains atomically.
+        if function.lifted_capture_count.is_some() {
+            continue;
+        }
+
+        let mut dependencies = std::collections::HashSet::new();
+        let collect_dependencies =
+            (!dependencies_recorded[index]).then_some(&mut dependencies);
+        let mut sink = Diagnostics::new();
+        let roots = MoveCheck {
+            f: function,
+            diags: &mut sink,
+            named_return_borrow: &named,
+            summary_dependencies: collect_dependencies,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            loop_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
+            loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_roots: std::collections::HashMap::new(),
+            loop_iter_drops: Vec::new(),
+            arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+            non_fallthrough: std::collections::HashSet::new(),
+        }
+        .check();
+        if !dependencies_recorded[index] {
+            let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+            dependencies.sort();
+            for callee in dependencies {
+                reverse_callers.entry(callee).or_default().push(index);
+            }
+            dependencies_recorded[index] = true;
+        }
+
+        let summary = summary_from_roots(&roots);
+        if named.get(&function.name) == Some(&summary) {
+            continue;
+        }
+        named.insert(function.name.clone(), summary);
+        if let Some(callers) = reverse_callers.get(&function.name) {
+            for &caller in callers {
+                if !queued[caller] {
+                    queued[caller] = true;
+                    worklist.push_back(caller);
+                }
+            }
+        }
+    }
+
+    for function in &mut program.fns {
+        let summary = named
+            .get(&function.name)
+            .cloned()
+            .unwrap_or(hir::ReturnBorrowSummary::None);
+        function.return_region = borrow_to_region_summary(&summary);
+        function.return_borrow = summary;
+    }
 }
 
 /// Effect/purity inference + the rule that a `par_map` function must be **Pure** (`draft.md` §11,
@@ -4836,9 +5075,18 @@ fn infer_fn_type_effects(
                 continue; // a function-typed parameter has no statically known target
             }
             let Ty::Fn(fid) = local.ty else { continue };
-            let Some(ft) = fn_types.get(fid as usize) else { continue };
-            let (params, ret) = (ft.params.clone(), ft.ret);
+            let Some(ft) = fn_types.get(fid as usize) else {
+                continue;
+            };
+            let (params, ret, return_borrow, return_region) = (
+                ft.params.clone(),
+                ft.ret,
+                ft.return_borrow.clone(),
+                ft.return_region.clone(),
+            );
             let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
+            fn_types[fresh as usize].return_borrow = return_borrow;
+            fn_types[fresh as usize].return_region = return_region;
             local.ty = Ty::Fn(fresh);
         }
     }
@@ -4966,9 +5214,12 @@ fn refine_fn_value_types(
                 boundaries,
                 loop_results: Vec::new(),
                 initialized_capture_params: std::collections::HashSet::new(),
+                fallthrough_expressions: std::collections::HashSet::new(),
             };
-            scan.block(&f.body);
-            if let Some(value) = f.body.value.as_deref() {
+            let body_falls_through = scan.block(&f.body);
+            if body_falls_through
+                && let Some(value) = f.body.value.as_deref()
+            {
                 scan.join_return_effects(value);
             }
         }
@@ -5064,6 +5315,7 @@ fn compute_effect_sets(
             boundaries,
             loop_results: Vec::new(),
             initialized_capture_params: std::collections::HashSet::new(),
+            fallthrough_expressions: std::collections::HashSet::new(),
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -5281,6 +5533,10 @@ struct EffectScan<'a> {
     /// initializes the cell; later closure constructions join into it. This distinguishes the
     /// uninitialized sentinel from a real Unknown capture, which must remain fail-closed.
     initialized_capture_params: std::collections::HashSet<u32>,
+    /// Expressions whose evaluation has at least one continuation in this structural pass. Value
+    /// projection queries consult this set so a dead block tail or all-diverging branch cannot be
+    /// reintroduced after the source-order walk excluded it.
+    fallthrough_expressions: std::collections::HashSet<usize>,
 }
 
 /// One source-value projection on the path to a concrete function-valued leaf.  Unlike the former
@@ -5977,7 +6233,40 @@ impl EffectScan<'_> {
         }
     }
 
-    fn stage_funcs<'a>(
+    fn form_node_captures(&mut self, kind: &ExprKind) -> bool {
+        for capture in node_captures(kind) {
+            if !self.expr(capture) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn form_stage_captures(&mut self, stages: &[Stage]) -> bool {
+        for stage in stages {
+            match &stage.kind {
+                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
+                    for capture in captures {
+                        if !self.expr(capture) {
+                            return false;
+                        }
+                    }
+                }
+                StageKind::WhereStrContains { needle } => {
+                    if !self.expr(needle) {
+                        return false;
+                    }
+                }
+                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
+            }
+        }
+        true
+    }
+
+    /// Join the callback actions only after every source/stage/terminal operand has formed.
+    /// Capture expressions were already walked by `form_stage_captures`, so this must never
+    /// re-evaluate them.
+    fn join_stage_actions<'a>(
         &mut self,
         source: &'a Expr,
         stages: &'a [Stage],
@@ -5991,11 +6280,6 @@ impl EffectScan<'_> {
                 StageKind::Map { func, captures }
                 | StageKind::Where { func, captures } => {
                     self.calls.push(func.clone());
-                    // Capture operands are reads of enclosing locals — walk them so no call edge /
-                    // effect they might contain is missed (exhaustiveness).
-                    for c in captures {
-                        self.expr(c);
-                    }
                     self.join_named_capture_effects(func, captures);
                     if self.known_effects.is_some() {
                         self.join_named_param_boundary_from_origin(
@@ -6011,9 +6295,7 @@ impl EffectScan<'_> {
                         };
                     }
                 }
-                // No lifted function (the whole point of hoisting): the needle is an expression
-                // evaluated once before the loop, so walk it for any call edge / effect it contains.
-                StageKind::WhereStrContains { needle } => self.expr(needle),
+                StageKind::WhereStrContains { .. } => {}
                 StageKind::Project { field } => {
                     origin.project(FnEffectProjection::StructField(*field));
                 }
@@ -6023,11 +6305,16 @@ impl EffectScan<'_> {
         origin
     }
 
-    fn block(&mut self, b: &Block) {
+    /// Scan one block in source order and report whether control can reach its end. A terminating
+    /// initializer/payload retains effects produced before its terminator but prevents the
+    /// statement's own boundary transfer and every later statement/tail.
+    fn block(&mut self, b: &Block) -> bool {
         for s in &b.stmts {
             match s {
                 Stmt::Let { local, init } => {
-                    self.expr(init);
+                    if !self.expr(init) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *local,
@@ -6040,7 +6327,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::Assign { local, value, .. } => {
-                    self.expr(value);
+                    if !self.expr(value) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *local,
@@ -6053,7 +6342,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignField { root, path, value } => {
-                    self.expr(value);
+                    if !self.expr(value) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         let destination: Vec<FnEffectProjection> = path
                             .iter()
@@ -6070,7 +6361,9 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::LetTuple { locals, init, .. } => {
-                    self.expr(init);
+                    if !self.expr(init) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         for (index, local) in locals.iter().enumerate() {
                             let Some(local) = *local
@@ -6105,9 +6398,10 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignIndex { base, index, value } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                 }
                 Stmt::AssignElemField {
                     base,
@@ -6117,9 +6411,10 @@ impl EffectScan<'_> {
                     value,
                     ..
                 } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                     if self.known_effects.is_some() {
                         let mut destination =
                             Vec::with_capacity(path.len() + 1);
@@ -6145,9 +6440,10 @@ impl EffectScan<'_> {
                     value,
                     ..
                 } => {
+                    if !self.expr(index) || !self.expr(value) {
+                        return false;
+                    }
                     self.mark_view_write(*base);
-                    self.expr(index);
-                    self.expr(value);
                     if self.known_effects.is_some() {
                         self.join_current_local_boundary(
                             *base,
@@ -6158,16 +6454,29 @@ impl EffectScan<'_> {
                         self.join_concrete_struct_id_effects(*struct_id, value);
                     }
                 }
-                Stmt::AssignVecLane { value, .. } => self.expr(value),
+                Stmt::AssignVecLane { value, .. } => {
+                    if !self.expr(value) {
+                        return false;
+                    }
+                }
                 Stmt::Return(Some(e)) => {
-                    self.expr(e);
+                    if !self.expr(e) {
+                        return false;
+                    }
                     if self.known_effects.is_some() {
                         self.join_return_effects(e);
                     }
+                    return false;
                 }
-                Stmt::Break(Some(e)) => {
-                    self.expr(e);
-                    if self.known_effects.is_some()
+                Stmt::Break {
+                    value: Some(e),
+                    accepted,
+                } => {
+                    if !self.expr(e) {
+                        return false;
+                    }
+                    if *accepted
+                        && self.known_effects.is_some()
                         && let Some((loop_ty, loop_key)) =
                             self.loop_results.last().copied()
                     {
@@ -6179,14 +6488,22 @@ impl EffectScan<'_> {
                             &mut Vec::new(),
                         );
                     }
+                    return false;
                 }
-                Stmt::Expr(e) => self.expr(e),
-                Stmt::Return(None) | Stmt::Break(None) => {}
+                Stmt::Expr(e) => {
+                    if !self.expr(e) {
+                        return false;
+                    }
+                }
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {
+                    return false;
+                }
             }
         }
         if let Some(v) = &b.value {
-            self.expr(v);
+            return self.expr(v);
         }
+        true
     }
 
     fn named_effect(&self, name: &str) -> FnEffect {
@@ -6207,12 +6524,15 @@ impl EffectScan<'_> {
             .unwrap_or(FnEffect::Unknown)
     }
 
-    fn block_value_effect(&self, block: &Block) -> FnEffect {
+    fn block_value_effect(&self, block: &Block) -> Option<FnEffect> {
         block
             .value
             .as_deref()
+            .filter(|value| {
+                self.fallthrough_expressions
+                    .contains(&effect_expression_key(value))
+            })
             .map(|value| self.fn_value_effect(value))
-            .unwrap_or(FnEffect::Unknown)
     }
 
     /// Effect of invoking the function value produced by `expr`. Origins are resolved only in the
@@ -6302,14 +6622,54 @@ impl EffectScan<'_> {
                     &[FnEffectProjection::TupleElement(*index)],
                 )
                 .unwrap_or(FnEffect::Unknown),
-            ExprKind::If { then, els, .. } => self.block_value_effect(then).join(self.block_value_effect(els)),
+            ExprKind::If { then, els, .. } => Self::join_optional_effect(
+                self.block_value_effect(then),
+                self.block_value_effect(els),
+            )
+            .unwrap_or(FnEffect::Unknown),
             ExprKind::Match { arms, .. } => arms
                 .iter()
+                .filter(|arm| {
+                    self.fallthrough_expressions
+                        .contains(&effect_expression_key(&arm.body))
+                })
                 .map(|arm| self.fn_value_effect(&arm.body))
                 .reduce(FnEffect::join)
                 .unwrap_or(FnEffect::Unknown),
+            ExprKind::Loop { .. } => self
+                .boundary_expression_effect(
+                    effect_expression_key(expr),
+                    &[],
+                )
+                .flatten()
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
+                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                    _ => None,
+                };
+                let from_success = success
+                    .map(|projection| {
+                        self.projected_fn_effect(opt, &[projection])
+                    })
+                    .unwrap_or(Some(FnEffect::Unknown));
+                let from_fallback = self
+                    .fallthrough_expressions
+                    .contains(&effect_expression_key(fallback))
+                    .then(|| self.fn_value_effect(fallback));
+                Self::join_optional_effect(from_success, from_fallback)
+                    .unwrap_or(FnEffect::Unknown)
+            }
+            ExprKind::Try(result) => self
+                .projected_fn_effect(
+                    result,
+                    &[FnEffectProjection::ResultOk],
+                )
+                .unwrap_or(FnEffect::Unknown),
             ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) | ExprKind::TaskGroup(block) => {
                 self.block_value_effect(block)
+                    .unwrap_or(FnEffect::Unknown)
             }
             _ => self.type_effect(expr.ty),
         }
@@ -6567,7 +6927,9 @@ impl EffectScan<'_> {
                         self.projected_fn_effect(opt, &wrapped)
                     })
                     .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = (!hir_expr_diverges(fallback))
+                let from_fallback = self
+                    .fallthrough_expressions
+                    .contains(&effect_expression_key(fallback))
                     .then(|| self.projected_fn_effect(fallback, path))
                     .flatten();
                 Self::join_optional_effect(from_success, from_fallback)
@@ -6609,6 +6971,10 @@ impl EffectScan<'_> {
             ),
             (ExprKind::Match { arms, .. }, _) => arms
                 .iter()
+                .filter(|arm| {
+                    self.fallthrough_expressions
+                        .contains(&effect_expression_key(&arm.body))
+                })
                 .map(|arm| self.projected_fn_effect(&arm.body, path))
                 .fold(None, Self::join_optional_effect),
             (
@@ -6635,6 +7001,10 @@ impl EffectScan<'_> {
         block
             .value
             .as_deref()
+            .filter(|value| {
+                self.fallthrough_expressions
+                    .contains(&effect_expression_key(value))
+            })
             .and_then(|value| self.projected_fn_effect(value, path))
     }
 
@@ -6934,37 +7304,34 @@ impl EffectScan<'_> {
     /// Effect of a `file` op (`pread`/`pwrite`/`len`, A4): each is a syscall → Impure. Split out
     /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn effect_file_op(&mut self, kind: &ExprKind) {
-        self.impure_direct = true;
-        match kind {
+    fn effect_file_op(&mut self, kind: &ExprKind) -> bool {
+        let falls_through = match kind {
             ExprKind::FilePread { file, buffer, offset } => {
-                self.expr(file);
-                self.expr(buffer);
-                self.expr(offset);
+                self.expr(file) && self.expr(buffer) && self.expr(offset)
             }
             ExprKind::FilePwrite { file, data, offset } => {
-                self.expr(file);
-                self.expr(data);
-                self.expr(offset);
+                self.expr(file) && self.expr(data) && self.expr(offset)
             }
             ExprKind::FileLen { file } => self.expr(file),
             _ => unreachable!("effect_file_op on a non-file op"),
+        };
+        if falls_through {
+            self.impure_direct = true;
         }
+        falls_through
     }
 
     /// Walk an `array_builder` op's sub-exprs for the effect check (all pure). `#[inline(never)]` so
     /// its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn effect_array_builder(&mut self, kind: &ExprKind) {
+    fn effect_array_builder(&mut self, kind: &ExprKind) -> bool {
         match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderNew { .. } => true,
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.expr(builder);
-                self.expr(value);
+                self.expr(builder) && self.expr(value)
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.expr(builder);
-                self.expr(data);
+                self.expr(builder) && self.expr(data)
             }
             ExprKind::ArrayBuilderBuild(i) => self.expr(i),
             _ => unreachable!("effect_array_builder on a non-array_builder op"),
@@ -7024,24 +7391,34 @@ impl EffectScan<'_> {
         self.loop_results.pop();
     }
 
-    fn expr(&mut self, e: &Expr) {
-        // A reducer node may carry capture operands (a lifted lambda's captured enclosing locals);
-        // walk them so no call edge / effect they contain is missed. (Stage captures are walked by
-        // `stage_funcs`.)
-        for c in node_captures(&e.kind) {
-            self.expr(c);
+    fn expr(&mut self, e: &Expr) -> bool {
+        let falls_through = self.expr_inner(e);
+        if falls_through {
+            self.fallthrough_expressions
+                .insert(effect_expression_key(e));
         }
-        self.join_node_capture_effects(&e.kind);
+        falls_through
+    }
+
+    fn expr_inner(&mut self, e: &Expr) -> bool {
+        macro_rules! walk {
+            ($child:expr) => {
+                if !self.expr($child) {
+                    return false;
+                }
+            };
+        }
+
         match &e.kind {
             // Observable side effects.
             ExprKind::Call { func, args, .. } => {
+                for a in args {
+                    walk!(a);
+                }
                 if func == "print" {
                     self.impure_direct = true;
                 } else {
                     self.calls.push(func.clone());
-                }
-                for a in args {
-                    self.expr(a);
                 }
                 if self.known_effects.is_some()
                     && let Some(params) = self
@@ -7073,23 +7450,23 @@ impl EffectScan<'_> {
                 }
             }
             ExprKind::Closure { lifted, captures } => {
+                for c in captures {
+                    walk!(c);
+                }
                 if self.known_effects.is_some()
                     && let Ty::Fn(fid) = e.ty
                     && let Some(ft) = self.fn_types.get(fid as usize)
                 {
                     ft.effect.set(self.named_effect(lifted));
                 }
-                for c in captures {
-                    self.expr(c);
-                }
                 self.join_named_capture_effects(lifted, captures);
             }
             ExprKind::CallFnValue { callee, args } => {
-                self.expr(callee);
-                self.consume_fn_value(callee);
+                walk!(callee);
                 for a in args {
-                    self.expr(a);
+                    walk!(a);
                 }
+                self.consume_fn_value(callee);
                 let target = self.static_fn_target(callee);
                 let callback_actual = args
                     .iter()
@@ -7124,7 +7501,7 @@ impl EffectScan<'_> {
                     }
                 }
                 // A bound/moved function value no longer identifies the named parameter boundary
-                // that must receive a callback-bearing actual. Until L2b carries joined target
+                // that must receive a callback-bearing actual. Until L2b-b carries joined target
                 // roots through function values, such an invocation is legal sequentially but
                 // cannot prove the enclosing function Pure for `par_map`.
                 if target.is_none() {
@@ -7142,404 +7519,416 @@ impl EffectScan<'_> {
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin | ExprKind::BufferNew { .. } => {}
             ExprKind::WriterWrite { writer, arg, .. } => {
+                walk!(writer);
+                walk!(arg);
                 self.impure_direct = true;
-                self.expr(writer);
-                self.expr(arg);
             }
             ExprKind::WriterFlush { writer } => {
+                walk!(writer);
                 self.impure_direct = true;
-                self.expr(writer);
             }
             ExprKind::ReaderRead { reader, buffer } => {
+                walk!(reader);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(buffer);
             }
             // `r.read_line(b)` reads the fd — Impure, like `reader.read`. `r.buffered()` only
             // allocates a lookahead (no I/O) — pure, like `BufferNew`.
             ExprKind::ReaderReadLine { reader, buffer } => {
+                walk!(reader);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(buffer);
             }
-            ExprKind::ReaderBuffered { reader } => self.expr(reader),
+            ExprKind::ReaderBuffered { reader } => walk!(reader),
             // `bytes.as_str()` validates UTF-8 in memory (no I/O) — pure, like `BufferBytes`.
-            ExprKind::BytesAsStr { bytes } => self.expr(bytes),
+            ExprKind::BytesAsStr { bytes } => walk!(bytes),
             ExprKind::IoCopy { reader, writer } => {
+                walk!(reader);
+                walk!(writer);
                 self.impure_direct = true;
-                self.expr(reader);
-                self.expr(writer);
             }
             // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
             // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
             // (the #296 expr-depth lesson).
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.effect_file_op(&e.kind),
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => {
+                if !self.effect_file_op(&e.kind) {
+                    return false;
+                }
+            }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
             // a field read.
-            ExprKind::StrBytes { inner } => self.expr(inner),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
+            ExprKind::StrBytes { inner } => walk!(inner),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
             ExprKind::BytesRead { bytes, offset, .. } => {
-                self.expr(bytes);
-                self.expr(offset);
+                walk!(bytes);
+                walk!(offset);
             }
             ExprKind::BufferPut { buffer, value, .. } => {
-                self.expr(buffer);
-                self.expr(value);
+                walk!(buffer);
+                walk!(value);
             }
             ExprKind::BufferAppend { buffer, data } => {
-                self.expr(buffer);
-                self.expr(data);
+                walk!(buffer);
+                walk!(data);
             }
             // `array_builder` new/push/append/build are all pure in-memory growth; walk the sub-exprs
             // in an `#[inline(never)]` helper so the arm locals stay out of this recursive frame (#296).
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.effect_array_builder(k),
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => {
+                if !self.effect_array_builder(k) {
+                    return false;
+                }
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
+                walk!(path);
                 self.impure_direct = true;
-                self.expr(path);
             }
             // `dns.resolve(host)` is impure (a name-resolution syscall) — excluded from `par_map`.
             ExprKind::DnsResolve { host } => {
+                walk!(host);
                 self.impure_direct = true;
-                self.expr(host);
             }
             // `tcp.connect(host, port)` is impure (DNS + connect syscalls) — excluded from `par_map`.
             ExprKind::TcpConnect { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             // `c.reader()` / `c.writer()` just wrap the conn's fd (no syscall — the I/O happens on the
             // returned reader/writer's `read`/`write`, already impure), like `io.stdout`: walk `conn`.
-            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.expr(conn),
+            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => walk!(conn),
             // `tcp.listen(host, port)` is impure (DNS + bind/listen syscalls) — excluded from `par_map`.
             ExprKind::TcpListen { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             // `l.accept()` is impure (a blocking accept syscall) — excluded from `par_map`.
             ExprKind::TcpAccept { listener } => {
+                walk!(listener);
                 self.impure_direct = true;
-                self.expr(listener);
             }
             // `udp.bind` / `u.send_to` / `u.recv_from` are impure (bind/sendto/recvfrom syscalls) —
             // excluded from `par_map`.
             ExprKind::UdpBind { host, port } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::UdpSendTo { sock, data, host, port } => {
+                walk!(sock);
+                walk!(data);
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(sock);
-                self.expr(data);
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::UdpRecvFrom { sock, buffer } => {
+                walk!(sock);
+                walk!(buffer);
                 self.impure_direct = true;
-                self.expr(sock);
-                self.expr(buffer);
             }
             ExprKind::FsWriteFile { path, data, .. } => {
+                walk!(path);
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(path);
-                self.expr(data);
             }
             // `std.path` ops are pure lexical string manipulation (no OS access) — like a field read.
-            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path),
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => walk!(path),
             ExprKind::PathJoin { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             // `std.env` / `std.time` observe/mutate external state — Impure.
             ExprKind::EnvGet { name } => {
+                walk!(name);
                 self.impure_direct = true;
-                self.expr(name);
             }
             ExprKind::EnvSet { name, value } => {
+                walk!(name);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(name);
-                self.expr(value);
             }
             ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(ns);
             }
             // `std.process` — `exit`/`abort` terminate the process (observable external effect), so
             // both are Impure: an `exit`/`abort` inside a `par_map` closure is rejected (not Pure).
             ExprKind::ProcessExit { code } => {
+                walk!(code);
                 self.impure_direct = true;
-                self.expr(code);
+                return false;
             }
-            ExprKind::ProcessAbort => self.impure_direct = true,
+            ExprKind::ProcessAbort => {
+                self.impure_direct = true;
+                return false;
+            }
             // `process.spawn` (fork+exec) / `ch.wait()` (waitpid) are impure — excluded from `par_map`.
             ExprKind::ProcessSpawn { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             ExprKind::ChildWait { child } => {
+                walk!(child);
                 self.impure_direct = true;
-                self.expr(child);
             }
             // `ch.kill(sig)` (signal delivery) / `process.exec` (execvp) are impure — excluded from
             // `par_map`.
             ExprKind::ChildKill { child, sig } => {
+                walk!(child);
+                walk!(sig);
                 self.impure_direct = true;
-                self.expr(child);
-                self.expr(sig);
             }
             ExprKind::ProcessExec { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             // `std.process` Slice 4 — `process.command`/`c.cwd(dir)`/`c.run()` fork or observe the
             // machine → **Impure** (excluded from `par_map`). The `run_output` accessors read owned
             // memory → **Pure** (like `resp.status()`/`resp.body()`). Recurse into the operands either
             // way so an effect *inside* them is still counted.
             ExprKind::ProcessCommand { cmd, args } => {
+                walk!(cmd);
+                walk!(args);
                 self.impure_direct = true;
-                self.expr(cmd);
-                self.expr(args);
             }
             ExprKind::CommandCwd { command, dir } => {
+                walk!(command);
+                walk!(dir);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(dir);
             }
             ExprKind::CommandTimeout { command, ns } => {
+                walk!(command);
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(ns);
             }
             // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` do a `setsockopt` syscall — Impure,
             // like `c.timeout_ns(ns)` on a command (the conn is borrowed, the ns is Copy).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                walk!(conn);
+                walk!(ns);
                 self.impure_direct = true;
-                self.expr(conn);
-                self.expr(ns);
             }
             ExprKind::CommandEnv { command, name, value } => {
+                walk!(command);
+                walk!(name);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(command);
-                self.expr(name);
-                self.expr(value);
             }
             ExprKind::CommandEnvClear { command } => {
+                walk!(command);
                 self.impure_direct = true;
-                self.expr(command);
             }
             ExprKind::CommandRun { command } => {
+                walk!(command);
                 self.impure_direct = true;
-                self.expr(command);
             }
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                self.expr(out);
+                walk!(out);
             }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
-            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
-            ExprKind::EncodingDecode { input, .. } => self.expr(input),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => walk!(data),
+            ExprKind::EncodingDecode { input, .. } => walk!(input),
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
             ExprKind::Compress { data, level, .. } => {
+                walk!(data);
+                walk!(level);
                 self.impure_direct = true;
-                self.expr(data);
-                self.expr(level);
             }
             ExprKind::Decompress { data, .. } => {
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(data);
             }
             // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
             // `shuffle`/`sample` produce or advance mutable RNG state. So an rng-using closure is
             // never `Pure` and is excluded from `par_map` (each thread would need its own generator).
             ExprKind::RandSeed => self.impure_direct = true,
             ExprKind::RandSeedWith { seed } => {
+                walk!(seed);
                 self.impure_direct = true;
-                self.expr(seed);
             }
             ExprKind::RandNext { rng } => {
+                walk!(rng);
                 self.impure_direct = true;
-                self.expr(rng);
             }
             ExprKind::RandRange { rng, lo, hi } => {
+                walk!(rng);
+                walk!(lo);
+                walk!(hi);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(lo);
-                self.expr(hi);
             }
             ExprKind::RandShuffle { rng, xs, .. } => {
+                walk!(rng);
+                walk!(xs);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(xs);
             }
             ExprKind::RandSample { rng, xs, k, .. } => {
+                walk!(rng);
+                walk!(xs);
+                walk!(k);
                 self.impure_direct = true;
-                self.expr(rng);
-                self.expr(xs);
-                self.expr(k);
             }
-            ExprKind::RegexCompile { pattern } => self.expr(pattern),
+            ExprKind::RegexCompile { pattern } => walk!(pattern),
             ExprKind::RegexIsMatch { regex, text }
             | ExprKind::RegexFindAll { regex, text }
             | ExprKind::RegexSplit { regex, text } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
             }
             ExprKind::RegexFind { regex, text, start } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
                 if let Some(s) = start {
-                    self.expr(s);
+                    walk!(s);
                 }
             }
             ExprKind::RegexReplace { regex, text, repl, .. } => {
-                self.expr(regex);
-                self.expr(text);
-                self.expr(repl);
+                walk!(regex);
+                walk!(text);
+                walk!(repl);
             }
             ExprKind::RegexCaptures { regex, text } | ExprKind::RegexGroupIndex { regex, name: text } => {
-                self.expr(regex);
-                self.expr(text);
+                walk!(regex);
+                walk!(text);
             }
-            ExprKind::RegexGroupCount { regex } => self.expr(regex),
+            ExprKind::RegexGroupCount { regex } => walk!(regex),
             ExprKind::CapturesGroup { caps, index } => {
-                self.expr(caps);
-                self.expr(index);
+                walk!(caps);
+                walk!(index);
             }
             // `std.cli` — **all pure** (no I/O; argv is already captured by `main(args)`): just
             // recurse into the operands so any effect *inside* them is still counted.
-            ExprKind::CliCommand { name } => self.expr(name),
+            ExprKind::CliCommand { name } => walk!(name),
             ExprKind::CliFlag { cmd, name, default, .. } => {
-                self.expr(cmd);
-                self.expr(name);
+                walk!(cmd);
+                walk!(name);
                 if let Some(d) = default {
-                    self.expr(d);
+                    walk!(d);
                 }
             }
             ExprKind::CliParse { cmd, args } => {
-                self.expr(cmd);
-                self.expr(args);
+                walk!(cmd);
+                walk!(args);
             }
             ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
-                self.expr(parsed);
-                self.expr(name);
+                walk!(parsed);
+                walk!(name);
             }
-            ExprKind::CliUsage { cmd } => self.expr(cmd),
+            ExprKind::CliUsage { cmd } => walk!(cmd),
             // `std.http` (Slice 1) — **all pure** (no I/O; serialize/parse operate on owned/borrowed
             // memory — the network client is Slice 2): recurse so an effect *inside* the operands is
             // still counted.
             ExprKind::HttpRequest { method, url } => {
-                self.expr(method);
-                self.expr(url);
+                walk!(method);
+                walk!(url);
             }
             ExprKind::HttpHeader { req, name, value } => {
-                self.expr(req);
-                self.expr(name);
-                self.expr(value);
+                walk!(req);
+                walk!(name);
+                walk!(value);
             }
             ExprKind::HttpBody { req, data } => {
-                self.expr(req);
-                self.expr(data);
+                walk!(req);
+                walk!(data);
             }
             // `r.timeout(ns)` / `cl.timeout(ns)` store a field on the handle — no I/O (the deadline is
             // applied at perform time), so like `HttpHeader`/`HttpBody` they are Pure; just recurse.
             ExprKind::HttpRequestTimeout { req, ns } => {
-                self.expr(req);
-                self.expr(ns);
+                walk!(req);
+                walk!(ns);
             }
             ExprKind::HttpClientTimeout { client, ns } => {
-                self.expr(client);
-                self.expr(ns);
+                walk!(client);
+                walk!(ns);
             }
-            ExprKind::HttpParse { data } => self.expr(data),
-            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp),
+            ExprKind::HttpParse { data } => walk!(data),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => walk!(resp),
             ExprKind::HttpRespHeader { resp, name } => {
-                self.expr(resp);
-                self.expr(name);
+                walk!(resp);
+                walk!(name);
             }
             // `std.http` (Slice 2) — `http.client()` allocates a handle (no I/O — **Pure**), but every
             // request op (`get`/`post`/`request`) hits the network (connect/write/read syscalls), so it
             // is **Impure** — excluded from `par_map`, like `tcp.connect` / `io`.
             ExprKind::HttpClient => {}
             ExprKind::HttpClientGet { client, url } => {
+                walk!(client);
+                walk!(url);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(url);
             }
             ExprKind::HttpClientPost { client, url, body } => {
+                walk!(client);
+                walk!(url);
+                walk!(body);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(url);
-                self.expr(body);
             }
             ExprKind::HttpClientRequest { client, req } => {
+                walk!(client);
+                walk!(req);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(req);
             }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                walk!(client);
+                walk!(urls);
+                walk!(max_concurrency);
                 self.impure_direct = true;
-                self.expr(client);
-                self.expr(urls);
-                self.expr(max_concurrency);
             }
             // `std.http` (Slice 4) — the server primitive. `serve`/`accept`/`respond` hit the network
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
             // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
             // so an effect *inside* the operands is still counted.
             ExprKind::HttpServe { host, port, .. } => {
+                walk!(host);
+                walk!(port);
                 self.impure_direct = true;
-                self.expr(host);
-                self.expr(port);
             }
             ExprKind::HttpAccept { server } => {
+                walk!(server);
                 self.impure_direct = true;
-                self.expr(server);
             }
             ExprKind::HttpRespond { ctx, rb } => {
+                walk!(ctx);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(ctx);
-                self.expr(rb);
             }
             ExprKind::HttpRespondStream { ctx, rb } => {
+                walk!(ctx);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(ctx);
-                self.expr(rb);
             }
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
+                walk!(stream);
+                walk!(chunk);
                 self.impure_direct = true;
-                self.expr(stream);
-                self.expr(chunk);
             }
             ExprKind::HttpStreamFinish { stream } => {
+                walk!(stream);
                 self.impure_direct = true;
-                self.expr(stream);
             }
             ExprKind::HttpStreamReject { stream, rb } => {
+                walk!(stream);
+                walk!(rb);
                 self.impure_direct = true;
-                self.expr(stream);
-                self.expr(rb);
             }
-            ExprKind::HttpResponseBuilder { status } => self.expr(status),
+            ExprKind::HttpResponseBuilder { status } => walk!(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
-                self.expr(rb);
-                self.expr(name);
-                self.expr(value);
+                walk!(rb);
+                walk!(name);
+                walk!(value);
             }
             ExprKind::HttpRbBody { rb, data } => {
-                self.expr(rb);
-                self.expr(data);
+                walk!(rb);
+                walk!(data);
             }
             // `ctx.headers()` is a pointer copy and `hs.get(name)` a read-only scan of an immutable
             // buffer, so both stay **Pure** (http.md item 10 ⑥) — which is what lets a handler that
@@ -7547,86 +7936,102 @@ impl EffectScan<'_> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.expr(ctx),
+            | ExprKind::HttpCtxHeaders { ctx } => walk!(ctx),
             ExprKind::HttpCtxHeader { headers, name } => {
-                self.expr(headers);
-                self.expr(name);
+                walk!(headers);
+                walk!(name);
             }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
             // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
             ExprKind::CryptoCtEqual { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             // `crypto.random` reads OS entropy → **Impure**: an rng-filling closure is never `Pure`,
             // so it is excluded from `par_map`.
             ExprKind::CryptoRandom { out } => {
+                walk!(out);
                 self.impure_direct = true;
-                self.expr(out);
             }
             // `crypto.sha256`/`sha512` — a C-engine (libcrypto) call, inferred **Impure** (draft §15:
             // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
             ExprKind::CryptoHash { data, .. } => {
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(data);
             }
             // `crypto.hmac_sha256` / `crypto.hkdf_sha256` — libcrypto calls, inferred **Impure**
             // (never `Pure`, so excluded from `par_map`, matching `crypto.sha256`). Recurse operands.
             ExprKind::CryptoHmac { key, data } => {
+                walk!(key);
+                walk!(data);
                 self.impure_direct = true;
-                self.expr(key);
-                self.expr(data);
             }
             ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                walk!(salt);
+                walk!(ikm);
+                walk!(info);
+                walk!(len);
                 self.impure_direct = true;
-                self.expr(salt);
-                self.expr(ikm);
-                self.expr(info);
-                self.expr(len);
             }
             // `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}` — libcrypto AEAD, inferred **Impure**
             // (never `Pure`, so excluded from `par_map`). Recurse the four byte-view operands.
             ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                walk!(key);
+                walk!(nonce);
+                walk!(input);
+                walk!(aad);
                 self.impure_direct = true;
-                self.expr(key);
-                self.expr(nonce);
-                self.expr(input);
-                self.expr(aad);
             }
             // `crypto.argon2id` — a libcrypto call, inferred **Impure** (never `Pure`, so excluded
             // from `par_map`). Recurse into all three operands (`params` is a Copy struct literal).
             ExprKind::CryptoArgon2 { password, salt, params } => {
+                walk!(password);
+                walk!(salt);
+                walk!(params);
                 self.impure_direct = true;
-                self.expr(password);
-                self.expr(salt);
-                self.expr(params);
             }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
-                self.expr(source);
-                self.stage_funcs(source, stages);
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                self.join_stage_actions(source, stages);
             }
             ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } => {
-                self.expr(source);
-                self.stage_funcs(source, stages);
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                self.join_stage_actions(source, stages);
             }
             // `map_into` writes each post-stage element into caller-provided storage. It is an
             // observable view write even when the destination expression itself is just a local
             // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                walk!(dst);
+                self.join_stage_actions(source, stages);
                 self.impure_direct = true;
-                self.expr(source);
-                self.stage_funcs(source, stages);
-                self.expr(dst);
             }
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
-                self.expr(source);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -7650,9 +8055,16 @@ impl EffectScan<'_> {
                 init,
                 ..
             } => {
-                self.expr(source);
-                self.expr(init);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                walk!(init);
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary(func, 0, init);
@@ -7674,8 +8086,15 @@ impl EffectScan<'_> {
                 }
             }
             ExprKind::ArrayParMap { source, stages, func, .. } => {
-                self.expr(source);
-                let origin = self.stage_funcs(source, stages);
+                walk!(source);
+                if !self.form_stage_captures(stages) {
+                    return false;
+                }
+                if !self.form_node_captures(&e.kind) {
+                    return false;
+                }
+                let origin = self.join_stage_actions(source, stages);
+                self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
                 if self.known_effects.is_some() {
                     self.join_named_param_boundary_from_origin(
@@ -7700,126 +8119,145 @@ impl EffectScan<'_> {
                 }
             }
             // `to_soa` transposes its source array — no stage/reducer functions of its own.
-            ExprKind::ArrayToSoa { source, .. } => self.expr(source),
+            ExprKind::ArrayToSoa { source, .. } => walk!(source),
             ExprKind::ArrayDot { a, b, .. } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
             ExprKind::ArrayChunks { source, n, .. } => {
-                self.expr(source);
-                self.expr(n);
+                walk!(source);
+                walk!(n);
             }
             // Structural recursion (no effect of their own).
-            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.expr(expr),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => walk!(expr),
+            ExprKind::Binary {
+                op: BinOp::And | BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                walk!(lhs);
+                // The RHS is conditionally reachable, but the short path remains a continuation
+                // even when the RHS terminates.
+                let _ = self.expr(rhs);
+                return true;
+            }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
+                walk!(lhs);
+                walk!(rhs);
             }
             ExprKind::If { cond, then, els } => {
-                self.expr(cond);
-                self.block(then);
-                self.block(els);
+                walk!(cond);
+                let then_falls_through = self.block(then);
+                let else_falls_through = self.block(els);
+                return then_falls_through || else_falls_through;
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
-                    self.expr(f);
+                    walk!(f);
                 }
             }
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
-                    self.expr(el);
+                    walk!(el);
                 }
             }
             ExprKind::MathOp { operands, .. } => {
                 for o in operands {
-                    self.expr(o);
+                    walk!(o);
                 }
             }
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for el in elems {
-                    self.expr(el);
+                    walk!(el);
                 }
             }
             ExprKind::ArrayZip { sources, .. } => {
                 for source in sources {
-                    self.expr(source);
+                    walk!(source);
                 }
             }
             ExprKind::Select { mask, a, b } => {
-                self.expr(mask);
-                self.expr(a);
-                self.expr(b);
+                walk!(mask);
+                walk!(a);
+                walk!(b);
             }
             ExprKind::VecSumWhere { vec, mask } => {
-                self.expr(vec);
-                self.expr(mask);
+                walk!(vec);
+                walk!(mask);
             }
             ExprKind::VecDot { a, b } => {
-                self.expr(a);
-                self.expr(b);
+                walk!(a);
+                walk!(b);
             }
-            ExprKind::VecMinMax { vec, .. } => self.expr(vec),
-            ExprKind::VecSum { vec } => self.expr(vec),
+            ExprKind::VecMinMax { vec, .. } => walk!(vec),
+            ExprKind::VecSum { vec } => walk!(vec),
             ExprKind::VecLoad { src, index, .. } => {
-                self.expr(src);
-                self.expr(index);
+                walk!(src);
+                walk!(index);
             }
             ExprKind::VecStore { dst, index, value, .. } => {
                 // `dst` is a writable slice place; the vector store mutates its backing buffer.
+                walk!(dst);
+                walk!(index);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(dst);
-                self.expr(index);
-                self.expr(value);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.expr(opt);
-                self.expr(fallback);
+                walk!(opt);
+                // The fallback is conditionally reachable. Its effects remain reachable, while the
+                // successful unwrap edge keeps the expression fallthrough even if fallback exits.
+                let _ = self.expr(fallback);
+                return true;
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
-                self.expr(builder);
-                self.expr(arg);
+                walk!(builder);
+                walk!(arg);
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
-                self.block(b)
+                return self.block(b);
             }
-            ExprKind::Loop { body, .. } => self.loop_body(e, body),
+            ExprKind::Loop { body, diverges, .. } => {
+                self.loop_body(e, body);
+                return !*diverges;
+            }
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
             ExprKind::Unsafe(b) => {
                 self.impure_direct = true;
-                self.block(b);
+                return self.block(b);
             }
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
+                walk!(e);
                 self.impure_direct = true;
-                self.expr(e);
             }
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
+                walk!(ptr);
+                walk!(offset);
                 self.impure_direct = true;
-                self.expr(ptr);
-                self.expr(offset);
             }
             ExprKind::RawStore { ptr, offset, value } => {
+                walk!(ptr);
+                walk!(offset);
+                walk!(value);
                 self.impure_direct = true;
-                self.expr(ptr);
-                self.expr(offset);
-                self.expr(value);
             }
             // Spawning / joining concurrent work is an observable effect (the enclosing function
             // is not pure); the spawned closure's own effects live in its lifted function.
             ExprKind::Spawn { closure, .. } => {
+                walk!(closure);
                 self.impure_direct = true;
-                self.expr(closure);
             }
-            ExprKind::TaskGet(inner) => self.expr(inner),
+            ExprKind::TaskGet(inner) => walk!(inner),
             ExprKind::Wait => self.impure_direct = true,
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
-                    self.expr(p);
+                    walk!(p);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.expr(scrutinee);
+                walk!(scrutinee);
+                let mut any_fallthrough = false;
                 for a in arms {
                     if self.known_effects.is_some()
                         && let [variant] = a.variants.as_slice()
@@ -7856,12 +8294,13 @@ impl EffectScan<'_> {
                             );
                         }
                     }
-                    self.expr(&a.body);
+                    any_fallthrough |= self.expr(&a.body);
                 }
+                return any_fallthrough;
             }
             ExprKind::ResultMapErr { result, f } => {
-                self.expr(result);
-                self.expr(f);
+                walk!(result);
+                walk!(f);
                 self.consume_fn_value(f);
                 let error_ty = match expand_tagged_ty(
                     result.ty,
@@ -7895,40 +8334,42 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::TupleIndex { recv, .. } => self.expr(recv),
+            ExprKind::TupleIndex { recv, .. } => walk!(recv),
             ExprKind::Index { recv, index } => {
-                self.expr(recv);
-                self.expr(index);
+                walk!(recv);
+                walk!(index);
             }
             ExprKind::SliceRange { recv, start, end } => {
-                self.expr(recv);
-                if let Some(s) = start { self.expr(s); }
-                if let Some(e) = end { self.expr(e); }
+                walk!(recv);
+                if let Some(s) = start { walk!(s); }
+                if let Some(e) = end { walk!(e); }
             }
             ExprKind::ElemField { recv, index, .. } => {
-                self.expr(recv);
-                self.expr(index);
+                walk!(recv);
+                walk!(index);
             }
             ExprKind::Try(result) => {
-                self.expr(result);
+                walk!(result);
                 if self.known_effects.is_some() {
                     self.join_try_error_effects(result);
                 }
+                // The Err edge returns, while the Ok edge continues.
+                return true;
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i)
             | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::Len(i)
-            | ExprKind::ArrayToSlice(i) => self.expr(i),
+            | ExprKind::ArrayToSlice(i) => walk!(i),
             ExprKind::StrPredicate { haystack, needle, .. } => {
-                self.expr(haystack);
-                self.expr(needle);
+                walk!(haystack);
+                walk!(needle);
             }
-            ExprKind::StrTrim { recv, .. } => self.expr(recv),
+            ExprKind::StrTrim { recv, .. } => walk!(recv),
             ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -7936,23 +8377,23 @@ impl EffectScan<'_> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
-            | ExprKind::JsonScan { input, .. } => self.expr(input),
+            | ExprKind::JsonScan { input, .. } => walk!(input),
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
-            ExprKind::JsonDoc { input } => self.expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.expr(doc),
+            ExprKind::JsonDoc { input } => walk!(input),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => walk!(doc),
             ExprKind::JsonDocGet { doc, key } => {
-                self.expr(doc);
-                self.expr(key);
+                walk!(doc);
+                walk!(key);
             }
             ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
-                self.expr(doc);
-                self.expr(index);
+                walk!(doc);
+                walk!(index);
             }
             // `builder(capacity)` — the capacity expr may itself have effects.
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
-                    self.expr(c);
+                    walk!(c);
                 }
             }
             // Leaves. A `ConstArray`'s elements are already-folded pure literals — no effects.
@@ -7963,6 +8404,7 @@ impl EffectScan<'_> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
         }
+        true
     }
 }
 
@@ -8146,11 +8588,6 @@ impl<'a> EscapeFlowCfg<'a> {
         }
     }
 
-    fn has_predecessor(&self, block: EscapeFlowBlockId) -> bool {
-        self.blocks
-            .iter()
-            .any(|candidate| candidate.successors.contains(&block))
-    }
 }
 
 /// Arena escape checking (`03-types.md` §7, generalized per `impl/08-memory-model-v2.md`):
@@ -8161,6 +8598,8 @@ impl<'a> EscapeFlowCfg<'a> {
 struct EscapeCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Settled same-program/imported return-region summaries for direct calls.
+    named_return_region: &'a std::collections::HashMap<String, hir::ReturnRegionSummary>,
     /// Tuple defs (to decide whether a `Ty::Tuple` is region-tracked — true iff an element is).
     tuples: &'a [hir::TupleDef],
     /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
@@ -9067,6 +9506,46 @@ impl<'a> EscapeCheck<'a> {
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
+    fn mapped_return_region(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> Region {
+        let hir::ReturnRegionSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return Region::Static;
+        };
+        let mut region = Region::Static;
+        for &index in params {
+            if let Some(value) = args.get(index as usize) {
+                region = region.shorter(self.region_of(value, depth));
+            }
+        }
+        region
+    }
+
+    fn mapped_return_slice_is_local(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+    ) -> bool {
+        let hir::ReturnRegionSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return false;
+        };
+        params.iter().any(|&index| {
+            args.get(index as usize)
+                .is_some_and(|value| self.slice_is_local(value))
+        })
+    }
+
     fn region_of(&self, e: &Expr, depth: u32) -> Region {
         match &e.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
@@ -9402,7 +9881,9 @@ impl<'a> EscapeCheck<'a> {
             // zero-argument closure can return an arena capture after that arena is freed.
             ExprKind::CallFnValue { callee, args } => args.iter().fold(
                 self.region_of(callee, depth),
-                |acc, a| acc.shorter(self.region_of(a, depth)),
+                |region, arg| {
+                    region.shorter(self.region_of(arg, depth))
+                },
             ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
@@ -9418,12 +9899,19 @@ impl<'a> EscapeCheck<'a> {
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
             // `f(arena_str)` out of the arena slips the escape check → use-after-free of the
-            // freed buffer. A function that does *not* return a borrow of its args is
-            // over-restricted here; precise per-fn "returns a borrow of arg i" inference is a
-            // later slice. Non-tracked args (ints, literals) are `Static` and don't shorten.
-            ExprKind::Call { args, .. } => args
-                .iter()
-                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
+            // freed buffer. L2b-a1 maps only the named function's settled parameter roots.
+            // Non-tracked args (ints, literals) are `Static` and don't shorten.
+            ExprKind::Call { func, args, .. } => self
+                .named_return_region
+                .get(func)
+                .map_or_else(
+                    || {
+                        args.iter().fold(Region::Static, |region, arg| {
+                            region.shorter(self.region_of(arg, depth))
+                        })
+                    },
+                    |summary| self.mapped_return_region(summary, args, depth),
+                ),
             // A `loop` yields one of its `break` values (scattered as `Stmt::Break` in the body, not
             // reachable from this node). Each is escape-checked directly (`check_break_escape`), which
             // requires a `break` value to be `Static` — so the loop's value is provably `Static` here.
@@ -9677,10 +10165,17 @@ impl<'a> EscapeCheck<'a> {
             // local-backed check is the one that catches its escape).
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
             ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
-            ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::Call { func, args, .. } => self
+                .named_return_region
+                .get(func)
+                .map_or_else(
+                    || args.iter().any(|arg| self.slice_is_local(arg)),
+                    |summary| self.mapped_return_slice_is_local(summary, args),
+                ),
             ExprKind::ArrayZip { sources, .. } => sources.iter().any(|a| self.slice_is_local(a)),
             ExprKind::CallFnValue { callee, args } => {
-                self.slice_is_local(callee) || args.iter().any(|a| self.slice_is_local(a))
+                self.slice_is_local(callee)
+                    || args.iter().any(|arg| self.slice_is_local(arg))
             }
             ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
@@ -9980,22 +10475,24 @@ impl<'a> EscapeCheck<'a> {
             | Stmt::AssignField { value, .. } => self.walk(value, depth),
             Stmt::Return(Some(value)) | Stmt::Expr(value) => self.walk(value, depth),
             Stmt::Return(None) => {}
-            Stmt::Break(value) => {
+            Stmt::Break { value, .. } => {
                 if let Some(value) = value {
                     self.walk(value, depth);
                 }
             }
         }
         self.push_flow_op(EscapeFlowOp::Stmt(stmt, depth));
-        if matches!(stmt, Stmt::Break(_)) {
+        if let Stmt::Break { accepted, .. } = stmt {
             let break_block = self.flow_current;
-            if let Some(exit) = self.loop_exit_blocks.last().copied() {
+            if *accepted
+                && let Some(exit) = self.loop_exit_blocks.last().copied()
+            {
                 self.flow.add_edge(break_block, exit);
             }
             // Keep lowering unreachable syntax for diagnostics, but isolate it from the break edge:
-            // successors observe the state exactly at `break`, never mutations written afterward.
+            // the CFG solver never replays this predecessor-less block, so successors observe the
+            // state exactly at an accepted `break`, never mutations written afterward.
             let unreachable = self.flow.new_block();
-            self.flow.add_edge(break_block, unreachable);
             self.flow_current = unreachable;
         }
     }
@@ -10231,8 +10728,10 @@ impl<'a> EscapeCheck<'a> {
             // would dangle — a per-iteration owned local is dropped at the `break`). Same rule and
             // check as a return; `.clone()` copies a view out. (Loosening this to let an
             // enclosing-arena / outer-frame view escape the loop is a future refinement.)
-            Stmt::Break(value) => {
-                if let Some(e) = value {
+            Stmt::Break { value, accepted } => {
+                if *accepted
+                    && let Some(e) = value
+                {
                     self.check_break_escape(e, depth);
                 }
             }
@@ -10340,16 +10839,6 @@ impl<'a> EscapeCheck<'a> {
         if let Some(region) = self.allocation_regions.last().copied() {
             self.allocation_region_by_expr.insert(Self::expr_key(e), region);
         }
-        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
-        // enclosing locals); walk them so a captured value escaping its region is caught.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                self.walk(c, depth);
-            }
-        }
-        for c in node_captures(&e.kind) {
-            self.walk(c, depth);
-        }
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
@@ -10388,11 +10877,8 @@ impl<'a> EscapeCheck<'a> {
                 if !hir_block_diverges(body) {
                     self.flow.add_edge(self.flow_current, head);
                 }
-                // Preserve the old analysis's benign input state after a syntactically break-less
-                // loop, even though runtime continuation is unreachable.
-                if !self.flow.has_predecessor(exit) {
-                    self.flow.add_edge(before, exit);
-                }
+                // Only a semantically accepted `break` adds a predecessor to `exit`. A rejected or
+                // break-less loop leaves it unreachable, so later syntax receives no escape state.
                 self.flow_current = exit;
             }
             // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
@@ -10541,8 +11027,25 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
+                for capture in node_captures(&e.kind) {
+                    self.walk(capture, depth);
+                }
+            }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
                 self.walk(index, depth);
@@ -10570,14 +11073,24 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(needle, depth);
             }
             ExprKind::StrTrim { recv, .. } => self.walk(recv, depth),
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
                 self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
                 self.walk(init, depth);
+                for capture in node_captures(&e.kind) {
+                    self.walk(capture, depth);
+                }
             }
             // `map_into` reads its source and writes `dst` — recurse into both (the destination
             // is a place read of the `out`/`mut` slice; nothing is moved out of it).
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.walk(source, depth);
+                for capture in stage_capture_exprs(stages) {
+                    self.walk(capture, depth);
+                }
                 self.walk(dst, depth);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -11126,8 +11639,10 @@ impl UnnecessaryHeapScan {
             // Destructure binds fresh locals (definitions, and never `box` — no producer yields a
             // tuple of boxes); just visit the init.
             Stmt::LetTuple { init, .. } => self.visit(init),
-            Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.visit(e),
-            Stmt::Return(None) | Stmt::Break(None) => {}
+            Stmt::Return(Some(e))
+            | Stmt::Break { value: Some(e), .. }
+            | Stmt::Expr(e) => self.visit(e),
+            Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
         }
     }
 
@@ -11171,16 +11686,6 @@ impl UnnecessaryHeapScan {
     }
 
     fn visit(&mut self, e: &Expr) {
-        // Capture operands (a lifted lambda's captured enclosing locals) live outside the normal child
-        // recursion — a captured box is an "other" use, so classify them too.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                self.visit(c);
-            }
-        }
-        for c in node_captures(&e.kind) {
-            self.visit(c);
-        }
         match &e.kind {
             // `p.get()` — the one occurrence that does *not* need a heap box. When the receiver is a
             // bare local, record it as a get and do NOT recurse into the receiver (so the inner
@@ -11261,8 +11766,25 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.visit(i),
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
+                for capture in node_captures(&e.kind) {
+                    self.visit(capture);
+                }
+            }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.visit(recv);
                 self.visit(index);
@@ -11290,12 +11812,22 @@ impl UnnecessaryHeapScan {
                 self.visit(needle);
             }
             ExprKind::StrTrim { recv, .. } => self.visit(recv),
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
                 self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
                 self.visit(init);
+                for capture in node_captures(&e.kind) {
+                    self.visit(capture);
+                }
             }
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.visit(source);
+                for capture in stage_capture_exprs(stages) {
+                    self.visit(capture);
+                }
                 self.visit(dst);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -11741,7 +12273,7 @@ fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
     match s {
         // `return` leaves the function; `break` leaves the loop — either way control never falls
         // through to the next statement in this block.
-        hir::Stmt::Return(_) | hir::Stmt::Break(_) => true,
+        hir::Stmt::Return(_) | hir::Stmt::Break { .. } => true,
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
         hir::Stmt::AssignIndex { index, value, .. }
@@ -11768,12 +12300,18 @@ fn hir_block_diverges(b: &hir::Block) -> bool {
 }
 
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
-/// arms do; a block-wrapping expr (`{…}` / `arena {…}` / `task_group {…}`) defers to its block.
-/// (A `match` / `?` may fall through, so they are conservatively non-diverging here.)
+/// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
+/// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
 fn hir_expr_diverges(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
-        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => hir_block_diverges(b),
+        ExprKind::Block(b)
+        | ExprKind::Arena(b)
+        | ExprKind::TaskGroup(b)
+        | ExprKind::Unsafe(b) => hir_block_diverges(b),
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| hir_expr_diverges(&arm.body))
+        }
         // A `loop` with no `break` never yields and control never reaches past it (it either loops
         // forever or exits the function via `return`/`?`). A loop *with* a `break` may fall through.
         ExprKind::Loop { diverges, .. } => *diverges,
@@ -11787,6 +12325,12 @@ fn hir_expr_diverges(e: &Expr) -> bool {
 struct MoveCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Settled same-program/imported return summaries for mapping call results back to their exact
+    /// caller-side inputs. The map is recomputed to a fixpoint before the diagnostic pass.
+    named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    /// Direct named calls observed by the exhaustive expression walk. Present only while building
+    /// the reverse worklist for named-return inference.
+    summary_dependencies: Option<&'a mut std::collections::HashSet<String>>,
     /// Tuple defs — so a Move tuple (one with an owned element) is recognised as a Move type and
     /// its consumption (pass / destructure / return) is tracked for use-after-move.
     tuples: &'a [hir::TupleDef],
@@ -11804,8 +12348,16 @@ struct MoveCheck<'a> {
     /// Intra-frame borrow provenance and invalidation state. This shares MoveCheck's evaluation
     /// order and control-flow joins, so every consuming position has one source of truth.
     borrows: BorrowState,
+    /// Stable identities for pipeline-source snapshots that must remain valid across a later
+    /// terminal argument. Snapshot roots live in `BorrowState`, so branch joins and owner
+    /// invalidation use the same machinery as ordinary view locals.
+    next_pipeline_snapshot: usize,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
+    /// Roots carried by value-bearing `break` edges for each active loop.
+    loop_value_breaks: Vec<BorrowRoots>,
+    /// Settled value roots of each walked loop expression, keyed by source span.
+    loop_value_roots: std::collections::HashMap<Span, BorrowRoots>,
     /// Per-iteration owned locals of each enclosing `loop` (innermost last) — the locals MIR drops
     /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
     /// generation exactly as the back-edge does.
@@ -11825,6 +12377,11 @@ struct MoveCheck<'a> {
     /// `task_group` value cannot escape its block at all). Pinned by
     /// `borrow_liveness.rs::a_template_returned_out_of_a_task_group_in_a_loop_is_rejected`.
     arena_depth: u32,
+    /// Symbolic parameter roots observed on explicit, implicit, and `?` return edges.
+    return_roots: BorrowRoots,
+    /// Expressions proven not to reach their result edge during this exact source-order walk.
+    /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
+    non_fallthrough: std::collections::HashSet<Span>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -11850,6 +12407,8 @@ enum BorrowRoot {
     /// loop's body). Depth is all the identity needed: every temporary at a given depth is freed by
     /// the same two edges — that loop's back-edge and its `break`s.
     IterTemp(u32),
+    /// Source-visible parameter whose embedded view provenance reaches the return.
+    Param(u32),
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
@@ -11878,6 +12437,8 @@ type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
     invalid: std::collections::HashMap<LocalId, EndedRoots>,
+    pipeline_sources: std::collections::HashMap<usize, BorrowRoots>,
+    invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
 }
 
 impl BorrowState {
@@ -11890,6 +12451,18 @@ impl BorrowState {
         }
     }
 
+    fn begin_pipeline_source(&mut self, snapshot: usize, roots: BorrowRoots) {
+        self.invalid_pipeline_sources.remove(&snapshot);
+        self.pipeline_sources.insert(snapshot, roots);
+    }
+
+    fn finish_pipeline_source(&mut self, snapshot: usize) -> EndedRoots {
+        self.pipeline_sources.remove(&snapshot);
+        self.invalid_pipeline_sources
+            .remove(&snapshot)
+            .unwrap_or_default()
+    }
+
     /// End every source generation matching `ended`. One entry point for both endings: a named
     /// local being consumed, and a whole class of roots (a loop depth's temporaries plus its owned
     /// locals) being dropped at an iteration edge.
@@ -11897,6 +12470,17 @@ impl BorrowState {
         for (&borrower, roots) in &self.sources {
             for &root in roots.iter().filter(|&&r| ended(r)) {
                 let entry = self.invalid.entry(borrower).or_default().entry(root).or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
+        for (&snapshot, roots) in &self.pipeline_sources {
+            for &root in roots.iter().filter(|&&r| ended(r)) {
+                let entry = self
+                    .invalid_pipeline_sources
+                    .entry(snapshot)
+                    .or_default()
+                    .entry(root)
+                    .or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
@@ -11913,6 +12497,22 @@ impl BorrowState {
         }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
+            for (&owner, &how) in roots {
+                let entry = into.entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
+        for (&snapshot, roots) in &b.pipeline_sources {
+            out.pipeline_sources
+                .entry(snapshot)
+                .or_default()
+                .extend(roots);
+        }
+        for (&snapshot, roots) in &b.invalid_pipeline_sources {
+            let into = out
+                .invalid_pipeline_sources
+                .entry(snapshot)
+                .or_default();
             for (&owner, &how) in roots {
                 let entry = into.entry(owner).or_insert(how);
                 *entry = (*entry).min(how);
@@ -11957,14 +12557,38 @@ fn clear_moved(moved: &mut MovedSet, id: LocalId) {
     moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
 }
 
+macro_rules! move_expr {
+    ($checker:expr, $expression:expr, $moved:expr, $consuming:expr, $direct:expr $(,)?) => {
+        if !$checker.expr($expression, $moved, $consuming, $direct) {
+            return false;
+        }
+    };
+}
+
 impl<'a> MoveCheck<'a> {
-    fn check(mut self) {
+    fn check(mut self) -> BorrowRoots {
+        for (position, &local) in self.f.params.iter().enumerate() {
+            if !self.local_may_borrow(local) {
+                continue;
+            }
+            self.borrows
+                .sources
+                .entry(local)
+                .or_default()
+                .insert(BorrowRoot::Param(position as u32));
+        }
         let mut moved: MovedSet = std::collections::HashSet::new();
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
         let ret_is_move = self.is_move_ty(self.f.ret);
-        self.block(&self.f.body, &mut moved, ret_is_move, true);
+        let falls_through = self.block(&self.f.body, &mut moved, ret_is_move, true);
+        if falls_through
+            && let Some(value) = &self.f.body.value
+        {
+            self.return_roots.extend(self.borrow_sources(value));
+        }
+        self.return_roots
     }
 
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple
@@ -12123,6 +12747,9 @@ impl<'a> MoveCheck<'a> {
     /// through `storage_roots`, while a materializing/moving arm routes through `borrow_sources`.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
         let mut roots = BorrowRoots::new();
+        if self.non_fallthrough.contains(&e.span) {
+            return roots;
+        }
         if !ty_may_borrow(
             e.ty,
             self.structs,
@@ -12141,6 +12768,65 @@ impl<'a> MoveCheck<'a> {
             roots.extend(self.borrow_sources(capture));
         }
         roots.extend(self.borrow_sources_inner(e));
+        roots
+    }
+
+    fn walked_stmt_falls_through(&self, statement: &Stmt) -> bool {
+        let expression_falls = |expression: &Expr| {
+            !self.non_fallthrough.contains(&expression.span)
+        };
+        match statement {
+            Stmt::Return(_) | Stmt::Break { .. } => false,
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                expression_falls(init)
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::AssignField { value, .. }
+            | Stmt::AssignVecLane { value, .. } => expression_falls(value),
+            Stmt::AssignIndex { index, value, .. }
+            | Stmt::AssignElemField { index, value, .. }
+            | Stmt::AssignElem { index, value, .. } => {
+                expression_falls(index) && expression_falls(value)
+            }
+            Stmt::Expr(expression) => expression_falls(expression),
+        }
+    }
+
+    fn block_value_roots(&self, block: &Block) -> BorrowRoots {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block
+                .value
+                .as_ref()
+                .map_or_else(BorrowRoots::new, |value| {
+                    self.borrow_sources(value)
+                })
+        } else {
+            BorrowRoots::new()
+        }
+    }
+
+    fn map_summary_roots<'b>(
+        &self,
+        summary: &hir::ReturnBorrowSummary,
+        args: impl std::ops::Fn(u32) -> Option<&'b Expr>,
+    ) -> BorrowRoots {
+        let hir::ReturnBorrowSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return BorrowRoots::new();
+        };
+        let mut roots = BorrowRoots::new();
+        for &index in params {
+            if let Some(value) = args(index) {
+                roots.extend(self.borrow_sources(value));
+            }
+        }
         roots
     }
 
@@ -12192,7 +12878,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayDictEncode { base, .. }
             | ExprKind::IndexField { base, .. }
             | ExprKind::Field { root: base, .. } => self.local_storage_roots(*base),
-            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
+            ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
             // Chunks are views into the source slots themselves. The materializing transforms below
             // instead copy view values into fresh storage, so they inherit only the source value's
             // already-flattened provenance, not ownership of its array header.
@@ -12260,13 +12947,24 @@ impl<'a> MoveCheck<'a> {
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
             // past the input's liveness is caught.
             ExprKind::JsonScan { input, .. } => self.storage_roots(input),
-            ExprKind::Call { args, .. } => {
-                let mut roots = BorrowRoots::new();
-                for arg in args {
-                    roots.extend(self.borrow_sources(arg));
-                }
-                roots
-            }
+            ExprKind::Call { func, args, .. } => self
+                .named_return_borrow
+                .get(func)
+                .map_or_else(
+                    || {
+                        let mut roots = BorrowRoots::new();
+                        for arg in args {
+                            roots.extend(self.borrow_sources(arg));
+                        }
+                        roots
+                    },
+                    |summary| {
+                        self.map_summary_roots(
+                            summary,
+                            |index| args.get(index as usize),
+                        )
+                    },
+                ),
             ExprKind::CallFnValue { callee, args } => {
                 let mut roots = self.borrow_sources(callee);
                 for arg in args {
@@ -12335,18 +13033,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Block(b)
             | ExprKind::Arena(b)
             | ExprKind::TaskGroup(b)
-            | ExprKind::Unsafe(b) => b
-                .value
-                .as_ref()
-                .map_or_else(BorrowRoots::new, |v| self.borrow_sources(v)),
+            | ExprKind::Unsafe(b) => self.block_value_roots(b),
             ExprKind::If { then, els, .. } => {
-                let mut roots = then
-                    .value
-                    .as_ref()
-                    .map_or_else(BorrowRoots::new, |v| self.borrow_sources(v));
-                if let Some(v) = &els.value {
-                    roots.extend(self.borrow_sources(v));
-                }
+                let mut roots = self.block_value_roots(then);
+                roots.extend(self.block_value_roots(els));
                 roots
             }
             ExprKind::Match { arms, .. } => {
@@ -12356,7 +13046,14 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
-            ExprKind::ElseUnwrap { opt, fallback } => union(vec![opt, fallback]),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                union(vec![opt, fallback])
+            }
+            ExprKind::Loop { .. } => self
+                .loop_value_roots
+                .get(&e.span)
+                .cloned()
+                .unwrap_or_default(),
             // ── The remaining forms record NO provenance, and the list is EXHAUSTIVE: there is no
             // `_` tail, so a new `ExprKind` cannot silently inherit "borrows nothing" — which is
             // precisely how `template` above (and `EnumValue`, and `RandSample`) escaped this pass.
@@ -12366,10 +13063,8 @@ impl<'a> MoveCheck<'a> {
             //   environment (a capturing `Closure` is handled above); a `Reader`/`Writer` opened here
             //   OWNS its fd (`c.reader()`/`.buffered()`, which do borrow, are handled above);
             //   `fs.read_*_view` returns an mmap view bound to the enclosing arena, whose lifetime
-            //   the escape check enforces via `region_of`; a `loop`'s value is provably `Static`
-            //   (`check_break_escape` rejects breaking a view of local storage out of the loop);
-            //   `OptionNone` carries no payload.
-            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone | ExprKind::Loop { .. }
+            //   the escape check enforces via `region_of`; `OptionNone` carries no payload.
+            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::FsReadFileView { .. }
             | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
@@ -12461,7 +13156,6 @@ impl<'a> MoveCheck<'a> {
             }
         }
     }
-
     fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
         let roots = if self.local_may_borrow(local) {
             self.borrow_sources(value)
@@ -12514,6 +13208,7 @@ impl<'a> MoveCheck<'a> {
             // Deeper temporaries are already dead — an inner loop's own edges ended them — but
             // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
+            BorrowRoot::Param(_) => false,
         });
     }
 
@@ -12557,8 +13252,153 @@ impl<'a> MoveCheck<'a> {
                 // escapes. All three are generic; none is template-specific.
                 "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; give the storage a longer life — bind the owned value to a local declared outside the loop, `.clone()` it into one, or allocate it in an `arena` that encloses the loop — and borrow that instead"
             ),
+            // Parameter roots outlive this frame and are never inserted into `invalid`.
+            // Keep the malformed-state fallback diagnostic-only and fail closed.
+            (BorrowRoot::Param(_), _) => format!(
+                "use of invalidated borrow '{borrower}': its external provenance ended unexpectedly"
+            ),
         };
         self.diags.error(msg, span);
+    }
+
+    /// Pipeline capture values are copied into preheader temporaries at their written stage
+    /// positions. A later terminal argument may invalidate storage borrowed by that copied view;
+    /// validate the already-formed capture at the action boundary without re-walking (and thus
+    /// without pretending the source expression is evaluated twice).
+    fn validate_pipeline_capture_use(&mut self, capture: &Expr) {
+        if let ExprKind::Local(local) = capture.kind {
+            self.check_borrow_use(local, capture.span);
+        }
+    }
+
+    fn pipeline_block_source_roots(&self, block: &Block) -> BorrowRoots {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block
+                .value
+                .as_deref()
+                .map_or_else(BorrowRoots::new, |value| {
+                    self.pipeline_source_roots(value)
+                })
+        } else {
+            BorrowRoots::new()
+        }
+    }
+
+    /// Storage retained by an already-evaluated pipeline source. Unlike ordinary result
+    /// provenance, an owned source place is borrowed by the terminal loop, so control-flow joins
+    /// must retain the union of the places selected by their continuing alternatives.
+    fn pipeline_source_roots(&self, source: &Expr) -> BorrowRoots {
+        let mut roots = BorrowRoots::new();
+        match &source.kind {
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    roots.extend(self.pipeline_source_roots(source));
+                }
+            }
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => {
+                roots.extend(self.pipeline_block_source_roots(block));
+            }
+            ExprKind::If { then, els, .. } => {
+                roots.extend(self.pipeline_block_source_roots(then));
+                roots.extend(self.pipeline_block_source_roots(els));
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    if !self.non_fallthrough.contains(&arm.body.span) {
+                        roots.extend(self.pipeline_source_roots(&arm.body));
+                    }
+                }
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                // An owned Some/Ok payload is transferred out and the old container is nulled
+                // before the enclosing pipeline sees it. Copy borrow-carrying payloads instead
+                // retain the success side's flattened provenance.
+                if !self.is_move_ty(source.ty) {
+                    roots.extend(self.pipeline_source_roots(opt));
+                }
+                if !self.non_fallthrough.contains(&fallback.span) {
+                    roots.extend(self.pipeline_source_roots(fallback));
+                }
+            }
+            // A loop transfers each accepted `break` value into its result slot. Unlike the
+            // borrow-preserving control joins above, its source places have already been moved and
+            // nulled before the enclosing pipeline observes the result.
+            ExprKind::Loop { .. } => {}
+            _ => roots.extend(self.storage_roots(source)),
+        }
+        roots
+    }
+
+    /// Record the owner generations retained by MIR's already-evaluated source operand. Unlike a
+    /// named view local, this snapshot has no HIR local id, so BorrowState tracks it in a separate
+    /// namespace while sharing the same invalidation and branch-join operations.
+    fn begin_pipeline_source_snapshot(&mut self, source: &Expr) -> Option<usize> {
+        let roots = self.pipeline_source_roots(source);
+        if roots.is_empty() {
+            return None;
+        }
+        let snapshot = self.next_pipeline_snapshot;
+        self.next_pipeline_snapshot += 1;
+        self.borrows.begin_pipeline_source(snapshot, roots);
+        Some(snapshot)
+    }
+
+    fn finish_pipeline_source_snapshot(
+        &mut self,
+        snapshot: Option<usize>,
+        span: Span,
+        validate: bool,
+    ) {
+        let Some(snapshot) = snapshot else { return };
+        let invalid = self.borrows.finish_pipeline_source(snapshot);
+        // An accepted `break` in a terminal operand has already copied the current borrow state
+        // into its enclosing loop frame. That edge never reaches the terminal action, so erase the
+        // analysis-only snapshot there as well; otherwise loop joins/fixpoints can resurrect it.
+        for frame in &mut self.loop_borrow_breaks {
+            for state in frame {
+                state.finish_pipeline_source(snapshot);
+            }
+        }
+        if !validate {
+            return;
+        }
+        let Some((root, how)) = invalid.into_iter().next() else {
+            return;
+        };
+        let message = match root {
+            BorrowRoot::Local(owner) => {
+                let owner = self
+                    .f
+                    .locals
+                    .get(owner as usize)
+                    .map_or("<source>", |local| local.name.as_str());
+                let why = match how {
+                    BorrowEnd::Consumed => {
+                        "was moved, reassigned, or reallocated by a later terminal argument"
+                    }
+                    BorrowEnd::Dropped => {
+                        "was dropped before the terminal action"
+                    }
+                };
+                format!(
+                    "pipeline source snapshot was invalidated before terminal action: owner '{owner}' {why}"
+                )
+            }
+            BorrowRoot::IterTemp(_) => {
+                "pipeline source snapshot was invalidated before terminal action: its temporary owner was dropped".to_string()
+            }
+            BorrowRoot::Param(_) => {
+                "pipeline source snapshot was invalidated before terminal action: its external owner ended unexpectedly".to_string()
+            }
+        };
+        self.diags.error(message, span);
     }
 
     /// Loop-back use-after-move analysis for `loop { body }`. See the call site in `expr` for the
@@ -12569,8 +13409,9 @@ impl<'a> MoveCheck<'a> {
         &mut self,
         body: &Block,
         body_locals: &std::ops::Range<LocalId>,
+        span: Span,
         moved: &mut MovedSet,
-    ) {
+    ) -> bool {
         let entry = moved.clone();
         let entry_borrows = self.borrows.clone();
         // The owned locals this body declares. They are freed on every edge that leaves an
@@ -12588,10 +13429,12 @@ impl<'a> MoveCheck<'a> {
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
+        self.loop_value_breaks.push(BorrowRoots::new());
         self.borrows = entry_borrows.clone();
-        self.block(body, &mut probe, false, false);
+        let probe_falls_through = self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
         self.loop_borrow_breaks.pop();
+        self.loop_value_breaks.pop();
         let mut probe_borrows = self.borrows.clone();
         Self::invalidate_iteration_drops(&mut probe_borrows, &drops, depth);
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
@@ -12601,27 +13444,27 @@ impl<'a> MoveCheck<'a> {
         // moved out by that lone `break` must not be seeded as moved for a (nonexistent) second
         // iteration. `probe`'s end state includes it (statements are walked linearly), so zero the
         // back-edge in that case.
-        let back_edge: MovedSet = if hir_block_diverges(body) {
-            MovedSet::new()
-        } else {
+        let back_edge: MovedSet = if probe_falls_through {
             probe.difference(&entry).copied().collect()
+        } else {
+            MovedSet::new()
         };
         // Borrow provenance is not a single monotonic moved bit: assignments can forward roots
         // through multiple locals, so a chain may take several iterations to reach the loop head.
         // Compute the finite may-state fixpoint with diagnostics still suppressed. Keeping the old
         // head in the join represents every possible iteration count, including the first.
-        let fixed_borrows = if hir_block_diverges(body) {
-            entry_borrows.clone()
-        } else {
+        let fixed_borrows = if probe_falls_through {
             let mut head = BorrowState::join(&entry_borrows, &probe_borrows);
             loop {
                 self.borrows = head.clone();
                 let mut probe_state = &entry | &back_edge;
                 self.loop_breaks.push(Vec::new());
                 self.loop_borrow_breaks.push(Vec::new());
+                self.loop_value_breaks.push(BorrowRoots::new());
                 self.block(body, &mut probe_state, false, false);
                 self.loop_breaks.pop();
                 self.loop_borrow_breaks.pop();
+                self.loop_value_breaks.pop();
                 let mut end = self.borrows.clone();
                 Self::invalidate_iteration_drops(&mut end, &drops, depth);
                 let next = BorrowState::join(&head, &BorrowState::join(&entry_borrows, &end));
@@ -12630,6 +13473,8 @@ impl<'a> MoveCheck<'a> {
                 }
                 head = next;
             }
+        } else {
+            entry_borrows.clone()
         };
         std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probes'
         // Real pass from the back-edge fixpoint, collecting `break` snapshots.
@@ -12637,12 +13482,23 @@ impl<'a> MoveCheck<'a> {
         self.borrows = fixed_borrows;
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
+        self.loop_value_breaks.push(BorrowRoots::new());
         self.block(body, &mut body_state, false, false);
         let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
+        let falls_through = !breaks.is_empty();
         let borrow_breaks = self
             .loop_borrow_breaks
             .pop()
             .expect("loop borrow-break frame balanced");
+        let value_roots = self
+            .loop_value_breaks
+            .pop()
+            .expect("loop value-break frame balanced");
+        if value_roots.is_empty() {
+            self.loop_value_roots.remove(&span);
+        } else {
+            self.loop_value_roots.insert(span, value_roots);
+        }
         self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
@@ -12663,6 +13519,7 @@ impl<'a> MoveCheck<'a> {
         } else {
             self.borrows = entry_borrows;
         }
+        falls_through
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context;
@@ -12676,17 +13533,21 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         tail_consuming: bool,
         tail_direct: bool,
-    ) {
+    ) -> bool {
+        let mut falls_through = true;
         for s in &b.stmts {
+            if !falls_through {
+                break;
+            }
             match s {
                 Stmt::Let { local, init } => {
-                    self.expr(init, moved, true, true);
+                    move_expr!(self, init, moved, true, true);
                     self.assign_borrow(*local, init);
                     clear_moved(moved, *local);
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
                     let was_moved = whole_moved(moved, *local);
-                    self.expr(value, moved, true, true);
+                    move_expr!(self, value, moved, true, true);
                     // The RHS consumed the old value iff it just transitioned the local live→moved
                     // (it appeared in a consuming position). If so, ownership of the old buffer
                     // transferred away — MIR must NOT drop it here (double-free). Otherwise the
@@ -12719,9 +13580,9 @@ impl<'a> MoveCheck<'a> {
                     if self_assign {
                         // MIR emits no code for an exact place self-assignment. Analyze the read
                         // without consuming it so existing borrows of the root stay valid too.
-                        self.expr(value, moved, false, false);
+                        move_expr!(self, value, moved, false, false);
                     } else {
-                        self.expr(value, moved, true, true);
+                        move_expr!(self, value, moved, true, true);
                     }
                     // The assignment installs a live replacement even when its RHS moved out of
                     // this same field through a transparent wrapper, consuming call, or one arm of
@@ -12745,8 +13606,8 @@ impl<'a> MoveCheck<'a> {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
-                    self.expr(index, moved, false, false);
-                    self.expr(value, moved, false, false);
+                    move_expr!(self, index, moved, false, false);
+                    move_expr!(self, value, moved, false, false);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
@@ -12759,43 +13620,61 @@ impl<'a> MoveCheck<'a> {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
-                    self.expr(index, moved, false, false);
-                    self.expr(value, moved, true, true);
+                    move_expr!(self, index, moved, false, false);
+                    move_expr!(self, value, moved, true, true);
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
                 }
-                Stmt::AssignVecLane { value, .. } => self.expr(value, moved, false, false),
-                Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
+                Stmt::AssignVecLane { value, .. } => {
+                    move_expr!(self, value, moved, false, false);
+                }
+                Stmt::Return(Some(e)) => {
+                    move_expr!(self, e, moved, true, true);
+                    // Control expressions establish match-arm payload bindings while they are
+                    // walked. Query after that walk so an explicit `return match ...` observes the
+                    // same binding provenance as a trailing match expression.
+                    self.return_roots.extend(self.borrow_sources(e));
+                }
                 Stmt::Return(None) => {}
                 // `break e` moves `e` out of the loop, exactly like `return` moves a value out of the
                 // function (a direct, consuming move site). Then snapshot the move state for the
                 // loop's post-state union (`break` is the only way control reaches past the loop).
-                Stmt::Break(value) => {
+                Stmt::Break { value, accepted } => {
                     if let Some(e) = value {
-                        self.expr(e, moved, true, true);
+                        move_expr!(self, e, moved, true, true);
+                        if *accepted {
+                            let roots = self.borrow_sources(e);
+                            if let Some(frame) = self.loop_value_breaks.last_mut() {
+                                frame.extend(roots);
+                            }
+                        }
                     }
-                    if let Some(frame) = self.loop_breaks.last_mut() {
-                        frame.push(moved.clone());
-                    }
-                    // This edge leaves the innermost loop, which drops its per-iteration owned
-                    // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them is
-                    // dead in the code that follows the loop. The invalidation applies to the
-                    // snapshot only: statements after a `break` are dead code, but this pass still
-                    // walks them, and they belong to the iteration that has not dropped yet.
-                    let mut at_break = self.borrows.clone();
-                    if let Some(drops) = self.loop_iter_drops.last() {
-                        let depth = self.loop_iter_drops.len() as u32;
-                        Self::invalidate_iteration_drops(&mut at_break, drops, depth);
-                    }
-                    if let Some(frame) = self.loop_borrow_breaks.last_mut() {
-                        frame.push(at_break);
+                    if *accepted {
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(moved.clone());
+                        }
+                        // This edge leaves the innermost loop, which drops its per-iteration owned
+                        // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them
+                        // is dead in the code that follows the loop. The invalidation applies to the
+                        // break snapshot only; the block walk stops before every unreachable later
+                        // statement.
+                        let mut at_break = self.borrows.clone();
+                        if let Some(drops) = self.loop_iter_drops.last() {
+                            let depth = self.loop_iter_drops.len() as u32;
+                            Self::invalidate_iteration_drops(&mut at_break, drops, depth);
+                        }
+                        if let Some(frame) = self.loop_borrow_breaks.last_mut() {
+                            frame.push(at_break);
+                        }
                     }
                 }
-                Stmt::Expr(e) => self.expr(e, moved, false, false),
+                Stmt::Expr(e) => {
+                    move_expr!(self, e, moved, false, false);
+                }
                 // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
-                    self.expr(init, moved, true, true);
+                    move_expr!(self, init, moved, true, true);
                     let roots = self.borrow_sources(init);
                     for l in locals.iter().flatten() {
                         let local_roots = if self.local_may_borrow(*l) {
@@ -12808,10 +13687,15 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
+            falls_through =
+                !matches!(s, Stmt::Return(_) | Stmt::Break { .. });
         }
-        if let Some(v) = &b.value {
-            self.expr(v, moved, tail_consuming, tail_direct);
+        if falls_through
+            && let Some(v) = &b.value
+        {
+            move_expr!(self, v, moved, tail_consuming, tail_direct);
         }
+        falls_through
     }
 
     /// `consuming` = this position takes a Move value by value (so it moves it). `direct` = the
@@ -12820,41 +13704,47 @@ impl<'a> MoveCheck<'a> {
     /// Move-check a `file` op's sub-exprs (A4) — all borrowed (the file is never consumed).
     /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn move_file_op(&mut self, kind: &ExprKind, moved: &mut MovedSet) {
+    fn move_file_op(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::FilePread { file, buffer, offset } => {
-                self.expr(file, moved, false, false);
-                self.expr(buffer, moved, false, false);
-                self.expr(offset, moved, false, false);
+                move_expr!(self, file, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
             }
             ExprKind::FilePwrite { file, data, offset } => {
-                self.expr(file, moved, false, false);
-                self.expr(data, moved, false, false);
-                self.expr(offset, moved, false, false);
+                move_expr!(self, file, moved, false, false);
+                move_expr!(self, data, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
             }
-            ExprKind::FileLen { file } => self.expr(file, moved, false, false),
+            ExprKind::FileLen { file } => {
+                move_expr!(self, file, moved, false, false);
+            }
             _ => unreachable!("move_file_op on a non-file op"),
         }
+        true
     }
 
     /// Move-check an `array_builder` op (M12 A6). `#[inline(never)]` so its arm locals stay out of the
     /// recursive [`Self::expr`] frame (#296). The builder is borrowed by push/append (grown in place);
     /// push's value is consumed (a `string` moves in); build consumes the builder.
     #[inline(never)]
-    fn move_array_builder(&mut self, kind: &ExprKind, moved: &mut MovedSet) {
+    fn move_array_builder(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::ArrayBuilderNew { .. } => {}
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.expr(builder, moved, false, false);
-                self.expr(value, moved, true, true);
+                move_expr!(self, builder, moved, false, false);
+                move_expr!(self, value, moved, true, true);
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.expr(builder, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, builder, moved, false, false);
+                move_expr!(self, data, moved, false, false);
             }
-            ExprKind::ArrayBuilderBuild(i) => self.expr(i, moved, true, true),
+            ExprKind::ArrayBuilderBuild(i) => {
+                move_expr!(self, i, moved, true, true);
+            }
             _ => unreachable!("move_array_builder on a non-array_builder op"),
         }
+        true
     }
 
     /// Transfer only the bound source(s) that produced a match scrutinee's result value.
@@ -12919,17 +13809,22 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
-    ) {
-        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
-        // enclosing locals); walk them as borrows so use-after-move of a captured value is caught.
-        if let Some(stages) = pipeline_stages(&e.kind) {
-            for c in stage_capture_exprs(stages) {
-                self.expr(c, moved, false, false);
-            }
+    ) -> bool {
+        let falls_through =
+            self.expr_inner(e, moved, consuming, direct);
+        if !falls_through {
+            self.non_fallthrough.insert(e.span);
         }
-        for c in node_captures(&e.kind) {
-            self.expr(c, moved, false, false);
-        }
+        falls_through
+    }
+
+    fn expr_inner(
+        &mut self,
+        e: &Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> bool {
         match &e.kind {
             ExprKind::Local(id) => {
                 if whole_moved(moved, *id) {
@@ -13030,18 +13925,43 @@ impl<'a> MoveCheck<'a> {
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 }
             }
-            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.expr(expr, moved, false, false),
-            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.expr(lhs, moved, false, false);
-                self.expr(rhs, moved, false, false);
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => move_expr!(self, expr, moved, false, false),
+            ExprKind::Binary {
+                op: BinOp::And | BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                move_expr!(self, lhs, moved, false, false);
+                let lhs_moved = moved.clone();
+                let lhs_borrows = self.borrows.clone();
+                let mut rhs_moved = lhs_moved.clone();
+                self.borrows = lhs_borrows.clone();
+                let rhs_falls_through =
+                    self.expr(rhs, &mut rhs_moved, false, false);
+                if rhs_falls_through {
+                    *moved = &lhs_moved | &rhs_moved;
+                    self.borrows =
+                        BorrowState::join(&lhs_borrows, &self.borrows);
+                } else {
+                    *moved = lhs_moved;
+                    self.borrows = lhs_borrows;
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::IntArith { lhs, rhs, .. } => {
+                move_expr!(self, lhs, moved, false, false);
+                move_expr!(self, rhs, moved, false, false);
             }
             // Value arguments / wrapped payloads are consumed (a direct move site). `print` is a
             // read-only builtin, so it *borrows* its argument (a `string` printed once is still
             // usable — `print(s); s.len()`); it never takes ownership.
             ExprKind::Call { func, args, .. } => {
+                if let Some(dependencies) = self.summary_dependencies.as_deref_mut() {
+                    dependencies.insert(func.clone());
+                }
                 let consuming = func != "print";
                 for a in args {
-                    self.expr(a, moved, consuming, consuming);
+                    move_expr!(self, a, moved, consuming, consuming);
                 }
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
@@ -13049,32 +13969,50 @@ impl<'a> MoveCheck<'a> {
             // A closure copies its captured (Copy) values into its env — reads, not moves.
             ExprKind::Closure { captures, .. } => {
                 for c in captures {
-                    self.expr(c, moved, false, false);
+                    move_expr!(self, c, moved, false, false);
                 }
             }
             ExprKind::CallFnValue { callee, args } => {
-                self.expr(callee, moved, false, false);
+                move_expr!(self, callee, moved, false, false);
                 for a in args {
-                    self.expr(a, moved, true, true);
+                    move_expr!(self, a, moved, true, true);
                 }
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
-                    self.expr(f, moved, true, true);
+                    move_expr!(self, f, moved, true, true);
                 }
             }
-            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
+            ExprKind::OptionSome(i)
+            | ExprKind::ResultOk(i)
+            | ExprKind::ResultErr(i)
+            | ExprKind::HeapNew(i) => move_expr!(self, i, moved, true, true),
+            ExprKind::Try(i) => {
+                // L2b-a1 preserves the conservative flattened Result provenance. L2b-a2 splits
+                // the implicit Err return edge from the continuing Ok projection. Do not attach
+                // that flattened union to a return type that cannot carry any borrow: the operand's
+                // Ok payload may borrow even though the propagated Err and enclosing return do not.
+                move_expr!(self, i, moved, true, true);
+                if ty_may_borrow(
+                    self.f.ret,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    self.return_roots.extend(self.borrow_sources(i));
+                }
+            }
             // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
             // str/int arg). `builder()` is a leaf.
-            ExprKind::BuilderToString(i) => self.expr(i, moved, true, true),
+            ExprKind::BuilderToString(i) => move_expr!(self, i, moved, true, true),
             ExprKind::BuilderWrite { builder, arg, .. } => {
-                self.expr(builder, moved, false, false);
-                self.expr(arg, moved, false, false);
+                move_expr!(self, builder, moved, false, false);
+                move_expr!(self, arg, moved, false, false);
             }
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
-                    self.expr(c, moved, false, false);
+                    move_expr!(self, c, moved, false, false);
                 }
             }
             // `w.write(x)` / `w.flush()` borrow the writer (and its arg); `r.read(b)` borrows both
@@ -13082,158 +14020,272 @@ impl<'a> MoveCheck<'a> {
             // borrow the buffer. The constructors (`io.stdout`, `buffer(cap)`) are leaves. None of
             // these Move handles is consumed — each is `Drop`-freed at scope exit.
             ExprKind::WriterWrite { writer, arg, .. } => {
-                self.expr(writer, moved, false, false);
-                self.expr(arg, moved, false, false);
+                move_expr!(self, writer, moved, false, false);
+                move_expr!(self, arg, moved, false, false);
             }
-            ExprKind::WriterFlush { writer } => self.expr(writer, moved, false, false),
+            ExprKind::WriterFlush { writer } => move_expr!(self, writer, moved, false, false),
             ExprKind::ReaderRead { reader, buffer } => {
-                self.expr(reader, moved, false, false);
-                self.expr(buffer, moved, false, false);
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
             }
             // `r.read_line(b)` **borrows** the reader (used repeatedly in a loop) and fills the buffer
             // in place — neither consumed, like `reader.read`.
             ExprKind::ReaderReadLine { reader, buffer } => {
-                self.expr(reader, moved, false, false);
-                self.expr(buffer, moved, false, false);
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
                 self.invalidate_storage(buffer);
             }
             // `r.buffered()` **consumes** the reader (Move — one fd, one owner; the buffered handle
             // takes it over), exactly like `array_builder.build()`.
-            ExprKind::ReaderBuffered { reader } => self.expr(reader, moved, true, true),
+            ExprKind::ReaderBuffered { reader } => move_expr!(self, reader, moved, true, true),
             // `bytes.as_str()` borrows the byte view (a validating re-view, not consumed).
-            ExprKind::BytesAsStr { bytes } => self.expr(bytes, moved, false, false),
+            ExprKind::BytesAsStr { bytes } => move_expr!(self, bytes, moved, false, false),
             // `io.copy(r, w)` borrows both handles (fd ownership does not move — neither is
             // consumed, so both stay usable after the call), like `print`'s argument. NOT a
             // consuming call, even though `reader`/`writer` are Move types.
             ExprKind::IoCopy { reader, writer } => {
-                self.expr(reader, moved, false, false);
-                self.expr(writer, moved, false, false);
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, writer, moved, false, false);
             }
             // `f.pread(b, off)` / `f.pwrite(data, off)` / `f.len()` all **borrow** the file (never
             // consumed — no move-out); the buffer is filled in place and the data/offset are read.
             // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.move_file_op(&e.kind, moved),
-            ExprKind::StrBytes { inner } => self.expr(inner, moved, false, false),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
+            ExprKind::FilePread { .. }
+            | ExprKind::FilePwrite { .. }
+            | ExprKind::FileLen { .. } => {
+                if !self.move_file_op(&e.kind, moved) {
+                    return false;
+                }
+            }
+            ExprKind::StrBytes { inner } => move_expr!(self, inner, moved, false, false),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => move_expr!(self, buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
             ExprKind::BytesRead { bytes, offset, .. } => {
-                self.expr(bytes, moved, false, false);
-                self.expr(offset, moved, false, false);
+                move_expr!(self, bytes, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
             }
             ExprKind::BufferPut { buffer, value, .. } => {
-                self.expr(buffer, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
+                move_expr!(self, value, moved, false, false);
                 self.invalidate_storage(buffer);
             }
             ExprKind::BufferAppend { buffer, data } => {
-                self.expr(buffer, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
+                move_expr!(self, data, moved, false, false);
                 self.invalidate_storage(buffer);
             }
-            ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
+            ExprKind::BufferNew { capacity } => move_expr!(self, capacity, moved, false, false),
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
             // so its arm locals stay out of this recursive frame (#296): the builder is **borrowed**
             // (grown in place); `push`'s value is **consumed** (a `string` moves in, a Copy scalar's
             // consume is a harmless no-op); `append`'s slice is borrowed; `build` **consumes** the
             // builder into the frozen `array<T>`.
-            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.move_array_builder(k, moved),
+            k @ (ExprKind::ArrayBuilderNew { .. }
+            | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. }
+            | ExprKind::ArrayBuilderBuild(_)) => {
+                if !self.move_array_builder(k, moved) {
+                    return false;
+                }
+            }
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
             // Both operands are borrowed (read for bytes), never consumed.
             ExprKind::StrPredicate { haystack, needle, .. } => {
-                self.expr(haystack, moved, false, false);
-                self.expr(needle, moved, false, false);
+                move_expr!(self, haystack, moved, false, false);
+                move_expr!(self, needle, moved, false, false);
             }
             // The receiver is borrowed (the trimmed view aliases its bytes), never consumed.
-            ExprKind::StrTrim { recv, .. } => self.expr(recv, moved, false, false),
+            ExprKind::StrTrim { recv, .. } => move_expr!(self, recv, moved, false, false),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
-                self.expr(i, moved, false, false)
+                move_expr!(self, i, moved, false, false)
+            }
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. } => {
+                move_expr!(self, source, moved, false, false);
+                for capture in stage_capture_exprs(stages) {
+                    move_expr!(self, capture, moved, false, false);
+                }
+                for capture in node_captures(&e.kind) {
+                    move_expr!(self, capture, moved, false, false);
+                }
             }
             // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
             // the index.
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
-                self.expr(recv, moved, false, false);
-                self.expr(index, moved, false, false);
+                move_expr!(self, recv, moved, false, false);
+                move_expr!(self, index, moved, false, false);
             }
             // A range slice borrows the receiver (a view, never consumed) and reads the bounds.
             ExprKind::SliceRange { recv, start, end } => {
-                self.expr(recv, moved, false, false);
-                if let Some(s) = start { self.expr(s, moved, false, false); }
-                if let Some(e) = end { self.expr(e, moved, false, false); }
+                move_expr!(self, recv, moved, false, false);
+                if let Some(s) = start { move_expr!(self, s, moved, false, false); }
+                if let Some(e) = end { move_expr!(self, e, moved, false, false); }
             }
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
-                self.expr(source, moved, false, false);
-                self.expr(init, moved, false, false);
+            ExprKind::ArrayReduce { source, stages, init, .. }
+            | ExprKind::ArrayScan { source, stages, init, .. } => {
+                move_expr!(self, source, moved, false, false);
+                let source_snapshot =
+                    self.begin_pipeline_source_snapshot(source);
+                for capture in stage_capture_exprs(stages) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                if !self.expr(init, moved, false, false) {
+                    self.finish_pipeline_source_snapshot(
+                        source_snapshot,
+                        e.span,
+                        false,
+                    );
+                    return false;
+                }
+                for capture in node_captures(&e.kind) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                for capture in stage_capture_exprs(stages) {
+                    self.validate_pipeline_capture_use(capture);
+                }
+                self.finish_pipeline_source_snapshot(
+                    source_snapshot,
+                    e.span,
+                    true,
+                );
             }
             // `map_into`: the source is borrowed (read per element, never consumed) and `dst` is a
             // borrowed writable slice place (a Copy `{ptr,len}` view — the buffer is written, but the
             // slice value itself is not moved).
-            ExprKind::ArrayMapInto { source, dst, .. } => {
-                self.expr(source, moved, false, false);
-                self.expr(dst, moved, false, false);
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
+                move_expr!(self, source, moved, false, false);
+                let source_snapshot =
+                    self.begin_pipeline_source_snapshot(source);
+                for capture in stage_capture_exprs(stages) {
+                    if !self.expr(capture, moved, false, false) {
+                        self.finish_pipeline_source_snapshot(
+                            source_snapshot,
+                            e.span,
+                            false,
+                        );
+                        return false;
+                    }
+                }
+                if !self.expr(dst, moved, false, false) {
+                    self.finish_pipeline_source_snapshot(
+                        source_snapshot,
+                        e.span,
+                        false,
+                    );
+                    return false;
+                }
+                for capture in stage_capture_exprs(stages) {
+                    self.validate_pipeline_capture_use(capture);
+                }
+                self.finish_pipeline_source_snapshot(
+                    source_snapshot,
+                    e.span,
+                    true,
+                );
             }
             ExprKind::ArrayDot { a, b, .. } => {
-                self.expr(a, moved, false, false);
-                self.expr(b, moved, false, false);
+                move_expr!(self, a, moved, false, false);
+                move_expr!(self, b, moved, false, false);
             }
             ExprKind::ArrayChunks { source, n, .. } => {
-                self.expr(source, moved, false, false);
-                self.expr(n, moved, false, false);
+                move_expr!(self, source, moved, false, false);
+                move_expr!(self, n, moved, false, false);
             }
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
-                    self.expr(e, moved, true, true);
+                    move_expr!(self, e, moved, true, true);
                 }
             }
             ExprKind::ArrayZip { sources, .. } => {
                 for source in sources {
-                    self.expr(source, moved, false, false);
+                    move_expr!(self, source, moved, false, false);
                 }
             }
             ExprKind::Select { mask, a, b } => {
-                self.expr(mask, moved, true, true);
-                self.expr(a, moved, true, true);
-                self.expr(b, moved, true, true);
+                move_expr!(self, mask, moved, true, true);
+                move_expr!(self, a, moved, true, true);
+                move_expr!(self, b, moved, true, true);
             }
             ExprKind::VecSumWhere { vec, mask } => {
-                self.expr(vec, moved, true, true);
-                self.expr(mask, moved, true, true);
+                move_expr!(self, vec, moved, true, true);
+                move_expr!(self, mask, moved, true, true);
             }
             ExprKind::VecDot { a, b } => {
-                self.expr(a, moved, true, true);
-                self.expr(b, moved, true, true);
+                move_expr!(self, a, moved, true, true);
+                move_expr!(self, b, moved, true, true);
             }
-            ExprKind::VecMinMax { vec, .. } => self.expr(vec, moved, true, true),
-            ExprKind::VecSum { vec } => self.expr(vec, moved, true, true),
+            ExprKind::VecMinMax { vec, .. } => move_expr!(self, vec, moved, true, true),
+            ExprKind::VecSum { vec } => move_expr!(self, vec, moved, true, true),
             ExprKind::VecLoad { src, index, .. } => {
-                self.expr(src, moved, true, true);
-                self.expr(index, moved, true, true);
+                move_expr!(self, src, moved, true, true);
+                move_expr!(self, index, moved, true, true);
             }
             ExprKind::VecStore { dst, index, value, .. } => {
-                self.expr(dst, moved, true, true);
-                self.expr(index, moved, true, true);
-                self.expr(value, moved, true, true);
+                move_expr!(self, dst, moved, true, true);
+                move_expr!(self, index, moved, true, true);
+                move_expr!(self, value, moved, true, true);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.expr(opt, moved, true, true);
+                move_expr!(self, opt, moved, true, true);
+                let success_moved = moved.clone();
+                let success_borrows = self.borrows.clone();
+                let mut fallback_moved = success_moved.clone();
+                self.borrows = success_borrows.clone();
                 // The fallback is an arm value: it inherits this position's `consuming` but is
                 // not a direct move site (like an `if`/`else` arm). A `Result<string, Error> else`
                 // yields a Move (`string`) result, moved at its binding site — treating the fallback
                 // consistently (arm value, not a direct move) keeps that sound.
-                self.expr(fallback, moved, consuming, false);
+                let fallback_falls_through =
+                    self.expr(fallback, &mut fallback_moved, consuming, false);
+                if fallback_falls_through {
+                    *moved = &success_moved | &fallback_moved;
+                    self.borrows =
+                        BorrowState::join(&success_borrows, &self.borrows);
+                } else {
+                    *moved = success_moved;
+                    self.borrows = success_borrows;
+                }
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => {
+                if !self.block(b, moved, consuming, direct) {
+                    return false;
+                }
+            }
             // `arena { … }` is transparent the same way, but the walk must know it is inside one:
             // MIR mints no hidden `string` owner for a `template` there, so no per-iteration borrow
             // root is recorded (see [`owns_hidden_string`] and `Self::template_owner_root`).
             ExprKind::Arena(b) => {
                 self.arena_depth += 1;
-                self.block(b, moved, consuming, direct);
+                let falls_through = self.block(b, moved, consuming, direct);
                 self.arena_depth -= 1;
+                if !falls_through {
+                    return false;
+                }
             }
             // A `loop` runs its body repeatedly, so a value moved out of an *enclosing* (pre-loop)
             // local by one iteration is already moved at the start of the next — a use there is a
@@ -13241,8 +14293,8 @@ impl<'a> MoveCheck<'a> {
             // control flow does not depend on move state, so one probe pass finds the exact back-edge
             // set): (1) a **probe** pass with diagnostics suppressed discovers which locals a
             // fall-through iteration moves (`break`/`return` paths diverge and are excluded from the
-            // fall-through by the `if`/`match`/`hir_*_diverges` machinery, so they never enter the
-            // back-edge); (2) the **real** pass runs from `entry ∪ back-edge`, so a back-edge-moved
+            // fall-through by the explicit expression and block flow joins, so they never enter
+            // the back-edge); (2) the **real** pass runs from `entry ∪ back-edge`, so a back-edge-moved
             // local seeded as already-moved is flagged when used/re-moved at the top of the body — and
             // a per-iteration local (declared *inside* the body) is harmlessly re-cleared by its own
             // `let` each pass, so it needs no special-casing. The body's tail value is discarded each
@@ -13250,27 +14302,31 @@ impl<'a> MoveCheck<'a> {
             // Extracted into an `#[inline(never)]` helper so its large locals — a `Diagnostics` sink
             // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
             // chain would otherwise overflow the stack; see `expr_depth` test).
-            ExprKind::Loop { body, body_locals, .. } => self.loop_moves(body, body_locals, moved),
+            ExprKind::Loop { body, body_locals, .. } => {
+                if !self.loop_moves(body, body_locals, e.span, moved) {
+                    return false;
+                }
+            }
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => move_expr!(self, e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
-                self.expr(ptr, moved, false, false);
-                self.expr(offset, moved, false, false);
+                move_expr!(self, ptr, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
             }
             ExprKind::RawStore { ptr, offset, value } => {
-                self.expr(ptr, moved, false, false);
-                self.expr(offset, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, ptr, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
+                move_expr!(self, value, moved, false, false);
             }
-            ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
+            ExprKind::Spawn { closure, .. } => move_expr!(self, closure, moved, false, false),
             // A sum-type construction moves each payload into the variant, exactly like a struct
             // literal — an owned `array<Struct>` payload (J2) is consumed here (and its source slot
             // nulled in MIR `null_moved_source`), a scalar / `str` / plain-struct payload is Copy so
             // "consuming" it is a no-op.
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
-                    self.expr(p, moved, true, true);
+                    move_expr!(self, p, moved, true, true);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
@@ -13297,7 +14353,7 @@ impl<'a> MoveCheck<'a> {
                 self.borrows = incoming_borrows.clone();
                 let consuming_control = has_move_binding
                     && match_scrutinee_materializes_result(scrutinee);
-                self.expr(
+                move_expr!(self,
                     scrutinee,
                     moved,
                     consuming_control,
@@ -13356,8 +14412,9 @@ impl<'a> MoveCheck<'a> {
                         // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
                         clear_moved(&mut m, *binding);
                     }
-                    self.expr(&a.body, &mut m, consuming, direct);
-                    if hir_expr_diverges(&a.body) {
+                    let arm_falls_through =
+                        self.expr(&a.body, &mut m, consuming, direct);
+                    if !arm_falls_through {
                         continue;
                     }
                     joined = Some(match joined {
@@ -13371,296 +14428,308 @@ impl<'a> MoveCheck<'a> {
                 }
                 if let Some(j) = joined {
                     *moved = j;
+                } else {
+                    self.borrows = incoming_borrows;
+                    return false;
                 }
-                self.borrows = joined_borrows.unwrap_or(incoming_borrows);
+                self.borrows =
+                    joined_borrows.expect("fallthrough match arm has borrow state");
             }
             ExprKind::ResultMapErr { result, f } => {
                 // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
-                self.expr(result, moved, true, true);
-                self.expr(f, moved, false, false);
+                move_expr!(self, result, moved, true, true);
+                move_expr!(self, f, moved, false, false);
             }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
                 let consuming =
                     is_owned_droppable(e.ty, self.structs, self.enums, self.tagged_types);
-                self.expr(inner, moved, consuming, consuming);
+                move_expr!(self, inner, moved, consuming, consuming);
             }
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
-                self.expr(cond, moved, false, false);
+                move_expr!(self, cond, moved, false, false);
                 // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
                 // bound owned local out through it is rejected (the `direct = false`).
                 let incoming_borrows = self.borrows.clone();
                 let mut m1 = moved.clone();
                 self.borrows = incoming_borrows.clone();
-                self.block(then, &mut m1, consuming, false);
+                let then_falls_through =
+                    self.block(then, &mut m1, consuming, false);
                 let b1 = self.borrows.clone();
                 let mut m2 = moved.clone();
                 self.borrows = incoming_borrows.clone();
-                self.block(els, &mut m2, consuming, false);
+                let else_falls_through =
+                    self.block(els, &mut m2, consuming, false);
                 let b2 = self.borrows.clone();
                 // Join the branch states — but a branch that always diverges (`return`) contributes
                 // nothing past the `if`, so its moves must not poison the fall-through. (Without this,
                 // `if c { return x }; use(x)` wrongly reports `x` moved.) When both diverge the code
                 // after is unreachable, so the post-state is immaterial.
-                *moved = match (hir_block_diverges(then), hir_block_diverges(els)) {
-                    (false, false) => &m1 | &m2,
-                    (true, false) => m2,
-                    (false, true) => m1,
-                    (true, true) => moved.clone(),
+                *moved = match (then_falls_through, else_falls_through) {
+                    (true, true) => &m1 | &m2,
+                    (false, true) => m2,
+                    (true, false) => m1,
+                    (false, false) => moved.clone(),
                 };
-                self.borrows = match (hir_block_diverges(then), hir_block_diverges(els)) {
-                    (false, false) => BorrowState::join(&b1, &b2),
-                    (true, false) => b2,
-                    (false, true) => b1,
-                    (true, true) => incoming_borrows,
+                self.borrows = match (then_falls_through, else_falls_through) {
+                    (true, true) => BorrowState::join(&b1, &b2),
+                    (false, true) => b2,
+                    (true, false) => b1,
+                    (false, false) => incoming_borrows,
                 };
+                if !then_falls_through && !else_falls_through {
+                    return false;
+                }
             }
             ExprKind::Template(parts) => {
                 for p in parts {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => move_expr!(self, h, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => move_expr!(self, access, moved, false, false),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => move_expr!(self, input, moved, false, false),
             // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
-            ExprKind::JsonScan { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonScan { input, .. } => move_expr!(self, input, moved, false, false),
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
             // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
-            ExprKind::JsonDoc { input } => self.expr(input, moved, false, false),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.expr(doc, moved, false, false),
+            ExprKind::JsonDoc { input } => move_expr!(self, input, moved, false, false),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => move_expr!(self, doc, moved, false, false),
             ExprKind::JsonDocGet { doc, key } => {
-                self.expr(doc, moved, false, false);
-                self.expr(key, moved, false, false);
+                move_expr!(self, doc, moved, false, false);
+                move_expr!(self, key, moved, false, false);
             }
             ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
-                self.expr(doc, moved, false, false);
-                self.expr(index, moved, false, false);
+                move_expr!(self, doc, moved, false, false);
+                move_expr!(self, index, moved, false, false);
             }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.expr(path, moved, false, false),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => move_expr!(self, path, moved, false, false),
             // `dns.resolve(host)` borrows its `str` host (never consumed).
-            ExprKind::DnsResolve { host } => self.expr(host, moved, false, false),
+            ExprKind::DnsResolve { host } => move_expr!(self, host, moved, false, false),
             // `tcp.connect(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
             ExprKind::TcpConnect { host, port } => {
-                self.expr(host, moved, false, false);
-                self.expr(port, moved, false, false);
+                move_expr!(self, host, moved, false, false);
+                move_expr!(self, port, moved, false, false);
             }
             // `c.reader()` / `c.writer()` borrow the `tcp_conn` (the fd stays owned by `c` — the
             // returned stream is `owns_fd:false`), never consumed — like `io.copy`'s handles.
-            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.expr(conn, moved, false, false),
+            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => move_expr!(self, conn, moved, false, false),
             // `tcp.listen(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
             ExprKind::TcpListen { host, port } => {
-                self.expr(host, moved, false, false);
-                self.expr(port, moved, false, false);
+                move_expr!(self, host, moved, false, false);
+                move_expr!(self, port, moved, false, false);
             }
             // `l.accept()` borrows the `tcp_listener` (the listening fd stays owned by `l`); the
             // returned `tcp_conn` is freshly owned, never consumes the listener.
-            ExprKind::TcpAccept { listener } => self.expr(listener, moved, false, false),
+            ExprKind::TcpAccept { listener } => move_expr!(self, listener, moved, false, false),
             // `udp.bind` borrows `host` (str, never consumed); `port` is a Copy i64. `u.send_to` /
             // `u.recv_from` borrow the `udp_socket` (the fd stays owned by `u`) plus their byte
             // view / buffer — none consumed.
             ExprKind::UdpBind { host, port } => {
-                self.expr(host, moved, false, false);
-                self.expr(port, moved, false, false);
+                move_expr!(self, host, moved, false, false);
+                move_expr!(self, port, moved, false, false);
             }
             ExprKind::UdpSendTo { sock, data, host, port } => {
-                self.expr(sock, moved, false, false);
-                self.expr(data, moved, false, false);
-                self.expr(host, moved, false, false);
-                self.expr(port, moved, false, false);
+                move_expr!(self, sock, moved, false, false);
+                move_expr!(self, data, moved, false, false);
+                move_expr!(self, host, moved, false, false);
+                move_expr!(self, port, moved, false, false);
             }
             ExprKind::UdpRecvFrom { sock, buffer } => {
-                self.expr(sock, moved, false, false);
-                self.expr(buffer, moved, false, false);
+                move_expr!(self, sock, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
             }
             // `fs.write_file(path, data)` borrows `data` (str/bytes/builder — not consumed), like
             // `writer.write`; neither `path` nor `data` is moved.
             ExprKind::FsWriteFile { path, data, .. } => {
-                self.expr(path, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, path, moved, false, false);
+                move_expr!(self, data, moved, false, false);
             }
             // `std.path`/`std.env`/`std.time` builtins borrow their `str`/`i64` args (never consumed).
-            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path, moved, false, false),
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => move_expr!(self, path, moved, false, false),
             ExprKind::PathJoin { a, b } => {
-                self.expr(a, moved, false, false);
-                self.expr(b, moved, false, false);
+                move_expr!(self, a, moved, false, false);
+                move_expr!(self, b, moved, false, false);
             }
-            ExprKind::EnvGet { name } => self.expr(name, moved, false, false),
+            ExprKind::EnvGet { name } => move_expr!(self, name, moved, false, false),
             ExprKind::EnvSet { name, value } => {
-                self.expr(name, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, value, moved, false, false);
             }
             ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
-            ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
+            ExprKind::TimeSleep { ns } => move_expr!(self, ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
-            ExprKind::ProcessExit { code } => self.expr(code, moved, false, false),
-            ExprKind::ProcessAbort => {}
+            ExprKind::ProcessExit { code } => {
+                move_expr!(self, code, moved, false, false);
+                return false;
+            }
+            ExprKind::ProcessAbort => return false,
             // `spawn` borrows `cmd`/`args` (never consumed); `wait` borrows its `child` (NOT consumed —
             // it only flips the reaped flag through the borrow, mirroring `l.accept()`).
             ExprKind::ProcessSpawn { cmd, args } => {
-                self.expr(cmd, moved, false, false);
-                self.expr(args, moved, false, false);
+                move_expr!(self, cmd, moved, false, false);
+                move_expr!(self, args, moved, false, false);
             }
-            ExprKind::ChildWait { child } => self.expr(child, moved, false, false),
+            ExprKind::ChildWait { child } => move_expr!(self, child, moved, false, false),
             // `kill` borrows its `child` (only flips the reaped flag through the borrow, like `wait`) and
             // reads a scalar `sig`; `exec` borrows `cmd`/`args` (never consumed).
             ExprKind::ChildKill { child, sig } => {
-                self.expr(child, moved, false, false);
-                self.expr(sig, moved, false, false);
+                move_expr!(self, child, moved, false, false);
+                move_expr!(self, sig, moved, false, false);
             }
             ExprKind::ProcessExec { cmd, args } => {
-                self.expr(cmd, moved, false, false);
-                self.expr(args, moved, false, false);
+                move_expr!(self, cmd, moved, false, false);
+                move_expr!(self, args, moved, false, false);
             }
             // `std.process` Slice 4 — `command`/`cwd`/`run` all BORROW the command (`run` is
             // re-runnable, `cwd` mutates in place — neither consumes it, like `ch.wait()`/`ch.kill()`);
             // the `run_output` accessors borrow `out`. So every operand is a read (no move).
             ExprKind::ProcessCommand { cmd, args } => {
-                self.expr(cmd, moved, false, false);
-                self.expr(args, moved, false, false);
+                move_expr!(self, cmd, moved, false, false);
+                move_expr!(self, args, moved, false, false);
             }
             ExprKind::CommandCwd { command, dir } => {
-                self.expr(command, moved, false, false);
-                self.expr(dir, moved, false, false);
+                move_expr!(self, command, moved, false, false);
+                move_expr!(self, dir, moved, false, false);
             }
             ExprKind::CommandTimeout { command, ns } => {
-                self.expr(command, moved, false, false);
-                self.expr(ns, moved, false, false);
+                move_expr!(self, command, moved, false, false);
+                move_expr!(self, ns, moved, false, false);
             }
             // `c.read_timeout_ns` / `c.write_timeout_ns` BORROW the conn (in-place socket-option set,
             // never consumed — like `c.timeout_ns` / `c.reader()`); every operand is a read (no move).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
-                self.expr(conn, moved, false, false);
-                self.expr(ns, moved, false, false);
+                move_expr!(self, conn, moved, false, false);
+                move_expr!(self, ns, moved, false, false);
             }
             ExprKind::CommandEnv { command, name, value } => {
-                self.expr(command, moved, false, false);
-                self.expr(name, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, command, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, value, moved, false, false);
             }
-            ExprKind::CommandEnvClear { command } => self.expr(command, moved, false, false),
-            ExprKind::CommandRun { command } => self.expr(command, moved, false, false),
+            ExprKind::CommandEnvClear { command } => move_expr!(self, command, moved, false, false),
+            ExprKind::CommandRun { command } => move_expr!(self, command, moved, false, false),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                self.expr(out, moved, false, false)
+                move_expr!(self, out, moved, false, false)
             }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
-            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
-            ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => move_expr!(self, data, moved, false, false),
+            ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
             ExprKind::Compress { data, level, .. } => {
-                self.expr(data, moved, false, false);
-                self.expr(level, moved, false, false);
+                move_expr!(self, data, moved, false, false);
+                move_expr!(self, level, moved, false, false);
             }
-            ExprKind::Decompress { data, .. } => self.expr(data, moved, false, false),
+            ExprKind::Decompress { data, .. } => move_expr!(self, data, moved, false, false),
             // `std.rand`: the `rng` receiver is Copy (advanced in place, never consumed) and `xs` is a
             // Copy slice view (borrowed), so nothing is moved — recurse non-consuming to catch a
             // use-after-move *inside* the operands.
             ExprKind::RandSeed => {}
-            ExprKind::RandSeedWith { seed } => self.expr(seed, moved, false, false),
-            ExprKind::RandNext { rng } => self.expr(rng, moved, false, false),
+            ExprKind::RandSeedWith { seed } => move_expr!(self, seed, moved, false, false),
+            ExprKind::RandNext { rng } => move_expr!(self, rng, moved, false, false),
             ExprKind::RandRange { rng, lo, hi } => {
-                self.expr(rng, moved, false, false);
-                self.expr(lo, moved, false, false);
-                self.expr(hi, moved, false, false);
+                move_expr!(self, rng, moved, false, false);
+                move_expr!(self, lo, moved, false, false);
+                move_expr!(self, hi, moved, false, false);
             }
             ExprKind::RandShuffle { rng, xs, .. } => {
-                self.expr(rng, moved, false, false);
-                self.expr(xs, moved, false, false);
+                move_expr!(self, rng, moved, false, false);
+                move_expr!(self, xs, moved, false, false);
             }
             ExprKind::RandSample { rng, xs, k, .. } => {
-                self.expr(rng, moved, false, false);
-                self.expr(xs, moved, false, false);
-                self.expr(k, moved, false, false);
+                move_expr!(self, rng, moved, false, false);
+                move_expr!(self, xs, moved, false, false);
+                move_expr!(self, k, moved, false, false);
             }
-            ExprKind::RegexCompile { pattern } => self.expr(pattern, moved, false, false),
+            ExprKind::RegexCompile { pattern } => move_expr!(self, pattern, moved, false, false),
             ExprKind::RegexIsMatch { regex, text }
             | ExprKind::RegexFindAll { regex, text }
             | ExprKind::RegexSplit { regex, text } => {
-                self.expr(regex, moved, false, false);
-                self.expr(text, moved, false, false);
+                move_expr!(self, regex, moved, false, false);
+                move_expr!(self, text, moved, false, false);
             }
             ExprKind::RegexFind { regex, text, start } => {
-                self.expr(regex, moved, false, false);
-                self.expr(text, moved, false, false);
+                move_expr!(self, regex, moved, false, false);
+                move_expr!(self, text, moved, false, false);
                 if let Some(s) = start {
-                    self.expr(s, moved, false, false);
+                    move_expr!(self, s, moved, false, false);
                 }
             }
             ExprKind::RegexReplace { regex, text, repl, .. } => {
-                self.expr(regex, moved, false, false);
-                self.expr(text, moved, false, false);
-                self.expr(repl, moved, false, false);
+                move_expr!(self, regex, moved, false, false);
+                move_expr!(self, text, moved, false, false);
+                move_expr!(self, repl, moved, false, false);
             }
             ExprKind::RegexCaptures { regex, text } | ExprKind::RegexGroupIndex { regex, name: text } => {
-                self.expr(regex, moved, false, false);
-                self.expr(text, moved, false, false);
+                move_expr!(self, regex, moved, false, false);
+                move_expr!(self, text, moved, false, false);
             }
-            ExprKind::RegexGroupCount { regex } => self.expr(regex, moved, false, false),
+            ExprKind::RegexGroupCount { regex } => move_expr!(self, regex, moved, false, false),
             ExprKind::CapturesGroup { caps, index } => {
-                self.expr(caps, moved, false, false);
-                self.expr(index, moved, false, false);
+                move_expr!(self, caps, moved, false, false);
+                move_expr!(self, index, moved, false, false);
             }
             // `std.cli`: every receiver (`cmd` / `parsed`) is **borrowed, never consumed** — `parse`
             // reads the flag table without moving the command (so `usage()` stays callable after),
             // and `get_*` reads the parsed map. The `str` name / argv / default args are borrowed too.
             // Recurse non-consuming to catch a use-after-move *inside* the operands.
-            ExprKind::CliCommand { name } => self.expr(name, moved, false, false),
+            ExprKind::CliCommand { name } => move_expr!(self, name, moved, false, false),
             ExprKind::CliFlag { cmd, name, default, .. } => {
-                self.expr(cmd, moved, false, false);
-                self.expr(name, moved, false, false);
+                move_expr!(self, cmd, moved, false, false);
+                move_expr!(self, name, moved, false, false);
                 if let Some(d) = default {
-                    self.expr(d, moved, false, false);
+                    move_expr!(self, d, moved, false, false);
                 }
             }
             ExprKind::CliParse { cmd, args } => {
-                self.expr(cmd, moved, false, false);
-                self.expr(args, moved, false, false);
+                move_expr!(self, cmd, moved, false, false);
+                move_expr!(self, args, moved, false, false);
             }
             ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
-                self.expr(parsed, moved, false, false);
-                self.expr(name, moved, false, false);
+                move_expr!(self, parsed, moved, false, false);
+                move_expr!(self, name, moved, false, false);
             }
-            ExprKind::CliUsage { cmd } => self.expr(cmd, moved, false, false),
+            ExprKind::CliUsage { cmd } => move_expr!(self, cmd, moved, false, false),
             // `std.http`: every receiver (`req` / `resp`) is **borrowed, never consumed** — `header`/
             // `body` mutate the request in place, `serialize`/`status`/`header`/`body`/`parse` read.
             // The `str`/byte args are borrowed too. Recurse non-consuming to catch a use-after-move
             // *inside* the operands.
             ExprKind::HttpRequest { method, url } => {
-                self.expr(method, moved, false, false);
-                self.expr(url, moved, false, false);
+                move_expr!(self, method, moved, false, false);
+                move_expr!(self, url, moved, false, false);
             }
             ExprKind::HttpHeader { req, name, value } => {
-                self.expr(req, moved, false, false);
-                self.expr(name, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, req, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, value, moved, false, false);
             }
             ExprKind::HttpBody { req, data } => {
-                self.expr(req, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, req, moved, false, false);
+                move_expr!(self, data, moved, false, false);
             }
             // `r.timeout`/`cl.timeout` BORROW the handle (in-place field set, never consumed — like
             // `r.body`/`c.timeout_ns`); every operand is a read (no move).
             ExprKind::HttpRequestTimeout { req, ns } => {
-                self.expr(req, moved, false, false);
-                self.expr(ns, moved, false, false);
+                move_expr!(self, req, moved, false, false);
+                move_expr!(self, ns, moved, false, false);
             }
             ExprKind::HttpClientTimeout { client, ns } => {
-                self.expr(client, moved, false, false);
-                self.expr(ns, moved, false, false);
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, ns, moved, false, false);
             }
-            ExprKind::HttpParse { data } => self.expr(data, moved, false, false),
-            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp, moved, false, false),
+            ExprKind::HttpParse { data } => move_expr!(self, data, moved, false, false),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => move_expr!(self, resp, moved, false, false),
             ExprKind::HttpRespHeader { resp, name } => {
-                self.expr(resp, moved, false, false);
-                self.expr(name, moved, false, false);
+                move_expr!(self, resp, moved, false, false);
+                move_expr!(self, name, moved, false, false);
             }
             // `std.http` (Slice 2): the `client` receiver is **borrowed** (a client fires many
             // requests — `get`/`post`/`request` read it, never consume). `get`/`post`'s `url`/`body`
@@ -13669,24 +14738,24 @@ impl<'a> MoveCheck<'a> {
             // and the MIR nulls its slot so the exit `Drop` doesn't double-free).
             ExprKind::HttpClient => {}
             ExprKind::HttpClientGet { client, url } => {
-                self.expr(client, moved, false, false);
-                self.expr(url, moved, false, false);
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, url, moved, false, false);
             }
             ExprKind::HttpClientPost { client, url, body } => {
-                self.expr(client, moved, false, false);
-                self.expr(url, moved, false, false);
-                self.expr(body, moved, false, false);
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, url, moved, false, false);
+                move_expr!(self, body, moved, false, false);
             }
             ExprKind::HttpClientRequest { client, req } => {
-                self.expr(client, moved, false, false);
-                self.expr(req, moved, true, true);
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, req, moved, true, true);
             }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
                 // `client`/`urls`/`max_concurrency` are all borrowed — nothing is consumed (the client
                 // fires many batches; the URL slice is read-only; the degree is a scalar).
-                self.expr(client, moved, false, false);
-                self.expr(urls, moved, false, false);
-                self.expr(max_concurrency, moved, false, false);
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, urls, moved, false, false);
+                move_expr!(self, max_concurrency, moved, false, false);
             }
             // `std.http` (Slice 4): `serve`'s args and `accept`'s `server` are borrowed (a server accepts
             // many, never consumed — like the client). The response builder ops mutate `rb` in place
@@ -13694,13 +14763,13 @@ impl<'a> MoveCheck<'a> {
             // `ctx` and `rb` (the runtime frees them — like `request`'s `req`); a use-after-move of
             // either is caught here, and the MIR nulls both slots so the exit `Drop` doesn't double-free.
             ExprKind::HttpServe { host, port, .. } => {
-                self.expr(host, moved, false, false);
-                self.expr(port, moved, false, false);
+                move_expr!(self, host, moved, false, false);
+                move_expr!(self, port, moved, false, false);
             }
-            ExprKind::HttpAccept { server } => self.expr(server, moved, false, false),
+            ExprKind::HttpAccept { server } => move_expr!(self, server, moved, false, false),
             ExprKind::HttpRespond { ctx, rb } => {
-                self.expr(ctx, moved, true, true);
-                self.expr(rb, moved, true, true);
+                move_expr!(self, ctx, moved, true, true);
+                move_expr!(self, rb, moved, true, true);
             }
             // `respond_stream` consumes `rb` ONLY — the ctx is **borrowed** (http.md item 8 ①: the
             // framework keeps the request handle for the whole request; the runtime lifts just the
@@ -13708,84 +14777,84 @@ impl<'a> MoveCheck<'a> {
             // consumed) and reads the chunk; `finish` consumes the stream; `reject` consumes BOTH
             // the stream and its answering builder.
             ExprKind::HttpRespondStream { ctx, rb } => {
-                self.expr(ctx, moved, false, false);
-                self.expr(rb, moved, true, true);
+                move_expr!(self, ctx, moved, false, false);
+                move_expr!(self, rb, moved, true, true);
             }
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
-                self.expr(stream, moved, false, false);
-                self.expr(chunk, moved, false, false);
+                move_expr!(self, stream, moved, false, false);
+                move_expr!(self, chunk, moved, false, false);
             }
-            ExprKind::HttpStreamFinish { stream } => self.expr(stream, moved, true, true),
+            ExprKind::HttpStreamFinish { stream } => move_expr!(self, stream, moved, true, true),
             ExprKind::HttpStreamReject { stream, rb } => {
-                self.expr(stream, moved, true, true);
-                self.expr(rb, moved, true, true);
+                move_expr!(self, stream, moved, true, true);
+                move_expr!(self, rb, moved, true, true);
             }
-            ExprKind::HttpResponseBuilder { status } => self.expr(status, moved, false, false),
+            ExprKind::HttpResponseBuilder { status } => move_expr!(self, status, moved, false, false),
             ExprKind::HttpRbHeader { rb, name, value } => {
-                self.expr(rb, moved, false, false);
-                self.expr(name, moved, false, false);
-                self.expr(value, moved, false, false);
+                move_expr!(self, rb, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, value, moved, false, false);
             }
             ExprKind::HttpRbBody { rb, data } => {
-                self.expr(rb, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, rb, moved, false, false);
+                move_expr!(self, data, moved, false, false);
             }
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.expr(ctx, moved, false, false),
+            | ExprKind::HttpCtxHeaders { ctx } => move_expr!(self, ctx, moved, false, false),
             ExprKind::HttpCtxHeader { headers, name } => {
-                self.expr(headers, moved, false, false);
-                self.expr(name, moved, false, false);
+                move_expr!(self, headers, moved, false, false);
+                move_expr!(self, name, moved, false, false);
             }
             // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
             // (`random`, filled in place) — nothing is consumed. Recurse non-consuming to catch a
             // use-after-move *inside* the operands.
             ExprKind::CryptoCtEqual { a, b } => {
-                self.expr(a, moved, false, false);
-                self.expr(b, moved, false, false);
+                move_expr!(self, a, moved, false, false);
+                move_expr!(self, b, moved, false, false);
             }
-            ExprKind::CryptoRandom { out } => self.expr(out, moved, false, false),
+            ExprKind::CryptoRandom { out } => move_expr!(self, out, moved, false, false),
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
-            ExprKind::CryptoHash { data, .. } => self.expr(data, moved, false, false),
+            ExprKind::CryptoHash { data, .. } => move_expr!(self, data, moved, false, false),
             // `crypto.hmac_sha256`/`hkdf_sha256` borrow every operand (never consume). Recurse
             // non-consuming to catch a use-after-move inside them.
             ExprKind::CryptoHmac { key, data } => {
-                self.expr(key, moved, false, false);
-                self.expr(data, moved, false, false);
+                move_expr!(self, key, moved, false, false);
+                move_expr!(self, data, moved, false, false);
             }
             ExprKind::CryptoHkdf { salt, ikm, info, len } => {
-                self.expr(salt, moved, false, false);
-                self.expr(ikm, moved, false, false);
-                self.expr(info, moved, false, false);
-                self.expr(len, moved, false, false);
+                move_expr!(self, salt, moved, false, false);
+                move_expr!(self, ikm, moved, false, false);
+                move_expr!(self, info, moved, false, false);
+                move_expr!(self, len, moved, false, false);
             }
             // AEAD seal/open borrow every operand (never consume). Recurse non-consuming to catch a
             // use-after-move inside them.
             ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
-                self.expr(key, moved, false, false);
-                self.expr(nonce, moved, false, false);
-                self.expr(input, moved, false, false);
-                self.expr(aad, moved, false, false);
+                move_expr!(self, key, moved, false, false);
+                move_expr!(self, nonce, moved, false, false);
+                move_expr!(self, input, moved, false, false);
+                move_expr!(self, aad, moved, false, false);
             }
             // `crypto.argon2id` borrows every operand (never consumes — `params` is Copy). Recurse
             // non-consuming to catch a use-after-move inside them.
             ExprKind::CryptoArgon2 { password, salt, params } => {
-                self.expr(password, moved, false, false);
-                self.expr(salt, moved, false, false);
-                self.expr(params, moved, false, false);
+                move_expr!(self, password, moved, false, false);
+                move_expr!(self, salt, moved, false, false);
+                move_expr!(self, params, moved, false, false);
             }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
-                    self.expr(el, moved, true, true);
+                    move_expr!(self, el, moved, true, true);
                 }
             }
             ExprKind::MathOp { operands, .. } => {
                 for o in operands {
-                    self.expr(o, moved, false, false);
+                    move_expr!(self, o, moved, false, false);
                 }
             }
             // `t.N` of a bound tuple reads field `N` independently of the other fields: it is
@@ -13809,7 +14878,7 @@ impl<'a> MoveCheck<'a> {
                             }
                         }
                     }
-                    _ => self.expr(recv, moved, false, false),
+                    _ => move_expr!(self, recv, moved, false, false),
                 }
             }
             // An aggregate constant is a Copy `{ptr,len}` view of rodata — reading it moves nothing.
@@ -13822,6 +14891,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Bool(_)
             | ExprKind::OptionNone => {}
         }
+        true
     }
 }
 
@@ -13831,7 +14901,7 @@ impl<'a> MoveCheck<'a> {
 /// loop entry so a `break` inside a nested region can be rejected (deferred — see `check_break`).
 struct LoopCtx {
     break_ty: Option<Ty>,
-    saw_break: bool,
+    accepted_breaks: std::collections::HashSet<Span>,
     region_depth: u32,
 }
 
@@ -13923,6 +14993,10 @@ struct Checker<'a, 't> {
     /// the top; its value type is unified into the frame's `break_ty` (like `match` arms). Reset to
     /// empty at a lambda boundary (a `break` cannot cross a lambda). `draft.md` §4.
     loops: Vec<LoopCtx>,
+    /// Loop expressions already checked as having a reachable, semantically accepted `break`.
+    /// Enclosing loop classification consumes this checker-owned result instead of re-interpreting
+    /// an inner loop's target and region gates.
+    loop_fallthrough: std::collections::HashSet<Span>,
     /// The enclosing function's name — used to generate unique names for lifted lambdas.
     cur_fn: String,
     /// The enclosing function's generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty
@@ -14047,6 +15121,7 @@ impl<'a, 't> Checker<'a, 't> {
             readonly_locals: std::collections::HashSet::new(),
             buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
+            loop_fallthrough: std::collections::HashSet::new(),
             cur_fn: String::new(),
             type_params,
             param_bounds,
@@ -14497,6 +15572,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         Fn {
             name: f.name.name.clone(),
+            lifted_capture_count: None,
             params,
             param_modes: f.params.iter().map(|p| p.mode).collect(),
             ret: self.finalize(ret),
@@ -14681,8 +15757,9 @@ impl<'a, 't> Checker<'a, 't> {
                 ast::Stmt::Break { value, span } => {
                     // `break` binds to the innermost enclosing `loop`; its value type unifies into
                     // the loop's value (`check_break`). Rejected outside a loop / across a lambda.
-                    let v = self.check_break(value.as_ref(), *span);
-                    stmts.push(Stmt::Break(v));
+                    let (value, accepted) =
+                        self.check_break(value.as_ref(), *span);
+                    stmts.push(Stmt::Break { value, accepted });
                 }
                 ast::Stmt::Expr(e) => {
                     let te = self.check_expr(e, None);
@@ -18646,6 +19723,7 @@ impl<'a, 't> Checker<'a, 't> {
         let name = format!("{}$lambda{}", self.cur_fn, self.lifted.len());
         self.lifted.push(hir::Fn {
             name: name.clone(),
+            lifted_capture_count: Some(captured.len()),
             params: param_ids,
             param_modes: vec![
                 ast::ParamMode::ByValue;
@@ -18813,10 +19891,10 @@ impl<'a, 't> Checker<'a, 't> {
                         match stage_fn {
                             Some(f) if is_map => stages.push(RawStage::Map(f)),
                             Some(f) => stages.push(RawStage::Where(f)),
-                            None => self.diags.error(
-                                format!("'.{}()' needs a function (named or `fn … {{ … }}`) or `.field`", field.name),
-                                e.span,
-                            ),
+                            None => stages.push(RawStage::Invalid {
+                                name: field.name.clone(),
+                                span: e.span,
+                            }),
                         }
                         return (src, stages);
                     }
@@ -18963,6 +20041,15 @@ impl<'a, 't> Checker<'a, 't> {
         let mut mapped = false;
         for raw in raw_stages {
             match raw {
+                RawStage::Invalid { name, span } => {
+                    self.diags.error(
+                        format!(
+                            "'.{name}()' needs a function (named or `fn … {{ … }}`) or `.field`"
+                        ),
+                        span,
+                    );
+                    return None;
+                }
                 RawStage::Project(field) => {
                     if !slot_backed {
                         self.diags.error(
@@ -19652,6 +20739,20 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        // A named destination's already-declared type may seed an inline literal source without
+        // evaluating the destination expression before the receiver/stage operands.
+        let dst_hint = self
+            .place_local(dst_arg)
+            .and_then(|(local, _)| self.locals.get(local as usize))
+            .and_then(|local| match self.resolve(local.ty) {
+                Ty::Slice(scalar) => Some(scalar_to_ty(scalar)),
+                _ => None,
+            });
+        // Type-check/evaluate the source pipeline first. Capture formation follows the source in
+        // written order; the explicit destination operand comes after every stage capture.
+        let Some((source, stages, elem)) = self.check_pipeline(recv, dst_hint, span) else {
+            return err;
+        };
         // The destination must be a writable slice place: a `mut` local slice or an `out` parameter.
         let dst = self.check_expr(dst_arg, None);
         if dst.ty == Ty::Error {
@@ -19679,10 +20780,8 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_readonly_dst(dst_id, dst_arg.span, "write into") {
             return err;
         }
-        // Type-check the pipeline; a stageless inline literal source infers its element from `dst`.
-        let Some((source, stages, elem)) = self.check_pipeline(recv, Some(scalar_to_ty(dst_es)), span) else {
-            return err;
-        };
+        // A stageless inline literal source used the quiet declaration hint above; the checked
+        // destination type is authoritative for the exact element equality below.
         // v1: length-preserving stages only — a filtering `where` (a dynamic survivor count) is deferred.
         if stages.iter().any(|s| matches!(s.kind, StageKind::Where { .. } | StageKind::WhereField { .. } | StageKind::WhereStrContains { .. })) {
             self.diags.error(
@@ -20025,12 +21124,9 @@ impl<'a, 't> Checker<'a, 't> {
         // The accumulator type + element hint: a named fold fixes both from its signature; a
         // lambda infers the accumulator from the initial value (and the element from the source).
         let named_sig = self.named_sig(fn_arg);
-        let (acc_ty, elem_hint, init) = match &named_sig {
-            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
-            None => {
-                let init = self.check_expr(init_arg, expected);
-                (self.finalize(init.ty), None, init)
-            }
+        let (acc_hint, elem_hint) = match &named_sig {
+            Some(sig) => (Some(sig.ret), sig.params.get(1).copied()),
+            None => (expected, None),
         };
         // `reduce` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
         let prev_scan = self.scan_terminal;
@@ -20040,6 +21136,10 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = piped else {
             return err;
         };
+        let init = self.check_expr(init_arg, acc_hint);
+        let acc_ty = named_sig
+            .as_ref()
+            .map_or_else(|| self.finalize(init.ty), |sig| sig.ret);
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
         // so it doesn't cascade into the lambda body / signature check (matching `scan`).
         if acc_ty == Ty::Error {
@@ -20097,16 +21197,17 @@ impl<'a, 't> Checker<'a, 't> {
         // Accumulator type + element hint: a named fold fixes both from its signature; a lambda
         // infers the accumulator from the initial value (and the element from the source).
         let named_sig = self.named_sig(fn_arg);
-        let (acc_ty, elem_hint, init) = match &named_sig {
-            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
-            None => {
-                let init = self.check_expr(init_arg, None);
-                (self.finalize(init.ty), None, init)
-            }
+        let (acc_hint, elem_hint) = match &named_sig {
+            Some(sig) => (Some(sig.ret), sig.params.get(1).copied()),
+            None => (None, None),
         };
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        let init = self.check_expr(init_arg, acc_hint);
+        let acc_ty = named_sig
+            .as_ref()
+            .map_or_else(|| self.finalize(init.ty), |sig| sig.ret);
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before the scalar check so it
         // doesn't cascade into a confusing "accumulator must be a scalar" diagnostic (matching reduce).
         if acc_ty == Ty::Error {
@@ -25527,7 +26628,7 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
         self.loops.push(LoopCtx {
             break_ty: expected,
-            saw_break: false,
+            accepted_breaks: std::collections::HashSet::new(),
             region_depth: self.arena_depth + self.task_group_depth,
         });
         // The body is a per-iteration statement sequence: its tail value is discarded, so no
@@ -25541,11 +26642,16 @@ impl<'a, 't> Checker<'a, 't> {
         let hi = self.locals.len() as LocalId;
         let body_locals = lo..hi;
         let ctx = self.loops.pop().expect("loop context balanced");
-        if ctx.saw_break {
+        let has_reachable_break =
+            ast_loop_block_flow(b, &ctx.accepted_breaks, &self.loop_fallthrough)
+                .reaches_break;
+        if has_reachable_break {
+            self.loop_fallthrough.insert(span);
             let ty = ctx.break_ty.unwrap_or(Ty::Unit);
             self.constrain(ty, expected, span);
             Expr { kind: ExprKind::Loop { body, diverges: false, body_locals }, ty, span }
         } else {
+            self.loop_fallthrough.remove(&span);
             // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
             // a diverging `match`) — the code after it is unreachable.
             let ty = expected.unwrap_or(Ty::Unit);
@@ -25557,14 +26663,18 @@ impl<'a, 't> Checker<'a, 't> {
     /// its `break_ty` (running-unify like `match` arms; a bare `break` contributes `()`). Rejected
     /// outside a loop, or when it would cross a lambda boundary (the `loops` stack is reset at each
     /// lambda), or when it sits inside an `arena`/`task_group` nested within the loop (deferred).
-    fn check_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Option<Expr> {
+    fn check_break(
+        &mut self,
+        value: Option<&ast::Expr>,
+        span: Span,
+    ) -> (Option<Expr>, bool) {
         if self.loops.is_empty() {
             self.diags.error(
                 "`break` outside of a `loop` (it cannot cross a lambda boundary; `?`/`return` exit the function instead)".to_string(),
                 span,
             );
             // Still check the value so nested errors surface; discard the result.
-            return value.map(|e| self.check_expr(e, None));
+            return (value.map(|e| self.check_expr(e, None)), false);
         }
         // Deferred: a `break` inside an `arena {}` / `task_group {}` that is itself inside the loop
         // would have to unwind (bulk-free) those regions on the jump to the loop exit — the scoped
@@ -25575,16 +26685,23 @@ impl<'a, 't> Checker<'a, 't> {
                 "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet; move the `break` out of the region (restructure so the region ends before the `break`)".to_string(),
                 span,
             );
-            return value.map(|e| self.check_expr(e, None));
+            return (value.map(|e| self.check_expr(e, None)), false);
         }
+        // This break is a control edge accepted for the current target loop. Record checker-owned
+        // evidence after target/region validation but before checking the payload: payload errors
+        // do not retarget the edge, while a region-rejected break above records no evidence.
+        self.loops
+            .last_mut()
+            .expect("enclosing loop checked above")
+            .accepted_breaks
+            .insert(span);
         // A bare array literal materializes only as a `let` initializer, slice borrow, or pipeline
         // source — MIR has no lowering for one in a free value position and would panic.
         let expected = self.loops.last().unwrap().break_ty;
         if let Some(v) = value
             && self.reject_bare_array_value(v, expected, "a `break` value")
         {
-            self.loops.last_mut().unwrap().saw_break = true;
-            return Some(self.check_expr(v, None));
+            return (Some(self.check_expr(v, None)), true);
         }
         let v = value.map(|e| self.check_expr(e, expected));
         let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);
@@ -25604,8 +26721,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        self.loops.last_mut().unwrap().saw_break = true;
-        v
+        (v, true)
     }
 
     // --- finalize ---
@@ -25642,8 +26758,10 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(value);
                 }
                 Stmt::AssignVecLane { value, .. } => self.finalize_expr(value),
-                Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
-                Stmt::Return(None) | Stmt::Break(None) => {}
+                Stmt::Return(Some(e))
+                | Stmt::Break { value: Some(e), .. }
+                | Stmt::Expr(e) => self.finalize_expr(e),
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),
             }
         }
@@ -25688,6 +26806,21 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::ArrayBuilderBuild(i) => self.finalize_expr(i),
             _ => unreachable!("finalize_array_builder on a non-array_builder op"),
+        }
+    }
+
+    fn finalize_pipeline_stages(&mut self, stages: &mut [Stage]) {
+        for stage in stages {
+            match &mut stage.kind {
+                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
+                    for capture in captures {
+                        self.finalize_expr(capture);
+                    }
+                }
+                StageKind::WhereStrContains { needle } => self.finalize_expr(needle),
+                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
+            }
+            stage.out_ty = self.finalize(stage.out_ty);
         }
     }
 
@@ -25898,9 +27031,33 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
+            }
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+            }
+            ExprKind::ArrayAnyAll { source, stages, captures, .. }
+            | ExprKind::ArrayPartition { source, stages, captures, .. }
+            | ExprKind::ArrayParMap { source, stages, captures, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
+            }
+            ExprKind::ArraySortBy { source, stages, captures, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
             }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.finalize_expr(recv);
@@ -25915,12 +27072,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(builder);
                 self.finalize_expr(arg);
             }
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+            ExprKind::ArrayReduce { source, stages, captures, init, .. }
+            | ExprKind::ArrayScan { source, stages, captures, init, .. } => {
                 self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
                 self.finalize_expr(init);
+                for capture in captures {
+                    self.finalize_expr(capture);
+                }
             }
-            ExprKind::ArrayMapInto { source, dst, .. } => {
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
                 self.finalize_expr(dst);
             }
             ExprKind::ArrayDot { a, b, .. } => {
@@ -26353,6 +27516,295 @@ impl<'a, 't> Checker<'a, 't> {
 /// so it never yields a value and need not match an expected value type.
 fn ast_block_diverges(b: &ast::Block) -> bool {
     b.tail.is_none() && matches!(b.stmts.last(), Some(ast::Stmt::Return(_)))
+}
+
+#[derive(Clone, Copy)]
+struct AstLoopFlow {
+    falls_through: bool,
+    reaches_break: bool,
+}
+
+impl AstLoopFlow {
+    const FALLTHROUGH: Self = Self {
+        falls_through: true,
+        reaches_break: false,
+    };
+
+    fn sequence(self, next: Self) -> Self {
+        if !self.falls_through {
+            return self;
+        }
+        Self {
+            falls_through: next.falls_through,
+            reaches_break: self.reaches_break || next.reaches_break,
+        }
+    }
+}
+
+fn ast_loop_block_flow(
+    block: &ast::Block,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
+    let mut flow = AstLoopFlow::FALLTHROUGH;
+    for statement in &block.stmts {
+        if !flow.falls_through {
+            break;
+        }
+        flow = flow.sequence(ast_loop_stmt_flow(
+            statement,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
+    }
+    if flow.falls_through
+        && let Some(tail) = &block.tail
+    {
+        flow = flow.sequence(ast_loop_expr_flow(
+            tail,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
+    }
+    flow
+}
+
+fn ast_loop_stmt_flow(
+    statement: &ast::Stmt,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
+    match statement {
+        ast::Stmt::Let { init, .. } | ast::Stmt::LetTuple { init, .. } => {
+            ast_loop_expr_flow(init, accepted_breaks, loop_fallthrough)
+        }
+        ast::Stmt::Assign { place, value } => {
+            ast_loop_expr_flow(place, accepted_breaks, loop_fallthrough).sequence(
+                ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough),
+            )
+        }
+        ast::Stmt::Return(value) => {
+            let value_flow = value
+                .as_ref()
+                .map_or(AstLoopFlow::FALLTHROUGH, |value| {
+                    ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough)
+                });
+            AstLoopFlow {
+                falls_through: false,
+                reaches_break: value_flow.reaches_break,
+            }
+        }
+        ast::Stmt::Break { value, span } => {
+            let value_flow = value
+                .as_ref()
+                .map_or(AstLoopFlow::FALLTHROUGH, |value| {
+                    ast_loop_expr_flow(value, accepted_breaks, loop_fallthrough)
+                });
+            AstLoopFlow {
+                falls_through: false,
+                reaches_break: value_flow.reaches_break
+                    || (value_flow.falls_through && accepted_breaks.contains(span)),
+            }
+        }
+        ast::Stmt::Expr(expression) => {
+            ast_loop_expr_flow(expression, accepted_breaks, loop_fallthrough)
+        }
+    }
+}
+
+fn ast_loop_expr_sequence<'a>(
+    expressions: impl IntoIterator<Item = &'a ast::Expr>,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
+    let mut flow = AstLoopFlow::FALLTHROUGH;
+    for expression in expressions {
+        flow = flow.sequence(ast_loop_expr_flow(
+            expression,
+            accepted_breaks,
+            loop_fallthrough,
+        ));
+        if !flow.falls_through {
+            break;
+        }
+    }
+    flow
+}
+
+fn ast_loop_expr_flow(
+    expression: &ast::Expr,
+    accepted_breaks: &std::collections::HashSet<Span>,
+    loop_fallthrough: &std::collections::HashSet<Span>,
+) -> AstLoopFlow {
+    use ast::ExprKind as K;
+    match &expression.kind {
+        K::Unit
+        | K::Int(_)
+        | K::Float(_)
+        | K::Char(_)
+        | K::Str(_)
+        | K::Bool(_)
+        | K::Path(_)
+        | K::FieldShorthand(_) => AstLoopFlow::FALLTHROUGH,
+        K::Unary { expr, .. }
+        | K::Try(expr)
+        | K::FieldAccess { recv: expr, .. }
+        | K::TupleIndex { recv: expr, .. } => {
+            ast_loop_expr_flow(expr, accepted_breaks, loop_fallthrough)
+        }
+        K::Cast { expr, .. } => {
+            ast_loop_expr_flow(expr, accepted_breaks, loop_fallthrough)
+        }
+        K::Binary { op, lhs, rhs } => {
+            let left =
+                ast_loop_expr_flow(lhs, accepted_breaks, loop_fallthrough);
+            if !left.falls_through {
+                return left;
+            }
+            let right =
+                ast_loop_expr_flow(rhs, accepted_breaks, loop_fallthrough);
+            AstLoopFlow {
+                falls_through: matches!(op, BinOp::And | BinOp::Or)
+                    || right.falls_through,
+                reaches_break: left.reaches_break || right.reaches_break,
+            }
+        }
+        K::Call { callee, args } => {
+            ast_loop_expr_flow(callee, accepted_breaks, loop_fallthrough)
+                .sequence(ast_loop_expr_sequence(
+                    args,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ))
+        }
+        K::If { cond, then, els } => {
+            let condition =
+                ast_loop_expr_flow(cond, accepted_breaks, loop_fallthrough);
+            if !condition.falls_through {
+                return condition;
+            }
+            let then_flow =
+                ast_loop_block_flow(then, accepted_breaks, loop_fallthrough);
+            let else_flow = els
+                .as_deref()
+                .map_or(AstLoopFlow::FALLTHROUGH, |els| {
+                    ast_loop_expr_flow(
+                        els,
+                        accepted_breaks,
+                        loop_fallthrough,
+                    )
+                });
+            AstLoopFlow {
+                falls_through: then_flow.falls_through || else_flow.falls_through,
+                reaches_break: condition.reaches_break
+                    || then_flow.reaches_break
+                    || else_flow.reaches_break,
+            }
+        }
+        K::Block(block) | K::Arena(block) | K::Unsafe(block) | K::TaskGroup(block) => {
+            ast_loop_block_flow(block, accepted_breaks, loop_fallthrough)
+        }
+        K::StructLit { fields, .. } => {
+            ast_loop_expr_sequence(
+                fields.iter().map(|field| &field.value),
+                accepted_breaks,
+                loop_fallthrough,
+            )
+        }
+        K::ElseUnwrap { opt, fallback } => {
+            let option =
+                ast_loop_expr_flow(opt, accepted_breaks, loop_fallthrough);
+            if !option.falls_through {
+                return option;
+            }
+            let fallback = ast_loop_expr_flow(
+                fallback,
+                accepted_breaks,
+                loop_fallthrough,
+            );
+            AstLoopFlow {
+                // The present/success edge bypasses the fallback.
+                falls_through: true,
+                reaches_break: option.reaches_break || fallback.reaches_break,
+            }
+        }
+        K::Loop(_) => AstLoopFlow {
+            // Breaks in this nested loop target it, not the loop currently being classified.
+            falls_through: loop_fallthrough.contains(&expression.span),
+            reaches_break: false,
+        },
+        K::ArrayLit(elements) | K::Tuple(elements) => {
+            ast_loop_expr_sequence(
+                elements,
+                accepted_breaks,
+                loop_fallthrough,
+            )
+        }
+        K::Index { recv, index } => {
+            ast_loop_expr_flow(recv, accepted_breaks, loop_fallthrough)
+                .sequence(ast_loop_expr_flow(
+                    index,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ))
+        }
+        K::SliceRange { recv, start, end } => {
+            let mut flow =
+                ast_loop_expr_flow(recv, accepted_breaks, loop_fallthrough);
+            if let Some(start) = start {
+                flow = flow.sequence(ast_loop_expr_flow(
+                    start,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ));
+            }
+            if let Some(end) = end {
+                flow = flow.sequence(ast_loop_expr_flow(
+                    end,
+                    accepted_breaks,
+                    loop_fallthrough,
+                ));
+            }
+            flow
+        }
+        // A lambda body is not evaluated while the function value is formed.
+        K::Lambda { .. } => AstLoopFlow::FALLTHROUGH,
+        K::Match { scrutinee, arms } => {
+            let scrutinee = ast_loop_expr_flow(
+                scrutinee,
+                accepted_breaks,
+                loop_fallthrough,
+            );
+            if !scrutinee.falls_through {
+                return scrutinee;
+            }
+            let mut any_fallthrough = false;
+            let mut reaches_break = scrutinee.reaches_break;
+            for arm in arms {
+                let arm = ast_loop_expr_flow(
+                    &arm.body,
+                    accepted_breaks,
+                    loop_fallthrough,
+                );
+                any_fallthrough |= arm.falls_through;
+                reaches_break |= arm.reaches_break;
+            }
+            AstLoopFlow {
+                falls_through: any_fallthrough,
+                reaches_break,
+            }
+        }
+        K::Template(parts) => ast_loop_expr_sequence(
+            parts.iter().filter_map(|part| {
+                let ast::TemplatePart::Hole(expression) = part else {
+                    return None;
+                };
+                Some(expression)
+            }),
+            accepted_breaks,
+            loop_fallthrough,
+        ),
+    }
 }
 
 /// Whether a braced `else { … }` fallback diverges (its last statement is `return`),
@@ -28829,6 +30281,326 @@ mod tests {
     }
 
     #[test]
+    fn lifted_function_origin_metadata_is_explicit() {
+        let (program, diagnostics) = check(
+            "\
+fn identity<T>(value: T) -> T = value
+fn named(value: i64) -> i64 = value
+fn main() -> i32 {
+  captured := 2
+  plain := [1, 2].map(fn value { value + 1 }).sum()
+  closed := [1, 2].map(fn value { value + captured }).sum()
+  return identity(named(plain + closed)) as i32
+}
+",
+        );
+        assert!(!diagnostics.has_errors());
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == "named")
+                .expect("ordinary named function")
+                .lifted_capture_count,
+            None
+        );
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .find(|function| function.name.starts_with("identity$"))
+                .expect("generic monomorph")
+                .lifted_capture_count,
+            None
+        );
+        let mut lifted = program
+            .fns
+            .iter()
+            .filter_map(|function| function.lifted_capture_count)
+            .collect::<Vec<_>>();
+        lifted.sort_unstable();
+        assert_eq!(
+            lifted,
+            vec![0, 1],
+            "non-capturing and one-capture lambdas keep distinct explicit metadata"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_diagnostic_order() {
+        let (_, diagnostics) = check(
+            "\
+fn main() -> i32 {
+  missing.map().reduce(also_missing, fn acc, x { acc + x })
+  return 0
+}
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("undefined name: 'missing'")),
+            "the receiver/source diagnostic must be retained: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("needs a function")
+                    && !message.contains("also_missing")),
+            "the earliest invalid source suppresses later malformed-stage and terminal-init diagnostics: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_snapshot_action_order_matrix() {
+        let (program, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  return [1].map(fn x {
+    print(x)
+    x
+  }).reduce({
+    return 7
+    0
+  }, fn acc, x { acc + x })
+}
+fn live() -> i64 {
+  return [1].map(fn x {
+    print(x)
+    x
+  }).reduce(0, fn acc, x { acc + x })
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let effects = fn_effects(&program, &std::collections::HashMap::new());
+        assert_eq!(
+            effects.get("stopped"),
+            Some(&FnEffect::Pure),
+            "a terminating init must prevent the earlier stage callback action"
+        );
+        assert_eq!(
+            effects.get("live"),
+            Some(&FnEffect::Impure),
+            "the all-fallthrough twin must join the stage callback action"
+        );
+    }
+
+    #[test]
+    fn pipeline_capture_owner_invalidation_is_rejected() {
+        let (_, diagnostics) = check(
+            "\
+fn main() -> i32 {
+  mut storage := \"hello\".clone()
+  view: str := storage
+  value := [1].map(fn x { x + view.len() }).reduce({
+    storage = \"replacement\".clone()
+    0
+  }, fn acc, x { acc + x })
+  return value as i32
+}
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("use of invalidated borrow 'view'")),
+            "stage snapshot must retain its owner dependency through init: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_source_snapshot_owner_invalidation_matrix() {
+        let (_, diagnostics) = check(
+            "\
+import core.json
+Row { score: i64 }
+fn make() -> array<i64> = [1, 2].to_array()
+fn add(acc: i64, value: i64) -> i64 = acc + value
+fn direct(flag: bool) -> i64 {
+  mut values := make()
+  return values.reduce({
+    if flag { values = make() }
+    0
+  }, add)
+}
+fn zipped(flag: bool) -> i64 {
+  mut left := make()
+  right := make()
+  return zip(left, right)
+    .map(fn pair { pair.0 + pair.1 })
+    .reduce({
+      if flag { left = make() }
+      0
+    }, add)
+}
+fn scanned(flag: bool) -> Result<i64, Error> {
+  mut input := \"[{\\\"score\\\":1}]\".clone()
+  rows: json.scanner<Row> := json.scan(input)
+  return rows.score.reduce({
+    if flag { input = \"[{\\\"score\\\":2}]\".clone() }
+    0
+  }, add)
+}
+fn stopped() -> i64 {
+  mut stopped_values := make()
+  return stopped_values.reduce({
+    stopped_values = make()
+    return 7
+    0
+  }, add)
+}
+fn broke() -> i64 {
+  mut broke_values := make()
+  return loop {
+    broke_values.reduce({
+      broke_values = make()
+      break 9
+      0
+    }, add)
+  }
+}
+fn selected(flag: bool, mutate: bool) -> i64 {
+  mut selected_values := make()
+  other := make()
+  return (if flag {
+    if mutate { selected_values } else { other }
+  } else {
+    other
+  }).reduce({
+    if mutate { selected_values = make() }
+    0
+  }, add)
+}
+fn transferred(flag: bool) -> i64 {
+  mut transferred_opt: Option<array<i64>> := Some(make())
+  fallback := make()
+  return (transferred_opt else fallback).reduce({
+    if flag { transferred_opt = Some(make()) }
+    0
+  }, add)
+}
+fn main() -> i32 = 0
+",
+        );
+        let snapshot_errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("pipeline source snapshot was invalidated")
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_errors.len(),
+            4,
+            "direct, zip, scanner, and selected-control-source mixed-branch invalidation must reject, while terminating init paths have no action boundary: {snapshot_errors:?}; all={:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'values'")),
+            "direct source owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'left'")),
+            "zipped constituent owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'input'")),
+            "scanner backing owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors
+                .iter()
+                .any(|message| message.contains("owner 'selected_values'")),
+            "selected control-flow source owner must be named: {snapshot_errors:?}"
+        );
+        assert!(
+            snapshot_errors.iter().all(|message| {
+                !message.contains("stopped_values")
+                    && !message.contains("broke_values")
+                    && !message.contains("transferred_opt")
+            }),
+            "terminating paths and transferred else-success containers must not remain source owners: {snapshot_errors:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_dead_state_isolated_across_analyses() {
+        let (_, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  mut storage := \"hello\".clone()
+  view: str := storage
+  return [1].reduce({
+    storage = \"replacement\".clone()
+    return 7
+    0
+  }, fn acc, x { acc + x + view.len() })
+}
+fn main() -> i32 = 0
+",
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("invalidated borrow")),
+            "a terminal capture after a terminating init must not join reachable borrow state: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_dead_hir_is_finalized_and_linted() {
+        let (_, diagnostics) = check(
+            "\
+fn stopped() -> i64 {
+  return [1].reduce(arena {
+    return 7
+    heap.new(1).get()
+  }, fn acc, x { acc + x })
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("unnecessary heap allocation")),
+            "finalization/lints must still traverse dead checked HIR"
+        );
+    }
+
+    #[test]
     fn concrete_function_values_record_distinct_inferred_effects_in_their_types() {
         let (program, diagnostics) = check(
             "fn quiet(x: i64) -> i64 = x + 1\nfn loud(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> i32 {\n  p := quiet\n  q := loud\n  return 0\n}\n",
@@ -28846,6 +30618,211 @@ mod tests {
         assert_eq!(pure, impure, "effect mutations must not destabilize signature equality");
         assert_eq!(pure.effect.get(), FnEffect::Pure);
         assert_eq!(impure.effect.get(), FnEffect::Impure);
+    }
+
+    #[test]
+    fn checked_break_acceptance_is_preserved_in_hir() {
+        let (program, diagnostics) = check(
+            "\
+fn accepted() -> i64 = loop { break 7 }
+fn rejected_region() -> i64 = loop {
+  arena { break 9 }
+}
+fn rejected_outside() -> i64 {
+  break 11
+}
+fn rejected_lambda() -> fn() -> i64 = fn { break 13 }
+fn rejected_heap_scan() -> i64 = loop {
+  arena {
+    break {
+      boxed := heap.new(17)
+      boxed.get()
+    }
+  }
+}
+",
+        );
+        assert!(
+            diagnostics.has_errors(),
+            "the three rejected breaks must diagnose"
+        );
+
+        let function = |name: &str| {
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"))
+        };
+        let loop_body = |name: &str| {
+            let value = function(name)
+                .body
+                .value
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} body value"));
+            let ExprKind::Loop { body, .. } = &value.kind else {
+                panic!("{name} must have a loop body");
+            };
+            body
+        };
+        let int_break = |statement: &Stmt| {
+            let Stmt::Break {
+                value: Some(Expr {
+                    kind: ExprKind::Int(value),
+                    ..
+                }),
+                accepted,
+            } = statement
+            else {
+                panic!("integer break");
+            };
+            (*value, *accepted)
+        };
+
+        let accepted = &loop_body("accepted").stmts[0];
+        assert_eq!(int_break(accepted), (7, true));
+        assert!(hir_stmt_diverges(accepted));
+
+        let region_value = loop_body("rejected_region")
+            .value
+            .as_deref()
+            .expect("region loop tail");
+        let Expr {
+            kind: ExprKind::Arena(region),
+            ..
+        } = region_value
+        else {
+            panic!("region wrapper");
+        };
+        let rejected_region = &region.stmts[0];
+        assert_eq!(int_break(rejected_region), (9, false));
+        assert!(hir_stmt_diverges(rejected_region));
+
+        let rejected_outside = &function("rejected_outside").body.stmts[0];
+        assert_eq!(int_break(rejected_outside), (11, false));
+        assert!(hir_stmt_diverges(rejected_outside));
+
+        let lambda = program
+            .fns
+            .iter()
+            .find(|function| function.lifted_capture_count == Some(0))
+            .expect("lifted rejected lambda");
+        let rejected_lambda = &lambda.body.stmts[0];
+        assert_eq!(int_break(rejected_lambda), (13, false));
+        assert!(hir_stmt_diverges(rejected_lambda));
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
+                "unnecessary heap allocation"
+            )),
+            "the structural heap scan must still visit a rejected break payload"
+        );
+    }
+
+    #[test]
+    fn rejected_break_effect_payload_is_visited_without_loop_result_join() {
+        let (program, diagnostics) = check(
+            "\
+fn impure() -> i64 {
+  print(1)
+  return 1
+}
+fn rejected() -> fn() -> i64 = loop {
+  arena {
+    break {
+      print(2)
+      impure
+    }
+  }
+}
+",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(
+                    "a `break` inside an `arena`/`task_group` nested in the loop"
+                )),
+            "the fixture must contain a region-rejected break"
+        );
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new())
+                .get("rejected"),
+            Some(&FnEffect::Impure),
+            "the payload's direct print effect must still be visited"
+        );
+
+        let rejected = program
+            .fns
+            .iter()
+            .find(|function| function.name == "rejected")
+            .expect("rejected function");
+        let loop_value = rejected.body.value.as_deref().expect("loop value");
+        let Ty::Fn(loop_fn_id) = loop_value.ty else {
+            panic!("loop result must retain its function type");
+        };
+        assert_ne!(
+            program.fn_types[loop_fn_id as usize].effect.get(),
+            FnEffect::Impure,
+            "the rejected impure function value must not join the loop-result effect boundary"
+        );
+    }
+
+    #[test]
+    fn effect_source_order_closure_matrix() {
+        let (program, diagnostics) = check(
+            "\
+fn pure(value: i64) -> i64 = value + 1
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn wrapper(value: i64) -> i64 {
+  f: fn(i64) -> i64 := loop {
+    break { break pure; impure }
+  }
+  return f(value)
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let callback = wrapper
+            .locals
+            .iter()
+            .find(|local| local.name == "f")
+            .expect("callback local");
+        let Ty::Fn(callback_id) = callback.ty else {
+            panic!("callback local must retain a function type");
+        };
+        let Stmt::Let { init, .. } = &wrapper.body.stmts[0] else {
+            panic!("wrapper callback binding");
+        };
+        let Ty::Fn(loop_id) = init.ty else {
+            panic!("loop result function type");
+        };
+        assert_eq!(
+            program.fn_types[callback_id as usize].effect.get(),
+            FnEffect::Pure,
+            "the inner accepted break must join pure while the dead outer payload tail stays excluded; loop={:?}, all={:?}",
+            program.fn_types[loop_id as usize].effect.get(),
+            program
+                .fn_types
+                .iter()
+                .map(|function| function.effect.get())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -30707,6 +32684,73 @@ mod tests {
         assert!(
             !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
+        );
+    }
+
+    #[test]
+    fn ty_may_borrow_is_cycle_safe_for_header_mediated_nominals() {
+        for field_ty in [
+            Ty::DynArray(Scalar::Struct(0)),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::Task(Scalar::Struct(0)),
+        ] {
+            let structures = vec![StructDef {
+                name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
+                fields: vec![FieldDef {
+                    name: "next".to_string(),
+                    ty: field_ty,
+                }],
+                align: None,
+                c_repr: false,
+            }];
+            assert!(
+                !ty_may_borrow(Ty::Struct(0), &structures, &[], &[], &[]),
+                "a header-only recursive graph has no borrowing leaf: {field_ty:?}"
+            );
+        }
+
+        let mixed_structures = vec![StructDef {
+            name: "MixedCycle".to_string(),
+            source_name: "MixedCycle".to_string(),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: Ty::DynArray(Scalar::Tagged(0)),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        let mixed_tagged = vec![hir::TaggedType::Option(Scalar::Struct(0))];
+        assert!(
+            !ty_may_borrow(
+                Ty::Struct(0),
+                &mixed_structures,
+                &[],
+                &[],
+                &mixed_tagged
+            ),
+            "mixed header/tagged cycles must terminate without inventing a borrow"
+        );
+
+        let borrowing_cycle = vec![StructDef {
+            name: "BorrowingCycle".to_string(),
+            source_name: "BorrowingCycle".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "next".to_string(),
+                    ty: Ty::DynStructArray(0, Layout::Aos),
+                },
+                FieldDef {
+                    name: "view".to_string(),
+                    ty: Ty::Str,
+                },
+            ],
+            align: None,
+            c_repr: false,
+        }];
+        assert!(
+            ty_may_borrow(Ty::Struct(0), &borrowing_cycle, &[], &[], &[]),
+            "a reachable borrowing leaf must survive a header-mediated cycle"
         );
     }
 
