@@ -793,6 +793,11 @@ fn validate_import_summaries(
     {
         return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
     }
+    let ret_may_borrow = itype_may_borrow(ret, summary, type_params)?;
+    let param_may_borrow = params
+        .iter()
+        .map(|param| itype_may_borrow(&param.ty, summary, type_params))
+        .collect::<Result<Vec<_>, _>>()?;
     for roots in [
         match borrow {
             ReturnBorrowSummary::None => None,
@@ -810,19 +815,22 @@ fn validate_import_summaries(
     .into_iter()
     .flatten()
     {
-        if !itype_may_borrow(ret, summary, type_params)? {
+        if !ret_may_borrow {
             return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
         }
         if !roots.1.is_empty() {
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            let Some(param) = params.get(index as usize) else {
+            let Some((_, &may_borrow)) = params
+                .get(index as usize)
+                .zip(param_may_borrow.get(index as usize))
+            else {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
             };
-            if !itype_may_borrow(&param.ty, summary, type_params)? {
+            if !may_borrow {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
@@ -1231,18 +1239,21 @@ pub fn validate_for_import(
     for structure in &summary.structs {
         for (_, ty) in &structure.fields {
             validate_import_type(ty, summary, &structure.type_params)?;
+            itype_may_borrow(ty, summary, &structure.type_params)?;
         }
     }
     for enumeration in &summary.enums {
         for (_, payload) in &enumeration.variants {
             for ty in payload {
                 validate_import_type(ty, summary, &enumeration.type_params)?;
+                itype_may_borrow(ty, summary, &enumeration.type_params)?;
             }
         }
     }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
             validate_import_type(ty, summary, &[])?;
+            itype_may_borrow(ty, summary, &[])?;
         }
     }
     Ok(())

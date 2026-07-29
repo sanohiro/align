@@ -1603,7 +1603,9 @@ contain the same concrete type as the prior actual; preserving one actual while 
 with a constant is likewise finite when it reaches an exact repeated node. Codegen retains one
 type-graph validator and its completed-node sets across every retained definition and signature root
 in the program; per-root active paths still distinguish a real inline cycle from a previously
-validated DAG.
+validated DAG. Semantic import validates every signature type, public struct field, sum payload, and
+constant annotation even when both provenance summaries are empty or the definition is not
+referenced by a function.
 
 The following closure matrix is authoritative for implementation and review. “All call forms” means
 same-unit named, imported, bound function value, indirect call, and generic monomorph where the

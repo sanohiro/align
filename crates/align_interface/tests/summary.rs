@@ -957,6 +957,26 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
         "a struct argument that embeds and grows its prior actual must reject even after a borrowing leaf is found"
     );
 
+    let mut empty_summary = generative.clone();
+    empty_summary.fns[0].return_borrow = ReturnBorrowSummary::None;
+    empty_summary.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&empty_summary),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an empty provenance summary must not skip signature type-graph validation"
+    );
+
+    let mut unreferenced = generative;
+    unreferenced.fns[0].params[0].ty = named("str", vec![]);
+    unreferenced.fns[0].ret = named("str", vec![]);
+    unreferenced.fns[0].return_borrow = ReturnBorrowSummary::None;
+    unreferenced.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&unreferenced),
+        Err(ImportCompatibilityError::ReturnSummaryGenerativeCapabilityGraph),
+        "an unreferenced public definition must still have a finite capability graph"
+    );
+
     let mut generative_pair = summary.clone();
     let mut grow = generative_pair
         .structs
