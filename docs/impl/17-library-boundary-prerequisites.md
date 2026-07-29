@@ -1601,10 +1601,37 @@ across structs, tuples, sums, and tagged records. A revisited header-mediated cy
 new edge, while any reachable borrowing leaf still makes the root borrow-capable.
 The interface-side equivalent does not recursively instantiate concrete generic types. Semantic
 import first builds one structured `(kind, exact local name)` definition index; rendered type strings
-are never graph keys. Before capability analysis, a complete semantic type walk rejects duplicate
-or ambiguous struct/enum names, duplicate type-parameter names, a parameter used with arguments,
-wrong local or known-builtin arity, and an unresolved bare name. Exact `summary.unit.Name` resolves
-locally; another qualified name is a conservative foreign leaf and never suffix-resolves locally.
+are never graph keys. The index rejects duplicate or ambiguous struct/enum names only among local
+definitions. A compiler-produced public definition may share the spelling of a source builtin:
+this is not a duplicate definition. Type resolution preserves sema's exact precedence:
+
+1. every generic function, struct, and sum type validates its declared type-parameter list after
+   the complete local type table exists. Stored parameter order is authoritative: a repeated
+   parameter reports `DuplicateTypeParameter`; if the duplicate pass fails, that item does not
+   enter the shadowing pass. Otherwise, the first parameter that shares a local declared-type name
+   reports `TypeParameterShadowsLocalType`;
+2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>` resolve before
+   every qualified user definition, including definitions in a unit literally named `json`;
+3. another declared type parameter wins only when used bare and without arguments;
+4. another bare source-builtin spelling resolves to that builtin;
+5. every remaining bare name resolves through the local-definition index; and
+6. exact `summary.unit.Name` resolves locally unless rule 2 applies. Another qualified name,
+   including `summary.unit.child.Name`, is a conservative foreign leaf and never prefix- or
+   suffix-resolves locally.
+
+If a non-shadowing type-parameter spelling is used with arguments, rules 2, 4, 5, and 6 still get
+their ordinary chance to resolve it. A generic function
+`fn f<Option>(value: Option<str>) -> Option<str>` in a unit with no local `Option` therefore uses the
+builtin `Option`; only an otherwise unresolved parameter spelling with arguments returns
+`TypeParameterWithArguments`. A type parameter may not use a local generic's spelling to reach
+that definition because producer sema rejects the shadowing declaration first. The same duplicate
+and shadowing checks apply to generic struct and sum-type parameters; importer validation never
+rejects a compiler-produced declaration that producer validation admitted.
+`Task` is an internal HIR type and is not a source-nameable interface builtin in L2b-a1, so a local
+definition named `Task` resolves locally. Before capability analysis, a complete semantic type walk
+rejects duplicate or ambiguous local struct/enum names, duplicate type-parameter names, a type
+parameter shadowing a local definition, an otherwise unresolved parameter used with arguments,
+wrong local or source-builtin arity, and an unresolved bare name.
 The walk validates children of every named, tuple, and function type even when capability evaluation
 later treats the outer type as opaque.
 
@@ -1663,7 +1690,8 @@ lattice direction, direct-actual measurement is independent of nested-reference 
 local-reference actual is scanned at most once per containing reference during dependency
 construction, and no definition is recursively instantiated. Each shape failure
 maps to one public import error: duplicate local definition, duplicate type parameter,
-type-parameter-with-arguments, wrong known/local arity, or unresolved bare type. The generativity
+type parameter shadowing a local definition, type-parameter-with-arguments, wrong known/local
+arity, or unresolved bare type. The generativity
 gate alone returns `ReturnSummaryGenerativeCapabilityGraph`; it never substitutes for a preceding
 shape error. Codegen likewise retains one
 type-graph validator and its completed-node sets across every retained definition and signature root
@@ -1681,10 +1709,26 @@ multi-invalid MIR is independent of hash-set iteration.
 Named-return inference likewise uses the checked-HIR direct-call graph rather than repeated
 whole-program rescans. Every function is analyzed once initially; when its monotone parameter-root
 summary grows, only its direct callers are queued again. A call chain therefore advances by
-dependency worklist edges rather than one whole-program round per link. Lifted lambdas and
-function-value targets remain deferred exactly as above. Owner tests place callers before callees
-and cover a mutually recursive pair so correctness and convergence cannot come from declaration
-order or an in-place single pass; the benchmark chain uses the same caller-before-callee order.
+dependency worklist edges rather than one whole-program round per link. Checked HIR records lifted
+origin as `lifted_capture_count: Option<usize>`: `None` for every named function and monomorph, and
+`Some(capture_count)` for every lifted lambda, including a non-capturing lambda. L2b-a1 skips only
+the latter explicit metadata; it never classifies origin from a mangled-name suffix. This also fixes
+the exact explicit-parameter/capture boundary that L2b-b will consume. Lifted lambdas and
+function-value targets otherwise remain deferred exactly as above. Owner tests place callers before
+callees, cover a mutually recursive pair, and include an ordinary dependency function whose legal
+source name is `lambda0`, so correctness and convergence cannot come from declaration order, an
+in-place single pass, or synthetic-name guessing; the benchmark chain uses the same
+caller-before-callee order. A checked-HIR owner test directly covers all metadata states:
+`None` for an ordinary named function, `None` for a generic monomorph, `Some(0)` for a
+non-capturing lifted lambda, and `Some(n)` with the exact positive capture count for a capturing
+lifted lambda.
+
+The reopened-review corrections stay in L2b-a1 as one parity follow-up. Splitting any of them into a
+later PR would leave the current producer able to emit an interface that its consumer rejects, or
+leave a legal exported named function without a provenance summary. The follow-up changes only the
+shared producer/importer generic-parameter name validation, semantic interface-name resolution
+seam, and checked-HIR function-origin metadata plus their owner tests; it does not widen L2b-a1
+into function-value or capture-root inference.
 
 The following closure matrix is authoritative for implementation and review. “All call forms” means
 same-unit named, imported, bound function value, indirect call, and generic monomorph where the
@@ -1693,7 +1737,7 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, duplicate/ambiguous local definitions or type parameters, parameter-with-arguments, wrong local/builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; checked HIR carries `lifted_capture_count` and no name spelling decides whether inference runs | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; a local definition sharing a source-builtin spelling is not a duplicate, and non-shadowing type-parameter, qualified `json.*` builtin, bare builtin, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; an a1 `?` edge may union the flattened operand roots only when the enclosing return type can recursively carry a borrow, so a borrow-capable `Ok` payload cannot put provenance on a scalar/error-only return; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
 | Closure/function-value provenance | L2b-b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
@@ -1713,7 +1757,7 @@ their first owning slice and remain cumulative gates afterward.
 | Slice | Exact owner tests | Exact benchmark command and required rows |
 |---|---|---|
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
-| L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_sema ty_may_borrow_is_cycle_safe_for_header_mediated_nominals`; `cargo test -p align_codegen_llvm malformed_mir_type_graphs_fail_before_llvm_construction`; `cargo test -p align_driver --test return_provenance --test interface_param_modes --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `import-validation` |
+| L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_sema ty_may_borrow_is_cycle_safe_for_header_mediated_nominals`; `cargo test -p align_sema lifted_function_origin_metadata_is_explicit`; `cargo test -p align_codegen_llvm malformed_mir_type_graphs_fail_before_llvm_construction`; `cargo test -p align_driver --test return_provenance --test interface_param_modes --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `import-validation` |
 | L2b-a2 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
@@ -1732,10 +1776,29 @@ Acceptance:
   `CodegenError`, both through the iterative graph walker rather than the process stack; a
   multi-invalid graph reports the first stored child before later siblings;
 - caller-before-callee chains and mutual named recursion converge to the same canonical return roots
-  in whole-program and per-unit checking, and only changed callees requeue their direct callers;
-- duplicate local/type-parameter keys, parameter-with-arguments, wrong local/builtin arity,
-  unresolved bare names, exact qualified-local names, foreign-qualified leaves, malformed nested
-  function types, and multi-invalid precedence have exact semantic-import tests;
+  in whole-program and per-unit checking, only changed callees requeue their direct callers, and a
+  dependency's ordinary exported `lambda0` function is inferred as named rather than skipped as a
+  lifted lambda;
+- duplicate local/type-parameter keys, function/struct/sum type-parameter local-definition
+  shadowing, duplicate-before-shadow multi-invalid precedence, unresolved
+  parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names,
+  exact qualified-local names,
+  unit-prefix-but-foreign names such as `foo.bar.Type`, other foreign-qualified leaves, malformed
+  nested function types, and multi-invalid precedence have exact semantic-import tests;
+- compiler-produced public `Option` and `Task` definitions validate for import; a bare
+  source-builtin spelling and an exact qualified local spelling resolve with the same precedence as
+  sema, while `Task` remains a local source name rather than an invented interface builtin;
+- a unit named `json` with a public local `doc` definition still resolves qualified `json.doc`,
+  `json.kind`, and `json.scanner<...>` as source builtins; a non-shadowing type-parameter spelling
+  reused by a resolvable builtin application follows that builtin, a type parameter matching a
+  local declared type rejects as forbidden shadowing, and a truly unresolved parameter application
+  reports `TypeParameterWithArguments`;
+- producer sema and semantic import both reject duplicate and local-shadowing type parameters on
+  generic functions, structs, and sum types in stored order; when one occurrence is both duplicate
+  and shadowing, `DuplicateTypeParameter` wins and no second shadow diagnostic is emitted for it;
+- checked HIR records named and generic-monomorph functions as `lifted_capture_count == None`,
+  a non-capturing lifted lambda as `Some(0)`, and a capturing lifted lambda as `Some(n)` with the
+  exact capture count;
 - a Move owner remains usable after a shared borrow;
 - moving from a borrowed binding is rejected;
 - a returned view dies when the caller owner moves/drops;

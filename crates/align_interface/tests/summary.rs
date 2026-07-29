@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ImportCompatibilityError,
+    DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ITypeParam,
+    ImportCompatibilityError,
     InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
     deserialize, encode_interface_surface, serialize, validate_for_import,
 };
@@ -1364,6 +1365,78 @@ fn semantic_import_growth_graph_handles_mutual_permuted_and_parallel_edges() {
 }
 
 #[test]
+fn compiler_produced_builtin_name_collisions_follow_source_resolution_precedence() {
+    let units = [
+        unit(
+            "names",
+            false,
+            "\
+module names
+pub Option { value: i64 }
+pub Task { value: i64 }
+pub Combined {
+  builtin_value: Option<str>,
+  local_option: names.Option,
+  local_task: Task,
+}
+",
+        ),
+        unit(
+            "params",
+            false,
+            "\
+module params
+pub BuiltinHolder<Option> { value: Option<str> }
+pub BuiltinChoice<Option> { Some(Option<str>) }
+pub fn builtin<Option>(value: Option<str>) -> Option<str> = value
+",
+        ),
+        unit(
+            "main",
+            true,
+            "import names\nimport params\nfn main() -> i32 = 0\n",
+        ),
+    ];
+    let produced = summaries(&units);
+    let names = find(&produced, "names");
+    assert_eq!(
+        validate_for_import(names),
+        Ok(()),
+        "every compiler-produced public name collision must remain importable"
+    );
+    assert_eq!(
+        validate_for_import(find(&produced, "params")),
+        Ok(()),
+        "a non-shadowing type parameter may reuse a source-builtin spelling"
+    );
+
+    let json_units = [
+        unit(
+            "json",
+            false,
+            "\
+module json
+pub doc { value: i64 }
+pub Row { value: i64 }
+pub fn local(value: doc) -> doc = value
+pub fn builtins(
+  document: json.doc,
+  kind: json.kind,
+  scanner: json.scanner<Row>,
+) -> i64 = 0
+",
+        ),
+        unit("main", true, "import json\nfn main() -> i32 = 0\n"),
+    ];
+    let produced = summaries(&json_units);
+    assert_eq!(
+        validate_for_import(find(&produced, "json")),
+        Ok(()),
+        "qualified json builtins must retain precedence over a same-unit local `doc`"
+    );
+}
+
+#[test]
 fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
     let base = one(
         "pub Wrapper<T> { value: T }\n\
@@ -1387,16 +1460,6 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
         "definition-index errors precede all type-shape errors"
     );
 
-    let mut builtin_collision = base.clone();
-    builtin_collision.structs[0].name = "Option".to_string();
-    assert_eq!(
-        validate_for_import(&builtin_collision),
-        Err(ImportCompatibilityError::DuplicateLocalType(
-            "Option".to_string()
-        )),
-        "a local definition cannot ambiguously reuse a builtin type name"
-    );
-
     let mut cross_kind_collision = base.clone();
     let mut enumeration =
         one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
@@ -1418,6 +1481,56 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
         Err(ImportCompatibilityError::DuplicateTypeParameter(
             "T".to_string()
         ))
+    );
+
+    let type_parameter = |name: &str| ITypeParam {
+        name: name.to_string(),
+        bound: None,
+    };
+    let mut function_shadow = base.clone();
+    function_shadow.fns[0].type_params = vec![type_parameter("Wrapper")];
+    function_shadow.fns[0].generic_body =
+        Some("pub fn identity<Wrapper>(value: str) -> str = value".to_string());
+    assert_eq!(
+        validate_for_import(&function_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut struct_shadow = base.clone();
+    struct_shadow.structs[0].type_params = vec![type_parameter("Wrapper")];
+    assert_eq!(
+        validate_for_import(&struct_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut enum_shadow = base.clone();
+    let mut generic_enum =
+        one("pub Choice<T> { Some(T) }\nfn main() -> i32 = 0\n")
+            .remove(0)
+            .enums
+            .remove(0);
+    generic_enum.type_params = vec![type_parameter("Wrapper")];
+    enum_shadow.enums.push(generic_enum);
+    assert_eq!(
+        validate_for_import(&enum_shadow),
+        Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
+            "Wrapper".to_string()
+        ))
+    );
+
+    let mut duplicate_and_shadow = function_shadow;
+    duplicate_and_shadow.fns[0].type_params =
+        vec![type_parameter("Wrapper"), type_parameter("Wrapper")];
+    assert_eq!(
+        validate_for_import(&duplicate_and_shadow),
+        Err(ImportCompatibilityError::DuplicateTypeParameter(
+            "Wrapper".to_string()
+        )),
+        "duplicate type parameters precede local-type shadowing"
     );
 
     let mut parameter_arguments = base.clone();
@@ -1469,6 +1582,15 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
     qualified_local.fns[0].params[0].ty = qualified.clone();
     qualified_local.fns[0].ret = qualified;
     assert_eq!(validate_for_import(&qualified_local), Ok(()));
+
+    let mut unit_prefix_foreign = base.clone();
+    unit_prefix_foreign.fns[0].params[0].ty =
+        named("main.child.Foreign", vec![]);
+    assert_eq!(
+        validate_for_import(&unit_prefix_foreign),
+        Ok(()),
+        "a longer qualified module sharing the unit prefix is foreign, not a missing local"
+    );
 
     let mut missing_qualified_local = base.clone();
     missing_qualified_local.fns[0].params[0].ty =

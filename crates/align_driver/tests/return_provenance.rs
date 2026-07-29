@@ -167,6 +167,178 @@ pub fn odd(first: str, second: str, depth: i64) -> str {
 }
 
 #[test]
+fn ordinary_exported_lambda_suffix_is_not_a_lifted_function() {
+    let files = &[
+        (
+            "dep.align",
+            "\
+module dep
+pub fn lambda0(value: str) -> str = value
+",
+        ),
+        (
+            "main.align",
+            "\
+import dep
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  owned := \"named lambda suffix\".clone()
+  result := dep.lambda0(owned)
+  consume(owned)
+  return result.len() as i32
+}
+",
+        ),
+    ];
+    let checked =
+        assert_same_verdict("l2b-named-lambda-suffix", files, "main.align");
+    assert!(
+        checked.diags.has_errors(),
+        "the named dependency result must retain its owner in both compilation modes"
+    );
+    let dependency = checked
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "dep")
+        .expect("dependency summary");
+    let function = dependency
+        .fns
+        .iter()
+        .find(|function| function.name == "lambda0")
+        .expect("ordinary exported lambda0");
+    assert_eq!(function.return_borrow, roots(&[0], &[]));
+    assert_eq!(
+        function.return_region,
+        ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        }
+    );
+}
+
+#[test]
+fn compiler_produced_builtin_name_collisions_import_in_both_modes() {
+    let files = &[
+        (
+            "names.align",
+            "\
+module names
+pub Option { value: i64 }
+pub Task { value: i64 }
+pub Combined {
+  builtin_value: Option<str>,
+  local_option: names.Option,
+  local_task: Task,
+}
+",
+        ),
+        (
+            "params.align",
+            "\
+module params
+pub BuiltinHolder<Option> { value: Option<str> }
+pub BuiltinChoice<Option> { Some(Option<str>) }
+pub fn builtin<Option>(value: Option<str>) -> Option<str> = value
+",
+        ),
+        (
+            "main.align",
+            "import names\nimport params\nfn main() -> i32 = 0\n",
+        ),
+    ];
+    let differential =
+        diff_check_multi("l2b-builtin-name-collisions", files, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(
+        !differential.per_unit.diags.has_errors(),
+        "compiler-produced public definitions must remain importable:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+}
+
+#[test]
+fn producer_and_importer_reject_generic_parameter_duplicates_and_shadowing() {
+    let cases = [
+        (
+            "fn-shadow",
+            "pub Local { value: i64 }\npub fn bad<Local>(value: Local) -> Local = value\n",
+            "type parameter 'Local' shadows a declared type",
+        ),
+        (
+            "struct-shadow",
+            "pub Local { value: i64 }\npub Holder<Local> { value: Local }\n",
+            "type parameter 'Local' shadows a declared type",
+        ),
+        (
+            "enum-shadow",
+            "pub Local { value: i64 }\npub Choice<Local> { Some(Local) }\n",
+            "type parameter 'Local' shadows a declared type",
+        ),
+        (
+            "fn-duplicate",
+            "pub fn bad<T, T>(value: T) -> T = value\n",
+            "duplicate type parameter 'T'",
+        ),
+        (
+            "struct-duplicate",
+            "pub Pair<T, T> { value: T }\n",
+            "duplicate type parameter 'T'",
+        ),
+        (
+            "enum-duplicate",
+            "pub Choice<T, T> { Some(T) }\n",
+            "duplicate type parameter 'T'",
+        ),
+        (
+            "duplicate-before-shadow",
+            "pub T { value: i64 }\npub Pair<T, T> { value: T }\n",
+            "duplicate type parameter 'T'",
+        ),
+    ];
+    for (case, declaration, message) in cases {
+        let dependency = format!("module bad\n{declaration}");
+        let files = [
+            ("bad.align", dependency.as_str()),
+            ("main.align", "import bad\nfn main() -> i32 = 0\n"),
+        ];
+        let differential = diff_check_multi(
+            &format!("l2b-generic-param-{case}"),
+            &files,
+            "main.align",
+        );
+        assert!(
+            differential.whole_errors && differential.per_unit_errors,
+            "{case} must reject in both modes:\nwhole:\n{}\nper-unit:\n{}",
+            differential.whole_diags,
+            differential.per_unit_diags
+        );
+        assert!(
+            differential.whole_diags.contains(message)
+                && differential.per_unit_diags.contains(message),
+            "{case} must preserve the owner diagnostic:\nwhole:\n{}\nper-unit:\n{}",
+            differential.whole_diags,
+            differential.per_unit_diags
+        );
+        if case == "duplicate-before-shadow" {
+            assert!(
+                !differential
+                    .whole_diags
+                    .contains("shadows a declared type")
+                    && !differential
+                        .per_unit_diags
+                        .contains("shadows a declared type"),
+                "duplicate validation must suppress the later shadow class"
+            );
+        }
+    }
+}
+
+#[test]
 fn loop_break_value_roots_drive_direct_and_imported_liveness() {
     let direct = "\
 fn loop_identity(value: str) -> str = loop { break value }

@@ -2239,6 +2239,41 @@ fn canonical_type_name(
     }
 }
 
+/// Validate one generic declaration's type-parameter namespace after the module's complete local
+/// type table exists. Duplicates are one earlier error class than local-type shadowing: if the
+/// duplicate pass fails, do not cascade shadowing diagnostics for the same malformed declaration.
+fn validate_declared_type_parameters(
+    parameters: &[ast::TypeParam],
+    local_types: &HashMap<String, TypeEntry>,
+    diags: &mut Diagnostics,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicate = false;
+    for parameter in parameters {
+        if !seen.insert(parameter.name.name.as_str()) {
+            diags.error(
+                format!("duplicate type parameter '{}'", parameter.name.name),
+                parameter.name.span,
+            );
+            duplicate = true;
+        }
+    }
+    if duplicate {
+        return;
+    }
+    for parameter in parameters {
+        if local_types.contains_key(&parameter.name.name) {
+            diags.error(
+                format!(
+                    "type parameter '{}' shadows a declared type",
+                    parameter.name.name
+                ),
+                parameter.name.span,
+            );
+        }
+    }
+}
+
 // --- pub-interface exposure check (M15 S1b) --------------------------------------------------
 //
 // A `pub` item's signature must name only `pub` types: a private type reachable from a module's
@@ -3283,6 +3318,25 @@ pub fn check_program_with_interface_facts(
         }
     }
 
+    // The no-shadowing rule applies to every generic declaration, not only functions. Run after
+    // Pass 0a has collected the complete module type table so a later declaration is visible too.
+    // Stored module/item/parameter order determines diagnostics; duplicate parameters are checked
+    // as an earlier class and suppress shadowing diagnostics for that malformed item.
+    for module in modules {
+        let local_types = type_table
+            .get(&module.path)
+            .expect("Pass 0a creates every module type table");
+        for item in &module.file.items {
+            let parameters = match item {
+                ast::Item::Fn(function) => &function.type_params,
+                ast::Item::Struct(structure) => &structure.type_params,
+                ast::Item::Enum(enumeration) => &enumeration.type_params,
+                ast::Item::Const(_) | ast::Item::Extern(_) => continue,
+            };
+            validate_declared_type_parameters(parameters, local_types, diags);
+        }
+    }
+
     // Pass 0a-2 (M15 S1b): a `pub` item's signature may name only `pub` types — a private type must
     // not leak through a public interface (the interface summary would name it without its
     // definition, so its layout change could not flip the unit's interface hash). `type_table` is now
@@ -4093,17 +4147,11 @@ pub fn check_program_with_interface_facts(
     for &(module, is_entry, f) in &all_fns {
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let imports = mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&no_imports);
-        // Generic type-parameter names (`fn f<T, U: Ord>`). Reject duplicates and names that collide
-        // with a declared type, so `Param` resolution is unambiguous; resolve each builtin bound.
+        // Generic type-parameter names (`fn f<T, U: Ord>`). Pass 0a-1 already validates duplicates
+        // and local-type shadowing for functions, structs, and sums alike; resolve each builtin bound.
         let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let mut bounds: Vec<Bound> = Vec::with_capacity(f.type_params.len());
-        for (i, t) in f.type_params.iter().enumerate() {
-            if tparams[..i].contains(&t.name.name) {
-                diags.error(format!("duplicate type parameter '{}'", t.name.name), t.name.span);
-            }
-            if type_table.get(module).is_some_and(|m| m.contains_key(&t.name.name)) {
-                diags.error(format!("type parameter '{}' shadows a declared type", t.name.name), t.name.span);
-            }
+        for t in &f.type_params {
             let bound = match &t.bound {
                 None => Bound::Unconstrained,
                 Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
@@ -4715,12 +4763,6 @@ fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRe
     }
 }
 
-fn is_lifted_lambda_name(name: &str) -> bool {
-    name.rsplit_once("$lambda").is_some_and(|(_, ordinal)| {
-        !ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
 /// Infer the L2b-a1 named-function parameter roots before the ordinary move/escape diagnostic pass.
 /// Calls form a finite may-lattice over sorted root sets, so recursive functions converge
 /// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
@@ -4759,7 +4801,7 @@ fn infer_return_provenance(
         // Lifted lambda parameters append captures after explicit arguments. Treating those slots
         // as ordinary named parameters would publish the wrong domain and disagree with the
         // closure's explicit-parameter signature. L2b-b infers both domains atomically.
-        if is_lifted_lambda_name(&function.name) {
+        if function.lifted_capture_count.is_some() {
             continue;
         }
 
@@ -14875,6 +14917,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         Fn {
             name: f.name.name.clone(),
+            lifted_capture_count: None,
             params,
             param_modes: f.params.iter().map(|p| p.mode).collect(),
             ret: self.finalize(ret),
@@ -19024,6 +19067,7 @@ impl<'a, 't> Checker<'a, 't> {
         let name = format!("{}$lambda{}", self.cur_fn, self.lifted.len());
         self.lifted.push(hir::Fn {
             name: name.clone(),
+            lifted_capture_count: Some(captured.len()),
             params: param_ids,
             param_modes: vec![
                 ast::ParamMode::ByValue;
@@ -29204,6 +29248,52 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn lifted_function_origin_metadata_is_explicit() {
+        let (program, diagnostics) = check(
+            "\
+fn identity<T>(value: T) -> T = value
+fn named(value: i64) -> i64 = value
+fn main() -> i32 {
+  captured := 2
+  plain := [1, 2].map(fn value { value + 1 }).sum()
+  closed := [1, 2].map(fn value { value + captured }).sum()
+  return identity(named(plain + closed)) as i32
+}
+",
+        );
+        assert!(!diagnostics.has_errors());
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == "named")
+                .expect("ordinary named function")
+                .lifted_capture_count,
+            None
+        );
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .find(|function| function.name.starts_with("identity$"))
+                .expect("generic monomorph")
+                .lifted_capture_count,
+            None
+        );
+        let mut lifted = program
+            .fns
+            .iter()
+            .filter_map(|function| function.lifted_capture_count)
+            .collect::<Vec<_>>();
+        lifted.sort_unstable();
+        assert_eq!(
+            lifted,
+            vec![0, 1],
+            "non-capturing and one-capture lambdas keep distinct explicit metadata"
+        );
     }
 
     #[test]

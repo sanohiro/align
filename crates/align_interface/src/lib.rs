@@ -695,6 +695,7 @@ fn render_enum(e: &IEnumDef) -> String {
 pub enum ImportCompatibilityError {
     DuplicateLocalType(String),
     DuplicateTypeParameter(String),
+    TypeParameterShadowsLocalType(String),
     TypeParameterWithArguments(String),
     InvalidTypeArity {
         name: String,
@@ -719,6 +720,12 @@ impl std::fmt::Display for ImportCompatibilityError {
             }
             ImportCompatibilityError::DuplicateTypeParameter(name) => {
                 write!(f, "interface contains duplicate type parameter `{name}`")
+            }
+            ImportCompatibilityError::TypeParameterShadowsLocalType(name) => {
+                write!(
+                    f,
+                    "interface type parameter `{name}` shadows a declared local type"
+                )
             }
             ImportCompatibilityError::TypeParameterWithArguments(name) => {
                 write!(f, "interface type parameter `{name}` cannot take type arguments")
@@ -822,8 +829,9 @@ impl<'a> LocalDefinitionIndex<'a> {
         let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
         let mut by_name = HashMap::new();
         for definition in &summary.structs {
-            if builtin_capability(&definition.name).is_some()
-                || by_name.insert(definition.name.as_str(), definitions.len()).is_some()
+            if by_name
+                .insert(definition.name.as_str(), definitions.len())
+                .is_some()
             {
                 return Err(ImportCompatibilityError::DuplicateLocalType(
                     definition.name.clone(),
@@ -832,8 +840,9 @@ impl<'a> LocalDefinitionIndex<'a> {
             definitions.push(LocalDefinition::Struct(definition));
         }
         for definition in &summary.enums {
-            if builtin_capability(&definition.name).is_some()
-                || by_name.insert(definition.name.as_str(), definitions.len()).is_some()
+            if by_name
+                .insert(definition.name.as_str(), definitions.len())
+                .is_some()
             {
                 return Err(ImportCompatibilityError::DuplicateLocalType(
                     definition.name.clone(),
@@ -869,8 +878,7 @@ impl<'a> LocalDefinitionIndex<'a> {
     fn is_missing_qualified_local(&self, path: &str) -> bool {
         path.strip_prefix(self.unit)
             .and_then(|rest| rest.strip_prefix('.'))
-            .is_some()
-            && self.local(path).is_none()
+            .is_some_and(|name| !name.contains('.') && !self.by_name.contains_key(name))
     }
 
     fn total_params(&self) -> usize {
@@ -891,7 +899,7 @@ fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
             (0, BuiltinCapability::BorrowLeaf)
         }
         "slice" | "soa" | "json.scanner" => (1, BuiltinCapability::BorrowLeaf),
-        "Option" | "array" | "Task" => (1, BuiltinCapability::Transparent),
+        "Option" | "array" => (1, BuiltinCapability::Transparent),
         "Result" => (2, BuiltinCapability::Transparent),
         "box" | "array_builder" => (1, BuiltinCapability::Opaque),
         "buffer" | "file" | "rng" | "regex" | "captures" | "tcp_conn"
@@ -1254,13 +1262,21 @@ impl<'a> CapabilityAnalysis<'a> {
     }
 }
 
-fn validate_unique_type_params(
+fn validate_type_params(
     type_params: &[ITypeParam],
+    index: &LocalDefinitionIndex<'_>,
 ) -> Result<(), ImportCompatibilityError> {
     let mut seen = HashSet::new();
     for parameter in type_params {
         if !seen.insert(parameter.name.as_str()) {
             return Err(ImportCompatibilityError::DuplicateTypeParameter(
+                parameter.name.clone(),
+            ));
+        }
+    }
+    for parameter in type_params {
+        if index.local(&parameter.name).is_some() {
+            return Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
                 parameter.name.clone(),
             ));
         }
@@ -1282,15 +1298,10 @@ fn validate_import_type_shape(
                 work.extend(params.iter().rev().map(|parameter| &parameter.ty));
             }
             IType::Named { path, args } => {
-                if let Some(parameter) = type_params
+                let parameter = type_params
                     .iter()
-                    .find(|parameter| parameter.name == *path)
-                {
-                    if !args.is_empty() {
-                        return Err(ImportCompatibilityError::TypeParameterWithArguments(
-                            parameter.name.clone(),
-                        ));
-                    }
+                    .find(|parameter| parameter.name == *path);
+                if args.is_empty() && parameter.is_some() {
                     continue;
                 }
                 let expected = if let Some((arity, _)) = builtin_capability(path) {
@@ -1308,6 +1319,10 @@ fn validate_import_type_shape(
                             actual: args.len(),
                         });
                     }
+                } else if let Some(parameter) = parameter {
+                    return Err(ImportCompatibilityError::TypeParameterWithArguments(
+                        parameter.name.clone(),
+                    ));
                 } else if !path.contains('.') || index.is_missing_qualified_local(path) {
                     return Err(ImportCompatibilityError::UnresolvedBareType(path.clone()));
                 }
@@ -1323,20 +1338,20 @@ fn validate_import_shapes(
     index: &LocalDefinitionIndex<'_>,
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
-        validate_unique_type_params(&function.type_params)?;
+        validate_type_params(&function.type_params, index)?;
         for parameter in &function.params {
             validate_import_type_shape(&parameter.ty, index, &function.type_params)?;
         }
         validate_import_type_shape(&function.ret, index, &function.type_params)?;
     }
     for structure in &summary.structs {
-        validate_unique_type_params(&structure.type_params)?;
+        validate_type_params(&structure.type_params, index)?;
         for (_, ty) in &structure.fields {
             validate_import_type_shape(ty, index, &structure.type_params)?;
         }
     }
     for enumeration in &summary.enums {
-        validate_unique_type_params(&enumeration.type_params)?;
+        validate_type_params(&enumeration.type_params, index)?;
         for (_, payload) in &enumeration.variants {
             for ty in payload {
                 validate_import_type_shape(ty, index, &enumeration.type_params)?;

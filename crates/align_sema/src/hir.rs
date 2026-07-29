@@ -251,6 +251,11 @@ pub struct FieldDef {
 #[derive(Clone, Debug)]
 pub struct Fn {
     pub name: String,
+    /// `None` for a source-named function or generic monomorph. A lifted lambda records
+    /// `Some(capture_count)`, including `Some(0)` for a non-capturing lambda. L2b-a1 uses the
+    /// explicit origin bit to defer the distinct capture-root domain; L2b-b will use the count to
+    /// split explicit parameters from trailing capture parameters.
+    pub lifted_capture_count: Option<usize>,
     /// Parameter locals, in declaration order. Each is also present in `locals`.
     pub params: Vec<LocalId>,
     /// Parameter access modes, parallel to [`Self::params`].
