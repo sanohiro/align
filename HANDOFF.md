@@ -287,15 +287,27 @@ borrow-preserving `if`/`match` sources retain selected owner roots until action;
 success payload and a value-producing loop instead transfer and null their old container/source.
 Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
 states.
-The next work is L2b-a2, now split by its closure matrix into three mergeable verticals:
-L2b-a2-s adds the finite projection fact and exact struct/tuple construction, selection, partial
-replacement, destructuring, and block/`if`/loop behavior; L2b-a2-a then adds fixed-array and
-element selection/replacement plus pipeline `Project`/`WhereField`; L2b-a2-t completes
-user-sum/`Option`/`Result`, `match`, `else`, `?`, and `map_err`. The original two-way split was
-narrowed before PR preflight when the aggregate implementation and owner tests exceeded the
-repository's roughly 1,000 changed-hand-written-line review bound. The public interface remains the
-L2a parameter-index summary, so a single aggregate actual deliberately remains conservative.
-Unknown extern and indirect targets retain the all-compatible-input fallback.
+L2b-a2-s is complete in #674. The remaining L2b-a2 work is split by its closure matrix into five
+mergeable verticals. L2b-a2-ac first closes MIR continuation after every terminating eager child.
+L2b-a2-af then adds validated fixed-array formation and exact/dynamic element and element-field
+selection/replacement on that completed substrate. L2b-a2-ar closes retained storage across
+non-fixed index/range, `ArrayChunks`, and `HttpRespHeader` actions. L2b-a2-ap separately closes
+pipeline `Project`/`WhereField` under an explicit stage/terminal state machine. L2b-a2-t completes
+user-sum/`Option`/`Result`, `match`, `else`, `?`, and `map_err`. The public interface remains the L2a
+parameter-index summary, so a single aggregate actual deliberately remains conservative. Unknown
+extern and indirect targets retain the all-compatible-input fallback.
+The ac implementation uses one required-child continuation protocol across every eager MIR parent:
+a terminating child may not feed a typed operation, lower a later sibling, append an action, build
+a helper CFG, allocate, or transfer cleanup. Direct tail delegation is permitted only when the
+caller performs no later work, and its first non-tail parent must apply the guard. The owner matrix
+requires every recursive child-lowering entrypoint (`lower_expr`, borrow/block wrappers, consumed
+argument lowering, and delegating helpers) to be classified, plus exact fixed/non-fixed/index/
+native/call/aggregate/control/pipeline no-action tests, whole/per-unit parity, and fail-closed
+handcrafted HIR.
+Block reachability is an O(1) `BuilderCtx` bit maintained by `new_block`/`terminate`, not a CFG scan
+after every child. Pre-child synthetic-owner, cleanup-bit, metadata, and explicit-region setup
+remains permitted only when the terminating edge owns its cleanup; no post-child transfer/action
+may use non-fallthrough as success.
 The final L2b-a2-s vertical is approximately 1,900 lines because its adversarial review required
 malformed constructor/read/write fail-closed validation, common eager-child source-order snapshots,
 snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
@@ -305,9 +317,9 @@ Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface by
 1.844 ms/import on Apple Silicon.
 Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in nine
+variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in twelve
 closed PRs so no incomplete borrow surface is exposed: L2a parameter-mode and provenance-summary
-representation, L2b-a1/a2-s/a2-a/a2-t/b
+representation, L2b-a1/a2-s/a2-ac/a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer

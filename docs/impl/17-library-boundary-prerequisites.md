@@ -1490,17 +1490,20 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-L2 ships through seven conceptual milestones in nine closed implementation PRs; L2b-a2 is split
-into product, array/pipeline, and tagged verticals below. A PR may add dormant representation or tighten
-existing provenance, but it must not accept source syntax whose complete safety contract belongs to
-a later milestone.
+L2 ships through seven conceptual milestones in twelve closed implementation PRs; L2b-a2 is split
+into product, MIR action-continuation, fixed-array, eager-receiver lifetime, pipeline, and tagged
+verticals below. A PR may add dormant representation or tighten existing provenance, but it must
+not accept source syntax whose complete safety contract belongs to a later milestone.
 
 | Slice | Exact closure | Public exposure at merge | Required gate |
 |---|---|---|---|
 | L2a | Replace `is_out`/bare parameter-type lists with `ParamMode`; add span-free return-borrow and return-region records to `FnTy`, named/imported signatures, HIR/MIR, interface codecs, hashes, and ABI fingerprints | Existing `ByValue` and `Out` behavior only; `borrow` and `borrow mut` remain identifiers outside parameter-mode lookahead and are rejected as modes | codec byte/hash goldens, corrupt-tag rejection, whole/per-unit identity, and an exhaustive consumer audit |
 | L2b-a1 | Infer parameter roots for named functions and preserve conservative flattened roots across recursion, direct/imported calls, control flow, and interfaces | No new borrow mode; aggregate projections and indirect calls retain all-compatible-input unions | scalar direct/imported matrix, semantic interface validation, and summary-inference size/time evidence |
 | L2b-a2-s | Add the projection fact and refine named summaries through structs, tuples, block/`if`/loop, field assignment, and destructuring | No new borrow mode; array, pipeline, tagged/control residuals, and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported product-view projection matrix and per-unit parity |
-| L2b-a2-a | Extend the projection fact through fixed arrays, element reads/writes, and pipeline field projections | No new borrow mode; tagged/control residuals and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported array/pipeline-view projection matrix and per-unit parity |
+| L2b-a2-ac | Close MIR fallthrough propagation after every terminating eager expression child, including enclosing consumers and later siblings | No new borrow mode or provenance precision; source semantics are unchanged | exhaustive eager-child/parent-consumer continuation matrix, exact MIR no-action assertions, runtime twins, and handcrafted-HIR fail-closed behavior |
+| L2b-a2-af | Extend the projection fact through validated fixed arrays and exact/dynamic element reads/writes | No new borrow mode; pipeline, tagged/control, non-fixed collection, and indirect-call residuals retain the L2b-a1 all-compatible-input fallback | direct/imported fixed-array projection matrix and per-unit parity |
+| L2b-a2-ar | Close eager retained-storage lifetime for non-fixed `Index`, `ElemField`, `SliceRange`, `ArrayChunks`, and `HttpRespHeader`; make non-fixed `ElemField` receiver-first | No new borrow mode or projection precision; non-fixed results remain flattened | invalidated eager-action matrix, terminating-operand twins, runtime source-order checks, malformed-HIR rejection, and per-unit parity |
+| L2b-a2-ap | Extend the projection fact through pipeline `Project`/`WhereField` and terminal formation | No new borrow mode; tagged/control and indirect calls retain the L2b-a1 all-compatible-input fallback; unsupported stages and terminals widen explicitly | direct/imported pipeline-view projection matrix and per-unit parity |
 | L2b-a2-t | Complete user-sum/`Option`/`Result`, `match`, `else`, `?`, and `map_err` projection | Complete L2b-a2 behavior; no new borrow mode; indirect calls retain the pre-L2b fallback | direct/imported tagged-view projection matrix and per-unit parity |
 | L2b-b | Extend the same inference to capture roots, closures, function-value joins/moves, direct/indirect targets, and unresolved higher-order fallback | Complete L2b behavior; no borrow mode | indirect/captured/joined nested-view matrix, malformed capture-domain rejection, and indirect-return evidence |
 | L2c | Add `ReturnCleanupAbi` to function and interface identity and implement `DynamicBit` for every recursively Move direct, indirect, and imported return; forward the selected bit on every return edge and store it in the caller slot | No borrow syntax; metadata and physical ABI land atomically before borrowed mutation can construct path-selected values | codec/hash goldens, `Result<Option<MoveStruct>, Error>` None/Some/Err matrix, ABI mismatch rejection, per-unit parity, and return-cost evidence |
@@ -1550,13 +1553,17 @@ both the closed and open-world effects `Impure`; a direct external callback para
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
 
-L2b is implemented as five independently sound vertical PRs. L2b-a1 owns named/direct/imported
+L2b is implemented as eight independently sound vertical PRs. L2b-a1 owns named/direct/imported
 parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
 flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
 targets. L2b-a2-s adds the projection fact and closes struct/tuple construction, selection,
 replacement, destructuring, and ordinary block/branch/loop flow while retaining conservative
-array, pipeline, and tagged residuals. L2b-a2-a then closes fixed arrays, element reads/writes, and
-pipeline field projection. L2b-a2-t closes tagged values, `match`, `else`, `?`, and `map_err`
+array, pipeline, and tagged residuals. L2b-a2-ac next closes MIR continuation after every
+terminating eager expression child. L2b-a2-af then closes validated fixed-array formation and
+element reads/writes while retaining conservative non-fixed and pipeline residuals. L2b-a2-ar
+closes the affected non-fixed index/range, chunks, and response-header retained-storage actions.
+L2b-a2-ap closes pipeline `Project`/`WhereField` propagation and terminal formation. L2b-a2-t
+closes tagged values, `match`, `else`, `?`, and `map_err`
 without weakening the indirect/unanalyzed fallback. L2b-b finally adds
 target-relative capture roots and function-value target sets, validates the explicit-parameter and
 capture domains in MIR, removes the now-obsolete unresolved-internal-target effect restriction, and
@@ -1587,14 +1594,73 @@ An aggregate returned across the interface likewise remains conservatively roote
 parameter represented by that aggregate. L2b-b later applies the same projection algebra to
 target-relative captures and indirect calls.
 
+### L2b-a2-ac MIR continuation closure matrix
+
+L2b-a2-ac is a prerequisite implementation slice, not a provenance extension. MIR currently uses
+an `Operand::Const(Const::Unit)` placeholder when a nested expression has already terminated its
+current continuation. Several eager parents consume that placeholder, lower a later sibling, or
+append an action because they do not re-check the builder after the child returns. The fix is one
+fallthrough protocol across every eager child site. It lands before fixed-array receiver reordering
+and before eager retained-storage actions rely on terminating-operand behavior.
+
+`lower_expr` remains typed as returning `Operand`; changing it and every helper to a second public
+result algebra would create a larger parallel lowering path without changing HIR or MIR. Instead,
+the existing internal `lowering_continues` seam is applied immediately after exactly one child; it
+reports whether the builder still has a reachable current continuation and converts an
+unterminated zero-predecessor join to `Term::Unreachable`. Every eager parent must stop immediately
+on the negative case. A direct tail delegation may return the child's placeholder unchanged only when it performs
+no later child, statement, block construction, owner transfer, or action; its first non-tail parent
+must apply the required-child check. Statement/function boundaries separately stop before using
+the placeholder. The placeholder is never stored, passed, cast, compared, returned as a typed
+source value, or used to construct control flow. The check is an in-place post-call macro or direct
+branch in the existing caller, never a wrapper that calls `lower_expr`: the latter would add a
+second recursive frame per nesting level and violate the measured `expr_depth` stack headroom.
+The canonical `lower_required!(builder, child, fallback)` macro expands in the caller to one
+`lower_expr` call followed by `lowering_continues`; `fallback` is the enclosing helper's existing
+unreachable return shape (`Operand::Const(Const::Unit)`, `None`, `false`, or `()`).
+
+| MIR continuation cell | Required closure | Exact owner evidence |
+|---|---|---|
+| required-child protocol | Lower one HIR child once, then call `lowering_continues` in the same caller frame before any post-child parent work. Fallthrough returns the exact operand. An unterminated join with no entry predecessor becomes `Unreachable`; all other termination propagates immediately through every enclosing eager parent. A direct tail delegation is the only unchecked form. `BuilderCtx` maintains one reachability bit per block: `new_block` starts false, the function entry starts true, and `terminate` marks `Goto`/`Branch` successors reachable only when it successfully installs the first terminator of a reachable current block. A duplicate terminator debug-asserts and returns without marking any successor. Structured-control lowering must emit every possible predecessor before selecting an unterminated join as current; marking a previously unreachable, already terminated block reachable debug-asserts, so a one-bit state cannot hide a late predecessor. `current_is_reachable` and every required-child check are therefore O(1); no per-child CFG allocation or scan is permitted. `Builder::push` debug-asserts that its current block has no terminator, making a missed same-block action fail in focused tests instead of silently appending before a stored terminator. No helper may wrap and recursively call `lower_expr`. | helper unit assertions for terminated, reachable, zero-predecessor, forward-join, branch, loop-backedge, unreachable-predecessor, ignored duplicate-terminator phantom edge, and rejected late reachability blocks; source audit classifying every recursive child-lowering entrypoint as required child, explicit control continuation, or tail delegation; debug assertions exercised by the exhaustive matrix; full `expr_depth` parser/check/MIR/codegen stack-headroom target; high-CFG MIR-lowering benchmark |
+| allowed pre-child preparation | A parent may allocate compile-time MIR slots/values, register a synthetic owner or cleanup bit needed by the child's own early-exit cleanup, or begin an explicit region whose child termination emits the matching cleanup before lowering the child. Completed earlier source operands keep their already-required temporary owners. Pre-child type/layout metadata is permitted only when it is necessary to lower that child or its early-exit cleanup, is read through checked lookup, and turns invalid handcrafted HIR into `Unreachable` before evaluation or mutation. Parent-result/action metadata—including function signature, result aggregate layout, field path, and action ABI facts—is deferred until every required child falls through and is also checked before action. These preparations are not evidence of child fallthrough. After a child fails `lowering_continues`, the parent may pop or restore only compile-time lexical bookkeeping—arena/task-group/loop/control frames and debug/span stacks—needed before lowering a sibling CFG arm; that restoration emits no MIR and transfers or disarms nothing. Otherwise the parent may perform only cleanup already owned by the terminating edge. It may not transfer/disarm an owner, mark a destination live, allocate runtime storage, restore runtime/action state, or emit the parent action. | `lower_borrowed_owned`, `lower_consumed_call_arg`, fixed Move array/struct formation, arena, and task-group first/middle/last termination twins; invalid pre-child cleanup metadata and deferred call/result/path metadata; exact synthetic-owner/drop-flag state and Drop-count assertions |
+| statement and function boundary | `Let`, `LetTuple`, `Assign`, `AssignField`, `AssignIndex`, `AssignElemField`, `AssignElem`, `AssignVecLane`, expression statements, `return`, `break`, tuple destructuring, and function/block tails use only operands from a live continuation. A terminating initializer/index/RHS/value emits no binding store, replacement Drop, destination null/store, tuple extraction, outer return/break edge, implicit Unit return, or later statement/tail. | terminating first/middle/final child twins for every statement discriminator; explicit return, accepted break, process exit/abort, and diverging block payloads; existing break/pipeline termination tests remain cumulative |
+| strict scalar and vector parents | Unary, non-no-op cast, non-short-circuit binary, checked/saturating/wrapping arithmetic, integer/vector division guards, math operations, vector construction/select/shuffle/extract/insert/load/store, raw pointer offset/load/store, and alignment/vector memory actions stop after the first terminating operand in written order. No later operand, divisor/bounds/alignment guard, `Rvalue`, store, or helper CFG is built. A no-op cast may tail-delegate either a fallthrough operand or a terminating placeholder because it performs no later work; the first non-tail boundary still guards it. | unary/cast/binary later-sibling matrix; division and vector-memory twins inspect statements and block count; runtime side-effect counters prove written order and no later action |
+| aggregate, capture, and call formation | Fixed/dynamic array, struct, tuple, user-sum, `Option`, `Result`, closure/capture aggregate, generic aggregate, direct call, indirect call, named-call argument list, and callable/capture preparation stop at the first terminating element, field, payload, callee, argument, or capture. No later child, allocation/materialization, call, aggregate `Rvalue`, ownership registration, or destination store is emitted. | first/middle/last aggregate and call operands; named/indirect/captured twins; owned aggregate Drop-count checks; whole/per-unit MIR parity |
+| template and string-builder formation | `Template` may register its hidden owned-string cleanup before holes, then lowers text, primitive/string/JSON holes, option/struct/array access, comma control, and union values in written order. The first terminating hole stops every later part and emits no `Rvalue::Template`, uninitialized result use, owner disarm, or parent action; its already-registered hidden owner remains correctly false/cleaned on the terminating edge. `BuilderNew`, every builder write kind, and finish apply the same rule to capacity, builder, and argument operands. | first/middle/last hole and builder-operand twins; every access discriminator; nested fully terminating/mixed zero-predecessor hole; exact Template absence plus hidden-owner flag/Drop assertions; malformed struct/enum id and path fail-closed twins |
+| storage, view, and collection read | Every ordinary `Index` discriminator, fixed/dynamic `ElemField`, `SliceRange`, `ArrayChunks` direct/materialized actions, `ArrayToSlice`, `ArrayToSoa`, field/nested-field read, string/bytes view, dict/struct-array access, and buffer operation stops before the next bound/index/value or read action. Fixed scalar `Index`, whole-element fixed `StructArray` `Index`, and fixed `ElemField` receiver/index twins are cumulative prerequisites for af. Ac changes no shipped receiver order. | exact MIR no-action assertions for fixed/non-fixed receivers, bounds, loads, owner inheritance, and later children; constant `IndexField` recorded as having no eager child; dynamic/SoA order parity |
+| native and runtime action | JSON, I/O, filesystem, path, socket/network, process, environment/CLI, encoding/compression/crypto, random/time, regex, HTTP/client/server, task, and unsafe/native helpers apply the same required-child protocol to every source-level operand before allocation, native call, state change, or helper CFG. Existing operation-specific validation order is unchanged because ac runs only after checked HIR formation. | one generated MIR representative for each helper family plus exact multi-operand first/middle/last termination twins; focused existing family tests stay cumulative |
+| structured control continuation | `if`, `match`, `else`, `?`, `map_err`, short-circuit boolean, loop, arena, task-group, unsafe, and nested block helpers distinguish a terminated arm from an explicitly created reachable join. They may switch `Builder.cur` only to a block with a real predecessor or an operation-defined early-return edge. A fully terminating construct propagates termination; a mixed construct yields only its fallthrough alternatives; no placeholder supplies a join value. | fully terminating/mixed/all-fallthrough triples for each control family; exact predecessor, phi/store, cleanup, and result assertions; nested eager parent around each triple |
+| pipeline and callback action | Existing source/stage/terminal continuation gates remain authoritative. Required-child checks cover source, stage operand/capture, terminal argument/capture, initializer, reducer, destination, and JSON-scanner callbacks before allocation, loop state, callback call, source nulling, or cleanup transfer. Ac does not reorder a pipeline operand or change effect/provenance inference. | cumulative `terminating_pipeline_operand_emits_no_terminal_state`, capture-order, source-shape, driver runtime, and effect-source-order matrices, each nested under a strict eager parent |
+| owner, cleanup, and allocation parity | A terminating child owns the cleanup and control edge it already emitted. Its parent performs no Drop, drop-flag write, source nulling, cleanup transfer, allocation, owner inheritance, or action-side restoration. Completed earlier operands retain only cleanup required on the terminating edge. Fallthrough allocation and Drop order are byte-for-byte unchanged. | owned earlier-operand + terminating-later-operand Drop-count twins; MIR drop-flag/null/transfer assertions; allocation counter parity on all-fallthrough twins |
+| malformed checked-HIR boundary | Direct `lower_program` on handcrafted HIR may contain inconsistent result or child metadata. Validation order is operation discriminator, checked metadata strictly required for the next child's cleanup/shape, that child, later children in written order, then checked parent-result/action metadata before action. An invalid required lookup emits `Unreachable`; a terminating child bypasses every later lookup. Neither case may panic, append an action, or use a typed placeholder. Ac does not add a separate whole-HIR validator and makes no semantic diagnostic-precedence claim. Normal driver input remains semantically validated before MIR. | `malformed_hir_eager_termination_fails_closed` covers invalid aggregate metadata, fixed/dynamic read metadata, missing function/tuple/struct ids, call/capture arity/type metadata, invalid field paths, and native helper result metadata with first/middle terminating children plus all-fallthrough rejection twins |
+| public and artifact boundary | No AST/HIR/MIR/LLVM/interface type, tag, codec, fingerprint, cache identity, source syntax, ownership rule, or runtime ABI changes. Whole-program and per-unit lowering use the same internal continuation protocol. | interface/hash goldens unchanged; a focused `per_unit_codegen` fixture compares whole/per-unit MIR, objects, and runtime for nested termination; high-CFG MIR-lowering time and allocation parity |
+
+The author-side matrix-to-diff pass must account for every recursive child-lowering entrypoint after
+the change: direct `lower_expr`, `lower_expr_for_borrow`, `lower_block`,
+`lower_block_for_borrow`, `lower_borrowed_owned`, `lower_consumed_call_arg`, and any helper that
+delegates to them. Each call points to one row above and is either guarded at the immediate
+required-child boundary, part of an explicit structured-control continuation with predecessor
+evidence, or a side-effect-free tail delegation. Iterator-based eager lowering is converted to
+written-order loops so it can stop at the first terminating child. A helper that creates blocks,
+pushes statements, allocates slots, mutates cleanup state, or lowers another child is never a tail
+delegation.
+
+This slice is expected to remain below roughly 1,000 changed hand-written lines because it changes
+one MIR file and reuses the existing Operand representation. It cannot be split by expression
+family: leaving any eager parent unchecked would still allow a typed placeholder or later sibling
+to escape through an otherwise fixed child, while downstream af/ar termination claims would depend
+on that gap.
+
 L2b-a2-s owns the base fact shape, parameter/local formation, struct/tuple
 construction/selection/replacement, destructuring, ordinary block/`if`/loop flow, liveness parity,
-and the product half of the public boundary. L2b-a2-a adds fixed-array paths, exact/dynamic element
-selection and replacement, pipeline `Project`/`WhereField`, and their source-order termination
-rules. L2b-a2-t owns tagged construction/binding, `match`, `else`, `?`, `map_err`, and the final
-public/malformed-boundary pass. Every extending PR must add malformed type/path/ordinal fallback
-owners for its new projection kinds and selected/unselected liveness owners to the shared focused
-targets. All three retain the scope-boundary row.
+and the product half of the public boundary. L2b-a2-ac first closes the MIR continuation
+prerequisite above without changing a projection fact. L2b-a2-af adds validated fixed-array paths
+and exact/dynamic element selection and replacement. L2b-a2-ar closes eager retained-storage
+actions for non-fixed reads. L2b-a2-ap adds pipeline `Project`/`WhereField` and terminal formation.
+L2b-a2-t owns tagged construction/binding, `match`, `else`, `?`, `map_err`, and the final
+public/malformed-boundary pass. Every extending projection PR must add malformed
+type/path/ordinal fallback owners for its new projection kinds and selected/unselected liveness
+owners to the shared focused targets. All six retain the scope-boundary row.
 
 | L2b-a2 path | Exact analysis contract | Owner evidence |
 |---|---|---|
@@ -1610,14 +1676,15 @@ targets. All three retain the scope-boundary row.
 | public and malformed boundary | `ReturnBorrowSummary` and `ReturnRegionSummary` remain the L2a codec and hash shape and remain equal in L2b-a2. Semantic import keeps the L2b-a1 validation order. No projection trie, local id, span, raw nominal id, or control-state bit is serialized. Because the codec carries parameter indices only, an imported aggregate result and any later projection from one aggregate actual deliberately retain that actual's complete compatible owner set. | unchanged codec/hash goldens, interface corruption suite, aggregate-actual precision-limit fixture, and summary byte-size benchmark row |
 | scope boundary | Indirect calls, closure captures, function-value joins/moves, target-relative capture slots, and direct calls without a settled named/imported summary—including unanalyzed extern targets—retain the documented all-compatible-input fallback. No `borrow`, `borrow mut`, cleanup ABI, resource, region, or database surface is enabled. | existing deferred-function-value and compatibility/extern fixtures plus disabled-mode regressions |
 
-L2b-a2-s, L2b-a2-a, and L2b-a2-t are the smallest independently correct verticals. The first PR
+L2b-a2-s, L2b-a2-ac, L2b-a2-af, L2b-a2-ar, L2b-a2-ap, and L2b-a2-t are the smallest independently correct verticals. The first PR
 publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
 retain the shipped flattened result. It must include product construction, reads, partial writes,
 destructuring, ordinary control joins, direct/imported consumption, and whole/per-unit parity
 together: omitting a writer or join can under-approximate the same public product fact. The second
-PR adds array formation, exact/dynamic reads and writes, and pipeline projection together; shipping
-exact array reads before the corresponding writes could retain only an overwritten owner, while
-shipping writes before formation would provide no precise destination paths. The third PR replaces
+PR closes the general MIR continuation invariant. The third PR adds validated fixed-array
+formation plus exact/dynamic reads and writes on that substrate. The fourth closes eager
+retained-storage lifetime for non-fixed reads. The fifth closes the explicit pipeline
+stage/terminal state machine. The sixth PR replaces
 the remaining tagged fallbacks atomically across constructors, pattern bindings, `else`, `?`, and
 `map_err`: splitting its explicit and implicit `Result` edges would let one value produce
 contradictory summaries. No PR may exceed roughly 1,000 changed hand-written lines without first
@@ -1929,7 +1996,10 @@ their first owning slice and remain cumulative gates afterward.
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
 | L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_sema ty_may_borrow_is_cycle_safe_for_header_mediated_nominals`; `cargo test -p align_sema lifted_function_origin_metadata_is_explicit`; `cargo test -p align_sema checked_break_acceptance_is_preserved_in_hir`; `cargo test -p align_sema rejected_break_effect_payload_is_visited_without_loop_result_join`; `cargo test -p align_sema effect_source_order_closure_matrix`; `cargo test -p align_sema pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_sema pipeline_terminal_diagnostic_order`; `cargo test -p align_sema pipeline_terminal_dead_state_isolated_across_analyses`; `cargo test -p align_sema pipeline_terminal_dead_hir_is_finalized_and_linted`; `cargo test -p align_sema pipeline_capture_owner_invalidation_is_rejected`; `cargo test -p align_sema pipeline_source_snapshot_owner_invalidation_matrix`; `cargo test -p align_codegen_llvm malformed_mir_type_graphs_fail_before_llvm_construction`; `cargo test -p align_mir rejected_checked_break_lowers_to_unreachable`; `cargo test -p align_mir terminating_break_payload_emits_no_outer_edge`; `cargo test -p align_mir mixed_break_payload_preserves_outer_edge`; `cargo test -p align_mir terminating_pipeline_operand_emits_no_terminal_state`; `cargo test -p align_mir pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_mir pipeline_terminal_source_shape_parity`; `cargo test -p align_driver --test return_provenance --test analysis_coverage --test interface_param_modes --test per_unit`; `cargo test -p align_driver --test m5 json_scan_reduce_fold`; `cargo test -p align_driver --test zip_pipeline pipeline_terminal_source_order` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `import-validation` |
 | L2b-a2-s | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
-| L2b-a2-a | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-ac | `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_mir malformed_hir_eager_termination_fails_closed`; `cargo test -p align_driver --test mir_continuation --test expr_depth`; `cargo test -p align_driver --test per_unit_codegen eager_expression_termination` | `bench/library_boundary/run.sh provenance`: `mir-continuation-lowering` |
+| L2b-a2-af | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-ar | `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test borrow_liveness --test struct_index --test chunks --test soa --test m11_http --test m11_http_get_many` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-ap | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-t | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
