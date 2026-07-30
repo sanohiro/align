@@ -149,9 +149,14 @@ every item below has since completed as recorded in the per-milestone sections, 
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
    sound `get`-before-`wait`, and a `wait()?` error boundary.
    **Successful-Wait flow correction pending am-w (2026-07-31):** the settled proof follows an
-   exact group/epoch through bare Result locals, copy/reassignment, `map_err`, and value-producing
+   exact group/generation/Wait id through bare Result locals, copy/reassignment, `map_err`, and value-producing
    control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and is
-   invalidated for every alias by a later Spawn. Calls/returns/captures/imports/aggregate
+   requires every earlier Wait for that drained generation to resolve Ok. A later empty Wait cannot
+   hide an unresolved or failed first Wait; Err invalidates every Wait/Task proof it covered.
+   Every Spawn advances the current generation and stales old Wait proofs; with an unresolved Wait
+   it also invalidates covered Tasks, while after completion one later Wait can reauthorize old and
+   new handles.
+   Calls/returns/captures/imports/aggregate
    reconstruction do not transport it. The current traversal does not implement the complete
    stored-result, match, and loop joins and can admit `get()` on an uninitialized slot. Each Move
    Task handle also carries its originating group through transparent local/control transfer;

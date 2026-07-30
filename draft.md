@@ -1419,13 +1419,19 @@ For a fallible group, `get()` requires control to be on the successful edge of t
 `wait()` since the latest `spawn`. The Result may be handled immediately or first kept in a bare
 local, copied/reassigned, passed through a block tail, `map_err`, or value-producing
 `if`/`match`/`else`/`loop`; the success proof survives only when every reachable value predecessor
-has the same task-group proof. `?`, an exhaustive Result `match`, or Result `else` then establishes
-the successful edge. An unrelated overwrite clears the proof, and `spawn` invalidates every saved
-proof for that group. Calls, returns, closure captures, imported values, and aggregate
+has the same group, proof epoch, Wait id, and covered task generation. `?`, an exhaustive Result `match`, or Result `else`
+then resolves that exact Wait. Every earlier Wait Result for the same drained task generation must
+also be proved successful: ignoring or delaying a failed first Wait and handling a later empty
+Wait cannot authorize an uninitialized result slot. An Err invalidates every Task and Wait proof
+it covered. Every `spawn` advances the current task generation and stales old Wait proofs; when an
+earlier Wait remains unresolved it also invalidates the covered Tasks. After success, one later
+successful Wait can reauthorize both old and new Task handles. An unrelated overwrite clears the
+local proof. Calls, returns, closure captures, imported values, and aggregate
 reconstruction do not transport the proof. Passing a Copy Result does not erase the caller's
 original local, but no callee result acquires its provenance.
 
-Each `Task<R>` is a Move handle whose compiler-only origin names the `task_group` that spawned it.
+Each `Task<R>` is a Move handle whose compiler-only origin names the `task_group` and task
+generation that spawned it.
 Local moves, reassignment, block tails, and value-producing control flow preserve that origin;
 calls, returns, captures, imports, and aggregate reconstruction do not transport it. `get()` checks
 the originating group, not merely the innermost active group. Entering a nested group preserves
@@ -1788,8 +1794,10 @@ fn main() -> i32 {
 The declaration is **bodyless** and bound to the C symbol `name` (never mangled). Because Align is
 AOT-compiled via LLVM with no GC, a foreign call is a direct native `call` — no marshaling, pinning,
 or stack-switch — and a `slice`/`str`/`raw` hands its pointer straight to C. Only `extern "C"` is
-supported; the FFI-safe signature types are the primitive scalars (integers, floats) and `raw` (an
-opaque byte pointer), plus a `()` (void) return. A function that calls an extern is inferred impure
+supported. Parameters admit integer and float scalars, `raw`, `str`, numeric `slice<T>` (including
+`bytes`), and an eligible non-empty `layout(C)` struct. Returns admit `()`, integer and float
+scalars, `raw`, and an eligible non-empty `layout(C)` struct; a view never returns. The later
+by-value-struct section gives the target-specific eligibility gate. A function that calls an extern is inferred impure
 (it contains `unsafe`), so it can never be a `par_map` callee. This is the keystone of the library
 strategy: `std`/`pkg` **own the memory wrappers and borrow the mathematical engines** (wrapping
 `libzstd`, `sqlite`, … via FFI) rather than reimplementing assembly-tuned algorithms in Align.

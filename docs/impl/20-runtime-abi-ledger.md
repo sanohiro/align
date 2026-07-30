@@ -16,15 +16,23 @@ runtime records have no `RuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
 `align_rt_http_serialize`. The base native registry therefore has 286 records.
-The explicit `alloc-count` runtime feature adds four test/benchmark-only
-counter exports. `par-map-probe` adds four more:
+The explicit `alloc-count` runtime feature may expose four
+test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `void @align_rt_test_par_map_force_caller(i32)`,
 `i64 @align_rt_test_par_map_min_chunk()`,
 `i64 @align_rt_test_par_map_min_chunk_for(i64, i64, i64)`, and
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
-Rust state only and adds no unmangled native export. The maximum registry,
-with all three features enabled, therefore has 294 records. Registry
-membership is never inferred from symbol spelling.
+Rust state only and adds no unmangled native export.
+
+The compiler-visible native registry is always exactly the 286 base records.
+There is no target option, environment variable, Cargo feature, linked-runtime
+inspection, or other ambient input that changes it. The eight optional probe
+records extend one unconditional 294-identity reserved-name set used only for
+external collision rejection and runtime-export verification. They never gain
+a `RuntimeKey`, callable/declaration policy, or compatible-extern reuse. Thus
+runtime feature selection changes neither accepted callable input nor MIR,
+interface, artifact, or cache identity. Registry membership is never inferred
+from symbol spelling.
 
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 
@@ -149,7 +157,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 
 Unkeyed native records:
 
-| Owner | Exact LLVM declaration | Presence |
+| Owner | Exact LLVM declaration | Runtime export presence |
 |---|---|---|
 | main error wrapper | `i32 @align_rt_report_error(i32)` | every Unit/Result main wrapper; no attributes |
 | argv wrapper | `{ ptr, i64 } @align_rt_args_build(i32, ptr)` | only argv main; no attributes |
@@ -171,11 +179,14 @@ Am-c replaces the current declaration statements, runtime string map, AEAD
 selection match, and attribute lookup with one typed `RuntimeAbi` row per key:
 `{ key, symbol, return type, ordered parameter types, return attrs, parameter
 attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
-that row. Unkeyed records use the same ABI shape without a key and add
-`presence = Always | AllocCount | ParMapProbe`; only the two wrapper records
-have an Align module declaration policy. All thirteen unkeyed identities still
-participate in external-collision and compatible-extern validation before LLVM
-construction.
+that row. The five base unkeyed records use the same ABI shape without a key;
+only the two wrapper records have an Align module declaration policy. The
+eight probe rows have
+`verification_presence = AllocCount | ParMapProbe`, but are reserved-only:
+their exact signatures are checked against the corresponding runtime build,
+their names always participate in collision rejection, and no compatible
+extern may reuse them. The compiler uses the fixed base table before LLVM
+construction and receives no runtime-feature input.
 
 Tests compare:
 
@@ -190,8 +201,9 @@ Tests compare:
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol;
-- compatible extern reuse against the active registry's complete LLVM type and
-  curated declaration attributes;
+- compatible extern reuse against only the fixed 286-row base registry's
+  complete LLVM type and curated declaration attributes, plus rejection of
+  every extern/export claimant for each of the eight reserved probe names;
 - one mutation of return type, every parameter ordinal, each attribute class,
   symbol, and key; and
 - trivial whole/per-unit emitted IR against a checked-in declaration golden

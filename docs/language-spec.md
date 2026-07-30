@@ -493,14 +493,18 @@ Its private runtime region stores spawned environments and result slots only. It
 allocation arena: ordinary owned values keep individual ownership, and arena-only operations still
 require an explicit `arena {}`.
 
-`Task.get()` is valid only after a successful `wait()` on every reachable path since the latest
-`spawn`. In a fallible group, the Wait Result may be handled directly or through a bare local,
+`Task.get()` is valid only after a successful `wait()` on every reachable path for its task
+generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
 copy/reassignment, block tail, `map_err`, or value-producing `if`/`match`/`else`/`loop`; only an
 exact proof present on every result predecessor survives. `?`, Result `match`, and Result `else`
-establish success only on their Ok continuation. An unrelated overwrite or later `spawn` clears
-the proof. Calls, returns, closure captures, imported values, and aggregate reconstruction do not
+establish success only on their Ok continuation. Every earlier Wait Result for that drained
+generation must also be proved successful; a later empty Wait cannot hide an unresolved or failed
+one. Err invalidates every Task/Wait proof it covered. Every Spawn advances the current generation
+and stales old Wait proofs. If a Wait was unresolved it also invalidates the covered Tasks;
+otherwise the next successful Wait reauthorizes old and new Task handles. An unrelated
+overwrite clears the local proof. Calls, returns, closure captures, imported values, and aggregate reconstruction do not
 transport it; passing a Copy Result leaves only the caller's original local proof intact.
-Each Task is a Move handle whose compiler-known origin names its spawning group. Local moves,
+Each Task is a Move handle whose compiler-known origin names its spawning group and generation. Local moves,
 reassignment, block tails, and value-producing control flow preserve that origin; calls, returns,
 captures, imports, and aggregate reconstruction do not. `get()` checks that exact still-active
 group. A nested group preserves outer facts: its own `wait()` cannot authorize an outer Task, while
@@ -529,8 +533,10 @@ called like any other function, but only inside `unsafe` — foreign code is out
 direct call or non-escaping pipeline/reducer/sort callback requires that lexical `unsafe`
 invocation site. An extern declaration cannot become a first-class function value because the
 function-value type carries no visible unsafe-call permission. The
-declaration is bodyless and bound to the C symbol; FFI-safe signature types are primitive scalars and
-`raw`, plus a `()` return. A foreign call is a direct native `call` (no marshaling — Align is
+declaration is bodyless and bound to the C symbol. Parameters admit integer and float scalars,
+`raw`, `str`, numeric `slice<T>` (including `bytes`), and an eligible non-empty `layout(C)`
+struct. Returns admit `()`, integer and float scalars, `raw`, and an eligible non-empty
+`layout(C)` struct; views never return. A foreign call is a direct native `call` (no marshaling — Align is
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
 wrappers and borrow C engines via FFI.
 

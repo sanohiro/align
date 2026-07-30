@@ -400,10 +400,15 @@ without locks. A `task_group` task, by contrast, *may* be impure — it performs
 safety comes from capture being by value (no shared mutable state) rather than from purity.
 Successful-Wait evidence follows the Result value only through transparent local/control
 operations. It is not inferred through a call, return, capture, import, or aggregate: those
-boundaries would require a second hidden effect/provenance summary. A later `spawn` invalidates
-every alias from the earlier task set. This lets stored Result handling remain ordinary source
-code while keeping `get()` safety visible and mechanically local.
-The Task handle carries a separate compiler-only origin for the group that created it. Because the
+boundaries would require a second hidden effect/provenance summary. Each fallible Wait also has a
+generation-local identity. All earlier Waits for one drained task generation must resolve Ok before
+that generation is complete; a later empty Wait cannot erase an unresolved or failed result.
+Failure invalidates the covered generation. Every Spawn advances the current task generation and
+stales prior Wait proofs. With an unresolved Wait it also invalidates old Tasks; otherwise a later
+successful Wait can cover old and new tasks.
+This lets stored Result handling remain ordinary source code while keeping `get()` safety visible
+and mechanically local.
+The Task handle carries a separate compiler-only origin for the group and generation that created it. Because the
 handle is Move, transparent local/control moves preserve that origin; opaque boundaries do not.
 Nested groups push a new identity without hiding outer facts. Therefore an inner Wait cannot
 authorize an outer Task, but an outer Wait Result handled inside the inner group updates the outer

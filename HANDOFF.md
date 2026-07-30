@@ -345,8 +345,11 @@ fresh adversarial review was not clean. The revised draft addresses those findin
 expression and every helper
 discriminator have exact rows in `docs/impl/19-hir-validation-ledger.md`; native ABI,
 generated-identity, corrected source/header origin facts, and the dependent PR order are recorded.
-The final author consistency pass and fresh adversarial re-review are clean on the current tree;
-the design PR still must pass its repository gate and merge before implementation begins.
+The pre-PR author consistency pass and adversarial preflight were clean. Post-open review of PR
+#678 reopened the am-w closure matrix: a failed drained Wait could be hidden by a later empty
+successful Wait, and seven adjacent ledger contradictions also required one coherent follow-up.
+The coherent follow-up is authored and mechanically verified; the design PR still needs a fresh
+clean review, its repository gate, and merge before implementation begins.
 The reviewed order is am-e exact entry ABI, am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
 extern invocation, am-d checked-HIR body/type-DAG stack safety, am-p placement, am-n nominal/link, am-h
@@ -369,12 +372,16 @@ validation. Am-e restricts no-arg `main` to Unit, exact i32, or
 `Result<Unit,builtin Error>`: other returns were accepted by sema but emitted an invalid external
 C `main` ABI. Am-f rejects bare return and reachable absent tails in non-Unit functions; both
 currently reach MIR/LLVM as `ret void` under a value-returning signature. Am-w replaces task
-wait-state traversal order with outcome-sensitive successful-wait
+wait-state traversal order with generation- and Wait-id-sensitive successful-wait
 dominance across `if`, direct `match wait()`, direct `wait() else`, every reachable loop break,
 early exits, nested groups, Spawn reset, infallible Wait, and direct fallible `wait()?`; its
 fallible-Wait Result carries compiler-only group provenance through bare locals, copies,
-reassignment, `map_err`, and value-producing control joins, so the settled stored-result form
-that exhaustively handles a stored Wait Result before reading a task remains valid. Calls, returns,
+reassignment, `map_err`, and value-producing control joins. Every earlier Wait for the same drained
+task generation must also resolve Ok: a later empty Wait cannot hide an unresolved or failed first
+result. Err invalidates every Task/Wait proof it covered. Every Spawn advances the current
+generation and stales prior Wait proofs; with an unresolved Wait it also invalidates covered Tasks,
+while after success one later Wait reauthorizes old and new handles. The settled stored-result form that exhaustively handles every
+covering Wait Result before reading a task remains valid. Calls, returns,
 captures, imported values, and aggregate reconstruction do not synthesize provenance, and every
 Spawn clears all aliases for that group. Each Move Task handle separately carries its originating
 group through transparent local/control transfer. Nested entry preserves outer facts; inner Wait
@@ -484,9 +491,11 @@ generated call registries; proposes injective compiler-owned identities for non-
 private generated helpers; inventories the 277 existing runtime lookup keys, all 239 `ExprKind`
 variants, and every helper discriminator. The revised native ledger promotes the four previously
 codegen-selected AEAD symbols to typed keys, for 281 keyed records. Five always-built unkeyed
-runtime records make the base native registry 286 entries; four `alloc-count` and four distinct
-`par-map-probe` exports make the all-feature maximum registry 294 entries. `task-group-probe` adds
-no unmangled export. Exact LLVM types/attributes and presence policy live in
+runtime records make the fixed compiler registry 286 entries. Four `alloc-count` and four distinct
+`par-map-probe` exports extend an unconditional 294-name collision-reservation set but are never
+callable or compatible-extern targets; runtime feature selection is verification-only and changes
+no compiler input or cache identity. `task-group-probe` adds no unmangled export. Exact LLVM
+types/attributes and verification presence policy live in
 `docs/impl/20-runtime-abi-ledger.md`. The draft
 also records every placement predicate and gives every body discriminator an envelope/child/type/
 ownership row in `docs/impl/19-hir-validation-ledger.md`; any body failure returns the same

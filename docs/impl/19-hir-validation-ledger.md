@@ -223,24 +223,44 @@ trusting the stored bits:
    incomplete boundary cell reject before any MIR or generated-kernel identity
    is constructed.
 10. Re-run the producer's per-`task_group` successful-wait dominance fact.
-    A group starts false; every reachable `Spawn` resets it false; an
-    infallible `Wait` sets it true. A fallible `Wait` produces a result proof
-    with a true `Ok` edge and false `Err` edge without changing the ambient
-    fact merely by being evaluated. The proof is the exact compiler-only
-    `WaitProof { group: usize, epoch: usize }`; both fields index
-    function-analysis-owned vectors and have no HIR/interface/wire form. A
-    group gets one preorder token. Its epoch token is replaced at every Spawn
-    and at a control join whose incoming task-set epochs differ. It propagates
+    A group starts with no completed task generation. Each group has one
+    compiler-only preorder `group: usize`, monotonically increasing
+    `current_generation` and `proof_epoch`, `completed_through`,
+    `valid_from`, and a sparse ordered set of unresolved fallible-wait ids.
+    These are indices or counters in function-analysis-owned vectors and have
+    no HIR/interface/wire form. Every `Spawn` increments
+    `current_generation` and `proof_epoch`, so every earlier WaitProof becomes
+    stale and completion no longer covers the current generation. If any Wait
+    was unresolved, that Spawn also clears the old unresolved set and sets
+    `valid_from` to the new generation, invalidating every older TaskProof in
+    O(1); otherwise old TaskProofs remain eligible and the next successful Wait
+    can reauthorize old and new handles.
+    An infallible group has no unresolved set and its `Wait` sets
+    `completed_through = current_generation`.
+    Each fallible `Wait` registers one fresh ordered wait id before producing
+    `WaitProof { group: usize, proof_epoch: usize, wait: usize,
+    covers_through: usize }`, where `covers_through` is the current task
+    generation. Evaluating
+    that Result alone does not establish completion. Handling its `Ok` edge
+    resolves that exact id idempotently; it establishes completion only when
+    every earlier Wait registered in that proof epoch is also proved `Ok` and
+    no later Spawn changed the epoch. It then advances `completed_through`
+    through the proof's covered generation. Handling its `Err` edge poisons
+    every task covered by that Wait: it advances `proof_epoch`, clears the
+    unresolved set, and sets `valid_from` past `covers_through`, invalidating
+    every affected TaskProof and WaitProof in O(1).
+    Therefore a second empty Wait cannot reauthorize task slots while an
+    earlier drained Wait Result is unresolved or failed. The proof propagates
     through a bare Result local,
     let/copy/reassignment, a block tail, `ResultMapErr`, and value-producing
     `if`/`match`/`else`/loop only when every reachable result predecessor carries
-    that same group proof. Overwrite with an unrelated Result clears it.
+    that same group/proof-epoch/wait/coverage proof. Overwrite with an unrelated
+    Result clears it.
     A call result, return value in another function, closure capture, imported
     value, or aggregate reconstruction has no proof; passing a Copy proof as an
     argument does not clear the caller's original local, but the callee and its
-    return do not inherit it. Every `Spawn` clears the ambient fact before its
-    new task can be read; its new epoch makes every saved alias for the old
-    epoch stale in O(1).
+    return do not inherit it. Multiple aliases of the same proof resolve one
+    wait id idempotently; a stale proof epoch or wait id has no effect.
     Entering a nested group pushes a distinct false ambient group but preserves
     the enclosing groups' ambient facts and local proofs. Inner Spawn/Wait
     operations change only the inner group. Leaving it removes that group's
@@ -248,40 +268,46 @@ trusting the stored bits:
     proof attached to the task-group block result, while preserving entries for
     every still-active enclosing group. A lambda/function instead starts with
     an empty active-group stack and no group proof.
-    `Spawn` also produces `TaskProof { group: usize }` for its Task handle.
-    The group field is the same analysis-vector index and has no stored/wire
+    `Spawn` also produces
+    `TaskProof { group: usize, born_generation: usize }` for its Task handle.
+    Both fields use the same analysis-vector indices and have no stored/wire
     form. `Task` is Move: a bare Task local, move/reassignment, block tail, or
     value-producing control expression transfers it and preserves its proof
     only when every reachable value predecessor names the same group; overwrite
     clears it. There is no Task-copy path. Calls, returns, captures, imports,
     and aggregate reconstruction do not transport Task proof. Leaving the group
     removes its token from the active-group stack.
-    `Try` consumes a proven Result expression only when `WaitProof.group` is
-    still active and continues only from its true edge, setting the ambient
-    fact for that group, not merely the innermost group. `Match` on a Result
+    `Try` consumes a proven Result expression only when its group and
+    proof epoch remains active and continues only after resolving that wait id's
+    true edge. It updates that group, not merely the innermost group. `Match` on a Result
     with a still-active proof starts each exact `Ok` arm with that proof's group
     true and each `Err` arm with it false; a
-    wildcard/or-pattern receives true only when every variant it covers has a
-    true edge. `ElseUnwrap` on a Result with a still-active proof continues with
-    that proof's group true on the unwrapped `Ok` edge and checks its fallback
-    with that group false; if that fallback terminates, only the true
-    continuation remains.
+    wildcard/or-pattern receives completion only when every variant it covers
+    resolves the same proof to a completed generation. `ElseUnwrap` on a
+    Result with a still-active proof resolves that proof on the unwrapped `Ok`
+    edge and poisons it on the `Err` fallback; if that fallback terminates,
+    only the successful continuation remains.
     `If`, ordinary `Match`/`ElseUnwrap` facts, and all other control joins start
     alternatives from their incoming ambient fact and AND the reachable
-    fallthrough alternatives. Local proof maps join by exact-group/current-
-    epoch intersection. When every reachable predecessor proves its own current
-    epoch, the merged local is remapped to the join epoch; otherwise it clears.
+    fallthrough alternatives. Local proof maps join by exact
+    group/proof-epoch/wait/coverage intersection. A join of distinct group
+    states allocates fresh generation/epoch counters, conservatively intersects
+    `valid_from`/`completed_through`, and retains a Task proof only when every
+    reachable predecessor carries that exact logical handle and authorizes its
+    born generation; unresolved Wait proofs never remap across such a join.
     A loop records the ambient fact and every result/local proof independently
     on each reachable accepted `Break`; an exit retains only facts present on
     every reachable break. A body-only state never escapes by traversal order.
     A terminating alternative contributes no post-join edge.
     `TaskGet` requires its operand's TaskProof group to remain active and that
-    exact group's current-epoch ambient fact to be true. It does not consult
+    `valid_from <= born_generation <= completed_through` and
+    `completed_through == current_generation`. It does not consult
     merely the innermost group: an inner Wait can never authorize an outer
-    Task. An outer Task may be read inside a nested group only if the outer
-    group had already completed a successful Wait and no later outer Spawn
-    reset it, including when the outer Wait Result is handled while the inner
-    group is active. A failed check chooses its fallible/infallible diagnostic
+    Task. An outer Task may be read inside a nested group only if its born generation
+    is still valid and the group's current generation has completed a successful
+    Wait with no unresolved or failed earlier
+    Wait can still cover that task, including when the outer Wait Result is
+    handled while the inner group is active. A failed check chooses its fallible/infallible diagnostic
     from `TaskProof.group`, never from the innermost group. Current Spawn
     results are primitive Copy values, so a successful `TaskGet` reads without
     consuming the Move handle, preserves its TaskProof, and may be repeated.
@@ -394,7 +420,7 @@ The result formula in every row is followed by the universal
 | `Match` | `env[arms.len]`: non-empty. `child[scrutinee,arms in order]`; `post[scrutinee is one sum type: user Enum(id), Option(T), or Result(T,E); each MatchArm uses that exact sum table; no tag repeats across arms, at most one wildcard occurs at its preserved source position, and coverage is exhaustive by all tags or that wildcard; all fallthrough arm bodies have one result type, while divergent arms are context-polymorphic; scrutinee evaluated once; branch ownership joins exactly]`. |
 | `ResultMapErr` | `env[]`; `child[result,f]`; `post[result.ty == Result(ok,err); f.ty == Fn(id) with one ByValue err parameter and return err2; FT summary/effect apply; result Result(ok,err2); Ok ownership passes unchanged and Err ownership transfers through f]`. |
 | `Spawn` | `env[fallible]`; `child[closure with SPAWN(fallible,ok)]`; `post[inside task_group; ok is one primitive Int/Float/Bool/Char/Unit scalar; closure.ty == Fn(id) with zero explicit parameters and stored return ok; Pure/Impure allowed by current task rule; the exact lifted target returns ok when false or Result(ok,builtin Error) when true; result Task(ok); closure/environment transfers to task storage]`. |
-| `TaskGet` | `env[]`; `child[task]`; `post[task.ty == Task(T) for current primitive Copy T; task has recomputed `TaskProof { group }`; that group remains active and its own current-epoch successful-wait fact is true on this exact path; an inner group's Wait cannot discharge it; failed-check diagnostic uses that group's fallibility; result T is copied without consuming the Move task handle, TaskProof remains available, and repeated get is valid; owned task results are not producer-reachable]`. |
+| `TaskGet` | `env[]`; `child[task]`; `post[task.ty == Task(T) for current primitive Copy T; task has recomputed `TaskProof { group, born_generation }`; that group remains active, `valid_from <= born_generation <= completed_through`, and `completed_through == current_generation` on this exact path, with no unresolved or failed earlier Wait covering it; an inner group's Wait cannot discharge it; failed-check diagnostic uses that group's fallibility; result T is copied without consuming the Move task handle, TaskProof remains available, and repeated get is valid; owned task results are not producer-reachable]`. |
 | `Wait` | `env[]`; `child[]`; `post[inside task_group; result Unit for infallible group or Result(Unit,builtin Error) for a fallible group exactly as producer records; joins registered tasks once]`. |
 | `Call` | `env[func,type_args]`: non-empty NUL-free func resolves one `SIG`; an extern target requires current lexical `unsafe_depth > 0`. Empty type_args require a non-Monomorph target. Non-empty type_args are concrete graph-valid types; encoding them with the single producer/validator-owned `mangle_mono_suffix(type_args)` (the current `mangle_mono("", type_args)` bytes) yields a non-empty `$...` suffix, func must equal a non-empty base plus that exact suffix, and the stored target must have `FnOrigin::Monomorph`. HIR stores neither the discarded generic template nor its bounds, so this row makes no uncheckable template/bound claim. `child[args in order]`; `post[arity/modes/types and disabled modes match the concrete SIG; Move/Out behavior and return provenance are exact; result SIG.ret; a source spelling equal to a RuntimeKey still resolves ProgramCall]`. |
 | `If` | `env[]`; `child[cond,then,els]`; `post[cond Bool; all fallthrough branches have one result type; missing-source else is represented by empty Unit block; divergent branch is context-polymorphic; state/ownership joins only fallthrough predecessors]`. |
@@ -415,7 +441,7 @@ The result formula in every row is followed by the universal
 | `Arena` | `env[]`; `child[block]`; `post[result block/context-selected divergence type; one arena begins before the block and ends exactly once on each exit; no escaping arena-owned value]`. |
 | `Unsafe` | `env[]`; `child[block at unsafe_depth+1]`; `post[result block/context-selected divergence type; depth is restored before the next sibling; no runtime region; unsafe permission is lexical and effect is Impure]`. |
 | `RawAlloc` | `env[]`; `child[size]`; `post[size i64; result Raw; unsafe lexical owner required; caller manually owns allocation]`. |
-| `RawFree` | `env[]`; `child[ptr]`; `post[ptr Raw; result Unit; unsafe; consumes the manual raw allocation capability but has no automatic Drop fact]`. |
+| `RawFree` | `env[]`; `child[ptr]`; `post[ptr Raw; result Unit; unsafe; runtime deallocates the referenced manual allocation; Raw is Copy, so its bits are neither nulled nor statically consumed and every later use or second free remains the unsafe programmer's responsibility; no automatic Drop fact]`. |
 | `RawLoad` | `env[scalar]`: scalar is Int/Float/Bool/Char or `Struct(id)` whose exact stored definition has `c_repr == true`; unlike extern by-value placement, the producer's raw-storable predicate does not reject an empty C-layout struct. `child[ptr,offset]`; `post[ptr Raw, offset i64, result scalar_to_ty(scalar); unsafe; borrowed memory read]`. |
 | `RawStore` | `env[]`; `child[ptr,offset,value]`; `post[ptr Raw, offset i64, value is Int/Float/Bool/Char or Struct(id) with c_repr == true under the same raw-storable predicate; result Unit; unsafe; manual memory write]`. |
 | `RawOffset` | `env[]`; `child[ptr,offset]`; `post[ptr Raw, offset i64, result Raw; unsafe; derived pointer has the same manual owner]`. |
@@ -516,7 +542,7 @@ means:
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
 | `JsonScan` | `env[struct_id]`: scanner row struct satisfies the streaming JSON row descriptor. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input]`. |
-| `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some i64 field. `child[]`; `post[result exact interned two-array tuple: i64 keys for Soa, Str keys for AosStr/Encoded, plus i64 aggregate; owned arrays, Str keys borrow base]`. |
+| `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some i64 field. `child[]`; `post[result exact interned two-array tuple: i64 keys for SoaI64; Str keys for SoaStr, AosStr, or Encoded; plus i64 aggregate; owned arrays, Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is dynamic/fixed AoS StructArray(struct_id), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
 
@@ -601,9 +627,11 @@ predicate, not type equality alone:
   `HttpRespondStream.rb`, and `HttpStreamReject.rb`. Every other handle
   operand uses the applicable place above.
 
-This predicate is validated before the row's remaining children. Owner tests
-enumerate every current semantic diagnostic containing “bind ... first” and
-mutate one accepted local/exempt producer to an equal-typed temporary. Thus a
+This predicate is a post relation and is validated only after every row child
+has completed, in the universal order above. Owner tests enumerate every
+current semantic diagnostic containing “bind ... first”, mutate one accepted
+local/exempt producer to an equal-typed temporary, and pair it with an invalid
+later child to prove that the child diagnostic wins. Thus a
 borrowed read cannot leak an fd, buffer, pid, pending output, or native handle
 merely because its `Ty` matches.
 
@@ -624,7 +652,7 @@ merely because its `Ty` matches.
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileOpenRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
-| `FilePwrite` | `env[]; child[file,data,offset]`; `File, bytes, i64; result ERR(i64); borrowed; Impure`. |
+| `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
 | `BufferNew` | `env[]; child[capacity]`; `i64; result Buffer; new owned allocation; Pure`. |
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
@@ -632,7 +660,7 @@ merely because its `Ty` matches.
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
-| `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),bytes; result Unit; data borrowed, buffer mutated; Pure`. |
+| `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
 | `ArrayBuilderNew` | `env[elem]`: exact admitted Copy scalar or String builder element. `child[]; result ArrayBuilder(elem); new owned allocation; Pure`. |
 | `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value scalar_to_ty(elem); moves_value iff elem==String; result Unit; String consumed, Copy value borrowed, builder mutated; Pure`. |
 | `ArrayBuilderAppend` | `env[]; child[builder,data]`; `SourceMutLocal(ArrayBuilder(copy elem),builder), data Slice(elem); result Unit; data borrowed, builder mutated; Pure`. |
@@ -650,7 +678,7 @@ merely because its `Ty` matches.
 | `TcpListen` | `env[]; child[host,port]`; `Str,i64; result ERR(TcpListener); new owned socket; Impure`. |
 | `TcpAccept` | `env[]; child[listener]`; `TcpListener; result ERR(TcpConn); listener borrowed, result owns accepted socket; Impure`. |
 | `UdpBind` | `env[]; child[host,port]`; `Str,i64; result ERR(UdpSocket); new owned socket; Impure`. |
-| `UdpSendTo` | `env[]; child[sock,data,host,port]`; `UdpSocket,bytes,Str,i64; result ERR(i64); all borrowed; Impure`. |
+| `UdpSendTo` | `env[]; child[sock,data,host,port]`; `UdpSocket,byte-view,Str,i64; result ERR(i64); all borrowed; Impure`. |
 | `UdpRecvFrom` | `env[]; child[sock,buffer]`; `LocalHandle(UdpSocket,sock), SourceMutLocal(Buffer,buffer); result ERR(i64); both borrowed, buffer mutated; Impure`. |
 | `FsReadFileView` | `env[]; child[path]`; `Str; inside arena; result ERR(Str); view rooted in arena; Impure`. |
 | `FsReadBytesView` | `env[]; child[path]`; `Str; inside arena; result ERR(bytes); view rooted in arena; Impure`. |
