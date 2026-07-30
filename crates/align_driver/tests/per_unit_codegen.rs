@@ -125,6 +125,56 @@ fn gate_b_multi_file_run_matches_whole_program() {
 }
 
 #[test]
+fn eager_expression_termination() {
+    let library = "\
+module continuation
+fn later() -> i64 {
+  print(99)
+  return 99
+}
+pub fn value() -> i64 = { return 7; 0 } + later()
+";
+    let main = "\
+import continuation
+fn main() {
+  print(continuation.value())
+}
+";
+    let files = &[("continuation.align", library), ("main.align", main)];
+    let built = build_per_unit_multi(
+        "eager-continuation",
+        files,
+        "main.align",
+    );
+    let function = built
+        .unit("continuation")
+        .mir
+        .fns
+        .iter()
+        .find(|function| function.name == "continuation$value")
+        .expect("exported value function");
+    assert!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .all(|statement| !matches!(
+                statement,
+                align_mir::Stmt::Let(_, align_mir::Rvalue::Call(..) | align_mir::Rvalue::Bin(..))
+            )),
+        "the per-unit MIR must omit the later sibling and parent action: {function:#?}"
+    );
+    if backend() {
+        let whole = build_and_run_multi("eager-continuation-whole", files, "main.align");
+        let per_unit = built.link_and_run();
+        assert_eq!(whole.status.code(), Some(0));
+        assert_eq!(per_unit.status.code(), Some(0));
+        assert_eq!(whole.stdout, per_unit.stdout);
+        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "7\n");
+    }
+}
+
+#[test]
 fn cross_unit_unit_call_is_a_value_in_both_build_paths() {
     if !backend() {
         return;

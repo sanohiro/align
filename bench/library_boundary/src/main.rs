@@ -101,6 +101,21 @@ fn provenance_fixture() -> String {
     source
 }
 
+fn mir_continuation_fixture() -> String {
+    let mut source = String::new();
+    for index in 0..256 {
+        source.push_str(&format!(
+            "fn branch_{index:04}(x: i32) -> i32 {{\n\
+             \u{20}\u{20}first := if x == {index} {{ x + 1 }} else {{ x - 1 }}\n\
+             \u{20}\u{20}second := if first > 0 {{ first * 2 }} else {{ 0 - first }}\n\
+             \u{20}\u{20}return if second == x {{ first }} else {{ second }}\n\
+             }}\n"
+        ));
+    }
+    source.push_str("fn main() -> i32 = branch_0255(1)\n");
+    source
+}
+
 fn import_validation_fixture() -> InterfaceSummary {
     let parameter = ITypeParam {
         name: "T".to_string(),
@@ -216,6 +231,35 @@ fn run_provenance() {
     let elapsed = start.elapsed();
     let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
     println!("import-validation\t{milliseconds:.3}\tms/import");
+
+    let continuation_source = mir_continuation_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let checked = align_driver::check(
+        &mut source_map,
+        "mir-continuation.align",
+        &continuation_source,
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "MIR continuation fixture must check"
+    );
+    let mir = align_driver::lower_to_mir(&checked.hir);
+    let block_count: usize = mir.fns.iter().map(|function| function.blocks.len()).sum();
+    assert!(
+        block_count >= 2_000,
+        "fixture must retain a high-CFG lowering workload"
+    );
+
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let mir = align_driver::lower_to_mir(black_box(&checked.hir));
+        black_box(mir);
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!("mir-continuation-lowering\t{milliseconds:.3}\tms/lower\t{block_count}\tblocks");
 }
 
 fn main() {

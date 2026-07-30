@@ -278,20 +278,29 @@ the pre-PR gate before a draft PR is opened:
    `gh pr create` bypasses the local guard and is prohibited for agent-driven
    work. CI rejects an absent or stale HEAD-bound attestation.
 
-Every code PR must still receive independent review after it is opened and
-before it is merged:
+Every code PR must still receive one independent review cycle after it is
+opened and before it is merged:
 
 1. Run the host-native review with `scripts/review-bounded.sh` and a fresh
-   independent adversarial reviewer on the final pushed diff.
-2. Verify every finding against the code. Apply valid findings and explain
-   rejected ones.
-3. Batch related valid findings into one coherent follow-up commit whenever
-   possible. Do not make one follow-up commit per review comment; separate
-   commits are for independent changes or a necessary checkpoint.
-4. Rerun `scripts/pre-pr.sh` after any follow-up and refresh the PR attestation
-   with `scripts/update-pr-preflight.sh`.
-5. Record both clean post-open reviews against the pushed SHA with
-   `scripts/record-post-review.sh`. Wait for CI and only then merge.
+   independent adversarial reviewer on the pushed diff. Each reviewer must
+   inspect the complete assigned scope and report all findings in that pass.
+2. Verify every finding against the code. Apply all valid findings, explain
+   rejected ones, and batch the fixes into one coherent follow-up commit
+   whenever possible.
+3. Close an ordinary follow-up with a finding-to-fix ledger and the focused
+   owner checks for the changed lines. Do not request another full-diff review
+   merely because valid P2/P3 findings were fixed.
+4. Require another independent review only when the follow-up changes a public
+   contract or strategy, changes ownership, cleanup, FFI, ABI, or an IR shape,
+   crosses three or more compiler layers, exceeds 250 hand-written changed
+   lines, responds to a P1 by redesigning the implementation, or the user asks
+   for another review.
+5. Refresh the final-SHA attestation, record the original review and bounded
+   finding closure, wait for CI, and only then merge.
+
+The normal cycle is therefore review once, fix all findings once, run the
+affected owner checks once, and finish. Repeated review is an explicit
+high-risk exception, not the default completion loop.
 
 Review execution follows the progress-monitoring rules above. If a review tool
 reaches its configured invocation bound without a verdict, record the elapsed
@@ -303,6 +312,29 @@ automation must not launch
 the change scope explicitly requires that expanded verification.
 
 Do not open and immediately merge a code PR.
+
+Do not rerun the same broad review or broad test gate on an unchanged tree.
+After a bounded review fix, run the smallest owner targets that can detect a
+regression in the changed lines; CI remains the final broad gate. Preserve a
+successful earlier result when only documentation or review records change.
+
+## Throughput and checkpoint discipline
+
+Implementation progress is measured by independently correct, mergeable
+source-and-test checkpoints, not by document length, review-log volume,
+formatting churn, or elapsed agent activity.
+
+- After the narrow source-of-truth read, reach a compiling, owner-test-backed
+  implementation checkpoint within 60 minutes.
+- Keep the existing two-hour PR-ready limit. If the checkpoint cannot be made
+  mergeable by then, reduce it to the next smaller correct vertical slice and
+  record the reason in `HANDOFF.md`.
+- Target at most 500 hand-written changed lines per implementation PR. Above
+  1,000 requires the existing written proof that the work cannot be split
+  safely.
+- Once the one review cycle and one coherent fix are complete, merge or
+  explicitly re-scope. Do not start another general improvement or discovery
+  loop inside that PR.
 
 ### Claude Code review adapter
 
