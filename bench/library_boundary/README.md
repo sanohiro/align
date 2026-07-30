@@ -23,6 +23,9 @@ a 256-function, high-CFG fixture with three expression-valued branches per funct
   interface bytes, so inference cost and summary-size growth are recorded together.
 - `import-validation`: semantic-import milliseconds per iteration, including the complete type-shape
   walk, borrow/growth fixed points, dependency-cycle check, and provenance-root validation.
+- `mir-global-type-validation`: whole-program MIR-lowering milliseconds per iteration for a trivial
+  body plus 512 concrete nominal roots, isolating the global type-domain/root/cycle preflight and
+  its required metadata copies.
 - `mir-continuation-lowering`: L2b-a2-ac whole-program MIR-lowering milliseconds per iteration and
   the fixture's total basic-block count, tracking the O(1) required-child continuation protocol.
 
