@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-30. `main` includes the shipped wave through #672.
+_Last updated: 2026-07-30. `main` includes the shipped wave through #674.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -287,9 +287,12 @@ borrow-preserving `if`/`match` sources retain selected owner roots until action;
 success payload and a value-producing loop instead transfer and null their old container/source.
 Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
 states.
-L2b-a2-s is complete in #674. The remaining L2b-a2 work is split by its closure matrix into five
+L2b-a2-s is complete in #674. The remaining L2b-a2 work is split by its closure matrix into seven
 mergeable verticals. L2b-a2-ac first closes MIR continuation after every terminating eager child.
-L2b-a2-af then adds validated fixed-array formation and exact/dynamic element and element-field
+L2b-a2-am-g then validates global type/function tables, callable symbol identity, declarations,
+and every stored-function header before direct handcrafted-HIR lowering. L2b-a2-am-b validates
+every statement, expression type relation and target, action discriminator, id, path, arity, and
+result wrapper. L2b-a2-af adds validated fixed-array formation and exact/dynamic element and element-field
 selection/replacement on that completed substrate. L2b-a2-ar closes retained storage across
 non-fixed index/range, `ArrayChunks`, and `HttpRespHeader` actions. L2b-a2-ap separately closes
 pipeline `Project`/`WhereField` under an explicit stage/terminal state machine. L2b-a2-t completes
@@ -301,13 +304,59 @@ a terminating child may not feed a typed operation, lower a later sibling, appen
 a helper CFG, allocate, or transfer cleanup. Direct tail delegation is permitted only when the
 caller performs no later work, and its first non-tail parent must apply the guard. The owner matrix
 requires every recursive child-lowering entrypoint (`lower_expr`, borrow/block wrappers, consumed
-argument lowering, and delegating helpers) to be classified, plus exact fixed/non-fixed/index/
-native/call/aggregate/control/pipeline no-action tests, whole/per-unit parity, and fail-closed
-handcrafted HIR.
+argument lowering, and delegating helpers) to be classified, plus representative
+fixed/non-fixed/index/native/call/aggregate/control/pipeline no-action tests and whole/per-unit
+parity. Normal driver input is semantically checked HIR; exhaustive handcrafted-HIR action
+metadata validation is the following am boundary.
 Block reachability is an O(1) `BuilderCtx` bit maintained by `new_block`/`terminate`, not a CFG scan
-after every child. Pre-child synthetic-owner, cleanup-bit, metadata, and explicit-region setup
-remains permitted only when the terminating edge owns its cleanup; no post-child transfer/action
-may use non-fallthrough as success.
+after every child. Pre-child synthetic-owner, cleanup-bit, explicit-region setup, and infallible
+checked-HIR type/layout fact derivation remain permitted when the terminating edge owns any
+required cleanup. Fallible compiler-table/path lookup and every parent action wait until all
+required children fall through; no post-child transfer/action may use non-fallthrough as success.
+The L2b-a2-ac implementation is complete on its branch: the caller-local required-child protocol
+covers expression, statement, call, aggregate, native, index/range, and pipeline lowering; all
+value-carrying joins reject an unterminated zero-predecessor block. Missing indirect-function
+signatures and invalid element-field paths terminate without a parent action as narrow defense in
+depth, not as an exhaustive malformed-HIR contract. The author-side matrix-to-diff pass classifies
+every recursive lowering entrypoint as an immediate required child, explicit predecessor-backed
+control continuation, or side-effect-free tail delegation. The focused whole/per-unit MIR and
+codegen owners pass. Positive MIR/codegen owners also preserve origin-compatible indirect and
+`map_err` callback signatures and the settled owned-`string` field to borrowed-`str` read. The
+final revised adversarial preflight is clean. The refreshed Apple Silicon provenance benchmark
+records 3.136 ms/check and
+22,848 bytes for summary inference, 1.835 ms/import, and
+`mir-continuation-lowering` at 1.105 ms/lower over 2,561 basic blocks. The passing ac depth owner is
+the end-to-end `within_limit_chain_compiles_and_runs` test; the broader `expr_depth` binary
+currently reproduces the same sema-time `deep_within_limit_expression_is_accepted` stack overflow
+on unchanged `origin/main` under local Rust 1.96.1 and is recorded as a baseline failure rather than
+a clean ac gate. The ac debug `lower_expr` frame is 75,808 bytes versus main's 77,168 bytes, so the
+slice improves rather than consumes MIR-lowering headroom.
+The hand-written ac diff is roughly 1,700 lines. It cannot split safely by expression family:
+landing any subset would retain the same reachable placeholder operand while knowingly leaving
+another eager parent able to append after termination. Reachability state, the caller-local guard,
+every recursive parent family, and their whole/per-unit tests are therefore one compatibility
+boundary and the smallest independently correct vertical. A fresh adversarial preflight found
+that the original matrix also promised fail-closed checks for every handcrafted-HIR action family
+while the implementation only hardened the two lookups touched by ac. The matrix was reopened:
+the broad contract is now L2b-a2-am-g/am-b. A second revised-matrix review found that action-only
+validation still omitted callable symbol uniqueness and universal `Expr.ty`/operator consistency,
+so the boundary was redesigned instead of patched again. Am-g validates MIR-reachable global type
+graphs, callable symbols, declarations, and stored-function headers, returning a canonical
+all-empty MIR program on failure; producer-permitted unreachable generic-template tagged entries
+remain allowed and omitted. Its roots are table entries, declarations, and stored-function
+headers only. Am-b exclusively owns every body-local type/id reference and callable-symbol use,
+derives the only permitted type for every expression discriminator, and validates each body,
+emitting an Unreachable-only function for invalid action metadata while
+preserving neighboring valid source, monomorphized, and lifted functions. A valid caller of such a
+rejected function reaches its Unreachable-only body. Valid MIR remains byte-identical. Am-g is one
+independent global/header fail-closed slice and fixes the exact link-name and callable-symbol byte
+predicates before any MIR/LLVM/link side effect. Am-b uses an iterative enter/exit worklist so the
+validator cannot replace ac's lowered-expression stack improvement with a new recursive overflow.
+Am-b's exhaustive discriminator walk and mutation
+owners may exceed 1,000 hand-written lines, but activation is atomic: a partial body validator would
+leave the same direct-lowering claim able to panic on an unchecked family. If it cannot remain one
+reviewable exhaustive match, dormant construction and final activation must be re-split before
+coding. Both distinct mergeable boundaries must land after ac and before af.
 The final L2b-a2-s vertical is approximately 1,900 lines because its adversarial review required
 malformed constructor/read/write fail-closed validation, common eager-child source-order snapshots,
 snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
@@ -317,9 +366,9 @@ Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface by
 1.844 ms/import on Apple Silicon.
 Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in twelve
+variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in fourteen
 closed PRs so no incomplete borrow surface is exposed: L2a parameter-mode and provenance-summary
-representation, L2b-a1/a2-s/a2-ac/a2-af/a2-ar/a2-ap/a2-t/b
+representation, L2b-a1/a2-s/a2-ac/a2-am-g/a2-am-b/a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer

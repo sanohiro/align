@@ -16,12 +16,15 @@ and empty return-borrow/return-region summaries. It reports:
 `provenance` builds a deterministic 256-function caller-before-callee dependency chain whose final
 exported function returns only parameter 1. This declaration order requires reverse-worklist
 propagation rather than succeeding through one in-place source-order scan. It also validates a
-deterministic 128-definition generic chain through 256 borrowing signatures. L2b-a1 reports:
+deterministic 128-definition generic chain through 256 borrowing signatures. The same group includes
+a 256-function, high-CFG fixture with three expression-valued branches per function. It reports:
 
 - `summary-inference`: full frontend-check milliseconds per iteration plus the canonical serialized
   interface bytes, so inference cost and summary-size growth are recorded together.
 - `import-validation`: semantic-import milliseconds per iteration, including the complete type-shape
   walk, borrow/growth fixed points, dependency-cycle check, and provenance-root validation.
+- `mir-continuation-lowering`: L2b-a2-ac whole-program MIR-lowering milliseconds per iteration and
+  the fixture's total basic-block count, tracking the O(1) required-child continuation protocol.
 
 L2b-b adds the `indirect-return` row to the same group after target-relative function-value
 provenance lands.

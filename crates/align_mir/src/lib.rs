@@ -2454,6 +2454,9 @@ struct Builder {
 /// `Builder::dbg`. `lower_expr` is deeply recursive, so growing `Builder` itself by even a few words
 /// multiplies across the accepted expression-depth limit and can overflow the test thread stack.
 struct BuilderCtx {
+    /// Monotone entry reachability for each MIR block. Kept out of `Builder` itself so recursive
+    /// expression lowering retains its measured stack headroom.
+    reachable_blocks: Vec<bool>,
     /// Runtime bit saying an SSA value is backed by an unbound owned temporary, rather than a
     /// borrowed bound place. Control-flow joins preserve the selected path's bit.
     value_temp_drop_flags: Vec<Option<Operand>>,
@@ -2517,6 +2520,7 @@ impl Builder {
             stmt_lines: Vec::new(),
             term: None,
         });
+        self.ctx.reachable_blocks.push(false);
         id
     }
 
@@ -2656,6 +2660,10 @@ impl Builder {
     }
 
     fn push(&mut self, s: Stmt) {
+        debug_assert!(
+            !self.is_terminated(),
+            "cannot append a MIR statement after the current block terminates"
+        );
         // Only track source lines when lowering located (explain-opt / debug info). Kept tiny and the
         // line work in a separate `#[inline(never)]` helper: `push` is inlined into `lower_expr`, a
         // very large, deeply recursive function, so any locals here would grow its per-level frame
@@ -2677,10 +2685,33 @@ impl Builder {
     }
 
     fn terminate(&mut self, t: Term) {
-        let b = &mut self.blocks[self.cur as usize];
-        if b.term.is_none() {
-            b.term = Some(t);
+        let current = self.cur as usize;
+        if self.blocks[current].term.is_some() {
+            debug_assert!(
+                self.blocks[current].term.is_none(),
+                "cannot install a second MIR terminator"
+            );
+            return;
         }
+        if self.ctx.reachable_blocks[current] {
+            let mut mark = |target: BlockId| {
+                let target = target as usize;
+                debug_assert!(
+                    self.blocks[target].term.is_none() || self.ctx.reachable_blocks[target],
+                    "a terminated unreachable block cannot gain a late predecessor"
+                );
+                self.ctx.reachable_blocks[target] = true;
+            };
+            match &t {
+                Term::Goto(target) => mark(*target),
+                Term::Branch(_, then_bb, else_bb) => {
+                    mark(*then_bb);
+                    mark(*else_bb);
+                }
+                Term::Return(_) | Term::Unreachable => {}
+            }
+        }
+        self.blocks[current].term = Some(t);
     }
 
     fn is_terminated(&self) -> bool {
@@ -2692,26 +2723,7 @@ impl Builder {
     /// when all arms terminate that join has no predecessor but also no terminator. Looking only at
     /// `is_terminated` would therefore treat its placeholder Unit operand as a real continuation.
     fn current_is_reachable(&self) -> bool {
-        let mut pending = vec![0];
-        let mut seen = vec![false; self.blocks.len()];
-        while let Some(block) = pending.pop() {
-            let index = block as usize;
-            if index >= self.blocks.len() || std::mem::replace(&mut seen[index], true) {
-                continue;
-            }
-            if block == self.cur {
-                return true;
-            }
-            match self.blocks[index].term.as_ref() {
-                Some(Term::Goto(target)) => pending.push(*target),
-                Some(Term::Branch(_, then_bb, else_bb)) => {
-                    pending.push(*then_bb);
-                    pending.push(*else_bb);
-                }
-                Some(Term::Return(_) | Term::Unreachable) | None => {}
-            }
-        }
-        false
+        self.ctx.reachable_blocks[self.cur as usize]
     }
 }
 
@@ -2755,6 +2767,7 @@ fn lower_fn(
         alias_scope: 0,
         loops: Vec::new(),
         ctx: Box::new(BuilderCtx {
+            reachable_blocks: Vec::new(),
             value_temp_drop_flags: Vec::new(),
             synthetic_drop_slots: Vec::new(),
             value_borrow_owners: Vec::new(),
@@ -2765,6 +2778,7 @@ fn lower_fn(
     };
     let entry = b.new_block();
     b.cur = entry;
+    b.ctx.reachable_blocks[entry as usize] = true;
 
     // Slot index == HIR LocalId (locals are created in id order).
     let params: Vec<Slot> = f.params.clone();
@@ -2784,7 +2798,7 @@ fn lower_fn(
     }
 
     let tail = lower_block(&mut b, &f.body);
-    if !b.is_terminated() {
+    if lowering_continues(&mut b) {
         // Fall-through end of the body: if the trailing value moves an owned local out (the
         // function returns it), clear that local's slot and flag — the caller now owns the value —
         // then conditionally drop the remaining owned locals.
@@ -3033,6 +3047,9 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
 /// Lower the root of an owned value in a borrowing context. Value-carrying control flow must not
 /// null a bound-local arm merely because it stores that borrowed value through a join slot.
 fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     match &e.kind {
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, true),
@@ -3046,7 +3063,7 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.arenas.push(handle);
             let tail = lower_block_for_borrow(b, block);
             b.arenas.pop();
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 Operand::Const(Const::Unit)
             } else {
                 b.push(Stmt::ArenaEnd(Operand::Value(handle)));
@@ -3059,7 +3076,7 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.task_groups.push(handle);
             let tail = lower_block_for_borrow(b, block);
             b.task_groups.pop();
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 Operand::Const(Const::Unit)
             } else {
                 b.push(Stmt::TgWait(Operand::Value(handle)));
@@ -3075,6 +3092,9 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
 /// producers can extend it and scalar consumers can end it immediately.
 fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         || !may_need_synthetic_owner(e)
     {
@@ -3083,7 +3103,7 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
     // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
     let owner = b.new_synthetic_owner(e.ty);
     let operand = lower_expr_for_borrow(b, e);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return operand;
     }
     let live = temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
@@ -3129,6 +3149,28 @@ fn inherit_borrow_owners<'a>(b: &mut Builder, value: ValueId, operands: impl Int
         }
     }
     b.attach_borrow_owners(value, owners);
+}
+
+/// Lower one required child and stop the enclosing helper when it has no live continuation.
+///
+/// This expands in the caller rather than wrapping `lower_expr` in another function, preserving
+/// the recursive stack headroom measured by the `expr_depth` gate. The lowered expression may use
+/// any recursive entrypoint (`lower_expr_for_borrow`, `lower_borrowed_owned`, ...).
+macro_rules! lower_required {
+    ($builder:expr, $lowered:expr, ()) => {{
+        let operand = $lowered;
+        if !lowering_continues($builder) {
+            return;
+        }
+        operand
+    }};
+    ($builder:expr, $lowered:expr, $fallback:expr) => {{
+        let operand = $lowered;
+        if !lowering_continues($builder) {
+            return $fallback;
+        }
+        operand
+    }};
 }
 
 /// Result storage for a value-carrying CFG join. Owned values get a parallel boolean slot; scalar
@@ -3219,9 +3261,12 @@ fn rng_slot(rng: &hir::Expr) -> Slot {
 /// (e.g. `return`), the current block becomes terminated and the rest of the block —
 /// including its trailing value — is dead code and is not lowered.
 fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
+    if !lowering_continues(b) {
+        return None;
+    }
     for s in &block.stmts {
         lower_stmt(b, s);
-        if b.is_terminated() {
+        if !lowering_continues(b) {
             return None;
         }
     }
@@ -3238,9 +3283,12 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
 /// Statements still use their ordinary ownership rules; only the value delivered by the block is
 /// borrowed by the enclosing expression.
 fn lower_block_for_borrow(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
+    if !lowering_continues(b) {
+        return None;
+    }
     for s in &block.stmts {
         lower_stmt(b, s);
-        if b.is_terminated() {
+        if !lowering_continues(b) {
             return None;
         }
     }
@@ -3269,6 +3317,9 @@ fn stmt_span(s: &hir::Stmt) -> Option<Span> {
 }
 
 fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
+    if !lowering_continues(b) {
+        return;
+    }
     // Anchor this statement's instructions to its primary expression's line (debug info). Set inline
     // — no save/restore wrapper — because `lower_stmt` sits at the base of `lower_expr`'s deep
     // per-sub-expression recursion; an extra wrapper frame there overflows the test thread on
@@ -3297,7 +3348,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     // fields remain owned until every later field succeeds, and the destination
                     // inherits the runtime mode of a heap/arena-joined source member.
                     let (op, owners) = lower_consumed_call_arg(b, init);
-                    if b.is_terminated() {
+                    if !lowering_continues(b) {
                         return;
                     }
                     inherited_flag = lowered_drop_flag(b, init, &op);
@@ -3317,22 +3368,19 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 }
                 hir::ExprKind::ArrayLit { elems, elem, pooled: false } => {
                     inherited_flag = store_array_elems(b, *local, elems, *elem);
-                    if b.is_terminated() {
+                    if !lowering_continues(b) {
                         return;
                     }
                 }
                 _ => {
-                    let op = lower_expr(b, init);
-                    if b.is_terminated() {
-                        return;
-                    }
+                    let op = lower_required!(b, lower_expr(b, init), ());
                     inherited_flag = lowered_drop_flag(b, init, &op);
                     b.push(Stmt::Store(*local, op));
                     // If the initializer moved an owned local, clear its storage and runtime flag.
                     null_moved_source(b, init);
                 }
             }
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return;
             }
             match inherited_flag {
@@ -3346,10 +3394,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // analysis), conditionally free the buffer being overwritten — else it leaks. The
             // runtime flag distinguishes an individually owned old value from arena-owned, moved,
             // or uninitialised paths.
-            let op = lower_expr(b, value);
-            if b.is_terminated() {
-                return;
-            }
+            let op = lower_required!(b, lower_expr(b, value), ());
             let inherited_flag = lowered_drop_flag(b, value, &op);
             if drop_old.get() && b.drop_locals.contains(local) {
                 b.emit_drop_if_live(*local);
@@ -3397,10 +3442,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // Assignment evaluates the RHS before mutating the destination. Capture it first so
             // borrows of the old field remain valid during evaluation and a consuming RHS can
             // transfer that exact ownership back into the destination.
-            let replacement = lower_expr(b, value);
-            if b.is_terminated() {
-                return;
-            }
+            let replacement = lower_required!(b, lower_expr(b, value), ());
             // The replacement is already captured, so clear its old source before the store. This
             // is path-local for control-flow RHSs: an arm that transfers the destination zeros it,
             // while a fresh-value arm leaves the old value live. Dropping the destination
@@ -3415,8 +3457,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
             // read). A `{ptr,len}` slice/owned-array writes through its buffer pointer; a fixed
             // stack array writes its slot directly.
-            let idx = lower_expr(b, index);
-            let val = lower_expr(b, value);
+            let idx = lower_required!(b, lower_expr(b, index), ());
+            let val = lower_required!(b, lower_expr(b, value), ());
             let base_ty = b.slots[*base as usize];
             match base_ty {
                 Ty::Slice(s) | Ty::DynArray(s) => {
@@ -3443,8 +3485,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // its path is always length 1); a fixed `array<Struct>` writes its slot element-field via
             // `StoreElemField` (a `[0,index,*path]` GEP); an owned dynamic `array<Struct>` writes
             // through the buffer pointer (`StoreElemFieldPtr`, a `[index,*path]` GEP).
-            let idx = lower_expr(b, index);
-            let val = lower_expr(b, value);
+            let idx = lower_required!(b, lower_expr(b, index), ());
+            let val = lower_required!(b, lower_expr(b, value), ());
             if *soa {
                 let soa_ty = b.slots[*base as usize];
                 let sv = b.fresh_value(soa_ty);
@@ -3512,8 +3554,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // into their columns (`StoreColumn` per field); a fixed `array<Struct>` stores the whole
             // struct aggregate into element `index` (`StoreIndex`, a `[0,index]` GEP). The struct is
             // plain-old-data (sema gate), so the value is a Copy aggregate — no per-field drop.
-            let idx = lower_expr(b, index);
-            let val = lower_expr(b, value);
+            let idx = lower_required!(b, lower_expr(b, index), ());
+            let val = lower_required!(b, lower_expr(b, value), ());
             if *soa {
                 let soa_ty = b.slots[*base as usize];
                 let sv = b.fresh_value(soa_ty);
@@ -3564,7 +3606,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         }
         // `v[lane] = value` → `v = insertelement(v, value, lane)` (a vector is a register value).
         hir::Stmt::AssignVecLane { local, lane, value } => {
-            let val = lower_expr(b, value);
+            let val = lower_required!(b, lower_expr(b, value), ());
             let vty = b.slots[*local as usize];
             let cur = b.fresh_value(vty);
             b.push(Stmt::Let(cur, Rvalue::Load(*local)));
@@ -3576,13 +3618,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // Evaluate an explicit Unit return for its effects, but keep the function ABI `void`.
             // Other Unit-producing control-flow expressions already canonicalize to Const::Unit;
             // a direct/indirect Unit call now does too.
-            let op = value.as_ref().and_then(|e| {
-                let op = lower_expr(b, e);
-                (e.ty != Ty::Unit).then_some(op)
-            });
+            let op = match value {
+                Some(e) => {
+                    let op = lower_required!(b, lower_expr(b, e), ());
+                    (e.ty != Ty::Unit).then_some(op)
+                }
+                None => None,
+            };
             // A diverging Unit expression (`process.exit` / `process.abort`, until Align has
             // `Never`) already emitted cleanup as required and terminated the block.
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return;
             }
             // A returned owned array is moved out: null its slot so the exit cleanup below frees
@@ -3619,17 +3664,10 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             };
             let (result_slot, iter_drops, exit) =
                 (frame.result_slot, frame.iter_drops.clone(), frame.exit);
-            let op = value.as_ref().map(|e| lower_expr(b, e));
-            if b.is_terminated() {
-                return;
-            }
-            if !b.current_is_reachable() {
-                // An all-diverging `if`/`match` payload selects its zero-predecessor join after
-                // lowering. Mark that synthetic continuation unreachable so `lower_block` stops;
-                // the inner break/return/process edge remains the only real exit.
-                b.terminate(Term::Unreachable);
-                return;
-            }
+            let op = match value {
+                Some(e) => Some(lower_required!(b, lower_expr(b, e), ())),
+                None => None,
+            };
             if let (Some(slot), Some(op)) = (result_slot, op) {
                 b.push(Stmt::Store(slot, op));
             }
@@ -3647,7 +3685,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         }
         hir::Stmt::LetTuple { locals, init, .. } => {
             // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
-            let tup = lower_expr(b, init);
+            let tup = lower_required!(b, lower_expr(b, init), ());
             let inherited_flag = lowered_drop_flag(b, init, &tup);
             // If the tuple was built from owned source locals (`(x, y) := (a, b)`), null them: the
             // destructure targets now own the buffers, so the source slots must not also free them.
@@ -3670,1222 +3708,1899 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // synthetic-owner path as a borrowing consumer, then end that ownership immediately.
             // A bare bound local is classified as a borrowed place and remains untouched.
             let op = lower_borrowed_owned(b, e);
-            if !b.is_terminated() {
+            if lowering_continues(b) {
                 drop_borrow_owners(b, &op);
             }
         }
     }
 }
 
+/// Materialize a sema-folded constant array without enlarging the recursive `lower_expr` frame.
+/// This helper never lowers a child expression.
+#[inline(never)]
+fn finish_const_array(
+    b: &mut Builder,
+    elems: &[hir::Expr],
+    elem: align_sema::Scalar,
+    ty: Ty,
+) -> Operand {
+    let cvals: Vec<ConstElem> = elems
+        .iter()
+        .map(|element| match &element.kind {
+            hir::ExprKind::Int(value) => ConstElem::Int(*value),
+            hir::ExprKind::Float(value) => ConstElem::Float(*value),
+            hir::ExprKind::Bool(value) => ConstElem::Bool(*value),
+            hir::ExprKind::Char(value) => ConstElem::Char(*value),
+            hir::ExprKind::Str(value) => ConstElem::Str(value.clone()),
+            _ => unreachable!("aggregate-constant element is a folded scalar/str literal"),
+        })
+        .collect();
+    let value = b.fresh_value(ty);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::ConstArray {
+            elems: cvals,
+            elem: align_sema::scalar_to_ty(elem),
+        },
+    ));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn terminated_operand() -> Operand {
+    Operand::Const(Const::Unit)
+}
+
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
-    // NOTE: `cur_span` is deliberately NOT set here. `lower_expr` is a very large, deeply recursive
-    // function; touching its frame (even one field write) grows it enough to overflow the test
-    // thread on machine-generated deep expressions (`expr_depth`). Instead the enclosing `lower_stmt`
-    // and `lower_block` (shallow, not per-sub-expression) set the span, which anchors every pipeline
-    // / loop / call site — a function body's pipeline lowers from one block-value expression, a
-    // statement's from its primary expression. Sub-expressions inherit the enclosing span; that
-    // statement-level granularity is what the debug-info anchoring needs (`09-explain-opt.md`).
-    match &e.kind {
-        hir::ExprKind::Unit => Operand::Const(Const::Unit),
-        hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),
-        hir::ExprKind::Float(v) => Operand::Const(Const::Float(*v, e.ty)),
-        hir::ExprKind::Char(v) => Operand::Const(Const::Char(*v)),
-        hir::ExprKind::Str(s) => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
-            Operand::Value(v)
+    'lower_expr: {
+        // Keep every required-child failure in this giant recursive dispatcher on one common exit.
+        // Separate `return Const::Unit` expansions make debug LLVM reserve one return temporary per
+        // match arm, enough to violate the measured expression-depth stack ceiling.
+        macro_rules! lower_required {
+            ($builder:expr, $lowered:expr, $fallback:expr) => {{
+                let operand = $lowered;
+                if !lowering_continues($builder) {
+                    break 'lower_expr terminated_operand();
+                }
+                operand
+            }};
         }
-        hir::ExprKind::ConstArray { elems, elem, len: _ } => {
-            // Each element is a folded scalar/str literal (built by sema's `const_literal`);
-            // collect them into the MIR aggregate and let codegen materialize the rodata global.
-            let cvals: Vec<ConstElem> = elems
-                .iter()
-                .map(|el| match &el.kind {
-                    hir::ExprKind::Int(v) => ConstElem::Int(*v),
-                    hir::ExprKind::Float(v) => ConstElem::Float(*v),
-                    hir::ExprKind::Bool(bl) => ConstElem::Bool(*bl),
-                    hir::ExprKind::Char(c) => ConstElem::Char(*c),
-                    hir::ExprKind::Str(s) => ConstElem::Str(s.clone()),
-                    _ => unreachable!("aggregate-constant element is a folded scalar/str literal"),
+        macro_rules! lower_required_binding {
+            ($builder:expr, $name:ident = $lowered:expr, $fallback:expr) => {
+                let $name = $lowered;
+                if !lowering_continues($builder) {
+                    break 'lower_expr terminated_operand();
+                }
+            };
+        }
+        // NOTE: `cur_span` is deliberately NOT set here. `lower_expr` is a very large, deeply
+        // recursive function; touching its frame (even one field write) grows it enough to overflow
+        // the test thread on machine-generated deep expressions (`expr_depth`). Instead the
+        // enclosing `lower_stmt` and `lower_block` (shallow, not per-sub-expression) set the span,
+        // which anchors every pipeline / loop / call site — a function body's pipeline lowers from
+        // one block-value expression, a statement's from its primary expression. Sub-expressions
+        // inherit the enclosing span; that statement-level granularity is what the debug-info
+        // anchoring needs (`09-explain-opt.md`).
+        match &e.kind {
+            hir::ExprKind::Unit => Operand::Const(Const::Unit),
+            hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),
+            hir::ExprKind::Float(v) => Operand::Const(Const::Float(*v, e.ty)),
+            hir::ExprKind::Char(v) => Operand::Const(Const::Char(*v)),
+            hir::ExprKind::Str(s) => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
+                Operand::Value(v)
+            }
+            hir::ExprKind::ConstArray {
+                elems,
+                elem,
+                len: _,
+            } => finish_const_array(b, elems, *elem, e.ty),
+            hir::ExprKind::Template(parts) => {
+                // Outside an explicit arena, retain the produced bytes in a hidden owned string.
+                // Its view inherits this owner through scalar/view consumers and loop/function
+                // cleanup. Register before holes: a `?` inside one may emit an early cleanup edge.
+                // The condition is sema's (`owns_hidden_string`), shared so `MoveCheck`'s borrow
+                // liveness ends a template view's generation at exactly the loop edge where this
+                // owner is freed.
+                let owner = owns_hidden_string(e, !b.arenas.is_empty())
+                    .then(|| b.new_synthetic_owner(Ty::String));
+                let mut pieces = Vec::new();
+                for p in parts {
+                    match p {
+                        hir::TemplatePart::Text(s) => {
+                            pieces.push(TemplatePiece::Static(s.clone()));
+                        }
+                        hir::TemplatePart::Hole(h) => {
+                            let ty = h.ty;
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, h),
+                                Operand::Const(Const::Unit)
+                            );
+                            // The piece is picked by sema's SINGLE display classification
+                            // (`print_kind`), never by a local catch-all: a printable type sema
+                            // accepts but this match forgot used to fall into `IntHole` and hand
+                            // codegen a `{ptr,len}` aggregate where it demanded an integer. An
+                            // owned `string` is already a borrowed `str` here (sema's
+                            // `StrBorrow`), so it renders through the one string path.
+                            pieces.push(match align_sema::print_kind(ty) {
+                                Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(op),
+                                Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(op),
+                                Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(op),
+                                Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(op),
+                                // `Int`, plus the poisoned `Ty::Error` hole — unprintable holes
+                                // are a sema error, and an erroring program never reaches MIR, so
+                                // the only `None` here is the error sentinel, which codegen renders
+                                // as an int.
+                                Some(align_sema::PrintKind::Int) | None => {
+                                    TemplatePiece::IntHole(op)
+                                }
+                            });
+                        }
+                        hir::TemplatePart::JsonStr(h) => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, h),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::JsonStrHole(op));
+                        }
+                        hir::TemplatePart::OptionField { access, name } => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, access),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::OptionField {
+                                opt: op,
+                                name: name.clone(),
+                            });
+                        }
+                        hir::TemplatePart::OptionStructField {
+                            access,
+                            name,
+                            struct_id,
+                        } => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, access),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::OptionStructField {
+                                opt: op,
+                                name: name.clone(),
+                                struct_id: *struct_id,
+                            });
+                        }
+                        hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
+                        hir::TemplatePart::StructArrayField { access, struct_id } => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, access),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::StructArrayField {
+                                array: op,
+                                struct_id: *struct_id,
+                            });
+                        }
+                        hir::TemplatePart::ScalarArrayField { access, elem } => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, access),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::ScalarArrayField {
+                                array: op,
+                                elem: *elem,
+                            });
+                        }
+                        hir::TemplatePart::UnionValue { access, enum_id } => {
+                            lower_required_binding!(
+                                b,
+                                op = lower_expr(b, access),
+                                Operand::Const(Const::Unit)
+                            );
+                            pieces.push(TemplatePiece::UnionValue {
+                                value: op,
+                                enum_id: *enum_id,
+                            });
+                        }
+                    }
+                }
+                let arena = b.arenas.last().map(|h| Operand::Value(*h));
+                let r = b.fresh_value(e.ty);
+                b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
+                if let Some(owner) = owner {
+                    b.push(Stmt::Store(owner, Operand::Value(r)));
+                    b.set_drop_flag(owner, true);
+                    b.attach_borrow_owners(r, [owner]);
+                }
+                Operand::Value(r)
+            }
+            hir::ExprKind::JsonDecode { struct_id, input } => {
+                lower_json_decode(b, *struct_id, input, e.ty)
+            }
+            hir::ExprKind::JsonDecodeArray { elem, input } => {
+                lower_json_decode_array(b, *elem, input, e.ty)
+            }
+            hir::ExprKind::JsonDecodeScalar { scalar, input } => {
+                lower_json_decode_scalar(b, *scalar, input, e.ty)
+            }
+            hir::ExprKind::JsonDecodeStructArray { struct_id, input } => {
+                lower_json_decode_struct_array(b, *struct_id, input, e.ty)
+            }
+            hir::ExprKind::JsonDecodeSoa { struct_id, input } => {
+                lower_json_decode_soa(b, *struct_id, input, e.ty)
+            }
+            hir::ExprKind::JsonDecodeUnion { enum_id, input } => {
+                lower_json_decode_union(b, *enum_id, input, e.ty)
+            }
+            // `json.doc(...)` and the doc accessors (J4). Out-of-line helpers (each builds a block or two)
+            // to keep the recursive `lower_expr` frame flat (the #296 expr-depth lesson).
+            hir::ExprKind::JsonDoc { input } => lower_json_doc(b, input, e.ty),
+            hir::ExprKind::JsonDocKind { doc } => {
+                lower_required_binding!(b, d = lower_expr(b, doc), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::JsonDocKind { doc: d }));
+                Operand::Value(v)
+            }
+            hir::ExprKind::JsonDocGet { doc, key } => lower_json_doc_get(b, doc, key, e.ty),
+            hir::ExprKind::JsonDocAt { doc, index } => lower_json_doc_at(b, doc, index, e.ty),
+            hir::ExprKind::JsonDocAsStr { doc } => lower_json_doc_as_str(b, doc, e.ty),
+            hir::ExprKind::JsonDocAsScalar { doc, scalar } => {
+                lower_json_doc_as_scalar(b, doc, *scalar, e.ty)
+            }
+            hir::ExprKind::JsonDocLen { doc } => {
+                lower_required_binding!(b, d = lower_expr(b, doc), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::JsonDocLen { doc: d }));
+                Operand::Value(v)
+            }
+            // `json.scan(input)` (J5): the scanner value is the input `{ptr,len}` view retyped as
+            // `json.scanner<Row>` — no allocation. It is bound to a local and consumed as a pipeline
+            // source (the fused terminal drives the streaming steps).
+            hir::ExprKind::JsonScan {
+                struct_id: _,
+                input,
+            } => {
+                lower_required_binding!(b, inp = lower_expr(b, input), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::JsonScanNew { input: inp }));
+                Operand::Value(v)
+            }
+            hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
+            hir::ExprKind::JsonDocElems { doc } => {
+                let arena = *b
+                    .arenas
+                    .last()
+                    .expect("json.doc.elems() outside an arena (sema-checked)");
+                let out = b.new_slot(e.ty); // slice<json.doc>
+                lower_required_binding!(b, d = lower_expr(b, doc), Operand::Const(Const::Unit));
+                let unit = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(
+                    unit,
+                    Rvalue::JsonDocElems {
+                        doc: d,
+                        arena: Operand::Value(arena),
+                        out,
+                    },
+                ));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Load(out)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
+            // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
+            // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
+            hir::ExprKind::ReaderOpen { path } => {
+                lower_open_handle(b, path, Ty::Reader, e.ty, |p, out| Rvalue::ReaderOpen {
+                    path: p,
+                    out,
                 })
-                .collect();
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ConstArray { elems: cvals, elem: align_sema::scalar_to_ty(*elem) }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Template(parts) => {
-            // Outside an explicit arena, retain the produced bytes in a hidden owned string. Its
-            // view inherits this owner through scalar/view consumers and loop/function cleanup.
-            // Register before holes: a `?` inside one may emit an early cleanup edge. The condition
-            // is sema's (`owns_hidden_string`), shared so `MoveCheck`'s borrow liveness ends a
-            // template view's generation at exactly the loop edge where this owner is freed.
-            let owner = owns_hidden_string(e, !b.arenas.is_empty()).then(|| b.new_synthetic_owner(Ty::String));
-            let mut pieces = Vec::new();
-            for p in parts {
-                match p {
-                    hir::TemplatePart::Text(s) => pieces.push(TemplatePiece::Static(s.clone())),
-                    hir::TemplatePart::Hole(h) => {
-                        let ty = h.ty;
-                        let op = lower_expr(b, h);
-                        // The piece is picked by sema's SINGLE display classification
-                        // (`print_kind`), never by a local catch-all: a printable type sema accepts
-                        // but this match forgot used to fall into `IntHole` and hand codegen a
-                        // `{ptr,len}` aggregate where it demanded an integer. An owned `string` is
-                        // already a borrowed `str` here (sema's `StrBorrow`), so it renders through
-                        // the one string path.
-                        pieces.push(match align_sema::print_kind(ty) {
-                            Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(op),
-                            Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(op),
-                            Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(op),
-                            Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(op),
-                            // `Int`, plus the poisoned `Ty::Error` hole — unprintable holes are a
-                            // sema error, and an erroring program never reaches MIR, so the only
-                            // `None` here is the error sentinel, which codegen renders as an int.
-                            Some(align_sema::PrintKind::Int) | None => TemplatePiece::IntHole(op),
-                        });
+            }
+            hir::ExprKind::WriterCreate { path } => {
+                lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreate {
+                    path: p,
+                    out,
+                })
+            }
+            // All A4 `file` ops — the two constructors (`fs.create_rw`/`fs.open_rw`, `Result<file, Error>`)
+            // and the three methods (`pread`/`pwrite`/`len`, `Result<i64, Error>`) — go through ONE
+            // `#[inline(never)]` dispatcher, so they add a single tiny arm to the recursive `lower_expr`
+            // frame rather than five inline bodies (the #296 expr-depth lesson; `lower_expr`'s debug frame
+            // is depth-multiplied, so keeping it flat matters).
+            hir::ExprKind::FileCreateRw { .. }
+            | hir::ExprKind::FileOpenRw { .. }
+            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePwrite { .. }
+            | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
+            hir::ExprKind::ReaderStdin => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ReaderStdin));
+                Operand::Value(v)
+            }
+            hir::ExprKind::WriterStd { fd, buffered } => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::WriterStd {
+                        fd: *fd,
+                        buffered: *buffered,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `r.read(b)` yields `Result<i64, Error>` from the runtime's i64: a count `>= 0` is `Ok`,
+            // a `< 0` value encodes `-(status)` for the `Err`.
+            hir::ExprKind::ReaderRead { reader, buffer } => {
+                lower_required_binding!(
+                    b,
+                    rop = lower_expr(b, reader),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(
+                    b,
+                    bop = lower_expr(b, buffer),
+                    Operand::Const(Const::Unit)
+                );
+                lower_reader_read(b, rop, bop, e.ty)
+            }
+            // All three A7 line-read ops (`r.buffered()` / `r.read_line(b)` / `bytes.as_str()`) go
+            // through ONE `#[inline(never)]` dispatcher, so `lower_expr` gains a single tiny arm rather
+            // than three inline bodies — `lower_expr` is depth-multiplied, so keeping its frame flat
+            // preserves the expr-depth budget (the #296 lesson, mirroring the file / array_builder
+            // dispatchers).
+            hir::ExprKind::ReaderBuffered { .. }
+            | hir::ExprKind::ReaderReadLine { .. }
+            | hir::ExprKind::BytesAsStr { .. } => lower_reader_line_expr(b, e),
+            // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
+            // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
+            hir::ExprKind::IoCopy { reader, writer } => {
+                lower_required_binding!(
+                    b,
+                    rop = lower_expr(b, reader),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(
+                    b,
+                    wop = lower_expr(b, writer),
+                    Operand::Const(Const::Unit)
+                );
+                let n = b.fresh_value(i64_ty());
+                b.push(Stmt::Let(n, Rvalue::IoCopy(rop, wop)));
+                lower_count_or_status_result(b, n, e.ty)
+            }
+            // `w.write(x)` / `w.flush()` yield `Result<(), Error>` from an i32 errno-status.
+            hir::ExprKind::WriterWrite {
+                writer,
+                arg,
+                builder,
+            } => {
+                lower_required_binding!(
+                    b,
+                    wop = lower_expr(b, writer),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, aop = lower_expr(b, arg), Operand::Const(Const::Unit));
+                let mk: Box<dyn FnOnce(&mut Builder) -> ValueId> = if *builder {
+                    Box::new(move |b| {
+                        let v = b.fresh_value(status_ty());
+                        b.push(Stmt::Let(v, Rvalue::WriterWriteBuilder(wop, aop)));
+                        v
+                    })
+                } else {
+                    Box::new(move |b| {
+                        let v = b.fresh_value(status_ty());
+                        b.push(Stmt::Let(v, Rvalue::WriterWrite(wop, aop)));
+                        v
+                    })
+                };
+                let code = mk(b);
+                lower_status_result(b, code, e.ty)
+            }
+            hir::ExprKind::WriterFlush { writer } => {
+                lower_required_binding!(
+                    b,
+                    wop = lower_expr(b, writer),
+                    Operand::Const(Const::Unit)
+                );
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::WriterFlush(wop)));
+                lower_status_result(b, code, e.ty)
+            }
+            hir::ExprKind::BufferNew { capacity } => {
+                lower_required_binding!(
+                    b,
+                    cap = lower_expr(b, capacity),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BufferNew(cap)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BufferBytes { buffer } => {
+                lower_required_binding!(
+                    b,
+                    bop = lower_expr(b, buffer),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BufferBytes(bop)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BufferLen { buffer } => {
+                lower_required_binding!(
+                    b,
+                    bop = lower_expr(b, buffer),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BytesRead { bytes, offset, be } => {
+                lower_bytes_read(b, bytes, offset, *be, e.ty)
+            }
+            hir::ExprKind::BufferPut { buffer, value, be } => {
+                lower_buffer_put(b, buffer, value, *be)
+            }
+            hir::ExprKind::BufferAppend { buffer, data } => lower_buffer_append(b, buffer, data),
+            // `array_builder<T>` (M12 A6) — new/push/append/build go through ONE `#[inline(never)]`
+            // dispatcher so they add a single tiny arm to the recursive `lower_expr` frame, not four
+            // inline bodies (the #296 expr-depth lesson).
+            hir::ExprKind::ArrayBuilderNew { .. }
+            | hir::ExprKind::ArrayBuilderPush { .. }
+            | hir::ExprKind::ArrayBuilderAppend { .. }
+            | hir::ExprKind::ArrayBuilderBuild(_) => lower_array_builder_expr(b, e),
+            // `fs.write_file(path, data)` yields `Result<(), Error>` from an i32 errno-status (str/bytes
+            // vs builder pick the runtime fn, like `writer.write`).
+            hir::ExprKind::FsWriteFile {
+                path,
+                data,
+                builder,
+            } => {
+                lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
+                lower_required_binding!(b, dop = lower_expr(b, data), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                let rv = if *builder {
+                    Rvalue::FsWriteFileBuilder {
+                        path: pop,
+                        builder: dop,
                     }
-                    hir::TemplatePart::JsonStr(h) => {
-                        let op = lower_expr(b, h);
-                        pieces.push(TemplatePiece::JsonStrHole(op));
+                } else {
+                    Rvalue::FsWriteFile {
+                        path: pop,
+                        data: dop,
                     }
-                    hir::TemplatePart::OptionField { access, name } => {
-                        let op = lower_expr(b, access);
-                        pieces.push(TemplatePiece::OptionField { opt: op, name: name.clone() });
-                    }
-                    hir::TemplatePart::OptionStructField { access, name, struct_id } => {
-                        let op = lower_expr(b, access);
-                        pieces.push(TemplatePiece::OptionStructField { opt: op, name: name.clone(), struct_id: *struct_id });
-                    }
-                    hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
-                    hir::TemplatePart::StructArrayField { access, struct_id } => {
-                        let op = lower_expr(b, access);
-                        pieces.push(TemplatePiece::StructArrayField { array: op, struct_id: *struct_id });
-                    }
-                    hir::TemplatePart::ScalarArrayField { access, elem } => {
-                        let op = lower_expr(b, access);
-                        pieces.push(TemplatePiece::ScalarArrayField { array: op, elem: *elem });
-                    }
-                    hir::TemplatePart::UnionValue { access, enum_id } => {
-                        let op = lower_expr(b, access);
-                        pieces.push(TemplatePiece::UnionValue { value: op, enum_id: *enum_id });
-                    }
-                }
-                if b.is_terminated() {
-                    return Operand::Value(b.fresh_value(e.ty));
-                }
+                };
+                b.push(Stmt::Let(code, rv));
+                lower_status_result(b, code, e.ty)
             }
-            let arena = b.arenas.last().map(|h| Operand::Value(*h));
-            let r = b.fresh_value(e.ty);
-            b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
-            if let Some(owner) = owner {
-                b.push(Stmt::Store(owner, Operand::Value(r)));
-                b.set_drop_flag(owner, true);
-                b.attach_borrow_owners(r, [owner]);
+            // `fs.exists(path)` yields a plain `bool` — the runtime's `1`/`0` compared `!= 0` (every
+            // error already folded to `0`, so there is no status branch).
+            hir::ExprKind::FsExists { path } => {
+                lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
+                let c = b.fresh_value(status_ty());
+                b.push(Stmt::Let(c, Rvalue::FsExists { path: pop }));
+                let v = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Bin(
+                        BinOp::Ne,
+                        Operand::Value(c),
+                        Operand::Const(Const::Int(0, status_ty())),
+                    ),
+                ));
+                Operand::Value(v)
             }
-            Operand::Value(r)
-        }
-        hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
-        hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
-        hir::ExprKind::JsonDecodeScalar { scalar, input } => lower_json_decode_scalar(b, *scalar, input, e.ty),
-        hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
-        hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
-        hir::ExprKind::JsonDecodeUnion { enum_id, input } => lower_json_decode_union(b, *enum_id, input, e.ty),
-        // `json.doc(...)` and the doc accessors (J4). Out-of-line helpers (each builds a block or two)
-        // to keep the recursive `lower_expr` frame flat (the #296 expr-depth lesson).
-        hir::ExprKind::JsonDoc { input } => lower_json_doc(b, input, e.ty),
-        hir::ExprKind::JsonDocKind { doc } => {
-            let d = lower_expr(b, doc);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::JsonDocKind { doc: d }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::JsonDocGet { doc, key } => lower_json_doc_get(b, doc, key, e.ty),
-        hir::ExprKind::JsonDocAt { doc, index } => lower_json_doc_at(b, doc, index, e.ty),
-        hir::ExprKind::JsonDocAsStr { doc } => lower_json_doc_as_str(b, doc, e.ty),
-        hir::ExprKind::JsonDocAsScalar { doc, scalar } => lower_json_doc_as_scalar(b, doc, *scalar, e.ty),
-        hir::ExprKind::JsonDocLen { doc } => {
-            let d = lower_expr(b, doc);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::JsonDocLen { doc: d }));
-            Operand::Value(v)
-        }
-        // `json.scan(input)` (J5): the scanner value is the input `{ptr,len}` view retyped as
-        // `json.scanner<Row>` — no allocation. It is bound to a local and consumed as a pipeline
-        // source (the fused terminal drives the streaming steps).
-        hir::ExprKind::JsonScan { struct_id: _, input } => {
-            let inp = lower_expr(b, input);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::JsonScanNew { input: inp }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
-        hir::ExprKind::JsonDocElems { doc } => {
-            let arena = *b.arenas.last().expect("json.doc.elems() outside an arena (sema-checked)");
-            let out = b.new_slot(e.ty); // slice<json.doc>
-            let d = lower_expr(b, doc);
-            let unit = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(unit, Rvalue::JsonDocElems { doc: d, arena: Operand::Value(arena), out }));
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Load(out)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
-        // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
-        // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
-        hir::ExprKind::ReaderOpen { path } => lower_open_handle(b, path, Ty::Reader, e.ty, |p, out| Rvalue::ReaderOpen { path: p, out }),
-        hir::ExprKind::WriterCreate { path } => lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreate { path: p, out }),
-        // All A4 `file` ops — the two constructors (`fs.create_rw`/`fs.open_rw`, `Result<file, Error>`)
-        // and the three methods (`pread`/`pwrite`/`len`, `Result<i64, Error>`) — go through ONE
-        // `#[inline(never)]` dispatcher, so they add a single tiny arm to the recursive `lower_expr`
-        // frame rather than five inline bodies (the #296 expr-depth lesson; `lower_expr`'s debug frame
-        // is depth-multiplied, so keeping it flat matters).
-        hir::ExprKind::FileCreateRw { .. } | hir::ExprKind::FileOpenRw { .. }
-        | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePwrite { .. } | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
-        hir::ExprKind::ReaderStdin => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ReaderStdin));
-            Operand::Value(v)
-        }
-        hir::ExprKind::WriterStd { fd, buffered } => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::WriterStd { fd: *fd, buffered: *buffered }));
-            Operand::Value(v)
-        }
-        // `r.read(b)` yields `Result<i64, Error>` from the runtime's i64: a count `>= 0` is `Ok`,
-        // a `< 0` value encodes `-(status)` for the `Err`.
-        hir::ExprKind::ReaderRead { reader, buffer } => {
-            let rop = lower_expr(b, reader);
-            let bop = lower_expr(b, buffer);
-            lower_reader_read(b, rop, bop, e.ty)
-        }
-        // All three A7 line-read ops (`r.buffered()` / `r.read_line(b)` / `bytes.as_str()`) go
-        // through ONE `#[inline(never)]` dispatcher, so `lower_expr` gains a single tiny arm rather
-        // than three inline bodies — `lower_expr` is depth-multiplied, so keeping its frame flat
-        // preserves the expr-depth budget (the #296 lesson, mirroring the file / array_builder
-        // dispatchers).
-        hir::ExprKind::ReaderBuffered { .. } | hir::ExprKind::ReaderReadLine { .. } | hir::ExprKind::BytesAsStr { .. } => {
-            lower_reader_line_expr(b, e)
-        }
-        // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
-        // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
-        hir::ExprKind::IoCopy { reader, writer } => {
-            let rop = lower_expr(b, reader);
-            let wop = lower_expr(b, writer);
-            let n = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(n, Rvalue::IoCopy(rop, wop)));
-            lower_count_or_status_result(b, n, e.ty)
-        }
-        // `w.write(x)` / `w.flush()` yield `Result<(), Error>` from an i32 errno-status.
-        hir::ExprKind::WriterWrite { writer, arg, builder } => {
-            let wop = lower_expr(b, writer);
-            let aop = lower_expr(b, arg);
-            let mk: Box<dyn FnOnce(&mut Builder) -> ValueId> = if *builder {
-                Box::new(move |b| { let v = b.fresh_value(status_ty()); b.push(Stmt::Let(v, Rvalue::WriterWriteBuilder(wop, aop))); v })
-            } else {
-                Box::new(move |b| { let v = b.fresh_value(status_ty()); b.push(Stmt::Let(v, Rvalue::WriterWrite(wop, aop))); v })
-            };
-            let code = mk(b);
-            lower_status_result(b, code, e.ty)
-        }
-        hir::ExprKind::WriterFlush { writer } => {
-            let wop = lower_expr(b, writer);
-            let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::WriterFlush(wop)));
-            lower_status_result(b, code, e.ty)
-        }
-        hir::ExprKind::BufferNew { capacity } => {
-            let cap = lower_expr(b, capacity);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BufferNew(cap)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BufferBytes { buffer } => {
-            let bop = lower_expr(b, buffer);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BufferBytes(bop)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BufferLen { buffer } => {
-            let bop = lower_expr(b, buffer);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BytesRead { bytes, offset, be } => lower_bytes_read(b, bytes, offset, *be, e.ty),
-        hir::ExprKind::BufferPut { buffer, value, be } => lower_buffer_put(b, buffer, value, *be),
-        hir::ExprKind::BufferAppend { buffer, data } => lower_buffer_append(b, buffer, data),
-        // `array_builder<T>` (M12 A6) — new/push/append/build go through ONE `#[inline(never)]`
-        // dispatcher so they add a single tiny arm to the recursive `lower_expr` frame, not four
-        // inline bodies (the #296 expr-depth lesson).
-        hir::ExprKind::ArrayBuilderNew { .. } | hir::ExprKind::ArrayBuilderPush { .. }
-        | hir::ExprKind::ArrayBuilderAppend { .. } | hir::ExprKind::ArrayBuilderBuild(_) => lower_array_builder_expr(b, e),
-        // `fs.write_file(path, data)` yields `Result<(), Error>` from an i32 errno-status (str/bytes
-        // vs builder pick the runtime fn, like `writer.write`).
-        hir::ExprKind::FsWriteFile { path, data, builder } => {
-            let pop = lower_expr(b, path);
-            let dop = lower_expr(b, data);
-            let code = b.fresh_value(status_ty());
-            let rv = if *builder {
-                Rvalue::FsWriteFileBuilder { path: pop, builder: dop }
-            } else {
-                Rvalue::FsWriteFile { path: pop, data: dop }
-            };
-            b.push(Stmt::Let(code, rv));
-            lower_status_result(b, code, e.ty)
-        }
-        // `fs.exists(path)` yields a plain `bool` — the runtime's `1`/`0` compared `!= 0` (every
-        // error already folded to `0`, so there is no status branch).
-        hir::ExprKind::FsExists { path } => {
-            let pop = lower_expr(b, path);
-            let c = b.fresh_value(status_ty());
-            b.push(Stmt::Let(c, Rvalue::FsExists { path: pop }));
-            let v = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
-            Operand::Value(v)
-        }
-        // `fs.remove(path)` yields `Result<(), Error>` from an i32 errno-status.
-        hir::ExprKind::FsRemove { path } => {
-            let pop = lower_expr(b, path);
-            let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
-            lower_status_result(b, code, e.ty)
-        }
-        // `fs.read_dir(path)` yields `Result<array<string>, Error>` — the same out-slot shape as
-        // `fs.read_file`, with an owned `DynArray(String)` payload.
-        hir::ExprKind::FsReadDir { path } => lower_fs_read_dir(b, path, e.ty),
-        // `dns.resolve(host)` yields `Result<array<string>, Error>` — identical lowering to
-        // `fs.read_dir` (owned `DynArray(String)` payload, deep-`Drop`), only the runtime call differs.
-        hir::ExprKind::DnsResolve { host } => lower_dns_resolve(b, host, e.ty),
-        hir::ExprKind::TcpConnect { host, port } => lower_tcp_connect(b, host, port, e.ty),
-        // `c.reader()` / `c.writer()` wrap the conn's fd in a borrowed reader/writer (`owns_fd:false`).
-        hir::ExprKind::ConnReader { conn } => {
-            let c = lower_expr(b, conn);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ConnReader(c)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ConnWriter { conn } => {
-            let c = lower_expr(b, conn);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ConnWriter(c)));
-            Operand::Value(v)
-        }
-        // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` — set an SO_RCVTIMEO/SO_SNDTIMEO deadline
-        // on the conn's fd in place; no value (like `c.cwd(dir)`).
-        hir::ExprKind::TcpReadTimeout { conn, ns } => {
-            let c = lower_expr(b, conn);
-            let n = lower_expr(b, ns);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::TcpReadTimeout { conn: c, ns: n }));
-            Operand::Const(Const::Unit)
-        }
-        hir::ExprKind::TcpWriteTimeout { conn, ns } => {
-            let c = lower_expr(b, conn);
-            let n = lower_expr(b, ns);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::TcpWriteTimeout { conn: c, ns: n }));
-            Operand::Const(Const::Unit)
-        }
-        hir::ExprKind::TcpListen { host, port } => lower_tcp_listen(b, host, port, e.ty),
-        hir::ExprKind::TcpAccept { listener } => lower_tcp_accept(b, listener, e.ty),
-        hir::ExprKind::UdpBind { host, port } => lower_udp_bind(b, host, port, e.ty),
-        hir::ExprKind::UdpSendTo { sock, data, host, port } => lower_udp_send_to(b, sock, data, host, port, e.ty),
-        hir::ExprKind::UdpRecvFrom { sock, buffer } => lower_udp_recv_from(b, sock, buffer, e.ty),
-        hir::ExprKind::ProcessSpawn { cmd, args } => lower_process_spawn(b, cmd, args, e.ty),
-        hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
-        hir::ExprKind::ChildKill { child, sig } => lower_child_kill(b, child, sig, e.ty),
-        hir::ExprKind::ProcessExec { cmd, args } => lower_process_exec(b, cmd, args, e.ty),
-        // `std.process` Slice 4 — `process.command` / `c.cwd` / `c.run` / the `run_output` accessors.
-        // Routed through one out-of-line helper (the `expr_depth` #296 headroom discipline).
-        hir::ExprKind::ProcessCommand { .. }
-        | hir::ExprKind::CommandCwd { .. }
-        | hir::ExprKind::CommandTimeout { .. }
-        | hir::ExprKind::CommandEnv { .. }
-        | hir::ExprKind::CommandEnvClear { .. }
-        | hir::ExprKind::CommandRun { .. }
-        | hir::ExprKind::RunOutputCode { .. }
-        | hir::ExprKind::RunOutputStdout { .. }
-        | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
-        // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
-        // runtime registers the mmap for `munmap` at arena end.
-        hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
-        hir::ExprKind::FsReadBytesView { path } => lower_fs_read_bytes_view(b, path, e.ty),
-        // `path.join(a, b)` → an owned `string` `{ptr,len}` returned by value (like `str_clone`).
-        hir::ExprKind::PathJoin { a, b: pb } => {
-            let ao = lower_expr(b, a);
-            let bo = lower_expr(b, pb);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::PathJoin { a: ao, b: bo }));
-            Operand::Value(v)
-        }
-        // `path.base`/`dir`/`ext(p)` → a borrowed sub-`str` `{ptr,len}` of `p` returned by value.
-        hir::ExprKind::PathComponent { kind, path } => {
-            let po = lower_expr(b, path);
-            let v = b.fresh_value(e.ty);
-            inherit_borrow_owners(b, v, [&po]);
-            b.push(Stmt::Let(v, Rvalue::PathComponent { kind: *kind, path: po }));
-            Operand::Value(v)
-        }
-        // `path.normalize(p)` → an owned `string` `{ptr,len}` returned by value.
-        hir::ExprKind::PathNormalize { path } => {
-            let po = lower_expr(b, path);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
-            Operand::Value(v)
-        }
-        // `env.get(name)` → `Option<string>`: the runtime writes the owned value into `out` and
-        // returns a present flag; branch `Some(<value>)` / `None`.
-        hir::ExprKind::EnvGet { name } => lower_env_get(b, name, e.ty),
-        // `env.set(name, value)` → `Result<(), Error>` from an i32 errno-status.
-        hir::ExprKind::EnvSet { name, value } => {
-            let no = lower_expr(b, name);
-            let vo = lower_expr(b, value);
-            let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::EnvSet { name: no, value: vo }));
-            lower_status_result(b, code, e.ty)
-        }
-        // `time.now()` / `time.instant()` → an `i64` returned by value.
-        hir::ExprKind::TimeNow => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::TimeNow));
-            Operand::Value(v)
-        }
-        hir::ExprKind::TimeInstant => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::TimeInstant));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ProcessCpuCount => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ProcessCpuCount));
-            Operand::Value(v)
-        }
-        // `time.sleep(ns)` → `()`; emit the void call and yield unit.
-        hir::ExprKind::TimeSleep { ns } => {
-            let no = lower_expr(b, ns);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::TimeSleep { ns: no }));
-            Operand::Const(Const::Unit)
-        }
-        // `process.exit(code)` — the settled cleanup-then-exit path: evaluate `code`, run the current
-        // function's pending cleanup (drops for live owned locals + `task_group`/arena ends — the
-        // exact emission a `return` uses, so buffered writers flush in their `Drop`), then a diverging
-        // runtime `align_rt_process_exit(code)` (void `-> !`, like `bounds_fail`). The block is then
-        // `Unreachable`; `lower_block`/`lower_fn` observe `is_terminated` and emit no code after it
-        // (#274 lesson). v1 gap: only the CURRENT frame's cleanup runs — full multi-frame unwind is
-        // deferred (`docs/impl/std-design/process.md`).
-        hir::ExprKind::ProcessExit { code } => {
-            let c = lower_expr(b, code);
-            b.emit_exit_cleanup();
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::Call("process_exit".to_string(), vec![c])));
-            b.terminate(Term::Unreachable);
-            Operand::Const(Const::Unit)
-        }
-        // `process.abort()` — the named escape hatch: NO cleanup emission, a bare diverging
-        // `align_rt_process_abort()` (`_exit`), then `Unreachable`.
-        hir::ExprKind::ProcessAbort => {
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::Call("process_abort".to_string(), vec![])));
-            b.terminate(Term::Unreachable);
-            Operand::Const(Const::Unit)
-        }
-        // `encoding.*_encode(data)` → an owned `string` `{ptr,len}` returned by value (like
-        // `PathNormalize`); the runtime allocates the buffer, the bound local `Drop`-frees it.
-        hir::ExprKind::EncodingEncode { kind, data } => {
-            let d = lower_expr(b, data);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::EncodingEncode { kind: *kind, data: d }));
-            Operand::Value(v)
-        }
-        // `encoding.*_decode(s)` → `Result<buffer, Error>`: the runtime writes an owned `buffer`
-        // handle into `out` and returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)`.
-        hir::ExprKind::EncodingDecode { kind, input } => lower_encoding_decode(b, *kind, input, e.ty),
-        // `compress.gzip_compress(data, level)` / `gzip_decompress(data)` → `Result<buffer, Error>`:
-        // the runtime writes an owned `buffer` handle into `out` + returns an i32 status; branch
-        // `Ok(<buffer>)` / `Err(<mapped>)` via the shared status→result helper.
-        hir::ExprKind::Compress { kind, data, level } => {
-            let out = b.new_slot(Ty::Buffer);
-            let d = lower_expr(b, data);
-            let lv = lower_expr(b, level);
-            let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::CompressCompress { kind: *kind, data: d, level: lv, out }));
-            emit_status_buffer_result(b, code, out, e.ty)
-        }
-        hir::ExprKind::Decompress { kind, data } => {
-            let out = b.new_slot(Ty::Buffer);
-            let d = lower_expr(b, data);
-            let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::CompressDecompress { kind: *kind, data: d, out }));
-            emit_status_buffer_result(b, code, out, e.ty)
-        }
-        // `encoding.utf8_valid(b)` → the runtime returns an `i32` (1/0); compare `!= 0` to a `bool`
-        // (the same i32→bool bridge as `fs.exists`).
-        hir::ExprKind::Utf8Valid { data } => {
-            let d = lower_expr(b, data);
-            let c = b.fresh_value(status_ty());
-            b.push(Stmt::Let(c, Rvalue::Utf8Valid { data: d }));
-            let v = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
-            Operand::Value(v)
-        }
-        // `crypto.constant_time_equal(a, b)` → the runtime returns an `i32` (1/0); compare `!= 0` to
-        // a `bool` (the same i32→bool bridge as `utf8_valid`). Both operands are byte views.
-        hir::ExprKind::CryptoCtEqual { a, b: bb } => {
-            let av = lower_expr(b, a);
-            let bv = lower_expr(b, bb);
-            let c = b.fresh_value(status_ty());
-            b.push(Stmt::Let(c, Rvalue::CryptoCtEqual { a: av, b: bv }));
-            let v = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
-            Operand::Value(v)
-        }
-        // `crypto.random(out)` → a void runtime call that fills the buffer in place; the expression
-        // value is `()` (the same shape as `time.sleep`).
-        hir::ExprKind::CryptoRandom { out } => {
-            let o = lower_expr(b, out);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::CryptoRandom { out: o }));
-            Operand::Const(Const::Unit)
-        }
-        // `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
-        // returned by value; the bound local `Drop`-frees it (same shape as `rand.sample`). The
-        // runtime allocates the digest buffer + aborts on an engine failure.
-        hir::ExprKind::CryptoHash { algo, data } => {
-            let dv = lower_expr(b, data);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CryptoHash { algo: *algo, data: dv }));
-            Operand::Value(v)
-        }
-        // `crypto.hmac_sha256(key, data)` / `crypto.hkdf_sha256(salt, ikm, info, len)` → out-of-line
-        // helpers. Their bodies bind several locals; kept out of this recursive `match` so those slots
-        // do not inflate `lower_expr`'s (per-recursion-level) stack frame in debug builds — a deep
-        // expression tree recurses through this function, and rustc reserves every arm's locals up
-        // front (the `expr_depth` headroom the #296 cap was measured against).
-        hir::ExprKind::CryptoHmac { key, data } => lower_crypto_hmac(b, key, data, e.ty),
-        hir::ExprKind::CryptoHkdf { salt, ikm, info, len } => lower_crypto_hkdf(b, salt, ikm, info, len, e.ty),
-        hir::ExprKind::CryptoAead { cipher, dir, key, nonce, input, aad } => {
-            lower_crypto_aead(b, *cipher, *dir, key, nonce, input, aad, e.ty)
-        }
-        hir::ExprKind::CryptoArgon2 { password, salt, params } => {
-            lower_crypto_argon2(b, password, salt, params, e.ty)
-        }
-        // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
-        // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
-        hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
-            let seed = match &e.kind {
-                hir::ExprKind::RandSeedWith { seed } => Some(lower_expr(b, seed)),
-                _ => None,
-            };
-            let out = b.new_slot(Ty::Rng);
-            let dummy = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(dummy, Rvalue::RandSeed { seed, out }));
-            let v = b.fresh_value(Ty::Rng);
-            b.push(Stmt::Let(v, Rvalue::Load(out)));
-            Operand::Value(v)
-        }
-        // `r.next()` — the receiver is a bound mut local (sema-checked); its slot id *is* the rng
-        // state, mutated in place by the runtime through a pointer.
-        hir::ExprKind::RandNext { rng } => {
-            let slot = rng_slot(rng);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RandNext { rng: slot }));
-            Operand::Value(v)
-        }
-        // `r.range(lo, hi)` — advance the rng, return a uniform i64 in `[lo, hi)`.
-        hir::ExprKind::RandRange { rng, lo, hi } => {
-            let slot = rng_slot(rng);
-            let lo = lower_expr(b, lo);
-            let hi = lower_expr(b, hi);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RandRange { rng: slot, lo, hi }));
-            Operand::Value(v)
-        }
-        // `r.shuffle(out xs)` — Fisher-Yates the slice in place; no value.
-        hir::ExprKind::RandShuffle { rng, xs, elem } => {
-            let slot = rng_slot(rng);
-            let xv = lower_expr(b, xs);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::RandShuffle { rng: slot, xs: xv, elem: *elem }));
-            Operand::Const(Const::Unit)
-        }
-        // `r.sample(xs, k)` → a fresh owned `array<T>` `{ptr,len}` returned by value; the bound local
-        // `Drop`-frees it. The runtime allocates + validates `k` (aborts on `k < 0` / `k > len`).
-        hir::ExprKind::RandSample { rng, xs, k, elem } => {
-            let slot = rng_slot(rng);
-            let xv = lower_expr(b, xs);
-            let kv = lower_expr(b, k);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RandSample { rng: slot, xs: xv, k: kv, elem: *elem }));
-            Operand::Value(v)
-        }
-        // `cli.command(name)` → an owned `cli command` handle returned by value (the bound local
-        // `Drop`-frees it via `cli_command_free`).
-        hir::ExprKind::CliCommand { name } => {
-            let nm = lower_expr(b, name);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CliCommand { name: nm }));
-            Operand::Value(v)
-        }
-        // `c.flag_*(...)` → register a flag into the command handle in place; no value. The receiver
-        // is a bound local (sema-checked); its loaded pointer value is the handle the runtime mutates.
-        hir::ExprKind::CliFlag { cmd, kind, name, default } => {
-            let cop = lower_expr(b, cmd);
-            let nm = lower_expr(b, name);
-            let def = default.as_ref().map(|d| lower_expr(b, d));
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::CliFlag { cmd: cop, kind: *kind, name: nm, default: def }));
-            Operand::Const(Const::Unit)
-        }
-        // `c.parse(args)` → `Result<parsed, Error>`: the runtime writes an owned `parsed` handle into
-        // `out` and returns an i32 status; branch `Ok(<parsed>)` / `Err(<mapped>)`.
-        hir::ExprKind::CliParse { cmd, args } => lower_cli_parse(b, cmd, args, e.ty),
-        // `p.get_bool(name)` → the runtime returns an i32 (1/0); compare `!= 0` to a `bool`.
-        hir::ExprKind::CliGetBool { parsed, name } => {
-            let pop = lower_expr(b, parsed);
-            let nm = lower_expr(b, name);
-            let c = b.fresh_value(status_ty());
-            b.push(Stmt::Let(c, Rvalue::CliGetBool { parsed: pop, name: nm }));
-            let v = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
-            Operand::Value(v)
-        }
-        // `p.get_i64(name)` → the runtime returns the i64 value directly.
-        hir::ExprKind::CliGetI64 { parsed, name } => {
-            let pop = lower_expr(b, parsed);
-            let nm = lower_expr(b, name);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CliGetI64 { parsed: pop, name: nm }));
-            Operand::Value(v)
-        }
-        // `p.get_str(name)` → a `str` view `{ptr,len}` into the parsed handle's storage (region-bound
-        // to `parsed`; not owned — no `Drop`).
-        hir::ExprKind::CliGetStr { parsed, name } => {
-            let pop = lower_expr(b, parsed);
-            let nm = lower_expr(b, name);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CliGetStr { parsed: pop, name: nm }));
-            Operand::Value(v)
-        }
-        // `c.usage()` → an owned `string` `{ptr,len}` returned by value (the bound local `Drop`-frees it).
-        hir::ExprKind::CliUsage { cmd } => {
-            let cop = lower_expr(b, cmd);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CliUsage { cmd: cop }));
-            Operand::Value(v)
-        }
-        // `std.regex` stays one recursive-match arm for expression-depth headroom; the dispatcher
-        // handles compile / match / find out of line.
-        hir::ExprKind::RegexCompile { .. }
-        | hir::ExprKind::RegexIsMatch { .. }
-        | hir::ExprKind::RegexFind { .. }
-        | hir::ExprKind::RegexFindAll { .. }
-        | hir::ExprKind::RegexSplit { .. }
-        | hir::ExprKind::RegexReplace { .. }
-        | hir::ExprKind::RegexCaptures { .. }
-        | hir::ExprKind::RegexGroupCount { .. }
-        | hir::ExprKind::RegexGroupIndex { .. }
-        | hir::ExprKind::CapturesGroup { .. } => lower_regex_expr(b, e),
-        // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
-        // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
-        // match grows by exactly one arm (not seven). A deep expression tree recurses through
-        // `lower_expr`, and rustc reserves every arm's locals per level (the `expr_depth` #296 headroom
-        // lesson — std.http is the last std module, so the cap's remaining headroom is thin).
-        hir::ExprKind::HttpRequest { .. }
-        | hir::ExprKind::HttpHeader { .. }
-        | hir::ExprKind::HttpBody { .. }
-        | hir::ExprKind::HttpRequestTimeout { .. }
-        | hir::ExprKind::HttpClientTimeout { .. }
-        | hir::ExprKind::HttpParse { .. }
-        | hir::ExprKind::HttpRespStatus { .. }
-        | hir::ExprKind::HttpRespHeader { .. }
-        | hir::ExprKind::HttpRespBody { .. }
-        | hir::ExprKind::HttpClient
-        | hir::ExprKind::HttpClientGet { .. }
-        | hir::ExprKind::HttpClientPost { .. }
-        | hir::ExprKind::HttpClientRequest { .. }
-        | hir::ExprKind::HttpGetMany { .. }
-        | hir::ExprKind::HttpServe { .. }
-        | hir::ExprKind::HttpAccept { .. }
-        | hir::ExprKind::HttpCtxMethod { .. }
-        | hir::ExprKind::HttpCtxPath { .. }
-        | hir::ExprKind::HttpCtxHeaders { .. }
-        | hir::ExprKind::HttpCtxHeader { .. }
-        | hir::ExprKind::HttpCtxBody { .. }
-        | hir::ExprKind::HttpResponseBuilder { .. }
-        | hir::ExprKind::HttpRbHeader { .. }
-        | hir::ExprKind::HttpRbBody { .. }
-        | hir::ExprKind::HttpRespond { .. }
-        | hir::ExprKind::HttpRespondStream { .. }
-        | hir::ExprKind::HttpStreamReject { .. }
-        | hir::ExprKind::HttpStreamSend { .. }
-        | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
-        hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
-        hir::ExprKind::Local(id) => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Load(*id)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Unary { op, expr } => {
-            let a = lower_expr(b, expr);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Un(*op, a)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Cast(inner) => {
-            let from = inner.ty;
-            let operand = lower_expr(b, inner);
-            // A no-op cast (same type, e.g. `x as i32` where `x: i32`) is just the operand.
-            if from == e.ty {
-                return operand;
+            // `fs.remove(path)` yields `Result<(), Error>` from an i32 errno-status.
+            hir::ExprKind::FsRemove { path } => {
+                lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
+                lower_status_result(b, code, e.ty)
             }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Cast { operand, from, to: e.ty }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Binary { op, lhs, rhs } => {
-            // `&&` / `||` short-circuit: the right operand is evaluated only when the left doesn't
-            // already decide the result. Lower to a branch (not a strict `Rvalue::Bin`), so a guard
-            // like `i < len && arr[i] > 0` doesn't evaluate `arr[i]` (and trap) when `i >= len`.
-            if matches!(op, BinOp::And | BinOp::Or) {
-                return lower_short_circuit(b, *op, lhs, rhs);
+            // `fs.read_dir(path)` yields `Result<array<string>, Error>` — the same out-slot shape as
+            // `fs.read_file`, with an owned `DynArray(String)` payload.
+            hir::ExprKind::FsReadDir { path } => lower_fs_read_dir(b, path, e.ty),
+            // `dns.resolve(host)` yields `Result<array<string>, Error>` — identical lowering to
+            // `fs.read_dir` (owned `DynArray(String)` payload, deep-`Drop`), only the runtime call differs.
+            hir::ExprKind::DnsResolve { host } => lower_dns_resolve(b, host, e.ty),
+            hir::ExprKind::TcpConnect { host, port } => lower_tcp_connect(b, host, port, e.ty),
+            // `c.reader()` / `c.writer()` wrap the conn's fd in a borrowed reader/writer (`owns_fd:false`).
+            hir::ExprKind::ConnReader { conn } => {
+                lower_required_binding!(b, c = lower_expr(b, conn), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ConnReader(c)));
+                Operand::Value(v)
             }
-            let l = lower_expr(b, lhs);
-            let r = lower_expr(b, rhs);
-            // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
-            // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
-            // division is IEEE (no guard).
-            if matches!(op, BinOp::Div | BinOp::Rem) && matches!(lhs.ty, Ty::Int(_)) {
-                return lower_int_div(b, *op, l, r, lhs.ty);
+            hir::ExprKind::ConnWriter { conn } => {
+                lower_required_binding!(b, c = lower_expr(b, conn), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ConnWriter(c)));
+                Operand::Value(v)
             }
-            // A `vecN<T>` `/` / `%` carries the same divisor guard, lane-wise: any zero lane aborts,
-            // and a signed `INT_MIN / -1` lane wraps. Float vectors are IEEE (no guard).
-            if let (BinOp::Div | BinOp::Rem, Ty::Vec(s, n)) = (op, e.ty) {
-                return lower_vec_div(b, *op, l, r, s, n, rhs.ty);
-            }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::IntArith { op, mode, lhs, rhs } => {
-            let int_ty = lhs.ty;
-            let a = lower_expr(b, lhs);
-            let bb = lower_expr(b, rhs);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::IntArith { op: *op, mode: *mode, int_ty, a, b: bb }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::MathOp { fn_, operands } => {
-            let ty = operands[0].ty;
-            let ops: Vec<Operand> = operands.iter().map(|o| lower_expr(b, o)).collect();
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::MathOp { fn_: *fn_, ty, operands: ops }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::FnValue(name) => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                v,
-                Rvalue::FnAddr {
-                    name: name.clone(),
-                    signature: fn_signature_facts(b, e.ty),
-                },
-            ));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Closure { lifted, captures } => {
-            let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
-            let ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                v,
-                Rvalue::Closure {
-                    lifted: lifted.clone(),
-                    captures: ops,
-                    capture_tys,
-                    signature: fn_signature_facts(b, e.ty),
-                },
-            ));
-            Operand::Value(v)
-        }
-        hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
-        hir::ExprKind::Call { .. } => lower_direct_call(b, e),
-        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
-        // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
-        // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
-        // headroom lesson: rustc reserves every arm's locals per level at opt-0).
-        hir::ExprKind::Loop { .. } => lower_loop(b, e),
-        // `Type.Variant(payload…)` — build the sum-type aggregate `{ i32 tag, … }`.
-        hir::ExprKind::EnumValue { enum_id, variant, payload } => {
-            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
-                lower_consumed_aggregate_parts(b, payload)
-            else {
-                return Operand::Const(Const::Unit);
-            };
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                v,
-                Rvalue::MakeEnum {
-                    enum_id: *enum_id,
-                    variant: *variant,
-                    payload: operands,
-                },
-            ));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(v, flag.clone());
-                b.attach_value_temp_drop_flag(v, flag);
-            }
-            finish_consumed_aggregate(b, payload, owners);
-            Operand::Value(v)
-        }
-        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, false),
-        hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
-        hir::ExprKind::Field { root, path } => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Field(*root, path.clone())));
-            Operand::Value(v)
-        }
-        hir::ExprKind::SoaColumn { base, struct_id, field } => {
-            let v = b.fresh_value(e.ty); // slice<FieldTy>
-            b.push(Stmt::Let(v, Rvalue::SoaColumn { base: *base, struct_id: *struct_id, field: *field }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Tuple { tuple_id, elems } => {
-            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
-                lower_consumed_aggregate_parts(b, elems)
-            else {
-                return Operand::Const(Const::Unit);
-            };
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                v,
-                Rvalue::MakeTuple {
-                    tuple_id: *tuple_id,
-                    elems: operands,
-                },
-            ));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(v, flag.clone());
-                b.attach_value_temp_drop_flag(v, flag);
-            }
-            finish_consumed_aggregate(b, elems, owners);
-            Operand::Value(v)
-        }
-        hir::ExprKind::TupleIndex { recv, index } => {
-            let t = lower_expr(b, recv);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: t, index: *index }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::IndexField { base, index, path } => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::IndexField(*base, index_const(*index as usize), path.clone())));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Block(blk) => {
-            lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit))
-        }
-        // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
-        // inner block; the enforcement + impurity were handled in sema.
-        hir::ExprKind::Unsafe(blk) => lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit)),
-        // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
-        hir::ExprKind::RawAlloc(size) => {
-            let sz = lower_expr(b, size);
-            let v = b.fresh_value(Ty::Raw);
-            b.push(Stmt::Let(v, Rvalue::RawAlloc(sz)));
-            Operand::Value(v)
-        }
-        // `raw.free(p)` → free the pointer (a side-effecting statement, like `ArenaEnd`); yields unit.
-        hir::ExprKind::RawFree(ptr) => {
-            let p = lower_expr(b, ptr);
-            b.push(Stmt::RawFree(p));
-            Operand::Const(Const::Unit)
-        }
-        // `raw.load(p, offset)` → read `scalar` at `p + offset` bytes.
-        hir::ExprKind::RawLoad { ptr, offset, scalar } => {
-            let p = lower_expr(b, ptr);
-            let off = lower_expr(b, offset);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RawLoad { ptr: p, offset: off, scalar: *scalar }));
-            Operand::Value(v)
-        }
-        // `raw.store(p, offset, v)` → write `v` at `p + offset` bytes (a side-effecting statement).
-        hir::ExprKind::RawStore { ptr, offset, value } => {
-            let p = lower_expr(b, ptr);
-            let off = lower_expr(b, offset);
-            let val = lower_expr(b, value);
-            b.push(Stmt::RawStore { ptr: p, offset: off, value: val });
-            Operand::Const(Const::Unit)
-        }
-        // `raw.offset(p, n)` → a new `raw` pointer `p + n` bytes.
-        hir::ExprKind::RawOffset { ptr, offset } => {
-            let p = lower_expr(b, ptr);
-            let off = lower_expr(b, offset);
-            let v = b.fresh_value(Ty::Raw);
-            b.push(Stmt::Let(v, Rvalue::RawOffset { ptr: p, offset: off }));
-            Operand::Value(v)
-        }
-        // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
-        // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
-        hir::ExprKind::TaskGroup(blk) => {
-            let handle = b.fresh_value(Ty::ArenaHandle);
-            b.push(Stmt::Let(handle, Rvalue::TgBegin));
-            b.task_groups.push(handle);
-            let tail = lower_block(b, blk);
-            b.task_groups.pop();
-            if b.is_terminated() {
+            // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` — set an SO_RCVTIMEO/SO_SNDTIMEO deadline
+            // on the conn's fd in place; no value (like `c.cwd(dir)`).
+            hir::ExprKind::TcpReadTimeout { conn, ns } => {
+                lower_required_binding!(b, c = lower_expr(b, conn), Operand::Const(Const::Unit));
+                lower_required_binding!(b, n = lower_expr(b, ns), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(v, Rvalue::TcpReadTimeout { conn: c, ns: n }));
                 Operand::Const(Const::Unit)
-            } else {
-                // Structured concurrency joins every task before the scope-owned task region is
-                // released. An explicit `wait()` may already have drained the list; the runtime
-                // wait operation is idempotent for an empty list.
-                b.push(Stmt::TgWait(Operand::Value(handle)));
-                b.push(Stmt::TgEnd(Operand::Value(handle)));
-                tail.unwrap_or(Operand::Const(Const::Unit))
             }
-        }
-        // ④b-1b (deferred): `spawn(closure)` snapshots the closure's captures into a fresh env in
-        // the task-group region and registers the task; it runs at `wait`. The `Task<R>` handle is
-        // the task's result slot. The closure's captures give the env layout.
-        hir::ExprKind::Spawn { closure, fallible } => {
-            let Ty::Task(s) = e.ty else { unreachable!("spawn result is a Task") };
-            let r_ty = align_sema::scalar_to_ty(s);
-            let capture_tys: Vec<Ty> = match &closure.kind {
-                hir::ExprKind::Closure { captures, .. } => captures.iter().map(|c| c.ty).collect(),
-                _ => Vec::new(),
-            };
-            let clos = lower_expr(b, closure);
-            let tg = Operand::Value(*b.task_groups.last().expect("spawn outside a task_group"));
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::SpawnTask { tg, closure: clos, capture_tys, r: r_ty, fallible: *fallible }));
-            Operand::Value(v)
-        }
-        // `t.get()` reads the result out of the task's slot.
-        hir::ExprKind::TaskGet(inner) => {
-            let bx = lower_expr(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
-            Operand::Value(v)
-        }
-        // `wait()` — run all deferred tasks of the enclosing task_group.
-        hir::ExprKind::Wait => {
-            let tg = Operand::Value(*b.task_groups.last().expect("wait outside a task_group"));
-            // A fallible group's `wait()` yields `Result<(), Error>` (built from the runtime's
-            // error code); an infallible group's yields `()`.
-            let fallible = matches!(e.ty, Ty::Result(..));
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::TgWaitResult { tg, fallible }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::OptionSome(inner) => {
-            let op = lower_expr(b, inner);
-            if b.is_terminated() {
-                return Operand::Const(Const::Unit);
-            }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::OptionSome(op)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::OptionNone => {
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::OptionNone));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, false),
-        hir::ExprKind::ResultOk(inner) => {
-            let op = lower_expr(b, inner);
-            if b.is_terminated() {
-                return Operand::Const(Const::Unit);
-            }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ResultOk(op)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ResultErr(inner) => {
-            let op = lower_expr(b, inner);
-            if b.is_terminated() {
-                return Operand::Const(Const::Unit);
-            }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ResultErr(op)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Try(inner) => lower_try(b, inner, e.ty),
-        hir::ExprKind::Arena(blk) => {
-            let handle = b.fresh_value(Ty::ArenaHandle);
-            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
-            b.arenas.push(handle);
-            let tail = lower_block(b, blk);
-            b.arenas.pop();
-            if b.is_terminated() {
-                // The body diverged (return/?): cleanup already ran on that path.
+            hir::ExprKind::TcpWriteTimeout { conn, ns } => {
+                lower_required_binding!(b, c = lower_expr(b, conn), Operand::Const(Const::Unit));
+                lower_required_binding!(b, n = lower_expr(b, ns), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(v, Rvalue::TcpWriteTimeout { conn: c, ns: n }));
                 Operand::Const(Const::Unit)
-            } else {
-                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
-                tail.unwrap_or(Operand::Const(Const::Unit))
             }
-        }
-        hir::ExprKind::HeapNew(inner) => {
-            let init = lower_expr(b, inner);
-            let handle = *b.arenas.last().expect("heap.new outside an arena (sema-checked)");
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::HeapAlloc(Operand::Value(handle), init)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BoxGet(inner) => {
-            let bx = lower_expr(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BoxClone(inner) => {
-            let src = lower_expr(b, inner);
-            let handle = *b.arenas.last().expect("clone outside an arena (sema-checked)");
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::StrClone(inner) => {
-            // Deep-copy the `str` bytes into a fresh heap buffer, yielding an owned `string`
-            // `{ptr,len}`. The slot it lands in is `Drop`-freed at scope exit (sema marks the
-            // String local for drop), so no arena is needed.
-            let src = lower_expr(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::StrClone(src)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::StrPredicate { kind, haystack, needle } => {
-            let h = lower_expr(b, haystack);
-            let n = lower_expr(b, needle);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::StrPredicate { kind: *kind, haystack: h.clone(), needle: n.clone() }));
-            drop_borrow_owners(b, &h);
-            drop_borrow_owners(b, &n);
-            Operand::Value(v)
-        }
-        hir::ExprKind::StrTrim { kind, recv } => {
-            let r = lower_expr(b, recv);
-            let v = b.fresh_value(e.ty);
-            inherit_borrow_owners(b, v, [&r]);
-            b.push(Stmt::Let(v, Rvalue::StrTrim { kind: *kind, recv: r }));
-            Operand::Value(v)
-        }
-        // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
-        // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
-        // `null_moved_source`), so its owner still `Drop`-frees it.
-        hir::ExprKind::StrBorrow(inner) => lower_borrowed_owned(b, inner),
-        // `str.bytes()` is the same zero-cost descriptor retype in the other direction: `str` and
-        // `slice<u8>` both lower as `{ptr,len}`. The HIR node retains borrow provenance; MIR needs
-        // no instruction or runtime call.
-        hir::ExprKind::StrBytes { inner } => lower_expr(b, inner),
-        hir::ExprKind::BuilderNew { capacity } => {
-            let cap = match capacity {
-                Some(c) => lower_expr(b, c),
-                None => Operand::Const(Const::Int(0, i64_ty())),
-            };
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BuilderNew { capacity: cap }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::BuilderWrite { builder, arg, kind } => {
-            let bop = lower_expr(b, builder);
-            let aop = lower_expr(b, arg);
-            let v = b.fresh_value(Ty::Unit);
-            let rv = match kind {
-                hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop, aop),
-                hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop, aop),
-                hir::BuilderWriteKind::Bool => Rvalue::BuilderWriteBool(bop, aop),
-                hir::BuilderWriteKind::Char => Rvalue::BuilderWriteChar(bop, aop),
-                hir::BuilderWriteKind::Float => Rvalue::BuilderWriteFloat(bop, aop),
-            };
-            b.push(Stmt::Let(v, rv));
-            Operand::Const(Const::Unit)
-        }
-        hir::ExprKind::BuilderToString(inner) => {
-            let bop = lower_expr(b, inner);
-            // The builder is consumed: null its slot so the exit `Drop` of an unfinished builder
-            // is a no-op (`builder_free(null)`), and the finished `string` owns its own buffer.
-            null_moved_source(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BuilderToString(bop)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ArraySum { source, stages } => {
-            // An explicitly parallel, directly-consumed integer map can fold its result in the
-            // range kernel. This removes the full transformed array and the serial reread while
-            // preserving the existing `par_map` Pure boundary and wrapping integer semantics.
-            // Keep staged maps on their existing paths: they are not yet a whole-range reduction.
-            // A direct `chunks(...).par_map(...)` is now eligible because its borrowed slice
-            // headers are safe range-kernel values and the integer reducer already accepts any
-            // fixed-width input stride.
-            if stages.is_empty()
-                && let hir::ExprKind::ArrayParMap { source: map_source, stages: map_stages, func, captures, elem } = &source.kind
-                && map_stages.is_empty()
-                && matches!(elem, Ty::Int(_))
-                && let Some(elem_in) = direct_par_map_elem_in(map_source.ty)
-            {
-                return lower_array_par_map_reduce(b, map_source, func, captures, elem_in, *elem);
+            hir::ExprKind::TcpListen { host, port } => lower_tcp_listen(b, host, port, e.ty),
+            hir::ExprKind::TcpAccept { listener } => lower_tcp_accept(b, listener, e.ty),
+            hir::ExprKind::UdpBind { host, port } => lower_udp_bind(b, host, port, e.ty),
+            hir::ExprKind::UdpSendTo {
+                sock,
+                data,
+                host,
+                port,
+            } => lower_udp_send_to(b, sock, data, host, port, e.ty),
+            hir::ExprKind::UdpRecvFrom { sock, buffer } => {
+                lower_udp_recv_from(b, sock, buffer, e.ty)
             }
-            // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
-            // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
-            if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, ReducerSpec::Sum, ReduceInit::Identity)
-            } else {
-                lower_array_reduce(b, source, stages, e.ty, ReduceInit::Identity, ReducerSpec::Sum)
+            hir::ExprKind::ProcessSpawn { cmd, args } => lower_process_spawn(b, cmd, args, e.ty),
+            hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
+            hir::ExprKind::ChildKill { child, sig } => lower_child_kill(b, child, sig, e.ty),
+            hir::ExprKind::ProcessExec { cmd, args } => lower_process_exec(b, cmd, args, e.ty),
+            // `std.process` Slice 4 — `process.command` / `c.cwd` / `c.run` / the `run_output` accessors.
+            // Routed through one out-of-line helper (the `expr_depth` #296 headroom discipline).
+            hir::ExprKind::ProcessCommand { .. }
+            | hir::ExprKind::CommandCwd { .. }
+            | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandEnv { .. }
+            | hir::ExprKind::CommandEnvClear { .. }
+            | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::RunOutputCode { .. }
+            | hir::ExprKind::RunOutputStdout { .. }
+            | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
+            // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
+            // runtime registers the mmap for `munmap` at arena end.
+            hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
+            hir::ExprKind::FsReadBytesView { path } => lower_fs_read_bytes_view(b, path, e.ty),
+            // `path.join(a, b)` → an owned `string` `{ptr,len}` returned by value (like `str_clone`).
+            hir::ExprKind::PathJoin { a, b: pb } => {
+                lower_required_binding!(b, ao = lower_expr(b, a), Operand::Const(Const::Unit));
+                lower_required_binding!(b, bo = lower_expr(b, pb), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::PathJoin { a: ao, b: bo }));
+                Operand::Value(v)
             }
-        }
-        hir::ExprKind::ArrayCount { source, stages } => {
-            if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, ReducerSpec::Count, ReduceInit::Identity)
-            } else {
-                lower_array_reduce(b, source, stages, i64_ty(), ReduceInit::Identity, ReducerSpec::Count)
+            // `path.base`/`dir`/`ext(p)` → a borrowed sub-`str` `{ptr,len}` of `p` returned by value.
+            hir::ExprKind::PathComponent { kind, path } => {
+                lower_required_binding!(b, po = lower_expr(b, path), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                inherit_borrow_owners(b, v, [&po]);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::PathComponent {
+                        kind: *kind,
+                        path: po,
+                    },
+                ));
+                Operand::Value(v)
             }
-        }
-        hir::ExprKind::ArrayReduce { source, stages, func, captures, init } => {
-            if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(
+            // `path.normalize(p)` → an owned `string` `{ptr,len}` returned by value.
+            hir::ExprKind::PathNormalize { path } => {
+                lower_required_binding!(b, po = lower_expr(b, path), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
+                Operand::Value(v)
+            }
+            // `env.get(name)` → `Option<string>`: the runtime writes the owned value into `out` and
+            // returns a present flag; branch `Some(<value>)` / `None`.
+            hir::ExprKind::EnvGet { name } => lower_env_get(b, name, e.ty),
+            // `env.set(name, value)` → `Result<(), Error>` from an i32 errno-status.
+            hir::ExprKind::EnvSet { name, value } => {
+                lower_required_binding!(b, no = lower_expr(b, name), Operand::Const(Const::Unit));
+                lower_required_binding!(b, vo = lower_expr(b, value), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(
+                    code,
+                    Rvalue::EnvSet {
+                        name: no,
+                        value: vo,
+                    },
+                ));
+                lower_status_result(b, code, e.ty)
+            }
+            // `time.now()` / `time.instant()` → an `i64` returned by value.
+            hir::ExprKind::TimeNow => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::TimeNow));
+                Operand::Value(v)
+            }
+            hir::ExprKind::TimeInstant => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::TimeInstant));
+                Operand::Value(v)
+            }
+            hir::ExprKind::ProcessCpuCount => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ProcessCpuCount));
+                Operand::Value(v)
+            }
+            // `time.sleep(ns)` → `()`; emit the void call and yield unit.
+            hir::ExprKind::TimeSleep { ns } => {
+                lower_required_binding!(b, no = lower_expr(b, ns), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(v, Rvalue::TimeSleep { ns: no }));
+                Operand::Const(Const::Unit)
+            }
+            // `process.exit(code)` — the settled cleanup-then-exit path: evaluate `code`, run the current
+            // function's pending cleanup (drops for live owned locals + `task_group`/arena ends — the
+            // exact emission a `return` uses, so buffered writers flush in their `Drop`), then a diverging
+            // runtime `align_rt_process_exit(code)` (void `-> !`, like `bounds_fail`). The block is then
+            // `Unreachable`; `lower_block`/`lower_fn` observe `is_terminated` and emit no code after it
+            // (#274 lesson). v1 gap: only the CURRENT frame's cleanup runs — full multi-frame unwind is
+            // deferred (`docs/impl/std-design/process.md`).
+            hir::ExprKind::ProcessExit { code } => {
+                lower_required_binding!(b, c = lower_expr(b, code), Operand::Const(Const::Unit));
+                b.emit_exit_cleanup();
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Call("process_exit".to_string(), vec![c]),
+                ));
+                b.terminate(Term::Unreachable);
+                Operand::Const(Const::Unit)
+            }
+            // `process.abort()` — the named escape hatch: NO cleanup emission, a bare diverging
+            // `align_rt_process_abort()` (`_exit`), then `Unreachable`.
+            hir::ExprKind::ProcessAbort => {
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Call("process_abort".to_string(), vec![]),
+                ));
+                b.terminate(Term::Unreachable);
+                Operand::Const(Const::Unit)
+            }
+            // `encoding.*_encode(data)` → an owned `string` `{ptr,len}` returned by value (like
+            // `PathNormalize`); the runtime allocates the buffer, the bound local `Drop`-frees it.
+            hir::ExprKind::EncodingEncode { kind, data } => {
+                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::EncodingEncode {
+                        kind: *kind,
+                        data: d,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `encoding.*_decode(s)` → `Result<buffer, Error>`: the runtime writes an owned `buffer`
+            // handle into `out` and returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)`.
+            hir::ExprKind::EncodingDecode { kind, input } => {
+                lower_encoding_decode(b, *kind, input, e.ty)
+            }
+            // `compress.gzip_compress(data, level)` / `gzip_decompress(data)` → `Result<buffer, Error>`:
+            // the runtime writes an owned `buffer` handle into `out` + returns an i32 status; branch
+            // `Ok(<buffer>)` / `Err(<mapped>)` via the shared status→result helper.
+            hir::ExprKind::Compress { kind, data, level } => {
+                let out = b.new_slot(Ty::Buffer);
+                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
+                lower_required_binding!(b, lv = lower_expr(b, level), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(
+                    code,
+                    Rvalue::CompressCompress {
+                        kind: *kind,
+                        data: d,
+                        level: lv,
+                        out,
+                    },
+                ));
+                emit_status_buffer_result(b, code, out, e.ty)
+            }
+            hir::ExprKind::Decompress { kind, data } => {
+                let out = b.new_slot(Ty::Buffer);
+                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(
+                    code,
+                    Rvalue::CompressDecompress {
+                        kind: *kind,
+                        data: d,
+                        out,
+                    },
+                ));
+                emit_status_buffer_result(b, code, out, e.ty)
+            }
+            // `encoding.utf8_valid(b)` → the runtime returns an `i32` (1/0); compare `!= 0` to a `bool`
+            // (the same i32→bool bridge as `fs.exists`).
+            hir::ExprKind::Utf8Valid { data } => {
+                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
+                let c = b.fresh_value(status_ty());
+                b.push(Stmt::Let(c, Rvalue::Utf8Valid { data: d }));
+                let v = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Bin(
+                        BinOp::Ne,
+                        Operand::Value(c),
+                        Operand::Const(Const::Int(0, status_ty())),
+                    ),
+                ));
+                Operand::Value(v)
+            }
+            // `crypto.constant_time_equal(a, b)` → the runtime returns an `i32` (1/0); compare `!= 0` to
+            // a `bool` (the same i32→bool bridge as `utf8_valid`). Both operands are byte views.
+            hir::ExprKind::CryptoCtEqual { a, b: bb } => {
+                lower_required_binding!(b, av = lower_expr(b, a), Operand::Const(Const::Unit));
+                lower_required_binding!(b, bv = lower_expr(b, bb), Operand::Const(Const::Unit));
+                let c = b.fresh_value(status_ty());
+                b.push(Stmt::Let(c, Rvalue::CryptoCtEqual { a: av, b: bv }));
+                let v = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Bin(
+                        BinOp::Ne,
+                        Operand::Value(c),
+                        Operand::Const(Const::Int(0, status_ty())),
+                    ),
+                ));
+                Operand::Value(v)
+            }
+            // `crypto.random(out)` → a void runtime call that fills the buffer in place; the expression
+            // value is `()` (the same shape as `time.sleep`).
+            hir::ExprKind::CryptoRandom { out } => {
+                lower_required_binding!(b, o = lower_expr(b, out), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(v, Rvalue::CryptoRandom { out: o }));
+                Operand::Const(Const::Unit)
+            }
+            // `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
+            // returned by value; the bound local `Drop`-frees it (same shape as `rand.sample`). The
+            // runtime allocates the digest buffer + aborts on an engine failure.
+            hir::ExprKind::CryptoHash { algo, data } => {
+                lower_required_binding!(b, dv = lower_expr(b, data), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CryptoHash {
+                        algo: *algo,
+                        data: dv,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `crypto.hmac_sha256(key, data)` / `crypto.hkdf_sha256(salt, ikm, info, len)` → out-of-line
+            // helpers. Their bodies bind several locals; kept out of this recursive `match` so those slots
+            // do not inflate `lower_expr`'s (per-recursion-level) stack frame in debug builds — a deep
+            // expression tree recurses through this function, and rustc reserves every arm's locals up
+            // front (the `expr_depth` headroom the #296 cap was measured against).
+            hir::ExprKind::CryptoHmac { key, data } => lower_crypto_hmac(b, key, data, e.ty),
+            hir::ExprKind::CryptoHkdf {
+                salt,
+                ikm,
+                info,
+                len,
+            } => lower_crypto_hkdf(b, salt, ikm, info, len, e.ty),
+            hir::ExprKind::CryptoAead {
+                cipher,
+                dir,
+                key,
+                nonce,
+                input,
+                aad,
+            } => lower_crypto_aead(b, *cipher, *dir, key, nonce, input, aad, e.ty),
+            hir::ExprKind::CryptoArgon2 {
+                password,
+                salt,
+                params,
+            } => lower_crypto_argon2(b, password, salt, params, e.ty),
+            // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
+            // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
+            hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
+                let seed = match &e.kind {
+                    hir::ExprKind::RandSeedWith { seed } => Some(lower_required!(
+                        b,
+                        lower_expr(b, seed),
+                        Operand::Const(Const::Unit)
+                    )),
+                    _ => None,
+                };
+                let out = b.new_slot(Ty::Rng);
+                let dummy = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(dummy, Rvalue::RandSeed { seed, out }));
+                let v = b.fresh_value(Ty::Rng);
+                b.push(Stmt::Let(v, Rvalue::Load(out)));
+                Operand::Value(v)
+            }
+            // `r.next()` — the receiver is a bound mut local (sema-checked); its slot id *is* the rng
+            // state, mutated in place by the runtime through a pointer.
+            hir::ExprKind::RandNext { rng } => {
+                let slot = rng_slot(rng);
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::RandNext { rng: slot }));
+                Operand::Value(v)
+            }
+            // `r.range(lo, hi)` — advance the rng, return a uniform i64 in `[lo, hi)`.
+            hir::ExprKind::RandRange { rng, lo, hi } => {
+                let slot = rng_slot(rng);
+                lower_required_binding!(b, lo = lower_expr(b, lo), Operand::Const(Const::Unit));
+                lower_required_binding!(b, hi = lower_expr(b, hi), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::RandRange { rng: slot, lo, hi }));
+                Operand::Value(v)
+            }
+            // `r.shuffle(out xs)` — Fisher-Yates the slice in place; no value.
+            hir::ExprKind::RandShuffle { rng, xs, elem } => {
+                let slot = rng_slot(rng);
+                lower_required_binding!(b, xv = lower_expr(b, xs), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::RandShuffle {
+                        rng: slot,
+                        xs: xv,
+                        elem: *elem,
+                    },
+                ));
+                Operand::Const(Const::Unit)
+            }
+            // `r.sample(xs, k)` → a fresh owned `array<T>` `{ptr,len}` returned by value; the bound local
+            // `Drop`-frees it. The runtime allocates + validates `k` (aborts on `k < 0` / `k > len`).
+            hir::ExprKind::RandSample { rng, xs, k, elem } => {
+                let slot = rng_slot(rng);
+                lower_required_binding!(b, xv = lower_expr(b, xs), Operand::Const(Const::Unit));
+                lower_required_binding!(b, kv = lower_expr(b, k), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::RandSample {
+                        rng: slot,
+                        xs: xv,
+                        k: kv,
+                        elem: *elem,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `cli.command(name)` → an owned `cli command` handle returned by value (the bound local
+            // `Drop`-frees it via `cli_command_free`).
+            hir::ExprKind::CliCommand { name } => {
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::CliCommand { name: nm }));
+                Operand::Value(v)
+            }
+            // `c.flag_*(...)` → register a flag into the command handle in place; no value. The receiver
+            // is a bound local (sema-checked); its loaded pointer value is the handle the runtime mutates.
+            hir::ExprKind::CliFlag {
+                cmd,
+                kind,
+                name,
+                default,
+            } => {
+                lower_required_binding!(b, cop = lower_expr(b, cmd), Operand::Const(Const::Unit));
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let def = match default {
+                    Some(default) => Some(lower_required!(
+                        b,
+                        lower_expr(b, default),
+                        Operand::Const(Const::Unit)
+                    )),
+                    None => None,
+                };
+                let v = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CliFlag {
+                        cmd: cop,
+                        kind: *kind,
+                        name: nm,
+                        default: def,
+                    },
+                ));
+                Operand::Const(Const::Unit)
+            }
+            // `c.parse(args)` → `Result<parsed, Error>`: the runtime writes an owned `parsed` handle into
+            // `out` and returns an i32 status; branch `Ok(<parsed>)` / `Err(<mapped>)`.
+            hir::ExprKind::CliParse { cmd, args } => lower_cli_parse(b, cmd, args, e.ty),
+            // `p.get_bool(name)` → the runtime returns an i32 (1/0); compare `!= 0` to a `bool`.
+            hir::ExprKind::CliGetBool { parsed, name } => {
+                lower_required_binding!(
+                    b,
+                    pop = lower_expr(b, parsed),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let c = b.fresh_value(status_ty());
+                b.push(Stmt::Let(
+                    c,
+                    Rvalue::CliGetBool {
+                        parsed: pop,
+                        name: nm,
+                    },
+                ));
+                let v = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Bin(
+                        BinOp::Ne,
+                        Operand::Value(c),
+                        Operand::Const(Const::Int(0, status_ty())),
+                    ),
+                ));
+                Operand::Value(v)
+            }
+            // `p.get_i64(name)` → the runtime returns the i64 value directly.
+            hir::ExprKind::CliGetI64 { parsed, name } => {
+                lower_required_binding!(
+                    b,
+                    pop = lower_expr(b, parsed),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CliGetI64 {
+                        parsed: pop,
+                        name: nm,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `p.get_str(name)` → a `str` view `{ptr,len}` into the parsed handle's storage (region-bound
+            // to `parsed`; not owned — no `Drop`).
+            hir::ExprKind::CliGetStr { parsed, name } => {
+                lower_required_binding!(
+                    b,
+                    pop = lower_expr(b, parsed),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CliGetStr {
+                        parsed: pop,
+                        name: nm,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `c.usage()` → an owned `string` `{ptr,len}` returned by value (the bound local `Drop`-frees it).
+            hir::ExprKind::CliUsage { cmd } => {
+                lower_required_binding!(b, cop = lower_expr(b, cmd), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::CliUsage { cmd: cop }));
+                Operand::Value(v)
+            }
+            // `std.regex` stays one recursive-match arm for expression-depth headroom; the dispatcher
+            // handles compile / match / find out of line.
+            hir::ExprKind::RegexCompile { .. }
+            | hir::ExprKind::RegexIsMatch { .. }
+            | hir::ExprKind::RegexFind { .. }
+            | hir::ExprKind::RegexFindAll { .. }
+            | hir::ExprKind::RegexSplit { .. }
+            | hir::ExprKind::RegexReplace { .. }
+            | hir::ExprKind::RegexCaptures { .. }
+            | hir::ExprKind::RegexGroupCount { .. }
+            | hir::ExprKind::RegexGroupIndex { .. }
+            | hir::ExprKind::CapturesGroup { .. } => lower_regex_expr(b, e),
+            // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
+            // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
+            // match grows by exactly one arm (not seven). A deep expression tree recurses through
+            // `lower_expr`, and rustc reserves every arm's locals per level (the `expr_depth` #296 headroom
+            // lesson — std.http is the last std module, so the cap's remaining headroom is thin).
+            hir::ExprKind::HttpRequest { .. }
+            | hir::ExprKind::HttpHeader { .. }
+            | hir::ExprKind::HttpBody { .. }
+            | hir::ExprKind::HttpRequestTimeout { .. }
+            | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpParse { .. }
+            | hir::ExprKind::HttpRespStatus { .. }
+            | hir::ExprKind::HttpRespHeader { .. }
+            | hir::ExprKind::HttpRespBody { .. }
+            | hir::ExprKind::HttpClient
+            | hir::ExprKind::HttpClientGet { .. }
+            | hir::ExprKind::HttpClientPost { .. }
+            | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpAccept { .. }
+            | hir::ExprKind::HttpCtxMethod { .. }
+            | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxHeaders { .. }
+            | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpCtxBody { .. }
+            | hir::ExprKind::HttpResponseBuilder { .. }
+            | hir::ExprKind::HttpRbHeader { .. }
+            | hir::ExprKind::HttpRbBody { .. }
+            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpStreamReject { .. }
+            | hir::ExprKind::HttpStreamSend { .. }
+            | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
+            hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
+            hir::ExprKind::Local(id) => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Load(*id)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Unary { op, expr } => {
+                lower_required_binding!(b, a = lower_expr(b, expr), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Un(*op, a)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Cast(inner) => {
+                let from = inner.ty;
+                let operand = lower_expr(b, inner);
+                // A no-op cast (same type, e.g. `x as i32` where `x: i32`) is just the operand.
+                if from == e.ty {
+                    return operand;
+                }
+                if !lowering_continues(b) {
+                    return Operand::Const(Const::Unit);
+                }
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Cast {
+                        operand,
+                        from,
+                        to: e.ty,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Binary { op, lhs, rhs } => {
+                // `&&` / `||` short-circuit: the right operand is evaluated only when the left doesn't
+                // already decide the result. Lower to a branch (not a strict `Rvalue::Bin`), so a guard
+                // like `i < len && arr[i] > 0` doesn't evaluate `arr[i]` (and trap) when `i >= len`.
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    return lower_short_circuit(b, *op, lhs, rhs);
+                }
+                lower_required_binding!(b, l = lower_expr(b, lhs), Operand::Const(Const::Unit));
+                lower_required_binding!(b, r = lower_expr(b, rhs), Operand::Const(Const::Unit));
+                // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
+                // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
+                // division is IEEE (no guard).
+                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(lhs.ty, Ty::Int(_)) {
+                    return lower_int_div(b, *op, l, r, lhs.ty);
+                }
+                // A `vecN<T>` `/` / `%` carries the same divisor guard, lane-wise: any zero lane aborts,
+                // and a signed `INT_MIN / -1` lane wraps. Float vectors are IEEE (no guard).
+                if let (BinOp::Div | BinOp::Rem, Ty::Vec(s, n)) = (op, e.ty) {
+                    return lower_vec_div(b, *op, l, r, s, n, rhs.ty);
+                }
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::IntArith { op, mode, lhs, rhs } => {
+                let int_ty = lhs.ty;
+                lower_required_binding!(b, a = lower_expr(b, lhs), Operand::Const(Const::Unit));
+                lower_required_binding!(b, bb = lower_expr(b, rhs), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::IntArith {
+                        op: *op,
+                        mode: *mode,
+                        int_ty,
+                        a,
+                        b: bb,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::MathOp { fn_, operands } => {
+                let Some(first) = operands.first() else {
+                    b.terminate(Term::Unreachable);
+                    return Operand::Const(Const::Unit);
+                };
+                let ty = first.ty;
+                let mut ops = Vec::with_capacity(operands.len());
+                for operand in operands {
+                    ops.push(lower_required!(
+                        b,
+                        lower_expr(b, operand),
+                        Operand::Const(Const::Unit)
+                    ));
+                }
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::MathOp {
+                        fn_: *fn_,
+                        ty,
+                        operands: ops,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::FnValue(name) => finish_fn_value(b, name, e.ty),
+            hir::ExprKind::Closure { lifted, captures } => {
+                let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
+                let mut ops = Vec::with_capacity(captures.len());
+                for capture in captures {
+                    ops.push(lower_required!(
+                        b,
+                        lower_expr(b, capture),
+                        Operand::Const(Const::Unit)
+                    ));
+                }
+                finish_closure(b, lifted, ops, capture_tys, e.ty)
+            }
+            hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
+            hir::ExprKind::Call { .. } => lower_direct_call(b, e),
+            hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
+            // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
+            // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
+            // headroom lesson: rustc reserves every arm's locals per level at opt-0).
+            hir::ExprKind::Loop { .. } => lower_loop(b, e),
+            // `Type.Variant(payload…)` — build the sum-type aggregate `{ i32 tag, … }`.
+            hir::ExprKind::EnumValue {
+                enum_id,
+                variant,
+                payload,
+            } => {
+                let Some(LoweredAggregateParts {
+                    operands,
+                    owners,
+                    drop_flag,
+                }) = lower_consumed_aggregate_parts(b, payload)
+                else {
+                    return Operand::Const(Const::Unit);
+                };
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::MakeEnum {
+                        enum_id: *enum_id,
+                        variant: *variant,
+                        payload: operands,
+                    },
+                ));
+                if let Some(flag) = drop_flag {
+                    b.attach_value_drop_flag(v, flag.clone());
+                    b.attach_value_temp_drop_flag(v, flag);
+                }
+                finish_consumed_aggregate(b, payload, owners);
+                Operand::Value(v)
+            }
+            hir::ExprKind::Match { scrutinee, arms } => {
+                lower_match(b, scrutinee, arms, e.ty, false)
+            }
+            hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
+            hir::ExprKind::Field { root, path } => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Field(*root, path.clone())));
+                Operand::Value(v)
+            }
+            hir::ExprKind::SoaColumn {
+                base,
+                struct_id,
+                field,
+            } => {
+                let v = b.fresh_value(e.ty); // slice<FieldTy>
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::SoaColumn {
+                        base: *base,
+                        struct_id: *struct_id,
+                        field: *field,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Tuple { tuple_id, elems } => {
+                let Some(LoweredAggregateParts {
+                    operands,
+                    owners,
+                    drop_flag,
+                }) = lower_consumed_aggregate_parts(b, elems)
+                else {
+                    return Operand::Const(Const::Unit);
+                };
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::MakeTuple {
+                        tuple_id: *tuple_id,
+                        elems: operands,
+                    },
+                ));
+                if let Some(flag) = drop_flag {
+                    b.attach_value_drop_flag(v, flag.clone());
+                    b.attach_value_temp_drop_flag(v, flag);
+                }
+                finish_consumed_aggregate(b, elems, owners);
+                Operand::Value(v)
+            }
+            hir::ExprKind::TupleIndex { recv, index } => {
+                lower_required_binding!(b, t = lower_expr(b, recv), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::TupleIndex {
+                        tuple: t,
+                        index: *index,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::IndexField { base, index, path } => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::IndexField(*base, index_const(*index as usize), path.clone()),
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Block(blk) => lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit)),
+            // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
+            // inner block; the enforcement + impurity were handled in sema.
+            hir::ExprKind::Unsafe(blk) => {
+                lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit))
+            }
+            // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
+            hir::ExprKind::RawAlloc(size) => {
+                lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(v, Rvalue::RawAlloc(sz)));
+                Operand::Value(v)
+            }
+            // `raw.free(p)` → free the pointer (a side-effecting statement, like `ArenaEnd`); yields unit.
+            hir::ExprKind::RawFree(ptr) => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                b.push(Stmt::RawFree(p));
+                Operand::Const(Const::Unit)
+            }
+            // `raw.load(p, offset)` → read `scalar` at `p + offset` bytes.
+            hir::ExprKind::RawLoad {
+                ptr,
+                offset,
+                scalar,
+            } => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                lower_required_binding!(
+                    b,
+                    off = lower_expr(b, offset),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::RawLoad {
+                        ptr: p,
+                        offset: off,
+                        scalar: *scalar,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `raw.store(p, offset, v)` → write `v` at `p + offset` bytes (a side-effecting statement).
+            hir::ExprKind::RawStore { ptr, offset, value } => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                lower_required_binding!(
+                    b,
+                    off = lower_expr(b, offset),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, val = lower_expr(b, value), Operand::Const(Const::Unit));
+                b.push(Stmt::RawStore {
+                    ptr: p,
+                    offset: off,
+                    value: val,
+                });
+                Operand::Const(Const::Unit)
+            }
+            // `raw.offset(p, n)` → a new `raw` pointer `p + n` bytes.
+            hir::ExprKind::RawOffset { ptr, offset } => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                lower_required_binding!(
+                    b,
+                    off = lower_expr(b, offset),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::RawOffset {
+                        ptr: p,
+                        offset: off,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
+            // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
+            hir::ExprKind::TaskGroup(blk) => {
+                let handle = b.fresh_value(Ty::ArenaHandle);
+                b.push(Stmt::Let(handle, Rvalue::TgBegin));
+                b.task_groups.push(handle);
+                let tail = lower_block(b, blk);
+                b.task_groups.pop();
+                if !lowering_continues(b) {
+                    Operand::Const(Const::Unit)
+                } else {
+                    // Structured concurrency joins every task before the scope-owned task region is
+                    // released. An explicit `wait()` may already have drained the list; the runtime
+                    // wait operation is idempotent for an empty list.
+                    b.push(Stmt::TgWait(Operand::Value(handle)));
+                    b.push(Stmt::TgEnd(Operand::Value(handle)));
+                    tail.unwrap_or(Operand::Const(Const::Unit))
+                }
+            }
+            // ④b-1b (deferred): `spawn(closure)` snapshots the closure's captures into a fresh env in
+            // the task-group region and registers the task; it runs at `wait`. The `Task<R>` handle is
+            // the task's result slot. The closure's captures give the env layout.
+            hir::ExprKind::Spawn { closure, fallible } => {
+                let Ty::Task(s) = e.ty else {
+                    unreachable!("spawn result is a Task")
+                };
+                let r_ty = align_sema::scalar_to_ty(s);
+                let capture_tys: Vec<Ty> = match &closure.kind {
+                    hir::ExprKind::Closure { captures, .. } => {
+                        captures.iter().map(|c| c.ty).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                lower_required_binding!(
+                    b,
+                    clos = lower_expr(b, closure),
+                    Operand::Const(Const::Unit)
+                );
+                let tg = Operand::Value(*b.task_groups.last().expect("spawn outside a task_group"));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::SpawnTask {
+                        tg,
+                        closure: clos,
+                        capture_tys,
+                        r: r_ty,
+                        fallible: *fallible,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `t.get()` reads the result out of the task's slot.
+            hir::ExprKind::TaskGet(inner) => {
+                lower_required_binding!(b, bx = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
+                Operand::Value(v)
+            }
+            // `wait()` — run all deferred tasks of the enclosing task_group.
+            hir::ExprKind::Wait => {
+                let tg = Operand::Value(*b.task_groups.last().expect("wait outside a task_group"));
+                // A fallible group's `wait()` yields `Result<(), Error>` (built from the runtime's
+                // error code); an infallible group's yields `()`.
+                let fallible = matches!(e.ty, Ty::Result(..));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::TgWaitResult { tg, fallible }));
+                Operand::Value(v)
+            }
+            hir::ExprKind::OptionSome(inner) => {
+                lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::OptionSome(op)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::OptionNone => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::OptionNone));
+                Operand::Value(v)
+            }
+            hir::ExprKind::ElseUnwrap { opt, fallback } => {
+                lower_else_unwrap(b, opt, fallback, e.ty, false)
+            }
+            hir::ExprKind::ResultOk(inner) => {
+                lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ResultOk(op)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::ResultErr(inner) => {
+                lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::ResultErr(op)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::Try(inner) => lower_try(b, inner, e.ty),
+            hir::ExprKind::Arena(blk) => {
+                let handle = b.fresh_value(Ty::ArenaHandle);
+                b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+                b.arenas.push(handle);
+                let tail = lower_block(b, blk);
+                b.arenas.pop();
+                if !lowering_continues(b) {
+                    // The body diverged (return/?): cleanup already ran on that path.
+                    Operand::Const(Const::Unit)
+                } else {
+                    b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                    tail.unwrap_or(Operand::Const(Const::Unit))
+                }
+            }
+            hir::ExprKind::HeapNew(inner) => {
+                lower_required_binding!(
+                    b,
+                    init = lower_expr(b, inner),
+                    Operand::Const(Const::Unit)
+                );
+                let handle = *b
+                    .arenas
+                    .last()
+                    .expect("heap.new outside an arena (sema-checked)");
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::HeapAlloc(Operand::Value(handle), init),
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BoxGet(inner) => {
+                lower_required_binding!(b, bx = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BoxClone(inner) => {
+                lower_required_binding!(b, src = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let handle = *b
+                    .arenas
+                    .last()
+                    .expect("clone outside an arena (sema-checked)");
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::StrClone(inner) => {
+                // Deep-copy the `str` bytes into a fresh heap buffer, yielding an owned `string`
+                // `{ptr,len}`. The slot it lands in is `Drop`-freed at scope exit (sema marks the
+                // String local for drop), so no arena is needed.
+                lower_required_binding!(b, src = lower_expr(b, inner), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::StrClone(src)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::StrPredicate {
+                kind,
+                haystack,
+                needle,
+            } => {
+                lower_required_binding!(
+                    b,
+                    h = lower_expr(b, haystack),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, n = lower_expr(b, needle), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::StrPredicate {
+                        kind: *kind,
+                        haystack: h.clone(),
+                        needle: n.clone(),
+                    },
+                ));
+                drop_borrow_owners(b, &h);
+                drop_borrow_owners(b, &n);
+                Operand::Value(v)
+            }
+            hir::ExprKind::StrTrim { kind, recv } => {
+                lower_required_binding!(b, r = lower_expr(b, recv), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                inherit_borrow_owners(b, v, [&r]);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::StrTrim {
+                        kind: *kind,
+                        recv: r,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
+            // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
+            // `null_moved_source`), so its owner still `Drop`-frees it.
+            hir::ExprKind::StrBorrow(inner) => lower_borrowed_owned(b, inner),
+            // `str.bytes()` is the same zero-cost descriptor retype in the other direction: `str` and
+            // `slice<u8>` both lower as `{ptr,len}`. The HIR node retains borrow provenance; MIR needs
+            // no instruction or runtime call.
+            hir::ExprKind::StrBytes { inner } => lower_expr(b, inner),
+            hir::ExprKind::BuilderNew { capacity } => {
+                let cap = match capacity {
+                    Some(c) => lower_required!(b, lower_expr(b, c), Operand::Const(Const::Unit)),
+                    None => Operand::Const(Const::Int(0, i64_ty())),
+                };
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BuilderNew { capacity: cap }));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BuilderWrite { builder, arg, kind } => {
+                lower_required_binding!(
+                    b,
+                    bop = lower_expr(b, builder),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, aop = lower_expr(b, arg), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Unit);
+                let rv = match kind {
+                    hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop, aop),
+                    hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop, aop),
+                    hir::BuilderWriteKind::Bool => Rvalue::BuilderWriteBool(bop, aop),
+                    hir::BuilderWriteKind::Char => Rvalue::BuilderWriteChar(bop, aop),
+                    hir::BuilderWriteKind::Float => Rvalue::BuilderWriteFloat(bop, aop),
+                };
+                b.push(Stmt::Let(v, rv));
+                Operand::Const(Const::Unit)
+            }
+            hir::ExprKind::BuilderToString(inner) => {
+                lower_required_binding!(b, bop = lower_expr(b, inner), Operand::Const(Const::Unit));
+                // The builder is consumed: null its slot so the exit `Drop` of an unfinished builder
+                // is a no-op (`builder_free(null)`), and the finished `string` owns its own buffer.
+                null_moved_source(b, inner);
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BuilderToString(bop)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::ArraySum { source, stages } => {
+                // An explicitly parallel, directly-consumed integer map can fold its result in the
+                // range kernel. This removes the full transformed array and the serial reread while
+                // preserving the existing `par_map` Pure boundary and wrapping integer semantics.
+                // Keep staged maps on their existing paths: they are not yet a whole-range reduction.
+                // A direct `chunks(...).par_map(...)` is now eligible because its borrowed slice
+                // headers are safe range-kernel values and the integer reducer already accepts any
+                // fixed-width input stride.
+                if stages.is_empty()
+                    && let hir::ExprKind::ArrayParMap {
+                        source: map_source,
+                        stages: map_stages,
+                        func,
+                        captures,
+                        elem,
+                    } = &source.kind
+                    && map_stages.is_empty()
+                    && matches!(elem, Ty::Int(_))
+                    && let Some(elem_in) = direct_par_map_elem_in(map_source.ty)
+                {
+                    return lower_array_par_map_reduce(
+                        b, map_source, func, captures, elem_in, *elem,
+                    );
+                }
+                // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
+                // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
+                if let Ty::JsonScanner(sid) = source.ty {
+                    lower_json_scan_reduce(
+                        b,
+                        source,
+                        stages,
+                        sid,
+                        e.ty,
+                        ReducerSpec::Sum,
+                        ReduceInit::Identity,
+                    )
+                } else {
+                    lower_array_reduce(
+                        b,
+                        source,
+                        stages,
+                        e.ty,
+                        ReduceInit::Identity,
+                        ReducerSpec::Sum,
+                    )
+                }
+            }
+            hir::ExprKind::ArrayCount { source, stages } => {
+                if let Ty::JsonScanner(sid) = source.ty {
+                    lower_json_scan_reduce(
+                        b,
+                        source,
+                        stages,
+                        sid,
+                        e.ty,
+                        ReducerSpec::Count,
+                        ReduceInit::Identity,
+                    )
+                } else {
+                    lower_array_reduce(
+                        b,
+                        source,
+                        stages,
+                        i64_ty(),
+                        ReduceInit::Identity,
+                        ReducerSpec::Count,
+                    )
+                }
+            }
+            hir::ExprKind::ArrayReduce {
+                source,
+                stages,
+                func,
+                captures,
+                init,
+            } => {
+                if let Ty::JsonScanner(sid) = source.ty {
+                    lower_json_scan_reduce(
+                        b,
+                        source,
+                        stages,
+                        sid,
+                        e.ty,
+                        ReducerSpec::Fold { func, captures },
+                        ReduceInit::Expr(init),
+                    )
+                } else {
+                    lower_array_reduce(
+                        b,
+                        source,
+                        stages,
+                        e.ty,
+                        ReduceInit::Expr(init),
+                        ReducerSpec::Fold { func, captures },
+                    )
+                }
+            }
+            hir::ExprKind::ArrayAnyAll {
+                source,
+                stages,
+                func,
+                captures,
+                all,
+            } => {
+                if let Ty::JsonScanner(sid) = source.ty {
+                    lower_json_scan_reduce(
+                        b,
+                        source,
+                        stages,
+                        sid,
+                        e.ty,
+                        ReducerSpec::AnyAll {
+                            func,
+                            captures,
+                            all: *all,
+                        },
+                        ReduceInit::Identity,
+                    )
+                } else {
+                    lower_array_reduce(
+                        b,
+                        source,
+                        stages,
+                        Ty::Bool,
+                        ReduceInit::Identity,
+                        ReducerSpec::AnyAll {
+                            func,
+                            captures,
+                            all: *all,
+                        },
+                    )
+                }
+            }
+            hir::ExprKind::ArrayMinMax {
+                source,
+                stages,
+                is_max,
+            } => {
+                if let Ty::JsonScanner(sid) = source.ty {
+                    lower_json_scan_reduce(
+                        b,
+                        source,
+                        stages,
+                        sid,
+                        e.ty,
+                        ReducerSpec::MinMax { is_max: *is_max },
+                        ReduceInit::Identity,
+                    )
+                } else {
+                    lower_array_reduce(
+                        b,
+                        source,
+                        stages,
+                        e.ty,
+                        ReduceInit::Identity,
+                        ReducerSpec::MinMax { is_max: *is_max },
+                    )
+                }
+            }
+            hir::ExprKind::ArrayToArray {
+                source,
+                stages,
+                elem,
+            } => lower_array_collect(b, source, stages, *elem, CollectKind::Collect, &[]).0,
+            hir::ExprKind::ArrayToSoa { source, struct_id } => {
+                lower_array_to_soa(b, source, *struct_id)
+            }
+            hir::ExprKind::ArrayMapInto {
+                source,
+                stages,
+                dst,
+                elem,
+            } => lower_array_map_into(b, source, stages, dst, *elem),
+            hir::ExprKind::ArrayScan {
+                source,
+                stages,
+                func,
+                captures,
+                init,
+                elem,
+            } => {
+                lower_array_collect(
                     b,
                     source,
                     stages,
-                    sid,
-                    e.ty,
-                    ReducerSpec::Fold { func, captures },
-                    ReduceInit::Expr(init),
+                    *elem,
+                    CollectKind::Scan {
+                        func,
+                        init,
+                        captures,
+                    },
+                    &[],
                 )
-            } else {
-                lower_array_reduce(
-                    b,
-                    source,
-                    stages,
-                    e.ty,
-                    ReduceInit::Expr(init),
-                    ReducerSpec::Fold { func, captures },
-                )
+                .0
             }
-        }
-        hir::ExprKind::ArrayAnyAll { source, stages, func, captures, all } => {
-            if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(
-                    b,
-                    source,
-                    stages,
-                    sid,
-                    e.ty,
-                    ReducerSpec::AnyAll { func, captures, all: *all },
-                    ReduceInit::Identity,
-                )
-            } else {
-                lower_array_reduce(
-                    b,
-                    source,
-                    stages,
-                    Ty::Bool,
-                    ReduceInit::Identity,
-                    ReducerSpec::AnyAll { func, captures, all: *all },
-                )
-            }
-        }
-        hir::ExprKind::ArrayMinMax { source, stages, is_max } => {
-            if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(
-                    b,
-                    source,
-                    stages,
-                    sid,
-                    e.ty,
-                    ReducerSpec::MinMax { is_max: *is_max },
-                    ReduceInit::Identity,
-                )
-            } else {
-                lower_array_reduce(
-                    b,
-                    source,
-                    stages,
-                    e.ty,
-                    ReduceInit::Identity,
-                    ReducerSpec::MinMax { is_max: *is_max },
-                )
-            }
-        }
-        hir::ExprKind::ArrayToArray { source, stages, elem } => {
-            lower_array_collect(b, source, stages, *elem, CollectKind::Collect, &[]).0
-        }
-        hir::ExprKind::ArrayToSoa { source, struct_id } => lower_array_to_soa(b, source, *struct_id),
-        hir::ExprKind::ArrayMapInto { source, stages, dst, elem } => lower_array_map_into(b, source, stages, dst, *elem),
-        hir::ExprKind::ArrayScan { source, stages, func, captures, init, elem } => {
-            lower_array_collect(
+            hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
+            hir::ExprKind::ArraySort {
+                source,
+                stages,
+                elem,
+            } => lower_array_sort(b, source, stages, *elem, None),
+            hir::ExprKind::ArraySortBy {
+                source,
+                stages,
+                key_func,
+                captures,
+                key_ty,
+                elem,
+            } => lower_array_sort(
                 b,
                 source,
                 stages,
                 *elem,
-                CollectKind::Scan { func, init, captures },
-                &[],
-            ).0
-        }
-        hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
-        hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem, None),
-        hir::ExprKind::ArraySortBy { source, stages, key_func, captures, key_ty, elem } => {
-            lower_array_sort(b, source, stages, *elem, Some(SortKey { func: key_func.clone(), captures: captures.clone(), key_ty: *key_ty }))
-        }
-        hir::ExprKind::ArrayPartition { source, stages, func, captures, elem } => {
-            let tuple_id = match e.ty {
-                Ty::Tuple(id) => id,
-                _ => unreachable!("partition result is a tuple"),
-            };
-            lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
-        }
-        hir::ExprKind::ArrayGroupAgg { base, struct_id, key_field, value_field, op, source } => {
-            let tuple_id = match e.ty {
-                Ty::Tuple(id) => id,
-                _ => unreachable!("group_by aggregate result is a tuple"),
-            };
-            match source {
-                hir::GroupSource::SoaI64 => lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
-                hir::GroupSource::SoaStr => lower_array_group_str_cols(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
-                hir::GroupSource::AosStr => lower_array_group_str(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
-                hir::GroupSource::Encoded => lower_array_group_encoded(b, *base, *struct_id, *value_field, *op, tuple_id),
-            }
-        }
-        hir::ExprKind::ArrayGroupAggMulti { base, struct_id, key_field, aggs, source } => {
-            let tuple_id = match e.ty {
-                Ty::Tuple(id) => id,
-                _ => unreachable!("group_by multi-aggregate result is a tuple"),
-            };
-            match source {
-                hir::GroupSource::AosStr => lower_array_group_multi_str(b, *base, *struct_id, *key_field, aggs, tuple_id),
-                // sema restricts the fused multi-aggregate to the AoS str key (first cut).
-                other => unreachable!("multi-aggregate group_by source {other:?} is sema-rejected"),
-            }
-        }
-        hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
-        hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
-            // With a direct scalar/AoS source, a chunk source, or a length-preserving scalar/AoS
-            // map/filter/projection chain, including a recognised invariant string filter, run in
-            // parallel via one range kernel. Copy captures are lowered once into the call-scoped
-            // context record; callable, field, and string filters use stable two-pass compaction.
-            // SoA and unsupported aggregate layouts retain the sequential collect loop.
-            let elem_in = match source.ty {
-                Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
-                Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
-                Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
-                _ => None,
-            };
-            if align_sema::par_map_parallelizable(
-                source.ty,
+                Some(SortKey {
+                    func: key_func.clone(),
+                    captures: captures.clone(),
+                    key_ty: *key_ty,
+                }),
+            ),
+            hir::ExprKind::ArrayPartition {
+                source,
                 stages,
-                &b.structs,
-                &b.enums,
-                &b.tagged_types,
-            ) && let Some(elem_in) = elem_in
-            {
-                    let free_src =
-                        pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+                func,
+                captures,
+                elem,
+            } => {
+                let tuple_id = match e.ty {
+                    Ty::Tuple(id) => id,
+                    _ => unreachable!("partition result is a tuple"),
+                };
+                lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
+            }
+            hir::ExprKind::ArrayGroupAgg {
+                base,
+                struct_id,
+                key_field,
+                value_field,
+                op,
+                source,
+            } => {
+                let tuple_id = match e.ty {
+                    Ty::Tuple(id) => id,
+                    _ => unreachable!("group_by aggregate result is a tuple"),
+                };
+                match source {
+                    hir::GroupSource::SoaI64 => lower_array_group_agg(
+                        b,
+                        *base,
+                        *struct_id,
+                        *key_field,
+                        *value_field,
+                        *op,
+                        tuple_id,
+                    ),
+                    hir::GroupSource::SoaStr => lower_array_group_str_cols(
+                        b,
+                        *base,
+                        *struct_id,
+                        *key_field,
+                        *value_field,
+                        *op,
+                        tuple_id,
+                    ),
+                    hir::GroupSource::AosStr => lower_array_group_str(
+                        b,
+                        *base,
+                        *struct_id,
+                        *key_field,
+                        *value_field,
+                        *op,
+                        tuple_id,
+                    ),
+                    hir::GroupSource::Encoded => {
+                        lower_array_group_encoded(b, *base, *struct_id, *value_field, *op, tuple_id)
+                    }
+                }
+            }
+            hir::ExprKind::ArrayGroupAggMulti {
+                base,
+                struct_id,
+                key_field,
+                aggs,
+                source,
+            } => {
+                let tuple_id = match e.ty {
+                    Ty::Tuple(id) => id,
+                    _ => unreachable!("group_by multi-aggregate result is a tuple"),
+                };
+                match source {
+                    hir::GroupSource::AosStr => lower_array_group_multi_str(
+                        b, *base, *struct_id, *key_field, aggs, tuple_id,
+                    ),
+                    // sema restricts the fused multi-aggregate to the AoS str key (first cut).
+                    other => {
+                        unreachable!("multi-aggregate group_by source {other:?} is sema-rejected")
+                    }
+                }
+            }
+            hir::ExprKind::ArrayDictEncode {
+                base,
+                struct_id,
+                key_field,
+            } => lower_dict_encode(b, *base, *struct_id, *key_field),
+            hir::ExprKind::ArrayParMap {
+                source,
+                stages,
+                func,
+                captures,
+                elem,
+            } => {
+                // With a direct scalar/AoS source, a chunk source, or a length-preserving scalar/AoS
+                // map/filter/projection chain, including a recognised invariant string filter, run in
+                // parallel via one range kernel. Copy captures are lowered once into the call-scoped
+                // context record; callable, field, and string filters use stable two-pass compaction.
+                // SoA and unsupported aggregate layouts retain the sequential collect loop.
+                let elem_in = match source.ty {
+                    Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => {
+                        Some(align_sema::scalar_to_ty(s))
+                    }
+                    Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => {
+                        Some(Ty::Struct(id))
+                    }
+                    _ => None,
+                };
+                if align_sema::par_map_parallelizable(
+                    source.ty,
+                    stages,
+                    &b.structs,
+                    &b.enums,
+                    &b.tagged_types,
+                ) && let Some(elem_in) = elem_in
+                {
+                    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
                     let src = match source.ty {
-                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
+                        Ty::Slice(_)
+                        | Ty::DynArray(_)
+                        | Ty::DynSliceArray(_)
+                        | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
                             lower_borrowed_owned(b, source)
                         }
                         _ => {
                             let (slot, n) = array_source_slot(b, source);
+                            if !lowering_continues(b) {
+                                return Operand::Const(Const::Unit);
+                            }
                             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
                             b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
                             Operand::Value(sv)
@@ -4898,13 +5613,29 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
                         let (kind, func, captures) = match &stage.kind {
-                            hir::StageKind::Map { func, captures } => (ParMapStageKind::Map, Some(func.clone()), captures.as_slice()),
-                            hir::StageKind::Where { func, captures } => (ParMapStageKind::Filter, Some(func.clone()), captures.as_slice()),
-                            hir::StageKind::Project { field } => (ParMapStageKind::Project { field: *field }, None, &[][..]),
-                            hir::StageKind::WhereField { field } => (ParMapStageKind::FilterField { field: *field }, None, &[][..]),
-                            hir::StageKind::WhereStrContains { needle } => {
-                                (ParMapStageKind::FilterStrContains, None, std::slice::from_ref(needle))
+                            hir::StageKind::Map { func, captures } => (
+                                ParMapStageKind::Map,
+                                Some(func.clone()),
+                                captures.as_slice(),
+                            ),
+                            hir::StageKind::Where { func, captures } => (
+                                ParMapStageKind::Filter,
+                                Some(func.clone()),
+                                captures.as_slice(),
+                            ),
+                            hir::StageKind::Project { field } => {
+                                (ParMapStageKind::Project { field: *field }, None, &[][..])
                             }
+                            hir::StageKind::WhereField { field } => (
+                                ParMapStageKind::FilterField { field: *field },
+                                None,
+                                &[][..],
+                            ),
+                            hir::StageKind::WhereStrContains { needle } => (
+                                ParMapStageKind::FilterStrContains,
+                                None,
+                                std::slice::from_ref(needle),
+                            ),
                         };
                         let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
                         let mut capture_ops = Vec::with_capacity(captures.len());
@@ -4935,194 +5666,309 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     // Free the source buffer if it is an owned temporary the runtime just consumed.
                     // A call returning `slice<T>` is a borrow and must never be classified as one.
                     let v = b.fresh_value(e.ty);
-                    b.push(Stmt::Let(v, Rvalue::ParMapParallel {
-                        src: src.clone(),
-                        func: func.clone(),
-                        stages: stage_records,
-                        captures: capture_ops,
-                        capture_tys,
-                        elem_in,
-                        elem_out: *elem,
-                        work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
-                    }));
+                    b.push(Stmt::Let(
+                        v,
+                        Rvalue::ParMapParallel {
+                            src: src.clone(),
+                            func: func.clone(),
+                            stages: stage_records,
+                            captures: capture_ops,
+                            capture_tys,
+                            elem_in,
+                            elem_out: *elem,
+                            work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
+                        },
+                    ));
                     if free_src {
                         drop_borrow_owners(b, &src);
                     }
                     return Operand::Value(v);
                 }
-            // Sequential fallback: append a `map(f)` stage (carrying any captures) and materialize
-            // via the collect loop.
-            let mut stages2 = stages.clone();
-            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone(), captures: captures.clone() }, out_ty: *elem });
-            lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect, &[]).0
-        }
-        hir::ExprKind::ArrayChunks { source, n, elem } => {
-            // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
-            let src = lower_chunks_source(b, source, *elem);
-            let n_op = lower_expr(b, n);
-            let v = b.fresh_value(e.ty);
-            inherit_borrow_owners(b, v, [&src]);
-            b.push(Stmt::Let(v, Rvalue::Chunks { src, n: n_op, elem: *elem }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::ArrayToSlice(inner) => {
-            if matches!(inner.ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
-                let owned_view = lower_borrowed_owned(b, inner);
+                // Sequential fallback: append a `map(f)` stage (carrying any captures) and materialize
+                // via the collect loop.
+                let mut stages2 = stages.clone();
+                stages2.push(hir::Stage {
+                    kind: hir::StageKind::Map {
+                        func: func.clone(),
+                        captures: captures.clone(),
+                    },
+                    out_ty: *elem,
+                });
+                lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect, &[]).0
+            }
+            hir::ExprKind::ArrayChunks { source, n, elem } => {
+                // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
+                lower_required_binding!(
+                    b,
+                    src = lower_chunks_source(b, source, *elem),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, n_op = lower_expr(b, n), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
-                inherit_borrow_owners(b, v, [&owned_view]);
-                b.push(Stmt::Let(v, Rvalue::Use(owned_view)));
-                return Operand::Value(v);
+                inherit_borrow_owners(b, v, [&src]);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Chunks {
+                        src,
+                        n: n_op,
+                        elem: *elem,
+                    },
+                ));
+                Operand::Value(v)
             }
-            let (slot, n) = array_source_slot(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Len(inner) => {
-            if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
-                // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
-                // materialized, but avoid allocating/filling headers for this scalar consumer.
-                let src = lower_chunks_source(b, source, *elem);
-                let n = lower_expr(b, n);
-                let src_len = b.fresh_value(i64_ty());
-                b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
-                let count = lower_chunks_count(b, Operand::Value(src_len), n);
-                drop_borrow_owners(b, &src);
-                return count;
+            hir::ExprKind::ArrayToSlice(inner) => {
+                if matches!(
+                    inner.ty,
+                    Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)
+                ) {
+                    lower_required_binding!(
+                        b,
+                        owned_view = lower_borrowed_owned(b, inner),
+                        Operand::Const(Const::Unit)
+                    );
+                    let v = b.fresh_value(e.ty);
+                    inherit_borrow_owners(b, v, [&owned_view]);
+                    b.push(Stmt::Let(v, Rvalue::Use(owned_view)));
+                    return Operand::Value(v);
+                }
+                let (slot, n) = array_source_slot(b, inner);
+                if !lowering_continues(b) {
+                    return Operand::Const(Const::Unit);
+                }
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
+                Operand::Value(v)
             }
-            // `str`/`slice` carry the length in their `{ ptr, len }` view.
-            let sv = lower_borrowed_owned(b, inner);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::SliceLen(sv.clone())));
-            drop_borrow_owners(b, &sv);
-            Operand::Value(v)
-        }
-        hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
-        hir::ExprKind::SliceRange { recv, start, end } => lower_slice_range(b, recv, start.as_deref(), end.as_deref(), e.ty),
-        hir::ExprKind::ElemField { recv, index, path, struct_id } => {
-            lower_index_field(b, recv, index, path, *struct_id, e.ty)
-        }
-        hir::ExprKind::ArrayLit { .. } => {
-            unreachable!("array literal only appears as a let initializer or pipeline source")
-        }
-        hir::ExprKind::ArrayZip { .. } => {
-            unreachable!("zip is a lazy source lowered only by its pipeline terminal")
-        }
-        // `select(mask, a, b)` → a vector `select` (`Rvalue::Select` with a vector mask cond).
-        hir::ExprKind::Select { mask, a, b: bexpr } => {
-            let cond = lower_expr(b, mask);
-            let av = lower_expr(b, a);
-            let bv = lower_expr(b, bexpr);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Select { cond, a: av, b: bv }));
-            Operand::Value(v)
-        }
-        // `vec.sum_where(mask)` → masked horizontal sum. `e.ty` is the element scalar; the width is
-        // recovered from the receiver's vector type.
-        hir::ExprKind::VecSumWhere { vec, mask } => {
-            let n = match vec.ty {
-                Ty::Vec(_, n) => n,
-                _ => unreachable!("sema types sum_where's receiver as a vector"),
-            };
-            let vv = lower_expr(b, vec);
-            let mv = lower_expr(b, mask);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecSumWhere { vec: vv, mask: mv, elem: e.ty, n }));
-            Operand::Value(v)
-        }
-        // `dot(a, b)` → vector multiply then a lane reduction. `e.ty` is the element; the width comes
-        // from the operand vector type.
-        hir::ExprKind::VecDot { a, b: bexpr } => {
-            let n = match a.ty {
-                Ty::Vec(_, n) => n,
-                _ => unreachable!("sema types dot's operands as vectors"),
-            };
-            let av = lower_expr(b, a);
-            let bv = lower_expr(b, bexpr);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecDot { a: av, b: bv, elem: e.ty, n }));
-            Operand::Value(v)
-        }
-        // `v.min()` / `v.max()` → fold the lanes with the scalar min/max intrinsic.
-        hir::ExprKind::VecMinMax { vec, max } => {
-            let n = match vec.ty {
-                Ty::Vec(_, n) => n,
-                _ => unreachable!("sema types min/max's receiver as a vector"),
-            };
-            let vv = lower_expr(b, vec);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecMinMax { vec: vv, elem: e.ty, n, max: *max }));
-            Operand::Value(v)
-        }
-        // `v.sum()` → add all lanes (the shared horizontal sum).
-        hir::ExprKind::VecSum { vec } => {
-            let n = match vec.ty {
-                Ty::Vec(_, n) => n,
-                _ => unreachable!("sema types sum's receiver as a vector"),
-            };
-            let vv = lower_expr(b, vec);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecSum { vec: vv, elem: e.ty, n }));
-            Operand::Value(v)
-        }
-        // `s.load(i)` → bounds-checked `<n x T>` load from the slice buffer at `i..i+n`. If the slice
-        // is a whole borrow of an `align(N)` binding and the address is provably N-aligned, tag the
-        // load with that alignment (the aligned-vector-load fast path); else fall back to element
-        // alignment. Computed from the *HIR* receiver before it is lowered to an opaque slice temp.
-        hir::ExprKind::VecLoad { src, index, elem, n } => {
-            let align = proven_vec_load_align(b, src, index, align_sema::scalar_to_ty(*elem));
-            let sv = lower_expr(b, src);
-            let idx = lower_expr(b, index);
-            emit_vec_bounds_check(b, &sv, &idx, *n);
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecLoad { slice: sv, index: idx, elem: align_sema::scalar_to_ty(*elem), n: *n, align }));
-            Operand::Value(v)
-        }
-        // `s.store(i, v)` → bounds-checked `<n x T>` store into the slice buffer at `i..i+n`. Unit.
-        hir::ExprKind::VecStore { dst, index, value, elem, n } => {
-            let sv = lower_expr(b, dst);
-            let idx = lower_expr(b, index);
-            let val = lower_expr(b, value);
-            emit_vec_bounds_check(b, &sv, &idx, *n);
-            b.push(Stmt::VecStore { slice: sv, index: idx, value: val, elem: align_sema::scalar_to_ty(*elem), n: *n });
-            Operand::Const(Const::Unit)
-        }
-        // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
-        hir::ExprKind::VecLit { elems, elem } => {
-            let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
-            let n = ops.len() as u32;
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::MakeVec { elems: ops, elem: align_sema::scalar_to_ty(*elem), n }));
-            Operand::Value(v)
-        }
-        // A struct literal in value position (return/arg/assign): materialize it into a
-        // temp slot field by field, then load the whole struct. (A `let` initializer stores
-        // straight into its own slot — see `lower_stmt` — avoiding this copy.)
-        hir::ExprKind::StructLit { .. } => {
-            let slot = b.new_slot(e.ty);
-            let mut owners = Vec::new();
-            let mut drop_flag = None;
-            if !store_consumed_struct_fields(
-                b,
-                slot,
-                &mut Vec::new(),
-                e,
-                &mut owners,
-                &mut drop_flag,
-            ) {
-                return Operand::Const(Const::Unit);
+            hir::ExprKind::Len(inner) => {
+                if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
+                    // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
+                    // materialized, but avoid allocating/filling headers for this scalar consumer.
+                    lower_required_binding!(
+                        b,
+                        src = lower_chunks_source(b, source, *elem),
+                        Operand::Const(Const::Unit)
+                    );
+                    lower_required_binding!(b, n = lower_expr(b, n), Operand::Const(Const::Unit));
+                    let src_len = b.fresh_value(i64_ty());
+                    b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
+                    let count = lower_chunks_count(b, Operand::Value(src_len), n);
+                    drop_borrow_owners(b, &src);
+                    return count;
+                }
+                // `str`/`slice` carry the length in their `{ ptr, len }` view.
+                lower_required_binding!(
+                    b,
+                    sv = lower_borrowed_owned(b, inner),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::SliceLen(sv.clone())));
+                drop_borrow_owners(b, &sv);
+                Operand::Value(v)
             }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Load(slot)));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(v, flag.clone());
-                b.attach_value_temp_drop_flag(v, flag);
+            hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
+            hir::ExprKind::SliceRange { recv, start, end } => {
+                lower_slice_range(b, recv, start.as_deref(), end.as_deref(), e.ty)
             }
-            null_consumed_struct_sources(b, e);
-            for owner in owners {
-                b.set_drop_flag(owner, false);
+            hir::ExprKind::ElemField {
+                recv,
+                index,
+                path,
+                struct_id,
+            } => lower_index_field(b, recv, index, path, *struct_id, e.ty),
+            hir::ExprKind::ArrayLit { .. } => {
+                unreachable!("array literal only appears as a let initializer or pipeline source")
             }
-            Operand::Value(v)
+            hir::ExprKind::ArrayZip { .. } => {
+                unreachable!("zip is a lazy source lowered only by its pipeline terminal")
+            }
+            // `select(mask, a, b)` → a vector `select` (`Rvalue::Select` with a vector mask cond).
+            hir::ExprKind::Select { mask, a, b: bexpr } => {
+                lower_required_binding!(b, cond = lower_expr(b, mask), Operand::Const(Const::Unit));
+                lower_required_binding!(b, av = lower_expr(b, a), Operand::Const(Const::Unit));
+                lower_required_binding!(b, bv = lower_expr(b, bexpr), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Select { cond, a: av, b: bv }));
+                Operand::Value(v)
+            }
+            // `vec.sum_where(mask)` → masked horizontal sum. `e.ty` is the element scalar; the width is
+            // recovered from the receiver's vector type.
+            hir::ExprKind::VecSumWhere { vec, mask } => {
+                let n = match vec.ty {
+                    Ty::Vec(_, n) => n,
+                    _ => unreachable!("sema types sum_where's receiver as a vector"),
+                };
+                lower_required_binding!(b, vv = lower_expr(b, vec), Operand::Const(Const::Unit));
+                lower_required_binding!(b, mv = lower_expr(b, mask), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::VecSumWhere {
+                        vec: vv,
+                        mask: mv,
+                        elem: e.ty,
+                        n,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `dot(a, b)` → vector multiply then a lane reduction. `e.ty` is the element; the width comes
+            // from the operand vector type.
+            hir::ExprKind::VecDot { a, b: bexpr } => {
+                let n = match a.ty {
+                    Ty::Vec(_, n) => n,
+                    _ => unreachable!("sema types dot's operands as vectors"),
+                };
+                lower_required_binding!(b, av = lower_expr(b, a), Operand::Const(Const::Unit));
+                lower_required_binding!(b, bv = lower_expr(b, bexpr), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::VecDot {
+                        a: av,
+                        b: bv,
+                        elem: e.ty,
+                        n,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `v.min()` / `v.max()` → fold the lanes with the scalar min/max intrinsic.
+            hir::ExprKind::VecMinMax { vec, max } => {
+                let n = match vec.ty {
+                    Ty::Vec(_, n) => n,
+                    _ => unreachable!("sema types min/max's receiver as a vector"),
+                };
+                lower_required_binding!(b, vv = lower_expr(b, vec), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::VecMinMax {
+                        vec: vv,
+                        elem: e.ty,
+                        n,
+                        max: *max,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `v.sum()` → add all lanes (the shared horizontal sum).
+            hir::ExprKind::VecSum { vec } => {
+                let n = match vec.ty {
+                    Ty::Vec(_, n) => n,
+                    _ => unreachable!("sema types sum's receiver as a vector"),
+                };
+                lower_required_binding!(b, vv = lower_expr(b, vec), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::VecSum {
+                        vec: vv,
+                        elem: e.ty,
+                        n,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `s.load(i)` → bounds-checked `<n x T>` load from the slice buffer at `i..i+n`. If the slice
+            // is a whole borrow of an `align(N)` binding and the address is provably N-aligned, tag the
+            // load with that alignment (the aligned-vector-load fast path); else fall back to element
+            // alignment. Computed from the *HIR* receiver before it is lowered to an opaque slice temp.
+            hir::ExprKind::VecLoad {
+                src,
+                index,
+                elem,
+                n,
+            } => {
+                lower_required_binding!(b, sv = lower_expr(b, src), Operand::Const(Const::Unit));
+                lower_required_binding!(b, idx = lower_expr(b, index), Operand::Const(Const::Unit));
+                let align = proven_vec_load_align(b, src, index, align_sema::scalar_to_ty(*elem));
+                emit_vec_bounds_check(b, &sv, &idx, *n);
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::VecLoad {
+                        slice: sv,
+                        index: idx,
+                        elem: align_sema::scalar_to_ty(*elem),
+                        n: *n,
+                        align,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // `s.store(i, v)` → bounds-checked `<n x T>` store into the slice buffer at `i..i+n`. Unit.
+            hir::ExprKind::VecStore {
+                dst,
+                index,
+                value,
+                elem,
+                n,
+            } => {
+                lower_required_binding!(b, sv = lower_expr(b, dst), Operand::Const(Const::Unit));
+                lower_required_binding!(b, idx = lower_expr(b, index), Operand::Const(Const::Unit));
+                lower_required_binding!(b, val = lower_expr(b, value), Operand::Const(Const::Unit));
+                emit_vec_bounds_check(b, &sv, &idx, *n);
+                b.push(Stmt::VecStore {
+                    slice: sv,
+                    index: idx,
+                    value: val,
+                    elem: align_sema::scalar_to_ty(*elem),
+                    n: *n,
+                });
+                Operand::Const(Const::Unit)
+            }
+            // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
+            hir::ExprKind::VecLit { elems, elem } => {
+                let mut ops = Vec::with_capacity(elems.len());
+                for element in elems {
+                    ops.push(lower_required!(
+                        b,
+                        lower_expr(b, element),
+                        Operand::Const(Const::Unit)
+                    ));
+                }
+                let n = ops.len() as u32;
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::MakeVec {
+                        elems: ops,
+                        elem: align_sema::scalar_to_ty(*elem),
+                        n,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            // A struct literal in value position (return/arg/assign): materialize it into a
+            // temp slot field by field, then load the whole struct. (A `let` initializer stores
+            // straight into its own slot — see `lower_stmt` — avoiding this copy.)
+            hir::ExprKind::StructLit { .. } => {
+                let slot = b.new_slot(e.ty);
+                let mut owners = Vec::new();
+                let mut drop_flag = None;
+                if !store_consumed_struct_fields(
+                    b,
+                    slot,
+                    &mut Vec::new(),
+                    e,
+                    &mut owners,
+                    &mut drop_flag,
+                ) {
+                    return Operand::Const(Const::Unit);
+                }
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::Load(slot)));
+                if let Some(flag) = drop_flag {
+                    b.attach_value_drop_flag(v, flag.clone());
+                    b.attach_value_temp_drop_flag(v, flag);
+                }
+                null_consumed_struct_sources(b, e);
+                for owner in owners {
+                    b.set_drop_flag(owner, false);
+                }
+                Operand::Value(v)
+            }
         }
     }
 }
@@ -5145,7 +5991,7 @@ fn lower_consumed_aggregate_parts(
     let mut aggregate_drop_flag = None;
     for part in parts {
         let (operand, owner) = lower_consumed_call_arg(b, part);
-        if b.is_terminated() {
+        if !lowering_continues(b) {
             return None;
         }
         if needs_drop_flag(part.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
@@ -5215,7 +6061,7 @@ fn store_consumed_struct_fields(
         }
         _ => {
             let (operand, owner) = lower_consumed_call_arg(b, value);
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return false;
             }
             if needs_drop_flag(value.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
@@ -5259,9 +6105,8 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     let hir::ExprKind::CallFnValue { callee, args } = &e.kind else {
         unreachable!("lower_call_fn_value on a non-call expression");
     };
-    let signature = fn_signature_facts(b, callee.ty);
     let c = lower_expr(b, callee);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     // The function type for the indirect call comes from the (sema-checked) arg types and the
@@ -5276,10 +6121,14 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         arg_owners.push(owner);
         // A nested `return`, `?`, or diverging expression already terminated the block. Do not
         // evaluate later arguments, transfer ownership, or emit the unreachable outer call.
-        if b.is_terminated() {
+        if !lowering_continues(b) {
             return Operand::Const(Const::Unit);
         }
     }
+    let Some(signature) = fn_signature_facts(b, callee.ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
     // A by-value owned argument is MOVED into the callee, exactly as in a direct call
     // (`lower_direct_call`) — null the source so the caller's exit `Drop` doesn't free the buffer the
     // callee now owns. Without this a bound owned local passed indirectly is double-freed (an inline
@@ -5340,20 +6189,61 @@ fn emit_indirect_call(
     if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
 }
 
-fn fn_signature_facts(b: &Builder, ty: Ty) -> FnSignatureFacts {
-    let Ty::Fn(id) = ty else {
-        unreachable!("function signature facts requested for non-function type {ty:?}");
+/// Finish a function-value action after all required children have fallen through. These helpers do
+/// not call `lower_expr`; keeping the comparatively large signature record out of its recursive
+/// frame preserves the measured expression-depth headroom.
+#[inline(never)]
+fn finish_fn_value(b: &mut Builder, name: &str, ty: Ty) -> Operand {
+    let Some(signature) = fn_signature_facts(b, ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
     };
-    let signature = b
-        .ctx
-        .fn_types
-        .get(id as usize)
-        .unwrap_or_else(|| panic!("missing function type {id} during MIR lowering"));
-    FnSignatureFacts {
+    let value = b.fresh_value(ty);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::FnAddr {
+            name: name.to_string(),
+            signature,
+        },
+    ));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn finish_closure(
+    b: &mut Builder,
+    lifted: &str,
+    captures: Vec<Operand>,
+    capture_tys: Vec<Ty>,
+    ty: Ty,
+) -> Operand {
+    let Some(signature) = fn_signature_facts(b, ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
+    let value = b.fresh_value(ty);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::Closure {
+            lifted: lifted.to_string(),
+            captures,
+            capture_tys,
+            signature,
+        },
+    ));
+    Operand::Value(value)
+}
+
+fn fn_signature_facts(b: &Builder, ty: Ty) -> Option<FnSignatureFacts> {
+    let Ty::Fn(id) = ty else {
+        return None;
+    };
+    let signature = b.ctx.fn_types.get(id as usize)?;
+    Some(FnSignatureFacts {
         param_modes: signature.params.iter().map(|(mode, _)| *mode).collect(),
         return_borrow: signature.return_borrow.clone(),
         return_region: signature.return_region.clone(),
-    }
+    })
 }
 
 /// Emit a named call and return its source-language value. Align represents Unit as an ordinary
@@ -5371,6 +6261,9 @@ fn emit_named_call(b: &mut Builder, func: String, args: Vec<Operand>, ret_ty: Ty
 /// drops the already-created value. Once every argument succeeds, the caller clears the owner flag
 /// immediately before emitting the call and the callee becomes the sole owner.
 fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot>) {
+    if !lowering_continues(b) {
+        return (Operand::Const(Const::Unit), Vec::new());
+    }
     if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         || !may_need_synthetic_owner(e)
     {
@@ -5449,7 +6342,7 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot
     }
     let owner = b.new_synthetic_owner(e.ty);
     let operand = lower_expr(b, e);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return (operand, vec![owner]);
     }
     // This is a transferring context, not a borrow. Transparent region wrappers may end with a
@@ -5493,7 +6386,7 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         arg_owners.push(owners);
         // Preserve left-to-right evaluation, but stop once an argument has transferred control.
         // In particular, never emit the outer call after a nested `return`.
-        if b.is_terminated() {
+        if !lowering_continues(b) {
             return Operand::Const(Const::Unit);
         }
     }
@@ -5772,8 +6665,8 @@ fn binary_scalar_width(scalar: Ty) -> i128 {
 /// range check catches an overflowing `off`, so no out-of-range address is ever formed.
 fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: bool, scalar: Ty) -> Operand {
     let width = binary_scalar_width(scalar);
-    let sv = lower_expr(b, bytes);
-    let off = lower_expr(b, offset);
+    let sv = lower_required!(b, lower_expr(b, bytes), Operand::Const(Const::Unit));
+    let off = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
     let end = b.fresh_value(i64_ty());
@@ -5815,8 +6708,8 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ArrayBuilderPush { builder, value, moves_value } => {
-            let bop = lower_expr(b, builder);
-            let val = lower_expr(b, value);
+            let bop = lower_required!(b, lower_expr(b, builder), Operand::Const(Const::Unit));
+            let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
             if *moves_value {
                 // A `string` element is moved into the builder; null its source slot so the source's
@@ -5831,14 +6724,14 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayBuilderAppend { builder, data } => {
             // `data` is a `slice<T>` `{ptr,len}`; the runtime appends `len` elements at the builder's
             // stored element stride.
-            let bop = lower_expr(b, builder);
-            let dop = lower_expr(b, data);
+            let bop = lower_required!(b, lower_expr(b, builder), Operand::Const(Const::Unit));
+            let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(t, Rvalue::ArrayBuilderAppend { builder: bop, data: dop }));
             Operand::Const(Const::Unit)
         }
         hir::ExprKind::ArrayBuilderBuild(builder) => {
-            let bop = lower_expr(b, builder);
+            let bop = lower_required!(b, lower_expr(b, builder), Operand::Const(Const::Unit));
             // The builder is consumed: null its slot so the exit `Drop` of an unfrozen builder is a
             // no-op, and the frozen `array<T>` owns the storage.
             null_moved_source(b, builder);
@@ -5852,8 +6745,8 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 
 fn lower_buffer_put(b: &mut Builder, buffer: &hir::Expr, value: &hir::Expr, be: bool) -> Operand {
     let scalar = value.ty;
-    let bufop = lower_expr(b, buffer);
-    let val = lower_expr(b, value);
+    let bufop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+    let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(t, Rvalue::BufferPut { buffer: bufop, value: val, scalar, be }));
     Operand::Const(Const::Unit)
@@ -5861,8 +6754,8 @@ fn lower_buffer_put(b: &mut Builder, buffer: &hir::Expr, value: &hir::Expr, be: 
 
 /// `buf.append(data)` → copy a raw `slice<u8>` blob onto the growable buffer. Unit-valued.
 fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) -> Operand {
-    let bufop = lower_expr(b, buffer);
-    let dop = lower_expr(b, data);
+    let bufop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+    let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(t, Rvalue::BufferAppend { buffer: bufop, data: dop }));
     Operand::Const(Const::Unit)
@@ -5876,6 +6769,9 @@ fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand
         Ty::DynArray(_) => lower_borrowed_owned(b, source),
         _ => {
             let (slot, len) = array_source_slot(b, source);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let sv = b.fresh_value(Ty::Slice(scalar_of(elem)));
             b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, len)));
             Operand::Value(sv)
@@ -5947,7 +6843,7 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
 fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty) -> Operand {
     // `v[lane]` on a vector → `extractelement` (no bounds check: sema validated a constant lane).
     if let Ty::Vec(_, _) = recv.ty {
-        let vv = lower_expr(b, recv);
+        let vv = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
         let lane = match &index.kind {
             hir::ExprKind::Int(v) => *v as u32,
             _ => unreachable!("sema requires a constant vector lane index"),
@@ -5958,8 +6854,8 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     }
     // `s[i]` on a `soa<Struct>` → gather the whole struct from the columns at `i` (bounds-checked).
     if let Ty::Soa(struct_id) = recv.ty {
-        let sv = lower_expr(b, recv);
-        let idx = lower_expr(b, index);
+        let sv = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
+        let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
         let len = b.fresh_value(i64_ty());
         b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
         emit_bounds_check(b, &idx, Operand::Value(len));
@@ -5970,9 +6866,13 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
         // A direct `.chunks(n)[i]` computes exactly one borrowed sub-view. Stored/escaping chunk
         // arrays and pipeline consumers retain the materialized representation.
-        let src = lower_chunks_source(b, source, *elem);
-        let n = lower_expr(b, n);
-        let idx = lower_expr(b, index);
+        let src = lower_required!(
+            b,
+            lower_chunks_source(b, source, *elem),
+            Operand::Const(Const::Unit)
+        );
+        let n = lower_required!(b, lower_expr(b, n), Operand::Const(Const::Unit));
+        let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
         let src_len = b.fresh_value(i64_ty());
         b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
         let count = lower_chunks_count(b, Operand::Value(src_len), n.clone());
@@ -6021,6 +6921,9 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         // `elem_ty` via `SliceIndex`.
         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
             let sv = lower_borrowed_owned(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Src::Slice(sv), Operand::Value(len))
@@ -6028,10 +6931,13 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         _ => {
             // A fixed `array<T>` (sema restricted `recv` to a literal / local).
             let (slot, n) = array_source_slot(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
         }
     };
-    let idx = lower_expr(b, index);
+    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     emit_bounds_check(b, &idx, len);
     let v = b.fresh_value(elem_ty);
     let borrowed_src = match &src {
@@ -6161,20 +7067,26 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
     let base = match recv.ty {
         Ty::Array(s, _) => {
             let (slot, n) = array_source_slot(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let v = b.fresh_value(Ty::Slice(s));
             b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
             Operand::Value(v)
         }
         _ => lower_borrowed_owned(b, recv),
     };
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let base_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(base_len, Rvalue::SliceLen(base.clone())));
     let start_op = match start {
-        Some(s) => lower_expr(b, s),
+        Some(s) => lower_required!(b, lower_expr(b, s), Operand::Const(Const::Unit)),
         None => Operand::Const(Const::Int(0, i64_ty())),
     };
     let end_op = match end {
-        Some(e) => lower_expr(b, e),
+        Some(e) => lower_required!(b, lower_expr(b, e), Operand::Const(Const::Unit)),
         None => Operand::Value(base_len),
     };
     emit_range_bounds_check(b, &start_op, &end_op, Operand::Value(base_len));
@@ -6196,7 +7108,7 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
 /// `array<Struct>` uses the pointer-based `IndexFieldPtr` (same addressing as a fused pipeline
 /// projection). Only the one field (a scalar or a `str` view) is loaded — no whole-struct copy.
 fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path: &[u32], struct_id: u32, leaf_ty: Ty) -> Operand {
-    let idx = lower_expr(b, index);
+    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     // Set the element-field address up the same way the fused pipeline does (one shared seam,
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
     // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
@@ -6204,6 +7116,9 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
     let (struct_view, slice_val, slot, len) = match recv.ty {
         Ty::DynStructArray(_, layout) => {
             let sv = lower_borrowed_owned(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Some((struct_id, layout)), Some(sv), 0, Operand::Value(len))
@@ -6211,7 +7126,7 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
         // `s[i].field` on a soa — a column-major `{ptr,len}` view; the shared seam reads the one
         // column directly as `IndexColumn`, no whole-struct gather.
         Ty::Soa(_) => {
-            let sv = lower_expr(b, recv);
+            let sv = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Some((struct_id, Layout::Soa)), Some(sv), 0, Operand::Value(len))
@@ -6219,15 +7134,21 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
             let (slot, n) = array_source_slot(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             (None, None, slot, Operand::Const(Const::Int(n, i64_ty())))
         }
+    };
+    let Some(first_ty) = checked_struct_field_path(b, struct_id, path, leaf_ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
     };
     emit_bounds_check(b, &idx, len);
     // Load the element's first field via the shared seam. For a depth-1 path that *is* the leaf; for
     // a nested path (`arr[i].a.x`) it is the intermediate sub-struct, which we materialize to a temp
     // slot and then project the remaining field path out of (reusing the slot-field GEP) — so the
     // pipeline's single-field seam stays untouched.
-    let first_ty = if path.len() == 1 { leaf_ty } else { b.structs[struct_id as usize].fields[path[0] as usize].ty };
     let first = lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], first_ty);
     let result = if path.len() == 1 {
         first
@@ -6246,6 +7167,38 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
         }
     }
     Operand::Value(result)
+}
+
+/// Validate handcrafted HIR field metadata after every written child has fallen through and before
+/// the first bounds/action instruction. Sema normally guarantees this path; malformed direct HIR
+/// must become an unreachable continuation instead of indexing compiler-owned tables.
+fn checked_struct_field_path(b: &Builder, struct_id: u32, path: &[u32], leaf_ty: Ty) -> Option<Ty> {
+    let first = *path.first()?;
+    let mut current = struct_id;
+    let mut first_ty = None;
+    for (depth, &field_index) in path.iter().enumerate() {
+        let field = b
+            .structs
+            .get(current as usize)?
+            .fields
+            .get(field_index as usize)?;
+        if depth == 0 {
+            debug_assert_eq!(field_index, first);
+            first_ty = Some(field.ty);
+        }
+        if depth + 1 == path.len() {
+            // Sema may expose an owned `string` leaf as a borrowed `str` read. Ac validates only
+            // that the stored field path is structurally safe to follow; am-b owns complete
+            // expression/type consistency. Preserve the checked expression's settled result type
+            // for a depth-one read, matching the pre-ac lowering.
+            return Some(if path.len() == 1 { leaf_ty } else { first_ty? });
+        }
+        let Ty::Struct(next) = field.ty else {
+            return None;
+        };
+        current = next;
+    }
+    None
 }
 
 fn index_const(i: usize) -> Operand {
@@ -6390,7 +7343,7 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
                 b.new_slot(source.ty)
             };
             let live = store_array_elems(b, slot, elems, *elem);
-            if owns_elements && !b.is_terminated() {
+            if owns_elements && lowering_continues(b) {
                 b.set_drop_flag_operand(
                     slot,
                     live.unwrap_or(Operand::Const(Const::Bool(false))),
@@ -6436,14 +7389,14 @@ fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir:
                 path.push(i as u32);
                 store_value_at(b, slot, path, fe);
                 path.pop();
-                if b.is_terminated() {
+                if !lowering_continues(b) {
                     return;
                 }
             }
         }
         _ => {
             let op = lower_expr(b, value);
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return;
             }
             b.push(Stmt::StoreField(slot, path.clone(), op));
@@ -6499,7 +7452,7 @@ fn store_array_elems(
         let mut array_drop_flag = None;
         for (i, e) in elems.iter().enumerate() {
             let (operand, element_owners) = lower_consumed_call_arg(b, e);
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return None;
             }
             let element_flag = lowered_drop_flag(b, e, &operand)
@@ -6534,7 +7487,7 @@ fn store_array_elems(
                 // materialized.
                 for (j, fe) in fields.iter().enumerate() {
                     let v = lower_expr(b, fe);
-                    if b.is_terminated() {
+                    if !lowering_continues(b) {
                         return None;
                     }
                     b.push(Stmt::StoreElemField(slot, index_const(i), vec![j as u32], v));
@@ -6545,7 +7498,7 @@ fn store_array_elems(
                 // element. This arm previously stored NOTHING, silently leaving the element
                 // uninitialised (a zeroed scalar, a garbage `str`/fn pointer).
                 let v = lower_expr(b, e);
-                if b.is_terminated() {
+                if !lowering_continues(b) {
                     return None;
                 }
                 b.push(Stmt::StoreIndex(slot, index_const(i), v));
@@ -6555,7 +7508,7 @@ fn store_array_elems(
     } else {
         for (i, e) in elems.iter().enumerate() {
             let v = lower_expr(b, e);
-            if b.is_terminated() {
+            if !lowering_continues(b) {
                 return None;
             }
             b.push(Stmt::StoreIndex(slot, index_const(i), v));
@@ -7058,6 +8011,9 @@ fn lower_array_par_map_reduce(
         }
         Ty::Array(_, _) => {
             let (slot, n) = array_source_slot(b, source);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
             b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
             Operand::Value(sv)
@@ -8140,7 +9096,7 @@ fn transpose_to_soa(
 fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let soa_ty = Ty::Soa(struct_id);
     let out = b.new_slot(soa_ty);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
     // so the runtime needs the innermost arena handle.
     let arena = *b.arenas.last().expect("json.decode → soa outside an arena (sema-checked)");
@@ -9404,7 +10360,14 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
 /// (`array_source_slot`); `mul`/`add` lower per element type (int or float).
 fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) -> Operand {
     let (a_slot, n) = array_source_slot(b, a);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let (b_slot, _nb) = array_source_slot(b, bex);
+
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
 
     let acc = b.new_slot(elem);
     b.push(Stmt::Store(acc, zero_of(elem)));
@@ -9517,7 +10480,7 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let ety = Ty::Enum(enum_id);
     let out = b.new_slot(ety);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, input: inp, out }));
 
@@ -9555,7 +10518,7 @@ fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, res
 fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
 
@@ -9596,7 +10559,7 @@ fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_
 fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynArray(scalar_of(elem));
     let out = b.new_slot(arr_ty);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeArray { elem, input: inp, out }));
 
@@ -9637,7 +10600,7 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
 /// to drop).
 fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(scalar);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeScalar { scalar, input: inp, out }));
 
@@ -9681,7 +10644,7 @@ fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, resu
 fn lower_json_doc(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arena = *b.arenas.last().expect("json.doc outside an arena (sema-checked)");
     let out = b.new_slot(Ty::JsonDoc);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDoc { input: inp, arena: Operand::Value(arena), out }));
 
@@ -9722,8 +10685,8 @@ fn lower_json_doc(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand 
 #[inline(never)]
 fn lower_json_doc_get(b: &mut Builder, doc: &hir::Expr, key: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::JsonDoc);
-    let d = lower_expr(b, doc);
-    let k = lower_expr(b, key);
+    let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
+    let k = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
     let unit = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(unit, Rvalue::JsonDocGet { doc: d, key: k, out }));
     let v = b.fresh_value(result_ty);
@@ -9734,8 +10697,8 @@ fn lower_json_doc_get(b: &mut Builder, doc: &hir::Expr, key: &hir::Expr, result_
 #[inline(never)]
 fn lower_json_doc_at(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::JsonDoc);
-    let d = lower_expr(b, doc);
-    let i = lower_expr(b, index);
+    let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
+    let i = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     let unit = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(unit, Rvalue::JsonDocAt { doc: d, index: i, out }));
     let v = b.fresh_value(result_ty);
@@ -9749,7 +10712,7 @@ fn lower_json_doc_at(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result
 #[inline(never)]
 fn lower_json_doc_as_str(b: &mut Builder, doc: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let d = lower_expr(b, doc);
+    let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::JsonDocAsStr { doc: d, out }));
     lower_json_doc_option(b, flag, out, Ty::Str, result_ty)
@@ -9761,7 +10724,7 @@ fn lower_json_doc_as_str(b: &mut Builder, doc: &hir::Expr, result_ty: Ty) -> Ope
 #[inline(never)]
 fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result_ty: Ty) -> Operand {
     let out = b.new_slot(scalar);
-    let d = lower_expr(b, doc);
+    let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::JsonDocAsScalar { scalar, doc: d, out }));
     lower_json_doc_option(b, flag, out, scalar, result_ty)
@@ -9773,8 +10736,8 @@ fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result
 #[inline(never)]
 fn lower_json_doc_key(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let d = lower_expr(b, doc);
-    let i = lower_expr(b, index);
+    let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
+    let i = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::JsonDocKey { doc: d, index: i, out }));
     lower_json_doc_option(b, flag, out, Ty::Str, result_ty)
@@ -9864,7 +10827,7 @@ fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Op
 
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
-    let p = lower_expr(b, path);
+    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadFile { path: p, out }));
 
@@ -9905,7 +10868,7 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
 /// Mirrors [`lower_fs_read_file`]'s out-slot shape, building an `Option` (not a `Result`).
 fn lower_env_get(b: &mut Builder, name: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
-    let n = lower_expr(b, name);
+    let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::EnvGet { name: n, out }));
 
@@ -9945,7 +10908,7 @@ fn lower_env_get(b: &mut Builder, name: &hir::Expr, result_ty: Ty) -> Operand {
 fn lower_fs_read_dir(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynArray(align_sema::Scalar::String);
     let out = b.new_slot(arr_ty);
-    let p = lower_expr(b, path);
+    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadDir { path: p, out }));
 
@@ -9986,7 +10949,7 @@ fn lower_fs_read_dir(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operan
 fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynArray(align_sema::Scalar::String);
     let out = b.new_slot(arr_ty);
-    let h = lower_expr(b, host);
+    let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::DnsResolve { host: h, out }));
 
@@ -10027,8 +10990,8 @@ fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operan
 /// `tcp_conn` handle payload.
 fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::TcpConn);
-    let h = lower_expr(b, host);
-    let p = lower_expr(b, port);
+    let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
+    let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     // The raw `tcp.connect(host, port)` surface has no timeout argument (Align has no optional args),
     // so it always lowers a literal `0` — the exact blocking connect. `std.http` (a later PR) builds
     // this Rvalue with its own effective-timeout operand instead.
@@ -10072,8 +11035,8 @@ fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result
 /// `Err(<mapped status>)`. Mirrors [`lower_tcp_connect`] with a `tcp_listener` handle payload.
 fn lower_tcp_listen(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::TcpListener);
-    let h = lower_expr(b, host);
-    let p = lower_expr(b, port);
+    let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
+    let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::TcpListen { host: h, port: p, out }));
 
@@ -10114,7 +11077,7 @@ fn lower_tcp_listen(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_
 /// host/port. The accepted `tcp_conn` is freshly owned — its `Drop` closes its fd.
 fn lower_tcp_accept(b: &mut Builder, listener: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::TcpConn);
-    let l = lower_expr(b, listener);
+    let l = lower_required!(b, lower_expr(b, listener), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::TcpAccept { listener: l, out }));
 
@@ -10154,8 +11117,8 @@ fn lower_tcp_accept(b: &mut Builder, listener: &hir::Expr, result_ty: Ty) -> Ope
 /// status>)`. Mirrors [`lower_tcp_listen`] with a `udp_socket` handle payload.
 fn lower_udp_bind(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::UdpSocket);
-    let h = lower_expr(b, host);
-    let p = lower_expr(b, port);
+    let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
+    let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::UdpBind { host: h, port: p, out }));
 
@@ -10194,10 +11157,10 @@ fn lower_udp_bind(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty
 /// the bytes sent (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention).
 fn lower_udp_send_to(b: &mut Builder, sock: &hir::Expr, data: &hir::Expr, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
-    let s = lower_expr(b, sock);
-    let d = lower_expr(b, data);
-    let h = lower_expr(b, host);
-    let p = lower_expr(b, port);
+    let s = lower_required!(b, lower_expr(b, sock), Operand::Const(Const::Unit));
+    let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
+    let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
+    let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let n = b.fresh_value(i64_ty());
     b.push(Stmt::Let(n, Rvalue::UdpSendTo { sock: s, data: d, host: h, port: p }));
     lower_count_or_status_result(b, n, result_ty)
@@ -10207,8 +11170,8 @@ fn lower_udp_send_to(b: &mut Builder, sock: &hir::Expr, data: &hir::Expr, host: 
 /// received (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention).
 fn lower_udp_recv_from(b: &mut Builder, sock: &hir::Expr, buffer: &hir::Expr, result_ty: Ty) -> Operand {
-    let s = lower_expr(b, sock);
-    let buf = lower_expr(b, buffer);
+    let s = lower_required!(b, lower_expr(b, sock), Operand::Const(Const::Unit));
+    let buf = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
     let n = b.fresh_value(i64_ty());
     b.push(Stmt::Let(n, Rvalue::UdpRecvFrom { sock: s, buffer: buf }));
     lower_count_or_status_result(b, n, result_ty)
@@ -10219,8 +11182,8 @@ fn lower_udp_recv_from(b: &mut Builder, sock: &hir::Expr, buffer: &hir::Expr, re
 /// [`lower_udp_bind`] with a `child` handle payload (the unwrapped local owns it — `Drop` reaps it).
 fn lower_process_spawn(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Child);
-    let c = lower_expr(b, cmd);
-    let a = lower_expr(b, args);
+    let c = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
+    let a = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::ProcessSpawn { cmd: c, args: a, out }));
 
@@ -10271,23 +11234,23 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileOpenRw { path: p, out })
         }
         hir::ExprKind::FilePread { file, buffer, offset } => {
-            let fop = lower_expr(b, file);
-            let bop = lower_expr(b, buffer);
-            let oop = lower_expr(b, offset);
+            let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
+            let bop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+            let oop = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
             b.push(Stmt::Let(n, Rvalue::FilePread { file: fop, buffer: bop, offset: oop }));
             lower_count_or_status_result(b, n, result_ty)
         }
         hir::ExprKind::FilePwrite { file, data, offset } => {
-            let fop = lower_expr(b, file);
-            let dop = lower_expr(b, data);
-            let oop = lower_expr(b, offset);
+            let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
+            let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
+            let oop = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
             b.push(Stmt::Let(n, Rvalue::FilePwrite { file: fop, data: dop, offset: oop }));
             lower_count_or_status_result(b, n, result_ty)
         }
         hir::ExprKind::FileLen { file } => {
-            let fop = lower_expr(b, file);
+            let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
             b.push(Stmt::Let(n, Rvalue::FileLen { file: fop }));
             lower_count_or_status_result(b, n, result_ty)
@@ -10300,7 +11263,7 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// exit code (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention). `child` is borrowed (never consumed — no move-out).
 fn lower_child_wait(b: &mut Builder, child: &hir::Expr, result_ty: Ty) -> Operand {
-    let ch = lower_expr(b, child);
+    let ch = lower_required!(b, lower_expr(b, child), Operand::Const(Const::Unit));
     let n = b.fresh_value(i64_ty());
     b.push(Stmt::Let(n, Rvalue::ChildWait { child: ch }));
     lower_count_or_status_result(b, n, result_ty)
@@ -10310,8 +11273,8 @@ fn lower_child_wait(b: &mut Builder, child: &hir::Expr, result_ty: Ty) -> Operan
 /// returning an `i32` errno-status; wrap into `Result<(), Error>` via the shared status helper. `child`
 /// is borrowed (no move-out); `sig` is a scalar `i64`.
 fn lower_child_kill(b: &mut Builder, child: &hir::Expr, sig: &hir::Expr, result_ty: Ty) -> Operand {
-    let ch = lower_expr(b, child);
-    let s = lower_expr(b, sig);
+    let ch = lower_required!(b, lower_expr(b, child), Operand::Const(Const::Unit));
+    let s = lower_required!(b, lower_expr(b, sig), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::ChildKill { child: ch, sig: s }));
     lower_status_result(b, code, result_ty)
@@ -10324,8 +11287,8 @@ fn lower_child_kill(b: &mut Builder, child: &hir::Expr, sig: &hir::Expr, result_
 /// address space, so pending `Drop`s / arena ends / buffered writers are inherently lost on success —
 /// this is the settled abort-class treatment (`docs/impl/std-design/process.md`).
 fn lower_process_exec(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
-    let c = lower_expr(b, cmd);
-    let a = lower_expr(b, args);
+    let c = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
+    let a = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::ProcessExec { cmd: c, args: a }));
     lower_status_result(b, code, result_ty)
@@ -10339,7 +11302,7 @@ fn lower_process_exec(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result
 fn lower_fs_read_file_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let arena = *b.arenas.last().expect("read_file_view outside an arena (sema-checked)");
     let out = b.new_slot(Ty::Str);
-    let p = lower_expr(b, path);
+    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadFileView { path: p, arena: Operand::Value(arena), out }));
 
@@ -10383,7 +11346,7 @@ fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) ->
     let arena = *b.arenas.last().expect("read_bytes_view outside an arena (sema-checked)");
     let elem = align_sema::Scalar::Int(IntTy { bits: 8, signed: false });
     let out = b.new_slot(Ty::Slice(elem));
-    let p = lower_expr(b, path);
+    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadBytesView { path: p, arena: Operand::Value(arena), out }));
 
@@ -10427,7 +11390,7 @@ fn lower_reader_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `r.buffered()` consumes the source reader (null its slot so it isn't double-freed — the
         // buffered handle, the same pointer, is the sole owner) and yields the buffered reader.
         hir::ExprKind::ReaderBuffered { reader } => {
-            let rop = lower_expr(b, reader);
+            let rop = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
             null_moved_source(b, reader);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ReaderBuffered(rop)));
@@ -10436,8 +11399,8 @@ fn lower_reader_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `r.read_line(b)` yields `Result<i64, Error>` from the runtime's i64 (bytes consumed incl.
         // terminator `>= 0` = `Ok`, `0` = EOF; `< 0` encodes `-(status)`).
         hir::ExprKind::ReaderReadLine { reader, buffer } => {
-            let rop = lower_expr(b, reader);
-            let bop = lower_expr(b, buffer);
+            let rop = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+            let bop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
             b.push(Stmt::Let(n, Rvalue::ReaderReadLine(rop, bop)));
             lower_count_or_status_result(b, n, e.ty)
@@ -10454,7 +11417,7 @@ fn lower_reader_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// out-slot-view + status shape mirrors [`lower_fs_read_bytes_view`] minus the arena/mmap.
 fn lower_bytes_as_str(b: &mut Builder, bytes: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let src = lower_expr(b, bytes);
+    let src = lower_required!(b, lower_expr(b, bytes), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::BytesAsStr { bytes: src, out }));
 
@@ -10500,7 +11463,7 @@ fn lower_open_handle(
     open_rv: impl FnOnce(Operand, Slot) -> Rvalue,
 ) -> Operand {
     let out = b.new_slot(handle_ty);
-    let p = lower_expr(b, path);
+    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, open_rv(p, out)));
 
@@ -10541,7 +11504,7 @@ fn lower_open_handle(
 /// (not a path) and there is no arena. The wrapped buffer is owned — the unwrapped local `Drop`s it.
 fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Buffer);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::EncodingDecode { kind, input: inp, out }));
     emit_status_buffer_result(b, code, out, result_ty)
@@ -10589,8 +11552,8 @@ fn emit_status_buffer_result(b: &mut Builder, code: ValueId, out: Slot, result_t
 /// its locals stay off the recursive `lower_expr` frame (see the call site).
 #[inline(never)]
 fn lower_crypto_hmac(b: &mut Builder, key: &hir::Expr, data: &hir::Expr, ty: Ty) -> Operand {
-    let kv = lower_expr(b, key);
-    let dv = lower_expr(b, data);
+    let kv = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
+    let dv = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
     let v = b.fresh_value(ty);
     b.push(Stmt::Let(v, Rvalue::CryptoHmac { key: kv, data: dv }));
     Operand::Value(v)
@@ -10603,10 +11566,10 @@ fn lower_crypto_hmac(b: &mut Builder, key: &hir::Expr, data: &hir::Expr, ty: Ty)
 #[inline(never)]
 fn lower_crypto_hkdf(b: &mut Builder, salt: &hir::Expr, ikm: &hir::Expr, info: &hir::Expr, len: &hir::Expr, ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Buffer);
-    let sv = lower_expr(b, salt);
-    let iv = lower_expr(b, ikm);
-    let nv = lower_expr(b, info);
-    let lv = lower_expr(b, len);
+    let sv = lower_required!(b, lower_expr(b, salt), Operand::Const(Const::Unit));
+    let iv = lower_required!(b, lower_expr(b, ikm), Operand::Const(Const::Unit));
+    let nv = lower_required!(b, lower_expr(b, info), Operand::Const(Const::Unit));
+    let lv = lower_required!(b, lower_expr(b, len), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::CryptoHkdf { salt: sv, ikm: iv, info: nv, len: lv, out }));
     emit_status_buffer_result(b, code, out, ty)
@@ -10629,10 +11592,10 @@ fn lower_crypto_aead(
     ty: Ty,
 ) -> Operand {
     let out = b.new_slot(Ty::Buffer);
-    let kv = lower_expr(b, key);
-    let nv = lower_expr(b, nonce);
-    let iv = lower_expr(b, input);
-    let av = lower_expr(b, aad);
+    let kv = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
+    let nv = lower_required!(b, lower_expr(b, nonce), Operand::Const(Const::Unit));
+    let iv = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let av = lower_required!(b, lower_expr(b, aad), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::CryptoAead { cipher, dir, key: kv, nonce: nv, input: iv, aad: av, out }));
     emit_status_buffer_result(b, code, out, ty)
@@ -10648,11 +11611,14 @@ fn lower_crypto_aead(
 #[inline(never)]
 fn lower_crypto_argon2(b: &mut Builder, password: &hir::Expr, salt: &hir::Expr, params: &hir::Expr, ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Buffer);
-    let pw = lower_expr(b, password);
-    let sv = lower_expr(b, salt);
+    let pw = lower_required!(b, lower_expr(b, password), Operand::Const(Const::Unit));
+    let sv = lower_required!(b, lower_expr(b, salt), Operand::Const(Const::Unit));
     // Materialize the `argon2_params` struct into a slot, then read its four `i64` fields.
     let pslot = b.new_slot(params.ty);
     store_value_at(b, pslot, &mut Vec::new(), params);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let read_field = |b: &mut Builder, idx: u32| {
         let v = b.fresh_value(i64_ty());
         b.push(Stmt::Let(v, Rvalue::Field(pslot, vec![idx])));
@@ -10676,8 +11642,8 @@ fn lower_crypto_argon2(b: &mut Builder, password: &hir::Expr, salt: &hir::Expr, 
 /// `array<str>`. The wrapped `parsed` is owned — the unwrapped local `Drop`s it (`cli_parsed_free`).
 fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::CliParsed);
-    let cop = lower_expr(b, cmd);
-    let av = lower_expr(b, args);
+    let cop = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
+    let av = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::CliParse { cmd: cop, args: av, out }));
 
@@ -10722,40 +11688,40 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `process.command(cmd, args)` → an owned `command` handle returned by value (the bound local
         // `Drop`-frees it via `command_free`).
         hir::ExprKind::ProcessCommand { cmd, args } => {
-            let c = lower_expr(b, cmd);
-            let a = lower_expr(b, args);
+            let c = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
+            let a = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Command { cmd: c, args: a }));
             Operand::Value(v)
         }
         // `c.cwd(dir)` → set the command handle's working directory in place; no value.
         hir::ExprKind::CommandCwd { command, dir } => {
-            let cm = lower_expr(b, command);
-            let d = lower_expr(b, dir);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
+            let d = lower_required!(b, lower_expr(b, dir), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandCwd { command: cm, dir: d }));
             Operand::Const(Const::Unit)
         }
         // `c.timeout_ns(ns)` → set the command handle's run timeout in place; no value.
         hir::ExprKind::CommandTimeout { command, ns } => {
-            let cm = lower_expr(b, command);
-            let n = lower_expr(b, ns);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, ns), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandTimeout { command: cm, ns: n }));
             Operand::Const(Const::Unit)
         }
         // `c.env(name, value)` → add/override one child environment variable in place; no value.
         hir::ExprKind::CommandEnv { command, name, value } => {
-            let cm = lower_expr(b, command);
-            let n = lower_expr(b, name);
-            let val = lower_expr(b, value);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandEnv { command: cm, name: n, value: val }));
             Operand::Const(Const::Unit)
         }
         // `c.env_clear()` → start the child environment empty, in place; no value.
         hir::ExprKind::CommandEnvClear { command } => {
-            let cm = lower_expr(b, command);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandEnvClear { command: cm }));
             Operand::Const(Const::Unit)
@@ -10764,12 +11730,12 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `http.parse` / `cl.get`). `command` is borrowed (re-runnable).
         hir::ExprKind::CommandRun { command } => {
             let out = b.new_slot(Ty::RunOutput);
-            let cm = lower_expr(b, command);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::CommandRun { command: cm, out }, out, Ty::RunOutput, e.ty)
         }
         // `out.code()` → the runtime returns the i64 exit code directly.
         hir::ExprKind::RunOutputCode { out } => {
-            let o = lower_expr(b, out);
+            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RunOutputCode { out: o }));
             Operand::Value(v)
@@ -10778,7 +11744,7 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
         // (region-bound to `out`; not owned — no `Drop`).
         hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
             let is_err = matches!(&e.kind, hir::ExprKind::RunOutputStderr { .. });
-            let o = lower_expr(b, out);
+            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RunOutputView { out: o, err: is_err }));
             Operand::Value(v)
@@ -10797,41 +11763,41 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `http.request(method, url)` → an owned `http request` handle returned by value (the bound
         // local `Drop`-frees it via `http_request_free`).
         hir::ExprKind::HttpRequest { method, url } => {
-            let m = lower_expr(b, method);
-            let u = lower_expr(b, url);
+            let m = lower_required!(b, lower_expr(b, method), Operand::Const(Const::Unit));
+            let u = lower_required!(b, lower_expr(b, url), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpRequest { method: m, url: u }));
             Operand::Value(v)
         }
         // `r.header(name, value)` → append a header to the request handle in place; no value.
         hir::ExprKind::HttpHeader { req, name, value } => {
-            let rq = lower_expr(b, req);
-            let nm = lower_expr(b, name);
-            let vl = lower_expr(b, value);
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
+            let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let vl = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpHeader { req: rq, name: nm, value: vl }));
             Operand::Const(Const::Unit)
         }
         // `r.body(data)` → copy the byte view into the request handle's body; no value.
         hir::ExprKind::HttpBody { req, data } => {
-            let rq = lower_expr(b, req);
-            let d = lower_expr(b, data);
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
+            let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpBody { req: rq, data: d }));
             Operand::Const(Const::Unit)
         }
         // `r.timeout(ns)` → set the request handle's per-request I/O timeout in place; no value.
         hir::ExprKind::HttpRequestTimeout { req, ns } => {
-            let rq = lower_expr(b, req);
-            let n = lower_expr(b, ns);
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, ns), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpRequestTimeout { req: rq, ns: n }));
             Operand::Const(Const::Unit)
         }
         // `cl.timeout(ns)` → set the client handle's default I/O timeout in place; no value.
         hir::ExprKind::HttpClientTimeout { client, ns } => {
-            let cl = lower_expr(b, client);
-            let n = lower_expr(b, ns);
+            let cl = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, ns), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpClientTimeout { client: cl, ns: n }));
             Operand::Const(Const::Unit)
@@ -10840,7 +11806,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::HttpParse { data } => lower_http_parse(b, data, e.ty),
         // `resp.status()` → the runtime returns the i64 status directly.
         hir::ExprKind::HttpRespStatus { resp } => {
-            let rp = lower_expr(b, resp);
+            let rp = lower_required!(b, lower_expr(b, resp), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpRespStatus { resp: rp }));
             Operand::Value(v)
@@ -10850,7 +11816,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `resp.body()` → a `slice<u8>` view `{ptr,len}` into the response buffer (region-bound to
         // `resp`; not owned — no `Drop`).
         hir::ExprKind::HttpRespBody { resp } => {
-            let rp = lower_expr(b, resp);
+            let rp = lower_required!(b, lower_expr(b, resp), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpRespBody { resp: rp }));
             Operand::Value(v)
@@ -10866,24 +11832,24 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // is borrowed (read, not consumed); `url` is a `str` view.
         hir::ExprKind::HttpClientGet { client, url } => {
             let out = b.new_slot(Ty::HttpResponse);
-            let c = lower_expr(b, client);
-            let u = lower_expr(b, url);
+            let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let u = lower_required!(b, lower_expr(b, url), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::HttpClientGet { client: c, url: u, out }, out, Ty::HttpResponse, e.ty)
         }
         // `cl.post(url, body)` → `Result<response, Error>`. `url`/`body` are byte views.
         hir::ExprKind::HttpClientPost { client, url, body } => {
             let out = b.new_slot(Ty::HttpResponse);
-            let c = lower_expr(b, client);
-            let u = lower_expr(b, url);
-            let bd = lower_expr(b, body);
+            let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let u = lower_required!(b, lower_expr(b, url), Operand::Const(Const::Unit));
+            let bd = lower_required!(b, lower_expr(b, body), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::HttpClientPost { client: c, url: u, body: bd, out }, out, Ty::HttpResponse, e.ty)
         }
         // `cl.request(req)` → `Result<response, Error>`. `req` is a Move `http request` **consumed** by
         // the call (the runtime frees it): null its source slot so the exit `Drop` doesn't double-free.
         hir::ExprKind::HttpClientRequest { client, req } => {
             let out = b.new_slot(Ty::HttpResponse);
-            let c = lower_expr(b, client);
-            let rq = lower_expr(b, req);
+            let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
             null_moved_source(b, req);
             lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, Ty::HttpResponse, e.ty)
         }
@@ -10897,27 +11863,27 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // lowering, `ok_ty = HttpServer`). `host`/`port` are read.
         hir::ExprKind::HttpServe { host, port, shared } => {
             let out = b.new_slot(Ty::HttpServer);
-            let h = lower_expr(b, host);
-            let p = lower_expr(b, port);
+            let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
+            let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out, shared: *shared }, out, Ty::HttpServer, e.ty)
         }
         // `srv.accept()` → `Result<http_request_ctx, Error>` (`ok_ty = HttpRequestCtx`). `server` is
         // borrowed (a server accepts many).
         hir::ExprKind::HttpAccept { server } => {
             let out = b.new_slot(Ty::HttpRequestCtx);
-            let s = lower_expr(b, server);
+            let s = lower_required!(b, lower_expr(b, server), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::HttpAccept { server: s, out }, out, Ty::HttpRequestCtx, e.ty)
         }
         // `ctx.method()` / `ctx.path()` → a `str` view `{ptr,len}` into the ctx buffer (region-bound to
         // `ctx`; not owned — no `Drop`).
         hir::ExprKind::HttpCtxMethod { ctx } => {
-            let cx = lower_expr(b, ctx);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpCtxMethod { ctx: cx }));
             Operand::Value(v)
         }
         hir::ExprKind::HttpCtxPath { ctx } => {
-            let cx = lower_expr(b, ctx);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpCtxPath { ctx: cx }));
             Operand::Value(v)
@@ -10925,7 +11891,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `ctx.headers()` → a `Rvalue::Use` of the ctx operand: the header-table view IS the ctx
         // pointer (http.md item 10 ②), so this is a pointer copy and adds no runtime call at all.
         hir::ExprKind::HttpCtxHeaders { ctx } => {
-            let cx = lower_expr(b, ctx);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Use(cx)));
             Operand::Value(v)
@@ -10935,7 +11901,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::HttpCtxHeader { headers, name } => lower_http_ctx_header(b, headers, name, e.ty),
         // `ctx.body()` → a `slice<u8>` view `{ptr,len}` into the ctx buffer (region-bound to `ctx`).
         hir::ExprKind::HttpCtxBody { ctx } => {
-            let cx = lower_expr(b, ctx);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpCtxBody { ctx: cx }));
             Operand::Value(v)
@@ -10943,24 +11909,24 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `http.response(status)` → an owned `response_builder` handle returned by value (the bound
         // local `Drop`-frees it via `http_response_free`).
         hir::ExprKind::HttpResponseBuilder { status } => {
-            let s = lower_expr(b, status);
+            let s = lower_required!(b, lower_expr(b, status), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpResponseBuilder { status: s }));
             Operand::Value(v)
         }
         // `rb.header(name, value)` → `()`. `rb` is borrowed (mutated in place); `name`/`value` are views.
         hir::ExprKind::HttpRbHeader { rb, name, value } => {
-            let r = lower_expr(b, rb);
-            let nm = lower_expr(b, name);
-            let vl = lower_expr(b, value);
+            let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
+            let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let vl = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpRbHeader { rb: r, name: nm, value: vl }));
             Operand::Value(v)
         }
         // `rb.body(data)` → `()`. `rb` is borrowed (mutated in place); `data` is a byte view.
         hir::ExprKind::HttpRbBody { rb, data } => {
-            let r = lower_expr(b, rb);
-            let d = lower_expr(b, data);
+            let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
+            let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpRbBody { rb: r, data: d }));
             Operand::Value(v)
@@ -10968,8 +11934,8 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `ctx.respond(rb)` → `Result<(), Error>`. BOTH `ctx` and `rb` are **consumed** by the call (the
         // runtime frees both): null both source slots so the exit `Drop` doesn't double-free.
         hir::ExprKind::HttpRespond { ctx, rb } => {
-            let cx = lower_expr(b, ctx);
-            let r = lower_expr(b, rb);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
+            let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
             null_moved_source(b, ctx);
             null_moved_source(b, rb);
             let code = b.fresh_value(status_ty());
@@ -10983,16 +11949,16 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // out-slot + i32-status lowering (`ok_ty = HttpStream`), like `srv.accept()`.
         hir::ExprKind::HttpRespondStream { ctx, rb } => {
             let out = b.new_slot(Ty::HttpStream);
-            let cx = lower_expr(b, ctx);
-            let r = lower_expr(b, rb);
+            let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
+            let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
             null_moved_source(b, rb);
             lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty)
         }
         // `s.send(chunk)` / `s.send_event(data)` → `Result<(), Error>`. `s` is **borrowed** (mutated
         // in place — not consumed); the payload is a byte view.
         hir::ExprKind::HttpStreamSend { stream, chunk, event } => {
-            let s = lower_expr(b, stream);
-            let ch = lower_expr(b, chunk);
+            let s = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let ch = lower_required!(b, lower_expr(b, chunk), Operand::Const(Const::Unit));
             let code = b.fresh_value(status_ty());
             b.push(Stmt::Let(code, Rvalue::HttpStreamSend { stream: s, chunk: ch, event: *event }));
             lower_status_result(b, code, e.ty)
@@ -11000,7 +11966,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `s.finish()` → `Result<(), Error>`. `s` is **consumed** (the runtime frees it): null its source
         // slot so the exit `Drop` doesn't double-free (a new `null_moved_source` arm — the easy-to-miss one).
         hir::ExprKind::HttpStreamFinish { stream } => {
-            let s = lower_expr(b, stream);
+            let s = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
             null_moved_source(b, stream);
             let code = b.fresh_value(status_ty());
             b.push(Stmt::Let(code, Rvalue::HttpStreamFinish { stream: s }));
@@ -11009,8 +11975,8 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `s.reject(rb)` → `Result<(), Error>`. BOTH `s` and `rb` are **consumed** (the runtime frees
         // both): null both source slots so the exit `Drop` doesn't double-free.
         hir::ExprKind::HttpStreamReject { stream, rb } => {
-            let s = lower_expr(b, stream);
-            let r = lower_expr(b, rb);
+            let s = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
             null_moved_source(b, stream);
             null_moved_source(b, rb);
             let code = b.fresh_value(status_ty());
@@ -11024,7 +11990,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// `http.parse(data)` → `Result<response, Error>` via the shared out-slot + i32-status lowering.
 fn lower_http_parse(b: &mut Builder, data: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::HttpResponse);
-    let d = lower_expr(b, data);
+    let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
     lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, Ty::HttpResponse, result_ty)
 }
 
@@ -11044,9 +12010,13 @@ fn lower_http_get_many(
     result_ty: Ty,
 ) -> Operand {
     let out = b.new_slot(Ty::DynResponseArray);
-    let c = lower_expr(b, client);
-    let u = lower_expr(b, urls);
-    let mc = lower_expr(b, max_concurrency);
+    let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+    let u = lower_required!(b, lower_expr(b, urls), Operand::Const(Const::Unit));
+    let mc = lower_required!(
+        b,
+        lower_expr(b, max_concurrency),
+        Operand::Const(Const::Unit)
+    );
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::HttpGetMany { client: c, urls: u, max_concurrency: mc, out }));
 
@@ -11123,12 +12093,12 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
         hir::ExprKind::RegexCompile { pattern } => {
             let out = b.new_slot(Ty::Regex);
-            let p = lower_expr(b, pattern);
+            let p = lower_required!(b, lower_expr(b, pattern), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::RegexCompile { pattern: p, out }, out, Ty::Regex, e.ty)
         }
         hir::ExprKind::RegexIsMatch { regex, text } => {
-            let re = lower_expr(b, regex);
-            let t = lower_expr(b, text);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let flag = b.fresh_value(status_ty());
             b.push(Stmt::Let(flag, Rvalue::RegexIsMatch { regex: re, text: t }));
             let matched = b.fresh_value(Ty::Bool);
@@ -11143,12 +12113,15 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 unreachable!("RegexFind must return Option<regex_match>")
             };
             let out = b.new_slot(Ty::Struct(match_id));
-            let re = lower_expr(b, regex);
-            let t = lower_expr(b, text);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let start = start
                 .as_ref()
                 .map(|s| lower_expr(b, s))
                 .unwrap_or(Operand::Const(Const::Int(0, i64_ty())));
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
             let flag = b.fresh_value(status_ty());
             b.push(Stmt::Let(flag, Rvalue::RegexFind { regex: re, text: t, start, out }));
 
@@ -11188,8 +12161,8 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // is never freed twice). Status is always 0; the load carries the `{ptr,len}` out.
             let is_split = matches!(e.kind, hir::ExprKind::RegexSplit { .. });
             let out = b.new_slot(e.ty);
-            let re = lower_expr(b, regex);
-            let t = lower_expr(b, text);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let status = b.fresh_value(status_ty());
             let rv = if is_split {
                 Rvalue::RegexSplit { regex: re, text: t, out }
@@ -11203,9 +12176,9 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::RegexReplace { regex, text, repl, all } => {
             // Owned `string` returned by value (the `PathNormalize` shape); the bound local `Drop`s it.
-            let re = lower_expr(b, regex);
-            let t = lower_expr(b, text);
-            let r = lower_expr(b, repl);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
+            let r = lower_required!(b, lower_expr(b, repl), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RegexReplace { regex: re, text: t, repl: r, all: *all }));
             Operand::Value(v)
@@ -11213,8 +12186,8 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::RegexCaptures { regex, text } => {
             // `Option<captures>` (owned Move handle) — the `env.get` out-slot + present-flag shape.
             let out = b.new_slot(Ty::Captures);
-            let re = lower_expr(b, regex);
-            let t = lower_expr(b, text);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let flag = b.fresh_value(status_ty());
             b.push(Stmt::Let(flag, Rvalue::RegexCaptures { regex: re, text: t, out }));
             lower_present_flag_option(b, flag, out, Ty::Captures, e.ty)
@@ -11225,22 +12198,22 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 unreachable!("CapturesGroup must return Option<regex_match>")
             };
             let out = b.new_slot(Ty::Struct(match_id));
-            let c = lower_expr(b, caps);
-            let idx = lower_expr(b, index);
+            let c = lower_required!(b, lower_expr(b, caps), Operand::Const(Const::Unit));
+            let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
             let flag = b.fresh_value(status_ty());
             b.push(Stmt::Let(flag, Rvalue::CapturesGroup { caps: c, index: idx, out }));
             lower_present_flag_option(b, flag, out, Ty::Struct(match_id), e.ty)
         }
         hir::ExprKind::RegexGroupCount { regex } => {
-            let re = lower_expr(b, regex);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
             let v = b.fresh_value(i64_ty());
             b.push(Stmt::Let(v, Rvalue::RegexGroupCount { regex: re }));
             Operand::Value(v)
         }
         hir::ExprKind::RegexGroupIndex { regex, name } => {
             // Runtime returns the index or `-1`; build `Option<i64>` by branching on `>= 0`.
-            let re = lower_expr(b, regex);
-            let n = lower_expr(b, name);
+            let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
             let idx = b.fresh_value(i64_ty());
             b.push(Stmt::Let(idx, Rvalue::RegexGroupIndex { regex: re, name: n }));
             let present = b.fresh_value(Ty::Bool);
@@ -11326,8 +12299,8 @@ fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, ok_ty
 #[inline(never)]
 fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let rp = lower_expr(b, resp);
-    let nm = lower_expr(b, name);
+    let rp = lower_required!(b, lower_expr(b, resp), Operand::Const(Const::Unit));
+    let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::HttpRespHeader { resp: rp, name: nm, out }));
 
@@ -11368,8 +12341,8 @@ fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, r
 #[inline(never)]
 fn lower_http_ctx_header(b: &mut Builder, headers: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let cx = lower_expr(b, headers);
-    let nm = lower_expr(b, name);
+    let cx = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
+    let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::HttpCtxHeader { ctx: cx, name: nm, out }));
 
@@ -11484,7 +12457,7 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
     let out = b.new_slot(arr_ty);
-    let inp = lower_expr(b, input);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
 
@@ -11527,7 +12500,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
         _ => Ty::Error,
     };
     let r = lower_expr(b, inner);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     let inner_flag = lowered_drop_flag(b, inner, &r);
@@ -11587,7 +12560,7 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     let opt_owner = needs_drop_flag(opt.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         .then(|| b.new_synthetic_owner(opt.ty));
     let opt_op = lower_expr(b, opt);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     let opt_flag = lowered_drop_flag(b, opt, &opt_op);
@@ -11656,12 +12629,23 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     } else {
         lower_expr(b, fallback)
     };
-    if !b.is_terminated() {
-        store_control_result(b, result_slot, result_flag, result_temp_flag, fallback, fb, borrow_result);
+    if lowering_continues(b) {
+        store_control_result(
+            b,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            fallback,
+            fb,
+            borrow_result,
+        );
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = join_bb;
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
@@ -11688,7 +12672,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     } else {
         lower_expr_for_borrow(b, scrutinee)
     };
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     let scrut_flag = lowered_drop_flag(b, scrutinee, &scrut);
@@ -11764,6 +12748,9 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         _ => b.terminate(Term::Goto(join_bb)),
     }
     b.cur = join_bb;
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
@@ -12049,7 +13036,7 @@ fn finish_arm(
     } else {
         lower_expr(b, body)
     };
-    if !b.is_terminated() {
+    if lowering_continues(b) {
         store_control_result(b, result_slot, result_flag, result_temp_flag, body, av, borrow_result);
         b.terminate(Term::Goto(join_bb));
     }
@@ -12069,15 +13056,19 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     // hidden owner until the mapper value is ready: a `return`/`?` inside that expression must
     // clean up the already-created Result just like a later explicit call argument does.
     let (rv, result_owners) = lower_consumed_call_arg(b, result);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     let source_flag = lowered_drop_flag(b, result, &rv)
         .unwrap_or(Operand::Const(Const::Bool(false)));
     let fv = lower_expr(b, f);
-    if b.is_terminated() {
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
+    let Some(mapper_signature) = fn_signature_facts(b, f.ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
     // `map_err` unwraps the result on both branches — if it was an owned local, null its slot so
     // the exit cleanup doesn't double-free the moved-out payload.
     null_moved_source(b, result);
@@ -12111,7 +13102,6 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     b.cur = err_bb;
     let errp = b.fresh_value(align_sema::scalar_to_ty(e_s));
     b.push(Stmt::Let(errp, Rvalue::ResultUnwrapErr(rv)));
-    let mapper_signature = fn_signature_facts(b, f.ty);
     let conv = emit_indirect_call(
         b,
         fv,
@@ -12140,6 +13130,9 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     }
     b.terminate(Term::Goto(join));
     b.cur = join;
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     load_control_result(b, out_ty, result_slot, result_flag, result_temp_flag)
 }
 
@@ -12149,7 +13142,7 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
 /// `if` over `a` that yields either the constant short-circuit value or `b`.
 fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::Expr) -> Operand {
     let slot = b.new_slot(Ty::Bool);
-    let l = lower_expr(b, lhs);
+    let l = lower_required!(b, lower_expr(b, lhs), Operand::Const(Const::Unit));
     let rhs_bb = b.new_block();
     let short_bb = b.new_block();
     let join_bb = b.new_block();
@@ -12166,7 +13159,7 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     // block operand), it already terminated `rhs_bb` — don't push a dead store / second terminator.
     b.cur = rhs_bb;
     let r = lower_expr(b, rhs);
-    if !b.is_terminated() {
+    if lowering_continues(b) {
         b.push(Stmt::Store(slot, r));
         b.terminate(Term::Goto(join_bb));
     }
@@ -12178,6 +13171,9 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     b.terminate(Term::Goto(join_bb));
 
     b.cur = join_bb;
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     let v = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(v, Rvalue::Load(slot)));
     Operand::Value(v)
@@ -12217,7 +13213,7 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
     // and clear their flags, then loop back.
-    if !b.is_terminated() {
+    if lowering_continues(b) {
         // Lowering may have discovered synthetic owners inside the body. Read the final frame
         // rather than the pre-body snapshot so those owners are also released on the back-edge.
         let iter_drops = b.loops.last().expect("loop frame remains active").iter_drops.clone();
@@ -12232,6 +13228,9 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
         // No `break`: the exit is unreachable. Terminate it so the CFG is well-formed; the returned
         // operand is never used (code after a diverging loop is dead — `lower_block` stops here).
         b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    }
+    if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     match result_slot {
@@ -12255,10 +13254,7 @@ fn lower_if(
 ) -> Operand {
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
 
-    let c = lower_expr(b, cond);
-    if b.is_terminated() {
-        return Operand::Const(Const::Unit);
-    }
+    let c = lower_required!(b, lower_expr(b, cond), Operand::Const(Const::Unit));
     let then_bb = b.new_block();
     let else_bb = b.new_block();
     let join_bb = b.new_block();
@@ -12270,7 +13266,7 @@ fn lower_if(
     } else {
         lower_block(b, then)
     };
-    if !b.is_terminated() {
+    if lowering_continues(b) {
         if let Some(op) = tv
             && let Some(value) = &then.value
         {
@@ -12285,16 +13281,27 @@ fn lower_if(
     } else {
         lower_block(b, els)
     };
-    if !b.is_terminated() {
+    if lowering_continues(b) {
         if let Some(op) = ev
             && let Some(value) = &els.value
         {
-            store_control_result(b, result_slot, result_flag, result_temp_flag, value, op, borrow_result);
+            store_control_result(
+                b,
+                result_slot,
+                result_flag,
+                result_temp_flag,
+                value,
+                op,
+                borrow_result,
+            );
         }
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = join_bb;
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
@@ -12385,6 +13392,312 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    fn empty_builder() -> Builder {
+        let mut builder = Builder {
+            slots: Vec::new(),
+            slot_align: Vec::new(),
+            value_tys: Vec::new(),
+            value_drop_flags: Vec::new(),
+            blocks: Vec::new(),
+            cur: 0,
+            ret: Ty::Unit,
+            arenas: Vec::new(),
+            task_groups: Vec::new(),
+            drop_locals: Vec::new(),
+            drop_flags: Vec::new(),
+            drop_individual_locals: Default::default(),
+            drop_individual_exprs: Default::default(),
+            tuples: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            tagged_types: Vec::new(),
+            alias_scope: 0,
+            loops: Vec::new(),
+            ctx: Box::new(BuilderCtx {
+                reachable_blocks: Vec::new(),
+                value_temp_drop_flags: Vec::new(),
+                synthetic_drop_slots: Vec::new(),
+                value_borrow_owners: Vec::new(),
+                slot_borrow_owners: Default::default(),
+                dbg: None,
+                fn_types: Rc::from(Vec::<hir::FnTy>::new()),
+            }),
+        };
+        let entry = builder.new_block();
+        builder.cur = entry;
+        builder.ctx.reachable_blocks[entry as usize] = true;
+        builder
+    }
+
+    #[test]
+    fn eager_expression_termination_matrix() {
+        // Reachability is established only by the first terminator of a reachable predecessor.
+        let mut branch = empty_builder();
+        let left = branch.new_block();
+        let right = branch.new_block();
+        branch.terminate(Term::Branch(Operand::Const(Const::Bool(true)), left, right));
+        assert!(branch.ctx.reachable_blocks[left as usize]);
+        assert!(branch.ctx.reachable_blocks[right as usize]);
+
+        // An unreachable predecessor cannot manufacture a reachable successor.
+        let mut unreachable_predecessor = empty_builder();
+        let dead = unreachable_predecessor.new_block();
+        let phantom = unreachable_predecessor.new_block();
+        unreachable_predecessor.cur = dead;
+        unreachable_predecessor.terminate(Term::Goto(phantom));
+        assert!(!unreachable_predecessor.ctx.reachable_blocks[phantom as usize]);
+        assert!(!lowering_continues(&mut unreachable_predecessor));
+        assert!(matches!(
+            unreachable_predecessor.blocks[dead as usize].term,
+            Some(Term::Goto(_))
+        ));
+
+        // An unselected forward join becomes an explicit unreachable continuation.
+        let mut empty_join = empty_builder();
+        let join = empty_join.new_block();
+        empty_join.cur = join;
+        assert!(!lowering_continues(&mut empty_join));
+        assert!(matches!(
+            empty_join.blocks[join as usize].term,
+            Some(Term::Unreachable)
+        ));
+
+        // A duplicate terminator cannot mark a phantom edge.
+        let mut duplicate = empty_builder();
+        let first = duplicate.new_block();
+        let phantom = duplicate.new_block();
+        duplicate.terminate(Term::Goto(first));
+        let duplicate_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            duplicate.terminate(Term::Goto(phantom));
+        }));
+        assert!(duplicate_result.is_err());
+        assert!(!duplicate.ctx.reachable_blocks[phantom as usize]);
+
+        // A block closed while unreachable cannot gain a late predecessor under the one-bit model.
+        let mut late = empty_builder();
+        let origin = late.new_block();
+        let spare = late.new_block();
+        let target = late.new_block();
+        late.terminate(Term::Branch(
+            Operand::Const(Const::Bool(true)),
+            origin,
+            spare,
+        ));
+        late.cur = target;
+        late.terminate(Term::Unreachable);
+        late.cur = origin;
+        let late_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            late.terminate(Term::Goto(target));
+        }));
+        assert!(late_result.is_err());
+        assert!(!late.ctx.reachable_blocks[target as usize]);
+
+        // Source-level eager parents stop at the child edge: no later sibling call or parent action.
+        let program = lower(
+            "\
+fn later() -> i64 {
+  print(99)
+  return 99
+}
+fn unary() -> i64 = -{ return 1; 0 }
+fn binary() -> i64 = { return 2; 0 } + later()
+fn call(a: i64, b: i64) -> i64 = a + b
+fn arguments() -> i64 = call({ return 3; 0 }, later())
+fn selected(flag: bool) -> i64 =
+  (if flag { return 4; 0 } else { return 5; 0 }) + later()
+fn fixed_index() -> i64 = [{ return 6; 0 }, later()][0]
+fn dynamic_index() -> i64 = [1].to_array()[{ return 7; 0 }]
+fn native() -> i64 = { return 8; 0 }.abs()
+fn aggregate() -> i64 {
+  pair := ({ return 9; 0 }, later())
+  return pair.0
+}
+fn pipeline() -> i64 =
+  [1, 2].map(fn x { x + 1 }).reduce({ return 10; 0 }, fn acc, x { acc + x })
+fn binding() -> i64 {
+  value := { return 11; 0 }
+  print(later())
+  return value
+}
+fn builder_arg() -> i64 {
+  b := builder()
+  b.write_int({ return 12; 0 })
+  b.write_int(later())
+  return 0
+}
+fn fail() -> Result<i64, Error> = Err(error(13))
+fn templated() -> Result<i64, Error> {
+  value := template \"x={fail()?} y={later()}\"
+  return Ok(value.len())
+}
+fn main() -> i32 = 0
+",
+        );
+        for name in [
+            "unary",
+            "binary",
+            "arguments",
+            "selected",
+            "fixed_index",
+            "dynamic_index",
+            "native",
+            "aggregate",
+            "pipeline",
+            "binding",
+            "builder_arg",
+        ] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            let emitted_forbidden_action = |statement: &Stmt| match name {
+                "unary" => matches!(statement, Stmt::Let(_, Rvalue::Un(..))),
+                "binary" | "selected" => matches!(statement, Stmt::Let(_, Rvalue::Bin(..))),
+                "arguments" => {
+                    matches!(statement, Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "call")
+                }
+                "fixed_index" => matches!(statement, Stmt::Let(_, Rvalue::Index(..))),
+                "dynamic_index" => matches!(statement, Stmt::Let(_, Rvalue::SliceIndex(..))),
+                "native" => matches!(statement, Stmt::Let(_, Rvalue::MathOp { .. })),
+                "aggregate" => matches!(statement, Stmt::Let(_, Rvalue::MakeTuple { .. })),
+                "pipeline" => matches!(statement, Stmt::Let(_, Rvalue::Call(..))),
+                "binding" => matches!(statement, Stmt::Store(..)),
+                "builder_arg" => matches!(
+                    statement,
+                    Stmt::Let(
+                        _,
+                        Rvalue::BuilderWriteStr(..)
+                            | Rvalue::BuilderWriteInt(..)
+                            | Rvalue::BuilderWriteBool(..)
+                            | Rvalue::BuilderWriteChar(..)
+                            | Rvalue::BuilderWriteFloat(..)
+                            | Rvalue::BuilderWriteStrIntStr(..)
+                    )
+                ),
+                _ => unreachable!("matrix function"),
+            };
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .all(|statement| {
+                        !matches!(
+                            statement,
+                            Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "later"
+                        ) && !emitted_forbidden_action(statement)
+                    }),
+                "{name} emitted a later sibling or parent action: {function:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_hir_continuation_metadata_fails_closed() {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "\
+Row { value: i64 }
+fn field(i: i64) -> i64 {
+  rows := [Row { value: 1 }]
+  return rows[i].value
+}
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 = f(value)
+fn main() -> i32 = 0
+",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let mut hir = check_file(&file, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "malformed-HIR fixture must check before mutation: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+
+        let field = hir
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "field")
+            .expect("field function");
+        let hir::Stmt::Return(Some(field_expr)) =
+            field.body.stmts.last_mut().expect("field return")
+        else {
+            panic!("field must end in a return");
+        };
+        let hir::ExprKind::ElemField { path, .. } = &mut field_expr.kind else {
+            panic!("field return must be an element-field read");
+        };
+        path.clear();
+
+        let apply = hir
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "apply")
+            .expect("apply function");
+        let call = apply.body.value.as_mut().expect("apply expression body");
+        let hir::ExprKind::CallFnValue { callee, .. } = &mut call.kind else {
+            panic!("apply body must be an indirect call");
+        };
+        callee.ty = Ty::Fn(u32::MAX);
+
+        let program = lower_program(&hir);
+        let field = program
+            .fns
+            .iter()
+            .find(|function| function.name == "field")
+            .expect("lowered field");
+        assert!(
+            field
+                .blocks
+                .iter()
+                .any(|block| matches!(block.term, Term::Unreachable)),
+            "invalid field metadata must terminate the continuation: {field:#?}"
+        );
+        assert!(
+            field
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .all(|statement| !matches!(
+                    statement,
+                    Stmt::Let(
+                        _,
+                        Rvalue::IndexField(..)
+                            | Rvalue::IndexFieldPtr { .. }
+                            | Rvalue::IndexColumn { .. }
+                    )
+                )),
+            "invalid field metadata must emit no field action: {field:#?}"
+        );
+
+        let apply = program
+            .fns
+            .iter()
+            .find(|function| function.name == "apply")
+            .expect("lowered apply");
+        assert!(
+            apply
+                .blocks
+                .iter()
+                .any(|block| matches!(block.term, Term::Unreachable)),
+            "a missing function signature must terminate the continuation: {apply:#?}"
+        );
+        assert!(
+            apply
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .all(|statement| !matches!(statement, Stmt::Let(_, Rvalue::CallIndirect { .. }))),
+            "a missing signature must emit no indirect call: {apply:#?}"
+        );
     }
 
     #[test]
