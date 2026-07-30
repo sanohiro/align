@@ -4671,7 +4671,11 @@ pub fn check_program_with_interface_facts(
             next_pipeline_snapshot: 0,
             loop_borrow_breaks: Vec::new(),
             loop_value_breaks: Vec::new(),
-            loop_value_roots: std::collections::HashMap::new(),
+            loop_value_facts: std::collections::HashMap::new(),
+            control_value_facts: std::collections::HashMap::new(),
+            walked_value_facts: std::collections::HashMap::new(),
+            value_snapshot_frames: Vec::new(),
+            reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
@@ -4743,7 +4747,11 @@ fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
     for root in roots {
         match root {
             BorrowRoot::Param(index) => params.push(*index),
-            BorrowRoot::Local(_) | BorrowRoot::IterTemp(_) => {}
+            BorrowRoot::Local(_)
+            | BorrowRoot::IterTemp(_)
+            | BorrowRoot::EndedLocal(_, _)
+            | BorrowRoot::EndedIterTemp(_, _)
+            | BorrowRoot::EndedParam(_, _) => {}
         }
     }
     if params.is_empty() {
@@ -4826,7 +4834,11 @@ fn infer_return_provenance(
             next_pipeline_snapshot: 0,
             loop_borrow_breaks: Vec::new(),
             loop_value_breaks: Vec::new(),
-            loop_value_roots: std::collections::HashMap::new(),
+            loop_value_facts: std::collections::HashMap::new(),
+            control_value_facts: std::collections::HashMap::new(),
+            walked_value_facts: std::collections::HashMap::new(),
+            value_snapshot_frames: Vec::new(),
+            reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
@@ -12354,10 +12366,23 @@ struct MoveCheck<'a> {
     next_pipeline_snapshot: usize,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
-    /// Roots carried by value-bearing `break` edges for each active loop.
-    loop_value_breaks: Vec<BorrowRoots>,
-    /// Settled value roots of each walked loop expression, keyed by source span.
-    loop_value_roots: std::collections::HashMap<Span, BorrowRoots>,
+    /// Projection-preserving facts carried by value-bearing `break` edges for each active loop.
+    loop_value_breaks: Vec<BorrowFact>,
+    /// Settled value facts of each walked loop expression, keyed by source span.
+    loop_value_facts: std::collections::HashMap<Span, BorrowFact>,
+    /// Settled value facts of walked branch expressions, captured before arm states join.
+    control_value_facts: std::collections::HashMap<Span, BorrowFact>,
+    /// Settled facts of walked expressions, captured immediately when that expression falls
+    /// through. Parent formation reads these snapshots so a later eager sibling cannot rewrite an
+    /// earlier runtime value's provenance in a product, residual aggregate, or call.
+    walked_value_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Direct borrow-capable children completed while each enclosing expression is evaluated.
+    /// Eager operations validate these snapshots at their action boundary; transparent/control
+    /// containers defer validation to the operation that consumes their selected result.
+    value_snapshot_frames: Vec<Vec<usize>>,
+    /// Loop refinement may revisit the same action. Emit one invalid-snapshot diagnostic per
+    /// checked parent/child identity pair.
+    reported_invalid_value_actions: std::collections::HashSet<(usize, usize)>,
     /// Per-iteration owned locals of each enclosing `loop` (innermost last) — the locals MIR drops
     /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
     /// generation exactly as the back-edge does.
@@ -12395,6 +12420,17 @@ enum MovedKey {
 
 type MovedSet = std::collections::HashSet<MovedKey>;
 
+/// How a borrow source's storage generation ended. Only the diagnostic wording depends on this —
+/// both endings kill every view rooted in that source.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BorrowEnd {
+    /// The source was moved away, reassigned, or reallocated in place.
+    Consumed,
+    /// The source's storage was **freed** where its binding scope ended — the per-iteration drop a
+    /// `loop` emits at its back-edge and at every `break` for owned locals declared in its body.
+    Dropped,
+}
+
 /// A storage generation a view may point into. Not every one has a name: MIR gives an **unbound
 /// Move temporary** a hidden owner slot (`new_synthetic_owner`) whose cleanup joins the innermost
 /// active loop, so `keep = "…".clone()` inside a `loop` borrows storage that the back-edge frees
@@ -12409,19 +12445,173 @@ enum BorrowRoot {
     IterTemp(u32),
     /// Source-visible parameter whose embedded view provenance reaches the return.
     Param(u32),
+    /// An already-ended root carried by a completion-time value snapshot. Keeping this marker in
+    /// the fact lets projection and named-summary selection transport the invalidation without
+    /// widening it to an unselected sibling.
+    EndedLocal(LocalId, BorrowEnd),
+    EndedIterTemp(u32, BorrowEnd),
+    EndedParam(u32, BorrowEnd),
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 
-/// How a borrow source's storage generation ended. Only the diagnostic wording depends on this —
-/// both endings kill every view rooted in that source.
+impl BorrowRoot {
+    fn ended(self, how: BorrowEnd) -> Self {
+        match self {
+            Self::Local(local) => Self::EndedLocal(local, how),
+            Self::IterTemp(depth) => Self::EndedIterTemp(depth, how),
+            Self::Param(param) => Self::EndedParam(param, how),
+            already @ (Self::EndedLocal(..)
+            | Self::EndedIterTemp(..)
+            | Self::EndedParam(..)) => already,
+        }
+    }
+
+    fn live(self) -> Option<Self> {
+        match self {
+            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) => Some(self),
+            Self::EndedLocal(..) | Self::EndedIterTemp(..) | Self::EndedParam(..) => None,
+        }
+    }
+
+    fn ended_source(self) -> Option<(Self, BorrowEnd)> {
+        match self {
+            Self::EndedLocal(local, how) => Some((Self::Local(local), how)),
+            Self::EndedIterTemp(depth, how) => Some((Self::IterTemp(depth), how)),
+            Self::EndedParam(param, how) => Some((Self::Param(param), how)),
+            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) => None,
+        }
+    }
+}
+
+/// One projection from an aggregate value to a recursively borrow-capable child. This is an
+/// analysis-local fact: public summaries still contain only parameter/capture roots.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum BorrowEnd {
-    /// The source was moved away, reassigned, or reallocated in place.
-    Consumed,
-    /// The source's storage was **freed** where its binding scope ended — the per-iteration drop a
-    /// `loop` emits at its back-edge and at every `break` for owned locals declared in its body.
-    Dropped,
+enum BorrowProjection {
+    StructField(u32),
+    TupleElement(u32),
+    EnumPayload { variant: u32, index: u32 },
+    OptionSome,
+    ResultOk,
+    ResultErr,
+}
+
+/// Borrow roots carried by a value, separated by aggregate projection. `direct` applies to the
+/// whole current value (and therefore every selected descendant); `projected` stores exact child
+/// facts. The final public summary flattens this finite trie back to parameter roots.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct BorrowFact {
+    direct: BorrowRoots,
+    projected: std::collections::BTreeMap<Vec<BorrowProjection>, BorrowRoots>,
+}
+
+impl BorrowFact {
+    fn from_direct(roots: BorrowRoots) -> Self {
+        Self {
+            direct: roots,
+            projected: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.direct.is_empty() && self.projected.values().all(BorrowRoots::is_empty)
+    }
+
+    fn flatten(&self) -> BorrowRoots {
+        let mut roots = self.direct.clone();
+        for projected in self.projected.values() {
+            roots.extend(projected);
+        }
+        roots
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        out.direct.extend(&other.direct);
+        for (path, roots) in &other.projected {
+            out.projected
+                .entry(path.clone())
+                .or_default()
+                .extend(roots);
+        }
+        out
+    }
+
+    fn prefixed(mut self, projection: BorrowProjection) -> Self {
+        let mut projected = std::collections::BTreeMap::new();
+        if !self.direct.is_empty() {
+            projected.insert(vec![projection], std::mem::take(&mut self.direct));
+        }
+        for (mut path, roots) in self.projected {
+            path.insert(0, projection);
+            projected.entry(path).or_insert_with(BorrowRoots::new).extend(roots);
+        }
+        Self {
+            direct: BorrowRoots::new(),
+            projected,
+        }
+    }
+
+    fn project_exact(&self, projection: BorrowProjection) -> Self {
+        let mut out = Self::from_direct(self.direct.clone());
+        for (path, roots) in &self.projected {
+            let Some((first, rest)) = path.split_first() else {
+                out.direct.extend(roots);
+                continue;
+            };
+            if *first != projection {
+                continue;
+            }
+            if rest.is_empty() {
+                out.direct.extend(roots);
+            } else {
+                out.projected
+                    .entry(rest.to_vec())
+                    .or_default()
+                    .extend(roots);
+            }
+        }
+        out
+    }
+
+    fn replace_exact(&mut self, path: &[BorrowProjection], incoming: BorrowFact) {
+        self.projected.retain(|candidate, _| {
+            !candidate.starts_with(path)
+        });
+        let mut incoming = incoming;
+        if !incoming.direct.is_empty() {
+            self.projected
+                .entry(path.to_vec())
+                .or_default()
+                .extend(std::mem::take(&mut incoming.direct));
+        }
+        for (suffix, roots) in incoming.projected {
+            let mut destination = path.to_vec();
+            destination.extend(suffix);
+            self.projected.entry(destination).or_default().extend(roots);
+        }
+    }
+
+    fn mark_ended(&mut self, invalid: &EndedRoots) {
+        let mark = |roots: &mut BorrowRoots| {
+            *roots = std::mem::take(roots)
+                .into_iter()
+                .map(|root| invalid.get(&root).map_or(root, |&how| root.ended(how)))
+                .collect();
+        };
+        mark(&mut self.direct);
+        for roots in self.projected.values_mut() {
+            mark(roots);
+        }
+    }
+
+    fn live_roots(&self) -> BorrowRoots {
+        self.flatten()
+            .into_iter()
+            .filter_map(BorrowRoot::live)
+            .collect()
+    }
+
 }
 
 /// Which ended source generations a borrower depends on, and how each ended. `Ord` on
@@ -12436,18 +12626,47 @@ type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
+    facts: std::collections::HashMap<LocalId, BorrowFact>,
     invalid: std::collections::HashMap<LocalId, EndedRoots>,
     pipeline_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
+    value_sources: std::collections::HashMap<usize, BorrowRoots>,
+    invalid_value_sources: std::collections::HashMap<usize, EndedRoots>,
 }
 
 impl BorrowState {
-    fn assign(&mut self, local: LocalId, roots: BorrowRoots) {
+    fn assign(&mut self, local: LocalId, fact: BorrowFact) {
         self.invalid.remove(&local);
+        self.update_fact(local, fact);
+    }
+
+    fn update_fact(&mut self, local: LocalId, fact: BorrowFact) {
+        let flattened = fact.flatten();
+        let roots = flattened
+            .iter()
+            .copied()
+            .filter_map(BorrowRoot::live)
+            .collect::<BorrowRoots>();
+        for root in flattened {
+            if let Some((source, how)) = root.ended_source() {
+                let entry = self
+                    .invalid
+                    .entry(local)
+                    .or_default()
+                    .entry(source)
+                    .or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
         if roots.is_empty() {
             self.sources.remove(&local);
         } else {
             self.sources.insert(local, roots);
+        }
+        if fact.is_empty() {
+            self.facts.remove(&local);
+        } else {
+            self.facts.insert(local, fact);
         }
     }
 
@@ -12461,6 +12680,20 @@ impl BorrowState {
         self.invalid_pipeline_sources
             .remove(&snapshot)
             .unwrap_or_default()
+    }
+
+    fn begin_value_source(&mut self, snapshot: usize, roots: BorrowRoots) {
+        self.invalid_value_sources.remove(&snapshot);
+        if roots.is_empty() {
+            self.value_sources.remove(&snapshot);
+        } else {
+            self.value_sources.insert(snapshot, roots);
+        }
+    }
+
+    fn finish_value_source(&mut self, snapshot: usize) {
+        self.value_sources.remove(&snapshot);
+        self.invalid_value_sources.remove(&snapshot);
     }
 
     /// End every source generation matching `ended`. One entry point for both endings: a named
@@ -12484,6 +12717,17 @@ impl BorrowState {
                 *entry = (*entry).min(how);
             }
         }
+        for (&snapshot, roots) in &self.value_sources {
+            for &root in roots.iter().filter(|&&r| ended(r)) {
+                let entry = self
+                    .invalid_value_sources
+                    .entry(snapshot)
+                    .or_default()
+                    .entry(root)
+                    .or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
     }
 
     fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
@@ -12494,6 +12738,12 @@ impl BorrowState {
         let mut out = a.clone();
         for (&local, roots) in &b.sources {
             out.sources.entry(local).or_default().extend(roots);
+        }
+        for (&local, fact) in &b.facts {
+            out.facts
+                .entry(local)
+                .and_modify(|current| *current = current.join(fact))
+                .or_insert_with(|| fact.clone());
         }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
@@ -12511,6 +12761,22 @@ impl BorrowState {
         for (&snapshot, roots) in &b.invalid_pipeline_sources {
             let into = out
                 .invalid_pipeline_sources
+                .entry(snapshot)
+                .or_default();
+            for (&owner, &how) in roots {
+                let entry = into.entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
+            }
+        }
+        for (&snapshot, roots) in &b.value_sources {
+            out.value_sources
+                .entry(snapshot)
+                .or_default()
+                .extend(roots);
+        }
+        for (&snapshot, roots) in &b.invalid_value_sources {
+            let into = out
+                .invalid_value_sources
                 .entry(snapshot)
                 .or_default();
             for (&owner, &how) in roots {
@@ -12571,11 +12837,12 @@ impl<'a> MoveCheck<'a> {
             if !self.local_may_borrow(local) {
                 continue;
             }
-            self.borrows
-                .sources
-                .entry(local)
-                .or_default()
-                .insert(BorrowRoot::Param(position as u32));
+            let mut roots = BorrowRoots::new();
+            roots.insert(BorrowRoot::Param(position as u32));
+            let ty = self.f.locals[local as usize].ty;
+            let fact =
+                self.normalize_borrow_fact(ty, BorrowFact::from_direct(roots));
+            self.borrows.assign(local, fact);
         }
         let mut moved: MovedSet = std::collections::HashSet::new();
         // If the function returns a Move type, its body's trailing expression is consumed by
@@ -12586,6 +12853,8 @@ impl<'a> MoveCheck<'a> {
         if falls_through
             && let Some(value) = &self.f.body.value
         {
+            let key = Self::expr_key(value);
+            self.validate_value_snapshot(key, key, value.span);
             self.return_roots.extend(self.borrow_sources(value));
         }
         self.return_roots
@@ -12636,6 +12905,159 @@ impl<'a> MoveCheck<'a> {
             roots.insert(BorrowRoot::Local(id));
         }
         roots
+    }
+
+    fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
+        let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
+        if self.local_owns_view_storage(id) {
+            fact.direct.insert(BorrowRoot::Local(id));
+        }
+        fact
+    }
+
+    fn projection_ty(&self, ty: Ty, projection: BorrowProjection) -> Option<Ty> {
+        match (expand_tagged_ty(ty, self.tagged_types), projection) {
+            (Ty::Struct(id), BorrowProjection::StructField(index)) => self
+                .structs
+                .get(id as usize)
+                .and_then(|def| def.fields.get(index as usize))
+                .map(|field| field.ty),
+            (Ty::Tuple(id), BorrowProjection::TupleElement(index)) => self
+                .tuples
+                .get(id as usize)
+                .and_then(|def| def.elems.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
+            (
+                Ty::Enum(id),
+                BorrowProjection::EnumPayload { variant, index },
+            ) => self
+                .enums
+                .get(id as usize)
+                .and_then(|def| def.variants.get(variant as usize))
+                .and_then(|variant| variant.payload.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
+            (Ty::Option(payload), BorrowProjection::OptionSome) => {
+                Some(scalar_to_ty(payload))
+            }
+            (Ty::Result(ok, _), BorrowProjection::ResultOk) => Some(scalar_to_ty(ok)),
+            (Ty::Result(_, err), BorrowProjection::ResultErr) => Some(scalar_to_ty(err)),
+            _ => None,
+        }
+    }
+
+    fn borrow_leaf_paths_inner(
+        &self,
+        ty: Ty,
+        visiting: &mut Vec<Ty>,
+    ) -> Vec<Vec<BorrowProjection>> {
+        if !ty_may_borrow(
+            ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            return Vec::new();
+        }
+        let ty = expand_tagged_ty(ty, self.tagged_types);
+        if visiting.contains(&ty) {
+            return vec![Vec::new()];
+        }
+        visiting.push(ty);
+        let mut paths = Vec::new();
+        let mut append = |projection: BorrowProjection, child: Ty| {
+            let children = self.borrow_leaf_paths_inner(child, visiting);
+            for mut path in children {
+                path.insert(0, projection);
+                paths.push(path);
+            }
+        };
+        match ty {
+            Ty::Struct(id) => {
+                if let Some(def) = self.structs.get(id as usize) {
+                    for (index, field) in def.fields.iter().enumerate() {
+                        append(BorrowProjection::StructField(index as u32), field.ty);
+                    }
+                }
+            }
+            Ty::Tuple(id) => {
+                if let Some(def) = self.tuples.get(id as usize) {
+                    for (index, element) in def.elems.iter().enumerate() {
+                        append(
+                            BorrowProjection::TupleElement(index as u32),
+                            scalar_to_ty(*element),
+                        );
+                    }
+                }
+            }
+            Ty::Enum(id) => {
+                if let Some(def) = self.enums.get(id as usize) {
+                    for (variant_index, variant) in def.variants.iter().enumerate() {
+                        for (payload_index, payload) in variant.payload.iter().enumerate() {
+                            append(
+                                BorrowProjection::EnumPayload {
+                                    variant: variant_index as u32,
+                                    index: payload_index as u32,
+                                },
+                                scalar_to_ty(*payload),
+                            );
+                        }
+                    }
+                }
+            }
+            Ty::Option(payload) => {
+                append(BorrowProjection::OptionSome, scalar_to_ty(payload));
+            }
+            Ty::Result(ok, err) => {
+                append(BorrowProjection::ResultOk, scalar_to_ty(ok));
+                append(BorrowProjection::ResultErr, scalar_to_ty(err));
+            }
+            _ => paths.push(Vec::new()),
+        }
+        visiting.pop();
+        if paths.is_empty() {
+            vec![Vec::new()]
+        } else {
+            paths
+        }
+    }
+
+    fn normalize_borrow_fact(&self, ty: Ty, fact: BorrowFact) -> BorrowFact {
+        if !matches!(expand_tagged_ty(ty, self.tagged_types), Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)) {
+            return fact;
+        }
+        let mut out = BorrowFact::default();
+        let mut entries = fact.projected.into_iter().collect::<Vec<_>>();
+        if !fact.direct.is_empty() {
+            entries.push((Vec::new(), fact.direct));
+        }
+        for (path, roots) in entries {
+            let mut selected_ty = Some(ty);
+            for &projection in &path {
+                selected_ty = selected_ty.and_then(|ty| self.projection_ty(ty, projection));
+            }
+            let Some(selected_ty) = selected_ty else {
+                out.direct.extend(roots);
+                continue;
+            };
+            let suffixes =
+                self.borrow_leaf_paths_inner(selected_ty, &mut Vec::new());
+            for suffix in suffixes {
+                let mut destination = path.clone();
+                destination.extend(suffix);
+                if destination.is_empty() {
+                    out.direct.extend(&roots);
+                } else {
+                    out.projected
+                        .entry(destination)
+                        .or_default()
+                        .extend(&roots);
+                }
+            }
+        }
+        out
     }
 
     /// The hidden-owner root of an **unbound Move temporary**, when one is materialized here. This
@@ -12746,9 +13168,13 @@ impl<'a> MoveCheck<'a> {
     /// [`Self::storage_roots`]. A borrow-producing arm below therefore routes its borrowed operand
     /// through `storage_roots`, while a materializing/moving arm routes through `borrow_sources`.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
-        let mut roots = BorrowRoots::new();
+        self.borrow_fact(e).flatten()
+    }
+
+    fn borrow_fact(&self, e: &Expr) -> BorrowFact {
+        let mut fact = BorrowFact::default();
         if self.non_fallthrough.contains(&e.span) {
-            return roots;
+            return fact;
         }
         if !ty_may_borrow(
             e.ty,
@@ -12757,18 +13183,266 @@ impl<'a> MoveCheck<'a> {
             self.enums,
             self.tagged_types,
         ) {
-            return roots;
+            return fact;
+        }
+        let key = Self::expr_key(e);
+        if let Some(fact) = self.walked_value_facts.get(&key) {
+            let mut fact = fact.clone();
+            if let Some(invalid) = self.borrows.invalid_value_sources.get(&key) {
+                fact.mark_ended(invalid);
+            }
+            return fact;
         }
         if let Some(stages) = pipeline_stages(&e.kind) {
             for capture in stage_capture_exprs(stages) {
-                roots.extend(self.borrow_sources(capture));
+                fact.direct.extend(self.borrow_sources(capture));
             }
         }
         for capture in node_captures(&e.kind) {
-            roots.extend(self.borrow_sources(capture));
+            fact.direct.extend(self.borrow_sources(capture));
         }
-        roots.extend(self.borrow_sources_inner(e));
-        roots
+        fact.join(&self.borrow_fact_inner(e))
+    }
+
+    fn expr_key(e: &Expr) -> usize {
+        e as *const Expr as usize
+    }
+
+    fn clear_value_snapshot(&mut self, key: usize) {
+        self.walked_value_facts.remove(&key);
+        self.borrows.finish_value_source(key);
+        for frame in &mut self.loop_borrow_breaks {
+            for state in frame {
+                state.finish_value_source(key);
+            }
+        }
+    }
+
+    fn ended_value_snapshot(&self, key: usize) -> Option<(BorrowRoot, BorrowEnd)> {
+        self.borrows
+            .invalid_value_sources
+            .get(&key)
+            .and_then(|invalid| invalid.iter().next().map(|(&root, &how)| (root, how)))
+            .or_else(|| {
+                self.walked_value_facts.get(&key).and_then(|fact| {
+                    fact.flatten()
+                        .into_iter()
+                        .find_map(BorrowRoot::ended_source)
+                })
+            })
+    }
+
+    fn validate_value_snapshot(&mut self, action: usize, snapshot: usize, span: Span) {
+        let Some((root, how)) = self.ended_value_snapshot(snapshot) else {
+            return;
+        };
+        if !self
+            .reported_invalid_value_actions
+            .insert((action, snapshot))
+        {
+            return;
+        }
+        let message = match root {
+            BorrowRoot::Local(owner) => {
+                let owner = self
+                    .f
+                    .locals
+                    .get(owner as usize)
+                    .map_or("<source>", |local| local.name.as_str());
+                let why = match how {
+                    BorrowEnd::Consumed => "was moved, reassigned, or reallocated by a later eager operand",
+                    BorrowEnd::Dropped => "was dropped before the enclosing operation",
+                };
+                format!(
+                    "value snapshot was invalidated before the enclosing operation: owner \
+                     '{owner}' {why}"
+                )
+            }
+            BorrowRoot::IterTemp(_) => {
+                "value snapshot was invalidated before the enclosing operation: its temporary owner was dropped".to_string()
+            }
+            BorrowRoot::Param(_) => {
+                "value snapshot was invalidated before the enclosing operation: its external owner ended unexpectedly".to_string()
+            }
+            BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..) => {
+                "value snapshot was invalidated before the enclosing operation".to_string()
+            }
+        };
+        self.diags.error(message, span);
+    }
+
+    fn defers_child_snapshot_validation(kind: &ExprKind) -> bool {
+        matches!(
+            kind,
+            ExprKind::Block(_)
+                | ExprKind::Arena(_)
+                | ExprKind::TaskGroup(_)
+                | ExprKind::Unsafe(_)
+                | ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::ElseUnwrap { .. }
+                | ExprKind::Loop { .. }
+                | ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                }
+        )
+    }
+
+    fn project_fact_or_flatten(
+        &self,
+        ty: Ty,
+        fact: BorrowFact,
+        path: &[BorrowProjection],
+        result_ty: Ty,
+    ) -> BorrowFact {
+        let fact = self.normalize_borrow_fact(ty, fact);
+        let fallback = fact.flatten();
+        let mut current_ty = ty;
+        let mut selected = fact;
+        for &projection in path {
+            let Some(next_ty) = self.projection_ty(current_ty, projection) else {
+                return BorrowFact::from_direct(fallback);
+            };
+            selected = selected.project_exact(projection);
+            current_ty = next_ty;
+        }
+        if expand_tagged_ty(current_ty, self.tagged_types)
+            != expand_tagged_ty(result_ty, self.tagged_types)
+        {
+            return BorrowFact::from_direct(fallback);
+        }
+        selected
+    }
+
+    fn local_projected_fact(
+        &self,
+        local: LocalId,
+        path: &[BorrowProjection],
+        result_ty: Ty,
+    ) -> BorrowFact {
+        let Some(ty) = self.f.locals.get(local as usize).map(|local| local.ty) else {
+            return BorrowFact::from_direct(self.local_storage_roots(local));
+        };
+        self.project_fact_or_flatten(ty, self.local_borrow_fact(local), path, result_ty)
+    }
+
+    fn block_value_fact(&self, block: &Block) -> BorrowFact {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block
+                .value
+                .as_ref()
+                .map_or_else(BorrowFact::default, |value| self.borrow_fact(value))
+        } else {
+            BorrowFact::default()
+        }
+    }
+
+    fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
+        match &e.kind {
+            ExprKind::Local(id) => self.local_borrow_fact(*id),
+            ExprKind::Field { root, path } => {
+                let path = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                self.local_projected_fact(*root, &path, e.ty)
+            }
+            ExprKind::TupleIndex { recv, index } => self.project_fact_or_flatten(
+                recv.ty,
+                self.borrow_fact(recv),
+                &[BorrowProjection::TupleElement(*index)],
+                e.ty,
+            ),
+            ExprKind::StructLit { struct_id, fields } => {
+                let valid = e.ty == Ty::Struct(*struct_id)
+                    && self.structs.get(*struct_id as usize).is_some_and(|definition| {
+                        definition.fields.len() == fields.len()
+                            && definition.fields.iter().zip(fields).all(
+                                |(expected, field)| {
+                                    expand_tagged_ty(expected.ty, self.tagged_types)
+                                        == expand_tagged_ty(field.ty, self.tagged_types)
+                                },
+                            )
+                    });
+                if !valid {
+                    return BorrowFact::from_direct(
+                        fields.iter().fold(BorrowRoots::new(), |mut roots, field| {
+                            roots.extend(self.borrow_sources(field));
+                            roots
+                        }),
+                    );
+                }
+                fields.iter().enumerate().fold(
+                    BorrowFact::default(),
+                    |fact, (index, field)| {
+                        fact.join(
+                            &self
+                                .borrow_fact(field)
+                                .prefixed(BorrowProjection::StructField(index as u32)),
+                        )
+                    },
+                )
+            }
+            ExprKind::Tuple { tuple_id, elems } => {
+                let valid = e.ty == Ty::Tuple(*tuple_id)
+                    && self.tuples.get(*tuple_id as usize).is_some_and(|definition| {
+                        definition.elems.len() == elems.len()
+                            && definition
+                                .elems
+                                .iter()
+                                .zip(elems)
+                                .all(|(expected, element)| {
+                                    expand_tagged_ty(
+                                        scalar_to_ty(*expected),
+                                        self.tagged_types,
+                                    ) == expand_tagged_ty(element.ty, self.tagged_types)
+                                })
+                    });
+                if !valid {
+                    return BorrowFact::from_direct(
+                        elems.iter().fold(BorrowRoots::new(), |mut roots, element| {
+                            roots.extend(self.borrow_sources(element));
+                            roots
+                        }),
+                    );
+                }
+                elems.iter().enumerate().fold(
+                    BorrowFact::default(),
+                    |fact, (index, element)| {
+                    fact.join(
+                        &self
+                            .borrow_fact(element)
+                            .prefixed(BorrowProjection::TupleElement(index as u32)),
+                    )
+                    },
+                )
+            }
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => self.block_value_fact(block),
+            ExprKind::If { .. } => self
+                .control_value_facts
+                .get(&e.span)
+                .cloned()
+                .unwrap_or_default(),
+            ExprKind::Loop { .. } => self
+                .loop_value_facts
+                .get(&e.span)
+                .cloned()
+                .unwrap_or_default(),
+            // L2b-a2-t owns tagged construction, match bindings, `else`, `?`, and `map_err`.
+            // Every remaining expression retains the L2b-a1 flattened conservative fact.
+            _ => BorrowFact::from_direct(self.borrow_sources_inner(e)),
+        }
     }
 
     fn walked_stmt_falls_through(&self, statement: &Stmt) -> bool {
@@ -13050,9 +13724,9 @@ impl<'a> MoveCheck<'a> {
                 union(vec![opt, fallback])
             }
             ExprKind::Loop { .. } => self
-                .loop_value_roots
+                .loop_value_facts
                 .get(&e.span)
-                .cloned()
+                .map(BorrowFact::flatten)
                 .unwrap_or_default(),
             // ── The remaining forms record NO provenance, and the list is EXHAUSTIVE: there is no
             // `_` tail, so a new `ExprKind` cannot silently inherit "borrows nothing" — which is
@@ -13157,12 +13831,66 @@ impl<'a> MoveCheck<'a> {
         }
     }
     fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
-        let roots = if self.local_may_borrow(local) {
-            self.borrow_sources(value)
+        let fact = if self.local_may_borrow(local) {
+            let fact = self.borrow_fact(value);
+            let ty = self.f.locals[local as usize].ty;
+            self.normalize_borrow_fact(ty, fact)
         } else {
-            BorrowRoots::new()
+            BorrowFact::default()
         };
-        self.borrows.assign(local, roots);
+        self.borrows.assign(local, fact);
+    }
+
+    fn replace_local_borrow_projection(
+        &mut self,
+        local: LocalId,
+        path: &[BorrowProjection],
+        value: &Expr,
+    ) {
+        if !self.local_may_borrow(local) {
+            return;
+        }
+        let local_ty = self.f.locals[local as usize].ty;
+        let current = self
+            .borrows
+            .facts
+            .get(&local)
+            .cloned()
+            .unwrap_or_default();
+        let mut current = self.normalize_borrow_fact(local_ty, current);
+        let incoming =
+            self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
+        let mut destination_ty = Some(local_ty);
+        for &projection in path {
+            destination_ty =
+                destination_ty.and_then(|ty| self.projection_ty(ty, projection));
+        }
+        if path.is_empty()
+            || destination_ty.is_none_or(|ty| {
+                expand_tagged_ty(ty, self.tagged_types)
+                    != expand_tagged_ty(value.ty, self.tagged_types)
+            })
+        {
+            current.direct.extend(incoming.flatten());
+            self.borrows.update_fact(local, current);
+            return;
+        }
+        current.replace_exact(path, incoming);
+        self.borrows.update_fact(local, current);
+    }
+
+    fn join_local_borrow_fallback(&mut self, local: LocalId, value: &Expr) {
+        if !self.local_may_borrow(local) {
+            return;
+        }
+        let mut current = self
+            .borrows
+            .facts
+            .get(&local)
+            .cloned()
+            .unwrap_or_default();
+        current.direct.extend(self.borrow_sources(value));
+        self.borrows.update_fact(local, current);
     }
 
     fn invalidate_owner(&mut self, owner: LocalId) {
@@ -13209,6 +13937,9 @@ impl<'a> MoveCheck<'a> {
             // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
             BorrowRoot::Param(_) => false,
+            BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..) => false,
         });
     }
 
@@ -13256,6 +13987,14 @@ impl<'a> MoveCheck<'a> {
             // Keep the malformed-state fallback diagnostic-only and fail closed.
             (BorrowRoot::Param(_), _) => format!(
                 "use of invalidated borrow '{borrower}': its external provenance ended unexpectedly"
+            ),
+            (
+                BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedIterTemp(..)
+                | BorrowRoot::EndedParam(..),
+                _,
+            ) => format!(
+                "use of invalidated borrow '{borrower}': its source generation ended unexpectedly"
             ),
         };
         self.diags.error(msg, span);
@@ -13397,6 +14136,11 @@ impl<'a> MoveCheck<'a> {
             BorrowRoot::Param(_) => {
                 "pipeline source snapshot was invalidated before terminal action: its external owner ended unexpectedly".to_string()
             }
+            BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..) => {
+                "pipeline source snapshot was invalidated before terminal action: its source generation had already ended".to_string()
+            }
         };
         self.diags.error(message, span);
     }
@@ -13426,10 +14170,12 @@ impl<'a> MoveCheck<'a> {
         // suppressed by swapping in a throwaway sink (restored after).
         let mut probe = entry.clone();
         let mut sink = Diagnostics::new();
+        let reported_invalid_value_actions =
+            self.reported_invalid_value_actions.clone();
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
-        self.loop_value_breaks.push(BorrowRoots::new());
+        self.loop_value_breaks.push(BorrowFact::default());
         self.borrows = entry_borrows.clone();
         let probe_falls_through = self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
@@ -13460,7 +14206,7 @@ impl<'a> MoveCheck<'a> {
                 let mut probe_state = &entry | &back_edge;
                 self.loop_breaks.push(Vec::new());
                 self.loop_borrow_breaks.push(Vec::new());
-                self.loop_value_breaks.push(BorrowRoots::new());
+                self.loop_value_breaks.push(BorrowFact::default());
                 self.block(body, &mut probe_state, false, false);
                 self.loop_breaks.pop();
                 self.loop_borrow_breaks.pop();
@@ -13476,13 +14222,17 @@ impl<'a> MoveCheck<'a> {
         } else {
             entry_borrows.clone()
         };
+        // Probe diagnostics were intentionally discarded, so their dedup identities must be too;
+        // otherwise the real pass would suppress the only user-visible invalid-snapshot error.
+        self.reported_invalid_value_actions =
+            reported_invalid_value_actions;
         std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probes'
         // Real pass from the back-edge fixpoint, collecting `break` snapshots.
         let mut body_state = &entry | &back_edge;
         self.borrows = fixed_borrows;
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
-        self.loop_value_breaks.push(BorrowRoots::new());
+        self.loop_value_breaks.push(BorrowFact::default());
         self.block(body, &mut body_state, false, false);
         let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
         let falls_through = !breaks.is_empty();
@@ -13490,14 +14240,14 @@ impl<'a> MoveCheck<'a> {
             .loop_borrow_breaks
             .pop()
             .expect("loop borrow-break frame balanced");
-        let value_roots = self
+        let value_fact = self
             .loop_value_breaks
             .pop()
             .expect("loop value-break frame balanced");
-        if value_roots.is_empty() {
-            self.loop_value_roots.remove(&span);
+        if value_fact.is_empty() {
+            self.loop_value_facts.remove(&span);
         } else {
-            self.loop_value_roots.insert(span, value_roots);
+            self.loop_value_facts.insert(span, value_fact);
         }
         self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
@@ -13597,6 +14347,18 @@ impl<'a> MoveCheck<'a> {
                     if !self_assign && self.is_move_ty(value.ty) {
                         self.invalidate_owner(*root);
                     }
+                    if !self_assign {
+                        let projections = path
+                            .iter()
+                            .copied()
+                            .map(BorrowProjection::StructField)
+                            .collect::<Vec<_>>();
+                        self.replace_local_borrow_projection(
+                            *root,
+                            &projections,
+                            value,
+                        );
+                    }
                 }
                 // `base[index] = value` — primitive array elements are Copy, so the index and value
                 // are read without consuming either.
@@ -13608,6 +14370,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
+                    self.join_local_borrow_fallback(*base, value);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
@@ -13625,12 +14388,15 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
+                    self.join_local_borrow_fallback(*base, value);
                 }
                 Stmt::AssignVecLane { value, .. } => {
                     move_expr!(self, value, moved, false, false);
                 }
                 Stmt::Return(Some(e)) => {
                     move_expr!(self, e, moved, true, true);
+                    let key = Self::expr_key(e);
+                    self.validate_value_snapshot(key, key, e.span);
                     // Control expressions establish match-arm payload bindings while they are
                     // walked. Query after that walk so an explicit `return match ...` observes the
                     // same binding provenance as a trailing match expression.
@@ -13644,9 +14410,11 @@ impl<'a> MoveCheck<'a> {
                     if let Some(e) = value {
                         move_expr!(self, e, moved, true, true);
                         if *accepted {
-                            let roots = self.borrow_sources(e);
+                            let key = Self::expr_key(e);
+                            self.validate_value_snapshot(key, key, e.span);
+                            let fact = self.borrow_fact(e);
                             if let Some(frame) = self.loop_value_breaks.last_mut() {
-                                frame.extend(roots);
+                                *frame = frame.join(&fact);
                             }
                         }
                     }
@@ -13675,15 +14443,25 @@ impl<'a> MoveCheck<'a> {
                 // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
                     move_expr!(self, init, moved, true, true);
-                    let roots = self.borrow_sources(init);
-                    for l in locals.iter().flatten() {
-                        let local_roots = if self.local_may_borrow(*l) {
-                            roots.clone()
+                    let fact = self.borrow_fact(init);
+                    for (index, local) in locals.iter().enumerate() {
+                        let Some(local) = local else { continue };
+                        let local_fact = if self.local_may_borrow(*local) {
+                            let selected = self.project_fact_or_flatten(
+                                init.ty,
+                                fact.clone(),
+                                &[BorrowProjection::TupleElement(index as u32)],
+                                self.f.locals[*local as usize].ty,
+                            );
+                            self.normalize_borrow_fact(
+                                self.f.locals[*local as usize].ty,
+                                selected,
+                            )
                         } else {
-                            BorrowRoots::new()
+                            BorrowFact::default()
                         };
-                        self.borrows.assign(*l, local_roots);
-                        clear_moved(moved, *l);
+                        self.borrows.assign(*local, local_fact);
+                        clear_moved(moved, *local);
                     }
                 }
             }
@@ -13810,10 +14588,45 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
+        let may_borrow = ty_may_borrow(
+            e.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        let key = Self::expr_key(e);
+        // A loop refinement or another repeated structural walk may revisit the same source node
+        // under a stronger state. Never let that prior pass answer this evaluation's fact query.
+        if may_borrow {
+            self.clear_value_snapshot(key);
+        }
+        self.value_snapshot_frames.push(Vec::new());
         let falls_through =
             self.expr_inner(e, moved, consuming, direct);
+        let child_snapshots = self
+            .value_snapshot_frames
+            .pop()
+            .expect("value snapshot frame for walked expression");
+        if falls_through
+            && !Self::defers_child_snapshot_validation(&e.kind)
+        {
+            for snapshot in child_snapshots {
+                self.validate_value_snapshot(key, snapshot, e.span);
+            }
+        }
         if !falls_through {
             self.non_fallthrough.insert(e.span);
+        } else if may_borrow {
+            // Every eager child has already stored its own completion-time fact. Forming this
+            // parent from those child snapshots preserves runtime source order even if a later
+            // sibling reassigned a local mentioned by an earlier child.
+            let fact = self.borrow_fact(e);
+            self.borrows.begin_value_source(key, fact.live_roots());
+            self.walked_value_facts.insert(key, fact);
+            if let Some(parent) = self.value_snapshot_frames.last_mut() {
+                parent.push(key);
+            }
         }
         falls_through
     }
@@ -13979,8 +14792,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::StructLit { fields, .. } => {
-                for f in fields {
-                    move_expr!(self, f, moved, true, true);
+                for field in fields {
+                    move_expr!(self, field, moved, true, true);
                 }
             }
             ExprKind::OptionSome(i)
@@ -14404,7 +15217,8 @@ impl<'a> MoveCheck<'a> {
                         } else {
                             BorrowRoots::new()
                         };
-                        self.borrows.assign(*binding, roots);
+                        self.borrows
+                            .assign(*binding, BorrowFact::from_direct(roots));
                         // An arm binding is INITIALIZED here from the scrutinee's payload, exactly
                         // like a `Let` — clear any stale moved bit. Without this, an arm that
                         // consumes its own binding inside a `loop` body poisons the back-edge
@@ -14457,12 +15271,26 @@ impl<'a> MoveCheck<'a> {
                 self.borrows = incoming_borrows.clone();
                 let then_falls_through =
                     self.block(then, &mut m1, consuming, false);
+                let then_fact = then_falls_through
+                    .then(|| self.block_value_fact(then));
                 let b1 = self.borrows.clone();
                 let mut m2 = moved.clone();
                 self.borrows = incoming_borrows.clone();
                 let else_falls_through =
                     self.block(els, &mut m2, consuming, false);
+                let else_fact = else_falls_through
+                    .then(|| self.block_value_fact(els));
                 let b2 = self.borrows.clone();
+                let value_fact = match (then_fact, else_fact) {
+                    (Some(then), Some(els)) => then.join(&els),
+                    (Some(fact), None) | (None, Some(fact)) => fact,
+                    (None, None) => BorrowFact::default(),
+                };
+                if value_fact.is_empty() {
+                    self.control_value_facts.remove(&e.span);
+                } else {
+                    self.control_value_facts.insert(e.span, value_fact);
+                }
                 // Join the branch states — but a branch that always diverges (`return`) contributes
                 // nothing past the `if`, so its moves must not poison the fall-through. (Without this,
                 // `if c { return x }; use(x)` wrongly reports `x` moved.) When both diverge the code
@@ -14848,8 +15676,8 @@ impl<'a> MoveCheck<'a> {
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
-                for el in elems {
-                    move_expr!(self, el, moved, true, true);
+                for element in elems {
+                    move_expr!(self, element, moved, true, true);
                 }
             }
             ExprKind::MathOp { operands, .. } => {
@@ -30278,6 +31106,218 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn projected_return_provenance_fails_closed() {
+        let (program, diagnostics) = check(
+            "\
+Pair { left: str, right: str }
+fn probe(value: Pair, replacement: str) -> str = value.left
+fn tuple(value: Pair, replacement: str) -> (str, str) = (value.left, replacement)
+fn main() -> i32 = 0
+",
+        );
+        assert!(!diagnostics.has_errors());
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "probe")
+            .expect("probe function");
+        let named = std::collections::HashMap::new();
+        let mut sink = Diagnostics::new();
+        let mut checker = MoveCheck {
+            f: function,
+            diags: &mut sink,
+            named_return_borrow: &named,
+            summary_dependencies: None,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            loop_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
+            loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_facts: std::collections::HashMap::new(),
+            control_value_facts: std::collections::HashMap::new(),
+            walked_value_facts: std::collections::HashMap::new(),
+            value_snapshot_frames: Vec::new(),
+            reported_invalid_value_actions: std::collections::HashSet::new(),
+            loop_iter_drops: Vec::new(),
+            arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+            non_fallthrough: std::collections::HashSet::new(),
+        };
+        let mut fact = BorrowFact::default();
+        fact.projected.insert(
+            vec![BorrowProjection::StructField(0)],
+            [BorrowRoot::Param(0)].into_iter().collect(),
+        );
+        fact.projected.insert(
+            vec![BorrowProjection::StructField(1)],
+            [BorrowRoot::Param(1)].into_iter().collect(),
+        );
+        let all = fact.flatten();
+        let pair_ty = function.locals[function.params[0] as usize].ty;
+        let tuple_ty = program
+            .fns
+            .iter()
+            .find(|function| function.name == "tuple")
+            .expect("tuple function")
+            .ret;
+        for (ty, path) in [
+            (
+                Ty::Struct(u32::MAX),
+                vec![BorrowProjection::StructField(0)],
+            ),
+            (
+                Ty::Tuple(u32::MAX),
+                vec![BorrowProjection::TupleElement(0)],
+            ),
+            (
+                Ty::Tagged(u32::MAX),
+                vec![BorrowProjection::OptionSome],
+            ),
+            (
+                pair_ty,
+                vec![BorrowProjection::StructField(u32::MAX)],
+            ),
+            (Ty::Str, vec![BorrowProjection::StructField(0)]),
+        ] {
+            assert_eq!(
+                checker
+                    .project_fact_or_flatten(ty, fact.clone(), &path, Ty::Str)
+                    .flatten(),
+                all,
+                "malformed projection metadata must retain every current-value root: {ty:?} {path:?}"
+            );
+        }
+        assert_eq!(
+            checker
+                .project_fact_or_flatten(
+                    pair_ty,
+                    fact.clone(),
+                    &[BorrowProjection::StructField(0)],
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                )
+                .flatten(),
+            all,
+            "a projection/result type disagreement must retain every current-value root"
+        );
+        let mut malformed_fact = fact.clone();
+        malformed_fact.projected.insert(
+            vec![BorrowProjection::StructField(u32::MAX)],
+            [BorrowRoot::Param(2)].into_iter().collect(),
+        );
+        assert_eq!(
+            checker
+                .project_fact_or_flatten(
+                    pair_ty,
+                    malformed_fact,
+                    &[BorrowProjection::StructField(0)],
+                    Ty::Str,
+                )
+                .flatten(),
+            [BorrowRoot::Param(0), BorrowRoot::Param(2)]
+                .into_iter()
+                .collect(),
+            "an impossible stored path must become a whole-value root before later projection"
+        );
+
+        let pair_local = function.params[0];
+        let replacement_local = function.params[1];
+        let pair_fact = checker.normalize_borrow_fact(
+            pair_ty,
+            BorrowFact::from_direct([BorrowRoot::Param(0)].into_iter().collect()),
+        );
+        checker.borrows.assign(pair_local, pair_fact.clone());
+        checker.borrows.assign(
+            replacement_local,
+            BorrowFact::from_direct([BorrowRoot::Param(1)].into_iter().collect()),
+        );
+        let replacement = Expr {
+            kind: ExprKind::Local(replacement_local),
+            ty: Ty::Str,
+            span: function.span,
+        };
+        let left = Expr {
+            kind: ExprKind::Field {
+                root: pair_local,
+                path: vec![0],
+            },
+            ty: Ty::Str,
+            span: function.span,
+        };
+        for malformed in [
+            Expr {
+                kind: ExprKind::StructLit {
+                    struct_id: u32::MAX,
+                    fields: vec![left.clone(), replacement.clone()],
+                },
+                ty: pair_ty,
+                span: function.span,
+            },
+            Expr {
+                kind: ExprKind::Tuple {
+                    tuple_id: u32::MAX,
+                    elems: vec![left, replacement.clone()],
+                },
+                ty: tuple_ty,
+                span: function.span,
+            },
+        ] {
+            assert_eq!(
+                checker
+                    .project_fact_or_flatten(
+                        malformed.ty,
+                        checker.borrow_fact(&malformed),
+                        &[match malformed.kind {
+                            ExprKind::StructLit { .. } => BorrowProjection::StructField(0),
+                            _ => BorrowProjection::TupleElement(0),
+                        }],
+                        Ty::Str,
+                    )
+                    .flatten(),
+                all,
+                "a malformed product constructor must flatten every child root"
+            );
+        }
+
+        for (path, value) in [
+            (
+                vec![
+                    BorrowProjection::StructField(0),
+                    BorrowProjection::StructField(0),
+                ],
+                replacement.clone(),
+            ),
+            (
+                vec![BorrowProjection::StructField(0)],
+                Expr {
+                    ty: pair_ty,
+                    ..replacement
+                },
+            ),
+        ] {
+            checker.borrows.assign(pair_local, pair_fact.clone());
+            checker.replace_local_borrow_projection(pair_local, &path, &value);
+            assert_eq!(
+                checker
+                    .local_projected_fact(
+                        pair_local,
+                        &[BorrowProjection::StructField(0)],
+                        Ty::Str,
+                    )
+                    .flatten(),
+                all,
+                "a malformed product write must retain old and incoming roots"
+            );
+        }
     }
 
     #[test]

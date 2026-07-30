@@ -258,10 +258,9 @@ admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b (#669) ad
 payload partial construction and uniform ownership; L1b-c (#670) adds tagged-in-tagged type
 representation plus the exact `Result<Option<Output>, DbError>` acceptance. Dynamic
 path-selected return cleanup bits remain L2; L1b accepts only values proven free-standing by the
-current ABI rules. L2a is complete in #672. L2b is split into L2b-a1 named/direct/imported
-parameter-root inference with conservative aggregate and indirect unions, L2b-a2 exact aggregate
-and control projection, and L2b-b closure/capture/function-value provenance. PR #673 carries
-L2b-a1. Its hand-written diff exceeds 1,000 lines because producer inference, consumer import
+current ABI rules. L2a is complete in #672. L2b-a1 named/direct/imported parameter-root inference
+with conservative aggregate and indirect unions is complete in #673. Its hand-written diff exceeds
+1,000 lines because producer inference, consumer import
 validation, whole/per-unit serialization parity, source-order reachability, and their owner tests
 form one compatibility boundary: splitting them would either publish unvalidated provenance or
 consume provenance whose producer semantics are not yet closed. The closure matrix therefore
@@ -288,10 +287,27 @@ borrow-preserving `if`/`match` sources retain selected owner roots until action;
 success payload and a value-producing loop instead transfer and null their old container/source.
 Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
 states.
+The next work is L2b-a2, now split by its closure matrix into three mergeable verticals:
+L2b-a2-s adds the finite projection fact and exact struct/tuple construction, selection, partial
+replacement, destructuring, and block/`if`/loop behavior; L2b-a2-a then adds fixed-array and
+element selection/replacement plus pipeline `Project`/`WhereField`; L2b-a2-t completes
+user-sum/`Option`/`Result`, `match`, `else`, `?`, and `map_err`. The original two-way split was
+narrowed before PR preflight when the aggregate implementation and owner tests exceeded the
+repository's roughly 1,000 changed-hand-written-line review bound. The public interface remains the
+L2a parameter-index summary, so a single aggregate actual deliberately remains conservative.
+Unknown extern and indirect targets retain the all-compatible-input fallback.
+The final L2b-a2-s vertical is approximately 1,900 lines because its adversarial review required
+malformed constructor/read/write fail-closed validation, common eager-child source-order snapshots,
+snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
+discriminating deferred-array/liveness owners in the same PR; separating any of them would publish
+an under-approximating or dangling fact.
+Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface bytes, and
+1.844 ms/import on Apple Silicon.
 Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
-borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b
+variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in nine
+closed PRs so no incomplete borrow surface is exposed: L2a parameter-mode and provenance-summary
+representation, L2b-a1/a2-s/a2-a/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer

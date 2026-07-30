@@ -106,6 +106,626 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
 }
 
 #[test]
+fn product_projection_summaries_select_exact_parameter_roots() {
+    let files = &[
+        (
+            "views.align",
+            "\
+module views
+pub Inner { left: str, right: str }
+pub Outer { inner: Inner, ignored: str }
+
+pub fn nested_field(left: str, right: str, ignored: str) -> str {
+  value := Outer {
+    inner: Inner { left: left, right: right }
+    ignored: ignored
+  }
+  return value.inner.left
+}
+
+pub fn replaced_field(left: str, right: str) -> str {
+  mut value := Inner { left: left, right: right }
+  value.left = right
+  return value.left
+}
+
+pub fn replaced_sibling(left: str, right: str) -> str {
+  mut value := Inner { left: left, right: right }
+  value.left = \"fixed\"
+  return value.right
+}
+
+pub fn replaced_nested_field(left: str, right: str) -> str {
+  mut value := Outer {
+    inner: Inner { left: left, right: \"fixed\" }
+    ignored: \"fixed\"
+  }
+  value.inner.left = right
+  return value.inner.left
+}
+
+pub fn whole_local_replacement(left: str, right: str) -> str {
+  mut value := Inner { left: left, right: \"fixed\" }
+  value = Inner { left: right, right: \"fixed\" }
+  return value.left
+}
+
+pub fn field_self_assignment(left: str, right: str) -> str {
+  mut value := Inner { left: left, right: right }
+  value.left = value.left
+  return value.left
+}
+
+pub fn tuple_index(left: str, right: str) -> str {
+  value := (left, right)
+  return value.0
+}
+
+pub fn struct_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  value := Inner {
+    left: current
+    right: {
+      saved := current
+      current = second
+      saved
+    }
+  }
+  return value.left
+}
+
+pub fn tuple_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  value := (
+    current,
+    {
+      saved := current
+      current = second
+      saved
+    },
+  )
+  return value.0
+}
+
+pub fn take_first(first: str, ignored: str) -> str = first
+
+pub fn call_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  return take_first(
+    current,
+    {
+      current = second
+      current
+    },
+  )
+}
+
+pub fn tuple_binding(left: str, right: str) -> str {
+  (selected, _) := (left, right)
+  return selected
+}
+
+pub fn control_tuple(left: str, right: str, choose: bool) -> str {
+  value := if choose { (left, \"fixed\") } else { (right, \"fixed\") }
+  return value.0
+}
+
+pub fn branch_reassignment(
+  left: str,
+  right: str,
+  then_value: str,
+  else_value: str,
+  choose: bool,
+) -> str {
+  mut value := Inner { left: left, right: right }
+  return if choose {
+    value.left = then_value
+    value.left
+  } else {
+    value.right = else_value
+    value.right
+  }
+}
+
+pub fn branch_loop(left: str, right: str, choose: bool) -> str {
+  value := loop {
+    break if choose {
+      Outer {
+        inner: Inner { left: left, right: \"fixed\" }
+        ignored: \"fixed\"
+      }
+    } else {
+      Outer {
+        inner: Inner { left: right, right: \"fixed\" }
+        ignored: \"fixed\"
+      }
+    }
+  }
+  return value.inner.left
+}
+
+pub fn loop_reassignment(left: str, right: str, choose: bool) -> str {
+  mut value := Inner { left: left, right: \"fixed\" }
+  return loop {
+    if choose {
+      value.left = right
+      break value.left
+    }
+    break value.left
+  }
+}
+
+pub fn deferred_array_write(first: str, second: str) -> str {
+  mut values := [\"fixed\", \"fixed\"]
+  values[0] = first
+  values[1] = second
+  return values[0]
+}
+
+pub fn deferred_array_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  values := [
+    current,
+    {
+      current = second
+      current
+    },
+  ]
+  return values[0]
+}
+
+pub fn deferred_element_field_write(first: str, second: str) -> str {
+  mut values := [Inner { left: \"fixed\", right: \"fixed\" }]
+  values[0].left = first
+  values[0].right = second
+  return values[0].left
+}
+
+pub fn deferred_pipeline_projection(first: str, second: str) -> str {
+  values := [Inner { left: first, right: second }].left.to_array()
+  return values[0]
+}
+
+",
+        ),
+        ("main.align", "import views\nfn main() -> i32 = 0\n"),
+    ];
+    let differential =
+        diff_check_multi("l2b-a2-product-projections", files, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(
+        !differential.per_unit.diags.has_errors(),
+        "product projection fixture must check:\nwhole:\n{}\nper-unit:\n{}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    let summary = differential
+        .per_unit
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "views")
+        .expect("views summary");
+    let find = |name: &str| {
+        summary
+            .fns
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} signature"))
+    };
+    for name in [
+        "nested_field",
+        "tuple_index",
+        "struct_child_snapshot",
+        "tuple_child_snapshot",
+        "call_child_snapshot",
+        "tuple_binding",
+        "field_self_assignment",
+    ] {
+        assert_eq!(
+            find(name).return_borrow,
+            roots(&[0], &[]),
+            "{name} must retain only the selected first parameter"
+        );
+    }
+    for name in [
+        "replaced_field",
+        "replaced_sibling",
+        "replaced_nested_field",
+        "whole_local_replacement",
+    ] {
+        assert_eq!(
+            find(name).return_borrow,
+            roots(&[1], &[]),
+            "{name} must retain only the installed/selected second parameter"
+        );
+    }
+    for name in ["control_tuple", "branch_loop", "loop_reassignment"] {
+        assert_eq!(
+            find(name).return_borrow,
+            roots(&[0, 1], &[]),
+            "{name} must retain every runtime-selectable parameter"
+        );
+    }
+    assert_eq!(
+        find("branch_reassignment").return_borrow,
+        roots(&[2, 3], &[]),
+        "branch result facts must be captured before branch-local states join"
+    );
+    for name in [
+        "deferred_array_write",
+        "deferred_array_child_snapshot",
+        "deferred_element_field_write",
+        "deferred_pipeline_projection",
+    ] {
+        assert_eq!(
+            find(name).return_borrow,
+            roots(&[0, 1], &[]),
+            "{name} must retain both roots until array/pipeline projection lands"
+        );
+    }
+}
+
+#[test]
+fn source_order_snapshots_drive_imported_owner_liveness() {
+    let producer = (
+        "views.align",
+        "\
+module views
+pub fn take_first(first: str, ignored: str) -> str = first
+pub fn call_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  return take_first(
+    current,
+    {
+      current = second
+      current
+    },
+  )
+}
+pub fn array_child_snapshot(first: str, second: str) -> str {
+  mut current := first
+  values := [
+    current,
+    {
+      current = second
+      current
+    },
+  ]
+  return values[0]
+}
+",
+    );
+    let unselected_named = assert_same_verdict(
+        "l2b-a2-source-order-named-unselected-owner",
+        &[
+            producer,
+            (
+                "main.align",
+                "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  result := views.call_child_snapshot(first, second)
+  consume(second)
+  return result.len() as i32
+}
+",
+            ),
+        ],
+        "main.align",
+    );
+    assert!(
+        !unselected_named.diags.has_errors(),
+        "a later named-call argument must not replace the selected earlier argument's owner"
+    );
+
+    let selected_named = assert_same_verdict(
+        "l2b-a2-source-order-named-selected-owner",
+        &[
+            producer,
+            (
+                "main.align",
+                "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  result := views.call_child_snapshot(first, second)
+  consume(first)
+  return result.len() as i32
+}
+",
+            ),
+        ],
+        "main.align",
+    );
+    assert!(
+        selected_named.diags.has_errors(),
+        "a named-call result must retain the completion-time owner of its selected argument"
+    );
+
+    let selected_array = assert_same_verdict(
+        "l2b-a2-source-order-array-selected-owner",
+        &[
+            producer,
+            (
+                "main.align",
+                "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  result := views.array_child_snapshot(first, second)
+  consume(first)
+  return result.len() as i32
+}
+",
+            ),
+        ],
+        "main.align",
+    );
+    assert!(
+        selected_array.diags.has_errors(),
+        "the deferred array fallback must retain the earlier runtime element's owner"
+    );
+
+    for (name, source) in [
+        (
+            "product",
+            "\
+Pair { left: str, right: str }
+fn main() -> i32 {
+  mut owner := \"first\".clone()
+  current: str := owner
+  pair := Pair {
+    left: current
+    right: {
+      owner = \"second\".clone()
+      \"fixed\"
+    }
+  }
+  return pair.left.len() as i32
+}
+",
+        ),
+        (
+            "named-call",
+            "\
+fn take_first(first: str, ignored: str) -> str = first
+fn main() -> i32 {
+  mut owner := \"first\".clone()
+  current: str := owner
+  result := take_first(
+    current,
+    {
+      owner = \"second\".clone()
+      \"fixed\"
+    },
+  )
+  return result.len() as i32
+}
+",
+        ),
+        (
+            "direct-result-use",
+            "\
+fn take_first(first: str, ignored: str) -> str = first
+fn main() -> i32 {
+  mut owner := \"first\".clone()
+  current: str := owner
+  return take_first(
+    current,
+    {
+      owner = \"second\".clone()
+      \"fixed\"
+    },
+  ).len() as i32
+}
+",
+        ),
+        (
+            "non-borrowing-call-result",
+            "\
+fn observe(first: str, ignored: str) -> i64 = first.len()
+fn main() -> i32 {
+  mut owner := \"first\".clone()
+  current: str := owner
+  value := observe(
+    current,
+    {
+      owner = \"second\".clone()
+      \"fixed\"
+    },
+  )
+  return value as i32
+}
+",
+        ),
+        (
+            "loop-probe-action",
+            "\
+fn observe(first: str, ignored: str) -> i64 = first.len()
+fn main() -> i32 {
+  loop {
+    mut owner := \"first\".clone()
+    current: str := owner
+    value := observe(
+      current,
+      {
+        owner = \"second\".clone()
+        \"fixed\"
+      },
+    )
+    break value as i32
+  }
+}
+",
+        ),
+    ] {
+        assert!(
+            check_errs(&format!("l2b-a2-source-order-ended-{name}"), source),
+            "a later eager sibling must invalidate the captured earlier owner generation ({name})"
+        );
+    }
+
+    assert!(
+        !check_errs(
+            "l2b-a2-source-order-terminating-later-operand",
+            "\
+import std.process
+fn observe(first: str, ignored: ()) -> i64 = first.len()
+fn main() -> i32 {
+  mut owner := \"first\".clone()
+  current: str := owner
+  value := observe(
+    current,
+    {
+      owner = \"second\".clone()
+      process.abort()
+    },
+  )
+  return value as i32
+}
+",
+        ),
+        "a terminating later operand performs no enclosing call action and must not validate its earlier snapshot"
+    );
+
+    assert!(
+        check_errs(
+            "l2b-a2-source-order-wrapper-expression-identity",
+            "\
+Row { owned: string, view: str }
+fn main() -> i32 {
+  owner := \"source\".clone()
+  view: str := owner
+  mut keep: slice<Row> := [Row { owned: \"initial\".clone(), view: view }]
+  mut done := false
+  loop {
+    keep = [Row { owned: \"iteration\".clone(), view: view }]
+    if done {
+      break
+    }
+    done = true
+  }
+  return keep.len() as i32
+}
+",
+        ),
+        "a synthetic ArrayToSlice wrapper must keep its own IterTemp root instead of aliasing its child by Span"
+    );
+}
+
+#[test]
+fn imported_aggregate_projection_is_exact_only_at_parameter_root_granularity() {
+    let selected_files = &[
+        (
+            "views.align",
+            "\
+module views
+pub Pair { selected: str, ignored: str }
+pub fn selected(first: str, second: str) -> str {
+  pair := Pair { selected: first, ignored: second }
+  return pair.selected
+}
+",
+        ),
+        (
+            "main.align",
+            "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  result := views.selected(first, second)
+  consume(second)
+  return result.len() as i32
+}
+",
+        ),
+    ];
+    let selected = assert_same_verdict(
+        "l2b-a2-imported-selected-parameter",
+        selected_files,
+        "main.align",
+    );
+    assert!(
+        !selected.diags.has_errors(),
+        "an imported scalar projection must not retain an unselected parameter"
+    );
+    let selected_owner_files = &[
+        selected_files[0],
+        (
+            "main.align",
+            "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  result := views.selected(first, second)
+  consume(first)
+  return result.len() as i32
+}
+",
+        ),
+    ];
+    let selected_owner = assert_same_verdict(
+        "l2b-a2-imported-selected-owner",
+        selected_owner_files,
+        "main.align",
+    );
+    assert!(
+        selected_owner.diags.has_errors(),
+        "an imported scalar projection must retain its selected parameter owner"
+    );
+
+    let aggregate_files = &[
+        (
+            "views.align",
+            "\
+module views
+pub Pair { selected: str, ignored: str }
+pub fn selected(pair: Pair) -> str = pair.selected
+",
+        ),
+        (
+            "main.align",
+            "\
+import views
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  first := \"first\".clone()
+  second := \"second\".clone()
+  pair := views.Pair { selected: first, ignored: second }
+  result := views.selected(pair)
+  consume(second)
+  return result.len() as i32
+}
+",
+        ),
+    ];
+    let aggregate = assert_same_verdict(
+        "l2b-a2-imported-aggregate-limit",
+        aggregate_files,
+        "main.align",
+    );
+    assert!(
+        aggregate.diags.has_errors(),
+        "the parameter-index-only interface must conservatively retain every owner in one aggregate actual"
+    );
+}
+
+#[test]
 fn caller_before_callee_and_mutual_recursion_converge_independently_of_declaration_order() {
     let files = &[
         (

@@ -1490,15 +1490,18 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-L2 ships through seven closed implementation slices. A slice may add dormant representation or
-tighten existing provenance, but it must not accept source syntax whose complete safety contract
-belongs to a later slice.
+L2 ships through seven conceptual milestones in nine closed implementation PRs; L2b-a2 is split
+into product, array/pipeline, and tagged verticals below. A PR may add dormant representation or tighten
+existing provenance, but it must not accept source syntax whose complete safety contract belongs to
+a later milestone.
 
 | Slice | Exact closure | Public exposure at merge | Required gate |
 |---|---|---|---|
 | L2a | Replace `is_out`/bare parameter-type lists with `ParamMode`; add span-free return-borrow and return-region records to `FnTy`, named/imported signatures, HIR/MIR, interface codecs, hashes, and ABI fingerprints | Existing `ByValue` and `Out` behavior only; `borrow` and `borrow mut` remain identifiers outside parameter-mode lookahead and are rejected as modes | codec byte/hash goldens, corrupt-tag rejection, whole/per-unit identity, and an exhaustive consumer audit |
 | L2b-a1 | Infer parameter roots for named functions and preserve conservative flattened roots across recursion, direct/imported calls, control flow, and interfaces | No new borrow mode; aggregate projections and indirect calls retain all-compatible-input unions | scalar direct/imported matrix, semantic interface validation, and summary-inference size/time evidence |
-| L2b-a2 | Refine named summaries through struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, branch/loop, and synthetic-selector projections | No new borrow mode; indirect calls retain the pre-L2b all-compatible-input fallback | direct/imported nested-view projection matrix and per-unit parity |
+| L2b-a2-s | Add the projection fact and refine named summaries through structs, tuples, block/`if`/loop, field assignment, and destructuring | No new borrow mode; array, pipeline, tagged/control residuals, and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported product-view projection matrix and per-unit parity |
+| L2b-a2-a | Extend the projection fact through fixed arrays, element reads/writes, and pipeline field projections | No new borrow mode; tagged/control residuals and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported array/pipeline-view projection matrix and per-unit parity |
+| L2b-a2-t | Complete user-sum/`Option`/`Result`, `match`, `else`, `?`, and `map_err` projection | Complete L2b-a2 behavior; no new borrow mode; indirect calls retain the pre-L2b fallback | direct/imported tagged-view projection matrix and per-unit parity |
 | L2b-b | Extend the same inference to capture roots, closures, function-value joins/moves, direct/indirect targets, and unresolved higher-order fallback | Complete L2b behavior; no borrow mode | indirect/captured/joined nested-view matrix, malformed capture-domain rejection, and indirect-return evidence |
 | L2c | Add `ReturnCleanupAbi` to function and interface identity and implement `DynamicBit` for every recursively Move direct, indirect, and imported return; forward the selected bit on every return edge and store it in the caller slot | No borrow syntax; metadata and physical ABI land atomically before borrowed mutation can construct path-selected values | codec/hash goldens, `Result<Option<MoveStruct>, Error>` None/Some/Err matrix, ABI mismatch rejection, per-unit parity, and return-cost evidence |
 | L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
@@ -1547,11 +1550,14 @@ both the closed and open-world effects `Impure`; a direct external callback para
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
 
-L2b is implemented as three independently sound vertical PRs. L2b-a1 owns named/direct/imported
+L2b is implemented as five independently sound vertical PRs. L2b-a1 owns named/direct/imported
 parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
 flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
-targets. L2b-a2 refines named
-aggregate/control projections without weakening that fallback. L2b-b then adds
+targets. L2b-a2-s adds the projection fact and closes struct/tuple construction, selection,
+replacement, destructuring, and ordinary block/branch/loop flow while retaining conservative
+array, pipeline, and tagged residuals. L2b-a2-a then closes fixed arrays, element reads/writes, and
+pipeline field projection. L2b-a2-t closes tagged values, `match`, `else`, `?`, and `map_err`
+without weakening the indirect/unanalyzed fallback. L2b-b finally adds
 target-relative capture roots and function-value target sets, validates the explicit-parameter and
 capture domains in MIR, removes the now-obsolete unresolved-internal-target effect restriction, and
 closes the indirect/captured benchmark row. This split keeps each hand-written diff near the
@@ -1566,6 +1572,67 @@ weighted-cycle rejection, closure-matrix owner tests, and import-validation benc
 fail-closed vertical. Splitting before the weighted-cycle gate would accept a malformed or
 non-terminating public type graph; splitting the gate from its shape/fixed-point prerequisites would
 reintroduce the same false accepts and false rejections that reopened this matrix.
+
+L2b-a2 has one implementation closure matrix. It refines the analysis-local value fact before that
+fact is flattened into the already-shipped parameter-root interface summary; it does not add a
+serialized projection path. A source parameter seeds one root at the whole-value boundary, so any
+nested selection from that single aggregate still names the same parameter. A value assembled
+inside the function instead records roots at its exact member/tag path, so selecting one member does
+not retain roots that exist only in a sibling. Direct/imported callers consume the resulting
+canonical parameter set exactly as in L2b-a1. An imported function that returns a scalar or one
+selected nested view is precise at parameter-root granularity: selection from a value assembled
+from distinct parameters can remove unselected parameter roots, but selection within one aggregate
+actual still names that whole parameter and therefore every caller owner embedded in that actual.
+An aggregate returned across the interface likewise remains conservatively rooted in every
+parameter represented by that aggregate. L2b-b later applies the same projection algebra to
+target-relative captures and indirect calls.
+
+L2b-a2-s owns the base fact shape, parameter/local formation, struct/tuple
+construction/selection/replacement, destructuring, ordinary block/`if`/loop flow, liveness parity,
+and the product half of the public boundary. L2b-a2-a adds fixed-array paths, exact/dynamic element
+selection and replacement, pipeline `Project`/`WhereField`, and their source-order termination
+rules. L2b-a2-t owns tagged construction/binding, `match`, `else`, `?`, `map_err`, and the final
+public/malformed-boundary pass. Every extending PR must add malformed type/path/ordinal fallback
+owners for its new projection kinds and selected/unselected liveness owners to the shared focused
+targets. All three retain the scope-boundary row.
+
+| L2b-a2 path | Exact analysis contract | Owner evidence |
+|---|---|---|
+| fact shape and flattening | A finite projection trie distinguishes struct fields, tuple elements, fixed-array elements, user-sum `(variant, payload)` slots, `Option.Some`, `Result.Ok`, and `Result.Err`. Each node may also carry a whole-value root. Projection inherits whole-value roots and selects only matching descendants; final return/interface formation flattens the selected trie to canonical parameter roots. A known inactive tag/payload projects to empty. A path/type disagreement, missing definition/id, or out-of-range ordinal instead returns the complete flattened fact at the current value, so malformed checked HIR can add conservative roots but cannot drop one. | direct checked-summary assertions; sema malformed-HIR projection tests for wrong kind, missing id, and out-of-range ordinal; whole/per-unit interface parity |
+| parameter and local formation | A recursively borrow-capable parameter seeds its whole-value parameter root. `let`, whole-local assignment, generic monomorph locals, and direct named/imported call results replace the destination fact after RHS evaluation; branch/loop joins union matching nodes. | parameter aggregate, local replacement, generic, direct, and imported fixtures |
+| aggregate construction and selection | Struct/tuple/fixed-array literals place each reachable child fact under its exact ordinal path. Every eager child/argument fact is captured immediately after that expression falls through, before any later sibling can mutate its source locals; precise product formation, residual aggregate fallback, and named-summary argument mapping all consume those completion-time facts. A snapshot is keyed by checked-expression identity, not source span, because synthetic view wrappers share their child's span. It participates in the same branch/loop invalidation state as a local: if a later sibling ends an owner generation, an ended-root marker remains at the exact projection path and invalidates the eventual destination. Every eager operation, including one whose result cannot borrow, validates its completed operand snapshots at the action boundary; a terminating later operand has no enclosing action and performs no validation. Loop probes isolate diagnostic-dedup state so only the real pass records that validation. Field, nested-field, tuple-index, fixed-array index, element-field, and pipeline selectors read the corresponding path. An index is exact only when checked HIR contains an in-range `ExprKind::Int`; no separate constant folding is performed. Every other index unions all reachable elements. `StageKind::Project { field }` selects that element-struct field, while `WhereField` preserves the complete incoming element fact. Receiver/source evaluation precedes index or stage action; a terminating predecessor produces no result fact. | nested struct, tuple, product/residual-array/named-call child-source-reassignment, direct and non-borrowing-result action use, later-sibling owner invalidation, loop-probe/real-pass diagnostic parity, terminating-later-operand negative twin, same-span array-to-slice wrapper, imported selected-owner liveness, fixed-array literal/dynamic index, element-field, `Project`, `WhereField`, and terminating receiver/index fixtures |
+| aggregate replacement and destructuring | A whole-local write replaces the complete fact. A struct-field or exact fixed-array/element-field write kills only the exact destination subtree and installs the RHS fact there after RHS evaluation. A dynamic-index write cannot identify the replaced slot, so every possible destination retains its old fact and joins the RHS fact; no old root is killed. Whole-element writes use the same rule before nested selection. Root/index/RHS evaluation follows HIR source order and performs no install when an earlier child terminates. Exact self-assignment preserves the old fact. Tuple destructuring projects each present binding's exact element after one successful initializer evaluation; an omitted binding receives nothing. This slice does not widen the tuple element types accepted by type formation. | field/nested-field replacement, exact/dynamic element replacement, whole-element replacement, self-assignment, terminating index/RHS, control-produced tuple, and tuple-destructure-with-hole fixtures |
+| tagged construction and pattern binding | User-sum, `Option`, and `Result` constructors place facts only below the active tag/payload path. A simple `match` binding selects its exact variant/payload ordinal; wildcard/or-pattern binds nothing. Branch arms start from the same evaluated scrutinee state and only fallthrough arms join. | user-sum, `Option`, `Result`, wildcard/or-pattern, mixed/all-diverging match fixtures |
+| `else` and `?` | `else` success selects `Option.Some` or `Result.Ok` and joins only a fallthrough fallback. `?` continues with only `Result.Ok`; its implicit early-return edge contributes only `Result.Err`, and only when the enclosing return can carry a borrow. The operand is evaluated once and a terminating operand contributes neither edge. | success/fallback, Ok/Err, terminating/mixed control, and direct/imported summary fixtures |
+| `map_err` | The output `Ok` projection preserves only the receiver's `Result.Ok`. For a statically named mapper, only the receiver's `Result.Err` is mapped through the mapper's settled parameter-root summary into the output `Result.Err`; mapper captures and unresolved function-value targets retain the L2b-a1 all-compatible fallback until L2b-b. Formation order and terminating receiver/mapper behavior remain the L2b-a1 contract. | named mapper fixed/identity, unresolved fallback, terminating mapper, and whole/per-unit fixtures |
+| branch, block, and loop result | Transparent block/arena/task-group/unsafe tails preserve the complete selected fact. `if` and `match` union only fallthrough alternatives. Each accepted `break value` contributes its complete fact to the target loop result; rejected, unreachable, or payload-terminating breaks contribute nothing. Loop backedge/local assignment state reaches the existing finite fixpoint without widening a selected member to its siblings. | block/branch/match/loop twins, mixed termination, reassignment fixpoint, and rejected-break regressions |
+| liveness and ownership parity | Existing invalidation continues to use the flattened owner-root set. Projection refinement may remove a sibling root but may never remove the selected value's owner, hidden temporary, or parameter root. Move/null, Drop, cleanup-bit, pipeline-source snapshot, escape, and effect behavior do not change in this slice. | owner-use diagnostics for selected versus unselected siblings plus the cumulative L2b-a1 gates |
+| public and malformed boundary | `ReturnBorrowSummary` and `ReturnRegionSummary` remain the L2a codec and hash shape and remain equal in L2b-a2. Semantic import keeps the L2b-a1 validation order. No projection trie, local id, span, raw nominal id, or control-state bit is serialized. Because the codec carries parameter indices only, an imported aggregate result and any later projection from one aggregate actual deliberately retain that actual's complete compatible owner set. | unchanged codec/hash goldens, interface corruption suite, aggregate-actual precision-limit fixture, and summary byte-size benchmark row |
+| scope boundary | Indirect calls, closure captures, function-value joins/moves, target-relative capture slots, and direct calls without a settled named/imported summary—including unanalyzed extern targets—retain the documented all-compatible-input fallback. No `borrow`, `borrow mut`, cleanup ABI, resource, region, or database surface is enabled. | existing deferred-function-value and compatibility/extern fixtures plus disabled-mode regressions |
+
+L2b-a2-s, L2b-a2-a, and L2b-a2-t are the smallest independently correct verticals. The first PR
+publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
+retain the shipped flattened result. It must include product construction, reads, partial writes,
+destructuring, ordinary control joins, direct/imported consumption, and whole/per-unit parity
+together: omitting a writer or join can under-approximate the same public product fact. The second
+PR adds array formation, exact/dynamic reads and writes, and pipeline projection together; shipping
+exact array reads before the corresponding writes could retain only an overwritten owner, while
+shipping writes before formation would provide no precise destination paths. The third PR replaces
+the remaining tagged fallbacks atomically across constructors, pattern bindings, `else`, `?`, and
+`map_err`: splitting its explicit and implicit `Result` edges would let one value produce
+contradictory summaries. No PR may exceed roughly 1,000 changed hand-written lines without first
+updating this matrix with a narrower safe boundary and a concrete reason that boundary fails.
+The final L2b-a2-s diff is approximately 1,900 changed hand-written lines after adversarial review
+required fail-closed constructor/read/write validation, common eager-child source-order snapshots,
+snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
+discriminating residual/liveness owners.
+Those checks cannot form a later PR: publishing the product fact first would let malformed checked
+HIR discard a root, while omitting the residual-write owner would let a deferred array write publish
+`None`; omitting snapshot invalidation or expression identity would respectively accept a dangling
+earlier child or drop a synthetic wrapper's temporary owner. Product formation, mutation, control
+joins, malformed fallback, source-order value lifetime, and their owner evidence therefore remain
+one independently sound vertical.
+
 Through L2b-a1, a `?` occurrence conservatively joins its flattened operand roots into the
 enclosing function only when that function's return type can recursively carry a borrow; its `Ok`
 projection continues through the ordinary expression and explicit/implicit return paths. L2b-a2
@@ -1861,7 +1928,9 @@ their first owning slice and remain cumulative gates afterward.
 |---|---|---|
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
 | L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_sema ty_may_borrow_is_cycle_safe_for_header_mediated_nominals`; `cargo test -p align_sema lifted_function_origin_metadata_is_explicit`; `cargo test -p align_sema checked_break_acceptance_is_preserved_in_hir`; `cargo test -p align_sema rejected_break_effect_payload_is_visited_without_loop_result_join`; `cargo test -p align_sema effect_source_order_closure_matrix`; `cargo test -p align_sema pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_sema pipeline_terminal_diagnostic_order`; `cargo test -p align_sema pipeline_terminal_dead_state_isolated_across_analyses`; `cargo test -p align_sema pipeline_terminal_dead_hir_is_finalized_and_linted`; `cargo test -p align_sema pipeline_capture_owner_invalidation_is_rejected`; `cargo test -p align_sema pipeline_source_snapshot_owner_invalidation_matrix`; `cargo test -p align_codegen_llvm malformed_mir_type_graphs_fail_before_llvm_construction`; `cargo test -p align_mir rejected_checked_break_lowers_to_unreachable`; `cargo test -p align_mir terminating_break_payload_emits_no_outer_edge`; `cargo test -p align_mir mixed_break_payload_preserves_outer_edge`; `cargo test -p align_mir terminating_pipeline_operand_emits_no_terminal_state`; `cargo test -p align_mir pipeline_terminal_snapshot_action_order_matrix`; `cargo test -p align_mir pipeline_terminal_source_shape_parity`; `cargo test -p align_driver --test return_provenance --test analysis_coverage --test interface_param_modes --test per_unit`; `cargo test -p align_driver --test m5 json_scan_reduce_fold`; `cargo test -p align_driver --test zip_pipeline pipeline_terminal_source_order` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `import-validation` |
-| L2b-a2 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-s | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-a | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2-t | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
 | L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call` |
