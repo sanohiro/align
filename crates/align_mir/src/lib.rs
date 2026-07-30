@@ -20,6 +20,10 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub mod print;
+mod validate_hir;
+
+#[cfg(test)]
+mod validate_hir_tests;
 
 /// A byte-offset → (line, col) index over every source file, built once from the [`SourceMap`] and
 /// threaded (via [`Rc`]) into lowering so each MIR statement can record the 1-based source
@@ -1537,6 +1541,30 @@ pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) ->
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
+    if !validate_hir::global_type_metadata_is_valid(program) {
+        return empty_program();
+    }
+    lower_program_unchecked(program, lines, per_unit)
+}
+
+fn empty_program() -> Program {
+    Program {
+        fns: Vec::new(),
+        externs: Vec::new(),
+        imported_fns: Vec::new(),
+        link_libs: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        tagged_types: Vec::new(),
+        tuples: Vec::new(),
+    }
+}
+
+fn lower_program_unchecked(
+    program: &hir::Program,
+    lines: Option<Rc<SourceLines>>,
+    per_unit: bool,
+) -> Program {
     // Function signature facts are immutable during MIR lowering. Materialize the shared table once
     // so lowering F functions does not deep-clone all T entries F times.
     let fn_types: Rc<[hir::FnTy]> = program.fn_types.clone().into();

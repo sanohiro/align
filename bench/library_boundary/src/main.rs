@@ -116,6 +116,15 @@ fn mir_continuation_fixture() -> String {
     source
 }
 
+fn mir_global_type_fixture() -> String {
+    let mut source = String::new();
+    for index in 0..512 {
+        source.push_str(&format!("Record_{index:04} {{ value: i64 }}\n"));
+    }
+    source.push_str("fn main() -> i32 = 0\n");
+    source
+}
+
 fn import_validation_fixture() -> InterfaceSummary {
     let parameter = ITypeParam {
         name: "T".to_string(),
@@ -231,6 +240,41 @@ fn run_provenance() {
     let elapsed = start.elapsed();
     let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
     println!("import-validation\t{milliseconds:.3}\tms/import");
+
+    let global_type_source = mir_global_type_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let checked = align_driver::check(
+        &mut source_map,
+        "mir-global-type.align",
+        &global_type_source,
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "MIR global-type fixture must check"
+    );
+    let mir = align_driver::lower_to_mir(&checked.hir);
+    assert_eq!(
+        mir.structs
+            .iter()
+            .filter(|definition| definition.source_name.starts_with("Record_"))
+            .count(),
+        512,
+        "fixture must retain every concrete nominal root"
+    );
+
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let mir = align_driver::lower_to_mir(black_box(&checked.hir));
+        black_box(mir);
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "mir-global-type-validation\t{milliseconds:.3}\tms/lower\t{}\ttypes",
+        checked.hir.structs.len()
+    );
 
     let continuation_source = mir_continuation_fixture();
     let mut source_map = align_span::SourceMap::new();
