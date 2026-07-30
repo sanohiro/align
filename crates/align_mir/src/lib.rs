@@ -7113,23 +7113,19 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
     // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
     // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
-    let (struct_view, slice_val, slot, len) = match recv.ty {
+    let (struct_view, slice_val, slot, fixed_len) = match recv.ty {
         Ty::DynStructArray(_, layout) => {
             let sv = lower_borrowed_owned(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
-            let len = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            (Some((struct_id, layout)), Some(sv), 0, Operand::Value(len))
+            (Some((struct_id, layout)), Some(sv), 0, None)
         }
         // `s[i].field` on a soa — a column-major `{ptr,len}` view; the shared seam reads the one
         // column directly as `IndexColumn`, no whole-struct gather.
         Ty::Soa(_) => {
             let sv = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
-            let len = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            (Some((struct_id, Layout::Soa)), Some(sv), 0, Operand::Value(len))
+            (Some((struct_id, Layout::Soa)), Some(sv), 0, None)
         }
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
@@ -7137,12 +7133,24 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
-            (None, None, slot, Operand::Const(Const::Int(n, i64_ty())))
+            (None, None, slot, Some(Operand::Const(Const::Int(n, i64_ty()))))
         }
     };
     let Some(first_ty) = checked_struct_field_path(b, struct_id, path, leaf_ty) else {
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
+    };
+    let len = match (&slice_val, fixed_len) {
+        (Some(source), _) => {
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(source.clone())));
+            Operand::Value(len)
+        }
+        (None, Some(len)) => len,
+        (None, None) => {
+            b.terminate(Term::Unreachable);
+            return Operand::Const(Const::Unit);
+        }
     };
     emit_bounds_check(b, &idx, len);
     // Load the element's first field via the shared seam. For a depth-1 path that *is* the leaf; for
@@ -13606,6 +13614,8 @@ fn field(i: i64) -> i64 {
   rows := [Row { value: 1 }]
   return rows[i].value
 }
+fn dynamic(rows: array<Row>, i: i64) -> i64 = rows[i].value
+fn soa(rows: soa<Row>, i: i64) -> i64 = rows[i].value
 fn apply(f: fn(i64) -> i64, value: i64) -> i64 = f(value)
 fn main() -> i32 = 0
 ",
@@ -13622,20 +13632,28 @@ fn main() -> i32 = 0
                 .collect::<Vec<_>>()
         );
 
-        let field = hir
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "field")
-            .expect("field function");
-        let hir::Stmt::Return(Some(field_expr)) =
-            field.body.stmts.last_mut().expect("field return")
-        else {
-            panic!("field must end in a return");
-        };
-        let hir::ExprKind::ElemField { path, .. } = &mut field_expr.kind else {
-            panic!("field return must be an element-field read");
-        };
-        path.clear();
+        for name in ["field", "dynamic", "soa"] {
+            let function = hir
+                .fns
+                .iter_mut()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            let field_expr = match function.body.value.as_mut() {
+                Some(value) => value,
+                None => {
+                    let hir::Stmt::Return(Some(value)) =
+                        function.body.stmts.last_mut().expect("field return")
+                    else {
+                        panic!("{name} must end in an element-field read");
+                    };
+                    value
+                }
+            };
+            let hir::ExprKind::ElemField { path, .. } = &mut field_expr.kind else {
+                panic!("{name} must contain an element-field read");
+            };
+            path.clear();
+        }
 
         let apply = hir
             .fns
@@ -13649,34 +13667,37 @@ fn main() -> i32 = 0
         callee.ty = Ty::Fn(u32::MAX);
 
         let program = lower_program(&hir);
-        let field = program
-            .fns
-            .iter()
-            .find(|function| function.name == "field")
-            .expect("lowered field");
-        assert!(
-            field
-                .blocks
+        for name in ["field", "dynamic", "soa"] {
+            let function = program
+                .fns
                 .iter()
-                .any(|block| matches!(block.term, Term::Unreachable)),
-            "invalid field metadata must terminate the continuation: {field:#?}"
-        );
-        assert!(
-            field
-                .blocks
-                .iter()
-                .flat_map(|block| &block.stmts)
-                .all(|statement| !matches!(
-                    statement,
-                    Stmt::Let(
-                        _,
-                        Rvalue::IndexField(..)
-                            | Rvalue::IndexFieldPtr { .. }
-                            | Rvalue::IndexColumn { .. }
-                    )
-                )),
-            "invalid field metadata must emit no field action: {field:#?}"
-        );
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("lowered {name}"));
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.term, Term::Unreachable)),
+                "invalid field metadata must terminate the continuation: {function:#?}"
+            );
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .all(|statement| !matches!(
+                        statement,
+                        Stmt::Let(
+                            _,
+                            Rvalue::SliceLen(..)
+                                | Rvalue::IndexField(..)
+                                | Rvalue::IndexFieldPtr { .. }
+                                | Rvalue::IndexColumn { .. }
+                        )
+                    )),
+                "invalid field metadata must emit no length or field action: {function:#?}"
+            );
+        }
 
         let apply = program
             .fns

@@ -67,23 +67,36 @@ HEAD, and `scripts/open-pr.sh` is the required agent path for opening the draft.
 CI rejects a missing or stale attestation. This keeps obvious ownership,
 malformed-input, ABI, and cross-stage omissions out of the external review cycle.
 
-After the draft is opened, run the required host-native and independent reviews
-on the final pushed diff. Batch related review fixes into one follow-up commit
-where possible; do not create one commit per finding. A review command has a
-15-minute watchdog implemented by `scripts/review-bounded.sh`. At elapsed
-checkpoints, inspect the process group, log growth, and last completed action
-before deciding whether to continue. Time alone is not a verdict: meaningful
-review work may continue while the process is making progress, but the hard
-15-minute bound still applies. If no verdict exists at the bound, terminate the
-process group, record the elapsed time and last completed action, then rerun a
-narrower review or ask for direction; never manufacture `CLEAN` from elapsed
-time or repeatedly restart the same broad review. Ordinary review automation must not promote `cargo test
---workspace` or `scripts/test-full.sh` into the PR path without an explicit
-scope justification.
+After the draft is opened, run one host-native and one independent review on the
+pushed diff. Each reviewer must inspect the complete assigned scope and report
+all findings in that pass. Verify the complete finding set and batch all valid
+fixes into one coherent follow-up. An ordinary follow-up is closed by a
+finding-to-fix ledger and the focused owner checks for the changed lines; it
+does not trigger another full-diff review.
 
-`scripts/record-post-review.sh` publishes the clean host and independent review
-as a SHA-bound GitHub status after the PR exists. The required status prevents a
-later push from inheriting an earlier review result.
+A second independent review is required only when the fix changes a public
+contract or strategy, changes ownership, cleanup, FFI, ABI, or an IR shape,
+crosses three or more compiler layers, exceeds 250 hand-written changed lines,
+or responds to a P1 by redesigning the implementation. The normal completion
+cycle is review once, fix all findings once, run the affected owner checks once,
+and finish.
+
+A review command has a 15-minute watchdog implemented by
+`scripts/review-bounded.sh`. At elapsed checkpoints, inspect the process group,
+log growth, and last completed action before deciding whether to continue. Time
+alone is not a verdict. If no verdict exists at the bound, preserve completed
+findings and continue only from the unfinished scope; do not restart the same
+broad review or manufacture `CLEAN` from elapsed time.
+
+Do not rerun the same broad review or broad test gate on an unchanged tree.
+After an ordinary review fix, run the smallest owner targets that can detect a
+regression in the changed lines. Preserve earlier successful broad results when
+only documentation or review records change, and let CI provide the final broad
+gate. Ordinary review automation must not promote `cargo test --workspace` or
+`scripts/test-full.sh` into the PR path without an explicit scope justification.
+
+The final SHA-bound status records the original review cycle plus its bounded
+finding closure. A later push cannot inherit that result.
 
 ## Change-specific verification
 

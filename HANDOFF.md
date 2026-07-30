@@ -165,6 +165,52 @@ preflight happen before a draft PR, review processes have a bounded watchdog,
 and related review fixes are batched instead of committed one finding at a time;
 see `CLAUDE.md` and `docs/impl/16-test-policy.md`.
 
+## Delivery retrospective: 2026-07-27 through 2026-07-30
+
+The recent pkg.db prerequisite wave delivered nontrivial compiler foundations
+but did not deliver a user-visible database package or SQLite/Postgres driver.
+The merged capability sequence is recursive Drop and `Option<string>` fields
+(#667), direct and multiple Move sum payloads (#668-#669), nested payload
+representation (#670), parameter-mode and empty return-provenance
+representation (#672), named return provenance (#673), and product return
+provenance (#674). PR #675 closes eager MIR continuation lowering, but remains
+compiler infrastructure rather than a usable pkg.db surface.
+
+GitHub's earliest-commit-to-merge wall-clock proxy shows the throughput failure
+clearly:
+
+```text
+PR    observable wall time    production / test / docs changed lines
+#666  8h17m                   0 / 0 / 10,746
+#667  7h13m                   1,736 / 1,397 / 158
+#668  15m                     808 / 447 / 155
+#669  24m                     68 / 313 / 82
+#670  47m                     3,889 / 496 / 156
+#671  14m                     0 / 0 / 169
+#672  8h42m                   4,468 / 2,068 / 72
+#673  23h27m                  7,380 / 3,057 / 549
+#674  2h20m                   1,150 / 620 / 113
+#675  4h06m at audit          4,595 / 295 / 258
+```
+
+These wall times exclude work before the first commit and may include idle
+review or CI waits. Changed-line counts also overstate implementation progress
+when formatting moves dominate, as in #675. They are evidence of delivery cost,
+not productive coding hours.
+
+The failure was operational: cross-cutting compiler slices were too broad,
+contract and matrix authoring expanded before a small executable checkpoint,
+ordinary findings caused repeated full-diff review, broad gates were repeated
+after narrow changes, and document or formatting churn was allowed to resemble
+implementation progress. The fast #668-#671 sequence proves that narrow,
+mergeable slices do not have the same failure mode.
+
+The canonical correction is in `CLAUDE.md`: one complete review pass, one
+coherent all-findings fix, no ordinary re-review, narrow owner checks after the
+fix, no repeated broad gate on an unchanged tree, a 60-minute implementation
+checkpoint, and a 500-line target for implementation PRs. Exceptions are
+limited to materially risky redesigns or explicit user direction.
+
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
 direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
@@ -322,7 +368,10 @@ every recursive lowering entrypoint as an immediate required child, explicit pre
 control continuation, or side-effect-free tail delegation. The focused whole/per-unit MIR and
 codegen owners pass. Positive MIR/codegen owners also preserve origin-compatible indirect and
 `map_err` callback signatures and the settled owned-`string` field to borrowed-`str` read. The
-final revised adversarial preflight is clean. The refreshed Apple Silicon provenance benchmark
+final revised adversarial preflight is clean. The post-open independent review found that dynamic
+and SoA element-field lowering still emitted `SliceLen` before its narrow malformed-path check;
+the follow-up moves that check before the first length/field action and adds fixed/dynamic/SoA
+negative owners. The refreshed Apple Silicon provenance benchmark
 records 3.136 ms/check and
 22,848 bytes for summary inference, 1.835 ms/import, and
 `mir-continuation-lowering` at 1.105 ms/lower over 2,561 basic blocks. The passing ac depth owner is
