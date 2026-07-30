@@ -5,14 +5,12 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-31. `main` includes the shipped wave through #675.
+_Last updated: 2026-07-30. `main` includes the shipped wave through #674.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
 #672 carries L2a parameter modes and explicit empty return-provenance facts through AST, HIR, MIR,
 interfaces, caches, and separate compilation without enabling the borrow ABI.
-#673 infers named direct/imported parameter-root provenance; #674 refines product projections; #675
-closes MIR continuation after every terminating eager child.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -95,9 +93,6 @@ facts must live in this repository.
 #669  multiple Move payload partial construction
 #670  nested tagged payload representation and exact pkg.db L1b shape
 #672  L2a parameter modes and return-provenance representation
-#673  named/direct/imported parameter-root inference
-#674  product return-provenance refinement
-#675  eager MIR continuation closure
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -195,7 +190,7 @@ PR    observable wall time    production / test / docs changed lines
 #672  8h42m                   4,468 / 2,068 / 72
 #673  23h27m                  7,380 / 3,057 / 549
 #674  2h20m                   1,150 / 620 / 113
-#675  4h14m                   4,595 / 295 / 258
+#675  4h06m at audit          4,595 / 295 / 258
 ```
 
 These wall times exclude work before the first commit and may include idle
@@ -338,15 +333,12 @@ borrow-preserving `if`/`match` sources retain selected owner roots until action;
 success payload and a value-producing loop instead transfer and null their old container/source.
 Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
 states.
-L2b-a2-s is complete in #674 and L2b-a2-ac in #675. The remaining L2b-a2 work is split by its
-closure matrix into eight mergeable verticals. L2b-a2-am-g-t first validates the global type
-domain, concrete roots, references, template reachability, and inline cycles. L2b-a2-am-g-n then
-validates nominal identities, table metadata, and link-library records after am-g-t succeeds.
-L2b-a2-am-g-h validates callable symbol identity, declarations, and every body-independent
-stored-function header before direct
-handcrafted-HIR lowering. L2b-a2-am-b validates every statement, body-correlated ownership fact,
-expression type relation and target, action discriminator, id, path, arity, and result wrapper.
-L2b-a2-af adds validated fixed-array formation and exact/dynamic element and element-field
+L2b-a2-s is complete in #674. The remaining L2b-a2 work is split by its closure matrix into seven
+mergeable verticals. L2b-a2-ac first closes MIR continuation after every terminating eager child.
+L2b-a2-am-g then validates global type/function tables, callable symbol identity, declarations,
+and every stored-function header before direct handcrafted-HIR lowering. L2b-a2-am-b validates
+every statement, expression type relation and target, action discriminator, id, path, arity, and
+result wrapper. L2b-a2-af adds validated fixed-array formation and exact/dynamic element and element-field
 selection/replacement on that completed substrate. L2b-a2-ar closes retained storage across
 non-fixed index/range, `ArrayChunks`, and `HttpRespHeader` actions. L2b-a2-ap separately closes
 pipeline `Project`/`WhereField` under an explicit stage/terminal state machine. L2b-a2-t completes
@@ -394,53 +386,26 @@ another eager parent able to append after termination. Reachability state, the c
 every recursive parent family, and their whole/per-unit tests are therefore one compatibility
 boundary and the smallest independently correct vertical. A fresh adversarial preflight found
 that the original matrix also promised fail-closed checks for every handcrafted-HIR action family
-while the implementation only hardened the two lookups touched by ac. The matrix was reopened.
-A second revised-matrix review found that action-only validation still omitted callable symbol
-uniqueness and universal `Expr.ty`/operator consistency. The 2026-07-31 implementation-boundary
-review then found that the proposed global/header slice still mixed body-derived Drop ownership
-facts into a body-free validator, rejected valid header-mediated nominal cycles, omitted the
-`main`/`align_main` emitted-symbol mapping, contradicted tagged/function-template reachability,
-underspecified the total type/signature predicates, and claimed source-vs-monomorph facts that
-current HIR cannot observe. The revised-matrix review found one remaining entry-wrapper gap and a
-later producer-parity review corrected an over-tightened answer: a parameterized `main` has exactly
-one `ByValue array<str>` parameter and returns `Result<Unit, builtin Error>`, while a no-argument
-`Result` main has that same exact result shape. Other concrete non-Result returns accepted by the
-current producer remain valid; malformed-HIR validation does not silently redefine entry
-semantics. Wrong builtin-Error identity/shape and all other parameter forms fail before wrapper
-lowering.
-
-The matrix is therefore split into L2b-a2-am-g-t/am-g-n/am-g-h/am-b. Am-g-t validates the global
-type domain and concrete roots, returning a canonical all-empty MIR program on failure. Tagged and
-function-type table entries are roots only when a concrete table, declaration, or stored header
-references them; unreachable generic-template entries remain permitted and omitted. It rejects
-only inline layout cycles and preserves validated header-mediated recursion. Am-g-n runs only
-after am-g-t succeeds because its source-shape walk directly indexes the validated type tables; it
-owns nominal identities, field/variant/table metadata, and link libraries. Am-g-h owns callable
-lookup/emitted symbols, including `main` to `align_main`, the generated
-wrapper, and the exact runtime/native symbol set from one registry shared with codegen, plus
-declarations and body-independent stored headers. The `align_rt_` prefix alone remains valid when
-the exact name is not emitted by the compiler. Am-g-h makes only the lifted-vs-non-lifted origin
-claims current HIR can prove. Function types preserve the already-shipped `Out` slice mode, while
-forming or calling such a first-class value remains an am-b body-use rejection. Am-b exclusively
-owns every body-local type/id reference, body-correlated `drop_individual_exprs` fact, and
-callable-symbol use, derives the only permitted type for every expression discriminator, and
-validates each body, emitting an Unreachable-only function for invalid action metadata while
+while the implementation only hardened the two lookups touched by ac. The matrix was reopened:
+the broad contract is now L2b-a2-am-g/am-b. A second revised-matrix review found that action-only
+validation still omitted callable symbol uniqueness and universal `Expr.ty`/operator consistency,
+so the boundary was redesigned instead of patched again. Am-g validates MIR-reachable global type
+graphs, callable symbols, declarations, and stored-function headers, returning a canonical
+all-empty MIR program on failure; producer-permitted unreachable generic-template tagged entries
+remain allowed and omitted. Its roots are table entries, declarations, and stored-function
+headers only. Am-b exclusively owns every body-local type/id reference and callable-symbol use,
+derives the only permitted type for every expression discriminator, and validates each body,
+emitting an Unreachable-only function for invalid action metadata while
 preserving neighboring valid source, monomorphized, and lifted functions. A valid caller of such a
-rejected function reaches its Unreachable-only body. Valid MIR remains byte-identical. Am-g-t,
-am-g-n, and am-g-h are independent sequential fail-closed slices sized to stay near the repository review
-bound. Am-b uses an iterative enter/exit worklist so the
+rejected function reaches its Unreachable-only body. Valid MIR remains byte-identical. Am-g is one
+independent global/header fail-closed slice and fixes the exact link-name and callable-symbol byte
+predicates before any MIR/LLVM/link side effect. Am-b uses an iterative enter/exit worklist so the
 validator cannot replace ac's lowered-expression stack improvement with a new recursive overflow.
 Am-b's exhaustive discriminator walk and mutation
 owners may exceed 1,000 hand-written lines, but activation is atomic: a partial body validator would
 leave the same direct-lowering claim able to panic on an unchecked family. If it cannot remain one
 reviewable exhaustive match, dormant construction and final activation must be re-split before
-coding. All four distinct mergeable boundaries must land after ac and before af.
-The first combined am-g-t implementation measured 1,535 changed hand-written lines including its
-exhaustive owners and plan updates. A fresh adversarial boundary review found no atomic dependency
-between type-domain validation and nominal/link validation, so the oversized slice was not
-justified as unsplittable: am-g-t and am-g-n are separate PRs. The one sequencing invariant above
-is the complete mitigation; this is an application of the existing review-size rule, not a new
-reusable rule.
+coding. Both distinct mergeable boundaries must land after ac and before af.
 The final L2b-a2-s vertical is approximately 1,900 lines because its adversarial review required
 malformed constructor/read/write fail-closed validation, common eager-child source-order snapshots,
 snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
@@ -450,9 +415,9 @@ Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface by
 1.844 ms/import on Apple Silicon.
 Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in sixteen
+variants before L1a–L7 are complete. L2 is implemented as seven conceptual milestones in fourteen
 closed PRs so no incomplete borrow surface is exposed: L2a parameter-mode and provenance-summary
-representation, L2b-a1/a2-s/a2-ac/a2-am-g-t/a2-am-g-n/a2-am-g-h/a2-am-b/a2-af/a2-ar/a2-ap/a2-t/b
+representation, L2b-a1/a2-s/a2-ac/a2-am-g/a2-am-b/a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
