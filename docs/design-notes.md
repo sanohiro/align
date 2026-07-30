@@ -398,6 +398,20 @@ The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure 
 captured values but not mutate external state), which is what makes data-parallel execution safe
 without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
 safety comes from capture being by value (no shared mutable state) rather than from purity.
+Successful-Wait evidence follows the Result value only through transparent local/control
+operations. It is not inferred through a call, return, capture, import, or aggregate: those
+boundaries would require a second hidden effect/provenance summary. A later `spawn` invalidates
+every alias from the earlier task set. This lets stored Result handling remain ordinary source
+code while keeping `get()` safety visible and mechanically local.
+The Task handle carries a separate compiler-only origin for the group that created it. Because the
+handle is Move, transparent local/control moves preserve that origin; opaque boundaries do not.
+Nested groups push a new identity without hiding outer facts. Therefore an inner Wait cannot
+authorize an outer Task, but an outer Wait Result handled inside the inner group updates the outer
+fact. `get()` consults that origin rather than the current nesting position. Current primitive
+results are copied out without consuming the handle. Group exit filters proofs by group identity:
+an inner Wait Result carried out as the block value loses its inner proof and cannot authorize an
+outer Task, while proofs naming still-active outer groups remain. Owned task results are a later
+extension.
 Ordinary sequential pipeline callables may also be Impure: deterministic input/stage order and
 `where` guards preserve their observable behavior. Their inferred effect is optimization evidence,
 not a rejection rule. Purity is inferred, never annotated, and is still weaker than
@@ -634,9 +648,27 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
 
 ---
 
+## The entry-point philosophy
+
+The source entry has one C-compatible boundary, not an arbitrary Align function exported under
+the special name `main`. No-argument `main` is Unit, exact i32, or
+`Result<(), Error>`; the argv form is the Result form. Exact i32 already is the C ABI. Unit and
+Result go through one generated i32 wrapper, so exit behavior is defined without teaching the
+language about additional platform entry ABIs. Rejecting every other return type is preferable to
+silently exposing a bool, float, or aggregate under C's `main` symbol.
+
 ## The safety stance
 
 Align is intentionally positioned between the following.
+
+`unsafe` authorizes an invocation site, not a value that can carry invisible permission elsewhere.
+An extern may therefore be called directly or used by an immediate non-escaping callback consumer
+inside `unsafe`, but it cannot become a first-class function value until the language has an
+explicit unsafe-callable type. This keeps foreign execution lexically visible.
+
+A declared non-Unit return is also a control-flow obligation. The compiler accepts a path only when
+it produces the declared value or provably does not continue; it never repairs reachable
+fallthrough with an ABI-dependent implicit value.
 
 ```text
 Rust

@@ -136,6 +136,11 @@ dynamic index / `.len()` / slice / pipeline reads the table with no allocation. 
 annotation is rejected. Deferred in an element: function calls, `as` casts, nested arrays, references
 to other aggregate constants, and struct constants / elements.
 
+Function completion matches the declared return. Unit functions may use bare `return` or reachable
+fallthrough. A non-Unit function must produce its value on every reachable path through a typed
+tail expression or `return value`; bare `return` and reachable fallthrough are compile errors.
+A proven non-fallthrough path needs no value.
+
 ### Type declarations (keyword-less)
 
 ```text
@@ -313,10 +318,15 @@ error type — construct `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar
 `main` it maps to the process exit code. Fallible builtins (`fs.read_file`, `json.decode`, …)
 return `Result<T, Error>`. A fallible `main` (`fn main() -> Result<(), E>`) restricts `E` to the
 builtin `Error` (the only type with a defined exit-code mapping; a user error enum there is a
-compile error until the full `Error` design lands — convert with `map_err(to_error)?`). `?` requires the same `E` (no implicit conversion — convert explicitly
+compile error — convert with `map_err(to_error)?`). `?` requires the same `E` (no implicit conversion — convert explicitly
 with `result.map_err(f)`). Error **context is structured, not free-form**: a variant carries the
 relevant data (a position, a code), e.g. `ParseError { BadToken(Pos), Eof }` — there is no
 `.with_context("…")` string-chaining.
+
+The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
+`Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
+forms use an i32-returning C wrapper; exact i32 is the C entry directly. Every other parameter or
+return shape is a compile error.
 
 ### Data processing
 
@@ -483,6 +493,22 @@ Its private runtime region stores spawned environments and result slots only. It
 allocation arena: ordinary owned values keep individual ownership, and arena-only operations still
 require an explicit `arena {}`.
 
+`Task.get()` is valid only after a successful `wait()` on every reachable path since the latest
+`spawn`. In a fallible group, the Wait Result may be handled directly or through a bare local,
+copy/reassignment, block tail, `map_err`, or value-producing `if`/`match`/`else`/`loop`; only an
+exact proof present on every result predecessor survives. `?`, Result `match`, and Result `else`
+establish success only on their Ok continuation. An unrelated overwrite or later `spawn` clears
+the proof. Calls, returns, closure captures, imported values, and aggregate reconstruction do not
+transport it; passing a Copy Result leaves only the caller's original local proof intact.
+Each Task is a Move handle whose compiler-known origin names its spawning group. Local moves,
+reassignment, block tails, and value-producing control flow preserve that origin; calls, returns,
+captures, imports, and aggregate reconstruction do not. `get()` checks that exact still-active
+group. A nested group preserves outer facts: its own `wait()` cannot authorize an outer Task, while
+handling an outer Wait Result inside it updates the outer group. Current task results are primitive
+Copy values, so `get()` is non-consuming and repeatable. Exiting a group removes every proof that
+names it, including proof on its block result; handling that Result outside cannot authorize an
+outer Task. Proofs for still-active outer groups remain. Owned results remain future work.
+
 ### Safety
 
 Normal code:
@@ -499,7 +525,10 @@ unsafe
 
 Only inside an unsafe block: the `raw.*` flat-memory ops (`alloc`/`free`/`load`/`store`/`offset`) and
 a foreign call. A C function is declared `extern "C" fn name(params) -> ret` (or a braced group) and
-called like any other function, but only inside `unsafe` — foreign code is outside the safe core. The
+called like any other function, but only inside `unsafe` — foreign code is outside the safe core. A
+direct call or non-escaping pipeline/reducer/sort callback requires that lexical `unsafe`
+invocation site. An extern declaration cannot become a first-class function value because the
+function-value type carries no visible unsafe-call permission. The
 declaration is bodyless and bound to the C symbol; FFI-safe signature types are primitive scalars and
 `raw`, plus a `()` return. A foreign call is a direct native `call` (no marshaling — Align is
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory

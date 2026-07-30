@@ -203,6 +203,13 @@ A single-expression function is written in `= expr` form.
 fn add(a: i32, b: i32) -> i32 = a + b
 ```
 
+Function completion follows the declared return exactly. A Unit function may
+fall through an empty/reachable block tail or use bare `return`. A non-Unit
+function must return a value on every reachable path, either through a typed
+tail expression or `return value`; bare `return` and reachable fallthrough are
+compile errors. A path proven non-fallthrough (`return value`, the propagated
+Err edge of `?`, or a diverging loop) needs no synthetic value.
+
 ### Statement Terminator (Go style)
 
 A statement is terminated by a newline (Go style). Normally `;` is not written. Indentation is insignificant (blocks use `{}`); there is no Python-like layout enforcement.
@@ -579,9 +586,13 @@ timeout); it is produced only by an explicit timeout site, never inferred from a
 
 A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
 exit-code mapping above is defined only for it. A user-defined error enum at that position is a
-compile error today (it will be allowed once the full `Error` design settles the general
-enum→exit-code mapping); propagate it with `map_err(to_error)?` to convert to `Error` at the
-boundary.
+compile error; propagate it with `map_err(to_error)?` to convert to `Error` at the boundary.
+
+The complete entry signature is closed. A no-argument `main` returns only `()`, exact `i32`, or
+`Result<(), Error>`. `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
+forms use a generated C `main` wrapper returning `i32`; Unit maps to exit 0 and Result uses the
+mapping above. The exact-i32 no-argument form is the C entry directly. Every other return or
+parameter shape is a compile error rather than a non-C-ABI external `main`.
 
 **Context is structured, not free-form.** To attach context to an error — where it occurred, what
 failed — give the error variant a payload that *carries that data*: a position, a code, a name.
@@ -1384,11 +1395,17 @@ owned values created in the block keep their normal individual ownership; operat
 arena allocation, including `heap.new`, still require an explicit nested `arena {}`.
 
 ```align
-task_group {
-  a := spawn(fn { fs.read_file("a.txt") })   // a deferred task; the `fn { }` makes the
-  b := spawn(fn { fs.read_file("b.txt") })   // "runs as a separate task" visible
-  wait()?                                     // join all; propagate the lowest-spawn-index error
-  process(a.get(), b.get())                   // extract each result (after the join)
+import std.fs
+
+fn main() {
+  task_group {
+    a := spawn(fn { fs.exists("a.txt") })   // a deferred task; the `fn { }` makes the
+    b := spawn(fn { fs.exists("b.txt") })   // "runs as a separate task" visible
+    wait()                                   // join all primitive-result tasks
+    print(a.get())                           // extract a result after its group joined
+    print(a.get())                           // primitive results may be read again
+    print(b.get())
+  }
 }
 ```
 
@@ -1397,6 +1414,27 @@ in the source (*Nothing hidden*), and it is the same lambda mechanism as `map`/`
 rather than a second, special-cased one (*One way*). It returns a `Task<R>` handle; `wait()?` is
 the single error boundary (it joins every task and propagates the lowest-spawn-index `Err`), and `a.get()`
 reads a task's result after the join.
+
+For a fallible group, `get()` requires control to be on the successful edge of the latest
+`wait()` since the latest `spawn`. The Result may be handled immediately or first kept in a bare
+local, copied/reassigned, passed through a block tail, `map_err`, or value-producing
+`if`/`match`/`else`/`loop`; the success proof survives only when every reachable value predecessor
+has the same task-group proof. `?`, an exhaustive Result `match`, or Result `else` then establishes
+the successful edge. An unrelated overwrite clears the proof, and `spawn` invalidates every saved
+proof for that group. Calls, returns, closure captures, imported values, and aggregate
+reconstruction do not transport the proof. Passing a Copy Result does not erase the caller's
+original local, but no callee result acquires its provenance.
+
+Each `Task<R>` is a Move handle whose compiler-only origin names the `task_group` that spawned it.
+Local moves, reassignment, block tails, and value-producing control flow preserve that origin;
+calls, returns, captures, imports, and aggregate reconstruction do not transport it. `get()` checks
+the originating group, not merely the innermost active group. Entering a nested group preserves
+outer group facts: an inner `wait()` cannot authorize an outer Task, while handling an outer
+fallible Wait Result inside the inner group updates the outer group's success fact. Current task
+results are primitive Copy values, so `get()` does not consume the Task handle and may be repeated.
+Leaving a nested group removes proofs that name that group, including proof on its block result;
+handling that Result outside cannot authorize an enclosing Task. Proofs for still-active outer
+groups remain. Owned task results remain a future extension.
 
 Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the
 point: it performs I/O. Safety comes from capture being by value (a task shares no mutable state
@@ -1725,7 +1763,10 @@ visible and traceable.
 
 A C function is declared `extern "C"` and called like any other function — but only inside `unsafe`,
 because foreign code is outside the safe core and can violate every invariant (ownership, no-alias,
-non-null):
+non-null). A direct call or a non-escaping pipeline/reducer/sort callback is valid only when that
+invocation expression is lexically inside `unsafe`. An extern declaration cannot be formed into a
+first-class function value: the current function-value type has no unsafe-call permission that
+could remain visible after escape.
 
 ```align
 extern "C" fn abs(x: i32) -> i32       // one declaration

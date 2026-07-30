@@ -1490,10 +1490,12 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-L2 requires at least fifteen implementation PRs; the final count remains open until the
-post-am-g-t malformed-HIR remainder ledger is complete. L2b-a2 first isolates product, MIR
+The completed am-r ledger proposes twenty-seven L2 implementation PRs; a clean fresh review fixes
+that count. Am-r itself is a design-only gate and is not one of those implementation PRs. L2b-a2
+first isolates product, MIR
 action-continuation, and global type-domain validation. Placement, nominal, callable namespace,
-declaration/header, and body validation remain behind the explicit am-r design gate below. A PR may
+declaration/header, and four body-validator construction/activation verticals follow the explicit
+am-r design gate below. A PR may
 add dormant representation or tighten existing provenance, but it must
 not accept source syntax whose complete safety contract belongs to a later milestone.
 
@@ -1504,7 +1506,21 @@ not accept source syntax whose complete safety contract belongs to a later miles
 | L2b-a2-s | Add the projection fact and refine named summaries through structs, tuples, block/`if`/loop, field assignment, and destructuring | No new borrow mode; array, pipeline, tagged/control residuals, and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported product-view projection matrix and per-unit parity |
 | L2b-a2-ac | Close MIR fallthrough propagation after every terminating eager expression child, including enclosing consumers and later siblings | No new borrow mode or provenance precision; source semantics are unchanged; the normal driver still supplies semantically checked HIR | exhaustive recursive-call-site classification, representative family-level no-action assertions, runtime twins, and whole/per-unit continuation parity |
 | L2b-a2-am-g-t | Validate concrete roots through every global type table before MIR construction | No source, semantic, HIR, MIR, interface, or ABI change; direct handcrafted-HIR lowering returns a canonical empty program only for an invalid global type domain while every placement, nominal, namespace, declaration/header, and body predicate remains the semantic-checker contract | exhaustive type-domain/root/reference/cycle mutation matrix across all lowering entrypoints and unchanged valid-program MIR |
-| L2b-a2-am-r | Design gate only: before any remaining malformed-HIR implementation, complete one new public-contract ledger that splits per-position type admissibility, nominal/link metadata, callable logical/emitted/generated namespaces, declarations/headers, and body validation into independently correct verticals | No implementation is authorized by this row. The ledger must preserve current producer acceptance or explicitly update every source of truth for a deliberate semantic/ABI change; it fixes the final PR count and prerequisites before code begins | fresh independent adversarial ledger review covering every producer placement predicate, runtime lookup key, exact compiler/native emitted identity, generated helper family, validation order, valid producer twin, and owner test |
+| L2b-a2-am-r | Design gate in progress: the public-contract ledger below isolates five producer corrections and one checked-HIR depth-safety closure, then splits per-position type admissibility, nominal/link metadata, declarations/headers, body validation, and the dependent callable representation change into fourteen independently correct verticals | This row authorizes no implementation itself. Only a clean reviewed ledger may fix unsafe producer acceptance, preserve every other producer surface, fix L2b at twenty-three and L2 at twenty-seven implementation PRs, and unblock am-e | fresh independent adversarial ledger review covering the entry ABI, return completeness, task-wait dominance, native output buffers, extern unsafe-callability, the proved conservative HIR depth ceiling and body/type-consumer safety, every producer placement predicate, exact body discriminator record, runtime key and native ABI row, compiler/generated emitted identity, validation order, valid producer twin, and owner test |
+| L2b-a2-am-e | Make the entry producer and backend ABI exact: no-arg `main` returns only Unit, exact signed i32, or `Result<Unit,builtin Error>`; argv main remains the exact Result form | The compiler rejects previously accepted non-C-ABI entry returns with one source diagnostic; Unit/Result wrappers and direct i32 entry behavior remain exact | sema signature matrix, whole/per-unit Unit/i32/Result exit behavior, every rejected graph-valid return, LLVM signature/link/ThinLTO parity |
+| L2b-a2-am-f | Make function completion exact before a non-Unit body reaches HIR/MIR | Bare return and reachable absent tail are valid only for Unit; every non-Unit path returns a typed value or is proven non-fallthrough | bare/value return, tail/absent tail, every control family, whole/per-unit MIR/LLVM verifier matrix |
+| L2b-a2-am-w | Make successful task-wait dominance path-complete before malformed-HIR validation consumes it | Reject a `TaskGet` unless its exact originating active group has completed a successful Wait on every reachable path since that group's latest Spawn; carry Wait proofs and Move Task origin proofs through exact transparent local/control flow without a type or runtime ABI change | straight-line/reset, infallible/fallible, stored/copied/reassigned/map_err Result, Task move/reassignment/control origin, if/match/else, loop-break, early-exit, Spawn alias invalidation, inner-Wait/outer-Task isolation, outer proof handled inside inner group, exited-inner proof clearing, repeated primitive get, whole/per-unit task result matrix |
+| L2b-a2-am-v | Require each native output `Buffer` to be a bound `mut` local before the runtime can write through it | Reject temporary and immutable output buffers at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom; every other native handle and accepted buffer use is unchanged | five-site local/mut/type/diagnostic-order matrix, accepted runtime/allocation twins, whole/per-unit parity |
+| L2b-a2-am-u | Make foreign invocation permission lexical and non-escaping | Reject extern function-value formation; direct extern calls and named extern pipeline/reducer/sort callbacks require their invocation expression inside `unsafe`; safe user/imported callable behavior and native RuntimeKey calls are unchanged | direct/callback/FnValue/unsafe-depth matrix, resolver diagnostic order, whole/per-unit extern ABI parity |
+| L2b-a2-am-d | Make the fixed conservative checked-HIR record ceiling and the unbounded valid type-DAG domain stack-safe end to end | Preserve every parser-valid source, including diagnosed HIR before producer finalization, while rejecting handcrafted HIR deeper than the fixed 259 ceiling before semantic consumption; every depth-259 body and every finite am-g-t-valid acyclic-inline/header-mediated type DAG at a producer-valid root remains stack-safe from HIR entry through LLVM verification on the 2 MiB test stack | exhaustive constructor-expansion ceiling proof, complete recursive body/type-consumer inventory, common iterative traversal closure, 258/259/260 body cases, deep valid/malformed type-DAG roots, and whole/per-unit MIR/LLVM parity |
+| L2b-a2-am-p | Validate every body-independent type placement against its exact sema producer predicate | No source acceptance change; placement-invalid handcrafted HIR becomes canonical-empty | producer/placement Cartesian matrix and valid graph-but-invalid-position twins |
+| L2b-a2-am-n | Validate nominal/source identities, complete structural equality, enum/table ordinals, alignment, and link libraries | No source, ABI, or artifact change on valid input | exact-byte/NUL/collision/shape/base/alignment/library matrix |
+| L2b-a2-am-h | Validate extern/import/stored/main/local body-independent declarations and headers, and retain normalized imported-effect facts in checked HIR | Header-invalid handcrafted HIR becomes canonical-empty; source/interface behavior is unchanged | mode/signature/summary/imported-effect/main/local/drop-set structural matrix |
+| L2b-a2-am-b1 | Build the dormant total-validator core for statements, ordinary expressions, calls, aggregates, tagged values, and structured control | No public entrypoint activation | exhaustive direct discriminator/field unit owners |
+| L2b-a2-am-b2 | Extend the dormant validator through storage, views, vectors, arrays, pipelines, templates, and JSON | No public entrypoint activation | exhaustive direct storage/stage/terminal/descriptor unit owners |
+| L2b-a2-am-b3 | Extend the dormant validator through every native/runtime family and generated-callable body fact | No public entrypoint activation | exhaustive direct native/helper/generated metadata unit owners |
+| L2b-a2-am-b4 | Correlate body-derived ownership and effect facts and activate the complete body validator in every lowering entrypoint | Any invalid body makes the whole MIR program canonical-empty; valid HIR stays byte-identical | full inventory assertion, ownership/effect-cell mutations, parallel-effect twins, depth bound, whole/per-unit identity and benchmark |
+| L2b-a2-am-c | After am-b4, separate program, runtime, and generated call targets and give Align/generated symbols injective compiler-owned identities | Existing source spellings remain accepted; internal MIR and LLVM/object symbol bytes change atomically, while interface and C/runtime ABI stay fixed | complete runtime-key/native-symbol registry, generated-family collision matrix, whole/per-unit link parity |
 | L2b-a2-af | Extend the projection fact through validated fixed arrays and exact/dynamic element reads/writes | No new borrow mode; pipeline, tagged/control, non-fixed collection, and indirect-call residuals retain the L2b-a1 all-compatible-input fallback | direct/imported fixed-array projection matrix and per-unit parity |
 | L2b-a2-ar | Close eager retained-storage lifetime for non-fixed `Index`, `ElemField`, `SliceRange`, `ArrayChunks`, and `HttpRespHeader`; make non-fixed `ElemField` receiver-first | No new borrow mode or projection precision; non-fixed results remain flattened | invalidated eager-action matrix, terminating-operand twins, runtime source-order checks, malformed-HIR rejection, and per-unit parity |
 | L2b-a2-ap | Extend the projection fact through pipeline `Project`/`WhereField` and terminal formation | No new borrow mode; tagged/control and indirect calls retain the L2b-a1 all-compatible-input fallback; unsupported stages and terminals widen explicitly | direct/imported pipeline-view projection matrix and per-unit parity |
@@ -1557,17 +1573,25 @@ both the closed and open-world effects `Impure`; a direct external callback para
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
 
-L2b requires at least eleven independently sound implementation PRs; the final number depends on
-the am-r split. L2b-a1 owns named/direct/imported
+The completed am-r ledger proposes twenty-three independently sound L2b implementation PRs; the count
+remains pending until its clean fresh review. L2b-a1 owns named/direct/imported
 parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
 flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
 targets. L2b-a2-s adds the projection fact and closes struct/tuple construction, selection,
 replacement, destructuring, and ordinary block/branch/loop flow while retaining conservative
 array, pipeline, and tagged residuals. L2b-a2-ac next closes MIR continuation after every
 terminating eager expression child for semantically checked HIR. L2b-a2-am-g-t then closes only the
-global type domain for direct lowering. L2b-a2-am-r is a required authoring and review gate that
-splits the remaining placement, nominal/link, callable namespace, declaration/header, and body
-surfaces before any of them are implemented. L2b-a2-af closes validated fixed-array formation and
+global type domain for direct lowering. L2b-a2-am-r is the authoring and review gate that must close
+five producer corrections, checked-HIR depth safety, and the remaining placement, nominal/link,
+declaration/header, body, and dependent callable surfaces before it authorizes the fourteen
+implementation verticals below.
+Am-e closes the C-entry signature hole, am-f closes non-Unit return completeness, am-w closes
+task-result wait dominance, am-v closes native output-buffer place/mutability, am-u closes escaping
+or non-lexical extern invocation, and am-d makes every checked-HIR body consumer stack-safe through
+the fixed conservative producer ceiling and establishes the common iterative traversal contract for every finite
+am-g-t-valid type DAG. Later am-p/am-n/am-h/am-b1–b4/am-c owners inherit that type-DAG contract
+before malformed-HIR validation begins. L2b-a2-af closes
+validated fixed-array formation and
 element reads/writes while retaining conservative non-fixed and pipeline residuals. L2b-a2-ar
 closes the affected non-fixed index/range, chunks, and response-header retained-storage actions.
 L2b-a2-ap closes pipeline `Project`/`WhereField` propagation and terminal formation. L2b-a2-t
@@ -1641,7 +1665,7 @@ unreachable return shape (`Operand::Const(Const::Unit)`, `None`, `false`, or `()
 | structured control continuation | `if`, `match`, `else`, `?`, `map_err`, short-circuit boolean, loop, arena, task-group, unsafe, and nested block helpers distinguish a terminated arm from an explicitly created reachable join. They may switch `Builder.cur` only to a block with a real predecessor or an operation-defined early-return edge. A fully terminating construct propagates termination; a mixed construct yields only its fallthrough alternatives; no placeholder supplies a join value. | fully terminating/mixed/all-fallthrough triples for each control family; exact predecessor, phi/store, cleanup, and result assertions; nested eager parent around each triple |
 | pipeline and callback action | Existing source/stage/terminal continuation gates remain authoritative. Required-child checks cover source, stage operand/capture, terminal argument/capture, initializer, reducer, destination, and JSON-scanner callbacks before allocation, loop state, callback call, source nulling, or cleanup transfer. Ac does not reorder a pipeline operand or change effect/provenance inference. | cumulative `terminating_pipeline_operand_emits_no_terminal_state`, capture-order, source-shape, driver runtime, and effect-source-order matrices, each nested under a strict eager parent |
 | owner, cleanup, and allocation parity | A terminating child owns the cleanup and control edge it already emitted. Its parent performs no Drop, drop-flag write, source nulling, cleanup transfer, allocation, owner inheritance, or action-side restoration. Completed earlier operands retain only cleanup required on the terminating edge. Fallthrough allocation and Drop order are byte-for-byte unchanged. | owned earlier-operand + terminating-later-operand Drop-count twins; MIR drop-flag/null/transfer assertions; allocation counter parity on all-fallthrough twins |
-| narrow malformed-HIR defense | Ac may replace a direct index or shape assumption touched by its continuation edits with a checked lookup, but this is defense in depth rather than a complete handcrafted-HIR contract. Missing indirect-function type metadata and an invalid element-field path terminate before the parent action. L2b-a2-am-g-t owns only the global type domain; am-r must settle and split the remaining structural boundary. | `malformed_hir_continuation_metadata_fails_closed` covers exactly the indirect-function signature and fixed/dynamic/SoA element-field-path cases, including no dynamic/SoA length action before rejection; no broader malformed-HIR claim is attached to ac |
+| narrow malformed-HIR defense | Ac may replace a direct index or shape assumption touched by its continuation edits with a checked lookup, but this is defense in depth rather than a complete handcrafted-HIR contract. Missing indirect-function type metadata and an invalid element-field path terminate before the parent action. L2b-a2-am-g-t owns only the global type domain; the completed am-r ledger assigns the remaining structural boundary to am-p/am-n/am-h/am-b1–b4/am-c. | `malformed_hir_continuation_metadata_fails_closed` covers exactly the indirect-function signature and fixed/dynamic/SoA element-field-path cases, including no dynamic/SoA length action before rejection; no broader malformed-HIR claim is attached to ac |
 | public and artifact boundary | No AST/HIR/MIR/LLVM/interface type, tag, codec, fingerprint, cache identity, source syntax, ownership rule, or runtime ABI changes. Whole-program and per-unit lowering call the same internal continuation implementation. | interface/hash goldens remain cumulative; focused whole-program and per-unit runtime twins agree, the existing single-unit gate retains MIR/object identity, and the high-CFG lowering row records continuation cost |
 
 The author-side matrix-to-diff pass must account for every recursive child-lowering entrypoint after
@@ -1688,6 +1712,823 @@ PR split and count; this section deliberately does not guess either.
 | am-g-t concrete type roots and total type domain | Before copying any record, validate tuples, structs, enums, and every type reachable from those tables, an `extern`/imported declaration, or a stored-function header. Every stored struct, enum, and tuple is a concrete root. Every stored tagged-type and function-type entry is also a concrete root unless it belongs to an abstract template graph: a node that contains `Scalar::Param`/`Ty::Param` or transitively depends on such a node. An unreachable abstract template graph is permitted because the producer retains generic-template interner entries that MIR omits; a concrete root that reaches one rejects. Every non-template tagged/function entry remains a root even when otherwise unreachable, so a missing id, inline cycle, or invalid concrete scalar cannot hide in discarded state. Every tagged reference and every function-type reference must be in range even inside a permitted template graph. Traverse with an explicit enter/exit worklist and visit colors rather than native recursion. `IntTy.bits` is exactly `8`, `16`, `32`, or `64`; `FloatTy.bits` is exactly `32` or `64`; the same widths apply inside every `PrimScalar`. `Vec`/`Mask` accepts only an integer/float scalar and exactly `2`, `4`, `8`, or `16` lanes. Every `Struct`/`Enum`/`Tuple`/`Tagged`/`Fn` discriminator resolves to its matching table, every struct-bearing collection resolves a struct, and `DictEncoded(id, field)` resolves an in-range `str` key field. `Ty::IntVar`, `Ty::FloatVar`, `Ty::Error`, and HIR-reachable `Ty::StrFinder` reject. Fixed arrays, tuples, structs, enums, `Option`, `Result`, and nested tagged payloads extend the active inline-layout path and reject an inline cycle. `Box`, slices, dynamic arrays, `ArrayBuilder`, `Task`, dynamic struct arrays, SoA, scanners, dictionary headers, and function closures validate their referenced entries but break that inline path; header-mediated nominal recursion is valid. Am-g-t validates graph formation only: it does not claim that every valid type is admissible in every field, payload, tuple element, parameter, return, local, or body position. | one mutation for every `Ty`, `Scalar`, and `PrimScalar` discriminator; every width/lane boundary; missing/wrong-kind table id and dictionary field; inline-cycle rejection and `Box`/dynamic-array/task/function-header positive cycle twins; reachable/unreachable `Param` tagged and function-type twins; unused malformed non-template tagged and function-type entries; first/middle/final concrete roots; placement-invalid but graph-valid positive twins remain unchanged for am-r; invalid results have every vector empty in all four entrypoints |
 | am-r reopened remainder | No implementation contract is authorized yet. The author ledger must enumerate the exact producer predicate for every field, payload, tuple element, parameter, return, local, and body position; nominal/link identities and validation order; logical callable keys; stored/imported/extern emitted identities; compiler/native declarations and compatible reuse; every `$fnval`, `$clos`, task-trampoline, and parallel-kernel identity; source encoding/NUL rules; ownership/allocation; cache and ABI effects; error precedence; and every valid producer twin. It must choose explicitly between preserving current source acceptance and a fully specified source/ABI change, then update every affected source of truth before implementation. | one owner row per placement and generated-symbol family; exact compiler/runtime spelling positives; duplicate/cross-class/multi-invalid precedence; whole/per-unit/cache identity; fresh independent adversarial review of the completed ledger and proposed PR boundaries |
 
+### L2b-a2-am-r public-contract ledger
+
+This ledger closes the reopened row above. Apart from the exact am-e, am-f, am-w, am-v, and am-u producer
+corrections recorded below, it preserves every currently accepted source spelling and type
+placement. Validation is an internal HIR-to-MIR precondition, not a new language diagnostic or
+artifact format. Every invalid placement, global identity, callable identity, declaration/header,
+or body returns the canonical empty MIR `Program`; body rejection is deliberately program-wide
+rather than per-function. A valid caller cannot retain a call to a rejected body, and no partial
+MIR, native declaration, Align-program/runtime/native/artifact/cache allocation, ownership
+transfer, or cacheable object survives rejection. Compiler-owned validation worklists may allocate
+and are released before return.
+All four whole-program/per-unit lowering entrypoints run the same phases before copying a HIR
+record:
+
+```text
+am-g-t type graph
+am-e   exact source-entry and C-entry ABI
+am-f   non-Unit return and fallthrough completeness
+am-w   outcome-sensitive successful task-wait dominance
+am-v   native output Buffer local/mutability
+am-u   lexical non-escaping extern invocation
+am-d   iterative checked-HIR depth closure
+am-p   placement predicates
+am-n   nominal and link metadata
+am-h   declarations and body-independent headers
+am-b4  activated total body validator assembled by am-b1/am-b2/am-b3
+am-c   typed callable targets and injective emitted identities, consuming am-b4-valid body facts
+```
+
+The exact public records are:
+
+| Entry | Inputs and defaults | Result, ownership, allocation, and artifact effect |
+|---|---|---|
+| `lower_program(&hir::Program) -> mir::Program` | shared HIR borrow; no ambient/default input | valid input returns the existing owned whole-program MIR; invalid input returns a newly owned `mir::Program` whose every vector is empty |
+| `lower_program_located(&hir::Program, &SourceMap) -> mir::Program` | shared HIR and source-map borrows; no ambient/default input | same validation/result; invalid input does not read source text or construct line tables |
+| `lower_program_per_unit(&hir::Program) -> mir::Program` | shared per-unit HIR borrow; no ambient/default input | valid input preserves imported declarations/exportability; invalid input returns the same all-empty record |
+| `lower_program_per_unit_located(&hir::Program, &SourceMap) -> mir::Program` | shared per-unit HIR/source-map borrows; no ambient/default input | combines the preceding two contracts |
+
+No entry adds a public error or diagnostic result. The caller owns the returned MIR and drops it
+normally. Validation allocation is compiler-only and is absent from MIR, interface, object, and
+package artifacts. Every valid-input identity owner compares the complete returned MIR with the
+pre-validation internal lowering path, including located lines and whole/per-unit distinctions.
+
+The first failing phase wins. Within a phase, vectors use stored order and bodies use function then
+statement/expression stored order. Each body record validates its envelope fields in the exact
+field order recorded by the body ledger, then its child expressions left-to-right to completion,
+then cross-field and derived-result facts. Thus an invalid parent id/discriminator beats every
+child failure, the first invalid child beats a later child, and a child failure beats an invalid
+derived `Expr.ty`. Validators return only success/failure;
+they allocate compiler-owned sets, maps, and explicit worklists with lifetime limited to the
+lowering call. They neither retain HIR text nor allocate runtime/package state. Rust `String`
+already guarantees valid UTF-8. Identity compares exact UTF-8 bytes without normalization.
+U+0000 is permitted in source string literals and rejected in every identifier, nominal, callable,
+extern, generated-name input, and link record before it reaches LLVM, C, or a linker. These checks
+run before any side effect.
+
+#### Type-placement ledger
+
+The following producer sets are exact:
+
+- `ty-scalar` is `ty_to_scalar`: integer, float, bool, char, unit, struct,
+  owned string, primitive-element owned array, AoS struct array, response array, `str`,
+  primitive-element slice, reader, writer, regex, captures, file, parsed CLI, TCP connection,
+  TCP listener, UDP socket, child, HTTP response, HTTP server, HTTP request context, response
+  builder, HTTP stream, run output, SoA, JSON document, enum, concrete tagged value, or a template
+  parameter. It also includes `Buffer`; `CliCommand`, `HttpRequest`, `HttpClient`, `Command`,
+  `HttpHeaders`, and every non-scalar composite are absent.
+- `payload-scalar` is `scalar_arg(..., allow_param=true)`: `ty-scalar` minus `Buffer`, with nested
+  `Option`/`Result` interned as `Tagged`. `Param` is legal only in an abstract template.
+- `collection-scalar` is `scalar_arg(..., allow_param=false)` plus `Fn`: `ty-scalar` minus
+  `Buffer`, `Reader`, `Writer`, `Regex`, `Captures`, `CliParsed`, `TcpConn`, `TcpListener`,
+  `UdpSocket`, `Child`, `HttpResponse`, `HttpServer`, `HttpRequestCtx`, `HttpStream`,
+  `ResponseBuilder`, and `RunOutput`, then plus `Fn`. `File` remains accepted because that is the
+  current producer predicate; am-p does not silently narrow it.
+  A dynamic scalar array must still reduce to one `PrimScalar`; nested arrays do not become an
+  element scalar.
+- `fn-scalar` is `ty-scalar` without `Slice`. A first-class callable return is `fn-scalar` or
+  `Result`; an annotated `FnTy` parameter uses `ty-scalar`, preserving the currently accepted
+  slice annotation, while an actual named/lifted function value uses `fn-scalar`.
+
+| Position, in validation order | Exact accepted producer contract | Required valid twin and invalid owner |
+|---|---|---|
+| struct field | `Int`, `Float`, `Bool`, `Char`, `Str`, `String`, `Struct`, `Enum`, every `is_move_handle` leaf, `HttpHeaders`, `Slice`, `Fn`, recursively admissible `Option`/`Result`/`Tagged`, `DynArray`, and `DynStructArray`. `DynArray(String)` rejects. Every inline struct reached through a direct/tagged field is acyclic and has no `align(N)`. `layout(C)` narrows the field to integer or float. | one positive per arm, direct/tagged nesting, Move enum/struct-array, and `http_headers`/function/slice fields; one wrong placement per arm and every `layout(C)`/alignment/cycle edge |
+| concrete enum payload | Integer, float, bool, char, `Str`, `String`, `Struct`, `Enum`, `Fn`, `ResponseBuilder`, recursively concrete `Option`/`Result`/`Tagged`, `DynArray` except `DynArray(String)`, and `DynStructArray` whose element struct is non-Move. Inline struct/enum/tagged cycles reject. | positive direct Move struct/enum, function, builder, tagged, scalar array, and non-Move struct-array payloads; owned-element and recursive negatives |
+| generic enum template and monomorph | A template first uses `scalar_arg(..., allow_param=true)`: `payload-scalar`, including `Param`, nested tagged parameters, and `ResponseBuilder`, but not the concrete-only `Fn` extension. A monomorph substitutes every parameter, then applies `enum_payload_ok`; this rejects `ResponseBuilder` in an emitted generic monomorph and rechecks graph-dependent struct/struct-array ownership after all definitions resolve. The validator accepts only the union actually emitted by these two paths and does not widen the template path to the concrete path. | abstract unused template twins, each concrete substitution, and concrete `Fn`/builder positives versus generic-monomorph negatives |
+| tuple element | Exactly integer, float, bool, char, `Str`, `String`, `DynArray`, or `DynStructArray`; order is significant and duplicate tuple element lists are one interned identity. | one positive per kind and all other graph-valid scalar/composite negatives |
+| `Option`/`Result` payload | `scalar_arg(..., allow_param=true)`: `payload-scalar`, with nested `Option`/`Result` interned as `Tagged`; abstract `Param` is template-only. | every payload kind, nested tagged values, and excluded buffer/builder/header/composite twins |
+| box type argument | `scalar_arg(..., allow_param=false)`, then reject `Struct`, `Enum`, every `Scalar::is_move`, and `Str`. The admitted type-formation remainder is integer, float, bool, char, unit, primitive `Slice`, SoA, JSON document, and a concrete non-Move `Tagged` value. This is deliberately broader than value construction: `heap.new` additionally rejects `Slice`, whose borrowed view cannot be stored as an owned box payload. | one type-formation positive for every admitted remainder including `Slice`/SoA/JSON/tagged; `heap.new(Slice)` body negative; struct/enum/owned/`Str`/parameter negatives |
+| slice/dynamic-array type argument | `collection-scalar`. A dynamic struct array instead records its exact struct id and rejects an over-aligned element. `File` is admitted here by the current type producer even though no array-literal producer admits it. SoA separately requires a non-empty struct containing only integer, float, bool, char, or `Str` fields. `ArrayBuilder` accepts only integer, float, bool, char, or `String`. | one positive per type-argument family including `File` and `Fn`; every explicitly excluded handle/nested/over-aligned/SoA-field/builder negative |
+| fixed-array literal element | Body-owned, not am-p-owned. A fixed struct array admits an over-aligned struct and records the padded/aligned slot contract. A scalar literal rejects every owned handle including `File`, every slice-bearing non-struct, and a Move enum; all elements have one checked type, `ArrayLit.elem` matches it, and the length fits the stored type. | over-aligned fixed-struct positive; `File` type-formation-positive/literal-negative twin; handle/slice/Move-enum/type/length/pooled-state matrix in am-b2 |
+| vector and mask element | Integer or float with exactly 2, 4, 8, or 16 lanes. | every width/lane endpoint and bool/char/aggregate negatives |
+| annotated `FnTy` type positions | Each parameter is `ty-scalar`. The return is any graph-valid non-`Error` type currently produced by `resolve_type`; the body/call validator separately requires each actual callable origin to satisfy `fn-scalar` parameters and a `fn-scalar`/`Result` return. Mode cardinality/class and summaries belong only to am-h. Imported effect transport belongs to am-h; body-correlated effect cells and parallel eligibility belong only to am-b4. | slice- and buffer-parameter annotation positives, actual fn-value slice negative, Result-return handler, and one type-position mutation per branch |
+| stored source function or monomorph type positions | Each parameter and return is a concrete `resolve_type` result. A parameter is not `Box`; a return is neither `Box` nor `Fn`. A monomorph contains no reachable `Param`. Modes, `main`, summaries, and local records belong only to am-h. | every source-nameable parameter/return family, Box/Fn boundary negatives, generic substitution twins |
+| imported function type positions | Same source-function type-position contract as its producer, plus id-free structural ABI type identity and no abstract/private type identity. Modes, summary equality, and interface header facts belong only to am-h. | whole/per-unit identical type twins and one type-position corruption at a time |
+| extern parameter and return type positions | Parameters are integer, float, raw, `Str`, numeric `Slice`, or a non-empty `layout(C)` struct. Returns are unit, integer, float, raw, or a non-empty `layout(C)` struct. Target-specific SysV size/register rejection remains codegen-owned after this target-independent validation. Modes and summaries belong only to am-h. | scalar/view/C-struct positives; empty/non-C/wrong field/view-return type negatives |
+| local, expression, statement, and block-tail position | A local may carry any concrete graph-valid type actually produced at that body point, including compiler-only task, dictionary, scanner, builder, and handle types. There is no global local allowlist. Am-b derives every expression result, requires exact equality with `Expr.ty`, then requires initializer, assignment, return, break, argument, capture, stage, and tail positions to equal their declared producer type and ownership facts. | valid producer twin for all 239 `ExprKind` variants; wrong `Expr.ty` and wrong consumer position for every family |
+
+Am-p owns this table and nothing else. It validates global/table/header placements whose producer is
+body-independent. The body-correlated final row is specified here but implemented only by am-b.
+This keeps `am-p` independent and prevents it from guessing whether a graph-valid local type was
+actually produced by its initializer.
+
+#### Nominal, link, and callable identity ledger
+
+Am-n visits structs, enums, tuples, then link libraries. Struct/enum `name` and `source_name` are
+non-empty exact UTF-8 without U+0000. Internal names are unique across the combined nominal
+namespace. A repeated `source_name` is legal only for the same nominal kind and identical complete,
+recursively id-free shape: declaration/member order, field/variant names, type graph, alignment,
+`layout(C)`, function modes, summaries, and callable ABI; the private function-effect origin is
+excluded. Field and variant names match `[A-Za-z_][A-Za-z0-9_]*` and are unique in their
+declaration. Tuple element vectors are unique. Alignment is `None` or a power of two in
+`1..=2^29`. Enum `field_base` starts at 1 and each next value is the checked preceding base plus
+payload length; the flattened count fits `u32`. Link libraries are unique, non-empty, do not start
+with `-`, and contain only ASCII alphanumeric bytes or `._+-`.
+
+Source-name preservation has positive owner evidence, not only rejection mutations. Two generic
+nominal instances that differ only in private function-effect origin retain distinct `name` values
+but the same producer `source_name` and identical complete source shape; am-n accepts both and the
+canonical source ABI bytes agree. Two modules declaring the same bare type spelling retain their
+distinct producer-mangled `source_name` values and canonical bytes differ. Mutating only
+`source_name` while keeping the private name and shape fixed also changes the canonical bytes.
+These twins prove that validation neither substitutes private `name` for `source_name` nor erases
+the source-visible nominal identity.
+
+Am-c replaces the ambiguous string-only callable table with three typed registries:
+
+```text
+ProgramCall(exact HIR logical name) -> Align definition/import/extern FunctionValue
+RuntimeCall(RuntimeKey)             -> exact align_rt_* FunctionValue
+GeneratedCall(GeneratedId)          -> private compiler helper FunctionValue
+```
+
+The concrete Rust representation is:
+
+```rust
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProgramCall(Box<str>);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u16)]
+pub enum RuntimeKey { /* the 281 variants below, in that exact order */ }
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DirectCall {
+    Program(ProgramCall),
+    Runtime(RuntimeKey),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GeneratedId {
+    FnValue {
+        target: ProgramCall,
+        signature: CanonicalFnAbi,
+    },
+    Closure {
+        lifted: ProgramCall,
+        explicit_signature: CanonicalFnAbi,
+        captures: Vec<CanonicalTy>,
+    },
+    Task {
+        fallible: bool,
+        result: CanonicalTy,
+    },
+    Parallel(ParallelGeneratedId),
+}
+```
+
+`ProgramCall::new` is crate-private and accepts only a non-empty, NUL-free exact UTF-8 logical name
+already present in the validated program/import/extern registry. It owns one boxed copy; that
+storage and its clones are ordinary compiler allocations. The allocation itself never reaches an
+artifact, while the semantic name bytes participate in the structural MIR hash, encoded
+`align_fn$...` identity, `GeneratedId` canonical bytes/stems, LLVM/object symbols, and debug output
+exactly as specified below.
+`RuntimeKey` is `Copy`. `DirectCall` and `GeneratedId` are compiler-owned values with lowering-call
+or codegen-module lifetime; no runtime allocation or Drop contract is introduced.
+
+The exact MIR field change is one-for-one:
+
+| Current field | Am-c field |
+|---|---|
+| `Rvalue::Call(String, Vec<Operand>)` | `Rvalue::Call(DirectCall, Vec<Operand>)` |
+| `Rvalue::FnAddr { name: String, signature }` | `Rvalue::FnAddr { target: ProgramCall, signature }` |
+| `Rvalue::Closure { lifted: String, captures, capture_tys, signature }` | `Rvalue::Closure { lifted: ProgramCall, captures, capture_tys, signature }` |
+| `ParMapStage.func: Option<String>` | `ParMapStage.func: Option<ProgramCall>` |
+| `Rvalue::ParMapParallel.func: String` | `Rvalue::ParMapParallel.func: ProgramCall` |
+| `Rvalue::ParMapReduce.func: String` | `Rvalue::ParMapReduce.func: ProgramCall` |
+| internal `Reducer::{Fold,AnyAll}.func`, `PreparedCollectKind::Scan.func`, and `SortKey.func` strings | the same fields as `ProgramCall`; no helper converts back to a logical string |
+
+HIR remains string-bearing. Am-b3/b4 first proves every HIR callable/body relation from
+[`19-hir-validation-ledger.md`](19-hir-validation-ledger.md). Am-c then converts a validated named
+target to `ProgramCall`, and converts a compiler builtin/native selection directly to
+`RuntimeKey`; it never classifies a program target by spelling. Codegen accepts `DirectCall` and
+cannot perform a string lookup that crosses the two classes.
+
+`CanonicalFnAbi` is the ordered parameter list of `{ mode, CanonicalTy }`, the return
+`CanonicalTy`, and exact borrow and region summaries. It has no return-cleanup field in am-c:
+`ReturnCleanupAbi` does not exist until later L2c, which must extend this record and its byte
+encoding atomically when it lands. It excludes effect because effect changes call legality, not the
+physical thunk signature.
+
+The parallel record is closed:
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum ParallelKernelMode {
+    Materialize = 0,
+    Reduce = 1,
+    FilterCount = 2,
+    FilterScatter = 3,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ParallelStageId {
+    Map {
+        target: ProgramCall,
+        abi: CanonicalFnAbi,
+        input: CanonicalTy,
+        output: CanonicalTy,
+        captures: Vec<CanonicalTy>,
+    },
+    Filter {
+        target: ProgramCall,
+        abi: CanonicalFnAbi,
+        input: CanonicalTy,
+        output: CanonicalTy,
+        captures: Vec<CanonicalTy>,
+    },
+    FilterStrContains {
+        input: CanonicalTy,
+        output: CanonicalTy,
+        needle: CanonicalTy,
+    },
+    Project {
+        input: CanonicalTy,
+        output: CanonicalTy,
+        field: u32,
+    },
+    FilterField {
+        input: CanonicalTy,
+        output: CanonicalTy,
+        field: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ParallelGeneratedId {
+    pub mode: ParallelKernelMode,
+    pub source: CanonicalTy,
+    pub terminal_input: CanonicalTy,
+    pub terminal_output: CanonicalTy,
+    pub terminal: ProgramCall,
+    pub terminal_abi: CanonicalFnAbi,
+    pub terminal_captures: Vec<CanonicalTy>,
+    pub stages: Vec<ParallelStageId>,
+    pub work_weight: u8,
+}
+```
+
+`source` is the exact source-container type, not only its element type. `input`/`output` are the
+stored stage types; their canonical reachable nominal definitions supply field layout identity.
+`Project.field` and `FilterField.field` are logical field ordinals. A string-filter needle is
+runtime data, so identity carries its type but not its bytes. Capture values likewise do not affect
+generated code; their ordered types do. `work_weight` is exactly `1`, `2`, or `4`.
+`Materialize` requires no filtering stage, `Reduce` requires the stage-free integer reduction form,
+and a chain containing any Filter/FilterStrContains/FilterField produces one `FilterCount` and one
+`FilterScatter` identity with otherwise identical fields. No raw nominal, tuple, tagged, or
+function-table id is present.
+
+Canonical bytes use this closed codec. Every integer is unsigned little-endian. Every count and
+byte length is `u32`; values that do not fit reject. A boolean is one byte, exactly `0` or `1`.
+UTF-8 text is `u32 byte_length || bytes`, with no normalization; callable/nominal/member text also
+rejects embedded NUL before encoding. Decoders reject unknown tags, invalid booleans, overflow,
+truncation, trailing bytes, duplicate definition fields/variants, out-of-range definition
+references, non-canonical root/definition order, and any type the am-g-t/am-p/am-h contract rejects.
+
+`CanonicalTy` is `version=1:u8 || node_count:u32 || nodes || root_type`. Nodes are assigned ordinals
+by first visit in a depth-first walk from the root; struct fields, enum variants/payloads, tuple
+elements, tagged payloads, and function parameters are visited in stored declaration order.
+Repeated and recursive references emit the first assigned `u32` ordinal. The node tags and payloads
+are:
+
+| Tag | Definition node payload |
+|---|---|
+| 0 | struct: source-name, optional alignment (`0` or `1 || u32`), C-layout bool, field count, then each field name and type |
+| 1 | enum: source-name, variant count, then each variant name, `field_base:u32`, payload count, and payload scalars |
+| 2 | tuple: element count and scalar elements |
+| 3 | tagged: `0 || option scalar` or `1 || ok scalar || err scalar` |
+| 4 | function: parameter count, each mode and scalar, return type, borrow summary, region summary; no effect or raw fn-table id |
+
+Struct/enum nodes include nominal `source_name` and their complete reachable shape. They exclude
+origin-aware private `name`. The fingerprint is nominal plus structural: different public nominals
+never merge, and the same source nominal with a different reachable graph never shares a helper or
+cache key. Cycles through box, function, or another header-mediated edge terminate through node
+references rather than truncation.
+
+The `root_type` tags `0..=56`, in exact order, are:
+
+```text
+Int Float Bool Char Option Result Tagged Box Array Vec Mask StructArray DynStructArray Slice Soa
+DynSliceArray DynArray DynResponseArray Str String ArenaHandle Raw Builder Writer Reader Buffer
+ArrayBuilder StrFinder File Rng Regex Captures CliCommand CliParsed TcpConn TcpListener UdpSocket
+Child Command RunOutput HttpRequest HttpResponse HttpClient HttpServer HttpRequestCtx
+ResponseBuilder HttpStream HttpHeaders JsonDoc JsonScanner Struct Tuple Fn Enum Task DictEncoded Unit
+```
+
+`Int` is `signed:bool || bits:u8`; `Float` is `bits:u8`. `Bool`, `Char`, the closed handles, `Str`,
+`String`, `Raw`, and `Unit` have no payload. `Option`, `Result`, `Box`, `Array`, `Vec`, `Mask`,
+`Slice`, `DynArray`, `ArrayBuilder`, and `Task` encode their scalar(s), then any `u32` length/lane.
+`DynSliceArray` encodes a primitive scalar. `StructArray` encodes a struct-node reference and
+length; `DynStructArray` encodes a struct-node reference and layout (`0=Aos`, `1=Soa`); `Soa`,
+`JsonScanner`, and `Struct` encode a struct-node reference. `Tagged`, `Tuple`, `Fn`, and `Enum`
+encode the matching node reference. `DictEncoded` encodes a struct-node reference then field
+ordinal. `DynResponseArray` has no payload.
+
+Valid scalar tags `0..=33`, in order, are:
+
+```text
+Int Float Bool Char Unit Struct String DynArray DynStructArray DynResponseArray Str Slice Enum
+Tagged Soa JsonDoc Reader Writer Buffer Regex Captures CliParsed TcpConn TcpListener UdpSocket
+Child File HttpResponse HttpServer HttpRequestCtx ResponseBuilder HttpStream RunOutput Fn
+```
+
+Scalar `Int`/`Float` use the same width payloads; `Struct`/`DynStructArray`/`Soa` use a struct-node
+reference; `Enum`, `Tagged`, and `Fn` use their matching node reference; `DynArray` and `Slice`
+contain one primitive scalar. Primitive scalar tags are exactly `0=Int`, `1=Float`, `2=Bool`,
+`3=Char`, `4=Str`, `5=String`, with width payloads on Int/Float. `Param`, `IntVar`, `FloatVar`,
+`Error`, a missing definition, and a raw table id have no encoding.
+
+Parameter modes are `0=ByValue`, `1=Out`, `2=Borrow`, `3=BorrowMut`; am-c input still rejects the
+later two modes. A summary is `0=None` or `1 || param_count || params || capture_count || captures`;
+indices are `u32`, strictly increasing in each vector. In am-c every capture vector is empty.
+`CanonicalFnAbi` is
+`version=1 || param_count || (mode || CanonicalTy)* || return CanonicalTy || borrow || region`.
+
+`GeneratedId` is `version=1` followed by `0=FnValue`, `1=Closure`, `2=Task`, or `3=Parallel`, then
+the fields in the Rust declaration order above. `ProgramCall` is encoded as its length-prefixed
+UTF-8 bytes. A vector is `u32 count` then elements. `ParallelGeneratedId` encodes its nine fields
+in declaration order. `ParallelKernelMode` is its explicit `repr(u8)` value.
+`ParallelStageId` is `0=Map`, `1=Filter`, `2=FilterStrContains`, `3=Project`, or
+`4=FilterField`, followed by that variant's fields in declaration order. Decoding repeats the
+semantic validity relations above and rejects a mode/stage combination that no producer emits.
+Semantic-to-byte and independent byte-to-semantic goldens are:
+
+| Semantic value | Canonical hex |
+|---|---|
+| `CanonicalTy::Unit` | `010000000038` |
+| `CanonicalTy::Bool` | `010000000002` |
+| signed `CanonicalTy::i64` | `0100000000000140` |
+| `CanonicalFnAbi { params: [], ret: Unit, borrow: None, region: None }` | `01000000000100000000380000` |
+| `GeneratedId::FnValue { target: "f", signature: preceding ABI }` | `0100010000006601000000000100000000380000` |
+| `GeneratedId::Closure { lifted: "l", explicit_signature: preceding empty ABI, captures: [Bool] }` | `0101010000006c0100000000010000000038000001000000010000000002` |
+| `GeneratedId::Task { fallible: false, result: Unit }` | `010200010000000038` |
+| `GeneratedId::Task { fallible: true, result: i64 }` | `0102010100000000000140` |
+| `GeneratedId::Parallel { mode: Materialize, source: slice<i64>, terminal_input: i64, terminal_output: i64, terminal: "f", terminal_abi: fn(ByValue i64) -> i64 with None/None, terminal_captures: [], stages: [], work_weight: 1 }` | `01030001000000000d000140010000000000014001000000000001400100000066010100000000010000000000014001000000000001400000000000000000000001` |
+
+Each golden is encoded from the semantic record and decoded from the literal bytes in separate
+tests. Malformed goldens flip version/tag/bool, truncate each scalar width, add one trailing byte,
+and replace a definition reference with `u32::MAX`.
+
+HIR-to-MIR lowering tags compiler-native calls as `RuntimeCall`; a user call with the same bytes
+remains `ProgramCall`. This is an internal MIR representation change and lands atomically across
+HIR lowering, MIR, whole/per-unit codegen, serialization-free consumers, tests, and benchmarks.
+It does not reserve a new source spelling. Non-exported whole-program Align definitions and
+per-unit Align definitions/imports use the injective emitted identity
+`align_fn$<UTF-8-byte-length>$<lowercase-hex-bytes>`; the same function gets the same identity in
+producer and consumer units. Explicit `--export` roots retain their requested exact external
+identity. Extern C symbols retain their exact identifier. Direct-i32 `main` emits `main`; Unit or
+`Result` main emits the encoded Align identity plus the generated external `main` wrapper.
+Explicit exports, extern definitions, and the external `main` identity are pairwise distinct. An extern declaration may
+reuse an exact native emitted identity only when its complete LLVM parameter/return ABI is
+identical to that native registry entry; both logical targets then point to the one declaration.
+A mismatched native redeclaration, an explicitly exported Align definition using a native identity,
+or any other external emitted collision rejects before LLVM construction. A non-exported Align
+definition whose logical bytes equal a native symbol or generated stem is encoded and remains
+valid. Thus an accepted
+extern declaration of `align_rt_print_i64` with one `i64` parameter remains accepted, while a
+second definition cannot collide with the linked runtime. The encoded per-unit symbol scheme changes
+object bytes once. The typed call target changes each affected unit's structural MIR `impl_hash`,
+and the compiler binary change changes `compiler_build_id`; both are already codegen-cache key
+fields, so no old producer or consumer object can hit. Interface bytes/hashes, source semantics,
+the C/runtime ABI, and structural type fingerprints do not change.
+
+ThinLTO consumes the same final emitted registry. In per-unit mode a derived-exportable source
+function and its imported declaration use the identical encoded Align identity and remain external;
+whole-program non-exported definitions and every generated helper remain internal. Explicit export,
+extern, native, and external `main` roots retain their exact external identities. ThinLTO
+internalization may not reclassify a function from logical-name spelling or reconstruct a generated
+identity from its readable stem. Owner builds run ThinLTO off/on for whole-program and two-unit
+inputs, compare link success and behavior, and assert that the implementation/object cache misses
+once for the representation/compiler-build change and then hits on an unchanged rebuilt input.
+
+The collision matrix is exhaustive:
+
+| Input pair | Result |
+|---|---|
+| two stored program definitions with the same logical name | am-n/am-h reject |
+| stored definition and import with the same logical name | exact compatible declaration/definition pair only; otherwise reject |
+| repeated compatible imported or extern declaration | dedupe to one program registry entry |
+| incompatible repeated extern declaration | reject |
+| non-exported program logical name equal to a RuntimeKey, native symbol, `align_gen$...` stem, or encoded-name-looking string | accept; emit the length-plus-hex `align_fn$...` identity |
+| compatible extern logical/emitted name equal to a native symbol | accept and reuse the one native declaration |
+| incompatible extern equal to a native symbol | reject |
+| explicit export equal to a native symbol, extern emitted identity, or external `main` | reject |
+| direct-i32 `main` plus any other claimant of external `main` | reject; otherwise direct main alone emits `main` |
+| wrapped main plus any other claimant of external `main` | reject; otherwise wrapper alone emits `main` and Align body remains encoded |
+| two equal `GeneratedId` values | dedupe |
+| unequal generated values with the same readable stem | deterministic `$0`, `$1`, … probe |
+| generated candidate equal to any program/native/external identity | probe; never reject the source spelling |
+
+Owner tests include separate positives for a non-exported runtime-key-equal logical name, a
+non-exported native-symbol-equal name, and a generated-stem-equal name; compatible and incompatible
+native externs; explicit export collision; direct and wrapped main; duplicate equal generated
+records; and unequal generated records with one/two occupied probe candidates.
+
+The exact `RuntimeKey` set is:
+
+```text
+alloc alloc_size_fail arena_alloc arena_begin arena_end
+array_builder_append array_builder_build array_builder_build_stack array_builder_free
+array_builder_free_stack array_builder_free_strings array_builder_free_strings_stack
+array_builder_init_stack array_builder_new array_builder_push array_builder_push_str
+base64_decode base64_encode base64url_decode base64url_encode bounds_fail
+buffer_append buffer_bytes buffer_free buffer_len buffer_new buffer_put
+builder_finish builder_finish_stack builder_free builder_free_stack builder_init_stack
+builder_into_string builder_into_string_stack builder_new builder_pop_comma builder_write
+builder_write_bool builder_write_char builder_write_f32 builder_write_f64 builder_write_int
+builder_write_json_str builder_write_str_int_str bytes_as_str child_free child_kill child_wait
+chunks cli_command cli_command_free cli_flag_bool cli_flag_i64 cli_flag_str cli_get_bool
+cli_get_i64 cli_get_str cli_parse cli_parsed_free cli_usage command_cwd command_env
+command_env_clear command_free command_new command_run command_timeout
+compress_gzip_compress compress_gzip_decompress compress_zstd_compress compress_zstd_decompress
+crypto_aes_gcm_open crypto_aes_gcm_seal crypto_argon2id
+crypto_chacha20_poly1305_open crypto_chacha20_poly1305_seal
+crypto_ct_equal crypto_hkdf_sha256 crypto_hmac_sha256 crypto_random
+crypto_sha256 crypto_sha512 dict_encode_str dict_lookup div_fail dns_resolve env_get env_set
+form_decode form_encode free free_response_array free_string_array fs_exists fs_read_bytes_view
+fs_read_dir fs_read_file fs_read_file_view fs_remove fs_write_file fs_write_file_builder
+gather_i64 group_count_i64 group_count_str group_count_str_cols group_max_i64 group_max_str
+group_max_str_cols group_min_i64 group_min_str group_min_str_cols group_multi_str group_sum_i64
+group_sum_str group_sum_str_cols hash128 hash64 hex_decode hex_encode html_escape
+http_accept http_body http_client_free http_client_get http_client_new http_client_post
+http_client_request http_client_timeout http_ctx_body http_ctx_free http_ctx_header
+http_ctx_method http_ctx_path http_get_many http_header http_parse http_rb_body http_rb_header
+http_request http_request_free http_resp_body http_resp_free http_resp_header http_resp_status
+http_respond http_respond_stream http_response_free http_response_new http_serve
+http_serve_shared http_server_free http_stream_finish http_stream_free http_stream_reject
+http_stream_send http_stream_send_event http_timeout io_copy io_file_create io_file_free
+io_file_len io_file_open io_file_pread io_file_pwrite io_reader_buffered io_reader_free
+io_reader_open io_reader_read io_reader_read_line io_reader_stdin io_writer_create
+io_writer_flush io_writer_free io_writer_std io_writer_write io_writer_write_builder
+json_decode json_decode_array json_decode_scalar json_decode_soa json_decode_struct_array
+json_decode_union json_doc_as_bool json_doc_as_f64 json_doc_as_i64 json_doc_as_str json_doc_at
+json_doc_elems json_doc_get json_doc_key json_doc_kind json_doc_len json_doc_parse
+json_encode_object json_encode_scalar_array json_encode_struct_array json_encode_union
+json_scan_next len_mismatch_fail par_map par_map_filter par_map_reduce path_base path_dir
+path_ext path_join path_normalize percent_decode percent_encode print print_bool print_char
+print_f32 print_f64 print_str process_abort process_cpu_count process_exec process_exit
+process_spawn range_fail regex_captures regex_captures_free regex_captures_group regex_compile
+regex_find regex_find_all regex_free regex_group_count regex_group_index regex_is_match
+regex_replace regex_split rng_next rng_range rng_sample rng_seed_os rng_seed_with rng_shuffle
+run_output_code run_output_free run_output_stderr run_output_stdout str_clone str_cmp
+str_contains str_ends_with str_eq str_eq_ignore_case str_find str_finder_find str_finder_free
+str_finder_new str_rfind str_starts_with str_trim str_trim_end str_trim_start tcp_accept
+tcp_conn_free tcp_conn_reader tcp_conn_writer tcp_connect tcp_listen tcp_listener_free
+tcp_read_timeout tcp_write_timeout tg_alloc tg_begin tg_end tg_register tg_wait time_instant
+time_now time_sleep udp_bind udp_recv_from udp_send_to udp_socket_free utf8_boundary_fail
+utf8_valid
+```
+
+Every key emits `align_rt_<key>` except `print -> align_rt_print_i64`,
+`cli_command -> align_rt_cli_command_new`, and
+`http_request -> align_rt_http_request_new`. The main wrapper additionally declares
+`align_rt_report_error` and, only for argv main, `align_rt_args_build`; neither has a MIR lookup
+key. Three further always-built runtime exports, four `alloc-count` probes, and four distinct
+`par-map-probe` exports are unkeyed but still occupy external identities. `task-group-probe` adds
+no unmangled export. The four AEAD cross-product symbols are ordinary keys
+rather than a codegen-side string match.
+[`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 281 keyed symbol/type/attribute
+records, the five always-built unkeyed records, and the eight feature-conditional probe records:
+286 base records and 294 when every runtime feature is active. Declaration, runtime lookup,
+extern-compatible reuse, ABI goldens, link-identity collision checks, and native-call body
+validation consume those rows. Adding a native call without its key or ABI row is a compile error
+rather than a drifting second list.
+
+Generated identities are typed, injective, and deterministic. After collecting and validating all
+requests, sort unique `GeneratedId` records by their canonical bytes. For each record, try the
+printed stem below with `$0`, then `$1`, and so on, selecting the first emitted name absent from the
+global registry. The checked increment rejects on integer exhaustion. This exact probe rule keeps
+every program/extern/export spelling accepted instead of reserving `align_gen$...`; probe choice is
+object identity but never ABI or interface identity.
+
+| Generated family | Exact identity and cache dimensions | Owner evidence |
+|---|---|---|
+| named function-value thunk | stem `align_gen$fnval$<target ProgramCall hex>`; one per exact target used by `FnAddr`. Signature is target ABI prefixed by the environment pointer. | same runtime-key/generated-stem spelling as a user function remains a distinct positive; duplicate uses dedupe; unknown target and signature mismatch reject |
+| lifted closure thunk | stem `align_gen$clos$<lifted ProgramCall hex>`; capture count/types, explicit signature, and lifted target must agree at every body occurrence before the single thunk is registered. | zero/many captures, repeated equal metadata, conflicting metadata, and target collision/probe twins |
+| task trampoline | stem `align_gen$tramp$<fallibility>$<complete structural result-type hex>`; the type key includes widths, signs, nominal structural fingerprints, tagged payloads, and no raw table id. | every supported result/fallibility pair, formerly colliding unsupported `x` types, whole/per-unit identity |
+| parallel kernel | stem `align_gen$par$<mode>$<complete structural-key hex>`. The key contains MIR/LLVM input and output types, terminal callable and exact signature, terminal capture types, every ordered stage kind/callable/signature/input/output/capture/path, field layout identity, and count/scatter mode. Cache lookup uses `GeneratedId`, never readable LLVM name. | existing structural-key matrix plus callable-name separator collisions, field-layout twins, count/scatter, generated-stem probe, and malformed-before-cache-reuse tests |
+
+Generated symbols are private and do not enter interface or ABI fingerprints. Their deterministic
+names affect only LLVM/object bytes and debug output. Program/native/generated registry construction,
+all compatible duplicate reuse, and all collision checks finish before any function body or helper
+CFG is emitted.
+
+#### Declaration/header and total-body ledger
+
+[`19-hir-validation-ledger.md`](19-hir-validation-ledger.md) is the authoritative per-record body
+ledger. The inventory and PR ranges below are routing information only; they do not replace its
+envelope order, child order, result/type relation, ownership correlation, or owner tests.
+
+Am-h validates, in order, externs, imports, stored functions, then locals:
+
+- modes are parallel to parameters; extern modes are `ByValue`; stored/import modes are
+  `ByValue` or `Out`, with `Out` only on `Slice`; `Borrow`/`BorrowMut` remain disabled;
+- return borrow and region summaries are identical. `None` is canonical for no roots.
+  `Roots { params, captures }` has a non-empty, strictly increasing, in-range `params` vector whose
+  referenced parameter types are borrow-capable, and an empty `captures` vector before L2b-b;
+- every imported non-generic public function carries one required `effect: FnEffect` header fact.
+  The semantic producer copies the exact `external_effects[canonical_name]` value when present and
+  normalizes an absent compatibility-map entry to `Impure`, matching the current fail-closed
+  analysis in which absence is both impure and unknown and impurity has diagnostic/classification
+  precedence. Whole-program HIR has no imported declarations. This fact is internal checked-HIR
+  transport, not a new interface field: the interface already stores the same three-valued effect.
+  Am-h validates and preserves the field but does not infer a stored function body from it;
+
+  ```text
+  FnEffect = Pure | Impure | Unknown
+
+  hir::ImportedFn {
+    name: String,
+    params: Vec<Ty>,
+    param_modes: Vec<ParamMode>,
+    ret: Ty,
+    return_borrow: ReturnBorrowSummary,
+    return_region: ReturnRegionSummary,
+    effect: FnEffect,
+  }
+
+  mir::ImportedFn {
+    name: String,
+    params: Vec<Ty>,
+    param_modes: Vec<ParamMode>,
+    ret: Ty,
+    return_borrow: ReturnBorrowSummary,
+    return_region: ReturnRegionSummary,
+  }
+  ```
+
+  `effect` is not part of the Align call ABI or `CanonicalFnAbi`; it is the imported semantic seed
+  consumed by the existing effect fixed point. Am-h replaces MIR's current
+  `Vec<hir::ImportedFn>` with `Vec<mir::ImportedFn>` in the exact existing field order and strips
+  `effect` only after validation. Both structs derive the same `ImportedFn { ... }` structural
+  Debug bytes for those six fields, so valid per-unit codegen input, `impl_hash`, interface-summary
+  bytes/hash, and cache behavior remain byte-identical. An owner test compares the old unchecked
+  MIR rendering/hash and new validated MIR rendering/hash for Pure, Impure, and Unknown imports;
+- `params` and `param_modes` have equal length. Each parameter id is unique, in range, and refers to
+  the local with that id and the signature type. A source function or generic monomorph marks those
+  locals `is_param: true`; a lifted function deliberately marks both explicit and trailing captured
+  parameter locals `is_param: false`, because `is_param` records the source-level no-alias
+  privilege rather than ABI parameter placement;
+- am-h replaces the ambiguous pair `lifted_capture_count: Option<usize>` plus `exportable: bool`
+  with one required origin record:
+
+  ```text
+  FnOrigin =
+    Source { is_entry: bool, is_public: bool }
+    | Monomorph
+    | Lifted { capture_count: u32 }
+  ```
+
+  `Source` is used for every emitted non-generic source declaration. `is_entry` is the producer's
+  compilation-unit role, and `is_public` is the declaration visibility even though an entry-unit
+  declaration is never externally visible. `Monomorph` is used only for a concrete generic
+  instantiation. It deliberately stores no template name or argument vector. A concrete
+  `Call.type_args` record is correlated only through one shared compiler-owned
+  `mangle_mono_suffix(type_args)` encoder (the current `mangle_mono("", type_args)` bytes), a
+  non-empty base prefix, the target's `Monomorph` origin, and its concrete signature/result. Sema
+  production and am-b validation call that same encoder; no second mangle grammar is permitted.
+  The discarded template and its bounds are not reconstructible at the HIR boundary and are not
+  claimed by am-h/am-b. `Lifted` is used only for a lambda helper,
+  including `capture_count == 0`, and
+  requires `capture_count as usize <= params.len()`, every mode `ByValue`, and both summaries
+  `None`. The stored HIR no longer carries an independently forgeable `exportable` bit:
+  `FnOrigin::is_exportable()` is true exactly for
+  `Source { is_entry: false, is_public: true }`. Whole-program MIR still forces internal linkage;
+  per-unit MIR copies only that derived value into its existing `mir::Fn.exportable` field;
+- `main` first obeys the ordinary source-function header rules. A `Result` return, with or without
+  argv, is exactly `Result<Unit, builtin Error>`. Only a
+  `Source { is_entry: true, .. }` function whose exact logical name is `main` may be the main
+  producer; `Monomorph` and `Lifted` never are. A main with parameters has exactly one
+  `ByValue DynArray(Str)` parameter and that Result return. After am-e, a no-argument main returns
+  exactly Unit, signed 32-bit `i32`, or that Result; every other graph-valid return has already
+  received the source diagnostic and is not producer-valid checked HIR. Unit and Result bodies use
+  an encoded internal Align identity plus the generated external
+  `i32 @main()`/`i32 @main(i32,ptr)` wrapper; exact i32 uses external `i32 @main()` directly. The
+  builtin error declaration is
+  `Error { NotFound, Invalid, Denied, Timeout, Code(i32) }` with exact identity, order, payload,
+  and field bases;
+- local id equals ordinal; name is non-empty and NUL-free; a parameter name is an ASCII source
+  identifier. Local alignment is `None` or a power of two in `1..=2^29`, and only a non-parameter
+  fixed integer/float array may carry it;
+- `drop_locals` and `drop_individual_locals` are sorted unique in-range sets and the latter is a
+  subset. Exact membership and `drop_individual_exprs` remain body-derived am-b facts.
+
+Am-b uses one explicit enter/exit worklist and a total `ExprKind` match. Am-b1, am-b2, and am-b3
+merge dormant validator modules plus exhaustive direct unit tests; they do not call the public
+lowering entrypoint and make no malformed-HIR promise. Am-b4 completes ownership correlation,
+effect correlation, proves the total discriminator inventory, activates the assembled validator in
+every entrypoint, and adds valid-HIR byte identity, canonical-empty rejection, whole/per-unit
+parity, and cost evidence. Effect correlation replays the existing source-order effect fixed point
+using stored imported effects as the only cross-unit seeds, implicit `Impure` for every extern, and
+body-derived effects for stored source/monomorph/lifted functions. It requires every concrete
+function-value `FnTy.effect` cell, aggregate projection/join cell, result boundary, and parallel
+callable eligibility decision to equal that replay. Annotation-only unused `FnTy` entries remain
+`Unknown`. A forged `Pure` imported seed is no more independently authenticatable at this internal
+boundary than a forged imported signature, but every body fact derived from the seed must be
+internally consistent. Activation is all-or-nothing; no partially validated expression family is
+exposed.
+
+Am-b1 owns every `Stmt`, local/place and `ExprKind::Unit` through
+`ExprKind::BuilderToString` in declaration order, plus `BuilderWriteKind`, `StrPredKind`, and
+`StrTrimKind`. Am-b2 owns `ExprKind::ArrayLit` through `ExprKind::ArrayDictEncode` in declaration
+order, plus every `StageKind`, `TemplatePart`, `GroupSource`, `GroupAgg1`, and `GroupOp`. Am-b3 owns
+`ExprKind::FsReadFile` through `ExprKind::CryptoArgon2` in declaration order, plus `AeadCipher`,
+`AeadDir`, `HashAlgo`, `CliFlagKind`, `EncodingKind`, `CompressKind`, and `PathComponentKind`.
+Those three closed ranges assign every discriminator to exactly one construction PR. The exact
+`ExprKind` inventory is:
+
+```text
+Unit Int Float Char Str Bool Local Unary Cast Binary IntArith MathOp FnValue Closure
+CallFnValue TaskGroup EnumValue Match ResultMapErr Spawn TaskGet Wait Call If StructLit Field
+SoaColumn Tuple TupleIndex IndexField Block OptionSome OptionNone ElseUnwrap ResultOk ResultErr
+Try Loop Arena Unsafe RawAlloc RawFree RawLoad RawStore RawOffset HeapNew BoxGet BoxClone
+StrClone StrPredicate StrTrim StrBorrow BuilderNew BuilderWrite BuilderToString ArrayLit
+ConstArray ArrayZip Select VecSumWhere VecDot VecMinMax VecSum VecLoad VecStore VecLit
+ArraySum ArrayCount ArrayAnyAll ArrayMinMax ArrayReduce ArrayScan ArrayDot ArraySort ArraySortBy
+ArrayToArray ArrayToSoa ArrayMapInto ArrayPartition ArrayParMap ArrayChunks ArrayToSlice Len Index
+SliceRange ElemField Template JsonDecode JsonDecodeArray JsonDecodeScalar JsonDecodeStructArray
+JsonDecodeSoa JsonDecodeUnion JsonDoc JsonDocKind JsonDocGet JsonDocAt JsonDocAsStr
+JsonDocAsScalar JsonDocLen JsonDocKey JsonDocElems JsonScan ArrayGroupAgg ArrayGroupAggMulti
+ArrayDictEncode FsReadFile ReaderStdin ReaderOpen WriterStd WriterCreate ReaderRead
+ReaderBuffered ReaderReadLine BytesAsStr WriterWrite WriterFlush IoCopy FileCreateRw FileOpenRw
+FilePread FilePwrite FileLen BufferNew BufferBytes StrBytes BufferLen BytesRead BufferPut
+BufferAppend ArrayBuilderNew ArrayBuilderPush ArrayBuilderAppend ArrayBuilderBuild FsWriteFile
+FsExists FsRemove FsReadDir DnsResolve TcpConnect ConnReader ConnWriter TcpReadTimeout
+TcpWriteTimeout TcpListen TcpAccept UdpBind UdpSendTo UdpRecvFrom FsReadFileView
+FsReadBytesView PathJoin PathComponent PathNormalize EnvGet EnvSet TimeNow TimeInstant
+ProcessCpuCount TimeSleep ProcessExit ProcessAbort ProcessSpawn ChildWait ChildKill ProcessExec
+ProcessCommand CommandCwd CommandTimeout CommandEnv CommandEnvClear CommandRun RunOutputCode
+RunOutputStdout RunOutputStderr EncodingEncode EncodingDecode Utf8Valid Compress Decompress
+RandSeed RandSeedWith RandNext RandRange RandShuffle RandSample RegexCompile RegexIsMatch
+RegexFind RegexFindAll RegexSplit RegexReplace RegexCaptures RegexGroupCount RegexGroupIndex
+CapturesGroup CliCommand CliFlag CliParse CliGetBool CliGetI64 CliGetStr CliUsage HttpRequest
+HttpHeader HttpBody HttpRequestTimeout HttpParse HttpRespStatus HttpRespHeader HttpRespBody
+HttpClient HttpClientTimeout HttpClientGet HttpClientPost HttpClientRequest HttpGetMany HttpServe
+HttpAccept HttpCtxMethod HttpCtxPath HttpCtxHeaders HttpCtxHeader HttpCtxBody HttpResponseBuilder
+HttpRbHeader HttpRbBody HttpRespond HttpRespondStream HttpStreamSend HttpStreamFinish
+HttpStreamReject CryptoCtEqual CryptoRandom CryptoHash CryptoHmac CryptoHkdf CryptoAead
+CryptoArgon2
+```
+
+The same exhaustiveness assertion covers `Stmt::{Let, LetTuple, Assign, AssignIndex,
+AssignVecLane, AssignField, AssignElemField, AssignElem, Return, Break, Expr}`,
+`StageKind::{Map, Where, WhereField, WhereStrContains, Project}`, every `TemplatePart`,
+`AeadCipher`, `AeadDir`, `HashAlgo`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
+`PathComponentKind`, `GroupSource`, `GroupOp`, `BuilderWriteKind`, `StrPredKind`, and
+`StrTrimKind`. For each discriminator the validator checks its non-child envelope fields in its
+ledger order, then child expressions left-to-right, then exact result and operand
+types, every relational id/path/ordinal/arity/mode/capture, operation-specific wrapper/ABI record, and
+body-derived ownership bit before advancing. One valid producer twin and one mutation of every
+stored field are owner tests; multi-invalid precedence follows the universal order above.
+
+#### Fixed implementation split, acceptance, and public effects
+
+| Slice | Independently complete closure | Focused owner and benchmark |
+|---|---|---|
+| L2b-a2-am-e | Restrict the source/checker entry producer to Unit, exact i32, or `Result<Unit,builtin Error>` and make every admitted form's C ABI/link identity exact in whole/per-unit and ThinLTO paths. | `main_signature_matrix`, whole/per-unit Unit/i32/Result exit-code and LLVM-signature owners; no benchmark row |
+| L2b-a2-am-f | Reject bare return and reachable absent body tail in every non-Unit function while preserving typed tail/return and proven non-fallthrough paths. | `function_return_completeness_matrix`, whole/per-unit MIR/LLVM verifier owners; no benchmark row |
+| L2b-a2-am-w | Replace traversal-order task wait state with group/epoch-scoped outcome-sensitive successful-wait dominance across Spawn, transparent Result local/copy/reassignment/`map_err` flow, transparent Move Task-handle origin flow, Try, Match, Else, nested groups, and every control join. | `task_get_successful_wait_dominance_matrix`, stored-result and Spawn-alias-invalidated twins, inner-Wait/outer-Task rejection, already-waited outer positive, outer stored-Wait proof handled inside inner positive, inner proof leaves outer false twin, inner Wait Result handled after group exit remains unproven, repeated primitive get, whole/per-unit task-group runtime owners; compile-time proof-alias scale row only |
+| L2b-a2-am-v | Require an exact bound `mut Buffer` local at the five native output positions without applying source `mut` to native objects that mutate only interior runtime state. | `native_output_buffer_requires_mut_local`, five runtime/allocation twins, whole/per-unit parity; no benchmark row |
+| L2b-a2-am-u | Reject extern `FnValue`; require lexical `unsafe` at direct extern Call and every named extern pipeline/reducer/sort invocation, with inference-only signature peeks remaining silent. | `extern_invocation_permission_matrix`, direct/callback/FnValue whole/per-unit owners; no benchmark row |
+| L2b-a2-am-d | Fix the conservative checked-HIR producer ceiling at 259, convert every body semantic replay and MIR-lowering consumer to explicit bounded frames, and expose one common explicit-worklist traversal for the finite but depth-unbounded type DAG already accepted by am-g-t. | `checked_hir_depth_closure_matrix`, 258/259/260 whole/per-unit MIR/LLVM owners, and deep valid/malformed type-DAG twins; no runtime benchmark |
+| L2b-a2-am-p | Activate all body-independent placement predicates; invalid placement is canonical-empty while graph-valid but position-invalid twins distinguish every producer set. | `malformed_hir_type_placement_fails_closed`, `valid_hir_type_placement_preflight_is_mir_identity`, deep valid placement and deep malformed later-sibling precedence; `mir-type-placement-validation` |
+| L2b-a2-am-n | Activate exact nominal/source-shape, tuple, alignment, enum-base, and link validation. | `malformed_hir_nominal_link_metadata_fails_closed`, shallow/deep equal-shape origin twins, and deep malformed later-sibling precedence; `mir-nominal-link-validation` |
+| L2b-a2-am-h | Activate extern/import/stored/main/local body-independent header validation, including normalized imported-effect transport. | `malformed_hir_declaration_header_metadata_fails_closed`, `valid_hir_declaration_header_preflight_is_mir_identity`, imported Pure/Impure/Unknown/absent-normalization twins, and deep signature/summary valid/malformed twins; `mir-header-validation` |
+| L2b-a2-am-b1 | Dormant total-validator core: every statement, local/place, ordinary expression/call/aggregate, tagged value, and structured-control record. | direct table-driven unit owner plus deep valid/malformed ordinary-body type relation; no public benchmark row yet |
+| L2b-a2-am-b2 | Dormant storage/vector/array/pipeline/template/JSON validator, including every stage, terminal, capture, and descriptor record. | direct table-driven unit owner plus deep valid/malformed storage/pipeline type relation; no public benchmark row yet |
+| L2b-a2-am-b3 | Dormant native/runtime validator plus generated-callable body facts for all I/O through crypto families. | direct table-driven unit owner plus deep valid/malformed native/generated signature relation; no public benchmark row yet |
+| L2b-a2-am-b4 | Add body-derived Drop/ownership and effect correlation, assert the full inventory, activate all body validation globally, and prove valid identity/four-entrypoint parity. | `malformed_hir_body_metadata_fails_closed`, `malformed_hir_effect_metadata_fails_closed`, `valid_hir_body_preflight_is_mir_identity`, maximum-depth and deep type-DAG stack owners, whole/per-unit codegen; `mir-body-validation` |
+| L2b-a2-am-c | Land typed program/runtime/generated call targets, encoded Align symbols, native registry, generated identities, and all name/collision validation atomically across sema/MIR/codegen and whole/per-unit paths. | callable namespace/collision/golden-symbol suites, deep semantic→bytes→semantic plus malformed deep-reference/truncation owners, and per-unit link parity; `mir-callable-namespace-validation` plus unchanged runtime-call cost |
+
+#### Am-f implementation closure matrix
+
+This matrix is authoritative before the return-completeness producer correction begins.
+
+| Cell | Required am-f closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | A bare `return` is accepted exactly when the active function return is Unit; otherwise it emits exactly `return without a value is only valid in a function returning (); this function returns <type>` at the containing block span. After the checked body is built, a non-Unit block body with no tail is accepted only when the existing source-order control-flow analysis proves its end unreachable; otherwise it emits exactly `function returning <type> has a reachable path without a return value` at the body span. A present tail is checked against the declared return as today. These checks run after return-type formation but before HIR publication; an ill-typed present value retains the existing type diagnostic before completion. | Unit/non-Unit × bare/value return × present/absent tail; wrong value plus missing path diagnostic order; exact spans/messages |
+| construction and control | Every reachable path of a non-Unit function ends in `Return(Some(value))`, a typed tail converted by existing lowering, `Try` error propagation, process termination, or a proven diverging loop/control expression. If/Match/Else join only reachable fallthroughs; loop exits use accepted Break paths; nested blocks, Arena, Unsafe, TaskGroup, and lifted lambda bodies retain their own active function return. Dead statements are still structurally checked but cannot create a fallthrough edge. The function root HIR body has an absent reachable tail only for Unit. | straight-line, if/match/else, loop/break, Try, process exit, nested region/unsafe/task group, lifted lambda, and dead-code mutations |
+| ownership, Drop, and allocation | Rejected functions publish no HIR/MIR, allocation, move, Drop, cleanup, or cacheable artifact. Accepted typed-return and non-fallthrough paths keep existing return move/nulling, arena/task cleanup, and allocation behavior. | Move/Copy return and cleanup parity, rejected-before-HIR, allocation-count twins |
+| generic, interface, whole/per-unit, and cache | Generic source bodies and each monomorph are checked under their concrete return; imported/extern bodyless declarations are unaffected. Whole/per-unit compilation applies the same local-body rule. Accepted interface/source/MIR/impl hashes are unchanged; the compiler-build change alone invalidates cached objects. | generic/monomorph return twins, interface goldens, whole/per-unit and cache miss-then-hit |
+| native/ABI and benchmark | No non-Unit function can reach MIR/LLVM with `Return(None)` or a reachable absent tail, so LLVM never emits `ret void` under a value-returning signature. The checks are linear in the already-bounded body walk and add no runtime work. | exact MIR terminators, raw/optimized LLVM verifier and executable results for every admitted return family; compile-time no-regression owner |
+
+#### Am-e/am-w implementation closure matrix
+
+This matrix is authoritative before either producer correction begins. Both corrections precede
+am-h/am-b4 so total HIR validation accepts exactly the corrected semantic producer.
+
+| Cell | Am-e entry closure | Am-w task-wait closure | Exact owner evidence |
+|---|---|---|---|
+| formation and validation | Source `main` is non-generic and has either no parameters or exact `ByValue array<str>`. No-arg return is Unit, exact signed i32, or `Result<Unit,builtin Error>`; argv requires that Result. After ordinary type formation, main return checks run before the parameter-shape check. An otherwise-valid non-Result return outside the admitted set emits exactly `main returns only (), i32, or Result<(), Error>; got <type>` at the return span. Existing wrong-Result Ok/Error diagnostics retain their order, followed by the existing argv/parameter diagnostic on a multi-invalid declaration. | Each active task group owns one ambient fact initialized false and one compiler-only preorder `group: usize` plus current `epoch: usize`, both indices into function-analysis-owned vectors with no HIR/interface/wire form. Spawn replaces the epoch, resets ambient completion, produces `WaitProof { group, epoch }` only through a fallible Wait, and produces `TaskProof { group }` on each handle. Differing control histories get a fresh join epoch. Infallible Wait sets ambient true. A fallible Wait leaves ambient state unchanged and its proof has a true Ok edge/false Err edge. TaskGet requires TaskProof's group still active and that exact group's current epoch ambient true. | all accepted signatures plus every other graph-valid return/parameter mutation and multi-invalid diagnostic order; straight-line infallible/fallible/reset/epoch-join, missing/wrong/stale TaskProof, and nested-group mutations |
+| construction and control | Exact i32 emits external `i32 @main()` directly. Unit/Result emit an internal Align body plus an external i32 wrapper; argv wrapper alone accepts `(i32,ptr)`. No other entry ABI is constructible. | A fallible-Wait Result carries compiler-only provenance for its exact active group. Bare local binding, copy/reassignment, block tail, `ResultMapErr`, and value-producing if/match/else/loop preserve it only when every reachable result predecessor has the same proof; unrelated overwrite clears it. Move Task handles transfer `TaskProof { group }` through transparent local binding, move/reassignment, block tail, and value-producing control flow; there is no Task-copy path. Try, Result Match, and Result Else update the ambient fact named by a still-active `WaitProof.group`, even while a nested group is active: Try continues with that group true; Match starts exact Ok with it true and Err with it false, with a wildcard/or-pattern receiving the AND of covered outcomes; Else continues with it true on Ok and checks its fallback with it false. Passing a Copy Wait proof leaves the caller local intact but no callee/import/return/capture/aggregate result inherits either proof. Spawn changes only its exact group's epoch/ambient state. Ordinary control joins AND ambient facts and intersect per-local proofs across reachable fallthroughs; loop exits do the same across accepted Break edges. Entering a nested group pushes a distinct false group while retaining outer facts/proofs; inner Spawn/Wait changes only the inner group. Exit removes its ambient fact and all WaitProof/TaskProof entries naming it, including a proof on the block result, while retaining every still-active outer entry. TaskGet looks up its TaskProof group anywhere on the active stack and checks that group's ambient fact, never the innermost group by position; its rejection diagnostic also uses that originating group's fallibility. Return, Try Err, process termination, and a diverging loop have no continuation. Lambdas/functions start empty. | whole/per-unit raw/optimized LLVM exact signatures and link/run exit behavior; direct and stored/copied/reassigned/map_err Wait proof; transparent Task move/reassignment/control proof and rejected Task-copy premise; the settled stored-Wait Result positive; unrelated overwrite and call/return/capture/aggregate nontransport; stale Wait aliases after Spawn; inner Wait plus outer Task rejection; outer successful Wait then nested outer TaskGet positive; outer stored-Wait proof handled inside inner positive plus inner-proof/outer-false twin; inner Wait Result block-tail then outside handling does not authorize outer; originating-group diagnostic selection; exact/wildcard/or Result arms; terminating Else fallback; if/match/else/loop-break/early-exit/lambda matrix |
+| ownership, Drop, and allocation | Rejected headers construct no HIR/MIR/runtime state. Accepted Unit/i32/Result paths keep existing body ownership and wrapper allocation behavior. | The ambient, WaitProof, and TaskProof maps are compiler-only state. Propagating or clearing them follows existing Copy Result and Move Task evaluation but creates no task, join, read, Align allocation, source nulling, Drop, or cleanup action. Current Task results are primitive Copy values: `TaskGet` is a non-consuming read, preserves the Move handle and its TaskProof, and repeated get is producer-valid. Group cleanup remains byte-identical on accepted input. Owned Task results and their consuming-get/Drop contract remain a separate future slice. | rejected-before-MIR tests; Copy Wait and Move Task local/control bookkeeping twins; repeated primitive get; no source-nulling/Drop/allocation change and MIR equality |
+| generic, interface, whole/per-unit, and cache | `main` remains entry-unit-only and non-generic. Interface summaries never export it. Whole/per-unit and ThinLTO preserve exactly external `main`; the compiler-build change invalidates old cached objects, while source/interface hashes for accepted input stay unchanged. | No interface or ABI field is added. Whole/per-unit semantic HIR agrees. Accepted-source MIR/impl hashes stay unchanged; rejected unsafe sources produce no artifact. | interface-byte/hash goldens for accepted entries; ThinLTO off/on; cache miss once then hit; whole/per-unit task twins |
+| benchmark | No persistent validation pass is added; one constant-time header predicate replaces invalid backend construction. | Spawn invalidation is O(1) by epoch replacement. Control joins examine only sparse live proof entries and are O(control edges plus the proof entries examined at those edges); there is no runtime work. | compile-time branch-count × live-proof-alias scale owner plus no regression in existing `mir-header-validation` and task-group rows; no new runtime benchmark |
+
+#### Am-v implementation closure matrix
+
+This matrix is authoritative before the native output-buffer producer correction begins. Am-v
+implements the `mut buffer` surface already promised by the language and library documentation; it
+does not add a new source construct.
+
+| Cell | Required am-v closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | After each operation's existing receiver, arity, child-expression, and exact `Buffer` type checks, `ReaderRead.buffer`, `ReaderReadLine.buffer`, `FilePread.buffer`, `UdpRecvFrom.buffer`, and `CryptoRandom.out` must be a bare source local with `is_mut == true`. A non-local reports exactly `'<operation>' needs a mut buffer local (bind it first, then pass that local)`; an immutable local reports exactly `cannot fill immutable buffer '<name>' in '<operation>' (declare with mut)`. The operation labels are `.read()`, `.read_line()`, `.pread()`, `.recv_from()`, and `crypto.random`. Existing earlier diagnostics retain precedence on a multi-invalid call. | five operations × wrong type/non-local/immutable/valid local, plus receiver/arity-and-place multi-invalid order |
+| construction, move, and control | Rejection constructs no native HIR row. An accepted output local is borrowed and mutated in place; it is neither moved nor nulled and retains its existing Drop. If/match/else/loop/early-exit behavior is ordinary expression behavior and no new compiler state joins. | HIR absence on reject; accepted HIR equality apart from source id; post-call reuse and exactly-once Drop across every control family |
+| ownership, lifetime, allocation, and FFI | The output buffer owns its existing allocation for the whole call and the runtime writes only through that stable local's buffer window. Am-v creates no allocation and changes no native key, C ABI, runtime allocation provenance, success/error result, or handle ownership. | five runtime success/error twins, allocation-count parity, unchanged 281 keyed native declarations and feature export sets |
+| generic, interface, whole/per-unit, and cache | `Buffer` is concrete and non-generic. No HIR/MIR/interface field or codec changes. Whole/per-unit compilation accepts and rejects the same sources; accepted MIR/impl/interface hashes remain byte-identical. The compiler-build change alone invalidates old cached objects. | whole/per-unit accepted/rejected twins, interface/hash goldens, one build-id cache miss then hit |
+| benchmark | Five constant-time AST-local/mutability predicates run inside existing semantic checks; no persistent pass or runtime work is added. | compile-time no-regression owner; no new runtime benchmark |
+
+#### Am-u implementation closure matrix
+
+This matrix is authoritative before the extern-call producer correction begins. `unsafe` remains a
+lexical invocation permission; am-u does not add an unsafe-callable function type.
+
+| Cell | Required am-u closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | `check_named_fn_value` rejects `FnSig.is_extern` before scalar-signature eligibility with exactly `extern function '<source name>' cannot be used as a function value; call it directly inside unsafe`. `check_named_call`, `resolve_stage_fn`, and `resolve_fn` accept an extern only when the owning Call, stage pipeline, reducer/partition/any/all/par_map/scan, or sort-by-key expression is at `unsafe_depth > 0`; otherwise they emit exactly `calling extern function '<source name>' requires an unsafe { } block`. `named_sig`, `named_param_hint`, and `resolve_named_fn_quiet` remain inference-only and never authorize or diagnose. Lookup/undefined, callable shape, and argument diagnostics retain their existing order around that one permission check. | bare/qualified direct calls; every stage and terminal resolver consumer; extern FnValue in/outside Unsafe; undefined/shape/permission multi-invalid pairs; exact one-diagnostic owner |
+| construction and control | Accepted direct extern HIR remains `Call`; accepted named higher-order HIR keeps its current target name at the non-escaping owning expression. Am-b1 requires lexical Unsafe for `Call` when `SIG(func).is_extern`; am-b2 requires it for every stored extern stage/terminal target. An extern never produces `FnValue`, `Closure`, `CallFnValue`, stored aggregate callable, return, capture, or task environment. Unsafe block entry/exit, branch, loop, early exit, and nested function/lambda bodies use their own lexical depth; permission never flows as data. | HIR presence/absence, direct and each callback family inside/outside/nested Unsafe, branch/loop/lambda scope matrix |
+| ownership, lifetime, allocation, and FFI | Permission is compiler-only lexical state. It creates no Align value, ownership transfer, Drop, allocation, cleanup, or provenance. Accepted foreign calls preserve their existing argument modes, FFI coercions, native allocation behavior, external declaration ABI, and link libraries. | accepted HIR/MIR/runtime equality, view/raw/layout(C) ABI owners, allocation and link parity |
+| generic, interface, whole/per-unit, and cache | Extern declarations remain bodyless, non-generic interface signatures. The source/interface codecs and hashes do not gain a permission field. Whole/per-unit compilation enforces the same lexical rule. Accepted MIR/impl/interface bytes are unchanged; the compiler-build change alone invalidates cached objects. | interface/hash goldens, whole/per-unit accepted/rejected twins, one build-id cache miss then hit |
+| benchmark | Permission checks are constant-time predicates inside existing callable resolution and HIR validation; no persistent pass or runtime work is added. | compile-time no-regression owner; no new runtime benchmark |
+
+#### Am-d implementation closure matrix
+
+This matrix is authoritative before the stack-safety closure begins. The checked-HIR record
+ceiling is fixed by the exhaustive conservative producer proof in
+[`19-hir-validation-ledger.md`](19-hir-validation-ledger.md). It is separate from the global type
+domain: am-g-t deliberately accepts every finite header-mediated nominal/tagged/function DAG, so
+am-d must not impose an ambient or raw type-depth cap.
+
+| Cell | Required am-d closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | The constructor inventory classifies every AST-to-HIR creation site and charges principal records, structural helpers, non-stacking `StrBorrow`/`ArrayToSlice` wrappers, bounded leaf-only expansions, parser recursion guards, and the synthetic expression-function root to derive the fixed conservative producer ceiling of 259. It makes no unsupported claim that 259 is the minimum or source-reachable maximum. A common explicit enter/exit worklist measures a handcrafted HIR body before any recursive semantic consumer runs. Record depth 260 rejects to canonical-empty in all four lowering entrypoints; every depth-259 body continues. Separately, am-d factors the am-g-t type visitor into one common explicit-worklist graph traversal with stable root, field, element, parameter, return, and reference order, visit colors, and no finite valid depth limit. | complete constructor-site exhaustiveness assertion; raw, coercion-expanded, nested Block/Stmt/MatchArm/Stage/TemplatePart 258/259/260 fixtures, including diagnosed HIR before finalization; deep valid nominal/tagged/function DAG and deep malformed missing-reference/wrong-kind sibling-precedence twins |
+| construction and control | Producer HIR finalization, lint, region, borrow, Move, Escape, and effect walks; am-b4 replay; and MIR `lower_expr` from every whole/per-unit located/unlocated entrypoint use explicit work items rather than native recursion. Enter/exit frames preserve the ledger's envelope-before-child, child source order, post-relation, result-type, and body-fact order across `if`, `match`, `else`, `?`, `map_err`, branch and loop joins, early exits, dead retained nodes, stages, and templates. No rejected body starts a later phase. The am-d inventory also enumerates every recursive type edge reachable in these phases and in codegen; each edge is migrated to the common worklist or classified with an owner-backed non-recursive/indirection-leaf proof. | exact first-error and reachable-state identity against shallow twins for every control family; complete recursive-call-site inventory assertion; all four entrypoints on the 2 MiB test thread; final MIR and raw/optimized LLVM verification at the accepted boundary |
+| ownership, Drop, allocation, and return | Iterative replay preserves construction, move-in/out, source nulling, Drop, replacement, return, loop cleanup, and allocation order exactly. `drop_plan_rec`, recursively Move classification, borrow capability, region/escape, and ownership predicates accept deep acyclic inline/header-mediated graphs without process-stack recursion. An over-bound body returns canonical-empty before any Align-program/runtime/native/artifact/cache allocation, ownership action, native registration, source-map read, or cache publication. Only compiler-owned validation worklist allocation may occur; it is released on success or rejection. | deep Copy/Move local/return/aggregate and Drop-plan roots; deep borrow/region/escape roots; replacement, branch/loop/early-return, arena/task cleanup, allocation-count, and canonical-empty no-action twins |
+| generic, interface, whole/per-unit, and cache | Every stored, monomorphized, and lifted function is an independent body-depth root. Whole/per-unit compilation uses the same body preflight. Interfaces and canonical type fingerprints retain the am-g-t finite type domain without a new depth field or limit. MIR type conversion and LLVM struct body/layout helpers accept deep graphs at stored header, parameter, local, return, and aggregate-field roots through raw and optimized verification. Accepted source/HIR/MIR/interface/impl hashes remain unchanged and only the compiler build id invalidates cached objects. | source/monomorph/lifted boundary fixtures, two-unit deep type-DAG import, deep MIR/LLVM parameter/local/return/field layout and executable twins, interface/hash goldens, and one build-id miss then hit |
+| current/future type consumers and benchmark | Before merge, am-d closes every currently active HIR→MIR→LLVM recursive type consumer, including `drop_plan_rec`, `ty_is_move`/`struct_is_move`, `ty_may_borrow`, slice/region/escape/ownership predicates, type/layout lowering, and LLVM struct-body/layout construction. Am-p placement, am-n complete source-shape comparison, am-h signature/summary correlation, am-b1–b4 body type relations, and am-c canonical encode/decode then inherit the common traversal. Each owning slice has a deep valid acyclic-inline and header-mediated DAG plus a deep malformed later-sibling case proving diagnostic precedence. Am-c canonical semantic-to-bytes and bytes-to-semantic traversal is depth-first first-visit order implemented with explicit work items; malformed deep references and truncation reject without using the process stack. Body and type traversal are linear in visited records/edges; worklists are bounded by input size rather than native stack depth. | am-d `deep_type_consumer_closure_matrix` across sema/MIR/codegen/driver roots; cumulative deep-DAG owner in am-p/am-n/am-h/am-b1–b4/am-c; am-c deep semantic→bytes→semantic golden and malformed deep-reference/truncation twins; unchanged `mir-global-type-validation`, later validation rows, and `mir-continuation-lowering` |
+
+#### Am-h/am-b4/am-c implementation closure matrix
+
+This matrix is authoritative before either internal representation change begins. The am-b
+ownership/control matrix is the per-record ledger in
+[`19-hir-validation-ledger.md`](19-hir-validation-ledger.md); am-c consumes it only after am-b4.
+
+| Cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | Am-h forms exactly one `FnOrigin` for every stored function, derives exportability only through `is_exportable()`, carries one normalized `FnEffect` on every imported HIR declaration, and converts to the six-field effect-free MIR declaration only after header validation. Am-b4 replays stored-body/cross-unit effect inference before am-c can consume a callable fact. Am-c forms `ProgramCall`, `RuntimeKey`, `CanonicalFnAbi`, `CanonicalTy`, and each `GeneratedId` only after am-b4 validation; canonical decoders reject before registry/cache publication. All nested type formation/comparison/canonicalization uses am-d's common explicit-worklist traversal and accepts every finite am-g-t-valid header-mediated DAG. | every origin/flag/count mutation; imported Pure/Impure/Unknown/absent-normalization twins; effect-stripped MIR Debug/impl-hash/interface-byte identity; every stored/projection/join effect-cell mutation and parallel eligibility twin; every canonical tag/width/reference/order mutation; shallow and deep semantic↔byte goldens; deep malformed reference/truncation rejection without process-stack recursion |
+| construction | Source declarations record entry/public flags, monomorph worklist outputs record `Monomorph`, every lifted lambda records its exact `u32` capture count, and interface-only declarations copy their exact external effect or normalize absence to `Impure`. Direct calls, function addresses, closures, tasks, and all four parallel kernel modes construct the exact typed target/identity at their current single construction sites. | private/public entry/non-entry, mono, zero/positive capture, imported effect states; direct/native/fn-value/closure/task/materialize/reduce/count/scatter construction owners |
+| move-in, move-out, source nulling, Drop, replacement, and return | `FnOrigin`, `RuntimeKey`, and kernel modes are Copy compiler metadata; boxed calls, canonical records, and generated ids use ordinary Rust ownership. They introduce no Align value, source nulling, Drop plan, replacement, return cleanup bit, runtime allocation, or allocation provenance. Existing callable operands/captures retain the am-b4-proved Move/Drop behavior byte-for-byte. | MIR equality excluding the typed metadata field, existing closure/task/parallel Drop and allocation-count owners, and explicit N/A assertions for new metadata |
+| body and control paths | HIR `Call`, `FnValue`, `Closure`, `Spawn`, every stage/terminal callable, `ResultMapErr`, and indirect-call signature/effect correlation are validated before conversion. `if`, `match`, `else`, `?`, `map_err`, loop/branch joins, early exits, and malformed input never create or publish a typed target or effect join after a rejected child/body. | all corresponding am-b owner ids, stored/local/projection/result effect-cell mutations, Pure/Unknown/Impure parallel twins, plus malformed-before-registry/cache tests and canonical-empty four-entrypoint parity |
+| generic and interface | Concrete generic instances record `Monomorph`; generic templates remain discarded. Imported declarations carry the already-existing interface effect fact only inside checked HIR, convert to the effect-free MIR declaration, and later convert to `ProgramCall` using their exact producer identity. Interface serialization/hash and source ABI fingerprints do not add `FnOrigin`, imported-effect transport, `DirectCall`, or `GeneratedId` and remain byte-identical. | generic source/mono name-equality twins, two-unit import/call/link, imported effect parity, effect-stripped MIR/impl-hash identity, unchanged interface/hash goldens |
+| whole-program and per-unit | Whole-program lowering derives internal linkage; per-unit lowering derives external linkage only for `Source { is_entry: false, is_public: true }`. Producer definitions and consumer imports encode the same program identity; direct/wrapped main and explicit exports follow the collision matrix. | whole/per-unit MIR, LLVM, executable, export, main, and ThinLTO off/on parity |
+| native/FFI and allocation parity | The active 286–294 native registry owns every runtime external identity. A compatible extern reuses the exact active row; incompatible ABI/attribute or external-name collisions reject before LLVM. Native calls, runtime ownership provenance, and success/error allocation counts are unchanged. | base/`alloc-count`/`par-map-probe`/all-feature bidirectional export sets, 281 declaration ABI rows, compatible/incompatible extern twins, cumulative native allocation owners |
+| cache and monomorphization | Typed target bytes participate in structural MIR `impl_hash`; the compiler build changes `compiler_build_id`. Monomorph keys and interface hashes remain unchanged. No generated lookup uses a printed stem or raw table id. | one representation-change miss then unchanged hit, monomorph identity twins, generated collision/probe matrix |
+| benchmark | Am-h and am-c retain linear validation/registry construction and do no artifact or runtime allocation during validation. Canonical encoding and decoding preserve depth-first first-visit bytes through explicit enter/exit work items rather than native recursion. | `mir-header-validation`, `mir-callable-namespace-validation`, deep semantic→bytes→semantic and malformed-decode rows, unchanged runtime-call and continuation rows |
+
+Approval of these fourteen implementation boundaries fixes L2b at twenty-three implementation PRs
+and L2 at twenty-seven. Until the clean fresh review, both counts remain proposed. Target the repository's
+500-line implementation checkpoint. If an implementation PR is expected to exceed roughly 1,000
+changed hand-written lines, record why it cannot split safely before coding.
+Am-d is one cross-cutting vertical even if that exceeds roughly 1,000 hand-written changed lines:
+splitting the producer/replay/lowering conversion would merge a state in which an accepted
+producer-depth body can still overflow a remaining recursive consumer, while splitting the common
+type visitor would leave a later phase free to reintroduce the same failure for a valid deep DAG.
+The exact body preflight, every current recursive body consumer, the common type traversal, and
+their boundary/deep-graph owners therefore land atomically.
+Am-c is cross-cutting by necessity because an untagged call string cannot distinguish a
+source-accepted user spelling from its runtime key; its closure matrix and complete source/MIR/
+codegen owner set land in the same PR. If any body construction PR approaches the bound, split its
+dormant inventory row before coding and update this ledger; do not activate a partial validator.
+
+Am-e deliberately narrows one unsound source corner: a no-argument `main` with any return other
+than Unit, exact i32, or `Result<Unit,builtin Error>` receives a source diagnostic before HIR.
+Those forms were checker-accepted but had no valid C entry ABI; retaining them would publish an
+external `main` with a non-C return type. `draft.md`, `docs/language-spec.md`,
+`docs/design-notes.md`, `docs/open-questions.md`, and `docs/impl/07-roadmap.md` record the corrected
+entry contract. Am-f enforces the settled every-path return obligation, preventing a reachable
+bare return or absent body tail from producing `ret void` under a non-Unit LLVM function. Am-w
+enforces the already-settled successful-wait dominance rule across every
+control path and every handled fallible-Wait success outcome; it changes no language design, but
+rejects the currently unsafe match/loop traversal holes before an uninitialized task slot can be
+read. Am-v enforces the already-documented `mut buffer` requirement at the five native output
+positions whose checkers currently accept an equal-typed temporary or immutable buffer. Am-u makes
+the settled unsafe-FFI boundary exact: a direct or non-escaping named callback invocation is
+lexically inside `unsafe`, while an extern can never escape as a first-class `Fn` value.
+
+Apart from those five explicit corrections, there is no source syntax, source acceptance, public
+diagnostic, interface byte/hash, structural type fingerprint, ownership rule, package API, runtime
+ABI, or C ABI change. Am-h replaces two internal
+checked-HIR origin/linkage fields with `FnOrigin`; no HIR is persisted or exchanged. Am-c changes
+internal MIR call representation and deterministic LLVM/object symbol bytes; its per-unit
+producer/consumer symbols change together, and the existing MIR `impl_hash` plus compiler-build
+cache identity invalidates every affected cached object. No language mirror covers these
+compiler-entry or internal-HIR contracts. Acceptance tests and benchmark rows above become
+cumulative after their owning slice.
+
 Am-g-t is independently complete and activates only its global type-domain all-empty rejection. It
 is linear in stored type metadata and allocates only compiler-owned validation worklists and visit
 maps. `valid_hir_global_type_preflight_is_mir_identity` compares the validated and internal
@@ -1699,8 +2540,8 @@ L2b-a2-s owns the base fact shape, parameter/local formation, struct/tuple
 construction/selection/replacement, destructuring, ordinary block/`if`/loop flow, liveness parity,
 and the product half of the public boundary. L2b-a2-ac first closes the MIR continuation
 prerequisite above without changing a projection fact. L2b-a2-am-g-t closes only direct
-handcrafted-HIR global type-domain validation without changing valid HIR. Am-r must settle and split
-all remaining malformed-HIR work before L2b-a2-af adds validated fixed-array paths
+handcrafted-HIR global type-domain validation without changing valid HIR. The completed am-r
+ledger inserts am-p, am-n, am-h, am-b1–b4, and am-c before L2b-a2-af adds validated fixed-array paths
 and exact/dynamic element selection and replacement. L2b-a2-ar closes eager retained-storage
 actions for non-fixed reads. L2b-a2-ap adds pipeline `Project`/`WhereField` and terminal formation.
 L2b-a2-t owns tagged construction/binding, `match`, `else`, `?`, `map_err`, and the final
@@ -1722,18 +2563,22 @@ owners to the shared focused targets. Every implementation slice retains the sco
 | public and malformed boundary | `ReturnBorrowSummary` and `ReturnRegionSummary` remain the L2a codec and hash shape and remain equal in L2b-a2. Semantic import keeps the L2b-a1 validation order. No projection trie, local id, span, raw nominal id, or control-state bit is serialized. Because the codec carries parameter indices only, an imported aggregate result and any later projection from one aggregate actual deliberately retain that actual's complete compatible owner set. | unchanged codec/hash goldens, interface corruption suite, aggregate-actual precision-limit fixture, and summary byte-size benchmark row |
 | scope boundary | Indirect calls, closure captures, function-value joins/moves, target-relative capture slots, and direct calls without a settled named/imported summary—including unanalyzed extern targets—retain the documented all-compatible-input fallback. No `borrow`, `borrow mut`, cleanup ABI, resource, region, or database surface is enabled. | existing deferred-function-value and compatibility/extern fixtures plus disabled-mode regressions |
 
-L2b-a2-s, L2b-a2-ac, and L2b-a2-am-g-t are independently correct completed or authorized
-verticals. The first PR
+L2b-a2-s, L2b-a2-ac, and L2b-a2-am-g-t are fixed completed verticals. Am-p, am-n, am-h, am-b1,
+am-b2, am-b3, am-b4, am-c, af, ar, ap, and t are the proposed remaining independently correct
+verticals pending the clean am-r review. The first PR
 publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
 retain the shipped flattened result. It must include product construction, reads, partial writes,
 destructuring, ordinary control joins, direct/imported consumption, and whole/per-unit parity
 together: omitting a writer or join can under-approximate the same public product fact. The second
 PR closes the general MIR continuation invariant for checked HIR. The third adds only global
-type-domain validation. Am-r must define the later verticals before implementation; af, ar, ap, and
-t retain their existing dependency order after that completed boundary. The tagged slice still
-replaces its explicit and implicit `Result` fallbacks atomically. No PR may exceed roughly 1,000
-changed hand-written lines without first updating this matrix with a narrower safe boundary and a
-concrete reason that boundary fails.
+type-domain validation. The eight am-r implementation verticals then close placement, nominal/link,
+header, total body metadata, and finally the callable representation change before af, ar, ap, and
+t retain their existing dependency order. Am-c follows am-b4 because its typed/generated identities
+consume already validated body callable facts; it must not duplicate or anticipate the b3/b4 body
+contract. The tagged slice still
+replaces its explicit and implicit `Result` fallbacks atomically. A PR expected to exceed roughly
+1,000 changed hand-written lines must first record in this matrix why no narrower safe boundary
+exists.
 The final L2b-a2-s diff is approximately 1,900 changed hand-written lines after adversarial review
 required fail-closed constructor/read/write validation, common eager-child source-order snapshots,
 snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
@@ -1895,18 +2740,18 @@ Named-return inference likewise uses the checked-HIR direct-call graph rather th
 whole-program rescans. Every function is analyzed once initially; when its monotone parameter-root
 summary grows, only its direct callers are queued again. A call chain therefore advances by
 dependency worklist edges rather than one whole-program round per link. Checked HIR records lifted
-origin as `lifted_capture_count: Option<usize>`: `None` for every named function and monomorph, and
-`Some(capture_count)` for every lifted lambda, including a non-capturing lambda. L2b-a1 skips only
-the latter explicit metadata; it never classifies origin from a mangled-name suffix. This also fixes
-the exact explicit-parameter/capture boundary that L2b-b will consume. Lifted lambdas and
-function-value targets otherwise remain deferred exactly as above. Owner tests place callers before
-callees, cover a mutually recursive pair, and include an ordinary dependency function whose legal
-source name is `lambda0`, so correctness and convergence cannot come from declaration order, an
-in-place single pass, or synthetic-name guessing; the benchmark chain uses the same
-caller-before-callee order. A checked-HIR owner test directly covers all metadata states:
-`None` for an ordinary named function, `None` for a generic monomorph, `Some(0)` for a
-non-capturing lifted lambda, and `Some(n)` with the exact positive capture count for a capturing
-lifted lambda.
+origin with the required `FnOrigin` record defined by am-h above. L2b-a1 skips only
+`FnOrigin::Lifted`; it never classifies origin from a mangled-name suffix. This also fixes the exact
+explicit-parameter/capture boundary that L2b-b will consume. Lifted lambdas and function-value
+targets otherwise remain deferred exactly as above. Owner tests place callers before callees, cover
+a mutually recursive pair, and include an ordinary dependency function whose legal source name is
+`lambda0`, so correctness and convergence cannot come from declaration order, an in-place single
+pass, or synthetic-name guessing; the benchmark chain uses the same caller-before-callee order.
+Direct checked-HIR owner tests cover all origin records: private and public declarations in entry
+and non-entry units, a generic monomorph, `Lifted { capture_count: 0 }`, and
+`Lifted { capture_count: n }` with the exact positive count. They also mutate each source flag and
+origin discriminator while holding the name constant, proving that neither visibility nor origin
+is inferred from spelling.
 
 The reopened-review corrections stay in L2b-a1 as one parity follow-up. Splitting any of them into a
 later PR would leave the current producer able to emit an interface that its consumer rejects,
@@ -2017,7 +2862,7 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; checked HIR carries `lifted_capture_count` and no name spelling decides whether inference runs | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, a local definition using the producer-reserved exact name `Error`, `argon2_params`, or `regex_match`, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; the complete struct/sum definition set is scanned for reserved names before duplicate detection; `generic_body` is precisely the producer's item-span fragment: it starts at `fn` for a function or the declared type name for a struct/sum, omits `pub` and every struct `align`/`layout` prefix, and contains exactly that full declaration/body; validation reconstructs `pub` plus canonical `align(N)` then `layout(C)` prefixes from the structured record, rejects a module/import, extra item, trailing non-END token, or syntax error, parses exactly one declaration, and compares its kind, name, ordered type parameters/bounds, ordered function parameter modes/types and return type, ordered struct fields plus reconstructed layout attributes, or ordered sum variants against the structured record; an extra `pub` in the fragment is a syntax error because visibility is reconstructed rather than compared; function parameter names and generic function implementation expressions are deliberately transported but are not separate structured interface fields; a structured generic `layout(C)` struct returns `GenericCLayoutUnsupported`, within a struct that gate precedes `GenericBodySyntax`, and syntax precedes `GenericBodyMismatch`; all three precede header validation; reserved-local-name rejection precedes duplicate-local-definition rejection and has the exact `ReservedLocalType(name)` import error; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; a local definition sharing any other source-builtin spelling is not a duplicate, and non-shadowing type-parameter, qualified `json.*` builtin, bare builtin, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; am-h replaces the ambiguous checked-HIR `lifted_capture_count`/`exportable` pair with the single required `FnOrigin` record and no name spelling decides whether inference or linkage applies | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, a local definition using the producer-reserved exact name `Error`, `argon2_params`, or `regex_match`, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; the complete struct/sum definition set is scanned for reserved names before duplicate detection; `generic_body` is precisely the producer's item-span fragment: it starts at `fn` for a function or the declared type name for a struct/sum, omits `pub` and every struct `align`/`layout` prefix, and contains exactly that full declaration/body; validation reconstructs `pub` plus canonical `align(N)` then `layout(C)` prefixes from the structured record, rejects a module/import, extra item, trailing non-END token, or syntax error, parses exactly one declaration, and compares its kind, name, ordered type parameters/bounds, ordered function parameter modes/types and return type, ordered struct fields plus reconstructed layout attributes, or ordered sum variants against the structured record; an extra `pub` in the fragment is a syntax error because visibility is reconstructed rather than compared; function parameter names and generic function implementation expressions are deliberately transported but are not separate structured interface fields; a structured generic `layout(C)` struct returns `GenericCLayoutUnsupported`, within a struct that gate precedes `GenericBodySyntax`, and syntax precedes `GenericBodyMismatch`; all three precede header validation; reserved-local-name rejection precedes duplicate-local-definition rejection and has the exact `ReservedLocalType(name)` import error; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; a local definition sharing any other source-builtin spelling is not a duplicate, and non-shadowing type-parameter, qualified `json.*` builtin, bare builtin, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; only reachable explicit returns, loop breaks, and trailing values contribute roots or loop post-state: eager children follow source order and stop after the first non-fallthrough child; `&&`/`||`, `if`/`match` arms, and `else` fallback fork from their common incoming state, retain every reachable dependency/return edge, exclude a diverging alternative from post-state, and join only fallthrough alternatives; `?` evaluates its operand once, contributes its reachable implicit error-return roots only when the enclosing return can borrow, and continues post-state only through the success edge; a loop builds its back-edge only from body fallthrough, its post-state only from reachable breaks, and is non-fallthrough when none exist; checker-owned evidence records the exact statement span of each `break` accepted for its target loop after the target/lambda and newly nested `arena`/`task_group` gates but before payload validation, then a post-check source-order classifier counts only reachable spans from that per-loop set and consumes the separately recorded fallthrough result of each nested loop; HIR carries the same accepted-edge bit on every checked `break`, and effect inference, EscapeCheck, MoveCheck/return-provenance, and MIR lowering may form a loop-result join, escape edge, move/borrow post-state, provenance root, or loop-exit terminator only from an accepted edge; a region-rejected `break` emits its region diagnostic first, checks and preserves its payload only for nested type/effect/ownership/escape diagnostics, records no accepted edge, remains non-fallthrough for recovery in every consumer, lowers fail-closed to `Unreachable` if malformed HIR is forced into MIR, and can neither satisfy an assertion nor combine with an unreachable accepted break to make the loop fall through; statements and tails after a non-fallthrough statement are never visited, so no dead edge can taint a summary or caller liveness; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
 | Effect source-order closure | L2b-a1 | each structural pass visits every reachable eager child once in language order; loop refinement may repeat that pass but every call, impurity flag, and boundary join is monotone and idempotent across fixpoint passes; block traversal stops after the first non-fallthrough statement and visits a tail only when the block falls through; an accepted `break value` visits the reachable effects inside `value` but joins its function-value/concrete effect into the target loop result only when `value` itself falls through to that break edge; ordinary fallthrough accepted breaks still join; written pipelines evaluate source, stage operands, terminal arguments, then terminal captures/action; `if`, `match`, `else`, short-circuit, `?`, `map_err`, nested blocks/regions, loops, explicit return, inner break, calls, aggregates, assignments, captures, pipelines, and process termination use the exhaustive product below and the same fallthrough contract as return provenance | no dead eager sibling, statement, tail, operation, branch-result, terminal argument, stage, or outer break whose payload already terminated can taint a local/result/expression boundary, named-call dependency, direct/indirect impurity, unresolved dispatch, parallel-callback purity, or fixpoint; a rejected break still visits reachable payload diagnostics but never joins a loop result; projection queries cannot reintroduce a dead tail; no conservative default may turn a proven non-fallthrough payload into a result edge | L2b-b extends the same source-order walker to function-value/capture roots |
@@ -2043,7 +2888,21 @@ their first owning slice and remain cumulative gates afterward.
 | L2b-a2-s | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-ac | `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_mir malformed_hir_continuation_metadata_fails_closed`; `cargo test -p align_driver --test mir_continuation`; `cargo test -p align_driver --test expr_depth within_limit_chain_compiles_and_runs`; `cargo test -p align_driver --test per_unit_codegen eager_expression_termination` | `bench/library_boundary/run.sh provenance`: `mir-continuation-lowering` |
 | L2b-a2-am-g-t | `cargo test -p align_mir malformed_hir_global_type_metadata_fails_closed`; `cargo test -p align_mir valid_hir_global_type_preflight_is_mir_identity`; `cargo test -p align_mir`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-global-type-validation`, `mir-continuation-lowering` |
-| L2b-a2-am-r | design-only ledger review; no implementation test or benchmark is authorized until the ledger fixes the split | none |
+| L2b-a2-am-r | design-only completed-ledger consistency check and fresh adversarial review; no implementation target | none |
+| L2b-a2-am-e | `cargo test -p align_sema main_signature_matrix`; `cargo test -p align_codegen_llvm main_abi_matrix`; `cargo test -p align_driver --test main_abi --test unit_main_exit_code --test per_unit_codegen --test thin_lto` | existing compile/codegen rows only; no new benchmark |
+| L2b-a2-am-f | `cargo test -p align_sema function_return_completeness_matrix`; `cargo test -p align_mir function_return_completeness_matrix`; `cargo test -p align_codegen_llvm function_return_completeness_matrix`; `cargo test -p align_driver --test value_control_flow --test analysis_coverage --test per_unit_codegen` | existing compile/control rows only; no new benchmark |
+| L2b-a2-am-w | `cargo test -p align_sema task_get_successful_wait_dominance_matrix`; `cargo test -p align_sema task_wait_proof_alias_scale`; `cargo test -p align_driver --test task_group --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `task-wait-proof-flow`; no new runtime benchmark |
+| L2b-a2-am-v | `cargo test -p align_sema native_output_buffer_requires_mut_local`; `cargo test -p align_driver --test m9_io --test m12_file_io --test m11_net --test m11_crypto --test per_unit_codegen` | existing native I/O rows only; no new benchmark |
+| L2b-a2-am-u | `cargo test -p align_sema extern_invocation_permission_matrix`; `cargo test -p align_driver --test ffi --test ffi_views --test ffi_link --test fn_values --test m5 --test per_unit_codegen` | existing extern/callable rows only; no new benchmark |
+| L2b-a2-am-d | `cargo test -p align_sema checked_hir_depth_closure_matrix`; `cargo test -p align_sema deep_type_consumer_closure_matrix`; `cargo test -p align_mir checked_hir_depth_closure_matrix`; `cargo test -p align_mir deep_type_consumer_closure_matrix`; `cargo test -p align_codegen_llvm checked_hir_depth_closure_matrix`; `cargo test -p align_codegen_llvm deep_type_consumer_closure_matrix`; `cargo test -p align_driver --test expr_depth --test per_unit_codegen --test deep_type_graphs` | existing compile/MIR/codegen and `mir-global-type-validation` rows only; no new runtime benchmark |
+| L2b-a2-am-p | `cargo test -p align_mir malformed_hir_type_placement_fails_closed`; `cargo test -p align_mir valid_hir_type_placement_preflight_is_mir_identity`; `cargo test -p align_mir deep_hir_type_dag_placement_is_stack_bounded`; `cargo test -p align_mir`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-type-placement-validation`, `mir-continuation-lowering` |
+| L2b-a2-am-n | `cargo test -p align_mir malformed_hir_nominal_link_metadata_fails_closed`; `cargo test -p align_mir valid_hir_nominal_link_preflight_is_mir_identity`; `cargo test -p align_mir deep_hir_source_shape_is_stack_bounded`; `cargo test -p align_mir`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-nominal-link-validation`, `mir-continuation-lowering` |
+| L2b-a2-am-h | `cargo test -p align_mir malformed_hir_declaration_header_metadata_fails_closed`; `cargo test -p align_mir valid_hir_declaration_header_preflight_is_mir_identity`; `cargo test -p align_mir deep_hir_header_type_dag_is_stack_bounded`; `cargo test -p align_mir`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-header-validation`, `mir-continuation-lowering` |
+| L2b-a2-am-b1 | `cargo test -p align_mir hir_body_validator_core`; `cargo test -p align_mir hir_body_validator_statements`; `cargo test -p align_mir deep_hir_body_core_type_dag_is_stack_bounded`; no public-entrypoint activation | none |
+| L2b-a2-am-b2 | `cargo test -p align_mir hir_body_validator_storage_pipeline_json`; `cargo test -p align_mir deep_hir_body_storage_type_dag_is_stack_bounded`; no public-entrypoint activation | none |
+| L2b-a2-am-b3 | `cargo test -p align_mir hir_body_validator_native`; `cargo test -p align_mir hir_body_validator_generated_callables`; `cargo test -p align_mir deep_hir_body_native_type_dag_is_stack_bounded`; no public-entrypoint activation | none |
+| L2b-a2-am-b4 | `cargo test -p align_mir malformed_hir_body_metadata_fails_closed`; `cargo test -p align_mir valid_hir_body_preflight_is_mir_identity`; `cargo test -p align_mir max_checked_hir_depth_body_preflight_is_stack_bounded`; `cargo test -p align_mir deep_hir_body_activation_type_dag_is_stack_bounded`; `cargo test -p align_mir`; `cargo test -p align_driver --test expr_depth within_limit_chain_compiles_and_runs`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-body-validation`, `mir-continuation-lowering` |
+| L2b-a2-am-c | `cargo test -p align_mir malformed_hir_callable_namespace_fails_closed`; `cargo test -p align_mir deep_canonical_type_codec_is_stack_bounded`; `cargo test -p align_codegen_llvm callable_namespace`; `cargo test -p align_driver --test per_unit_codegen --test exports`; `cargo test -p align_mir`; `cargo test -p align_codegen_llvm` | `bench/library_boundary/run.sh provenance`: `mir-callable-namespace-validation`, `mir-continuation-lowering` |
 | L2b-a2-af | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-ar | `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test borrow_liveness --test struct_index --test chunks --test soa --test m11_http --test m11_http_get_many` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-ap | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
@@ -2162,9 +3021,9 @@ Acceptance:
   `GenericCLayoutUnsupported`; fragments containing an extra `pub`, module/import, second item,
   trailing token, wrong declaration kind, or malformed syntax reject with the recorded
   C-layout-before-syntax-before-mismatch precedence;
-- checked HIR records named and generic-monomorph functions as `lifted_capture_count == None`,
-  a non-capturing lifted lambda as `Some(0)`, and a capturing lifted lambda as `Some(n)` with the
-  exact capture count;
+- checked HIR records source declarations, generic monomorphs, and lifted lambdas with distinct
+  `FnOrigin` variants; lifted counts are exact, and source entry/public flags determine exportability
+  without a parallel stored boolean;
 - a reachable fixed return or loop break followed by an unreachable parameter-returning exit
   produces `None`, keeps the caller owner usable, and contributes no dead loop post-state in either
   whole-program or per-unit checking;

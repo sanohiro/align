@@ -148,6 +148,18 @@ every item below has since completed as recorded in the per-milestone sections, 
    first-class-closures → `task_group` arc (slices ①–④c) is COMPLETE**: closures as values /
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
    sound `get`-before-`wait`, and a `wait()?` error boundary.
+   **Successful-Wait flow correction pending am-w (2026-07-31):** the settled proof follows an
+   exact group/epoch through bare Result locals, copy/reassignment, `map_err`, and value-producing
+   control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and is
+   invalidated for every alias by a later Spawn. Calls/returns/captures/imports/aggregate
+   reconstruction do not transport it. The current traversal does not implement the complete
+   stored-result, match, and loop joins and can admit `get()` on an uninitialized slot. Each Move
+   Task handle also carries its originating group through transparent local/control transfer;
+   `get()` checks that group rather than the innermost active group. Nested entry retains outer
+   facts, inner Wait cannot authorize an outer Task, and handling an outer Wait Result inside the
+   inner group updates the outer fact. Exit clears proofs naming the exited group, including one on
+   its Result block value, without clearing outer proofs. Current primitive `get()` is
+   non-consuming and repeatable. Am-w owns the producer correction and scale matrix.
 4. **Language-spec stock-take (2026-06-24) → the "big three" expressiveness gaps.** Before `std`,
    the language itself needs three interlocked features to be expressively complete (model any
    domain, handle errors well). Validated against an external review pass (Codex/Gemini); these are
@@ -278,6 +290,10 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 ## M1 — The Bones of the Language (functions, control, struct, bool) — DONE
 
 - [done] `fn` (normal form + `= expr` short form), multiple arguments, function calls.
+- **Return-completeness correction pending am-f (2026-07-31):** the settled contract permits bare
+  return/reachable fallthrough only for Unit. The current checker can emit `Return(None)` or an
+  absent reachable tail for a non-Unit function, which reaches LLVM as `ret void` under a
+  value-returning signature. Am-f rejects both before HIR and pins every-path completion.
 - [done] `if` / comparison operations / `bool`.
 - [done] `mut` and reassignment.
 - [done] One `print` equivalent of `std.io`, wired directly to the runtime (for output
@@ -342,10 +358,17 @@ Type representation in the compiler (keeps `Ty: Copy`)
   int/float literal defaults there, exactly like a bare literal). This sidesteps
   inference variables living inside a composite type — acceptable for M2.
 
-Runtime ABI for Result-returning main (locked)
-- M2 `main` takes no arguments (sema rejects params); `main(args: array<str>)`
-  (`draft.md` §17) is future. Both `-> i32` and `-> Result<(), Error>` are allowed.
+Runtime ABI for Result-returning main (locked; am-e correction pending)
+- The locked entry family supersedes M2's original no-argument-only
+  restriction. A no-argument `main` returns only `()`, exact signed `i32`, or
+  `Result<(), Error>`. The argv form is exactly
+  `main(args: array<str>) -> Result<(), Error>`. Every other return or parameter
+  shape must be rejected before HIR/codegen; it must never become an external C
+  `main` with a non-C return ABI. The current checker still accepts that invalid
+  corner; am-e is the pending producer correction.
 - `fn main() -> i32` stays the C entry unchanged (M0/M1 behavior preserved).
+- `fn main() -> ()` is lowered under the symbol `align_main`; codegen emits a C
+  `main` wrapper that calls it and returns 0.
 - `fn main() -> Result<(), Error>` is lowered under the symbol `align_main`;
   codegen emits a C `main` wrapper that calls it, and on `Err(code)` calls the
   runtime `align_rt_report_error(i32) -> i32` (reports + returns the clamped exit
@@ -1203,8 +1226,12 @@ and the hot/cold field-split suggestion (needs heuristic design).
   the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay
   auto-linked). `ast::ExternBlock.link`, parser `parse_link_clause`. (`tests/ffi_link.rs`,
   `examples/ffi_link.align`.)
-  **FFI v1 is COMPLETE** (extern decls + unsafe-gating, scalar+`raw`+`()` signatures, `layout(C)`
-  struct-by-pointer, `str`/`slice`/`bytes` views, `link("name")`). **By-value struct passing shipped
+  **FFI v1 shipped** extern declarations, unsafe-gated direct calls, scalar+`raw`+`()` signatures,
+  `layout(C)` struct-by-pointer, `str`/`slice`/`bytes` views, and `link("name")`. A 2026-07-31 audit
+  found that higher-order resolvers and function-value formation bypass the intended lexical
+  permission. The settled target is direct and non-escaping pipeline/reducer/sort callback
+  invocation only while lexically inside `unsafe`, with no extern function values; am-u is the
+  pending producer correction. **By-value struct passing shipped
   beyond v1** (#329, 2026-07-03): a `layout(C)` struct ≤ 16 bytes passes/returns in registers on
   **x86-64 SysV only**, emitting clang's exact coercion and verified against a compiled-C-helper
   round-trip harness; codegen refuses (rather than guesses) on any non-SysV target, a >16-byte
