@@ -471,6 +471,51 @@ fn checked_hir_depth_closure_matrix() {
 }
 
 #[test]
+fn deep_type_consumer_closure_matrix() {
+    std::thread::Builder::new()
+        .name("deep-type-mir-owner".to_string())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+            let mut program = baseline_program();
+            program.structs = (0..DEPTH)
+                .map(|index| StructDef {
+                    name: format!("Deep{index}"),
+                    source_name: format!("Deep{index}"),
+                    fields: vec![FieldDef {
+                        name: "next".to_string(),
+                        ty: if index + 1 == DEPTH {
+                            Ty::String
+                        } else {
+                            Ty::Struct((index + 1) as u32)
+                        },
+                    }],
+                    align: None,
+                    c_repr: false,
+                })
+                .collect();
+            program.tagged_types = (0..DEPTH)
+                .map(|index| TaggedType::Option(if index + 1 == DEPTH {
+                    Scalar::Struct(0)
+                } else {
+                    Scalar::Tagged((index + 1) as u32)
+                }))
+                .collect();
+            program.fn_types[0].ret = Ty::Tagged(0);
+            assert_accepted("deep nominal/tagged type consumer", &program);
+
+            program.structs[DEPTH - 1].fields.push(FieldDef {
+                name: "later_missing".to_string(),
+                ty: Ty::Struct(DEPTH as u32 + 7),
+            });
+            assert_rejected("deep later-sibling type error", &program);
+        })
+        .expect("spawn deep type MIR owner")
+        .join()
+        .expect("deep type MIR owner");
+}
+
+#[test]
 fn malformed_hir_global_type_metadata_fails_closed() {
     for (label, ty) in [
         ("param", Ty::Param(0)),
