@@ -425,11 +425,12 @@ spines, immediate parent-owned continuations for multi-child ownership boundarie
 out-of-line structured-control and specialized-operation frames bounded by the fixed 259 ceiling.
 The outer dispatcher reaches the existing file, reader, array-builder, process-command, path,
 regex, and HTTP helpers without retaining the giant recursive frame; strict string wrappers stay
-on the eager worklist. Mixed eager/call, string/path, block/template, `if`, binary/wildcard `match`,
-`else`, short-circuit, loop, and arena/task-group boundary owners run on the 2 MiB test stack. The
-final raw/optimized LLVM owner uses the same
-accepted record boundary, and the deep owned-leaf codegen owner emits the actual recursive Drop on
-that same stack.
+on the eager worklist. Mixed eager/call, string/path/regex, self-buffering reader,
+block/template, `if`, binary/wildcard `match`, `else`, short-circuit, loop, and arena/task-group
+boundary owners run on the 2 MiB test stack. Reachability replay propagates strict-child divergence
+through transparent stage/template records before visiting later siblings. The final raw/optimized
+LLVM owner uses the same accepted record boundary, and the deep owned-leaf codegen owner emits the
+actual recursive Drop on that same stack.
 Am-g-t intentionally
 admits every finite header-mediated type DAG with no depth cap, so
 am-d also establishes one common iterative type traversal. Am-p placement, am-n shape comparison,

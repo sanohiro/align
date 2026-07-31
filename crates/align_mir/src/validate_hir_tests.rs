@@ -362,6 +362,113 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::ReaderStdin,
+        ty: Ty::Reader,
+        span,
+    };
+    for _ in 2..depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::ReaderBuffered {
+                reader: Box::new(expr),
+            },
+            ty: Ty::Reader,
+            span,
+        };
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_reader_buffered".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::Reader,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_regex_string_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Str("x".to_string()),
+        ty: Ty::Str,
+        span,
+    };
+    for _ in 2..depth {
+        expr = if expr.ty == Ty::String {
+            hir::Expr {
+                kind: hir::ExprKind::StrBorrow(Box::new(expr)),
+                ty: Ty::Str,
+                span,
+            }
+        } else {
+            hir::Expr {
+                kind: hir::ExprKind::RegexReplace {
+                    regex: Box::new(hir::Expr {
+                        kind: hir::ExprKind::Local(0),
+                        ty: Ty::Regex,
+                        span,
+                    }),
+                    text: Box::new(expr),
+                    repl: Box::new(hir::Expr {
+                        kind: hir::ExprKind::Str("y".to_string()),
+                        ty: Ty::Str,
+                        span,
+                    }),
+                    all: false,
+                },
+                ty: Ty::String,
+                span,
+            }
+        };
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_regex_string".to_string(),
+        lifted_capture_count: None,
+        params: vec![0],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: vec![hir::Local {
+            id: 0,
+            name: "regex".to_string(),
+            ty: Ty::Regex,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }],
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 fn with_template_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
@@ -972,6 +1079,8 @@ fn checked_hir_depth_closure_matrix() {
                 with_mixed_eager_body_depth,
                 with_str_trim_body_depth,
                 with_path_string_body_depth,
+                with_reader_buffered_body_depth,
+                with_regex_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,
                 with_match_arm_body_depth,
@@ -1002,6 +1111,8 @@ fn checked_hir_depth_closure_matrix() {
                 with_mixed_eager_body_depth,
                 with_str_trim_body_depth,
                 with_path_string_body_depth,
+                with_reader_buffered_body_depth,
+                with_regex_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,
                 with_match_arm_body_depth,

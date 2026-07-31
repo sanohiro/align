@@ -37,6 +37,51 @@ pub(crate) enum BodyEvent<'a> {
     },
 }
 
+fn transparent_record_diverges(record: BodyRecord<'_>) -> bool {
+    match record {
+        BodyRecord::Stmt(statement) => crate::hir_stmt_diverges(statement),
+        BodyRecord::Expr(expression) => crate::hir_expr_diverges(expression),
+        BodyRecord::Stage(stage) => match &stage.kind {
+            StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
+                captures.iter().any(crate::hir_expr_diverges)
+            }
+            StageKind::WhereStrContains { needle } => crate::hir_expr_diverges(needle),
+            StageKind::WhereField { .. } | StageKind::Project { .. } => false,
+        },
+        BodyRecord::TemplatePart(part) => match part {
+            TemplatePart::Hole(expression)
+            | TemplatePart::JsonStr(expression)
+            | TemplatePart::OptionField {
+                access: expression, ..
+            }
+            | TemplatePart::OptionStructField {
+                access: expression, ..
+            }
+            | TemplatePart::StructArrayField {
+                access: expression, ..
+            }
+            | TemplatePart::ScalarArrayField {
+                access: expression, ..
+            }
+            | TemplatePart::UnionValue {
+                access: expression, ..
+            } => crate::hir_expr_diverges(expression),
+            TemplatePart::Text(_) | TemplatePart::PopComma => false,
+        },
+        BodyRecord::Block(_)
+        | BodyRecord::StmtExit(_)
+        | BodyRecord::ExprExit { .. }
+        | BodyRecord::MatchArm { .. } => false,
+    }
+}
+
+fn record_is_strict_expression_child(record: BodyRecord<'_>) -> bool {
+    matches!(
+        record,
+        BodyRecord::Expr(_) | BodyRecord::Stage(_) | BodyRecord::TemplatePart(_)
+    )
+}
+
 /// Check every stored function body before a recursive checked-HIR consumer can run.
 ///
 /// Every body is an independent root at depth one. The match over [`ExprKind`] is deliberately
@@ -870,25 +915,10 @@ fn walk_body_records<'a>(
             if reachable_only {
                 let first_diverging = work[child_start..]
                     .iter()
-                    .position(|(child, _)| match child {
-                        BodyRecord::Stmt(statement) => {
-                            crate::hir_stmt_diverges(statement)
-                        }
-                        BodyRecord::Expr(expression) => {
-                            crate::hir_expr_diverges(expression)
-                        }
-                        BodyRecord::Block(_)
-                        | BodyRecord::StmtExit(_)
-                        | BodyRecord::ExprExit { .. }
-                        | BodyRecord::MatchArm { .. }
-                        | BodyRecord::Stage(_)
-                        | BodyRecord::TemplatePart(_) => false,
-                    });
+                    .position(|(child, _)| transparent_record_diverges(*child));
                 if let Some(index) = first_diverging {
-                    expression_children_completed = !matches!(
-                        work[child_start + index].0,
-                        BodyRecord::Expr(_)
-                    );
+                    expression_children_completed =
+                        !record_is_strict_expression_child(work[child_start + index].0);
                     work.truncate(child_start + index + 1);
                 }
             }

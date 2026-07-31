@@ -12517,10 +12517,14 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
             },
             HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)) => {
                 match &expression.kind {
-                    ExprKind::If { then, els, .. } => {
+                    ExprKind::If { cond, then, els } => {
+                        // The condition is strict. If it diverges the branches are unreachable;
+                        // otherwise the `if` diverges only when both alternatives do.
+                        work.push(HirDivergenceWork::Any(2));
                         work.push(HirDivergenceWork::All(2));
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(els)));
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(then)));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(cond)));
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
@@ -12528,17 +12532,44 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                     | ExprKind::Unsafe(block) => {
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(block)));
                     }
-                    ExprKind::Match { arms, .. } if !arms.is_empty() => {
+                    ExprKind::Match { scrutinee, arms } if !arms.is_empty() => {
+                        // The scrutinee is strict; arm bodies are alternatives.
+                        work.push(HirDivergenceWork::Any(2));
                         work.push(HirDivergenceWork::All(arms.len()));
                         for arm in arms.iter().rev() {
                             work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(&arm.body)));
                         }
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(scrutinee)));
                     }
                     // A loop with no `break` never yields and control never reaches past it.
                     ExprKind::Loop { diverges, .. } => {
                         work.push(HirDivergenceWork::Value(*diverges));
                     }
-                    _ => work.push(HirDivergenceWork::Value(false)),
+                    // Only the left/receiver operand is guaranteed to run. The right/fallback
+                    // expression is conditional and cannot make the whole expression always
+                    // diverge.
+                    ExprKind::Binary {
+                        op: align_ast::BinOp::And | align_ast::BinOp::Or,
+                        lhs,
+                        ..
+                    } => work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(lhs))),
+                    ExprKind::ElseUnwrap { opt, .. } => {
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(opt)));
+                    }
+                    // Every remaining direct HIR child is evaluated strictly in producer order.
+                    // Propagating `Any` is what makes a wrapper such as `id(loop {})`, a template
+                    // hole, or a pipeline capture diverge before its parent's later siblings.
+                    _ => {
+                        let children = hir_depth::direct_expr_children(expression);
+                        if children.is_empty() {
+                            work.push(HirDivergenceWork::Value(false));
+                        } else {
+                            work.push(HirDivergenceWork::Any(children.len()));
+                            for child in children.into_iter().rev() {
+                                work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(child)));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -34864,6 +34895,74 @@ fn main() -> i32 = 0
                 .iter()
                 .map(|function| function.effect.get())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn effect_scan_prunes_transitively_diverging_template_holes() {
+        let (mut program, diagnostics) = check(
+            "\
+fn id(value: i64) -> i64 = value
+fn impure() -> i64 {
+  print(1)
+  return 1
+}
+fn wrapper() -> i64 {
+  template \"{id(1)}{impure()}\"
+  print(2)
+  return 0
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::Template(parts),
+            ..
+        }) = &mut wrapper.body.stmts[0]
+        else {
+            panic!("wrapper template statement");
+        };
+        let first_hole = parts
+            .iter_mut()
+            .find_map(|part| match part {
+                TemplatePart::Hole(expression) => Some(expression),
+                _ => None,
+            })
+            .expect("first template hole");
+        let ExprKind::Call { args, .. } = &mut first_hole.kind else {
+            panic!("first template hole call");
+        };
+        args[0] = Expr {
+            kind: ExprKind::Loop {
+                body: Block {
+                    stmts: Vec::new(),
+                    value: None,
+                },
+                diverges: true,
+                body_locals: 0..0,
+            },
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span: args[0].span,
+        };
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new()).get("wrapper"),
+            Some(&FnEffect::Pure),
+            "the nested diverging first hole must suppress the later impure hole and statement"
         );
     }
 
