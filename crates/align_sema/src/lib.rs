@@ -14998,10 +14998,13 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> Option<bool> {
-        #[derive(Clone, Copy)]
         enum Post<'e> {
             None,
             Try(&'e Expr),
+            JoinIncoming {
+                moved: MovedSet,
+                borrows: BorrowState,
+            },
         }
 
         let mut wrappers = Vec::new();
@@ -15084,6 +15087,74 @@ impl<'a> MoveCheck<'a> {
                             current_consuming,
                             current_direct,
                             Post::None,
+                        )
+                    }
+                    ExprKind::Binary {
+                        op: BinOp::And | BinOp::Or,
+                        lhs,
+                        rhs,
+                    } if self.expr_is_move_neutral(lhs)
+                        && !hir_expr_diverges(lhs) =>
+                    {
+                        (
+                            rhs.as_ref(),
+                            false,
+                            false,
+                            false,
+                            Post::JoinIncoming {
+                                moved: moved.clone(),
+                                borrows: self.borrows.clone(),
+                            },
+                        )
+                    }
+                    ExprKind::ElseUnwrap { opt, fallback }
+                        if self.expr_is_move_neutral(opt)
+                            && !hir_expr_diverges(opt) =>
+                    {
+                        (
+                            fallback.as_ref(),
+                            false,
+                            current_consuming,
+                            false,
+                            Post::JoinIncoming {
+                                moved: moved.clone(),
+                                borrows: self.borrows.clone(),
+                            },
+                        )
+                    }
+                    ExprKind::If { cond, then, els }
+                        if self.expr_is_move_neutral(cond)
+                            && !hir_expr_diverges(cond) =>
+                    {
+                        let child = if self
+                            .move_neutral_block_value(els)
+                            .is_some()
+                        {
+                            then.stmts
+                                .is_empty()
+                                .then_some(then.value.as_deref())
+                                .flatten()
+                        } else if self
+                            .move_neutral_block_value(then)
+                            .is_some()
+                        {
+                            els.stmts
+                                .is_empty()
+                                .then_some(els.value.as_deref())
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        let Some(child) = child else { break };
+                        (
+                            child,
+                            false,
+                            current_consuming,
+                            false,
+                            Post::JoinIncoming {
+                                moved: moved.clone(),
+                                borrows: self.borrows.clone(),
+                            },
                         )
                     }
                     ExprKind::OptionSome(child)
@@ -15175,7 +15246,7 @@ impl<'a> MoveCheck<'a> {
             return None;
         }
 
-        for &(wrapper, opens_arena, _) in &wrappers {
+        for (wrapper, opens_arena, _) in &wrappers {
             let may_borrow = ty_may_borrow(
                 wrapper.ty,
                 self.structs,
@@ -15187,18 +15258,20 @@ impl<'a> MoveCheck<'a> {
                 self.clear_value_snapshot(Self::expr_key(wrapper));
             }
             self.value_snapshot_frames.push(Vec::new());
-            if opens_arena {
+            if *opens_arena {
                 self.arena_depth += 1;
             }
         }
 
-        let falls_through = self.expr(
+        let mut falls_through = self.expr(
             current,
             moved,
             current_consuming,
             current_direct,
         );
-        for &(wrapper, opens_arena, post) in wrappers.iter().rev() {
+        for (wrapper, opens_arena, post) in
+            wrappers.into_iter().rev()
+        {
             if opens_arena {
                 self.arena_depth -= 1;
             }
@@ -15207,10 +15280,31 @@ impl<'a> MoveCheck<'a> {
                 .pop()
                 .expect("value snapshot frame for transparent expression");
             let key = Self::expr_key(wrapper);
+            let try_result = match post {
+                Post::JoinIncoming {
+                    moved: incoming_moved,
+                    borrows: incoming_borrows,
+                } => {
+                    if falls_through {
+                        *moved = &incoming_moved | &*moved;
+                        self.borrows = BorrowState::join(
+                            &incoming_borrows,
+                            &self.borrows,
+                        );
+                    } else {
+                        *moved = incoming_moved;
+                        self.borrows = incoming_borrows;
+                    }
+                    falls_through = true;
+                    None
+                }
+                Post::Try(result) => Some(result),
+                Post::None => None,
+            };
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
             } else {
-                if let Post::Try(result) = post
+                if let Some(result) = try_result
                     && ty_may_borrow(
                         self.f.ret,
                         self.structs,
@@ -15247,6 +15341,18 @@ impl<'a> MoveCheck<'a> {
             }
         }
         Some(falls_through)
+    }
+
+    fn move_neutral_block_value<'b>(
+        &self,
+        block: &'b Block,
+    ) -> Option<&'b Expr> {
+        if !block.stmts.is_empty() {
+            return None;
+        }
+        let value = block.value.as_deref()?;
+        (self.expr_is_move_neutral(value) && !hir_expr_diverges(value))
+            .then_some(value)
     }
 
     fn transparent_pipeline_capture(

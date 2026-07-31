@@ -992,6 +992,13 @@ mod tests {
         TemplatePart,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum MoveControlShape {
+        ShortCircuit,
+        ElseUnwrap,
+        If,
+    }
+
     fn int_ty() -> Ty {
         Ty::Int(IntTy {
             bits: 64,
@@ -1306,6 +1313,126 @@ mod tests {
         }
     }
 
+    fn move_control_program_at_boundary(
+        shape: MoveControlShape,
+    ) -> hir::Program {
+        let span = Span::new(0, 0, 0);
+        let target_expression_depth = MAX_CHECKED_HIR_DEPTH - 1;
+        let delta = match shape {
+            MoveControlShape::ShortCircuit
+            | MoveControlShape::ElseUnwrap => 1,
+            MoveControlShape::If => 2,
+        };
+        let mut expression = Expr {
+            kind: ExprKind::StrBorrow(Box::new(Expr {
+                kind: ExprKind::Local(0),
+                ty: Ty::String,
+                span,
+            })),
+            ty: Ty::Str,
+            span,
+        };
+        let mut expression_depth = 2;
+        while expression_depth + delta <= target_expression_depth {
+            let kind = match shape {
+                MoveControlShape::ShortCircuit => ExprKind::Binary {
+                    op: crate::BinOp::And,
+                    lhs: Box::new(Expr {
+                        kind: ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    }),
+                    rhs: Box::new(expression),
+                },
+                MoveControlShape::ElseUnwrap => ExprKind::ElseUnwrap {
+                    opt: Box::new(Expr {
+                        kind: ExprKind::OptionNone,
+                        ty: Ty::Option(crate::Scalar::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        })),
+                        span,
+                    }),
+                    fallback: Box::new(expression),
+                },
+                MoveControlShape::If => ExprKind::If {
+                    cond: Box::new(Expr {
+                        kind: ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    }),
+                    then: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(expression)),
+                    },
+                    els: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(leaf())),
+                    },
+                },
+            };
+            expression = Expr {
+                kind,
+                ty: match shape {
+                    MoveControlShape::ShortCircuit => Ty::Bool,
+                    MoveControlShape::ElseUnwrap
+                    | MoveControlShape::If => int_ty(),
+                },
+                span,
+            };
+            expression_depth += delta;
+        }
+        while expression_depth < target_expression_depth {
+            expression = Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: int_ty(),
+                span,
+            };
+            expression_depth += 1;
+        }
+        assert_eq!(expression_depth, target_expression_depth);
+        let ret = expression.ty;
+        hir::Program {
+            fns: vec![hir::Fn {
+                name: "deep_move_control".to_string(),
+                lifted_capture_count: None,
+                params: vec![0],
+                param_modes: vec![align_ast::ParamMode::ByValue],
+                ret,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                locals: vec![hir::Local {
+                    id: 0,
+                    name: "value".to_string(),
+                    ty: Ty::String,
+                    is_mut: false,
+                    is_param: true,
+                    align: None,
+                }],
+                body: Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(expression)),
+                },
+                span,
+                drop_locals: Vec::new(),
+                drop_individual_locals: Vec::new(),
+                drop_individual_exprs: Default::default(),
+                exportable: false,
+            }],
+            externs: Vec::new(),
+            link_libs: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            tagged_types: Vec::new(),
+            tuples: Vec::new(),
+            fn_types: Vec::new(),
+            imported_fns: Vec::new(),
+        }
+    }
+
     #[test]
     fn checked_hir_depth_closure_matrix() {
         for shape in [
@@ -1360,6 +1487,15 @@ mod tests {
                     move_shape_program_at_boundary(Shape::MatchArm),
                     move_shape_program_at_boundary(Shape::Stage),
                     move_shape_program_at_boundary(Shape::TemplatePart),
+                    move_control_program_at_boundary(
+                        MoveControlShape::ShortCircuit,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::ElseUnwrap,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::If,
+                    ),
                 ]);
                 for move_program in move_programs {
                     assert!(checked_hir_body_depth_is_valid(&move_program));
