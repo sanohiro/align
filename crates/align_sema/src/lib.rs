@@ -30928,8 +30928,6 @@ fn struct_acyclic(
         enums,
         tagged_types,
         visiting,
-        &mut Vec::new(),
-        &mut Vec::new(),
     )
 }
 
@@ -30945,8 +30943,6 @@ fn enum_acyclic(
         enums,
         tagged_types,
         &mut Vec::new(),
-        &mut Vec::new(),
-        &mut Vec::new(),
     )
 }
 
@@ -30955,127 +30951,107 @@ fn type_graph_acyclic(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    struct_path: &mut Vec<u32>,
-    enum_path: &mut Vec<u32>,
-    tagged_path: &mut Vec<u32>,
+    initial_struct_path: &mut Vec<u32>,
 ) -> bool {
-    match ty {
-        Ty::Struct(id) => {
-            if struct_path.contains(&id) {
-                return false;
-            }
-            let Some(def) = structs.get(id as usize) else { return true };
-            struct_path.push(id);
-            let ok = def
-                .fields
-                .iter()
-                .all(|field| {
-                    type_graph_acyclic(
-                        field.ty,
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                });
-            struct_path.pop();
-            ok
-        }
-        Ty::Enum(id) => {
-            if enum_path.contains(&id) {
-                return false;
-            }
-            let Some(def) = enums.get(id as usize) else { return true };
-            enum_path.push(id);
-            let ok = def.variants.iter().all(|variant| {
-                variant.payload.iter().all(|payload| {
-                    type_graph_acyclic(
-                        scalar_to_ty(*payload),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                })
-            });
-            enum_path.pop();
-            ok
-        }
-        Ty::Option(payload) => type_graph_acyclic(
-            scalar_to_ty(payload),
-            structs,
-            enums,
-            tagged_types,
-            struct_path,
-            enum_path,
-            tagged_path,
-        ),
-        Ty::Result(ok, err) => {
-            type_graph_acyclic(
-                scalar_to_ty(ok),
-                structs,
-                enums,
-                tagged_types,
-                struct_path,
-                enum_path,
-                tagged_path,
-            ) && type_graph_acyclic(
-                scalar_to_ty(err),
-                structs,
-                enums,
-                tagged_types,
-                struct_path,
-                enum_path,
-                tagged_path,
-            )
-        }
-        Ty::Tagged(id) => {
-            if tagged_path.contains(&id) {
-                return false;
-            }
-            let Some(entry) = tagged_types.get(id as usize) else {
-                return false;
-            };
-            tagged_path.push(id);
-            let ok = match *entry {
-                hir::TaggedType::Option(payload) => type_graph_acyclic(
-                    scalar_to_ty(payload),
-                    structs,
-                    enums,
-                    tagged_types,
-                    struct_path,
-                    enum_path,
-                    tagged_path,
-                ),
-                hir::TaggedType::Result(ok, err) => {
-                    type_graph_acyclic(
-                        scalar_to_ty(ok),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    ) && type_graph_acyclic(
-                        scalar_to_ty(err),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                }
-            };
-            tagged_path.pop();
-            ok
-        }
-        _ => true,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum Node {
+        Struct(u32),
+        Enum(u32),
+        Tagged(u32),
     }
+
+    enum Work {
+        Enter(Ty),
+        Exit(Node),
+    }
+
+    let mut active: std::collections::HashSet<Node> = initial_struct_path
+        .iter()
+        .copied()
+        .map(Node::Struct)
+        .collect();
+    let mut complete = std::collections::HashSet::new();
+    let mut work = vec![Work::Enter(ty)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Ty::Struct(id)) => {
+                let node = Node::Struct(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(definition) = structs.get(id as usize) else {
+                    active.remove(&node);
+                    continue;
+                };
+                work.push(Work::Exit(node));
+                for field in definition.fields.iter().rev() {
+                    work.push(Work::Enter(field.ty));
+                }
+            }
+            Work::Enter(Ty::Enum(id)) => {
+                let node = Node::Enum(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(definition) = enums.get(id as usize) else {
+                    active.remove(&node);
+                    continue;
+                };
+                work.push(Work::Exit(node));
+                for payload in definition
+                    .variants
+                    .iter()
+                    .rev()
+                    .flat_map(|variant| variant.payload.iter().rev())
+                {
+                    work.push(Work::Enter(scalar_to_ty(*payload)));
+                }
+            }
+            Work::Enter(Ty::Option(payload)) => {
+                work.push(Work::Enter(scalar_to_ty(payload)));
+            }
+            Work::Enter(Ty::Result(ok, err)) => {
+                work.push(Work::Enter(scalar_to_ty(err)));
+                work.push(Work::Enter(scalar_to_ty(ok)));
+            }
+            Work::Enter(Ty::Tagged(id)) => {
+                let node = Node::Tagged(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(entry) = tagged_types.get(id as usize) else {
+                    return false;
+                };
+                work.push(Work::Exit(node));
+                match *entry {
+                    hir::TaggedType::Option(payload) => {
+                        work.push(Work::Enter(scalar_to_ty(payload)));
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        work.push(Work::Enter(scalar_to_ty(err)));
+                        work.push(Work::Enter(scalar_to_ty(ok)));
+                    }
+                }
+            }
+            Work::Enter(_) => {}
+            Work::Exit(node) => {
+                if !active.remove(&node) {
+                    return false;
+                }
+                complete.insert(node);
+            }
+        }
+    }
+    true
 }
 
 /// Whether a scalar is a valid sum-type variant payload. Direct structs and sums may be Move: the
@@ -33993,6 +33969,35 @@ fn main() -> i32 = 0
         assert!(
             !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
+        );
+    }
+
+    #[test]
+    fn inline_type_graph_acyclicity_is_stack_bounded() {
+        let mut structs = (0..4_096)
+            .map(|depth| StructDef {
+                name: format!("S{depth}"),
+                source_name: format!("S{depth}"),
+                fields: vec![FieldDef {
+                    name: "next".to_string(),
+                    ty: if depth == 4_095 {
+                        Ty::Bool
+                    } else {
+                        Ty::Struct(depth + 1)
+                    },
+                }],
+                align: None,
+                c_repr: false,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            struct_acyclic(0, &structs, &[], &[], &mut Vec::new()),
+            "a finite deep inline graph must not consume the process stack"
+        );
+        structs[4_095].fields[0].ty = Ty::Struct(0);
+        assert!(
+            !struct_acyclic(0, &structs, &[], &[], &mut Vec::new()),
+            "a deep inline cycle must still reject"
         );
     }
 
