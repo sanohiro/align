@@ -30139,27 +30139,30 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     // struct). An owned (`string`, Move-struct, or `Option<owned>`) field makes the enclosing struct a
     // Move type with a recursive `Drop` (Slice 3 / the REST-gateway runway Slice B). Owned
     // *collections* (`array<T>` etc.) as fields are a later slice.
-    match ty {
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
         // enclosing struct to borrowed storage (`struct_has_str_rec` / `tracks_region` handle that).
-        Ty::Enum(_) => true,
+        Ty::Enum(_) => {}
         // A Move **handle** field (F1②, the pkg.web request `Ctx` owning its `http_request_ctx`). A
         // bare pointer handle (`file`, `http_request_ctx`, a reader/writer/buffer, a socket, an http
         // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
         // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
         // handle arm → the null-safe `*_free`; the DropPlan leaf makes the struct Move). The admitted
         // set matches codegen's `handle_free_fn`.
-        _ if is_move_handle(ty) => true,
+        _ if is_move_handle(ty) => {}
         // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
         // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no
         // heap (its DropPlan is `None`, so the enclosing struct stays **Copy** — a Move
         // `Ctx` would be consumed by its own accessors) and needs no drop. It region-ties the
         // enclosing struct to the request buffer: `region_of(StructLit)` folds in each field's region,
         // so a `Ctx` built from a local ctx handle cannot outlive it.
-        Ty::HttpHeaders => true,
+        Ty::HttpHeaders => {}
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
         // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
@@ -30168,39 +30171,45 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // folds in each field value's region, so a struct holding a slice field cannot outlive the
         // buffer the slice views (the escape check enforces it). A `slice<str>` element also carries
         // `str` views, tracked via `struct_has_str_rec` below.
-        Ty::Slice(_) => true,
+        Ty::Slice(_) => {}
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
         // `abi_type`/`ty_size_align` already size it), owns no heap (its DropPlan is `None`,
         // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
-        Ty::Fn(_) => true,
+        Ty::Fn(_) => {}
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
         // rejected until array-in-Option lands, matching the direct-field rule).
-        Ty::Option(s) => is_field_ok(scalar_to_ty(s), tagged_types),
+        Ty::Option(s) => work.push(scalar_to_ty(s)),
         Ty::Result(ok, err) => {
-            is_field_ok(scalar_to_ty(ok), tagged_types)
-                && is_field_ok(scalar_to_ty(err), tagged_types)
+            work.push(scalar_to_ty(err));
+            work.push(scalar_to_ty(ok));
         }
-        Ty::Tagged(id) => tagged_types
-            .get(id as usize)
-            .is_some_and(|entry| match *entry {
+        Ty::Tagged(id) if visited_tagged.insert(id) => {
+            let Some(entry) = tagged_types.get(id as usize) else {
+                return false;
+            };
+            match *entry {
                 hir::TaggedType::Option(payload) => {
-                    is_field_ok(scalar_to_ty(payload), tagged_types)
+                    work.push(scalar_to_ty(payload));
                 }
                 hir::TaggedType::Result(ok, err) => {
-                    is_field_ok(scalar_to_ty(ok), tagged_types)
-                        && is_field_ok(scalar_to_ty(err), tagged_types)
+                    work.push(scalar_to_ty(err));
+                    work.push(scalar_to_ty(ok));
                 }
-            }),
+            }
+        }
+        Ty::Tagged(_) => return false,
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
         // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
         // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
         // (pass 0b-2), where the struct table is populated; here we admit the array shape.
-        Ty::DynArray(_) | Ty::DynStructArray(..) => true,
-        _ => false,
+        Ty::DynArray(_) | Ty::DynStructArray(..) => {}
+        _ => return false,
+        }
     }
+    true
 }
 
 fn collect_inline_struct_ids(
@@ -30208,83 +30217,66 @@ fn collect_inline_struct_ids(
     tagged_types: &[hir::TaggedType],
     output: &mut Vec<u32>,
 ) {
-    fn visit(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        active: &mut Vec<u32>,
-        output: &mut Vec<u32>,
-    ) {
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
         match ty {
             Ty::Struct(id) => {
                 if !output.contains(&id) {
                     output.push(id);
                 }
             }
-            Ty::Option(payload) => {
-                visit(scalar_to_ty(payload), tagged_types, active, output)
-            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
             Ty::Result(ok, err) => {
-                visit(scalar_to_ty(ok), tagged_types, active, output);
-                visit(scalar_to_ty(err), tagged_types, active, output);
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
             }
-            Ty::Tagged(id) if !active.contains(&id) => {
-                let Some(entry) = tagged_types.get(id as usize) else {
-                    return;
-                };
-                active.push(id);
-                match *entry {
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(entry) = tagged_types.get(id as usize) {
+                    match *entry {
                     hir::TaggedType::Option(payload) => {
-                        visit(scalar_to_ty(payload), tagged_types, active, output)
+                            work.push(scalar_to_ty(payload));
                     }
                     hir::TaggedType::Result(ok, err) => {
-                        visit(scalar_to_ty(ok), tagged_types, active, output);
-                        visit(scalar_to_ty(err), tagged_types, active, output);
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
                     }
                 }
-                active.pop();
             }
             _ => {}
         }
     }
-    visit(ty, tagged_types, &mut Vec::new(), output);
 }
 
 fn ty_contains_inline_enum(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    fn visit(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        active: &mut Vec<u32>,
-    ) -> bool {
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
         match ty {
-            Ty::Enum(_) => true,
-            Ty::Option(payload) => {
-                visit(scalar_to_ty(payload), tagged_types, active)
-            }
+            Ty::Enum(_) => return true,
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
             Ty::Result(ok, err) => {
-                visit(scalar_to_ty(ok), tagged_types, active)
-                    || visit(scalar_to_ty(err), tagged_types, active)
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
             }
-            Ty::Tagged(id) if !active.contains(&id) => {
-                let Some(entry) = tagged_types.get(id as usize) else {
-                    return false;
-                };
-                active.push(id);
-                let found = match *entry {
-                    hir::TaggedType::Option(payload) => {
-                        visit(scalar_to_ty(payload), tagged_types, active)
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(entry) = tagged_types.get(id as usize) {
+                    match *entry {
+                        hir::TaggedType::Option(payload) => {
+                            work.push(scalar_to_ty(payload));
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
                     }
-                    hir::TaggedType::Result(ok, err) => {
-                        visit(scalar_to_ty(ok), tagged_types, active)
-                            || visit(scalar_to_ty(err), tagged_types, active)
-                    }
-                };
-                active.pop();
-                found
+                }
             }
-            _ => false,
+            _ => {}
         }
     }
-    visit(ty, tagged_types, &mut Vec::new())
+    false
 }
 
 /// Whether struct `id`'s complete inline layout graph is acyclic. Structs, Options, Results, and
@@ -33622,6 +33614,23 @@ fn main() -> i32 = 0
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
         let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[]);
         assert!(tagged_mangle.len() > DEPTH * 2);
+        assert!(is_field_ok(Ty::Tagged(0), &tagged));
+        let mut tagged_struct = tagged.clone();
+        tagged_struct[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Struct(42));
+        let mut inline_structs = Vec::new();
+        collect_inline_struct_ids(
+            Ty::Tagged(0),
+            &tagged_struct,
+            &mut inline_structs,
+        );
+        assert_eq!(inline_structs, vec![42]);
+        tagged_struct[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Enum(9));
+        assert!(ty_contains_inline_enum(
+            Ty::Tagged(0),
+            &tagged_struct
+        ));
 
         let fn_types = (0..DEPTH)
             .map(|id| hir::FnTy {
