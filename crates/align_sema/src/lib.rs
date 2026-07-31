@@ -15083,6 +15083,12 @@ impl<'a> MoveCheck<'a> {
                 value: &'e Expr,
                 accepted: bool,
             },
+            BlockAssignField {
+                root: LocalId,
+                path: &'e [u32],
+                value: &'e Expr,
+                self_assign: bool,
+            },
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15119,6 +15125,75 @@ impl<'a> MoveCheck<'a> {
                     )
                 } else {
                     match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignField { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignField {
+                            root,
+                            path,
+                            value,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single field assign guard")
+                        };
+                        self.check_borrow_use(*root, value.span);
+                        if whole_moved(moved, *root) {
+                            let name = &self.f.locals[*root as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                value.span,
+                            );
+                        }
+                        let self_assign = matches!(
+                            &value.kind,
+                            ExprKind::Field {
+                                root: source,
+                                path: source_path,
+                            } if source == root && source_path == path
+                        );
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            !self_assign,
+                            !self_assign,
+                            Post::BlockAssignField {
+                                root: *root,
+                                path,
+                                value,
+                                self_assign,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignVecLane { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignVecLane { value, .. }] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single vector lane assign guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            false,
+                            false,
+                            Post::None,
+                        )
+                    }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
                     | ExprKind::TaskGroup(block)
@@ -16265,6 +16340,34 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     falls_through = false;
+                    None
+                }
+                Post::BlockAssignField {
+                    root,
+                    path,
+                    value,
+                    self_assign,
+                } => {
+                    if falls_through {
+                        if let [field] = path {
+                            moved.remove(&MovedKey::Field(root, *field));
+                        }
+                        if !self_assign && self.is_move_ty(value.ty) {
+                            self.invalidate_owner(root);
+                        }
+                        if !self_assign {
+                            let projections = path
+                                .iter()
+                                .copied()
+                                .map(BorrowProjection::StructField)
+                                .collect::<Vec<_>>();
+                            self.replace_local_borrow_projection(
+                                root,
+                                &projections,
+                                value,
+                            );
+                        }
+                    }
                     None
                 }
                 Post::None => None,

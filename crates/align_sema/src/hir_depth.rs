@@ -1014,6 +1014,8 @@ mod tests {
         BlockReturn,
         BlockLetTuple,
         BlockBreak,
+        BlockAssignField,
+        BlockAssignVecLane,
     }
 
     fn int_ty() -> Ty {
@@ -1355,7 +1357,9 @@ mod tests {
             | MoveControlShape::BlockAssign
             | MoveControlShape::BlockReturn
             | MoveControlShape::BlockLetTuple
-            | MoveControlShape::BlockBreak => 3,
+            | MoveControlShape::BlockBreak
+            | MoveControlShape::BlockAssignField
+            | MoveControlShape::BlockAssignVecLane => 3,
         };
         let mut expression = Expr {
             kind: ExprKind::StrBorrow(Box::new(Expr {
@@ -1604,6 +1608,26 @@ mod tests {
                     }],
                     value: None,
                 }),
+                MoveControlShape::BlockAssignField => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignField {
+                            root: 0,
+                            path: vec![0],
+                            value: expression,
+                        }],
+                        value: None,
+                    })
+                }
+                MoveControlShape::BlockAssignVecLane => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignVecLane {
+                            local: 0,
+                            lane: 0,
+                            value: expression,
+                        }],
+                        value: None,
+                    })
+                }
             };
             expression = Expr {
                 kind,
@@ -1627,7 +1651,9 @@ mod tests {
                     | MoveControlShape::BlockAssign
                     | MoveControlShape::BlockReturn
                     | MoveControlShape::BlockLetTuple
-                    | MoveControlShape::BlockBreak => Ty::Unit,
+                    | MoveControlShape::BlockBreak
+                    | MoveControlShape::BlockAssignField
+                    | MoveControlShape::BlockAssignVecLane => Ty::Unit,
                 },
                 span,
             };
@@ -1797,6 +1823,12 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::BlockBreak,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignField,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignVecLane,
                     ),
                 ]);
                 for move_program in move_programs {
