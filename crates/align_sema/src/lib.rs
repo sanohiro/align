@@ -9607,34 +9607,31 @@ impl<'a> EscapeCheck<'a> {
     /// control-flow expression that may select one are frame-capped so a derived view cannot escape
     /// and dangle when the hidden owner is dropped.
     fn unbound_owned_temporary(&self, e: &Expr) -> bool {
-        if !needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            return false;
-        }
-        match &e.kind {
-            ExprKind::Local(_)
-            | ExprKind::Field { .. }
-            | ExprKind::TupleIndex { .. }
-            | ExprKind::Index { .. }
-            | ExprKind::ElemField { .. } => false,
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
-                block.value.as_ref().is_some_and(|value| self.unbound_owned_temporary(value))
+        let mut expression = e;
+        loop {
+            if !needs_drop_flag(
+                expression.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                return false;
             }
-            _ => true,
-        }
-    }
-
-    fn borrowed_storage_region(&self, owner: &Expr, depth: u32) -> Region {
-        let region = self.region_of(owner, depth);
-        if self.unbound_owned_temporary(owner) {
-            region.shorter(Region::Frame)
-        } else {
-            region
+            match &expression.kind {
+                ExprKind::Local(_)
+                | ExprKind::Field { .. }
+                | ExprKind::TupleIndex { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::ElemField { .. } => return false,
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    let Some(value) = block.value.as_deref() else {
+                        return false;
+                    };
+                    expression = value;
+                }
+                _ => return true,
+            }
         }
     }
 
@@ -9649,69 +9646,59 @@ impl<'a> EscapeCheck<'a> {
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
-    fn mapped_return_region(
-        &self,
-        summary: &hir::ReturnRegionSummary,
-        args: &[Expr],
-        depth: u32,
-    ) -> Region {
-        let hir::ReturnRegionSummary::Roots {
-            params,
-            captures: _,
-        } = summary
-        else {
-            return Region::Static;
-        };
-        let mut region = Region::Static;
-        for &index in params {
-            if let Some(value) = args.get(index as usize) {
-                region = region.shorter(self.region_of(value, depth));
+    fn region_of(&self, e: &Expr, depth: u32) -> Region {
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            Shorter(usize, Region),
+            Cap(Region),
+        }
+        fn push_fold<'e>(
+            work: &mut Vec<Work<'e>>,
+            initial: Region,
+            children: Vec<(&'e Expr, u32, Option<Region>)>,
+        ) {
+            work.push(Work::Shorter(children.len(), initial));
+            for (child, depth, cap) in children.into_iter().rev() {
+                if let Some(cap) = cap {
+                    work.push(Work::Cap(cap));
+                }
+                work.push(Work::Eval(child, depth));
             }
         }
-        region
-    }
 
-    fn mapped_return_slice_is_local(
-        &self,
-        summary: &hir::ReturnRegionSummary,
-        args: &[Expr],
-    ) -> bool {
-        let hir::ReturnRegionSummary::Roots {
-            params,
-            captures: _,
-        } = summary
-        else {
-            return false;
-        };
-        params.iter().any(|&index| {
-            args.get(index as usize)
-                .is_some_and(|value| self.slice_is_local(value))
-        })
-    }
-
-    fn region_of(&self, e: &Expr, depth: u32) -> Region {
-        match &e.kind {
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => match &expression.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
             // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
             // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => self.allocation_region(e),
-            ExprKind::Template(_) => self
-                .allocation_region_by_expr
-                .get(&Self::expr_key(e))
-                .copied()
-                .unwrap_or(Region::Frame),
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => {
+                values.push(self.allocation_region(expression));
+            }
+            ExprKind::Template(_) => values.push(
+                self.allocation_region_by_expr
+                    .get(&Self::expr_key(expression))
+                    .copied()
+                    .unwrap_or(Region::Frame),
+            ),
             // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
             // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
             // / `fs.remove` return owned / non-region values and stay explicitly `Static` below.
-            ExprKind::FsReadFileView { .. } => self.allocation_region(e),
+            ExprKind::FsReadFileView { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `fs.read_bytes_view(p)` returns a `bytes` (`slice<u8>`) view of the same mmap, so it is
             // arena-bound exactly like `read_file_view`'s `str` view. Unlike a `str`, a `slice<u8>` is
             // not `tracks_region` (its element is numeric), so `region_bearing` is what routes the
             // escape check here — this arm gives the view its Arena region.
-            ExprKind::FsReadBytesView { .. } => self.allocation_region(e),
+            ExprKind::FsReadBytesView { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // A spawned task's handle is a box in the enclosing `task_group` region.
-            ExprKind::Spawn { .. } => Region::arena(depth),
+            ExprKind::Spawn { .. } => values.push(Region::arena(depth)),
             // `.to_array()` and these other producers use the explicit enclosing arena when one
             // exists and otherwise create free-standing owned storage. `reduce` follows the same
             // rule for a region-tracked accumulator. A task_group's private runtime region never
@@ -9719,10 +9706,17 @@ impl<'a> EscapeCheck<'a> {
             // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
             // also borrows its source/input, so it needs the shorter of the two regions.)
             ExprKind::ArrayToArray { source, stages, .. } => {
-                let from_source =
-                    self.allocation_region(e).shorter(self.region_of(source, depth));
-                stage_capture_exprs(stages)
-                    .fold(from_source, |acc, capture| acc.shorter(self.region_of(capture, depth)))
+                let mut children = Vec::with_capacity(1 + stages.len());
+                children.push((source.as_ref(), depth, None));
+                children.extend(
+                    stage_capture_exprs(stages)
+                        .map(|capture| (capture, depth, None)),
+                );
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    children,
+                );
             }
             ExprKind::ArrayReduce {
                 source,
@@ -9738,99 +9732,166 @@ impl<'a> EscapeCheck<'a> {
                 init,
                 ..
             } => {
-                let from_values = self
-                    .allocation_region(e)
-                    .shorter(self.region_of(source, depth))
-                    .shorter(self.region_of(init, depth));
-                stage_capture_exprs(stages)
-                    .chain(captures)
-                    .fold(from_values, |acc, capture| {
-                        acc.shorter(self.region_of(capture, depth))
-                    })
+                let mut children =
+                    Vec::with_capacity(2 + stages.len() + captures.len());
+                children.push((source.as_ref(), depth, None));
+                children.push((init.as_ref(), depth, None));
+                children.extend(
+                    stage_capture_exprs(stages)
+                        .chain(captures)
+                        .map(|capture| (capture, depth, None)),
+                );
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    children,
+                );
             }
-            ExprKind::ArrayPartition { .. } | ExprKind::ArraySort { .. } | ExprKind::ArraySortBy { .. } => self.allocation_region(e),
+            ExprKind::ArrayPartition { .. }
+            | ExprKind::ArraySort { .. }
+            | ExprKind::ArraySortBy { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // The range-kernel runtime always returns a fresh malloc-backed primitive array, even
             // when the source expression is nested inside an arena. It carries no source views (the
             // checked `par_map` result is primitive), so it is freely returnable and individually
             // dropped. Unsupported shapes use the arena-aware sequential collector below.
             ExprKind::ArrayParMap { source, stages, .. }
                 if par_map_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types)
-                    && par_map_result_is_plain_primitive(e.ty) => Region::Static,
-            ExprKind::ArrayParMap { .. } => self.allocation_region(e),
+                    && par_map_result_is_plain_primitive(expression.ty) => {
+                values.push(Region::Static);
+            }
+            ExprKind::ArrayParMap { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
             // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
-            ExprKind::JsonDecode { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonDecode { input, .. } => work.push(Work::Eval(input, depth)),
             // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
             // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
-            ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonDecodeStructArray { input, .. } => {
+                work.push(Work::Eval(input, depth));
+            }
             // A decoded shape-directed union (J1b): a `str`-payload variant is a zero-copy view into
             // the input, so a `str`-bearing union carries the input's region; a scalar-only union
             // borrows nothing and stays `Static` (freely returnable), mirroring `tracks_region`'s
             // precision at the enum level (the region change is opt-in on a borrowing payload).
-            ExprKind::JsonDecodeUnion { input, enum_id } if self.tracks_region(Ty::Enum(*enum_id)) => self.region_of(input, depth),
-            ExprKind::JsonDecodeUnion { .. } => Region::Static,
+            ExprKind::JsonDecodeUnion { input, enum_id }
+                if self.tracks_region(Ty::Enum(*enum_id)) =>
+            {
+                work.push(Work::Eval(input, depth));
+            }
+            ExprKind::JsonDecodeUnion { .. } => values.push(Region::Static),
             // `json.decode → soa`: the column buffer is arena-allocated, and a `str` column holds
             // zero-copy views into the JSON input (like the AoS decode). So a str-bearing soa is
             // bound to BOTH — the arena buffer and the input — i.e. the shorter of the two regions.
             // (A primitive-only soa borrows nothing and stays purely arena-regioned via the group
             // arm above, so it is self-contained and free to escape the input.)
             ExprKind::JsonDecodeSoa { input, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(input, depth).shorter(self.allocation_region(e))
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    vec![(input, depth, None)],
+                );
             }
-            ExprKind::JsonDecodeSoa { .. } => self.allocation_region(e),
+            ExprKind::JsonDecodeSoa { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
-            ExprKind::JsonDoc { input } => self
-                .region_of(input, depth)
-                .shorter(self.allocation_region(e)),
+            ExprKind::JsonDoc { input } => push_fold(
+                &mut work,
+                self.allocation_region(expression),
+                vec![(input, depth, None)],
+            ),
             // `json.scan(input)` (J5): the scanner is a `{ptr,len}` view of the input (no arena tape),
             // and the rows it streams borrow the input. So it is region-tied to the input alone — it
             // cannot outlive it (a scanner escaping its input view is caught, like a `str`).
-            ExprKind::JsonScan { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonScan { input, .. } => work.push(Work::Eval(input, depth)),
             // `d.get(k)` / `d.at(i)` yield another `json.doc` viewing the same tape; `d.as_str()` a
             // `str` view into the input (or the arena, for an escaped string). All live exactly as long
             // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
             // (`d.kind()` / `d.as_i64/f64/bool()` copy out a Copy scalar → the `Static` list below.)
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => self.region_of(doc, depth),
+            ExprKind::JsonDocGet { doc, .. }
+            | ExprKind::JsonDocAt { doc, .. }
+            | ExprKind::JsonDocAsStr { doc }
+            | ExprKind::JsonDocKey { doc, .. } => work.push(Work::Eval(doc, depth)),
             // `d.elems()` bump-allocates the handle buffer in the enclosing arena, and each element
             // handle views the same tape (the doc's region). So the slice is region-tied to BOTH — the
             // arena and the doc — i.e. the shorter of the two (like `json.decode → soa` / `to_array`).
-            ExprKind::JsonDocElems { doc } => self
-                .region_of(doc, depth)
-                .shorter(self.allocation_region(e)),
+            ExprKind::JsonDocElems { doc } => push_fold(
+                &mut work,
+                self.allocation_region(expression),
+                vec![(doc, depth, None)],
+            ),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
             // source (the shorter of the two). A primitive-only `to_soa` borrows nothing → the group
             // arm below binds it purely to the arena (self-contained, like `to_array`'s buffer).
             ExprKind::ArrayToSoa { source, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(source, depth).shorter(self.allocation_region(e))
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    vec![(source, depth, None)],
+                );
             }
-            ExprKind::ArrayToSoa { .. } => self.allocation_region(e),
+            ExprKind::ArrayToSoa { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
-            ExprKind::ElemField { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::ElemField { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // `s[i]` on a `soa` *gathers* a whole struct. A primitive-only struct is copied
             // column-by-column into a fresh POD value that borrows nothing → `Static` (returnable).
             // A struct with a `str` column gathers `str` views that borrow the soa's buffer/input,
             // so the gathered value inherits the soa's region (it must not outlive it).
             ExprKind::Index { recv, .. } if matches!(recv.ty, Ty::Soa(_)) => match recv.ty {
-                Ty::Soa(sid) if self.struct_has_str(sid) => self.region_of(recv, depth),
-                _ => Region::Static,
+                Ty::Soa(sid) if self.struct_has_str(sid) => {
+                    work.push(Work::Eval(recv, depth));
+                }
+                _ => values.push(Region::Static),
             },
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
-            ExprKind::Index { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::Index { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
-            ExprKind::SliceRange { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::SliceRange { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // An array literal lives as long as its shortest-lived element — a `[str]` of arena
             // `str` views is arena-regioned (the same rule as a struct literal over its fields). A
             // Move-struct array literal, however, *owns* its elements' heap buffers (its `.clone()`
@@ -9838,30 +9899,52 @@ impl<'a> EscapeCheck<'a> {
             // frame-local — the temporary's buffers die within the frame — so cap it at `Frame`, the
             // same bound a bound Move-struct array gets at its `let` (else the view could be returned).
             ExprKind::ArrayLit { elems, .. } => {
-                let r = elems
-                    .iter()
-                    .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth)));
-                if matches!(e.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums, self.tagged_types)) {
-                    r.shorter(Region::Frame)
-                } else {
-                    r
+                if matches!(
+                    expression.ty,
+                    Ty::StructArray(sid, _)
+                        if struct_is_move(
+                            sid,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                ) {
+                    work.push(Work::Cap(Region::Frame));
                 }
+                push_fold(
+                    &mut work,
+                    Region::Static,
+                    elems
+                        .iter()
+                        .map(|element| (element, depth, None))
+                        .collect(),
+                );
             }
-            ExprKind::ArrayZip { .. } => Region::Static,
+            ExprKind::ArrayZip { .. } => values.push(Region::Static),
             // A tuple lives as long as its shortest-lived element (same rule as an array literal):
             // a tuple holding an arena `str` view is arena-regioned and cannot escape.
-            ExprKind::Tuple { elems, .. } => elems
-                .iter()
-                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            ExprKind::Tuple { elems, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                elems
+                    .iter()
+                    .map(|element| (element, depth, None))
+                    .collect(),
+            ),
             // A sum-type value lives as long as its shortest-lived payload (J1: `Content.Text(view)`
             // is bound to `view`'s region — a scalar-only variant folds to `Static`, freely
             // returnable). Same rule as a tuple / struct literal over its members.
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            ExprKind::EnumValue { payload, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                payload
+                    .iter()
+                    .map(|element| (element, depth, None))
+                    .collect(),
+            ),
             // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
             // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
-            ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
+            ExprKind::TupleIndex { recv, .. } => work.push(Work::Eval(recv, depth)),
             // `chunks` makes an `array<slice<T>>` (`DynSliceArray`) whose slice headers borrow the
             // source's **backing storage**. That storage region is distinct from the *element*
             // region `region_of(source)` returns for reads: `arr[i]` of an `array<str>` yields a
@@ -9871,28 +9954,80 @@ impl<'a> EscapeCheck<'a> {
             // use-after-free of the frame slot). So bind the chunks result to its source's storage
             // region (see `chunks_source_storage_region`), and also to the element region (`shorter`)
             // so an `array<str>` of arena strings is bounded by both its slot and that arena.
-            ExprKind::ArrayChunks { source, .. } => self
-                .chunks_source_storage_region(source, depth)
-                .shorter(self.region_of(source, depth)),
+            ExprKind::ArrayChunks { source, .. } => {
+                let (initial, mut children) = match &source.kind {
+                    ExprKind::Local(p)
+                        if matches!(
+                            source.ty,
+                            Ty::Array(..) | Ty::StructArray(..)
+                        ) =>
+                    {
+                        (
+                            self.decl_depth.get(p).map_or(
+                                Region::Static,
+                                |declaration_depth| {
+                                    Region::Frame.shorter(Region::arena(
+                                        *declaration_depth,
+                                    ))
+                                },
+                            ),
+                            Vec::new(),
+                        )
+                    }
+                    ExprKind::Local(p)
+                        if self.state.local_backed_slice.contains(p) =>
+                    {
+                        (Region::Frame, Vec::new())
+                    }
+                    ExprKind::ArrayLit { .. } => (
+                        Region::Frame.shorter(Region::arena(depth)),
+                        Vec::new(),
+                    ),
+                    _ => (
+                        Region::Static,
+                        vec![(
+                            source.as_ref(),
+                            depth,
+                            self.unbound_owned_temporary(source)
+                                .then_some(Region::Frame),
+                        )],
+                    ),
+                };
+                children.push((source.as_ref(), depth, None));
+                push_fold(&mut work, initial, children);
+            }
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
-            ExprKind::ArrayToSlice(inner) => self.borrowed_storage_region(inner, depth),
+            ExprKind::ArrayToSlice(inner) => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    inner,
+                    depth,
+                    self.unbound_owned_temporary(inner)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
             ExprKind::Try(inner)
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
+            | ExprKind::ResultErr(inner) => work.push(Work::Eval(inner, depth)),
             // `map_err` passes the `Ok` payload through unchanged, while its mapped error may
             // borrow the mapper closure's environment. The result can outlive neither source.
-            ExprKind::ResultMapErr { result, f } => self
-                .region_of(result, depth)
-                .shorter(self.region_of(f, depth)),
+            ExprKind::ResultMapErr { result, f } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(result, depth, None), (f, depth, None)],
+            ),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
-            }
+            ExprKind::ElseUnwrap { opt, fallback } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(opt, depth, None), (fallback, depth, None)],
+            ),
             // A `str` borrow of an owned `string` (slice 7b) views storage owned by *this* frame
             // (the `string` is `Drop`-freed at frame exit), so the view is `Frame`-regioned — it
             // must not escape the frame. This feeds `region_of(Call)`: passing a borrowed string
@@ -9901,54 +10036,74 @@ impl<'a> EscapeCheck<'a> {
             // `string` is heap-owned (`Static`), so this is exactly `Frame`; but if a later slice
             // arena-allocates a `string` (`Arena(k)`, shorter than `Frame`), the borrow must not
             // outlive that arena — taking the shorter keeps it sound for free.
-            ExprKind::StrBorrow(inner) => Region::Frame.shorter(self.region_of(inner, depth)),
+            ExprKind::StrBorrow(inner) => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(inner, depth, None)],
+            ),
             // `str.bytes()` is a zero-copy re-view of exactly the same `{ptr,len}` storage, so it
             // inherits the receiver's region. An owned `string` receiver was first `StrBorrow`ed,
             // which supplies the required Frame bound.
-            ExprKind::StrBytes { inner } => self.region_of(inner, depth),
+            ExprKind::StrBytes { inner } => work.push(Work::Eval(inner, depth)),
             // A trim yields a sub-`str` of its receiver (same bytes), so the view lives exactly as
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
-            ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
+            ExprKind::StrTrim { recv, .. } => work.push(Work::Eval(recv, depth)),
             // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
             // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
             // explicit arm the default classification used to mis-infer `Static`, letting a view of
             // an arena/frame `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned
             // strings and are explicitly `Static`.
-            ExprKind::PathComponent { path, .. } => self.region_of(path, depth),
+            ExprKind::PathComponent { path, .. } => work.push(Work::Eval(path, depth)),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
-            ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
+            ExprKind::BufferBytes { buffer } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(buffer, depth, None)],
+            ),
             // `bytes.as_str()` is a zero-copy `str` view of the SAME storage `bytes` viewed, so it
             // lives exactly as long as its receiver — inherit its region directly (like `StrTrim` /
             // `PathComponent`). A view of `buf.bytes()` (Frame) stays Frame; a view of an arena
             // `read_bytes_view` (Arena) stays Arena. `?` preserves it (the `Try` arm above). Without
             // this arm a `Static` classification would let a view of a dropped buffer escape (#297).
-            ExprKind::BytesAsStr { bytes } => self.region_of(bytes, depth),
+            ExprKind::BytesAsStr { bytes } => work.push(Work::Eval(bytes, depth)),
             // `r.buffered()` yields an owned `reader` over the source reader's fd, so it inherits the
             // source's region (a `c.reader().buffered()` stays conn-bound; a `fs.open(...)` reader is
             // owned/`Static`). A plain `read_line` result is a Copy `i64` (not region-tracked → the
             // explicitly `Static`), so no provenance arm is needed for it.
-            ExprKind::ReaderBuffered { reader } => self.region_of(reader, depth),
+            ExprKind::ReaderBuffered { reader } => work.push(Work::Eval(reader, depth)),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
             // frame. Without this explicit arm a `Static` classification would let the view
             // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
-            ExprKind::CliGetStr { parsed, .. } => Region::Frame.shorter(self.region_of(parsed, depth)),
+            ExprKind::CliGetStr { parsed, .. } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(parsed, depth, None)],
+            ),
             // `resp.header(name)` returns `Option<str>` and `resp.body()` a `slice<u8>`, both **views**
             // into the `http response` handle's owned buffer (freed at frame exit). Like `CliGetStr` /
             // `BufferBytes`, they are `Frame`-regioned and bound to `resp` (or shorter if `resp` is
             // arena-scoped) — an escape past `resp`'s `Drop` reads freed memory (#297). Without these
             // arms a `Static` classification is unsound; `.clone()` (header) / a copy-out copies past `resp`.
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
-                Region::Frame.shorter(self.region_of(resp, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(resp, depth, None)],
+                );
             }
             // `out.stdout()`/`out.stderr()` are `str` **views** into the `run_output` handle's owned
             // buffers (freed at frame exit), so — like the `resp.*` / `p.get_str` views — they are
             // `Frame`-regioned and bound to `out` (or shorter if `out` is arena-scoped). An escape past
             // `out`'s `Drop` reads freed memory (#297, P9). `.clone()` copies past `out`.
             ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                Region::Frame.shorter(self.region_of(out, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(out, depth, None)],
+                );
             }
             // `ctx.method()`/`path()`/`body()`/`headers()` are the read-duals: `str` / `slice<u8>` /
             // header-table **views** into the `http_request_ctx` handle's owned buffer (freed at frame
@@ -9959,14 +10114,20 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => Region::Frame.shorter(self.region_of(ctx, depth)),
+            | ExprKind::HttpCtxHeaders { ctx } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(ctx, depth, None)],
+            ),
             // `hs.get(name)` **inherits** its receiver's region instead of re-capping at `Frame` — the
             // one line the whole `ctx.headers()` design turns on (http.md item 10 ④). Through a
             // parameter (`fn header(c: Ctx, name: str) = c.headers.get(name)`) the caller provably
             // outlives the call, so the view is `Static` there and the wrapper compiles; minted from a
             // local handle the receiver is already `Frame`-capped by the arm above, so the lookup is
             // too. This is the rule `str`/`slice` views already follow through parameters.
-            ExprKind::HttpCtxHeader { headers, .. } => self.region_of(headers, depth),
+            ExprKind::HttpCtxHeader { headers, .. } => {
+                work.push(Work::Eval(headers, depth));
+            }
             // `c.reader()` / `c.writer()` borrow the `tcp_conn`'s fd (`owns_fd: false` — only `c`'s
             // `Drop` closes it), so — like `BufferBytes` / `CliGetStr` — the returned stream is
             // region-bound to `c`: `Frame` (or shorter if `c` lives in an arena). It must not escape
@@ -9974,16 +10135,37 @@ impl<'a> EscapeCheck<'a> {
             // explicit arm a `Static` classification would let the stream outlive
             // the connection. (`c` is a bound local — the receiver gate in `check_conn_stream`.)
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => {
-                Region::Frame.shorter(self.region_of(conn, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(conn, depth, None)],
+                );
             }
-            ExprKind::Local(p) => self.state.region.get(p).copied().unwrap_or(Region::Static),
+            ExprKind::Local(p) => values.push(
+                self.state
+                    .region
+                    .get(p)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
+            ExprKind::StructLit { fields, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                fields
+                    .iter()
+                    .map(|field| (field, depth, None))
+                    .collect(),
+            ),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { root, .. } => self.state.region.get(root).copied().unwrap_or(Region::Static),
+            ExprKind::Field { root, .. } => values.push(
+                self.state
+                    .region
+                    .get(root)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
             // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
@@ -9996,71 +10178,129 @@ impl<'a> EscapeCheck<'a> {
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
             // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
             // so inheriting is harmless — never checked.)
-            | ExprKind::SoaColumn { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
-            ExprKind::Block(b) => self.region_of_block(b, depth),
+            | ExprKind::SoaColumn { base, .. } => values.push(
+                self.state
+                    .region
+                    .get(base)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
+            ExprKind::Block(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // `unsafe {}` is a plain marker block — its value's region is the tail value's region (no
             // new region opened, unlike `arena {}`). Explicit so an arena value returned from an
             // unsafe block isn't incorrectly classified `Static` and allowed to escape.
-            ExprKind::Unsafe(b) => self.region_of_block(b, depth),
+            ExprKind::Unsafe(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
             // be inferred `Static` and could then escape undetected (a use-after-free across
             // nested arenas); the per-block walk only checks the immediate boundary, not a
             // later escape of the binding.
-            ExprKind::Arena(b) => self.region_of_block(b, depth + 1),
+            ExprKind::Arena(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth + 1));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             ExprKind::If { then, els, .. } => {
-                self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
+                push_fold(
+                    &mut work,
+                    Region::Static,
+                    [then, els]
+                        .into_iter()
+                        .filter_map(|block| {
+                            block
+                                .value
+                                .as_deref()
+                                .map(|value| (value, depth, None))
+                        })
+                        .collect(),
+                );
             }
             // A `match` yields one of its arms' values, so it lives only as long as the
             // shortest-lived arm (the same rule as `if`/`else`). Without this, an arena value
             // returned through a match arm is inferred `Static` and escapes undetected (a
             // use-after-free — `region_of` must not classify this value as `Static`).
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(&a.body, depth))),
+            ExprKind::Match { arms, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                arms
+                    .iter()
+                    .map(|arm| (&arm.body, depth, None))
+                    .collect(),
+            ),
             // An indirect call's result may borrow one of its arguments (`g := id; g(s)`) or its
             // closure environment (`f := fn { captured_view }; f()`). It therefore lives no longer
             // than either the callee or the shortest-lived argument. Without the callee fold, a
             // zero-argument closure can return an arena capture after that arena is freed.
-            ExprKind::CallFnValue { callee, args } => args.iter().fold(
-                self.region_of(callee, depth),
-                |region, arg| {
-                    region.shorter(self.region_of(arg, depth))
-                },
+            ExprKind::CallFnValue { callee, args } => push_fold(
+                &mut work,
+                Region::Static,
+                std::iter::once((callee.as_ref(), depth, None))
+                    .chain(args.iter().map(|argument| (argument, depth, None)))
+                    .collect(),
             ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
-            ExprKind::IndexField { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
+            ExprKind::IndexField { base, .. } => values.push(
+                self.state
+                    .region
+                    .get(base)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
-            ExprKind::TaskGet(inner) => self.region_of(inner, depth),
+            ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
             // A `task_group {}` opens a region for its spawned tasks (like `arena {}`), so its value
             // is evaluated one level deeper — else a binding capturing a task_group's value (a `Task`
             // handle / box) is inferred `Static` and escapes the group undetected (use-after-free).
-            ExprKind::TaskGroup(b) => self.region_of_block(b, depth + 1),
+            ExprKind::TaskGroup(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth + 1));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // A call's result may be a view borrowing one of its arguments (`fn id(s: str) -> str
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
             // `f(arena_str)` out of the arena slips the escape check → use-after-free of the
             // freed buffer. L2b-a1 maps only the named function's settled parameter roots.
             // Non-tracked args (ints, literals) are `Static` and don't shorten.
-            ExprKind::Call { func, args, .. } => self
-                .named_return_region
-                .get(func)
-                .map_or_else(
-                    || {
-                        args.iter().fold(Region::Static, |region, arg| {
-                            region.shorter(self.region_of(arg, depth))
-                        })
-                    },
-                    |summary| self.mapped_return_region(summary, args, depth),
-                ),
+            ExprKind::Call { func, args, .. } => {
+                let children = match self.named_return_region.get(func) {
+                    Some(hir::ReturnRegionSummary::Roots { params, .. }) => params
+                        .iter()
+                        .filter_map(|&index| args.get(index as usize))
+                        .map(|argument| (argument, depth, None))
+                        .collect(),
+                    Some(hir::ReturnRegionSummary::None) => Vec::new(),
+                    None => args
+                        .iter()
+                        .map(|argument| (argument, depth, None))
+                        .collect(),
+                };
+                push_fold(&mut work, Region::Static, children);
+            }
             // A `loop` yields one of its `break` values (scattered as `Stmt::Break` in the body, not
             // reachable from this node). Each is escape-checked directly (`check_break_escape`), which
             // requires a `break` value to be `Static` — so the loop's value is provably `Static` here.
             // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
             // this must become the shorter of the break values' regions instead.)
-            ExprKind::Loop { .. } => Region::Static,
+            ExprKind::Loop { .. } => values.push(Region::Static),
             // A closure `{fn_ptr, env_ptr}`: if it captures anything, codegen copies the captures into
             // a **frame-local** environment buffer (see align_mir lowering), so the value lives no
             // longer than the current frame — it must be `Frame`, NOT `Static`, even when every
@@ -10071,10 +10311,17 @@ impl<'a> EscapeCheck<'a> {
             // further. A **non-capturing** closure has a null env and is genuinely `Static` (returnable)
             // — the same as a bare named-fn `FnValue`, which is why a fn-payload route table of named
             // functions stays legal.
-            ExprKind::Closure { captures, .. } if captures.is_empty() => Region::Static,
-            ExprKind::Closure { captures, .. } => captures
-                .iter()
-                .fold(Region::Frame, |acc, c| acc.shorter(self.region_of(c, depth))),
+            ExprKind::Closure { captures, .. } if captures.is_empty() => {
+                values.push(Region::Static);
+            }
+            ExprKind::Closure { captures, .. } => push_fold(
+                &mut work,
+                Region::Frame,
+                captures
+                    .iter()
+                    .map(|capture| (capture, depth, None))
+                    .collect(),
+            ),
             // Producers that own their result, return a scalar, or otherwise carry no borrow
             // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
             // expression must force its escape semantics to be classified here instead of falling
@@ -10249,12 +10496,25 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
-            | ExprKind::ArrayGroupAggMulti { .. } => Region::Static,
+            | ExprKind::ArrayGroupAggMulti { .. } => values.push(Region::Static),
+                },
+                Work::Shorter(count, initial) => {
+                    let start = values
+                        .len()
+                        .checked_sub(count)
+                        .expect("region child results");
+                    let region = values
+                        .drain(start..)
+                        .fold(initial, Region::shorter);
+                    values.push(region);
+                }
+                Work::Cap(cap) => {
+                    let region = values.pop().expect("region child result");
+                    values.push(region.shorter(cap));
+                }
+            }
         }
-    }
-
-    fn region_of_block(&self, b: &Block, depth: u32) -> Region {
-        b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(Region::Static)
+        values.pop().expect("region result")
     }
 
     /// General allocation region for `e`. Task-group storage is intentionally absent: only spawned
@@ -10271,99 +10531,101 @@ impl<'a> EscapeCheck<'a> {
         e as *const Expr as usize
     }
 
-    /// The region of the **backing storage** a `chunks` source borrows — deliberately distinct from
-    /// the source's *element/value* region ([`Self::region_of`]). A fixed stack `array<T>` / AoS
-    /// `array<Struct>` bound as a `Let`-local owns a **frame slot**, scoped to the arena it was
-    /// declared in (`Frame.shorter(arena(decl_depth))`); a fixed-array *parameter* borrows the caller
-    /// (never in `decl_depth` → `Static`, so chunking a param array stays returnable). An array
-    /// literal materializes a frame temporary at the current depth. A `slice` that itself borrows a
-    /// frame-local array (`local_backed_slice`) re-borrows that frame storage. Any other source (an
-    /// owned `array<T>`/`slice` producer, a slice param, a nested value expression) borrows storage
-    /// that `region_of` already places correctly — use it as-is. `chunks` restricts a fixed-`array`
-    /// source to a literal or a bare local (`check_array_chunks`), so no nested-expression fixed
-    /// array reaches here.
-    fn chunks_source_storage_region(&self, source: &Expr, depth: u32) -> Region {
-        match &source.kind {
-            ExprKind::Local(p) if matches!(source.ty, Ty::Array(..) | Ty::StructArray(..)) => self
-                .decl_depth
-                .get(p)
-                .map_or(Region::Static, |d| Region::Frame.shorter(Region::arena(*d))),
-            ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => Region::Frame,
-            ExprKind::ArrayLit { .. } => Region::Frame.shorter(Region::arena(depth)),
-            _ => self.borrowed_storage_region(source, depth),
-        }
-    }
-
     /// Whether a slice-bearing expression contains a borrow of *function-local* storage (and so
     /// cannot be returned). An array literal / local array materializes in this frame; a slice
     /// parameter borrows the caller (safe). Wrappers preserve this provenance, as do calls (a
     /// callee can only re-borrow its arguments) and value-carrying control-flow expressions.
     fn slice_is_local(&self, e: &Expr) -> bool {
-        match &e.kind {
+        let mut work = vec![e];
+        while let Some(expression) = work.pop() {
+            match &expression.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
             // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
             // `resp.body()` is a `slice<u8>` view into the `http response` handle's frame-local buffer
             // — local-backed like `buf.bytes()`, so returning it is rejected (its region arm above also
             // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
             // local-backed check is the one that catches its escape).
-            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
-            ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
-            ExprKind::Call { func, args, .. } => self
-                .named_return_region
-                .get(func)
-                .map_or_else(
-                    || args.iter().any(|arg| self.slice_is_local(arg)),
-                    |summary| self.mapped_return_slice_is_local(summary, args),
-                ),
-            ExprKind::ArrayZip { sources, .. } => sources.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::ArrayToSlice(_)
+            | ExprKind::ArrayLit { .. }
+            | ExprKind::BufferBytes { .. }
+            | ExprKind::HttpRespBody { .. }
+            | ExprKind::HttpCtxBody { .. } => return true,
+            ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => return true,
+            ExprKind::Local(_) => {}
+            ExprKind::Call { func, args, .. } => {
+                if let Some(hir::ReturnRegionSummary::Roots { params, .. }) =
+                    self.named_return_region.get(func)
+                {
+                    work.extend(
+                        params
+                            .iter()
+                            .rev()
+                            .filter_map(|&index| args.get(index as usize)),
+                    );
+                } else if !matches!(
+                    self.named_return_region.get(func),
+                    Some(hir::ReturnRegionSummary::None)
+                ) {
+                    work.extend(args.iter().rev());
+                }
+            }
+            ExprKind::ArrayZip { sources, .. } => work.extend(sources.iter().rev()),
             ExprKind::CallFnValue { callee, args } => {
-                self.slice_is_local(callee)
-                    || args.iter().any(|arg| self.slice_is_local(arg))
+                work.extend(args.iter().rev());
+                work.push(callee);
             }
             ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner) => self.slice_is_local(inner),
+            | ExprKind::Try(inner) => work.push(inner),
             ExprKind::ResultMapErr { result, f } => {
-                self.slice_is_local(result) || self.slice_is_local(f)
+                work.push(f);
+                work.push(result);
             }
-            ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
-            ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
-            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.slice_is_local(recv),
-            ExprKind::StructLit { fields, .. } => fields.iter().any(|f| self.slice_is_local(f)),
-            ExprKind::Field { root, .. } => self.state.local_backed_slice.contains(root),
-            ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
+            ExprKind::Tuple { elems, .. } => work.extend(elems.iter().rev()),
+            ExprKind::TupleIndex { recv, .. }
+            | ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. } => work.push(recv),
+            ExprKind::StructLit { fields, .. } => work.extend(fields.iter().rev()),
+            ExprKind::Field { root, .. } if self.state.local_backed_slice.contains(root) => {
+                return true;
+            }
+            ExprKind::Field { .. } => {}
+            ExprKind::Block(b) => work.extend(b.value.as_deref()),
             ExprKind::If { then, els, .. } => {
-                then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
-                    || els.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                work.extend(els.value.as_deref());
+                work.extend(then.value.as_deref());
             }
             // A range slice `recv[a..b]` borrows the receiver's storage, so it is frame-local iff
             // the receiver is (a sub-slice of a local array is still a view of that stack array).
             // Without this, `return xs[0..2]` over a local array returns a dangling slice.
-            ExprKind::SliceRange { recv, .. } => self.slice_is_local(recv),
+            ExprKind::SliceRange { recv, .. } => work.push(recv),
             // A `match`/`else` yields one of its arms, so it is frame-local if any arm is (like the
             // `if`/`else` arm above — a local-backed slice must not escape through either).
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.slice_is_local(&a.body)),
+            ExprKind::Match { arms, .. } => {
+                work.extend(arms.iter().rev().map(|arm| &arm.body));
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.slice_is_local(opt) || self.slice_is_local(fallback)
+                work.push(fallback);
+                work.push(opt);
             }
             // An `arena` / `unsafe` / `task_group` block yields its block value, which is frame-local
             // if the inner value is (like the plain `Block` arm above). Without these a local-backed
             // slice returned through such a block escapes the function undetected (dangling slice).
             ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
-                b.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                work.extend(b.value.as_deref());
             }
             // A closure may return a captured local-backed slice. Its callable value carries those
             // captures into an indirect call or `map_err`, so preserve that provenance.
             ExprKind::Closure { captures, .. } => {
-                captures.iter().any(|capture| self.slice_is_local(capture))
+                work.extend(captures.iter().rev());
             }
             // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
             // the body, not reachable from this node. Each `break` value is escape-checked directly
             // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
             // value is provably never local-backed, and `false` here is sound. (If the `break`-escape
             // rule is ever loosened to let a frame-local view escape the loop, revisit this arm.)
-            ExprKind::Loop { .. } => false,
+            ExprKind::Loop { .. } => {}
             // These forms do not introduce or forward a function-local slice. Keep the list
             // exhaustive so a new HIR expression cannot silently default to non-local provenance.
             ExprKind::Unit
@@ -10589,8 +10851,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
-            | ExprKind::CryptoArgon2 { .. } => false,
+            | ExprKind::CryptoArgon2 { .. } => {}
+            }
         }
+        false
     }
 
     fn lower_block(&mut self, b: &'a Block, depth: u32) {
