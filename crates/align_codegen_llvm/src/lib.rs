@@ -22,6 +22,7 @@ pub mod thinlto_spike;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
+mod drop_codegen;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
@@ -802,17 +803,15 @@ fn build_module<'c>(
     // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
     // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
     // unchanged.
+    let mut type_layouts = align_sema::TypeLayoutCache::new(
+        &program.structs,
+        &program.enums,
+        &program.tagged_types,
+    );
     let field_perm: Vec<Vec<u32>> = program
         .structs
         .iter()
-        .map(|s| {
-            logical_to_physical(
-                s,
-                &program.structs,
-                &program.enums,
-                &program.tagged_types,
-            )
-        })
+        .map(|s| logical_to_physical(s, &mut type_layouts))
         .collect();
     let mut completed_struct_types = HashSet::new();
     for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
@@ -4573,11 +4572,9 @@ fn task_tramp_key(ty: Ty) -> String {
 /// overflow either compiler layer and field ordering cannot drift from the huge-copy lint's layout.
 fn field_abi_align(
     ty: Ty,
-    structs: &[StructDef],
-    enums: &[EnumDef],
-    tagged_types: &[hir::TaggedType],
+    layouts: &mut align_sema::TypeLayoutCache<'_>,
 ) -> u64 {
-    align_sema::ty_abi_layout(ty, structs, enums, tagged_types).1
+    layouts.layout(ty).1
 }
 
 /// The logical→physical field-index map for a struct. A non-`layout(C)` struct is laid out in
@@ -4587,9 +4584,7 @@ fn field_abi_align(
 /// vector `m` satisfies `m[logical] = physical`; invert with [`physical_order`] to emit the body.
 fn logical_to_physical(
     s: &StructDef,
-    structs: &[StructDef],
-    enums: &[EnumDef],
-    tagged_types: &[hir::TaggedType],
+    layouts: &mut align_sema::TypeLayoutCache<'_>,
 ) -> Vec<u32> {
     let n = s.fields.len();
     if s.c_repr {
@@ -4598,12 +4593,7 @@ fn logical_to_physical(
     // Physical order = logical indices sorted by descending alignment (stable → decl order on ties).
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| {
-        std::cmp::Reverse(field_abi_align(
-            s.fields[i as usize].ty,
-            structs,
-            enums,
-            tagged_types,
-        ))
+        std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, layouts))
     });
     // Invert: `map[logical] = physical`.
     let mut map = vec![0u32; n];
@@ -11193,7 +11183,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_struct_gep(st, base, pi, "dropnest")
                         .map_err(|e| self.err(e))?;
-                    self.drop_struct_fields(fp, nid)?;
+                    self.drop_ty_at(fp, Ty::Struct(nid))?;
                 }
                 // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
                 // struct Move through the recursive DropPlan. Tag-switch and free the live variant's
@@ -11205,20 +11195,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_struct_gep(st, base, pi, "dropenumfld")
                         .map_err(|e| self.err(e))?;
-                    self.drop_enum(fp, eid)?;
+                    self.drop_ty_at(fp, Ty::Enum(eid))?;
                 }
                 // An owned `array<Move-struct>` field (J3b) — the `Chat { messages: array<Message> }`
                 // shape, where each element owns a buffer (a `string`/owned-array field, or a Move-enum
                 // field like `Message`'s `content`). Deep-free each element then the AoS (`free(null)` is
                 // a no-op for an empty array) via the shared helper.
-                Ty::DynStructArray(eid, _)
+                ty @ Ty::DynStructArray(eid, _)
                     if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
                 {
                     let fp = self
                         .builder
                         .build_struct_gep(st, base, pi, "dropdeeparr")
                         .map_err(|e| self.err(e))?;
-                    self.deep_free_struct_array(fp, eid)?;
+                    self.drop_ty_at(fp, ty)?;
                 }
                 // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
                 // free its single heap buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an
@@ -11253,7 +11243,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let ep = unsafe {
                             self.builder.build_in_bounds_gep(arr_ty, fp, &[zero, idx], "dropnestel").map_err(|e| self.err(e))?
                         };
-                        self.drop_struct_fields(ep, eid)?;
+                        self.drop_ty_at(ep, Ty::Struct(eid))?;
                     }
                 }
                 // A Move **handle** field (F1②): a bare pointer handle — `http_request_ctx`, `file`,
@@ -11288,185 +11278,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         base: inkwell::values::PointerValue<'c>,
         ty: Ty,
     ) -> Result<(), CodegenError> {
-        match ty {
-            Ty::Option(payload) => self.drop_option_at(base, payload),
-            Ty::Result(ok, err) => self.drop_result_at(base, ok, err),
-            Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
-                Some(hir::TaggedType::Option(payload)) => self.drop_option_at(base, *payload),
-                Some(hir::TaggedType::Result(ok, err)) => self.drop_result_at(base, *ok, *err),
-                None => Err(self.err(format!("nested tagged type id {id} is missing"))),
-            },
-            Ty::Struct(id) => self.drop_struct_fields(base, id),
-            Ty::Enum(id) => self.drop_enum(base, id),
-            Ty::DynStructArray(id, _)
-                if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
-            {
-                self.deep_free_struct_array(base, id)
-            }
-            Ty::DynArray(Scalar::String) => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "dropstrarr")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "dropstrarrptr").map_err(|e| self.err(e))?;
-                let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            Ty::DynResponseArray => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "droprsparr")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "droprsparrptr").map_err(|e| self.err(e))?;
-                let len = self.builder.build_extract_value(agg, 1, "droprsparrlen").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            ty if let Some(free_fn) = handle_free_fn(ty) => {
-                let ptr = self
-                    .builder
-                    .build_load(self.ctx.ptr_type(AddressSpace::default()), base, "drophandlev")
-                    .map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs[free_fn], &[ptr.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            Ty::String
-            | Ty::DynArray(_)
-            | Ty::DynStructArray(..)
-            | Ty::DynSliceArray(_) => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "dropslicev")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "dropsliceptr").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free"], &[ptr.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Drop an `Option<T>` by testing the tag before reading or recursively dropping its payload.
-    fn drop_option_at(
-        &self,
-        base: inkwell::values::PointerValue<'c>,
-        payload: Scalar,
-    ) -> Result<(), CodegenError> {
-        let option_ty = option_struct_type(
-            self.ctx,
-            payload,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let tag_ptr = self
-            .builder
-            .build_struct_gep(option_ty, base, 0, "dropopttagp")
-            .map_err(|e| self.err(e))?;
-        let tag = self
-            .builder
-            .build_load(self.ctx.i8_type(), tag_ptr, "dropopttag")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        let some = self.ctx.append_basic_block(self.func, "drop.opt.some");
-        let cont = self.ctx.append_basic_block(self.func, "drop.opt.cont");
-        let is_some = self
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                tag,
-                self.ctx.i8_type().const_int(1, false),
-                "dropoptissome",
-            )
-            .map_err(|e| self.err(e))?;
-        self.builder
-            .build_conditional_branch(is_some, some, cont)
-            .map_err(|e| self.err(e))?;
-        self.builder.position_at_end(some);
-        let payload_ptr = self
-            .builder
-            .build_struct_gep(option_ty, base, 1, "dropoptpayload")
-            .map_err(|e| self.err(e))?;
-        self.drop_ty_at(payload_ptr, scalar_to_ty(payload))?;
-        self.builder
-            .build_unconditional_branch(cont)
-            .map_err(|e| self.err(e))?;
-        self.builder.position_at_end(cont);
-        Ok(())
-    }
-
-    /// Drop a `Result<T,E>` by selecting exactly the active Ok/Err payload.
-    fn drop_result_at(
-        &self,
-        base: inkwell::values::PointerValue<'c>,
-        ok: Scalar,
-        err: Scalar,
-    ) -> Result<(), CodegenError> {
-        let result_ty = result_struct_type(
-            self.ctx,
-            ok,
-            err,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let tag_ptr = self
-            .builder
-            .build_struct_gep(result_ty, base, 0, "droprestagp")
-            .map_err(|e| self.err(e))?;
-        let tag = self
-            .builder
-            .build_load(self.ctx.i8_type(), tag_ptr, "droprestag")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        let cont = self.ctx.append_basic_block(self.func, "drop.result.cont");
-        let ok_plan = drop_plan(scalar_to_ty(ok), self.structs, self.enums, self.tagged_defs);
-        let err_plan = drop_plan(
-            scalar_to_ty(err),
-            self.structs,
-            self.enums,
-            self.tagged_defs,
-        );
-        let ok_bb = ok_plan
-            .needs_drop()
-            .then(|| self.ctx.append_basic_block(self.func, "drop.result.ok"));
-        let err_bb = err_plan
-            .needs_drop()
-            .then(|| self.ctx.append_basic_block(self.func, "drop.result.err"));
-        let mut cases = Vec::with_capacity(2);
-        if let Some(bb) = ok_bb {
-            cases.push((self.ctx.i8_type().const_zero(), bb));
-        }
-        if let Some(bb) = err_bb {
-            cases.push((self.ctx.i8_type().const_int(1, false), bb));
-        }
-        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
-        if let Some(bb) = ok_bb {
-            self.builder.position_at_end(bb);
-            let payload = self.builder.build_struct_gep(result_ty, base, 1, "dropresok").map_err(|e| self.err(e))?;
-            self.drop_ty_at(payload, scalar_to_ty(ok))?;
-            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
-        }
-        if let Some(bb) = err_bb {
-            self.builder.position_at_end(bb);
-            let payload = self.builder.build_struct_gep(result_ty, base, 2, "droprese").map_err(|e| self.err(e))?;
-            self.drop_ty_at(payload, scalar_to_ty(err))?;
-            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
-        }
-        self.builder.position_at_end(cont);
-        Ok(())
+        self.emit_drop_at_iterative(base, ty)
     }
 
     /// Deep-free an owned `array<Move-struct>` (J3b) whose `{ptr,len}` aggregate lives at `slice_ptr`:
@@ -15316,9 +15128,9 @@ mod tests {
             };
             tagged_type.set_body(&fields, false);
         }
+        let mut layouts = align_sema::TypeLayoutCache::new(&structs, &enums, &tagged_defs);
         for (s, st) in structs.iter().zip(&struct_types) {
-            let perm =
-                logical_to_physical(s, &structs, &enums, &tagged_defs);
+            let perm = logical_to_physical(s, &mut layouts);
             set_struct_body(
                 &ctx,
                 *st,
@@ -15372,7 +15184,8 @@ mod tests {
                         c_repr: false,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(field_abi_align(Ty::Struct(0), &structs, &[], &[]), 8);
+                let mut probe_layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
+                assert_eq!(field_abi_align(Ty::Struct(0), &mut probe_layouts), 8);
 
                 let ctx = Context::create();
                 let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
@@ -15382,8 +15195,9 @@ mod tests {
                     .iter()
                     .map(|structure| ctx.opaque_struct_type(&structure.name))
                     .collect::<Vec<_>>();
+                let mut layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
                 for (structure, llvm_ty) in structs.iter().zip(&struct_types) {
-                    let permutation = logical_to_physical(structure, &structs, &[], &[]);
+                    let permutation = logical_to_physical(structure, &mut layouts);
                     set_struct_body(
                         &ctx,
                         *llvm_ty,
@@ -15397,6 +15211,22 @@ mod tests {
                 }
                 assert_eq!(target_data.get_abi_alignment(&struct_types[0]), 8);
                 assert_eq!(target_data.get_abi_size(&struct_types[0]), 8);
+
+                let mut owned = structs;
+                owned[DEPTH - 1].fields[0].ty = Ty::String;
+                let llvm = codegen_program(
+                    vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                    vec![],
+                    vec![Ty::Struct(0)],
+                    owned,
+                    vec![],
+                    vec![],
+                )
+                .expect("deep recursive Drop emission must use compiler-owned frames");
+                assert!(
+                    function_body(&llvm, "main").contains("@align_rt_free"),
+                    "the deepest owned leaf must still be dropped"
+                );
             })
             .expect("spawn deep type codegen owner")
             .join()

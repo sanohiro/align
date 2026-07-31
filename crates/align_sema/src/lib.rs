@@ -18,7 +18,7 @@ pub use hir::*;
 mod hir_depth;
 pub use hir_depth::{MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid};
 mod type_layout;
-pub use type_layout::ty_abi_layout;
+pub use type_layout::{TypeLayoutCache, ty_abi_layout};
 
 /// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
