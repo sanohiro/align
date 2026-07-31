@@ -15003,6 +15003,11 @@ impl<'a> MoveCheck<'a> {
             Try(&'e Expr),
             LoopBreak(Option<&'e Expr>),
             LoopDiverge,
+            Pipeline {
+                source: &'e Expr,
+                snapshots_source: bool,
+                snapshot: Option<Option<usize>>,
+            },
             JoinIncoming {
                 moved: MovedSet,
                 borrows: BorrowState,
@@ -15013,12 +15018,23 @@ impl<'a> MoveCheck<'a> {
         let mut current = root;
         let mut current_consuming = consuming;
         let mut current_direct = direct;
+        let mut prefix_falls_through = None;
         loop {
             let (child, opens_arena, child_consuming, child_direct, post) =
-                if let Some(child) =
-                    self.transparent_pipeline_capture(current)
+                if let Some((source, child, snapshots_source)) =
+                    self.transparent_pipeline_child(current)
                 {
-                    (child, false, false, false, Post::None)
+                    (
+                        child,
+                        false,
+                        false,
+                        false,
+                        Post::Pipeline {
+                            source,
+                            snapshots_source,
+                            snapshot: None,
+                        },
+                    )
                 } else {
                     match &current.kind {
                     ExprKind::Block(block)
@@ -15329,6 +15345,22 @@ impl<'a> MoveCheck<'a> {
                 self.arena_depth += 1;
             };
             wrappers.push((current, opens_arena, post));
+            if let Some((_, _, Post::Pipeline {
+                source,
+                snapshots_source,
+                snapshot,
+            })) = wrappers.last_mut()
+            {
+                if !self.expr(source, moved, false, false) {
+                    prefix_falls_through = Some(false);
+                    break;
+                }
+                if *snapshots_source {
+                    *snapshot = Some(
+                        self.begin_pipeline_source_snapshot(source),
+                    );
+                }
+            }
             current = child;
             current_consuming = child_consuming;
             current_direct = child_direct;
@@ -15337,12 +15369,14 @@ impl<'a> MoveCheck<'a> {
             return None;
         }
 
-        let mut falls_through = self.expr(
-            current,
-            moved,
-            current_consuming,
-            current_direct,
-        );
+        let mut falls_through = prefix_falls_through.unwrap_or_else(|| {
+            self.expr(
+                current,
+                moved,
+                current_consuming,
+                current_direct,
+            )
+        });
         for (wrapper, opens_arena, post) in
             wrappers.into_iter().rev()
         {
@@ -15401,6 +15435,16 @@ impl<'a> MoveCheck<'a> {
                     self.loop_value_facts.remove(&wrapper.span);
                     None
                 }
+                Post::Pipeline { snapshot, .. } => {
+                    if let Some(snapshot) = snapshot {
+                        self.finish_pipeline_source_snapshot(
+                            snapshot,
+                            wrapper.span,
+                            falls_through,
+                        );
+                    }
+                    None
+                }
                 Post::None => None,
             };
             if !falls_through {
@@ -15457,11 +15501,11 @@ impl<'a> MoveCheck<'a> {
             .then_some(value)
     }
 
-    fn transparent_pipeline_capture(
+    fn transparent_pipeline_child(
         &self,
         expression: &'a Expr,
-    ) -> Option<&'a Expr> {
-        let (source, stages) = match &expression.kind {
+    ) -> Option<(&'a Expr, &'a Expr, bool)> {
+        let (source, child, snapshots_source) = match &expression.kind {
             ExprKind::ArraySum { source, stages }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayMinMax { source, stages, .. }
@@ -15471,19 +15515,50 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArraySortBy { source, stages, .. }
             | ExprKind::ArrayPartition { source, stages, .. }
             | ExprKind::ArrayParMap { source, stages, .. } => {
-                (source.as_ref(), stages.as_slice())
+                if !node_captures(&expression.kind).is_empty() {
+                    return None;
+                }
+                let mut captures = stage_capture_exprs(stages);
+                let capture = captures.next()?;
+                if captures.next().is_some() {
+                    return None;
+                }
+                (source.as_ref(), capture, false)
+            }
+            ExprKind::ArrayReduce {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            }
+            | ExprKind::ArrayScan {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            } if stage_capture_exprs(stages).next().is_none()
+                && captures.is_empty() =>
+            {
+                (source.as_ref(), init.as_ref(), true)
+            }
+            ExprKind::ArrayMapInto {
+                source,
+                stages,
+                dst,
+                ..
+            } if stage_capture_exprs(stages).next().is_none() => {
+                (source.as_ref(), dst.as_ref(), true)
             }
             _ => return None,
         };
-        if !node_captures(&expression.kind).is_empty()
-            || !self.expr_is_move_neutral(source)
+        if hir_depth::expr_postorder(source).len() != 1
             || hir_expr_diverges(source)
         {
             return None;
         }
-        let mut captures = stage_capture_exprs(stages);
-        let capture = captures.next()?;
-        captures.next().is_none().then_some(capture)
+        Some((source, child, snapshots_source))
     }
 
     /// Whether the complete expression tree can neither observe nor change Move/borrow state.

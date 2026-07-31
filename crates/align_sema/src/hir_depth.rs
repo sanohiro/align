@@ -999,6 +999,9 @@ mod tests {
         If,
         LoopBreak,
         LoopRepeat,
+        ReduceInit,
+        ScanInit,
+        MapIntoDst,
     }
 
     fn int_ty() -> Ty {
@@ -1322,7 +1325,10 @@ mod tests {
         let target_expression_depth = MAX_CHECKED_HIR_DEPTH - 1;
         let delta = match shape {
             MoveControlShape::ShortCircuit
-            | MoveControlShape::ElseUnwrap => 1,
+            | MoveControlShape::ElseUnwrap
+            | MoveControlShape::ReduceInit
+            | MoveControlShape::ScanInit
+            | MoveControlShape::MapIntoDst => 1,
             MoveControlShape::If => 2,
             MoveControlShape::LoopBreak
             | MoveControlShape::LoopRepeat => 3,
@@ -1393,6 +1399,39 @@ mod tests {
                     diverges: true,
                     body_locals: 0..0,
                 },
+                MoveControlShape::ReduceInit => ExprKind::ArrayReduce {
+                    source: Box::new(Expr {
+                        kind: ExprKind::Local(0),
+                        ty: Ty::String,
+                        span,
+                    }),
+                    stages: Vec::new(),
+                    func: "reduce".to_string(),
+                    captures: Vec::new(),
+                    init: Box::new(expression),
+                },
+                MoveControlShape::ScanInit => ExprKind::ArrayScan {
+                    source: Box::new(Expr {
+                        kind: ExprKind::Local(0),
+                        ty: Ty::String,
+                        span,
+                    }),
+                    stages: Vec::new(),
+                    func: "scan".to_string(),
+                    captures: Vec::new(),
+                    init: Box::new(expression),
+                    elem: int_ty(),
+                },
+                MoveControlShape::MapIntoDst => ExprKind::ArrayMapInto {
+                    source: Box::new(Expr {
+                        kind: ExprKind::Local(0),
+                        ty: Ty::String,
+                        span,
+                    }),
+                    stages: Vec::new(),
+                    dst: Box::new(expression),
+                    elem: int_ty(),
+                },
             };
             expression = Expr {
                 kind,
@@ -1401,7 +1440,10 @@ mod tests {
                     MoveControlShape::ElseUnwrap
                     | MoveControlShape::If
                     | MoveControlShape::LoopBreak
-                    | MoveControlShape::LoopRepeat => int_ty(),
+                    | MoveControlShape::LoopRepeat
+                    | MoveControlShape::ReduceInit
+                    | MoveControlShape::ScanInit
+                    | MoveControlShape::MapIntoDst => int_ty(),
                 },
                 span,
             };
@@ -1526,6 +1568,15 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::LoopRepeat,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::ReduceInit,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::ScanInit,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::MapIntoDst,
                     ),
                 ]);
                 for move_program in move_programs {
