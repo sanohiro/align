@@ -15014,17 +15014,13 @@ impl<'a> MoveCheck<'a> {
         let mut current_consuming = consuming;
         let mut current_direct = direct;
         loop {
-            if let Some(child) =
-                self.transparent_pipeline_capture(current)
-            {
-                wrappers.push((current, false, Post::None));
-                current = child;
-                current_consuming = false;
-                current_direct = false;
-                continue;
-            }
             let (child, opens_arena, child_consuming, child_direct, post) =
-                match &current.kind {
+                if let Some(child) =
+                    self.transparent_pipeline_capture(current)
+                {
+                    (child, false, false, false, Post::None)
+                } else {
+                    match &current.kind {
                     ExprKind::Block(block)
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
@@ -15315,7 +15311,22 @@ impl<'a> MoveCheck<'a> {
                     | ExprKind::BytesAsStr { bytes: child } => {
                         (child.as_ref(), false, false, false, Post::None)
                     }
-                    _ => break,
+                        _ => break,
+                    }
+                };
+            let may_borrow = ty_may_borrow(
+                current.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            );
+            if may_borrow {
+                self.clear_value_snapshot(Self::expr_key(current));
+            }
+            self.value_snapshot_frames.push(Vec::new());
+            if opens_arena {
+                self.arena_depth += 1;
             };
             wrappers.push((current, opens_arena, post));
             current = child;
@@ -15324,23 +15335,6 @@ impl<'a> MoveCheck<'a> {
         }
         if wrappers.is_empty() {
             return None;
-        }
-
-        for (wrapper, opens_arena, _) in &wrappers {
-            let may_borrow = ty_may_borrow(
-                wrapper.ty,
-                self.structs,
-                self.tuples,
-                self.enums,
-                self.tagged_types,
-            );
-            if may_borrow {
-                self.clear_value_snapshot(Self::expr_key(wrapper));
-            }
-            self.value_snapshot_frames.push(Vec::new());
-            if *opens_arena {
-                self.arena_depth += 1;
-            }
         }
 
         let mut falls_through = self.expr(
