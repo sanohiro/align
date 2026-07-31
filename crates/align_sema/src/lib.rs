@@ -11698,6 +11698,20 @@ impl UnnecessaryHeapScan {
     }
 
     fn visit(&mut self, e: &Expr) {
+        if matches!(e.kind, ExprKind::Binary { .. } | ExprKind::IntArith { .. }) {
+            let mut work = vec![e];
+            while let Some(node) = work.pop() {
+                match &node.kind {
+                    ExprKind::Binary { lhs, rhs, .. }
+                    | ExprKind::IntArith { lhs, rhs, .. } => {
+                        work.push(rhs);
+                        work.push(lhs);
+                    }
+                    _ => self.visit(node),
+                }
+            }
+            return;
+        }
         match &e.kind {
             // `p.get()` — the one occurrence that does *not* need a heap box. When the receiver is a
             // bare local, record it as a get and do NOT recurse into the receiver (so the inner
@@ -11750,9 +11764,8 @@ impl UnnecessaryHeapScan {
                 self.block(els);
             }
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.visit(expr),
-            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.visit(lhs);
-                self.visit(rhs);
+            ExprKind::Binary { .. } | ExprKind::IntArith { .. } => {
+                unreachable!("binary trees are visited by the explicit worklist")
             }
             ExprKind::Call { args, .. } => {
                 for a in args {
@@ -14588,6 +14601,31 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
+        if matches!(
+            e.kind,
+            ExprKind::Binary {
+                op: BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr,
+                ..
+            } | ExprKind::IntArith { .. }
+        ) && self.eager_binary_tree_is_non_borrowing(e)
+        {
+            return self.expr_non_borrowing_binary_tree(e, moved);
+        }
         let may_borrow = ty_may_borrow(
             e.ty,
             self.structs,
@@ -14629,6 +14667,58 @@ impl<'a> MoveCheck<'a> {
             }
         }
         falls_through
+    }
+
+    fn eager_binary_tree_is_non_borrowing(&self, root: &Expr) -> bool {
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if ty_may_borrow(
+                node.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                return false;
+            }
+            match &node.kind {
+                ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                } => return false,
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::IntArith { lhs, rhs, .. } => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn expr_non_borrowing_binary_tree(
+        &mut self,
+        root: &Expr,
+        moved: &mut MovedSet,
+    ) -> bool {
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            match &node.kind {
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::IntArith { lhs, rhs, .. } => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                _ => {
+                    if !self.expr(node, moved, false, false) {
+                        self.non_fallthrough.insert(root.span);
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn expr_inner(
@@ -17935,35 +18025,200 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Check the right operand of a binary op, supporting a scalar–vector broadcast in either order.
-    /// Normally the rhs is hinted with the lhs type (so a literal adopts it). But if the lhs is a
-    /// scalar and the rhs turns out to be a vector (`2.0 + a`), that hint mis-constrains, so the
-    /// speculative diagnostics are rolled back and the rhs is re-checked unhinted (the scalar then
-    /// broadcasts against the vector in [`Self::vec_binop`]).
-    fn check_binop_rhs(&mut self, lhs_ty: Ty, rhs: &ast::Expr) -> Expr {
-        if matches!(self.resolve(lhs_ty), Ty::Vec(..)) {
-            return self.check_expr(rhs, None); // vec lhs: rhs self-types
+    /// Type-check an eager or short-circuit binary tree with heap-owned continuation frames.
+    ///
+    /// Parser-valid left-associative chains may contain 128 AST expressions. Keeping the former
+    /// recursive `check_expr(lhs)` call here made that accepted boundary exhaust the 2 MiB compiler
+    /// test stack before HIR existed. `AfterLhs` retains the source-order type hint and
+    /// scalar/vector retry point; `AfterRhs` applies the former parent logic only after both
+    /// operands have completed.
+    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        enum Frame<'e> {
+            Enter {
+                expr: &'e ast::Expr,
+                expected: Option<Ty>,
+            },
+            AfterLhs {
+                op: BinOp,
+                rhs: &'e ast::Expr,
+                expected: Option<Ty>,
+                span: Span,
+            },
+            AfterRhs {
+                op: BinOp,
+                lhs: Expr,
+                rhs: &'e ast::Expr,
+                expected: Option<Ty>,
+                span: Span,
+                diagnostic_mark: Option<usize>,
+            },
         }
-        let mark = self.diags.len();
-        let r = self.check_expr(rhs, Some(lhs_ty));
-        if matches!(self.resolve(r.ty), Ty::Vec(..)) {
-            // Sound to roll back here: the only side effect of the speculative check was the
-            // diagnostic. The hint applied `unify(rhs = Vec, lhs_ty)`, and `unify` binds a variable
-            // only to a concrete `Int`/`Float` (its `(IntVar, Int)` / `(FloatVar, Float)` arms) — never
-            // to a `Vec` (that hits the mismatch arm), so `lhs_ty` is left exactly as it was.
-            self.diags.truncate(mark);
-            return self.check_expr(rhs, None);
+
+        let lhs_expected = match op {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr => expected,
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => None,
+            BinOp::And | BinOp::Or => Some(Ty::Bool),
+        };
+        let mut frames = vec![
+            Frame::AfterLhs {
+                op,
+                rhs,
+                expected,
+                span,
+            },
+            Frame::Enter {
+                expr: lhs,
+                expected: lhs_expected,
+            },
+        ];
+        let mut values = Vec::new();
+
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Enter { expr, expected } => {
+                    let ast::ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+                        values.push(self.check_expr(expr, expected));
+                        continue;
+                    };
+                    let lhs_expected = match op {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr => expected,
+                        BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge => None,
+                        BinOp::And | BinOp::Or => Some(Ty::Bool),
+                    };
+                    frames.push(Frame::AfterLhs {
+                        op: *op,
+                        rhs,
+                        expected,
+                        span: expr.span,
+                    });
+                    frames.push(Frame::Enter {
+                        expr: lhs,
+                        expected: lhs_expected,
+                    });
+                }
+                Frame::AfterLhs {
+                    op,
+                    rhs,
+                    expected,
+                    span,
+                } => {
+                    let lhs = values.pop().expect("binary lhs value");
+                    let (rhs_expected, diagnostic_mark) = match op {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge => {
+                            if matches!(self.resolve(lhs.ty), Ty::Vec(..)) {
+                                (None, None)
+                            } else {
+                                (Some(lhs.ty), Some(self.diags.len()))
+                            }
+                        }
+                        BinOp::And | BinOp::Or => (Some(Ty::Bool), None),
+                        BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr => (Some(lhs.ty), None),
+                    };
+                    frames.push(Frame::AfterRhs {
+                        op,
+                        lhs,
+                        rhs,
+                        expected,
+                        span,
+                        diagnostic_mark,
+                    });
+                    frames.push(Frame::Enter {
+                        expr: rhs,
+                        expected: rhs_expected,
+                    });
+                }
+                Frame::AfterRhs {
+                    op,
+                    lhs,
+                    rhs,
+                    expected,
+                    span,
+                    diagnostic_mark,
+                } => {
+                    let right = values.pop().expect("binary rhs value");
+                    if let Some(mark) = diagnostic_mark
+                        && matches!(self.resolve(right.ty), Ty::Vec(..))
+                    {
+                        // A scalar lhs may broadcast against a vector rhs. The hinted first check
+                        // can only have added diagnostics: unification never binds a scalar
+                        // inference variable to a vector. Discard those diagnostics and replay the
+                        // rhs without the scalar hint, preserving the former recursive path.
+                        self.diags.truncate(mark);
+                        frames.push(Frame::AfterRhs {
+                            op,
+                            lhs,
+                            rhs,
+                            expected,
+                            span,
+                            diagnostic_mark: None,
+                        });
+                        frames.push(Frame::Enter {
+                            expr: rhs,
+                            expected: None,
+                        });
+                        continue;
+                    }
+                    values.push(self.finish_binary(op, lhs, right, expected, span));
+                }
+            }
         }
-        r
+
+        values.pop().expect("binary root value")
     }
 
-    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+    fn finish_binary(
+        &mut self,
+        op: BinOp,
+        l: Expr,
+        r: Expr,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
         let ty;
-        let (l, r);
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                l = self.check_expr(lhs, expected);
-                r = self.check_binop_rhs(l.ty, rhs);
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
                     // Vectors support all elementwise arithmetic `+` `-` `*` `/` `%` (M6). Integer
                     // `/`/`%` carry the same lane-wise divisor guard as scalars (zero lane → abort,
@@ -17996,8 +18251,6 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                l = self.check_expr(lhs, None);
-                r = self.check_binop_rhs(l.ty, rhs);
                 // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar in either
                 // order like `scores > 80` / `80 < scores`) is elementwise and yields a `mask` (M6).
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
@@ -18052,15 +18305,11 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             BinOp::And | BinOp::Or => {
-                l = self.check_expr(lhs, Some(Ty::Bool));
-                r = self.check_expr(rhs, Some(Ty::Bool));
                 ty = Ty::Bool;
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 // Bitwise / shift: integer-only, no implicit coercion. The shift amount shares the
                 // value's type (unified like arithmetic), so the result is that integer type.
-                l = self.check_expr(lhs, expected);
-                r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
                 if matches!(t, Ty::Vec(..)) {
                     // Vectors carry only elementwise `+` `-` `*` `/` `%` (and comparisons → `mask`), not
@@ -27653,6 +27902,27 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn finalize_expr(&mut self, e: &mut Expr) {
+        if matches!(e.kind, ExprKind::Binary { .. } | ExprKind::IntArith { .. }) {
+            let mut work = vec![e];
+            while let Some(node) = work.pop() {
+                if !matches!(
+                    node.kind,
+                    ExprKind::Binary { .. } | ExprKind::IntArith { .. }
+                ) {
+                    self.finalize_expr(node);
+                    continue;
+                }
+                node.ty = self.finalize(node.ty);
+                let (lhs, rhs) = match &mut node.kind {
+                    ExprKind::Binary { lhs, rhs, .. }
+                    | ExprKind::IntArith { lhs, rhs, .. } => (lhs.as_mut(), rhs.as_mut()),
+                    _ => unreachable!("binary worklist contains only binary nodes"),
+                };
+                work.push(rhs);
+                work.push(lhs);
+            }
+            return;
+        }
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
         let span = e.span;
@@ -27740,9 +28010,8 @@ impl<'a, 't> Checker<'a, 't> {
                     ));
                 }
             }
-            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.finalize_expr(lhs);
-                self.finalize_expr(rhs);
+            ExprKind::Binary { .. } | ExprKind::IntArith { .. } => {
+                unreachable!("binary trees are finalized by the explicit worklist")
             }
             ExprKind::Call { func, args, type_args } => {
                 for a in args {
