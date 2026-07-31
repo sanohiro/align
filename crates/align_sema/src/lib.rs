@@ -14720,6 +14720,11 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
+        if let Some(falls_through) =
+            self.expr_transparent_spine(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
         if self.expr_is_move_neutral(e) {
             let falls_through = !hir_expr_diverges(e);
             if !falls_through {
@@ -14793,6 +14798,88 @@ impl<'a> MoveCheck<'a> {
             }
         }
         falls_through
+    }
+
+    /// Evaluate an empty transparent block spine without one native call frame per wrapper. Block,
+    /// arena, task-group, and unsafe tails preserve the caller's consuming/direct mode; only arena
+    /// adjusts the hidden-owner context while its child is evaluated.
+    fn expr_transparent_spine(
+        &mut self,
+        root: &Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        let mut wrappers = Vec::new();
+        let mut current = root;
+        loop {
+            let (block, opens_arena) = match &current.kind {
+                ExprKind::Block(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block) => (block, false),
+                ExprKind::Arena(block) => (block, true),
+                _ => break,
+            };
+            if !block.stmts.is_empty() {
+                break;
+            }
+            let Some(value) = block.value.as_deref() else {
+                break;
+            };
+            wrappers.push((current, opens_arena));
+            current = value;
+        }
+        if wrappers.is_empty() {
+            return None;
+        }
+
+        for &(wrapper, opens_arena) in &wrappers {
+            let may_borrow = ty_may_borrow(
+                wrapper.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            );
+            if may_borrow {
+                self.clear_value_snapshot(Self::expr_key(wrapper));
+            }
+            self.value_snapshot_frames.push(Vec::new());
+            if opens_arena {
+                self.arena_depth += 1;
+            }
+        }
+
+        let falls_through = self.expr(current, moved, consuming, direct);
+        for &(wrapper, opens_arena) in wrappers.iter().rev() {
+            if opens_arena {
+                self.arena_depth -= 1;
+            }
+            let child_snapshots = self
+                .value_snapshot_frames
+                .pop()
+                .expect("value snapshot frame for transparent expression");
+            debug_assert!(Self::defers_child_snapshot_validation(&wrapper.kind));
+            let key = Self::expr_key(wrapper);
+            if !falls_through {
+                self.non_fallthrough.insert(wrapper.span);
+            } else if ty_may_borrow(
+                wrapper.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                let fact = self.borrow_fact(wrapper);
+                self.borrows.begin_value_source(key, fact.live_roots());
+                self.walked_value_facts.insert(key, fact);
+                if let Some(parent) = self.value_snapshot_frames.last_mut() {
+                    parent.push(key);
+                }
+            }
+            let _ = child_snapshots;
+        }
+        Some(falls_through)
     }
 
     /// Whether the complete expression tree can neither observe nor change Move/borrow state.
