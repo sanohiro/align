@@ -300,10 +300,10 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 ## M1 — The Bones of the Language (functions, control, struct, bool) — DONE
 
 - [done] `fn` (normal form + `= expr` short form), multiple arguments, function calls.
-- **Return-completeness correction pending am-f (2026-07-31):** the settled contract permits bare
-  return/reachable fallthrough only for Unit. The current checker can emit `Return(None)` or an
-  absent reachable tail for a non-Unit function, which reaches LLVM as `ret void` under a
-  value-returning signature. Am-f rejects both before HIR and pins every-path completion.
+- **Return-completeness correction implemented by am-f (2026-08-01):** bare return and reachable
+  fallthrough are accepted only for Unit. Every non-Unit path now produces a typed value or is
+  proven non-fallthrough before HIR publication/MIR lowering, so LLVM cannot receive `ret void`
+  under a value-returning signature.
 - [done] `if` / comparison operations / `bool`.
 - [done] `mut` and reassignment.
 - [done] One `print` equivalent of `std.io`, wired directly to the runtime (for output
@@ -1558,8 +1558,9 @@ and http last (needs net + TLS).
     a `return` uses (drops → task_groups reversed → arenas reversed, innermost-first; no second
     mechanism), then `exit(code)` (low-byte truncation documented); `abort()` = immediate
     `_exit(1)`, no cleanup — the named-dangerous escape hatch, distinct from `panic_abort`'s
-    SIGABRT. No `Ty::Never` exists, so both are typed `Ty::Unit` v1 (statement position; a
-    proper `Ty::Never` is a recorded deferral); the block gets `Unreachable`, and the normal-path
+    SIGABRT. No `Ty::Never` exists, so both keep a `Ty::Unit` surface result, while checked
+    non-fallthrough flow lets them complete any return path without a synthetic value (a proper
+    `Ty::Never` is a recorded deferral); the block gets `Unreachable`, and the normal-path
     cleanup is `is_terminated`-guarded (no double drop/arena-end). Global flush machinery
     proven unneeded (print is write-through; every writer is a local flushed by its Drop in
     the exit cleanup). v1 gap recorded: current-frame cleanup only; full stack unwind is the

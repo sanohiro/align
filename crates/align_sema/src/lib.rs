@@ -12441,6 +12441,15 @@ fn hir_block_diverges(b: &hir::Block) -> bool {
     hir_diverges(HirDivergenceNode::Block(b))
 }
 
+/// The structural type retained by a transparent block wrapper whose continuation is unreachable.
+/// An enclosing context wins; otherwise a checked dead tail keeps the inference behavior it had
+/// before am-f without making that tail a fallthrough edge. A wrapper with neither is Unit.
+fn diverging_block_result_ty(block: &Block, expected: Option<Ty>) -> Ty {
+    expected
+        .or_else(|| block.value.as_deref().map(|value| value.ty))
+        .unwrap_or(Ty::Unit)
+}
+
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
 /// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
 /// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
@@ -18884,6 +18893,12 @@ impl<'a, 't> Checker<'a, 't> {
                             }
                         }
                     }
+                    Ty::Param(index) => output.push_str(
+                        self.type_params
+                            .get(index as usize)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown type parameter>"),
+                    ),
                     // No id (primitives), or no source name to resolve (fn#) — the free form is fine.
                     _ => output.push_str(&ty_name(ty)),
                 },
@@ -19116,9 +19131,13 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         let body = match &f.body {
-            ast::FnBody::Block(b) => self.check_block(b, Some(ret)),
+            ast::FnBody::Block(b) => {
+                let body = self.check_block(b, Some(ret));
+                self.check_return_completeness(&body, ret, b.span);
+                body
+            }
             ast::FnBody::Expr(e) => {
-                let value = self.check_expr(e, Some(ret));
+                let value = self.check_completion_expr(e, Some(ret));
                 Block {
                     stmts: Vec::new(),
                     value: Some(Box::new(value)),
@@ -19153,6 +19172,23 @@ impl<'a, 't> Checker<'a, 't> {
             drop_individual_locals: Vec::new(),
             drop_individual_exprs: std::collections::HashMap::new(),
             exportable: false,
+        }
+    }
+
+    fn check_return_completeness(&mut self, body: &Block, ret: Ty, span: Span) {
+        let resolved_ret = self.resolve(ret);
+        if resolved_ret != Ty::Unit
+            && resolved_ret != Ty::Error
+            && body.value.is_none()
+            && !hir_block_diverges(body)
+        {
+            self.diags.error(
+                format!(
+                    "function returning {} has a reachable path without a return value",
+                    self.ty_display(resolved_ret)
+                ),
+                span,
+            );
         }
     }
 
@@ -19318,7 +19354,17 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 ast::Stmt::Return(value) => {
                     // The enclosing function's return type is the expected one. We
-                    // thread it via `expected` of the body block (M1: one level).
+                    // keep it in `ret_hint`; lifted lambda checking installs its own active return.
+                    let resolved_ret = self.resolve(self.ret_hint);
+                    if value.is_none() && resolved_ret != Ty::Unit && resolved_ret != Ty::Error {
+                        self.diags.error(
+                            format!(
+                                "return without a value is only valid in a function returning (); this function returns {}",
+                                self.ty_display(resolved_ret)
+                            ),
+                            b.span,
+                        );
+                    }
                     let v = value.as_ref().map(|e| self.check_expr(e, Some(self.ret_hint)));
                     stmts.push(Stmt::Return(v));
                 }
@@ -19422,9 +19468,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
 
+        let prefix_diverges = stmts.iter().any(hir_stmt_diverges);
+        let tail_expected = if prefix_diverges { None } else { expected };
         let value = b.tail.as_ref().map(|e| {
-            self.reject_bare_array_value(e, expected, "a block value");
-            Box::new(self.check_expr(e, expected))
+            self.reject_bare_array_value(e, tail_expected, "a block value");
+            Box::new(self.check_completion_expr(e, tail_expected))
         });
         self.scope.truncate(scope_mark);
         Block { stmts, value }
@@ -19786,6 +19834,21 @@ impl<'a, 't> Checker<'a, 't> {
         result
     }
 
+    /// Check a function, block, or match-arm completion expression. Process termination has an
+    /// exact Unit HIR result but never reaches the surrounding completion edge, so a direct
+    /// `exit`/`abort` tail needs no value constraint. This deliberately does not propagate through
+    /// eager parents: without a first-class Never type, their ordinary operand/result relations
+    /// remain exact.
+    fn check_completion_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        let errors_before = self.diags.error_count();
+        let result = self.check_expr_inner(e, expected);
+        let directly_terminates = matches!(result.kind, ExprKind::ProcessExit { .. } | ExprKind::ProcessAbort);
+        if self.diags.error_count() == errors_before && expected.is_some() && !directly_terminates {
+            self.constrain(result.ty, expected, e.span);
+        }
+        result
+    }
+
     fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
         match &e.kind {
             ast::ExprKind::Unit => {
@@ -19884,12 +19947,13 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::Try(inner) => self.check_try(inner, expected, e.span),
             ast::ExprKind::Arena(b) => {
-                let diverges = ast_block_diverges(b);
+                let syntax_diverges = ast_block_diverges(b);
                 self.arena_depth += 1;
-                let block = self.check_block(b, if diverges { None } else { expected });
+                let block = self.check_block(b, if syntax_diverges { None } else { expected });
                 self.arena_depth -= 1;
+                let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    expected.unwrap_or(Ty::Unit)
+                    diverging_block_result_ty(&block, expected)
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -19901,12 +19965,13 @@ impl<'a, 't> Checker<'a, 't> {
                 // A marker block — no region, no runtime effect. It only raises `unsafe_depth` so the
                 // `raw.*` ops inside are permitted, and (via the effect scan) marks the fn impure. The
                 // block value passes through exactly like a plain block / `arena {}`.
-                let diverges = ast_block_diverges(b);
+                let syntax_diverges = ast_block_diverges(b);
                 self.unsafe_depth += 1;
-                let block = self.check_block(b, if diverges { None } else { expected });
+                let block = self.check_block(b, if syntax_diverges { None } else { expected });
                 self.unsafe_depth -= 1;
+                let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    expected.unwrap_or(Ty::Unit)
+                    diverging_block_result_ty(&block, expected)
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -19915,18 +19980,19 @@ impl<'a, 't> Checker<'a, 't> {
                 Expr { kind: ExprKind::Unsafe(block), ty, span: e.span }
             }
             ast::ExprKind::TaskGroup(b) => {
-                let diverges = ast_block_diverges(b);
+                let syntax_diverges = ast_block_diverges(b);
                 // A `task_group` opens a task-only region: spawned environments/results live in it,
                 // but ordinary arena-requiring operations still need an explicit `arena {}`.
                 self.task_group_depth += 1;
                 self.wait_state.push(false);
                 self.task_group_fallible.push(false);
-                let block = self.check_block(b, if diverges { None } else { expected });
+                let block = self.check_block(b, if syntax_diverges { None } else { expected });
                 self.task_group_fallible.pop();
                 self.wait_state.pop();
                 self.task_group_depth -= 1;
+                let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    expected.unwrap_or(Ty::Unit)
+                    diverging_block_result_ty(&block, expected)
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -19946,13 +20012,15 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, e.span),
             ast::ExprKind::Block(b) => {
                 // A block that always returns never yields a value; let it take the
-                // expected type so it fits any value position.
-                if ast_block_diverges(b) {
-                    let block = self.check_block(b, None);
-                    let ty = expected.unwrap_or(Ty::Unit);
+                // expected type so it fits that value position. With no expected type, preserve a
+                // retained dead tail's structural type for existing eager-parent checking; the HIR
+                // divergence predicate still prevents that tail from creating a continuation edge.
+                let syntax_diverges = ast_block_diverges(b);
+                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                if hir_block_diverges(&block) {
+                    let ty = diverging_block_result_ty(&block, expected);
                     return Expr { kind: ExprKind::Block(block), ty, span: e.span };
                 }
-                let block = self.check_block(b, expected);
                 let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                 Expr { kind: ExprKind::Block(block), ty, span: e.span }
             }
@@ -23419,6 +23487,7 @@ impl<'a, 't> Checker<'a, 't> {
             Some(t) => t,
             None => checked.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit),
         };
+        self.check_return_completeness(&checked, ret, body.span);
         let mut body_fin = checked;
         self.finalize_block(&mut body_fin);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
@@ -27286,10 +27355,9 @@ impl<'a, 't> Checker<'a, 't> {
     ///   cleanup-then-exit semantics (Nothing-hidden: no silently lost buffered output).
     /// - `abort()` is the named escape hatch: immediate `_exit`, NO cleanup.
     ///
-    /// There is no `Never` type yet, so both are typed `()` (v1): they lower to a diverging runtime
-    /// call, but the type system does not model the divergence — so `process.exit` cannot be the tail
-    /// value of a non-unit-returning function (use it as a statement). Recorded in
-    /// `docs/impl/std-design/process.md`.
+    /// There is no `Never` type yet, so both retain a `()` HIR result. Used as direct completion
+    /// expressions or statements, the non-fallthrough predicate records that no value reaches the
+    /// function/block continuation; am-f invents no source, HIR, or runtime value.
     fn check_process_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if method == "abort" {
@@ -30434,11 +30502,13 @@ impl<'a, 't> Checker<'a, 't> {
                     (vec![idx], locals)
                 }
             };
-            // Each arm body is checked against the running result type, so the constraint (and any
-            // mismatch error) comes from `check_expr`; the first non-error arm fixes the type.
+            // Each fallthrough arm is checked against the running result type. A diverging arm
+            // contributes no value to the join; direct process completion also retains its exact
+            // Unit HIR type instead of being coerced to the match result. The first non-diverging,
+            // non-error arm fixes an otherwise unconstrained result type.
             self.reject_bare_array_value(&arm.body, result_ty, "a `match` arm value");
-            let body = self.check_expr(&arm.body, result_ty);
-            if result_ty.is_none() && body.ty != Ty::Error {
+            let body = self.check_completion_expr(&arm.body, result_ty);
+            if result_ty.is_none() && body.ty != Ty::Error && !hir_expr_diverges(&body) {
                 result_ty = Some(body.ty);
             }
             self.scope.truncate(scope_mark);
@@ -30469,13 +30539,19 @@ impl<'a, 't> Checker<'a, 't> {
         // an absent `else` is a path that did not wait). Soundly tracks `get`-before-`wait`.
         let in_tg = !self.wait_state.is_empty();
         let w_before = self.wait_state.last().copied().unwrap_or(false);
-        let then_b = self.check_block(then, expected);
+        let then_b = self.check_block(
+            then,
+            if ast_block_diverges(then) { None } else { expected },
+        );
         let w_then = self.wait_state.last().copied().unwrap_or(false);
         if in_tg {
             *self.wait_state.last_mut().unwrap() = w_before;
         }
         let els_b = match els {
-            Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(b, expected),
+            Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(
+                b,
+                if ast_block_diverges(b) { None } else { expected },
+            ),
             Some(e) => {
                 // `else if` chain: check as an expression and wrap as a block value.
                 self.reject_bare_array_value(e, expected, "an `else` value");
@@ -30489,12 +30565,31 @@ impl<'a, 't> Checker<'a, 't> {
             *self.wait_state.last_mut().unwrap() = w_then && w_els;
         }
 
-        // If both branches produce a value, the if has that (unified) type; else Unit.
-        let ty = match (&then_b.value, &els_b.value) {
-            (Some(t), Some(e)) => self.unify(t.ty, e.ty, span),
-            _ => Ty::Unit,
+        // A diverging condition, or two diverging alternatives, produces no value and therefore
+        // satisfies any expected type. Otherwise only fallthrough alternatives contribute a value;
+        // a reachable alternative with no tail contributes Unit.
+        let condition_diverges = hir_expr_diverges(&c);
+        let then_diverges = hir_block_diverges(&then_b);
+        let else_diverges = hir_block_diverges(&els_b);
+        let always_diverges = condition_diverges || (then_diverges && else_diverges);
+        let then_ty = (!then_diverges)
+            .then_some(then_b.value.as_deref().map(|value| value.ty).unwrap_or(Ty::Unit));
+        let else_ty = (!else_diverges)
+            .then_some(els_b.value.as_deref().map(|value| value.ty).unwrap_or(Ty::Unit));
+        let ty = if always_diverges {
+            expected.unwrap_or(Ty::Unit)
+        } else {
+            match (then_ty, else_ty) {
+                (Some(then_ty), Some(else_ty)) => self.unify(then_ty, else_ty, span),
+                (Some(ty), None) | (None, Some(ty)) => ty,
+                // Both alternatives diverging implies `always_diverges`; retain a fail-closed
+                // fallback rather than trusting a source-derived control invariant with a panic.
+                (None, None) => Ty::Unit,
+            }
         };
-        self.constrain(ty, expected, span);
+        if !always_diverges {
+            self.constrain(ty, expected, span);
+        }
         Expr { kind: ExprKind::If { cond: Box::new(c), then: then_b, els: els_b }, ty, span }
     }
 
@@ -36630,6 +36725,285 @@ fn exit_branch(flag: bool) -> i64 {
         // `main(args)` must return Result (the only form the wrapper marshals argv into).
         let (_r, noresult) = check("fn main(args: array<str>) -> i32 = 0\n");
         assert!(noresult.has_errors(), "main(args) with a non-Result return must error");
+    }
+
+    #[test]
+    fn function_return_completeness_matrix() {
+        for (name, source) in [
+            ("unit-fallthrough", "fn f() {}\nfn main() -> i32 = 0\n"),
+            ("unit-bare-return", "fn f() { return }\nfn main() -> i32 = 0\n"),
+            ("typed-tail", "fn f() -> i64 = 7\nfn main() -> i32 = 0\n"),
+            ("typed-return", "fn f() -> i64 { return 7 }\nfn main() -> i32 = 0\n"),
+            (
+                "if-all-return",
+                "fn f(c: bool) -> i64 { if c { return 1 } else { return 2 } }\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "match-all-return",
+                "Choice { A, B }\nfn f(v: Choice) -> i64 { match v { A => { return 1 } B => { return 2 } } }\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "match-return-then-value",
+                "Choice { A, B }\nfn f(v: Choice) -> i64 { x := match v { A => { return 1 } B => 2 }\nreturn x\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "match-process-then-value",
+                "import std.process\nChoice { A, B }\nfn f(v: Choice) -> i64 = match v { A => process.exit(1) B => 2 }\nfn main() -> i32 = 0\n",
+            ),
+            ("diverging-loop", "fn f() -> i64 { loop {} }\nfn main() -> i32 = 0\n"),
+            (
+                "loop-value-tail",
+                "fn f() -> i64 = loop { break 7 }\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "process-exit",
+                "import std.process\nfn f() -> i64 { process.exit(7)\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "process-abort",
+                "import std.process\nfn f() -> i64 { process.abort()\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "process-exit-expression-body",
+                "import std.process\nfn f() -> i64 = process.exit(7)\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "transparent-regions",
+                "fn arena_return() -> i64 { arena { return 1 } }\nfn unsafe_return() -> i64 { unsafe { return 2 } }\nfn group_return() -> i64 { task_group { return 3 } }\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "try-then-return",
+                "fn f(v: Result<i64, Error>) -> Result<i64, Error> { x := v?\nreturn Ok(x)\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "else-then-return",
+                "fn f(v: Option<i64>) -> i64 { x := v else { return 1 }\nreturn x\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "dead-syntax-after-return",
+                "fn f() -> i64 { return 1\nprint(2)\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "generic-tail",
+                "fn id<T>(value: T) -> T = value\nfn main() -> i32 = id(0)\n",
+            ),
+            (
+                "lifted-lambda-all-return",
+                "fn main() -> i32 { if [1].all(fn x { if x > 0 { return true } else { return false } }) { return 0 }\nreturn 1\n}\n",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{name} must satisfy non-Unit completion: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let (program, diagnostics) = check(
+            "import std.process\nChoice { A, B }\nfn direct_exit() -> i64 = process.exit(7)\nfn block_abort() -> i64 { process.abort()\n}\nfn matched_exit(value: Choice) -> i64 = match value { A => process.exit(7) B => 8 }\nfn main() -> i32 = 0\n",
+        );
+        assert!(!diagnostics.has_errors());
+        for name in ["direct_exit", "block_abort"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                function.body.value.as_deref().expect("process tail").ty,
+                Ty::Unit,
+                "{name} keeps exact Unit HIR while its completion edge is unreachable"
+            );
+        }
+        let matched_exit = program
+            .fns
+            .iter()
+            .find(|function| function.name == "matched_exit")
+            .expect("missing matched_exit");
+        let matched_value = matched_exit.body.value.as_deref().expect("match tail");
+        let ExprKind::Match { arms, .. } = &matched_value.kind else {
+            panic!("matched_exit tail must remain a match")
+        };
+        assert_eq!(matched_value.ty, Ty::Int(IntTy { bits: 64, signed: true }));
+        assert_eq!(
+            arms[0].body.ty,
+            Ty::Unit,
+            "a direct process arm stays Unit while only the fallthrough arm fixes the match type"
+        );
+
+        let (program, diagnostics) = check(
+            "fn block_value() -> i64 { value := { return 1\n0\n}\nreturn value\n}\nfn arena_value() -> i64 { value := arena { return 2\n0\n}\nreturn value\n}\nfn unsafe_value() -> i64 { value := unsafe { return 3\n0\n}\nreturn value\n}\nfn group_value() -> i64 { value := task_group { return 4\n0\n}\nreturn value\n}\nfn main() -> i32 = 0\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "transparent diverging wrappers retain expected-none dead-tail inference: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        for name in ["block_value", "arena_value", "unsafe_value", "group_value"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let Stmt::Let { init, .. } = &function.body.stmts[0] else {
+                panic!("{name} starts with a retained diverging initializer")
+            };
+            assert_eq!(
+                init.ty,
+                Ty::Int(IntTy { bits: 64, signed: true }),
+                "{name} retains its dead-tail structural type without a fallthrough edge"
+            );
+            assert!(hir_expr_diverges(init), "{name} initializer remains non-fallthrough");
+        }
+
+        for (name, source, expected) in [
+            (
+                "bare-return",
+                "fn f() -> i64 { return }\nfn main() -> i32 = 0\n",
+                "return without a value is only valid in a function returning (); this function returns i64",
+            ),
+            (
+                "straight-fallthrough",
+                "fn f() -> i64 { value := 1 }\nfn main() -> i32 = 0\n",
+                "function returning i64 has a reachable path without a return value",
+            ),
+            (
+                "partial-if",
+                "fn f(c: bool) -> i64 { if c { return 1 }\nvalue := 0\n}\nfn main() -> i32 = 0\n",
+                "function returning i64 has a reachable path without a return value",
+            ),
+            (
+                "partial-match",
+                "Choice { A, B }\nfn f(v: Choice) -> i64 { match v { A => { return 1 } B => {} }\nvalue := 0\n}\nfn main() -> i32 = 0\n",
+                "function returning i64 has a reachable path without a return value",
+            ),
+            (
+                "partial-else",
+                "fn f(v: Option<i64>) -> i64 { x := v else { return 1 }\n}\nfn main() -> i32 = 0\n",
+                "function returning i64 has a reachable path without a return value",
+            ),
+            (
+                "partial-try",
+                "fn f(v: Result<i64, Error>) -> Result<i64, Error> { x := v?\n}\nfn main() -> i32 = 0\n",
+                "function returning Result<i64, Error> has a reachable path without a return value",
+            ),
+            (
+                "breaking-loop",
+                "fn f() -> i64 { loop { break }\nvalue := 0\n}\nfn main() -> i32 = 0\n",
+                "function returning i64 has a reachable path without a return value",
+            ),
+            (
+                "lifted-lambda-fallthrough",
+                "fn main() -> i32 { if [1].all(fn x { if x > 0 { return true }\nseen := x\n}) { return 0 }\nreturn 1\n}\n",
+                "function returning bool has a reachable path without a return value",
+            ),
+            (
+                "lifted-lambda-bare-return",
+                "fn main() -> i32 { if [1].all(fn x { return }) { return 0 }\nreturn 1\n}\n",
+                "return without a value is only valid in a function returning (); this function returns bool",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            assert_eq!(errors[0].message, expected, "{name}");
+            let span = errors[0].span.expect("completion diagnostics have a body span");
+            let body = &source[span.lo as usize..span.hi as usize];
+            assert!(body.starts_with('{') && body.ends_with('}'), "{name}: {body:?}");
+        }
+
+        let (_, diagnostics) =
+            check("fn f(c: bool) -> i64 = if c { 1 } else {}\nfn main() -> i32 = 0\n");
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(errors, ["type mismatch: i64 vs ()"]);
+
+        let (_, diagnostics) = check(
+            "fn f(c: bool) -> i64 { if c { return true }\nvalue := 0\n}\nfn main() -> i32 = 0\n",
+        );
+        let messages = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "type mismatch: bool vs i64",
+                "function returning i64 has a reachable path without a return value",
+            ],
+            "an ill-typed return value precedes the completion diagnostic"
+        );
+
+        let (_, diagnostics) = check(
+            "fn bad<T>(value: T) -> T { copy := value\n}\nfn main() -> i32 { copy := bad(1)\nreturn 0\n}\n",
+        );
+        let messages = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "function returning T has a reachable path without a return value",
+                "function returning i64 has a reachable path without a return value",
+            ],
+            "a generic template and its concrete monomorph each enforce completion"
+        );
+
+        let (_, diagnostics) = check(
+            "fn bad<T>(value: T) -> Option<T> { copy := value\n}\nfn main() -> i32 = 0\n",
+        );
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            ["function returning Option<T> has a reachable path without a return value"]
+        );
+
+        for (name, source) in [
+            (
+                "named-strict-wrapper",
+                "import std.process\nfn sink(value: ()) {}\nfn f() -> i64 = sink(process.exit(7))\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "generic-strict-wrapper",
+                "import std.process\nfn sink<T>(value: T) {}\nfn f() -> i64 = sink(process.exit(7))\nfn main() -> i32 = 0\n",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(errors, ["type mismatch: () vs i64"], "{name}");
+        }
+
+        let (_, diagnostics) = check(
+            "import std.process\nfn f() -> i64 = 1 + process.exit(7)\nfn main() -> i32 = 0\n",
+        );
+        assert!(
+            diagnostics.has_errors(),
+            "a Unit process operation is not a general Never coercion inside arithmetic"
+        );
     }
 
     #[test]

@@ -83,11 +83,12 @@ drop したい場合は、先に `kill()` するとよい(あるいは将来の�
   グローバルバッファを導入するなら、その flush は `align_rt_process_exit` にフックする。
 - **終了コードの切り詰め。** `i64 -> i32`、Unix の `wait` では下位 8 ビットのみが観測される
   (`WEXITSTATUS`):`exit(256)` → `0`、`exit(-1)` → `255`。`exit(3)` に一致、ドキュメント化済み。
-- **divergence の型付け(v1 の制限)。** `Never` 型がまだ無いため `exit`/`abort` は `()` 型。MIR では発散する
-  (クリーンアップ + 呼び出し + `Unreachable`)し、後続コードは死んでいて出力されない(`lower_block` が
-  `is_terminated` で停止 — `return` 後のコードと同等、ICE なし)。ただし型システムは発散を表現しないため、
-  `process.exit` を非 unit を返す関数の**末尾値**にはできない — 文として使う(例:`process.exit(3)` の後に
-  末尾 `0`)。適切な発散/`Never` 型が理想形で、これは deferred。
+- **divergence の型付け(v1 の制限)。** `Never` 型がまだ無いため `exit`/`abort` の公開結果型は `()` のまま。
+  checked control flow と MIR では発散し(クリーンアップ + 呼び出し + `Unreachable`)、後続コードは死んでいて
+  出力されない(`lower_block` が `is_terminated` で停止 — `return` 後のコードと同等、ICE なし)。am-f の
+  return-completeness 検査はこの制御効果を使い、直接の completion 式または非 fallthrough 文経路として
+  両操作を受理する。末尾値を捏造せず、eager parent を通した一般的な `Never` coercion でもない。
+  first-class の発散/`Never` 型は引き続き deferred。
 - **v1 のマルチフレーム gap(正確に記録)。** 現在の関数のクリーンアップのみが走る。スタックを遡って
   *すべての* 呼び出し側の Drop を実行する完全なマルチフレーム巻き戻しは理想形で、deferred。所有リソースが
   すべて `exit` を呼ぶフレーム内(あるいはそこに束縛された arena / バッファ付き writer)に存在するプログラムでは、

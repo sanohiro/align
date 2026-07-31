@@ -14981,6 +14981,56 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn function_return_completeness_matrix() {
+        let program = lower(
+            "import std.process\nChoice { A, B }\nfn tail() -> i64 = 11\nfn explicit() -> i64 { return 12 }\nfn branch(flag: bool) -> i64 { if flag { return 13 } else { return 14 } }\nfn selected(value: Choice) -> i64 { result := match value { A => { return 15 } B => 16 }\nreturn result\n}\nfn loop_value() -> i64 = loop { break 17 }\nfn endless() -> i64 { loop {} }\nfn exits() -> i64 { process.exit(18)\n}\nfn aborts() -> i64 { process.abort()\n}\nfn unwrapped(value: Option<i64>) -> i64 { x := value else { return 20 }\nreturn x\n}\nfn tried(value: Result<i64, Error>) -> Result<i64, Error> { x := value?\nreturn Ok(x)\n}\nfn arena_return() -> i64 { arena { return 21 } }\nfn unsafe_return() -> i64 { unsafe { return 22 } }\nfn group_return() -> i64 { task_group { return 23 } }\nfn moved() -> string = \"owned\".clone()\nfn dead_tail() -> i64 { return 24\nprint(25)\n}\nfn main() -> i32 = 0\n",
+        );
+
+        for function in program.fns.iter().filter(|function| function.ret != Ty::Unit) {
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .all(|block| !matches!(block.term, Term::Return(None))),
+                "{} must not lower a void return under {:?}:\n{}",
+                function.name,
+                function.ret,
+                print::function_to_string(function)
+            );
+        }
+        for name in ["tail", "explicit", "branch", "selected", "loop_value", "unwrapped", "tried", "arena_return", "unsafe_return", "group_return", "moved", "dead_tail", "main"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.term, Term::Return(Some(_)))),
+                "{name} must return a typed operand:\n{}",
+                print::function_to_string(function)
+            );
+        }
+        for name in ["endless", "exits", "aborts"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.term, Term::Unreachable)),
+                "{name} must retain its non-fallthrough terminator:\n{}",
+                print::function_to_string(function)
+            );
+        }
+    }
+
+    #[test]
     fn json_mir_uses_target_ids_without_copied_schema_strings() {
         let p = lower(
             "import core.json\nS { secret_field: i64 }\nfn main() -> Result<(), Error> {\n  s: S := json.decode(\"{}\")?\n  print(s.secret_field)\n  return Ok(())\n}\n",
