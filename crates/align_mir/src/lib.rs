@@ -4182,6 +4182,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
     matches!(
         &e.kind,
         hir::ExprKind::Binary { op: BinOp::And | BinOp::Or, .. }
+        | hir::ExprKind::Unary { .. }
         | hir::ExprKind::Call { .. }
         | hir::ExprKind::CallFnValue { .. }
         | hir::ExprKind::ResultMapErr { .. }
@@ -4197,9 +4198,9 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
     )
 }
 
-/// Unary eager wrappers have exactly one unconditionally evaluated child and perform no parent
-/// action before that child completes. They can therefore share a heterogeneous worklist without
-/// disturbing the required-child ownership/termination protocol used by multi-child operations.
+/// Strict eager parents perform no parent action between their source-ordered children. They can
+/// therefore share a heterogeneous worklist without disturbing the required-child ownership and
+/// termination protocol used by parent-specific or structurally optimized operations.
 fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or),
@@ -4208,24 +4209,20 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
         | hir::ExprKind::RawLoad { .. }
         | hir::ExprKind::RawStore { .. }
         | hir::ExprKind::RawOffset { .. }
-        | hir::ExprKind::Unary { .. }
-            | hir::ExprKind::Cast(_)
-            | hir::ExprKind::TaskGet(_)
-            | hir::ExprKind::OptionSome(_)
-            | hir::ExprKind::ResultOk(_)
-            | hir::ExprKind::ResultErr(_)
-            | hir::ExprKind::Try(_)
-            | hir::ExprKind::RawAlloc(_)
-            | hir::ExprKind::RawFree(_)
-            | hir::ExprKind::HeapNew(_)
-            | hir::ExprKind::BoxGet(_)
-            | hir::ExprKind::BoxClone(_)
-            | hir::ExprKind::StrClone(_)
-            | hir::ExprKind::StrBorrow(_)
-            | hir::ExprKind::BuilderToString(_)
-            | hir::ExprKind::ArrayToSlice(_)
-            | hir::ExprKind::Len(_)
-            | hir::ExprKind::ArrayBuilderBuild(_) => true,
+        | hir::ExprKind::Cast(_)
+        | hir::ExprKind::TaskGet(_)
+        | hir::ExprKind::OptionSome(_)
+        | hir::ExprKind::ResultOk(_)
+        | hir::ExprKind::ResultErr(_)
+        | hir::ExprKind::Try(_)
+        | hir::ExprKind::RawAlloc(_)
+        | hir::ExprKind::RawFree(_)
+        | hir::ExprKind::HeapNew(_)
+        | hir::ExprKind::BoxGet(_)
+        | hir::ExprKind::BoxClone(_)
+        | hir::ExprKind::StrClone(_)
+        | hir::ExprKind::StrBorrow(_)
+        | hir::ExprKind::BuilderToString(_) => true,
         _ => false,
     }
 }
@@ -4240,6 +4237,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Binary { op, lhs, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
             lower_short_circuit(b, *op, lhs, rhs)
         }
+        hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
         hir::ExprKind::Call { .. } => lower_direct_call(b, e),
         hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
         hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
