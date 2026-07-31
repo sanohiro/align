@@ -14800,9 +14800,9 @@ impl<'a> MoveCheck<'a> {
         falls_through
     }
 
-    /// Evaluate an empty transparent block spine without one native call frame per wrapper. Block,
-    /// arena, task-group, and unsafe tails preserve the caller's consuming/direct mode; only arena
-    /// adjusts the hidden-owner context while its child is evaluated.
+    /// Evaluate a one-child expression spine without one native call frame per wrapper. Each frame
+    /// records the exact child consuming/direct mode and post-action; transparent blocks preserve
+    /// the caller mode, while constructors consume their payload and view operators borrow it.
     fn expr_transparent_spine(
         &mut self,
         root: &Expr,
@@ -14810,30 +14810,96 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> Option<bool> {
+        #[derive(Clone, Copy)]
+        enum Post<'e> {
+            None,
+            Try(&'e Expr),
+        }
+
         let mut wrappers = Vec::new();
         let mut current = root;
+        let mut current_consuming = consuming;
+        let mut current_direct = direct;
         loop {
-            let (block, opens_arena) = match &current.kind {
-                ExprKind::Block(block)
-                | ExprKind::TaskGroup(block)
-                | ExprKind::Unsafe(block) => (block, false),
-                ExprKind::Arena(block) => (block, true),
-                _ => break,
+            let (child, opens_arena, child_consuming, child_direct, post) =
+                match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.stmts.is_empty() && block.value.is_some() =>
+                    {
+                        (
+                            block.value.as_deref().expect("checked block value"),
+                            false,
+                            current_consuming,
+                            current_direct,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::Arena(block)
+                        if block.stmts.is_empty() && block.value.is_some() =>
+                    {
+                        (
+                            block.value.as_deref().expect("checked arena value"),
+                            true,
+                            current_consuming,
+                            current_direct,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::OptionSome(child)
+                    | ExprKind::ResultOk(child)
+                    | ExprKind::ResultErr(child)
+                    | ExprKind::HeapNew(child)
+                    | ExprKind::BuilderToString(child) => {
+                        (child.as_ref(), false, true, true, Post::None)
+                    }
+                    ExprKind::Try(child) => {
+                        (child.as_ref(), false, true, true, Post::Try(child))
+                    }
+                    ExprKind::TaskGet(child) => {
+                        let consumes = is_owned_droppable(
+                            current.ty,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        );
+                        (child.as_ref(), false, consumes, consumes, Post::None)
+                    }
+                    ExprKind::ReaderBuffered { reader: child } => {
+                        (child.as_ref(), false, true, true, Post::None)
+                    }
+                    ExprKind::Unary { expr: child, .. }
+                    | ExprKind::Cast(child)
+                    | ExprKind::RawAlloc(child)
+                    | ExprKind::RawFree(child)
+                    | ExprKind::BoxGet(child)
+                    | ExprKind::BoxClone(child)
+                    | ExprKind::StrClone(child)
+                    | ExprKind::StrBorrow(child)
+                    | ExprKind::ArrayToSlice(child)
+                    | ExprKind::Len(child) => {
+                        (child.as_ref(), false, false, false, Post::None)
+                    }
+                    ExprKind::StrBytes { inner: child }
+                    | ExprKind::StrTrim { recv: child, .. }
+                    | ExprKind::BufferBytes { buffer: child }
+                    | ExprKind::BufferLen { buffer: child }
+                    | ExprKind::BytesAsStr { bytes: child } => {
+                        (child.as_ref(), false, false, false, Post::None)
+                    }
+                    _ => break,
             };
-            if !block.stmts.is_empty() {
-                break;
-            }
-            let Some(value) = block.value.as_deref() else {
-                break;
-            };
-            wrappers.push((current, opens_arena));
-            current = value;
+            wrappers.push((current, opens_arena, post));
+            current = child;
+            current_consuming = child_consuming;
+            current_direct = child_direct;
         }
         if wrappers.is_empty() {
             return None;
         }
 
-        for &(wrapper, opens_arena) in &wrappers {
+        for &(wrapper, opens_arena, _) in &wrappers {
             let may_borrow = ty_may_borrow(
                 wrapper.ty,
                 self.structs,
@@ -14850,8 +14916,13 @@ impl<'a> MoveCheck<'a> {
             }
         }
 
-        let falls_through = self.expr(current, moved, consuming, direct);
-        for &(wrapper, opens_arena) in wrappers.iter().rev() {
+        let falls_through = self.expr(
+            current,
+            moved,
+            current_consuming,
+            current_direct,
+        );
+        for &(wrapper, opens_arena, post) in wrappers.iter().rev() {
             if opens_arena {
                 self.arena_depth -= 1;
             }
@@ -14859,25 +14930,45 @@ impl<'a> MoveCheck<'a> {
                 .value_snapshot_frames
                 .pop()
                 .expect("value snapshot frame for transparent expression");
-            debug_assert!(Self::defers_child_snapshot_validation(&wrapper.kind));
             let key = Self::expr_key(wrapper);
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
-            } else if ty_may_borrow(
-                wrapper.ty,
-                self.structs,
-                self.tuples,
-                self.enums,
-                self.tagged_types,
-            ) {
-                let fact = self.borrow_fact(wrapper);
-                self.borrows.begin_value_source(key, fact.live_roots());
-                self.walked_value_facts.insert(key, fact);
-                if let Some(parent) = self.value_snapshot_frames.last_mut() {
-                    parent.push(key);
+            } else {
+                if let Post::Try(result) = post
+                    && ty_may_borrow(
+                        self.f.ret,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                {
+                    self.return_roots.extend(self.borrow_sources(result));
+                }
+                if !Self::defers_child_snapshot_validation(&wrapper.kind) {
+                    for snapshot in child_snapshots {
+                        self.validate_value_snapshot(
+                            key,
+                            snapshot,
+                            wrapper.span,
+                        );
+                    }
+                }
+                if ty_may_borrow(
+                    wrapper.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    let fact = self.borrow_fact(wrapper);
+                    self.borrows.begin_value_source(key, fact.live_roots());
+                    self.walked_value_facts.insert(key, fact);
+                    if let Some(parent) = self.value_snapshot_frames.last_mut() {
+                        parent.push(key);
+                    }
                 }
             }
-            let _ = child_snapshots;
         }
         Some(falls_through)
     }
