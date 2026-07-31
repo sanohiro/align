@@ -5743,6 +5743,156 @@ struct EffectTypeTables<'a> {
     tagged_types: &'a [hir::TaggedType],
 }
 
+fn fn_effect_leaf_paths(
+    root: Ty,
+    tables: EffectTypeTables<'_>,
+    concrete_only: bool,
+) -> Vec<(Vec<FnEffectProjection>, u32)> {
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter {
+            ty: Ty,
+            projection: Option<FnEffectProjection>,
+        },
+        Exit {
+            ty: Ty,
+            pop_projection: bool,
+        },
+    }
+
+    let mut work = vec![Work::Enter {
+        ty: root,
+        projection: None,
+    }];
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
+    let mut leaves = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit { ty, pop_projection } => {
+                visiting.remove(&ty);
+                if pop_projection {
+                    path.pop();
+                }
+            }
+            Work::Enter { ty, projection } => {
+                if let Some(projection) = projection {
+                    path.push(projection);
+                }
+                let pop_projection = projection.is_some();
+                let ty = expand_tagged_ty(ty, tables.tagged_types);
+                if let Ty::Fn(id) = ty {
+                    leaves.push((path.clone(), id));
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+                if !matches!(
+                    ty,
+                    Ty::Struct(_)
+                        | Ty::Tuple(_)
+                        | Ty::Enum(_)
+                        | Ty::Option(_)
+                        | Ty::Result(..)
+                        | Ty::StructArray(..)
+                        | Ty::DynStructArray(..)
+                        | Ty::Array(..)
+                        | Ty::DynArray(_)
+                        | Ty::Slice(_)
+                ) || !visiting.insert(ty)
+                {
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let mut children = Vec::new();
+                match ty {
+                    Ty::Struct(id) => {
+                        if let Some(definition) = tables.structs.get(id as usize)
+                            && (!concrete_only
+                                || definition.name != definition.source_name)
+                        {
+                            children.extend(definition.fields.iter().enumerate().map(
+                                |(index, field)| {
+                                    (
+                                        FnEffectProjection::StructField(index as u32),
+                                        field.ty,
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Tuple(id) => {
+                        if let Some(definition) = tables.tuples.get(id as usize) {
+                            children.extend(definition.elems.iter().enumerate().map(
+                                |(index, element)| {
+                                    (
+                                        FnEffectProjection::TupleElement(index as u32),
+                                        scalar_to_ty(*element),
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Enum(id) => {
+                        if let Some(definition) = tables.enums.get(id as usize)
+                            && (!concrete_only
+                                || definition.name != definition.source_name)
+                        {
+                            for (variant_index, variant) in
+                                definition.variants.iter().enumerate()
+                            {
+                                children.extend(variant.payload.iter().enumerate().map(
+                                    |(payload_index, payload)| {
+                                        (
+                                            FnEffectProjection::EnumPayload {
+                                                variant: variant_index as u32,
+                                                index: payload_index as u32,
+                                            },
+                                            scalar_to_ty(*payload),
+                                        )
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Ty::Option(payload) => children.push((
+                        FnEffectProjection::OptionSome,
+                        scalar_to_ty(payload),
+                    )),
+                    Ty::Result(ok, err) => {
+                        children.push((FnEffectProjection::ResultOk, scalar_to_ty(ok)));
+                        children.push((FnEffectProjection::ResultErr, scalar_to_ty(err)));
+                    }
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => children.push((
+                        FnEffectProjection::ArrayElement,
+                        Ty::Struct(id),
+                    )),
+                    Ty::Array(payload, _) | Ty::DynArray(payload) | Ty::Slice(payload) => {
+                        children.push((
+                            FnEffectProjection::ArrayElement,
+                            scalar_to_ty(payload),
+                        ));
+                    }
+                    _ => {}
+                }
+
+                work.push(Work::Exit { ty, pop_projection });
+                for (projection, child) in children.into_iter().rev() {
+                    work.push(Work::Enter {
+                        ty: child,
+                        projection: Some(projection),
+                    });
+                }
+            }
+        }
+    }
+    leaves
+}
+
 /// Per-function callback-origin cells for written source aggregates such as
 /// `Holder<fn(i64) -> i64>`. Their shared source type must remain immutable: storing call/return
 /// origins in it would let one unrelated function poison every peer with the same annotation.
@@ -5883,155 +6033,9 @@ fn effect_boundary_leaves(
     ty: Ty,
     tables: EffectTypeTables<'_>,
 ) -> Vec<EffectBoundaryLeaf> {
-    fn walk(
-        ty: Ty,
-        tables: EffectTypeTables<'_>,
-        path: &mut Vec<FnEffectProjection>,
-        visiting: &mut Vec<Ty>,
-        paths: &mut Vec<Vec<FnEffectProjection>>,
-    ) {
-        let ty = expand_tagged_ty(ty, tables.tagged_types);
-        if matches!(ty, Ty::Fn(_)) {
-            paths.push(path.clone());
-            return;
-        }
-        if !matches!(
-            ty,
-            Ty::Struct(_)
-                | Ty::Tuple(_)
-                | Ty::Enum(_)
-                | Ty::Option(_)
-                | Ty::Result(..)
-                | Ty::StructArray(..)
-                | Ty::DynStructArray(..)
-                | Ty::Array(..)
-                | Ty::DynArray(_)
-                | Ty::Slice(_)
-        ) || visiting.contains(&ty)
-        {
-            return;
-        }
-        visiting.push(ty);
-        match ty {
-            Ty::Struct(id) => {
-                if let Some(def) = tables.structs.get(id as usize) {
-                    for (index, field) in def.fields.iter().enumerate() {
-                        path.push(FnEffectProjection::StructField(index as u32));
-                        walk(field.ty, tables, path, visiting, paths);
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Tuple(id) => {
-                if let Some(def) = tables.tuples.get(id as usize) {
-                    for (index, element) in def.elems.iter().enumerate() {
-                        path.push(FnEffectProjection::TupleElement(index as u32));
-                        walk(
-                            scalar_to_ty(*element),
-                            tables,
-                            path,
-                            visiting,
-                            paths,
-                        );
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Enum(id) => {
-                if let Some(def) = tables.enums.get(id as usize) {
-                    for (variant_index, variant) in
-                        def.variants.iter().enumerate()
-                    {
-                        for (payload_index, payload) in
-                            variant.payload.iter().enumerate()
-                        {
-                            path.push(FnEffectProjection::EnumPayload {
-                                variant: variant_index as u32,
-                                index: payload_index as u32,
-                            });
-                            walk(
-                                scalar_to_ty(*payload),
-                                tables,
-                                path,
-                                visiting,
-                                paths,
-                            );
-                            path.pop();
-                        }
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                path.push(FnEffectProjection::OptionSome);
-                walk(
-                    scalar_to_ty(payload),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::Result(ok, err) => {
-                path.push(FnEffectProjection::ResultOk);
-                walk(
-                    scalar_to_ty(ok),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-                path.push(FnEffectProjection::ResultErr);
-                walk(
-                    scalar_to_ty(err),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                path.push(FnEffectProjection::ArrayElement);
-                walk(
-                    Ty::Struct(id),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::Array(payload, _)
-            | Ty::DynArray(payload)
-            | Ty::Slice(payload) => {
-                path.push(FnEffectProjection::ArrayElement);
-                walk(
-                    scalar_to_ty(payload),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            _ => {}
-        }
-        visiting.pop();
-    }
-
-    let mut paths = Vec::new();
-    walk(
-        ty,
-        tables,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &mut paths,
-    );
-    paths
+    fn_effect_leaf_paths(ty, tables, false)
         .into_iter()
-        .map(|path| EffectBoundaryLeaf {
+        .map(|(path, _)| EffectBoundaryLeaf {
             path,
             seed: None,
             effect: std::cell::Cell::new(None),
@@ -7229,137 +7233,24 @@ impl EffectScan<'_> {
         ty: Ty,
         incoming: &Expr,
         path: &mut Vec<FnEffectProjection>,
-        visiting: &mut Vec<Ty>,
+        _visiting: &mut Vec<Ty>,
     ) {
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        if let Ty::Fn(id) = ty {
+        let tables = EffectTypeTables {
+            structs: self.structs,
+            enums: self.enums,
+            tuples: self.tuples,
+            tagged_types: self.tagged_types,
+        };
+        for (suffix, id) in fn_effect_leaf_paths(ty, tables, true) {
             let Some(function) = self.fn_types.get(id as usize) else {
-                return;
+                continue;
             };
-            if let Some(incoming) = self.projected_fn_effect(incoming, path) {
-                function
-                    .effect
-                    .set(function.effect.get().join(incoming));
+            let mut full_path = path.clone();
+            full_path.extend(suffix);
+            if let Some(incoming) = self.projected_fn_effect(incoming, &full_path) {
+                function.effect.set(function.effect.get().join(incoming));
             }
-            return;
         }
-        if !matches!(
-            ty,
-            Ty::Struct(_)
-                | Ty::Tuple(_)
-                | Ty::Enum(_)
-                | Ty::Option(_)
-                | Ty::Result(..)
-                | Ty::StructArray(..)
-                | Ty::DynStructArray(..)
-                | Ty::Array(..)
-                | Ty::DynArray(_)
-                | Ty::Slice(_)
-        ) {
-            return;
-        }
-        if visiting.contains(&ty) {
-            return;
-        }
-        visiting.push(ty);
-        match ty {
-            Ty::Struct(id) => {
-                let Some(def) = self.structs.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                if def.name == def.source_name {
-                    visiting.pop();
-                    return;
-                }
-                for (index, field) in def.fields.iter().enumerate() {
-                    path.push(FnEffectProjection::StructField(index as u32));
-                    self.join_concrete_effects(field.ty, incoming, path, visiting);
-                    path.pop();
-                }
-            }
-            Ty::Tuple(id) => {
-                let Some(def) = self.tuples.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                for (index, element) in def.elems.iter().enumerate() {
-                    path.push(FnEffectProjection::TupleElement(index as u32));
-                    self.join_concrete_effects(
-                        scalar_to_ty(*element),
-                        incoming,
-                        path,
-                        visiting,
-                    );
-                    path.pop();
-                }
-            }
-            Ty::Enum(id) => {
-                let Some(def) = self.enums.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                if def.name == def.source_name {
-                    visiting.pop();
-                    return;
-                }
-                for (variant_index, variant) in def.variants.iter().enumerate() {
-                    for (payload_index, payload) in variant.payload.iter().enumerate() {
-                        path.push(FnEffectProjection::EnumPayload {
-                            variant: variant_index as u32,
-                            index: payload_index as u32,
-                        });
-                        self.join_concrete_effects(
-                            scalar_to_ty(*payload),
-                            incoming,
-                            path,
-                            visiting,
-                        );
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                path.push(FnEffectProjection::OptionSome);
-                self.join_concrete_effects(
-                    scalar_to_ty(payload),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            Ty::Result(ok, err) => {
-                path.push(FnEffectProjection::ResultOk);
-                self.join_concrete_effects(scalar_to_ty(ok), incoming, path, visiting);
-                path.pop();
-                path.push(FnEffectProjection::ResultErr);
-                self.join_concrete_effects(
-                    scalar_to_ty(err),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                path.push(FnEffectProjection::ArrayElement);
-                self.join_concrete_effects(Ty::Struct(id), incoming, path, visiting);
-                path.pop();
-            }
-            Ty::Array(payload, _) | Ty::DynArray(payload) | Ty::Slice(payload) => {
-                path.push(FnEffectProjection::ArrayElement);
-                self.join_concrete_effects(
-                    scalar_to_ty(payload),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            _ => {}
-        }
-        visiting.pop();
     }
 
     fn consume_fn_value(&mut self, expr: &Expr) {
@@ -33720,6 +33611,34 @@ fn main() -> i32 = 0
             }))
             .collect::<Vec<_>>();
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Fn(7);
+        let tables = EffectTypeTables {
+            structs: &structs,
+            enums: &[],
+            tuples: &[],
+            tagged_types: &[],
+        };
+        let effect_paths = fn_effect_leaf_paths(Ty::Struct(0), tables, false);
+        assert_eq!(effect_paths.len(), 1);
+        assert_eq!(effect_paths[0].0.len(), DEPTH);
+        assert_eq!(effect_paths[0].1, 7);
+        for definition in &mut structs {
+            definition.source_name.push_str("$source");
+        }
+        assert_eq!(
+            fn_effect_leaf_paths(
+                Ty::Struct(0),
+                EffectTypeTables {
+                    structs: &structs,
+                    enums: &[],
+                    tuples: &[],
+                    tagged_types: &[],
+                },
+                true,
+            ),
+            effect_paths
+        );
 
         structs[DEPTH - 1].fields[0].ty = Ty::Struct(0);
         assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
