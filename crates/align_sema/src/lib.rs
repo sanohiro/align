@@ -19849,6 +19849,40 @@ impl<'a, 't> Checker<'a, 't> {
         result
     }
 
+    /// Reconcile a completion expression that was checked before its surrounding control result
+    /// type was known. Direct process completion and proven control expressions contribute no
+    /// value. A strict eager parent still retains its own exact result relation and must match.
+    fn reconcile_diverging_completion_expr(&mut self, expression: &Expr, expected: Ty) {
+        if expression.ty == Ty::Error || !hir_expr_diverges(expression) {
+            return;
+        }
+        match &expression.kind {
+            ExprKind::ProcessExit { .. }
+            | ExprKind::ProcessAbort
+            | ExprKind::Loop { diverges: true, .. }
+            | ExprKind::If { .. }
+            | ExprKind::Match { .. } => {}
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::Unsafe(block)
+            | ExprKind::TaskGroup(block) => {
+                self.reconcile_diverging_completion_block(block, expected);
+            }
+            _ => self.constrain(expression.ty, Some(expected), expression.span),
+        }
+    }
+
+    fn reconcile_diverging_completion_block(&mut self, block: &Block, expected: Ty) {
+        // A diverging statement is the admitted non-fallthrough statement path. Only a tail that
+        // caused the block to diverge still needs its late result relation reconciled.
+        if block.stmts.iter().any(hir_stmt_diverges) {
+            return;
+        }
+        if let Some(value) = block.value.as_deref() {
+            self.reconcile_diverging_completion_expr(value, expected);
+        }
+    }
+
     fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
         match &e.kind {
             ast::ExprKind::Unit => {
@@ -30397,6 +30431,7 @@ impl<'a, 't> Checker<'a, 't> {
         if s.ty == Ty::Error {
             return err;
         }
+        let scrutinee_diverges = hir_expr_diverges(&s);
         let Some((type_name, variants)) = self.match_variants(self.resolve(s.ty)) else {
             self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
@@ -30423,6 +30458,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());
         // The match's value type: unify all arm bodies (drives inference from `expected`).
         let mut result_ty: Option<Ty> = expected;
+        let mut unconstrained_diverging_arms = Vec::new();
         for arm in arms {
             // Payload bindings are scoped to this arm only — snapshot the scope and restore after.
             let scope_mark = self.scope.len();
@@ -30506,9 +30542,14 @@ impl<'a, 't> Checker<'a, 't> {
             // contributes no value to the join; direct process completion also retains its exact
             // Unit HIR type instead of being coerced to the match result. The first non-diverging,
             // non-error arm fixes an otherwise unconstrained result type.
-            self.reject_bare_array_value(&arm.body, result_ty, "a `match` arm value");
-            let body = self.check_completion_expr(&arm.body, result_ty);
-            if result_ty.is_none() && body.ty != Ty::Error && !hir_expr_diverges(&body) {
+            let arm_expected = if scrutinee_diverges { None } else { result_ty };
+            self.reject_bare_array_value(&arm.body, arm_expected, "a `match` arm value");
+            let body = self.check_completion_expr(&arm.body, arm_expected);
+            let body_diverges = hir_expr_diverges(&body);
+            if !scrutinee_diverges && result_ty.is_none() && body_diverges {
+                unconstrained_diverging_arms.push(checked.len());
+            }
+            if !scrutinee_diverges && result_ty.is_none() && body.ty != Ty::Error && !body_diverges {
                 result_ty = Some(body.ty);
             }
             self.scope.truncate(scope_mark);
@@ -30528,12 +30569,17 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         let ty = result_ty.unwrap_or(Ty::Unit);
+        for index in unconstrained_diverging_arms {
+            self.reconcile_diverging_completion_expr(&checked[index].body, ty);
+        }
         self.constrain(ty, expected, span);
         Expr { kind: ExprKind::Match { scrutinee: Box::new(s), arms: checked }, ty, span }
     }
 
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
         let c = self.check_expr(cond, Some(Ty::Bool));
+        let condition_diverges = hir_expr_diverges(&c);
+        let branch_expected = if condition_diverges { None } else { expected };
         // `task_group` `wait`-state (slice ④c): each branch starts from the pre-`if` state; after
         // the `if`, a `wait()` is guaranteed only if it ran on *every* path — `then && else` (and
         // an absent `else` is a path that did not wait). Soundly tracks `get`-before-`wait`.
@@ -30541,7 +30587,7 @@ impl<'a, 't> Checker<'a, 't> {
         let w_before = self.wait_state.last().copied().unwrap_or(false);
         let then_b = self.check_block(
             then,
-            if ast_block_diverges(then) { None } else { expected },
+            if ast_block_diverges(then) { None } else { branch_expected },
         );
         let w_then = self.wait_state.last().copied().unwrap_or(false);
         if in_tg {
@@ -30550,12 +30596,12 @@ impl<'a, 't> Checker<'a, 't> {
         let els_b = match els {
             Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(
                 b,
-                if ast_block_diverges(b) { None } else { expected },
+                if ast_block_diverges(b) { None } else { branch_expected },
             ),
             Some(e) => {
                 // `else if` chain: check as an expression and wrap as a block value.
-                self.reject_bare_array_value(e, expected, "an `else` value");
-                let v = self.check_expr(e, expected);
+                self.reject_bare_array_value(e, branch_expected, "an `else` value");
+                let v = self.check_expr(e, branch_expected);
                 Block { stmts: Vec::new(), value: Some(Box::new(v)) }
             }
             None => Block { stmts: Vec::new(), value: None },
@@ -30568,7 +30614,6 @@ impl<'a, 't> Checker<'a, 't> {
         // A diverging condition, or two diverging alternatives, produces no value and therefore
         // satisfies any expected type. Otherwise only fallthrough alternatives contribute a value;
         // a reachable alternative with no tail contributes Unit.
-        let condition_diverges = hir_expr_diverges(&c);
         let then_diverges = hir_block_diverges(&then_b);
         let else_diverges = hir_block_diverges(&els_b);
         let always_diverges = condition_diverges || (then_diverges && else_diverges);
@@ -30589,6 +30634,14 @@ impl<'a, 't> Checker<'a, 't> {
         };
         if !always_diverges {
             self.constrain(ty, expected, span);
+        }
+        if expected.is_none() && !condition_diverges {
+            if then_diverges {
+                self.reconcile_diverging_completion_block(&then_b, ty);
+            }
+            if else_diverges {
+                self.reconcile_diverging_completion_block(&els_b, ty);
+            }
         }
         Expr { kind: ExprKind::If { cond: Box::new(c), then: then_b, els: els_b }, ty, span }
     }
@@ -36748,7 +36801,19 @@ fn exit_branch(flag: bool) -> i64 {
             ),
             (
                 "match-process-then-value",
-                "import std.process\nChoice { A, B }\nfn f(v: Choice) -> i64 = match v { A => process.exit(1) B => 2 }\nfn main() -> i32 = 0\n",
+                "import std.process\nChoice { A, B }\nfn f(v: Choice) -> i64 { out := match v { A => process.exit(1) B => 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "if-process-then-value",
+                "import std.process\nfn f(c: bool) -> i64 { out := if c { process.exit(1) } else { 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "if-diverging-condition",
+                "fn f() -> i64 = if { return 1\ntrue\n} { false } else { false }\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "match-diverging-scrutinee",
+                "Choice { A, B }\nfn f() -> i64 = match { return 1\nChoice.A\n} { A => false B => false }\nfn main() -> i32 = 0\n",
             ),
             ("diverging-loop", "fn f() -> i64 { loop {} }\nfn main() -> i32 = 0\n"),
             (
@@ -36986,6 +37051,33 @@ fn exit_branch(flag: bool) -> i64 {
             (
                 "generic-strict-wrapper",
                 "import std.process\nfn sink<T>(value: T) {}\nfn f() -> i64 = sink(process.exit(7))\nfn main() -> i32 = 0\n",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(errors, ["type mismatch: () vs i64"], "{name}");
+        }
+
+        for (name, source) in [
+            (
+                "match-eager-first",
+                "import std.process\nChoice { A, B }\nfn sink(value: ()) {}\nfn f(value: Choice) -> i64 { out := match value { A => sink(process.exit(1)) B => 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "match-eager-last",
+                "import std.process\nChoice { A, B }\nfn sink(value: ()) {}\nfn f(value: Choice) -> i64 { out := match value { A => 2 as i64 B => sink(process.exit(1)) }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "if-eager-let-bound",
+                "import std.process\nfn sink(value: ()) {}\nfn f(flag: bool) -> i64 { out := if flag { sink(process.exit(1)) } else { 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "if-eager-direct-tail",
+                "import std.process\nfn sink(value: ()) {}\nfn f(flag: bool) -> i64 = if flag { sink(process.exit(1)) } else { 2 as i64 }\nfn main() -> i32 = 0\n",
             ),
         ] {
             let (_, diagnostics) = check(source);
