@@ -1131,6 +1131,39 @@ mod tests {
                     Some(&crate::FnEffect::Pure),
                     "the accepted checked-HIR boundary must scan effects without process-stack recursion"
                 );
+
+                let mut diagnostics = crate::Diagnostics::new();
+                let named_return_region = std::collections::HashMap::new();
+                {
+                    let function = &program.fns[0];
+                    let mut escape = crate::EscapeCheck {
+                        f: function,
+                        diags: &mut diagnostics,
+                        named_return_region: &named_return_region,
+                        tuples: &program.tuples,
+                        structs: &program.structs,
+                        enums: &program.enums,
+                        tagged_types: &program.tagged_types,
+                        state: crate::EscapeState::default(),
+                        drop_region: std::collections::HashMap::new(),
+                        drop_individual: std::collections::HashMap::new(),
+                        drop_individual_exprs: std::collections::HashMap::new(),
+                        decl_depth: std::collections::HashMap::new(),
+                        task_group_regions: Vec::new(),
+                        allocation_regions: Vec::new(),
+                        allocation_region_by_expr: std::collections::HashMap::new(),
+                        flow: crate::EscapeFlowCfg::new(),
+                        flow_current: 0,
+                        loop_exit_blocks: Vec::new(),
+                        collecting_walk_children: false,
+                        walk_children: Vec::new(),
+                    };
+                    escape.check();
+                }
+                assert!(
+                    !diagnostics.has_errors(),
+                    "the accepted checked-HIR boundary must build and solve escape flow without process-stack recursion"
+                );
             })
             .expect("spawn checked-HIR divergence owner")
             .join()

@@ -4687,6 +4687,8 @@ pub fn check_program_with_interface_facts(
                 flow: EscapeFlowCfg::new(),
                 flow_current: 0,
                 loop_exit_blocks: Vec::new(),
+                collecting_walk_children: false,
+                walk_children: Vec::new(),
             };
             ec.check();
             (ec.drop_region, ec.drop_individual, ec.drop_individual_exprs)
@@ -8505,6 +8507,75 @@ enum EscapeFlowOp<'a> {
     ReturnEscape(&'a Expr, u32),
 }
 
+enum EscapeWalkItem<'a> {
+    Expr(&'a Expr, u32),
+    ExprExit(&'a Expr, u32),
+    Block(&'a Block, u32),
+    Stmt(&'a Stmt, u32),
+    StmtExit(&'a Stmt, u32),
+    Op(EscapeFlowOp<'a>),
+    ArenaDone {
+        block: &'a Block,
+        inner: u32,
+        target: Region,
+    },
+    TaskGroupDone {
+        block: &'a Block,
+        inner: u32,
+        target: Region,
+    },
+    LoopDone {
+        body: &'a Block,
+        head: EscapeFlowBlockId,
+        exit: EscapeFlowBlockId,
+    },
+    IfAfterCond {
+        then: &'a Block,
+        els: &'a Block,
+        depth: u32,
+    },
+    IfThenDone {
+        then_diverges: bool,
+        else_entry: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+    },
+    IfDone {
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+        then_diverges: bool,
+        else_diverges: bool,
+    },
+    MatchAfterScrutinee {
+        scrutinee: &'a Expr,
+        arms: &'a [hir::MatchArm],
+        depth: u32,
+    },
+    MatchArmStart {
+        scrutinee: &'a Expr,
+        arm: &'a hir::MatchArm,
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+        depth: u32,
+    },
+    MatchArmDone {
+        arm: &'a hir::MatchArm,
+        join: EscapeFlowBlockId,
+    },
+    MatchDone {
+        arms: &'a [hir::MatchArm],
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+    },
+    ElseAfterOpt {
+        fallback: &'a Expr,
+        depth: u32,
+    },
+    ElseDone {
+        fallback: &'a Expr,
+        join: EscapeFlowBlockId,
+    },
+}
+
 impl<'a> EscapeFlowCfg<'a> {
     fn new() -> Self {
         Self {
@@ -8584,6 +8655,11 @@ struct EscapeCheck<'a> {
     flow_current: EscapeFlowBlockId,
     /// CFG exit block for each active loop, innermost last.
     loop_exit_blocks: Vec<EscapeFlowBlockId>,
+    /// Direct expression children collected by the exhaustive operand match. The outer walk drains
+    /// them onto its explicit worklist; recursive-looking calls made while this flag is set only
+    /// append here and return immediately.
+    collecting_walk_children: bool,
+    walk_children: Vec<(&'a Expr, u32)>,
 }
 
 impl<'a> EscapeCheck<'a> {
@@ -8599,7 +8675,7 @@ impl<'a> EscapeCheck<'a> {
                 self.state.individual_may.insert(param, true);
             }
         }
-        self.lower_block(&self.f.body, 0);
+        self.walk_block(&self.f.body, 0);
         // The body's trailing value is the function's return value (single-expression
         // bodies and fall-through blocks), so apply the same escape check there.
         if let Some(v) = &self.f.body.value {
@@ -10857,50 +10933,387 @@ impl<'a> EscapeCheck<'a> {
         false
     }
 
-    fn lower_block(&mut self, b: &'a Block, depth: u32) {
-        for s in &b.stmts {
-            self.lower_stmt(s, depth);
-        }
-        if let Some(v) = &b.value {
-            self.walk(v, depth);
-        }
+    fn walk_block(&mut self, block: &'a Block, depth: u32) {
+        self.walk_items(vec![EscapeWalkItem::Block(block, depth)]);
     }
 
-    fn lower_stmt(&mut self, stmt: &'a Stmt, depth: u32) {
-        match stmt {
-            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
-                self.walk(init, depth)
-            }
-            Stmt::AssignIndex { index, value, .. }
-            | Stmt::AssignElemField { index, value, .. }
-            | Stmt::AssignElem { index, value, .. } => {
-                self.walk(index, depth);
-                self.walk(value, depth);
-            }
-            Stmt::AssignVecLane { value, .. }
-            | Stmt::Assign { value, .. }
-            | Stmt::AssignField { value, .. } => self.walk(value, depth),
-            Stmt::Return(Some(value)) | Stmt::Expr(value) => self.walk(value, depth),
-            Stmt::Return(None) => {}
-            Stmt::Break { value, .. } => {
-                if let Some(value) = value {
-                    self.walk(value, depth);
+    fn walk_items(&mut self, mut work: Vec<EscapeWalkItem<'a>>) {
+        while let Some(item) = work.pop() {
+            match item {
+                EscapeWalkItem::Expr(expression, depth) => {
+                    if let Some(region) = self.allocation_regions.last().copied() {
+                        self.allocation_region_by_expr
+                            .insert(Self::expr_key(expression), region);
+                    }
+                    match &expression.kind {
+                        ExprKind::Arena(block) => {
+                            let inner = depth + 1;
+                            self.allocation_regions.push(Region::arena(inner));
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::ArenaDone {
+                                block,
+                                inner,
+                                target: Region::arena(depth),
+                            });
+                            work.push(EscapeWalkItem::Block(block, inner));
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Block(block, depth));
+                        }
+                        ExprKind::Loop { body, .. } => {
+                            let before = self.flow_current;
+                            let head = self.flow.new_block();
+                            let exit = self.flow.new_block();
+                            self.flow.add_edge(before, head);
+                            self.flow_current = head;
+                            self.loop_exit_blocks.push(exit);
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::LoopDone { body, head, exit });
+                            work.push(EscapeWalkItem::Block(body, depth));
+                        }
+                        ExprKind::TaskGroup(block) => {
+                            let inner = depth + 1;
+                            self.task_group_regions.push(Region::arena(inner));
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::TaskGroupDone {
+                                block,
+                                inner,
+                                target: Region::arena(depth),
+                            });
+                            work.push(EscapeWalkItem::Block(block, inner));
+                        }
+                        ExprKind::Spawn { closure, .. } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Expr(closure, depth));
+                            if let Some(group) =
+                                self.task_group_regions.last().copied()
+                            {
+                                self.push_flow_op(EscapeFlowOp::SpawnCapture {
+                                    closure,
+                                    group,
+                                    depth,
+                                });
+                            }
+                        }
+                        ExprKind::Match { scrutinee, arms } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::MatchAfterScrutinee {
+                                scrutinee,
+                                arms,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(scrutinee, depth));
+                        }
+                        ExprKind::ResultMapErr { result, f } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            if let Ty::Result(_, err) = result.ty
+                                && needs_drop_flag(
+                                    scalar_to_ty(err),
+                                    self.structs,
+                                    self.tuples,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                            {
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::CallTransfer(result, depth),
+                                ));
+                            }
+                            work.push(EscapeWalkItem::Expr(f, depth));
+                            work.push(EscapeWalkItem::Expr(result, depth));
+                        }
+                        ExprKind::If { cond, then, els } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::IfAfterCond {
+                                then,
+                                els,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(cond, depth));
+                        }
+                        ExprKind::Call { func, args, .. } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let borrows_args =
+                                matches!(func.as_str(), "print" | "hash64" | "hash128");
+                            for argument in args.iter().rev() {
+                                if !borrows_args {
+                                    work.push(EscapeWalkItem::Op(
+                                        EscapeFlowOp::CallTransfer(argument, depth),
+                                    ));
+                                }
+                                work.push(EscapeWalkItem::Expr(argument, depth));
+                            }
+                        }
+                        ExprKind::CallFnValue { callee, args } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            for argument in args.iter().rev() {
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::CallTransfer(argument, depth),
+                                ));
+                                work.push(EscapeWalkItem::Expr(argument, depth));
+                            }
+                            work.push(EscapeWalkItem::Expr(callee, depth));
+                        }
+                        ExprKind::Try(result) => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Op(
+                                EscapeFlowOp::TryErrEscape(result, depth),
+                            ));
+                            work.push(EscapeWalkItem::Expr(result, depth));
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::ElseAfterOpt {
+                                fallback,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(opt, depth));
+                        }
+                        _ => {
+                            debug_assert!(!self.collecting_walk_children);
+                            debug_assert!(self.walk_children.is_empty());
+                            self.collecting_walk_children = true;
+                            self.collect_expr_children(expression, depth);
+                            self.collecting_walk_children = false;
+                            let children = std::mem::take(&mut self.walk_children);
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.extend(
+                                children
+                                    .into_iter()
+                                    .rev()
+                                    .map(|(child, depth)| {
+                                        EscapeWalkItem::Expr(child, depth)
+                                    }),
+                            );
+                        }
+                    }
+                }
+                EscapeWalkItem::ExprExit(expression, depth) => {
+                    if needs_drop_flag(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) {
+                        self.push_flow_op(EscapeFlowOp::DropProvenance(
+                            expression,
+                            depth,
+                        ));
+                    }
+                }
+                EscapeWalkItem::Block(block, depth) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(EscapeWalkItem::Expr(value, depth));
+                    }
+                    work.extend(
+                        block
+                            .stmts
+                            .iter()
+                            .rev()
+                            .map(|statement| {
+                                EscapeWalkItem::Stmt(statement, depth)
+                            }),
+                    );
+                }
+                EscapeWalkItem::Stmt(statement, depth) => {
+                    work.push(EscapeWalkItem::StmtExit(statement, depth));
+                    match statement {
+                        Stmt::Let { init, .. }
+                        | Stmt::LetTuple { init, .. } => {
+                            work.push(EscapeWalkItem::Expr(init, depth));
+                        }
+                        Stmt::AssignIndex { index, value, .. }
+                        | Stmt::AssignElemField { index, value, .. }
+                        | Stmt::AssignElem { index, value, .. } => {
+                            work.push(EscapeWalkItem::Expr(value, depth));
+                            work.push(EscapeWalkItem::Expr(index, depth));
+                        }
+                        Stmt::AssignVecLane { value, .. }
+                        | Stmt::Assign { value, .. }
+                        | Stmt::AssignField { value, .. }
+                        | Stmt::Return(Some(value))
+                        | Stmt::Expr(value) => {
+                            work.push(EscapeWalkItem::Expr(value, depth));
+                        }
+                        Stmt::Return(None) => {}
+                        Stmt::Break { value, .. } => {
+                            if let Some(value) = value {
+                                work.push(EscapeWalkItem::Expr(value, depth));
+                            }
+                        }
+                    }
+                }
+                EscapeWalkItem::StmtExit(statement, depth) => {
+                    self.push_flow_op(EscapeFlowOp::Stmt(statement, depth));
+                    if let Stmt::Break { accepted, .. } = statement {
+                        let break_block = self.flow_current;
+                        if *accepted
+                            && let Some(exit) =
+                                self.loop_exit_blocks.last().copied()
+                        {
+                            self.flow.add_edge(break_block, exit);
+                        }
+                        // Retain unreachable syntax for diagnostics without letting it mutate the
+                        // accepted break edge's state.
+                        self.flow_current = self.flow.new_block();
+                    }
+                }
+                EscapeWalkItem::Op(op) => self.push_flow_op(op),
+                EscapeWalkItem::ArenaDone {
+                    block,
+                    inner,
+                    target,
+                } => {
+                    self.allocation_regions.pop();
+                    if let Some(value) = block.value.as_deref() {
+                        self.push_flow_op(EscapeFlowOp::ArenaExit {
+                            value,
+                            value_depth: inner,
+                            target,
+                        });
+                    }
+                }
+                EscapeWalkItem::TaskGroupDone {
+                    block,
+                    inner,
+                    target,
+                } => {
+                    self.task_group_regions.pop();
+                    if let Some(value) = block.value.as_deref() {
+                        self.push_flow_op(EscapeFlowOp::TaskGroupExit {
+                            value,
+                            value_depth: inner,
+                            target,
+                        });
+                    }
+                }
+                EscapeWalkItem::LoopDone { body, head, exit } => {
+                    self.loop_exit_blocks.pop();
+                    if !hir_block_diverges(body) {
+                        self.flow.add_edge(self.flow_current, head);
+                    }
+                    self.flow_current = exit;
+                }
+                EscapeWalkItem::IfAfterCond { then, els, depth } => {
+                    let branch = self.flow_current;
+                    let then_entry = self.flow.new_block();
+                    let else_entry = self.flow.new_block();
+                    let join = self.flow.new_block();
+                    self.flow.add_edge(branch, then_entry);
+                    self.flow.add_edge(branch, else_entry);
+                    self.flow_current = then_entry;
+                    work.push(EscapeWalkItem::IfDone {
+                        branch,
+                        join,
+                        then_diverges: hir_block_diverges(then),
+                        else_diverges: hir_block_diverges(els),
+                    });
+                    work.push(EscapeWalkItem::Block(els, depth));
+                    work.push(EscapeWalkItem::IfThenDone {
+                        then_diverges: hir_block_diverges(then),
+                        else_entry,
+                        join,
+                    });
+                    work.push(EscapeWalkItem::Block(then, depth));
+                }
+                EscapeWalkItem::IfThenDone {
+                    then_diverges,
+                    else_entry,
+                    join,
+                } => {
+                    if !then_diverges {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    self.flow_current = else_entry;
+                }
+                EscapeWalkItem::IfDone {
+                    branch,
+                    join,
+                    then_diverges,
+                    else_diverges,
+                } => {
+                    if !else_diverges {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    if then_diverges && else_diverges {
+                        self.flow.add_edge(branch, join);
+                    }
+                    self.flow_current = join;
+                }
+                EscapeWalkItem::MatchAfterScrutinee {
+                    scrutinee,
+                    arms,
+                    depth,
+                } => {
+                    let branch = self.flow_current;
+                    let join = self.flow.new_block();
+                    work.push(EscapeWalkItem::MatchDone {
+                        arms,
+                        branch,
+                        join,
+                    });
+                    work.extend(arms.iter().rev().map(|arm| {
+                        EscapeWalkItem::MatchArmStart {
+                            scrutinee,
+                            arm,
+                            branch,
+                            join,
+                            depth,
+                        }
+                    }));
+                }
+                EscapeWalkItem::MatchArmStart {
+                    scrutinee,
+                    arm,
+                    branch,
+                    join,
+                    depth,
+                } => {
+                    let entry = self.flow.new_block();
+                    self.flow.add_edge(branch, entry);
+                    self.flow_current = entry;
+                    self.push_flow_op(EscapeFlowOp::MatchBindings {
+                        scrutinee,
+                        bindings: &arm.bindings,
+                        depth,
+                    });
+                    work.push(EscapeWalkItem::MatchArmDone { arm, join });
+                    work.push(EscapeWalkItem::Expr(&arm.body, depth));
+                }
+                EscapeWalkItem::MatchArmDone { arm, join } => {
+                    if !hir_expr_diverges(&arm.body) {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                }
+                EscapeWalkItem::MatchDone {
+                    arms,
+                    branch,
+                    join,
+                } => {
+                    if !arms.iter().any(|arm| !hir_expr_diverges(&arm.body)) {
+                        self.flow.add_edge(branch, join);
+                    }
+                    self.flow_current = join;
+                }
+                EscapeWalkItem::ElseAfterOpt { fallback, depth } => {
+                    let branch = self.flow_current;
+                    let fallback_entry = self.flow.new_block();
+                    let join = self.flow.new_block();
+                    self.flow.add_edge(branch, join);
+                    self.flow.add_edge(branch, fallback_entry);
+                    self.flow_current = fallback_entry;
+                    work.push(EscapeWalkItem::ElseDone { fallback, join });
+                    work.push(EscapeWalkItem::Expr(fallback, depth));
+                }
+                EscapeWalkItem::ElseDone { fallback, join } => {
+                    if !hir_expr_diverges(fallback) {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    self.flow_current = join;
                 }
             }
-        }
-        self.push_flow_op(EscapeFlowOp::Stmt(stmt, depth));
-        if let Stmt::Break { accepted, .. } = stmt {
-            let break_block = self.flow_current;
-            if *accepted
-                && let Some(exit) = self.loop_exit_blocks.last().copied()
-            {
-                self.flow.add_edge(break_block, exit);
-            }
-            // Keep lowering unreachable syntax for diagnostics, but isolate it from the break edge:
-            // the CFG solver never replays this predecessor-less block, so successors observe the
-            // state exactly at an accepted `break`, never mutations written afterward.
-            let unreachable = self.flow.new_block();
-            self.flow_current = unreachable;
         }
     }
 
@@ -11201,8 +11614,7 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
-    /// recursive [`Self::walk`] frame (#296).
+    /// Collect a `file` op's sub-expressions (A4).
     #[inline(never)]
     fn walk_file_op(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
@@ -11221,8 +11633,7 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Walk an `array_builder` op's sub-exprs for the escape walk. `#[inline(never)]` so its arm
-    /// locals stay out of the recursive [`Self::walk`] frame (#296).
+    /// Collect an `array_builder` op's sub-expressions for the escape walk.
     #[inline(never)]
     fn walk_array_builder(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
@@ -11243,9 +11654,17 @@ impl<'a> EscapeCheck<'a> {
     /// Lower every checked-HIR value position into the compact escape CFG. This match is exhaustive:
     /// adding syntax requires either explicit control-flow edges or explicit operand recursion.
     fn walk(&mut self, e: &'a Expr, depth: u32) {
-        if let Some(region) = self.allocation_regions.last().copied() {
-            self.allocation_region_by_expr.insert(Self::expr_key(e), region);
+        if self.collecting_walk_children {
+            self.walk_children.push((e, depth));
+            return;
         }
+        self.walk_items(vec![EscapeWalkItem::Expr(e, depth)]);
+    }
+
+    /// Exhaustive direct-operand inventory for expression forms without escape-CFG control.
+    /// Calls to [`Self::walk`] append to `walk_children` while this method is active; the outer
+    /// explicit worklist later evaluates those children in source order.
+    fn collect_expr_children(&mut self, e: &'a Expr, depth: u32) {
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
@@ -11258,150 +11677,39 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
-            ExprKind::Arena(b) => {
-                let inner = depth + 1;
-                self.allocation_regions.push(Region::arena(inner));
-                self.lower_block(b, inner);
-                self.allocation_regions.pop();
-                if let Some(v) = &b.value {
-                    self.push_flow_op(EscapeFlowOp::ArenaExit {
-                        value: v,
-                        value_depth: inner,
-                        target: Region::arena(depth),
-                    });
-                }
+            ExprKind::Arena(_)
+            | ExprKind::Block(_)
+            | ExprKind::Loop { .. }
+            | ExprKind::Unsafe(_) => {
+                unreachable!("escape control expressions use explicit walk items");
             }
-            ExprKind::Block(b) => self.lower_block(b, depth),
-            ExprKind::Loop { body, .. } => {
-                let before = self.flow_current;
-                let head = self.flow.new_block();
-                let exit = self.flow.new_block();
-                self.flow.add_edge(before, head);
-                self.flow_current = head;
-                self.loop_exit_blocks.push(exit);
-                self.lower_block(body, depth);
-                self.loop_exit_blocks.pop();
-                if !hir_block_diverges(body) {
-                    self.flow.add_edge(self.flow_current, head);
-                }
-                // Only a semantically accepted `break` adds a predecessor to `exit`. A rejected or
-                // break-less loop leaves it unreachable, so later syntax receives no escape state.
-                self.flow_current = exit;
-            }
-            // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
-            ExprKind::Unsafe(b) => self.lower_block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
             // region value (e.g. a `Task` handle) cannot escape as the block's value.
-            ExprKind::TaskGroup(b) => {
-                let inner = depth + 1;
-                self.task_group_regions.push(Region::arena(inner));
-                self.lower_block(b, inner);
-                self.task_group_regions.pop();
-                if let Some(v) = &b.value {
-                    self.push_flow_op(EscapeFlowOp::TaskGroupExit {
-                        value: v,
-                        value_depth: inner,
-                        target: Region::arena(depth),
-                    });
-                }
-            }
-            ExprKind::Spawn { closure, .. } => {
-                if let Some(group) = self.task_group_regions.last().copied() {
-                    self.push_flow_op(EscapeFlowOp::SpawnCapture {
-                        closure,
-                        group,
-                        depth,
-                    });
-                }
-                self.walk(closure, depth);
+            ExprKind::TaskGroup(_)
+            | ExprKind::Spawn { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
                     self.walk(p, depth);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
-                self.walk(scrutinee, depth);
-                let branch = self.flow_current;
-                let join = self.flow.new_block();
-                let mut continuing = false;
-                for a in arms {
-                    let arm = self.flow.new_block();
-                    self.flow.add_edge(branch, arm);
-                    self.flow_current = arm;
-                    self.push_flow_op(EscapeFlowOp::MatchBindings {
-                        scrutinee,
-                        bindings: &a.bindings,
-                        depth,
-                    });
-                    self.walk(&a.body, depth);
-                    if !hir_expr_diverges(&a.body) {
-                        self.flow.add_edge(self.flow_current, join);
-                        continuing = true;
-                    }
-                }
-                if !continuing {
-                    self.flow.add_edge(branch, join);
-                }
-                self.flow_current = join;
-            }
-            ExprKind::ResultMapErr { result, f } => {
-                self.walk(result, depth);
-                self.walk(f, depth);
-                // `map_err` synthesizes a real call with the `Err` payload as a by-value
-                // argument. A Move error therefore obeys the same ownership-transfer rule as an
-                // explicit call. Result slots carry one cleanup-provenance bit, so a non-
-                // individual result must fail closed even when its runtime variant may be `Ok`.
-                if let Ty::Result(_, err) = result.ty
-                    && needs_drop_flag(
-                        scalar_to_ty(err),
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                {
-                    self.push_flow_op(EscapeFlowOp::CallTransfer(result, depth));
-                }
+            ExprKind::Match { .. }
+            | ExprKind::ResultMapErr { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
-            ExprKind::If { cond, then, els } => {
-                self.walk(cond, depth);
-                let branch = self.flow_current;
-                let then_entry = self.flow.new_block();
-                let else_entry = self.flow.new_block();
-                let join = self.flow.new_block();
-                self.flow.add_edge(branch, then_entry);
-                self.flow.add_edge(branch, else_entry);
-                self.flow_current = then_entry;
-                self.lower_block(then, depth);
-                if !hir_block_diverges(then) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                self.flow_current = else_entry;
-                self.lower_block(els, depth);
-                if !hir_block_diverges(els) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                if hir_block_diverges(then) && hir_block_diverges(els) {
-                    self.flow.add_edge(branch, join);
-                }
-                self.flow_current = join;
+            ExprKind::If { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.walk(expr, depth),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.walk(lhs, depth);
                 self.walk(rhs, depth);
             }
-            ExprKind::Call { func, args, .. } => {
-                let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
-                for a in args {
-                    self.walk(a, depth);
-                    if !borrows_args {
-                        self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
-                    }
-                }
+            ExprKind::Call { .. } => {
+                unreachable!("escape calls use explicit walk items");
             }
             // A fn value is a `Static` pointer (no region); an indirect call recurses its parts.
             ExprKind::FnValue(_) => {}
@@ -11413,12 +11721,8 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(c, depth);
                 }
             }
-            ExprKind::CallFnValue { callee, args } => {
-                self.walk(callee, depth);
-                for a in args {
-                    self.walk(a, depth);
-                    self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
-                }
+            ExprKind::CallFnValue { .. } => {
+                unreachable!("escape calls use explicit walk items");
             }
             ExprKind::StructLit { fields, .. } => {
                 // No per-field rejection: the struct *carries* the region of its fields
@@ -11428,9 +11732,8 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(f, depth);
                 }
             }
-            ExprKind::Try(i) => {
-                self.walk(i, depth);
-                self.push_flow_op(EscapeFlowOp::TryErrEscape(i, depth));
+            ExprKind::Try(_) => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
@@ -11542,19 +11845,8 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.walk(opt, depth);
-                let branch = self.flow_current;
-                let fallback_entry = self.flow.new_block();
-                let join = self.flow.new_block();
-                self.flow.add_edge(branch, join);
-                self.flow.add_edge(branch, fallback_entry);
-                self.flow_current = fallback_entry;
-                self.walk(fallback, depth);
-                if !hir_expr_diverges(fallback) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                self.flow_current = join;
+            ExprKind::ElseUnwrap { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::Template(parts) => {
                 for p in parts {
@@ -11951,15 +12243,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
-        }
-        if needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            self.push_flow_op(EscapeFlowOp::DropProvenance(e, depth));
         }
     }
 }
