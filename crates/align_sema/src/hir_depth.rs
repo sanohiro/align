@@ -995,7 +995,9 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum MoveControlShape {
         ShortCircuit,
+        ShortCircuitLhs,
         ElseUnwrap,
+        ElseOpt,
         If,
         IfElse,
         IfCondition,
@@ -1327,7 +1329,9 @@ mod tests {
         let target_expression_depth = MAX_CHECKED_HIR_DEPTH - 1;
         let delta = match shape {
             MoveControlShape::ShortCircuit
+            | MoveControlShape::ShortCircuitLhs
             | MoveControlShape::ElseUnwrap
+            | MoveControlShape::ElseOpt
             | MoveControlShape::ReduceInit
             | MoveControlShape::ScanInit
             | MoveControlShape::MapIntoDst => 1,
@@ -1358,6 +1362,15 @@ mod tests {
                     }),
                     rhs: Box::new(expression),
                 },
+                MoveControlShape::ShortCircuitLhs => ExprKind::Binary {
+                    op: crate::BinOp::And,
+                    lhs: Box::new(expression),
+                    rhs: Box::new(Expr {
+                        kind: ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    }),
+                },
                 MoveControlShape::ElseUnwrap => ExprKind::ElseUnwrap {
                     opt: Box::new(Expr {
                         kind: ExprKind::OptionNone,
@@ -1368,6 +1381,18 @@ mod tests {
                         span,
                     }),
                     fallback: Box::new(expression),
+                },
+                MoveControlShape::ElseOpt => ExprKind::ElseUnwrap {
+                    opt: Box::new(expression),
+                    fallback: Box::new(Expr {
+                        kind: ExprKind::StrBorrow(Box::new(Expr {
+                            kind: ExprKind::Local(0),
+                            ty: Ty::String,
+                            span,
+                        })),
+                        ty: Ty::Str,
+                        span,
+                    }),
                 },
                 MoveControlShape::If => ExprKind::If {
                     cond: Box::new(Expr {
@@ -1474,8 +1499,10 @@ mod tests {
             expression = Expr {
                 kind,
                 ty: match shape {
-                    MoveControlShape::ShortCircuit => Ty::Bool,
+                    MoveControlShape::ShortCircuit
+                    | MoveControlShape::ShortCircuitLhs => Ty::Bool,
                     MoveControlShape::ElseUnwrap
+                    | MoveControlShape::ElseOpt
                     | MoveControlShape::If
                     | MoveControlShape::IfElse
                     | MoveControlShape::IfCondition
@@ -1598,7 +1625,13 @@ mod tests {
                         MoveControlShape::ShortCircuit,
                     ),
                     move_control_program_at_boundary(
+                        MoveControlShape::ShortCircuitLhs,
+                    ),
+                    move_control_program_at_boundary(
                         MoveControlShape::ElseUnwrap,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::ElseOpt,
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::If,

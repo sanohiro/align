@@ -15029,9 +15029,16 @@ impl<'a> MoveCheck<'a> {
                 then_result:
                     Option<(bool, MovedSet, BorrowState, BorrowFact)>,
             },
-            JoinIncoming {
-                moved: MovedSet,
-                borrows: BorrowState,
+            OptionalAfterFirst {
+                second: &'e Expr,
+                consuming: bool,
+                direct: bool,
+            },
+            OptionalAfterSecond {
+                first: &'e Expr,
+                first_consuming: bool,
+                first_direct: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
             },
         }
 
@@ -15128,34 +15135,67 @@ impl<'a> MoveCheck<'a> {
                         op: BinOp::And | BinOp::Or,
                         lhs,
                         rhs,
-                    } if self.expr_is_move_neutral(lhs)
-                        && !hir_expr_diverges(lhs) =>
+                    } =>
                     {
-                        (
-                            rhs.as_ref(),
-                            false,
-                            false,
-                            false,
-                            Post::JoinIncoming {
-                                moved: moved.clone(),
-                                borrows: self.borrows.clone(),
-                            },
-                        )
+                        if hir_depth::expr_postorder(lhs).len()
+                            >= hir_depth::expr_postorder(rhs).len()
+                        {
+                            (
+                                lhs.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::OptionalAfterFirst {
+                                    second: rhs,
+                                    consuming: false,
+                                    direct: false,
+                                },
+                            )
+                        } else {
+                            (
+                                rhs.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::OptionalAfterSecond {
+                                    first: lhs,
+                                    first_consuming: false,
+                                    first_direct: false,
+                                    incoming: None,
+                                },
+                            )
+                        }
                     }
-                    ExprKind::ElseUnwrap { opt, fallback }
-                        if self.expr_is_move_neutral(opt)
-                            && !hir_expr_diverges(opt) =>
+                    ExprKind::ElseUnwrap { opt, fallback } =>
                     {
-                        (
-                            fallback.as_ref(),
-                            false,
-                            current_consuming,
-                            false,
-                            Post::JoinIncoming {
-                                moved: moved.clone(),
-                                borrows: self.borrows.clone(),
-                            },
-                        )
+                        if hir_depth::expr_postorder(opt).len()
+                            >= hir_depth::expr_postorder(fallback).len()
+                        {
+                            (
+                                opt.as_ref(),
+                                false,
+                                true,
+                                true,
+                                Post::OptionalAfterFirst {
+                                    second: fallback,
+                                    consuming: current_consuming,
+                                    direct: false,
+                                },
+                            )
+                        } else {
+                            (
+                                fallback.as_ref(),
+                                false,
+                                current_consuming,
+                                false,
+                                Post::OptionalAfterSecond {
+                                    first: opt,
+                                    first_consuming: true,
+                                    first_direct: true,
+                                    incoming: None,
+                                },
+                            )
+                        }
                     }
                     ExprKind::If { cond, then, els }
                         if then.stmts.is_empty()
@@ -15415,6 +15455,26 @@ impl<'a> MoveCheck<'a> {
                             );
                         }
                     }
+                    Post::OptionalAfterSecond {
+                        first,
+                        first_consuming,
+                        first_direct,
+                        incoming,
+                    } => {
+                        if !self.expr(
+                            first,
+                            moved,
+                            *first_consuming,
+                            *first_direct,
+                        ) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *incoming = Some((
+                            moved.clone(),
+                            self.borrows.clone(),
+                        ));
+                    }
                     Post::IfAfterThen {
                         condition,
                         incoming,
@@ -15494,21 +15554,52 @@ impl<'a> MoveCheck<'a> {
             }
             let key = Self::expr_key(wrapper);
             let try_result = match post {
-                Post::JoinIncoming {
-                    moved: incoming_moved,
-                    borrows: incoming_borrows,
+                Post::OptionalAfterFirst {
+                    second,
+                    consuming,
+                    direct,
                 } => {
                     if falls_through {
-                        *moved = &incoming_moved | &*moved;
-                        self.borrows = BorrowState::join(
-                            &incoming_borrows,
-                            &self.borrows,
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut second_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let second_falls = self.expr(
+                            second,
+                            &mut second_moved,
+                            consuming,
+                            direct,
                         );
-                    } else {
-                        *moved = incoming_moved;
-                        self.borrows = incoming_borrows;
+                        if second_falls {
+                            *moved = &incoming_moved | &second_moved;
+                            self.borrows = BorrowState::join(
+                                &incoming_borrows,
+                                &self.borrows,
+                            );
+                        } else {
+                            *moved = incoming_moved;
+                            self.borrows = incoming_borrows;
+                        }
+                        falls_through = true;
                     }
-                    falls_through = true;
+                    None
+                }
+                Post::OptionalAfterSecond { incoming, .. } => {
+                    if let Some((incoming_moved, incoming_borrows)) =
+                        incoming
+                    {
+                        if falls_through {
+                            *moved = &incoming_moved | &*moved;
+                            self.borrows = BorrowState::join(
+                                &incoming_borrows,
+                                &self.borrows,
+                            );
+                        } else {
+                            *moved = incoming_moved;
+                            self.borrows = incoming_borrows;
+                        }
+                        falls_through = true;
+                    }
                     None
                 }
                 Post::Try(result) => Some(result),
