@@ -6234,39 +6234,8 @@ impl EffectScan<'_> {
         }
     }
 
-    fn form_node_captures(&mut self, kind: &ExprKind) -> bool {
-        for capture in node_captures(kind) {
-            if !self.expr(capture) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn form_stage_captures(&mut self, stages: &[Stage]) -> bool {
-        for stage in stages {
-            match &stage.kind {
-                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
-                    for capture in captures {
-                        if !self.expr(capture) {
-                            return false;
-                        }
-                    }
-                }
-                StageKind::WhereStrContains { needle } => {
-                    if !self.expr(needle) {
-                        return false;
-                    }
-                }
-                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
-            }
-        }
-        true
-    }
-
-    /// Join the callback actions only after every source/stage/terminal operand has formed.
-    /// Capture expressions were already walked by `form_stage_captures`, so this must never
-    /// re-evaluate them.
+    /// Join callback actions after the iterative event walk has formed every source, stage capture,
+    /// and terminal operand. This action phase must never re-evaluate those expressions.
     fn join_stage_actions<'a>(
         &mut self,
         source: &'a Expr,
@@ -6310,201 +6279,252 @@ impl EffectScan<'_> {
     /// initializer/payload retains effects produced before its terminator but prevents the
     /// statement's own boundary transfer and every later statement/tail.
     fn block(&mut self, b: &Block) -> bool {
-        for s in &b.stmts {
-            match s {
-                Stmt::Let { local, init } => {
-                    if !self.expr(init) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *local,
-                            init,
-                            &[],
-                            &[],
+        for event in hir_depth::reachable_body_events(b) {
+            match event {
+                hir_depth::BodyEvent::StmtEnter(_) => {}
+                hir_depth::BodyEvent::StmtExit(statement) => {
+                    self.finish_stmt_effect(statement);
+                }
+                hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } => {
+                    self.enter_match_arm_effect(scrutinee, arm);
+                }
+                hir_depth::BodyEvent::ExprEnter(expression) => {
+                    if matches!(expression.kind, ExprKind::Loop { .. }) {
+                        let key = effect_expression_key(expression);
+                        self.boundaries.ensure_expression(
+                            key,
+                            expression.ty,
+                            EffectTypeTables {
+                                structs: self.structs,
+                                enums: self.enums,
+                                tuples: self.tuples,
+                                tagged_types: self.tagged_types,
+                            },
                         );
-                        self.set_local_effect(*local, self.fn_value_effect(init), false);
-                        self.join_concrete_type_effects(*local, init);
+                        self.loop_results.push((expression.ty, key));
                     }
                 }
-                Stmt::Assign { local, value, .. } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *local,
-                            value,
-                            &[],
-                            &[],
-                        );
-                        self.set_local_effect(*local, self.fn_value_effect(value), true);
-                        self.join_concrete_type_effects(*local, value);
-                    }
-                }
-                Stmt::AssignField { root, path, value } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        let destination: Vec<FnEffectProjection> = path
-                            .iter()
-                            .copied()
-                            .map(FnEffectProjection::StructField)
-                            .collect();
-                        self.join_current_local_boundary(
-                            *root,
-                            value,
-                            &[],
-                            &destination,
-                        );
-                        self.join_concrete_struct_field_effect(*root, path, value);
-                    }
-                }
-                Stmt::LetTuple { locals, init, .. } => {
-                    if !self.expr(init) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        for (index, local) in locals.iter().enumerate() {
-                            let Some(local) = *local
-                            else {
-                                continue;
-                            };
-                            let Some(ty) = self
-                                .locals
-                                .get(local as usize)
-                                .map(|local| local.ty)
-                            else {
-                                continue;
-                            };
-                            let source = [FnEffectProjection::TupleElement(
-                                index as u32,
-                            )];
-                            self.join_current_local_boundary(
-                                local,
-                                init,
-                                &source,
-                                &[],
-                            );
-                            self.join_concrete_effects(
-                                ty,
-                                init,
-                                &mut vec![FnEffectProjection::TupleElement(
-                                    index as u32,
-                                )],
-                                &mut Vec::new(),
-                            );
-                        }
-                    }
-                }
-                Stmt::AssignIndex { base, index, value } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
-                    }
-                    self.mark_view_write(*base);
-                }
-                Stmt::AssignElemField {
-                    base,
-                    index,
-                    path,
-                    struct_id,
-                    value,
-                    ..
+                hir_depth::BodyEvent::ExprExit {
+                    expression,
+                    children_completed,
                 } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
+                    let falls_through = self.finish_expr_effect(
+                        expression,
+                        children_completed,
+                    );
+                    if matches!(expression.kind, ExprKind::Loop { .. }) {
+                        self.loop_results.pop();
                     }
-                    self.mark_view_write(*base);
-                    if self.known_effects.is_some() {
-                        let mut destination =
-                            Vec::with_capacity(path.len() + 1);
-                        destination.push(FnEffectProjection::ArrayElement);
-                        destination.extend(
-                            path.iter()
-                                .copied()
-                                .map(FnEffectProjection::StructField),
-                        );
-                        self.join_current_local_boundary(
-                            *base,
-                            value,
-                            &[],
-                            &destination,
-                        );
-                        self.join_concrete_struct_id_field_effect(*struct_id, path, value);
+                    if falls_through {
+                        self.fallthrough_expressions
+                            .insert(effect_expression_key(expression));
                     }
-                }
-                Stmt::AssignElem {
-                    base,
-                    index,
-                    struct_id,
-                    value,
-                    ..
-                } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
-                    }
-                    self.mark_view_write(*base);
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *base,
-                            value,
-                            &[],
-                            &[FnEffectProjection::ArrayElement],
-                        );
-                        self.join_concrete_struct_id_effects(*struct_id, value);
-                    }
-                }
-                Stmt::AssignVecLane { value, .. } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                }
-                Stmt::Return(Some(e)) => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_return_effects(e);
-                    }
-                    return false;
-                }
-                Stmt::Break {
-                    value: Some(e),
-                    accepted,
-                } => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                    if *accepted
-                        && self.known_effects.is_some()
-                        && let Some((loop_ty, loop_key)) =
-                            self.loop_results.last().copied()
-                    {
-                        self.join_expression_boundary(loop_key, e);
-                        self.join_concrete_effects(
-                            loop_ty,
-                            e,
-                            &mut Vec::new(),
-                            &mut Vec::new(),
-                        );
-                    }
-                    return false;
-                }
-                Stmt::Expr(e) => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                }
-                Stmt::Return(None) | Stmt::Break { value: None, .. } => {
-                    return false;
                 }
             }
         }
-        if let Some(v) = &b.value {
-            return self.expr(v);
+        !hir_block_diverges(b)
+    }
+
+    fn finish_stmt_effect(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::Let { local, init } => {
+                if hir_expr_diverges(init) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(*local, init, &[], &[]);
+                    self.set_local_effect(*local, self.fn_value_effect(init), false);
+                    self.join_concrete_type_effects(*local, init);
+                }
+            }
+            Stmt::Assign { local, value, .. } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(*local, value, &[], &[]);
+                    self.set_local_effect(*local, self.fn_value_effect(value), true);
+                    self.join_concrete_type_effects(*local, value);
+                }
+            }
+            Stmt::AssignField { root, path, value } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    let destination = path
+                        .iter()
+                        .copied()
+                        .map(FnEffectProjection::StructField)
+                        .collect::<Vec<_>>();
+                    self.join_current_local_boundary(
+                        *root,
+                        value,
+                        &[],
+                        &destination,
+                    );
+                    self.join_concrete_struct_field_effect(*root, path, value);
+                }
+            }
+            Stmt::LetTuple { locals, init, .. } => {
+                if hir_expr_diverges(init) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    for (index, local) in locals.iter().enumerate() {
+                        let Some(local) = *local else {
+                            continue;
+                        };
+                        let Some(ty) = self
+                            .locals
+                            .get(local as usize)
+                            .map(|local| local.ty)
+                        else {
+                            continue;
+                        };
+                        let source = [FnEffectProjection::TupleElement(index as u32)];
+                        self.join_current_local_boundary(
+                            local,
+                            init,
+                            &source,
+                            &[],
+                        );
+                        self.join_concrete_effects(
+                            ty,
+                            init,
+                            &mut vec![FnEffectProjection::TupleElement(index as u32)],
+                            &mut Vec::new(),
+                        );
+                    }
+                }
+            }
+            Stmt::AssignIndex { base, index, value } => {
+                if !hir_expr_diverges(index) && !hir_expr_diverges(value) {
+                    self.mark_view_write(*base);
+                }
+            }
+            Stmt::AssignElemField {
+                base,
+                index,
+                path,
+                struct_id,
+                value,
+                ..
+            } => {
+                if hir_expr_diverges(index) || hir_expr_diverges(value) {
+                    return;
+                }
+                self.mark_view_write(*base);
+                if self.known_effects.is_some() {
+                    let mut destination = Vec::with_capacity(path.len() + 1);
+                    destination.push(FnEffectProjection::ArrayElement);
+                    destination.extend(
+                        path.iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    self.join_current_local_boundary(
+                        *base,
+                        value,
+                        &[],
+                        &destination,
+                    );
+                    self.join_concrete_struct_id_field_effect(
+                        *struct_id,
+                        path,
+                        value,
+                    );
+                }
+            }
+            Stmt::AssignElem {
+                base,
+                index,
+                struct_id,
+                value,
+                ..
+            } => {
+                if hir_expr_diverges(index) || hir_expr_diverges(value) {
+                    return;
+                }
+                self.mark_view_write(*base);
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(
+                        *base,
+                        value,
+                        &[],
+                        &[FnEffectProjection::ArrayElement],
+                    );
+                    self.join_concrete_struct_id_effects(*struct_id, value);
+                }
+            }
+            Stmt::Return(Some(value)) => {
+                if !hir_expr_diverges(value) && self.known_effects.is_some() {
+                    self.join_return_effects(value);
+                }
+            }
+            Stmt::Break {
+                value: Some(value),
+                accepted,
+            } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if *accepted
+                    && self.known_effects.is_some()
+                    && let Some((loop_ty, loop_key)) =
+                        self.loop_results.last().copied()
+                {
+                    self.join_expression_boundary(loop_key, value);
+                    self.join_concrete_effects(
+                        loop_ty,
+                        value,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    );
+                }
+            }
+            Stmt::AssignVecLane { .. }
+            | Stmt::Expr(_)
+            | Stmt::Return(None)
+            | Stmt::Break { value: None, .. } => {}
         }
-        true
+    }
+
+    fn enter_match_arm_effect(&mut self, scrutinee: &Expr, arm: &hir::MatchArm) {
+        if self.known_effects.is_none() {
+            return;
+        }
+        let [variant] = arm.variants.as_slice() else {
+            return;
+        };
+        for (index, binding) in arm.bindings.iter().enumerate() {
+            let Some(ty) = self
+                .locals
+                .get(*binding as usize)
+                .map(|local| local.ty)
+            else {
+                continue;
+            };
+            let Some(projection) = self.match_payload_projection(
+                scrutinee.ty,
+                *variant,
+                index as u32,
+            ) else {
+                continue;
+            };
+            self.join_current_local_boundary(
+                *binding,
+                scrutinee,
+                &[projection],
+                &[],
+            );
+            self.join_concrete_effects(
+                ty,
+                scrutinee,
+                &mut vec![projection],
+                &mut Vec::new(),
+            );
+        }
     }
 
     fn named_effect(&self, name: &str) -> FnEffect {
@@ -6525,155 +6545,574 @@ impl EffectScan<'_> {
             .unwrap_or(FnEffect::Unknown)
     }
 
-    fn block_value_effect(&self, block: &Block) -> Option<FnEffect> {
-        block
-            .value
-            .as_deref()
-            .filter(|value| {
-                self.fallthrough_expressions
-                    .contains(&effect_expression_key(value))
-            })
-            .map(|value| self.fn_value_effect(value))
+    fn eval_fn_effect(
+        &self,
+        root: &Expr,
+        root_path: &[FnEffectProjection],
+    ) -> Option<FnEffect> {
+        enum Work<'a> {
+            Eval {
+                expression: &'a Expr,
+                path: Vec<FnEffectProjection>,
+            },
+            Value(Option<FnEffect>),
+            Join(usize),
+        }
+
+        let mut work = vec![Work::Eval {
+            expression: root,
+            path: root_path.to_vec(),
+        }];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            let Work::Eval { expression, path } = item else {
+                match item {
+                    Work::Value(value) => values.push(value),
+                    Work::Join(count) => {
+                        let start = values.len().saturating_sub(count);
+                        let joined = values
+                            .drain(start..)
+                            .fold(None, Self::join_optional_effect);
+                        values.push(joined);
+                    }
+                    Work::Eval { .. } => unreachable!(),
+                }
+                continue;
+            };
+
+            if path.is_empty() {
+                match &expression.kind {
+                    ExprKind::Local(id) => {
+                        let effect = self
+                            .boundary_local_effect(*id, &[])
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*id as usize)
+                                    .map(|local| self.type_effect(local.ty))
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::Field {
+                        root,
+                        path: field_path,
+                    } => {
+                        let path = field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField)
+                            .collect::<Vec<_>>();
+                        let effect = self
+                            .boundary_local_effect(*root, &path)
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*root as usize)
+                                    .and_then(|local| {
+                                        self.projected_type_effect(local.ty, &path)
+                                    })
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::Index { recv, .. } => {
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path: vec![FnEffectProjection::ArrayElement],
+                        });
+                    }
+                    ExprKind::IndexField {
+                        base,
+                        path: field_path,
+                        ..
+                    } => {
+                        let mut path = Vec::with_capacity(field_path.len() + 1);
+                        path.push(FnEffectProjection::ArrayElement);
+                        path.extend(
+                            field_path
+                                .iter()
+                                .copied()
+                                .map(FnEffectProjection::StructField),
+                        );
+                        let effect = self
+                            .boundary_local_effect(*base, &path)
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*base as usize)
+                                    .and_then(|local| {
+                                        self.projected_type_effect(local.ty, &path)
+                                    })
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::ElemField {
+                        recv,
+                        path: field_path,
+                        ..
+                    } => {
+                        let mut path = Vec::with_capacity(field_path.len() + 1);
+                        path.push(FnEffectProjection::ArrayElement);
+                        path.extend(
+                            field_path
+                                .iter()
+                                .copied()
+                                .map(FnEffectProjection::StructField),
+                        );
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path,
+                        });
+                    }
+                    ExprKind::TupleIndex { recv, index } => {
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path: vec![FnEffectProjection::TupleElement(*index)],
+                        });
+                    }
+                    ExprKind::If { then, els, .. } => {
+                        let children = [then, els]
+                            .into_iter()
+                            .filter_map(|block| block.value.as_deref())
+                            .filter(|value| {
+                                self.fallthrough_expressions
+                                    .contains(&effect_expression_key(value))
+                            })
+                            .collect::<Vec<_>>();
+                        work.push(Work::Join(children.len()));
+                        work.extend(children.into_iter().rev().map(|expression| {
+                            Work::Eval {
+                                expression,
+                                path: Vec::new(),
+                            }
+                        }));
+                    }
+                    ExprKind::Match { arms, .. } => {
+                        let children = arms
+                            .iter()
+                            .map(|arm| &arm.body)
+                            .filter(|body| {
+                                self.fallthrough_expressions
+                                    .contains(&effect_expression_key(body))
+                            })
+                            .collect::<Vec<_>>();
+                        work.push(Work::Join(children.len()));
+                        work.extend(children.into_iter().rev().map(|expression| {
+                            Work::Eval {
+                                expression,
+                                path: Vec::new(),
+                            }
+                        }));
+                    }
+                    ExprKind::Loop { .. } => {
+                        work.push(Work::Value(Some(
+                            self.boundary_expression_effect(
+                                effect_expression_key(expression),
+                                &[],
+                            )
+                            .flatten()
+                            .unwrap_or(FnEffect::Unknown),
+                        )));
+                    }
+                    ExprKind::ElseUnwrap { opt, fallback } => {
+                        let success = match expand_tagged_ty(
+                            opt.ty,
+                            self.tagged_types,
+                        ) {
+                            Ty::Option(_) => {
+                                Some(FnEffectProjection::OptionSome)
+                            }
+                            Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                            _ => None,
+                        };
+                        let fallback_live = self
+                            .fallthrough_expressions
+                            .contains(&effect_expression_key(fallback));
+                        let count = 1 + usize::from(fallback_live);
+                        work.push(Work::Join(count));
+                        if fallback_live {
+                            work.push(Work::Eval {
+                                expression: fallback,
+                                path: Vec::new(),
+                            });
+                        }
+                        if let Some(success) = success {
+                            work.push(Work::Eval {
+                                expression: opt,
+                                path: vec![success],
+                            });
+                        } else {
+                            work.push(Work::Value(Some(FnEffect::Unknown)));
+                        }
+                    }
+                    ExprKind::Try(result) => {
+                        work.push(Work::Eval {
+                            expression: result,
+                            path: vec![FnEffectProjection::ResultOk],
+                        });
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::Unsafe(block)
+                    | ExprKind::TaskGroup(block) => {
+                        if let Some(value) = block.value.as_deref().filter(|value| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(value))
+                        }) {
+                            work.push(Work::Eval {
+                                expression: value,
+                                path: Vec::new(),
+                            });
+                        } else {
+                            work.push(Work::Value(None));
+                        }
+                    }
+                    _ => work.push(Work::Value(Some(
+                        self.type_effect(expression.ty),
+                    ))),
+                }
+                continue;
+            }
+
+            let projection = path[0];
+            let rest = path[1..].to_vec();
+            match (&expression.kind, projection) {
+                (
+                    ExprKind::StructLit { fields, .. },
+                    FnEffectProjection::StructField(field),
+                ) => {
+                    if let Some(value) = fields.get(field as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (
+                    ExprKind::Tuple { elems, .. },
+                    FnEffectProjection::TupleElement(index),
+                ) => {
+                    if let Some(value) = elems.get(index as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (
+                    ExprKind::EnumValue {
+                        variant,
+                        payload,
+                        ..
+                    },
+                    FnEffectProjection::EnumPayload {
+                        variant: projected_variant,
+                        index,
+                    },
+                ) => {
+                    if *variant != projected_variant {
+                        work.push(Work::Value(None));
+                    } else if let Some(value) = payload.get(index as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (ExprKind::OptionSome(value), FnEffectProjection::OptionSome)
+                | (ExprKind::ResultOk(value), FnEffectProjection::ResultOk)
+                | (ExprKind::ResultErr(value), FnEffectProjection::ResultErr) => {
+                    work.push(Work::Eval {
+                        expression: value,
+                        path: rest,
+                    });
+                }
+                (ExprKind::OptionNone, FnEffectProjection::OptionSome)
+                | (ExprKind::ResultOk(_), FnEffectProjection::ResultErr)
+                | (ExprKind::ResultErr(_), FnEffectProjection::ResultOk) => {
+                    work.push(Work::Value(None));
+                }
+                (
+                    ExprKind::ArrayLit { elems, .. },
+                    FnEffectProjection::ArrayElement,
+                ) => {
+                    work.push(Work::Join(elems.len()));
+                    work.extend(elems.iter().rev().map(|expression| Work::Eval {
+                        expression,
+                        path: rest.clone(),
+                    }));
+                }
+                (
+                    ExprKind::ArrayToArray { source, stages, .. },
+                    FnEffectProjection::ArrayElement,
+                ) if stages.is_empty() => {
+                    work.push(Work::Eval {
+                        expression: source,
+                        path,
+                    });
+                }
+                (
+                    ExprKind::SliceRange { recv, .. }
+                    | ExprKind::ArrayToSlice(recv),
+                    FnEffectProjection::ArrayElement,
+                ) => {
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path,
+                    });
+                }
+                (ExprKind::Index { recv, .. }, _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::Field { root, path: field_path }, _) => {
+                    let Some(root_ty) =
+                        self.locals.get(*root as usize).map(|local| local.ty)
+                    else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                        continue;
+                    };
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len());
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    let effect = self
+                        .boundary_local_effect(*root, &wrapped)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(root_ty, &wrapped)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::IndexField { base, path: field_path, .. }, _) => {
+                    let Some(base_ty) =
+                        self.locals.get(*base as usize).map(|local| local.ty)
+                    else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                        continue;
+                    };
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    let effect = self
+                        .boundary_local_effect(*base, &wrapped)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(base_ty, &wrapped)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::ElemField { recv, path: field_path, .. }, _) => {
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::TupleIndex { recv, index }, _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::TupleElement(*index));
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (
+                    ExprKind::ResultMapErr { result, .. },
+                    FnEffectProjection::ResultOk,
+                ) => {
+                    work.push(Work::Eval {
+                        expression: result,
+                        path,
+                    });
+                }
+                (
+                    ExprKind::ResultMapErr { f, .. },
+                    FnEffectProjection::ResultErr,
+                ) => {
+                    let effect = self
+                        .static_fn_target(f)
+                        .and_then(|target| {
+                            self.boundary_result_effect(target, &rest)
+                        })
+                        .unwrap_or(Some(FnEffect::Unknown));
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::ElseUnwrap { opt, fallback }, _) => {
+                    let success = match expand_tagged_ty(
+                        opt.ty,
+                        self.tagged_types,
+                    ) {
+                        Ty::Option(_) => Some(FnEffectProjection::OptionSome),
+                        Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                        _ => None,
+                    };
+                    let fallback_live = self
+                        .fallthrough_expressions
+                        .contains(&effect_expression_key(fallback));
+                    let count = 1 + usize::from(fallback_live);
+                    work.push(Work::Join(count));
+                    if fallback_live {
+                        work.push(Work::Eval {
+                            expression: fallback,
+                            path: path.clone(),
+                        });
+                    }
+                    if let Some(success) = success {
+                        let mut wrapped = Vec::with_capacity(path.len() + 1);
+                        wrapped.push(success);
+                        wrapped.extend(path);
+                        work.push(Work::Eval {
+                            expression: opt,
+                            path: wrapped,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (ExprKind::Try(result), _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::ResultOk);
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: result,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::Call { func, .. }, _) => {
+                    let effect = self
+                        .boundary_result_effect(func, &path)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(expression.ty, &path)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::Loop { .. }, _) => {
+                    work.push(Work::Value(
+                        self.boundary_expression_effect(
+                            effect_expression_key(expression),
+                            &path,
+                        )
+                        .unwrap_or(Some(FnEffect::Unknown)),
+                    ));
+                }
+                (ExprKind::Local(local), _) => {
+                    let effect = self
+                        .boundary_local_effect(*local, &path)
+                        .unwrap_or_else(|| {
+                            self.locals
+                                .get(*local as usize)
+                                .and_then(|local| {
+                                    self.projected_type_effect(local.ty, &path)
+                                })
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::If { then, els, .. }, _) => {
+                    let children = [then, els]
+                        .into_iter()
+                        .filter_map(|block| block.value.as_deref())
+                        .filter(|value| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(value))
+                        })
+                        .collect::<Vec<_>>();
+                    work.push(Work::Join(children.len()));
+                    work.extend(children.into_iter().rev().map(|expression| {
+                        Work::Eval {
+                            expression,
+                            path: path.clone(),
+                        }
+                    }));
+                }
+                (ExprKind::Match { arms, .. }, _) => {
+                    let children = arms
+                        .iter()
+                        .map(|arm| &arm.body)
+                        .filter(|body| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(body))
+                        })
+                        .collect::<Vec<_>>();
+                    work.push(Work::Join(children.len()));
+                    work.extend(children.into_iter().rev().map(|expression| {
+                        Work::Eval {
+                            expression,
+                            path: path.clone(),
+                        }
+                    }));
+                }
+                (
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::Unsafe(block)
+                    | ExprKind::TaskGroup(block),
+                    _,
+                ) => {
+                    if let Some(value) = block.value.as_deref().filter(|value| {
+                        self.fallthrough_expressions
+                            .contains(&effect_expression_key(value))
+                    }) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path,
+                        });
+                    } else {
+                        work.push(Work::Value(None));
+                    }
+                }
+                _ => work.push(Work::Value(Some(FnEffect::Unknown))),
+            }
+        }
+        debug_assert_eq!(values.len(), 1);
+        values.pop().unwrap_or(Some(FnEffect::Unknown))
     }
 
-    /// Effect of invoking the function value produced by `expr`. Origins are resolved only in the
-    /// refinement walk and stored in `FnTy`; indirect-call consumers otherwise read the type bit.
-    fn fn_value_effect(&self, expr: &Expr) -> FnEffect {
-        match &expr.kind {
-            ExprKind::Local(id) => {
-                if let Some(effect) = self.boundary_local_effect(*id, &[]) {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*id as usize)
-                    .map(|local| self.type_effect(local.ty))
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Field {
-                root,
-                path: field_path,
-            } => {
-                let path: Vec<FnEffectProjection> = field_path
-                    .iter()
-                    .copied()
-                    .map(FnEffectProjection::StructField)
-                    .collect();
-                if let Some(effect) =
-                    self.boundary_local_effect(*root, &path)
-                {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*root as usize)
-                    .and_then(|local| {
-                        self.projected_type_effect(local.ty, &path)
-                    })
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Index { recv, .. } => self
-                .projected_fn_effect(
-                    recv,
-                    &[FnEffectProjection::ArrayElement],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::IndexField {
-                base,
-                path: field_path,
-                ..
-            } => {
-                let mut path = Vec::with_capacity(field_path.len() + 1);
-                path.push(FnEffectProjection::ArrayElement);
-                path.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                if let Some(effect) =
-                    self.boundary_local_effect(*base, &path)
-                {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*base as usize)
-                    .and_then(|local| {
-                        self.projected_type_effect(local.ty, &path)
-                    })
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::ElemField {
-                recv,
-                path: field_path,
-                ..
-            } => {
-                let mut path = Vec::with_capacity(field_path.len() + 1);
-                path.push(FnEffectProjection::ArrayElement);
-                path.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                self.projected_fn_effect(recv, &path)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::TupleIndex { recv, index } => self
-                .projected_fn_effect(
-                    recv,
-                    &[FnEffectProjection::TupleElement(*index)],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::If { then, els, .. } => Self::join_optional_effect(
-                self.block_value_effect(then),
-                self.block_value_effect(els),
-            )
-            .unwrap_or(FnEffect::Unknown),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .filter(|arm| {
-                    self.fallthrough_expressions
-                        .contains(&effect_expression_key(&arm.body))
-                })
-                .map(|arm| self.fn_value_effect(&arm.body))
-                .reduce(FnEffect::join)
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::Loop { .. } => self
-                .boundary_expression_effect(
-                    effect_expression_key(expr),
-                    &[],
-                )
-                .flatten()
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
-                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
-                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
-                    _ => None,
-                };
-                let from_success = success
-                    .map(|projection| {
-                        self.projected_fn_effect(opt, &[projection])
-                    })
-                    .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = self
-                    .fallthrough_expressions
-                    .contains(&effect_expression_key(fallback))
-                    .then(|| self.fn_value_effect(fallback));
-                Self::join_optional_effect(from_success, from_fallback)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Try(result) => self
-                .projected_fn_effect(
-                    result,
-                    &[FnEffectProjection::ResultOk],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) | ExprKind::TaskGroup(block) => {
-                self.block_value_effect(block)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            _ => self.type_effect(expr.ty),
-        }
+    /// Effect of invoking the function value produced by `expression`.
+    fn fn_value_effect(&self, expression: &Expr) -> FnEffect {
+        self.eval_fn_effect(expression, &[])
+            .unwrap_or(FnEffect::Unknown)
     }
 
     fn set_local_effect(&self, local: LocalId, incoming: FnEffect, join: bool) {
@@ -6765,247 +7204,14 @@ impl EffectScan<'_> {
 
     /// Effect at one function-valued leaf of `expr`. `None` means this runtime variant has no such
     /// payload; `Some(Unknown)` means the payload exists but its origin cannot be proved.
+    /// Effect at one function-valued leaf of `expression`. `None` means the live variant has no
+    /// such payload; `Some(Unknown)` means the payload exists but its origin cannot be proved.
     fn projected_fn_effect(
         &self,
-        expr: &Expr,
+        expression: &Expr,
         path: &[FnEffectProjection],
     ) -> Option<FnEffect> {
-        let Some((projection, rest)) = path.split_first() else {
-            return Some(self.fn_value_effect(expr));
-        };
-        match (&expr.kind, *projection) {
-            (
-                ExprKind::StructLit { fields, .. },
-                FnEffectProjection::StructField(field),
-            ) => fields
-                .get(field as usize)
-                .map(|value| self.projected_fn_effect(value, rest))
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (
-                ExprKind::Tuple { elems, .. },
-                FnEffectProjection::TupleElement(index),
-            ) => elems
-                .get(index as usize)
-                .map(|value| self.projected_fn_effect(value, rest))
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (
-                ExprKind::EnumValue {
-                    variant,
-                    payload,
-                    ..
-                },
-                FnEffectProjection::EnumPayload {
-                    variant: projected_variant,
-                    index,
-                },
-            ) => {
-                if *variant != projected_variant {
-                    None
-                } else {
-                    payload
-                        .get(index as usize)
-                        .map(|value| self.projected_fn_effect(value, rest))
-                        .unwrap_or(Some(FnEffect::Unknown))
-                }
-            }
-            (ExprKind::OptionSome(value), FnEffectProjection::OptionSome)
-            | (ExprKind::ResultOk(value), FnEffectProjection::ResultOk)
-            | (ExprKind::ResultErr(value), FnEffectProjection::ResultErr) => {
-                self.projected_fn_effect(value, rest)
-            }
-            (ExprKind::OptionNone, FnEffectProjection::OptionSome) => None,
-            (ExprKind::ResultOk(_), FnEffectProjection::ResultErr)
-            | (ExprKind::ResultErr(_), FnEffectProjection::ResultOk) => None,
-            (ExprKind::ArrayLit { elems, .. }, FnEffectProjection::ArrayElement) => {
-                elems
-                    .iter()
-                    .map(|value| self.projected_fn_effect(value, rest))
-                    .fold(None, Self::join_optional_effect)
-            }
-            (
-                ExprKind::ArrayToArray { source, stages, .. },
-                FnEffectProjection::ArrayElement,
-            ) if stages.is_empty() => self.projected_fn_effect(source, path),
-            (
-                ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv),
-                FnEffectProjection::ArrayElement,
-            ) => self.projected_fn_effect(recv, path),
-            (ExprKind::Index { recv, .. }, _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (ExprKind::Field { root, path: field_path }, _) => {
-                let Some(root_ty) =
-                    self.locals.get(*root as usize).map(|local| local.ty)
-                else {
-                    return Some(FnEffect::Unknown);
-                };
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len());
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                if let Some(effect) =
-                    self.boundary_local_effect(*root, &wrapped)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(root_ty, &wrapped)
-            }
-            (ExprKind::IndexField { base, path: field_path, .. }, _) => {
-                let Some(base_ty) =
-                    self.locals.get(*base as usize).map(|local| local.ty)
-                else {
-                    return Some(FnEffect::Unknown);
-                };
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                if let Some(effect) =
-                    self.boundary_local_effect(*base, &wrapped)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(base_ty, &wrapped)
-            }
-            (ExprKind::ElemField { recv, path: field_path, .. }, _) => {
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (ExprKind::TupleIndex { recv, index }, _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::TupleElement(*index));
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (
-                ExprKind::ResultMapErr { result, .. },
-                FnEffectProjection::ResultOk,
-            ) => self.projected_fn_effect(result, path),
-            (
-                ExprKind::ResultMapErr { f, .. },
-                FnEffectProjection::ResultErr,
-            ) => self
-                .static_fn_target(f)
-                .and_then(|target| {
-                    self.boundary_result_effect(target, rest)
-                })
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (ExprKind::ElseUnwrap { opt, fallback }, _) => {
-                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
-                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
-                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
-                    _ => None,
-                };
-                let from_success = success
-                    .map(|success| {
-                        let mut wrapped = Vec::with_capacity(path.len() + 1);
-                        wrapped.push(success);
-                        wrapped.extend_from_slice(path);
-                        self.projected_fn_effect(opt, &wrapped)
-                    })
-                    .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = self
-                    .fallthrough_expressions
-                    .contains(&effect_expression_key(fallback))
-                    .then(|| self.projected_fn_effect(fallback, path))
-                    .flatten();
-                Self::join_optional_effect(from_success, from_fallback)
-            }
-            (ExprKind::Try(result), _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::ResultOk);
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(result, &wrapped)
-            }
-            (ExprKind::Call { func, .. }, _) => {
-                if let Some(effect) =
-                    self.boundary_result_effect(func, path)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(expr.ty, path)
-            }
-            (ExprKind::Loop { .. }, _) => self
-                .boundary_expression_effect(
-                    effect_expression_key(expr),
-                    path,
-                )
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (ExprKind::Local(local), _) => {
-                if let Some(effect) =
-                    self.boundary_local_effect(*local, path)
-                {
-                    return effect;
-                }
-                self.locals
-                    .get(*local as usize)
-                    .map(|local| self.projected_type_effect(local.ty, path))
-                    .unwrap_or(Some(FnEffect::Unknown))
-            }
-            (ExprKind::If { then, els, .. }, _) => Self::join_optional_effect(
-                self.block_projected_fn_effect(then, path),
-                self.block_projected_fn_effect(els, path),
-            ),
-            (ExprKind::Match { arms, .. }, _) => arms
-                .iter()
-                .filter(|arm| {
-                    self.fallthrough_expressions
-                        .contains(&effect_expression_key(&arm.body))
-                })
-                .map(|arm| self.projected_fn_effect(&arm.body, path))
-                .fold(None, Self::join_optional_effect),
-            (
-                ExprKind::Block(block)
-                | ExprKind::Arena(block)
-                | ExprKind::Unsafe(block)
-                | ExprKind::TaskGroup(block),
-                _,
-            ) => self.block_projected_fn_effect(block, path),
-            // Transforming pipelines and indirect calls do not yet carry recursive return-origin
-            // summaries (L2b). Reading their result type here could select one syntactic origin
-            // even when another runtime path produced the value, so every unhandled producer fails
-            // closed. Same-program direct calls are handled above after their explicit returns and
-            // concrete call arguments have joined the callee's private effect cells.
-            _ => Some(FnEffect::Unknown),
-        }
-    }
-
-    fn block_projected_fn_effect(
-        &self,
-        block: &Block,
-        path: &[FnEffectProjection],
-    ) -> Option<FnEffect> {
-        block
-            .value
-            .as_deref()
-            .filter(|value| {
-                self.fallthrough_expressions
-                    .contains(&effect_expression_key(value))
-            })
-            .and_then(|value| self.projected_fn_effect(value, path))
+        self.eval_fn_effect(expression, path)
     }
 
     fn join_concrete_type_effects(&self, local: LocalId, incoming: &Expr) {
@@ -7131,23 +7337,27 @@ impl EffectScan<'_> {
         }
     }
 
-    fn erased_target_may_be_internal(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Local(local) => self
-                .locals
-                .get(*local as usize)
-                .is_none_or(|local| !local.is_param),
-            ExprKind::Field { root, .. }
-            | ExprKind::IndexField { base: root, .. } => self
-                .locals
-                .get(*root as usize)
-                .is_none_or(|local| !local.is_param),
-            ExprKind::TupleIndex { recv, .. }
-            | ExprKind::Index { recv, .. }
-            | ExprKind::ElemField { recv, .. } => {
-                self.erased_target_may_be_internal(recv)
+    fn erased_target_may_be_internal(&self, mut expression: &Expr) -> bool {
+        loop {
+            match &expression.kind {
+                ExprKind::Local(local) => {
+                    return self
+                        .locals
+                        .get(*local as usize)
+                        .is_none_or(|local| !local.is_param);
+                }
+                ExprKind::Field { root, .. }
+                | ExprKind::IndexField { base: root, .. } => {
+                    return self
+                        .locals
+                        .get(*root as usize)
+                        .is_none_or(|local| !local.is_param);
+                }
+                ExprKind::TupleIndex { recv, .. }
+                | ExprKind::Index { recv, .. }
+                | ExprKind::ElemField { recv, .. } => expression = recv,
+                _ => return true,
             }
-            _ => true,
         }
     }
 
@@ -7188,112 +7398,34 @@ impl EffectScan<'_> {
         .is_empty()
     }
 
-    /// Effect of a `file` op (`pread`/`pwrite`/`len`, A4): each is a syscall → Impure. Split out
-    /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
-    #[inline(never)]
-    fn effect_file_op(&mut self, kind: &ExprKind) -> bool {
-        let falls_through = match kind {
-            ExprKind::FilePread { file, buffer, offset } => {
-                self.expr(file) && self.expr(buffer) && self.expr(offset)
-            }
-            ExprKind::FilePwrite { file, data, offset } => {
-                self.expr(file) && self.expr(data) && self.expr(offset)
-            }
-            ExprKind::FileLen { file } => self.expr(file),
-            _ => unreachable!("effect_file_op on a non-file op"),
-        };
-        if falls_through {
-            self.impure_direct = true;
-        }
-        falls_through
-    }
-
-    /// Walk an `array_builder` op's sub-exprs for the effect check (all pure). `#[inline(never)]` so
-    /// its arm locals stay out of the recursive [`Self::expr`] frame (#296).
-    #[inline(never)]
-    fn effect_array_builder(&mut self, kind: &ExprKind) -> bool {
-        match kind {
-            ExprKind::ArrayBuilderNew { .. } => true,
-            ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.expr(builder) && self.expr(value)
-            }
-            ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.expr(builder) && self.expr(data)
-            }
-            ExprKind::ArrayBuilderBuild(i) => self.expr(i),
-            _ => unreachable!("effect_array_builder on a non-array_builder op"),
+    fn effect_children_form(
+        &self,
+        expression: &Expr,
+        children_completed: bool,
+    ) -> bool {
+        match &expression.kind {
+            ExprKind::Binary {
+                op: align_ast::BinOp::And | align_ast::BinOp::Or,
+                lhs,
+                ..
+            } => !hir_expr_diverges(lhs),
+            ExprKind::ElseUnwrap { opt, .. } => !hir_expr_diverges(opt),
+            _ => children_completed,
         }
     }
 
-    /// Scan one loop until every callback-origin cell reaches a backedge fixpoint. Function-value
-    /// effects form a finite three-point lattice. Boundary cells additionally begin uninitialized,
-    /// so three transitions per cell are a conservative convergence bound. Ordinary effect
-    /// collection does not mutate these cells and needs only one structural pass.
-    fn loop_body(&mut self, expression: &Expr, body: &Block) {
-        let key = effect_expression_key(expression);
-        self.boundaries.ensure_expression(
-            key,
-            expression.ty,
-            EffectTypeTables {
-                structs: self.structs,
-                enums: self.enums,
-                tuples: self.tuples,
-                tagged_types: self.tagged_types,
-            },
-        );
-        self.loop_results.push((expression.ty, key));
-        if self.known_effects.is_some() {
-            let mut passes = 0usize;
-            loop {
-                let before: Vec<FnEffect> = self
-                    .fn_types
-                    .iter()
-                    .map(|function| function.effect.get())
-                    .collect();
-                let before_boundaries = self.boundaries.snapshot();
-                self.block(body);
-                passes = passes.saturating_add(1);
-                if self
-                    .fn_types
-                    .iter()
-                    .map(|function| function.effect.get())
-                    .eq(before)
-                    && self.boundaries.snapshot() == before_boundaries
-                {
-                    break;
-                }
-                let max_passes = self
-                    .fn_types
-                    .len()
-                    .saturating_add(self.boundaries.leaf_count())
-                    .saturating_mul(3)
-                    .saturating_add(1);
-                if passes >= max_passes {
-                    break;
-                }
-            }
-        } else {
-            self.block(body);
+    fn finish_expr_effect(
+        &mut self,
+        e: &Expr,
+        children_completed: bool,
+    ) -> bool {
+        if !self.effect_children_form(e, children_completed) {
+            return false;
         }
-        self.loop_results.pop();
-    }
-
-    fn expr(&mut self, e: &Expr) -> bool {
-        let falls_through = self.expr_inner(e);
-        if falls_through {
-            self.fallthrough_expressions
-                .insert(effect_expression_key(e));
-        }
-        falls_through
-    }
-
-    fn expr_inner(&mut self, e: &Expr) -> bool {
         macro_rules! walk {
-            ($child:expr) => {
-                if !self.expr($child) {
-                    return false;
-                }
-            };
+            ($child:expr) => {{
+                let _ = $child;
+            }};
         }
 
         match &e.kind {
@@ -7435,12 +7567,8 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
-            // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
-            // (the #296 expr-depth lesson).
             ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => {
-                if !self.effect_file_op(&e.kind) {
-                    return false;
-                }
+                self.impure_direct = true;
             }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
             // a field read.
@@ -7460,14 +7588,11 @@ impl EffectScan<'_> {
                 walk!(buffer);
                 walk!(data);
             }
-            // `array_builder` new/push/append/build are all pure in-memory growth; walk the sub-exprs
-            // in an `#[inline(never)]` helper so the arm locals stay out of this recursive frame (#296).
-            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => {
-                if !self.effect_array_builder(k) {
-                    return false;
-                }
-            }
+            // `array_builder` new/push/append/build are all pure in-memory growth.
+            ExprKind::ArrayBuilderNew { .. }
+            | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. }
+            | ExprKind::ArrayBuilderBuild(_) => {}
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7882,17 +8007,11 @@ impl EffectScan<'_> {
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 self.join_stage_actions(source, stages);
             }
             ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 self.join_stage_actions(source, stages);
             }
             // `map_into` writes each post-stage element into caller-provided storage. It is an
@@ -7900,9 +8019,6 @@ impl EffectScan<'_> {
             // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 walk!(dst);
                 self.join_stage_actions(source, stages);
                 self.impure_direct = true;
@@ -7911,12 +8027,6 @@ impl EffectScan<'_> {
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -7943,13 +8053,7 @@ impl EffectScan<'_> {
                 ..
             } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 walk!(init);
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -7974,12 +8078,6 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayParMap { source, stages, func, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -8025,7 +8123,7 @@ impl EffectScan<'_> {
                 walk!(lhs);
                 // The RHS is conditionally reachable, but the short path remains a continuation
                 // even when the RHS terminates.
-                let _ = self.expr(rhs);
+                let _ = rhs;
                 return true;
             }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -8034,9 +8132,7 @@ impl EffectScan<'_> {
             }
             ExprKind::If { cond, then, els } => {
                 walk!(cond);
-                let then_falls_through = self.block(then);
-                let else_falls_through = self.block(els);
-                return then_falls_through || else_falls_through;
+                return !hir_block_diverges(then) || !hir_block_diverges(els);
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
@@ -8093,7 +8189,7 @@ impl EffectScan<'_> {
                 walk!(opt);
                 // The fallback is conditionally reachable. Its effects remain reachable, while the
                 // successful unwrap edge keeps the expression fallthrough even if fallback exits.
-                let _ = self.expr(fallback);
+                let _ = fallback;
                 return true;
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
@@ -8101,18 +8197,15 @@ impl EffectScan<'_> {
                 walk!(arg);
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
-                return self.block(b);
+                return !hir_block_diverges(b);
             }
-            ExprKind::Loop { body, diverges, .. } => {
-                self.loop_body(e, body);
-                return !*diverges;
-            }
+            ExprKind::Loop { diverges, .. } => return !*diverges,
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
             ExprKind::Unsafe(b) => {
                 self.impure_direct = true;
-                return self.block(b);
+                return !hir_block_diverges(b);
             }
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
                 walk!(e);
@@ -8144,46 +8237,9 @@ impl EffectScan<'_> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 walk!(scrutinee);
-                let mut any_fallthrough = false;
-                for a in arms {
-                    if self.known_effects.is_some()
-                        && let [variant] = a.variants.as_slice()
-                    {
-                        for (index, binding) in a.bindings.iter().enumerate() {
-                            let Some(ty) = self
-                                .locals
-                                .get(*binding as usize)
-                                .map(|local| local.ty)
-                            else {
-                                continue;
-                            };
-                            let Some(projection) =
-                                self.match_payload_projection(
-                                    scrutinee.ty,
-                                    *variant,
-                                    index as u32,
-                                )
-                            else {
-                                continue;
-                            };
-                            let source = [projection];
-                            self.join_current_local_boundary(
-                                *binding,
-                                scrutinee,
-                                &source,
-                                &[],
-                            );
-                            self.join_concrete_effects(
-                                ty,
-                                scrutinee,
-                                &mut vec![projection],
-                                &mut Vec::new(),
-                            );
-                        }
-                    }
-                    any_fallthrough |= self.expr(&a.body);
-                }
-                return any_fallthrough;
+                return arms
+                    .iter()
+                    .any(|arm| !hir_expr_diverges(&arm.body));
             }
             ExprKind::ResultMapErr { result, f } => {
                 walk!(result);
@@ -11475,7 +11531,9 @@ impl UnnecessaryHeapScan {
                     }
                     _ => {}
                 },
-                hir_depth::BodyEvent::ExprExit(_) => {}
+                hir_depth::BodyEvent::StmtExit(_)
+                | hir_depth::BodyEvent::ExprExit { .. }
+                | hir_depth::BodyEvent::MatchArmEnter { .. } => {}
             }
         }
         // Emit in a deterministic order (by span start) so diagnostics are stable.
@@ -11503,7 +11561,6 @@ impl UnnecessaryHeapScan {
 /// past the `if`). Conservative: only `true` when divergence is certain (any statement that always
 /// diverges — including an intermediate one, after which the rest is dead — or a tail `if`/block
 /// that itself diverges); anything else is `false`, falling back to the safe union.
-#[cfg(test)]
 fn hir_stmt_diverges(statement: &hir::Stmt) -> bool {
     hir_diverges(HirDivergenceNode::Stmt(statement))
 }

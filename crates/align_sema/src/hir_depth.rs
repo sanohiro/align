@@ -8,9 +8,16 @@ pub const MAX_CHECKED_HIR_DEPTH: usize = 259;
 enum BodyRecord<'a> {
     Block(&'a Block),
     Stmt(&'a Stmt),
+    StmtExit(&'a Stmt),
     Expr(&'a Expr),
-    ExprExit(&'a Expr),
-    MatchArm(&'a MatchArm),
+    ExprExit {
+        expression: &'a Expr,
+        children_completed: bool,
+    },
+    MatchArm {
+        scrutinee: &'a Expr,
+        arm: &'a MatchArm,
+    },
     Stage(&'a Stage),
     TemplatePart(&'a TemplatePart),
 }
@@ -18,8 +25,16 @@ enum BodyRecord<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum BodyEvent<'a> {
     StmtEnter(&'a Stmt),
+    StmtExit(&'a Stmt),
     ExprEnter(&'a Expr),
-    ExprExit(&'a Expr),
+    ExprExit {
+        expression: &'a Expr,
+        children_completed: bool,
+    },
+    MatchArmEnter {
+        scrutinee: &'a Expr,
+        arm: &'a MatchArm,
+    },
 }
 
 /// Check every stored function body before a recursive checked-HIR consumer can run.
@@ -32,6 +47,7 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
             BodyRecord::Block(&function.body),
             MAX_CHECKED_HIR_DEPTH,
             None,
+            false,
         ) {
             return false;
         }
@@ -43,6 +59,7 @@ fn walk_body_records<'a>(
     root: BodyRecord<'a>,
     max_depth: usize,
     mut events: Option<&mut Vec<BodyEvent<'a>>>,
+    reachable_only: bool,
 ) -> bool {
     let mut work = vec![(root, 1usize)];
     while let Some((record, depth)) = work.pop() {
@@ -56,18 +73,31 @@ fn walk_body_records<'a>(
         if let Some(events) = events.as_mut() {
             match record {
                 BodyRecord::Stmt(stmt) => events.push(BodyEvent::StmtEnter(stmt)),
+                BodyRecord::StmtExit(stmt) => events.push(BodyEvent::StmtExit(stmt)),
                 BodyRecord::Expr(expr) => events.push(BodyEvent::ExprEnter(expr)),
-                BodyRecord::ExprExit(expr) => events.push(BodyEvent::ExprExit(expr)),
+                BodyRecord::ExprExit {
+                    expression,
+                    children_completed,
+                } => events.push(BodyEvent::ExprExit {
+                    expression,
+                    children_completed,
+                }),
+                BodyRecord::MatchArm { scrutinee, arm } => {
+                    events.push(BodyEvent::MatchArmEnter { scrutinee, arm });
+                }
                 BodyRecord::Block(_)
-                | BodyRecord::MatchArm(_)
                 | BodyRecord::Stage(_)
                 | BodyRecord::TemplatePart(_) => {}
             }
         }
         let child_depth = depth + 1;
         let child_start = work.len();
+        let exit_stmt = match record {
+            BodyRecord::Stmt(stmt) => Some(stmt),
+            _ => None,
+        };
         match record {
-                BodyRecord::ExprExit(_) => {}
+                BodyRecord::StmtExit(_) | BodyRecord::ExprExit { .. } => {}
                 BodyRecord::Block(block) => {
                     work.extend(
                         block
@@ -101,7 +131,7 @@ fn walk_body_records<'a>(
                     }
                     Stmt::Expr(expr) => work.push((BodyRecord::Expr(expr), child_depth)),
                 },
-                BodyRecord::MatchArm(arm) => {
+                BodyRecord::MatchArm { arm, .. } => {
                     work.push((BodyRecord::Expr(&arm.body), child_depth));
                 }
                 BodyRecord::Stage(stage) => match &stage.kind {
@@ -453,10 +483,12 @@ fn walk_body_records<'a>(
                     }
                     ExprKind::Match { scrutinee, arms } => {
                         work.push((BodyRecord::Expr(scrutinee), child_depth));
-                        work.extend(
-                            arms.iter()
-                                .map(|arm| (BodyRecord::MatchArm(arm), child_depth)),
-                        );
+                        work.extend(arms.iter().map(|arm| {
+                            (
+                                BodyRecord::MatchArm { scrutinee, arm },
+                                child_depth,
+                            )
+                        }));
                     }
                     ExprKind::Spawn { closure, .. } => {
                         work.push((BodyRecord::Expr(closure), child_depth));
@@ -820,8 +852,43 @@ fn walk_body_records<'a>(
                     }
                 },
             }
+            let mut expression_children_completed = true;
+            if reachable_only {
+                let first_diverging = work[child_start..]
+                    .iter()
+                    .position(|(child, _)| match child {
+                        BodyRecord::Stmt(statement) => {
+                            crate::hir_stmt_diverges(statement)
+                        }
+                        BodyRecord::Expr(expression) => {
+                            crate::hir_expr_diverges(expression)
+                        }
+                        BodyRecord::Block(_)
+                        | BodyRecord::StmtExit(_)
+                        | BodyRecord::ExprExit { .. }
+                        | BodyRecord::MatchArm { .. }
+                        | BodyRecord::Stage(_)
+                        | BodyRecord::TemplatePart(_) => false,
+                    });
+                if let Some(index) = first_diverging {
+                    expression_children_completed = !matches!(
+                        work[child_start + index].0,
+                        BodyRecord::Expr(_)
+                    );
+                    work.truncate(child_start + index + 1);
+                }
+            }
+            if let Some(stmt) = exit_stmt {
+                work.push((BodyRecord::StmtExit(stmt), depth));
+            }
             if let Some(expr) = exit_expr {
-                work.push((BodyRecord::ExprExit(expr), depth));
+                work.push((
+                    BodyRecord::ExprExit {
+                        expression: expr,
+                        children_completed: expression_children_completed,
+                    },
+                    depth,
+                ));
             }
             // Children were appended in producer order. Reverse only this record's suffix so the
             // LIFO worklist completes the first child before starting the next one.
@@ -838,13 +905,23 @@ fn walk_body_records<'a>(
 pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
     let mut events = Vec::new();
     let root = &*root;
-    let valid = walk_body_records(BodyRecord::Expr(root), usize::MAX, Some(&mut events));
+    let valid = walk_body_records(
+        BodyRecord::Expr(root),
+        usize::MAX,
+        Some(&mut events),
+        false,
+    );
     debug_assert!(valid);
     events
         .into_iter()
         .filter_map(|event| match event {
-            BodyEvent::ExprExit(expr) => Some(expr as *const Expr as *mut Expr),
-            BodyEvent::StmtEnter(_) | BodyEvent::ExprEnter(_) => None,
+            BodyEvent::ExprExit { expression, .. } => {
+                Some(expression as *const Expr as *mut Expr)
+            }
+            BodyEvent::StmtEnter(_)
+            | BodyEvent::StmtExit(_)
+            | BodyEvent::ExprEnter(_)
+            | BodyEvent::MatchArmEnter { .. } => None,
         })
         .collect()
 }
@@ -855,6 +932,24 @@ pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
         BodyRecord::Block(root),
         usize::MAX,
         Some(&mut events),
+        false,
+    );
+    debug_assert!(valid);
+    events
+}
+
+/// Source-order enter/exit events with unreachable siblings removed after a diverging child.
+///
+/// Alternative `if`/`match` branches remain present because their block/arm records are not
+/// sequential expression children. Consumers can therefore replay all runtime possibilities while
+/// skipping statements, arguments, captures, and tails that cannot be reached.
+pub(crate) fn reachable_body_events(root: &Block) -> Vec<BodyEvent<'_>> {
+    let mut events = Vec::new();
+    let valid = walk_body_records(
+        BodyRecord::Block(root),
+        usize::MAX,
+        Some(&mut events),
+        true,
     );
     debug_assert!(valid);
     events
@@ -1026,6 +1121,15 @@ mod tests {
                 assert!(
                     !crate::hir_expr_diverges(root),
                     "nested expression statements do not make the body diverge"
+                );
+                let effects = crate::fn_effects(
+                    &program,
+                    &std::collections::HashMap::new(),
+                );
+                assert_eq!(
+                    effects.get("deep"),
+                    Some(&crate::FnEffect::Pure),
+                    "the accepted checked-HIR boundary must scan effects without process-stack recursion"
                 );
             })
             .expect("spawn checked-HIR divergence owner")
