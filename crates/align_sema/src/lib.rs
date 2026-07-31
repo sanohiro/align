@@ -29078,185 +29078,167 @@ fn ty_mangle_impl(
     fn_types: &[hir::FnTy],
     include_fn_origin: bool,
 ) -> String {
-    #[allow(clippy::too_many_arguments)]
-    fn key(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        structs: &[StructDef],
-        enums: &[hir::EnumDef],
-        tuples: &[hir::TupleDef],
-        fn_types: &[hir::FnTy],
-        include_fn_origin: bool,
-        tagged_visiting: &mut HashSet<u32>,
-        fn_visiting: &mut HashSet<u32>,
-    ) -> String {
-        let scalar = |s: Scalar,
-                      tagged_visiting: &mut HashSet<u32>,
-                      fn_visiting: &mut HashSet<u32>| {
-            key(
-                scalar_to_ty(s),
-                tagged_types,
-                structs,
-                enums,
-                tuples,
-                fn_types,
-                include_fn_origin,
-                tagged_visiting,
-                fn_visiting,
-            )
-        };
-        match ty {
-            Ty::Struct(id) => structs.get(id as usize).map_or_else(
-                || "S_invalid".to_string(),
-                |s| {
-                    let name = if include_fn_origin {
-                        &s.name
-                    } else {
-                        &s.source_name
-                    };
-                    format!("S{}_{}", name.len(), name)
-                },
-            ),
-            Ty::Enum(id) => enums.get(id as usize).map_or_else(
-                || "E_invalid".to_string(),
-                |e| {
-                    let name = if include_fn_origin {
-                        &e.name
-                    } else {
-                        &e.source_name
-                    };
-                    format!("E{}_{}", name.len(), name)
-                },
-            ),
-            Ty::Tagged(id) if tagged_visiting.insert(id) => {
-                let result = match tagged_types.get(id as usize) {
-                    Some(hir::TaggedType::Option(payload)) => {
-                        format!("O_{}", scalar(*payload, tagged_visiting, fn_visiting))
-                    }
-                    Some(hir::TaggedType::Result(ok, err)) => {
-                        format!(
-                            "R_{}_{}",
-                            scalar(*ok, tagged_visiting, fn_visiting),
-                            scalar(*err, tagged_visiting, fn_visiting)
-                        )
-                    }
-                    None => "T_invalid".to_string(),
-                };
+    enum Work {
+        Type(Ty),
+        Text(String),
+        ExitTagged(u32),
+        ExitFn(u32),
+    }
+
+    fn push_sequence(work: &mut Vec<Work>, sequence: Vec<Work>) {
+        work.extend(sequence.into_iter().rev());
+    }
+
+    let mut work = vec![Work::Type(ty)];
+    let mut output = String::new();
+    let mut tagged_visiting = HashSet::new();
+    let mut fn_visiting = HashSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Text(text) => output.push_str(&text),
+            Work::ExitTagged(id) => {
                 tagged_visiting.remove(&id);
-                result
             }
-            Ty::Tagged(_) => "T_cycle".to_string(),
-            Ty::Option(payload) => {
-                format!("O_{}", scalar(payload, tagged_visiting, fn_visiting))
+            Work::ExitFn(id) => {
+                fn_visiting.remove(&id);
             }
-            Ty::Result(ok, err) => {
-                format!(
-                    "R_{}_{}",
-                    scalar(ok, tagged_visiting, fn_visiting),
-                    scalar(err, tagged_visiting, fn_visiting)
-                )
-            }
-            Ty::Box(payload) => {
-                format!("B_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Array(payload, n) => {
-                format!("A{n}_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Slice(payload) => {
-                format!("V_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::DynArray(payload) => {
-                format!("D_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Task(payload) => {
-                format!("K_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::StructArray(id, n) => format!(
-                "A{n}_{}",
-                key(
-                    Ty::Struct(id),
-                    tagged_types,
-                    structs,
-                    enums,
-                    tuples,
-                    fn_types,
-                    include_fn_origin,
-                    tagged_visiting,
-                    fn_visiting
-                )
-            ),
-            Ty::DynStructArray(id, _) => {
-                format!(
-                    "D_{}",
-                    key(
-                        Ty::Struct(id),
-                        tagged_types,
-                        structs,
-                        enums,
-                        tuples,
-                        fn_types,
-                        include_fn_origin,
-                        tagged_visiting,
-                        fn_visiting
-                    )
-                )
-            }
-            Ty::Soa(id) => format!(
-                "Q_{}",
-                key(
-                    Ty::Struct(id),
-                    tagged_types,
-                    structs,
-                    enums,
-                    tuples,
-                    fn_types,
-                    include_fn_origin,
-                    tagged_visiting,
-                    fn_visiting
-                )
-            ),
-            Ty::Tuple(id) => tuples.get(id as usize).map_or_else(
-                || "U_invalid".to_string(),
-                |tuple| {
-                    format!(
-                        "U{}_{}",
-                        tuple.elems.len(),
-                        tuple
-                            .elems
-                            .iter()
-                            .map(|element| {
-                                scalar(
-                                    *element,
-                                    tagged_visiting,
-                                    fn_visiting,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    )
+            Work::Type(ty) => match ty {
+                Ty::Struct(id) => output.push_str(&structs.get(id as usize).map_or_else(
+                    || "S_invalid".to_string(),
+                    |structure| {
+                        let name = if include_fn_origin {
+                            &structure.name
+                        } else {
+                            &structure.source_name
+                        };
+                        format!("S{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::Enum(id) => output.push_str(&enums.get(id as usize).map_or_else(
+                    || "E_invalid".to_string(),
+                    |enumeration| {
+                        let name = if include_fn_origin {
+                            &enumeration.name
+                        } else {
+                            &enumeration.source_name
+                        };
+                        format!("E{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::Tagged(id) if tagged_visiting.insert(id) => {
+                    let sequence = match tagged_types.get(id as usize).copied() {
+                        Some(hir::TaggedType::Option(payload)) => vec![
+                            Work::Text("O_".to_string()),
+                            Work::Type(scalar_to_ty(payload)),
+                            Work::ExitTagged(id),
+                        ],
+                        Some(hir::TaggedType::Result(ok, err)) => vec![
+                            Work::Text("R_".to_string()),
+                            Work::Type(scalar_to_ty(ok)),
+                            Work::Text("_".to_string()),
+                            Work::Type(scalar_to_ty(err)),
+                            Work::ExitTagged(id),
+                        ],
+                        None => {
+                            tagged_visiting.remove(&id);
+                            vec![Work::Text("T_invalid".to_string())]
+                        }
+                    };
+                    push_sequence(&mut work, sequence);
+                }
+                Ty::Tagged(_) => output.push_str("T_cycle"),
+                Ty::Option(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("O_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Result(ok, err) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("R_".to_string()),
+                        Work::Type(scalar_to_ty(ok)),
+                        Work::Text("_".to_string()),
+                        Work::Type(scalar_to_ty(err)),
+                    ],
+                ),
+                Ty::Box(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("B_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Array(payload, len) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text(format!("A{len}_")),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Slice(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("V_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::DynArray(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("D_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Task(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("K_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::StructArray(id, len) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text(format!("A{len}_")),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::DynStructArray(id, _) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("D_".to_string()),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::Soa(id) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("Q_".to_string()),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::Tuple(id) => match tuples.get(id as usize) {
+                    None => output.push_str("U_invalid"),
+                    Some(tuple) => {
+                        let mut sequence =
+                            vec![Work::Text(format!("U{}_", tuple.elems.len()))];
+                        for (index, element) in tuple.elems.iter().enumerate() {
+                            if index > 0 {
+                                sequence.push(Work::Text("_".to_string()));
+                            }
+                            sequence.push(Work::Type(scalar_to_ty(*element)));
+                        }
+                        push_sequence(&mut work, sequence);
+                    }
                 },
-            ),
-            Ty::Fn(id) if fn_visiting.insert(id) => {
-                let result = fn_types.get(id as usize).map_or_else(
-                    || "F_invalid".to_string(),
-                    |function| {
-                        let params = function
-                            .params
-                            .iter()
-                            .map(|(mode, ty)| {
-                                let mode = match mode {
-                                    ast::ParamMode::ByValue => "v",
-                                    ast::ParamMode::Out => "o",
-                                    ast::ParamMode::Borrow => "b",
-                                    ast::ParamMode::BorrowMut => "m",
-                                };
-                                format!(
-                                    "{mode}{}",
-                                    scalar(*ty, tagged_visiting, fn_visiting)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("_");
+                Ty::Fn(id) if fn_visiting.insert(id) => match fn_types.get(id as usize) {
+                    None => {
+                        fn_visiting.remove(&id);
+                        output.push_str("F_invalid");
+                    }
+                    Some(function) => {
                         let roots = |params: &[u32], captures: &[u32]| {
                             format!(
                                 "p{}_c{}",
@@ -29289,42 +29271,44 @@ fn ty_mangle_impl(
                         } else {
                             String::new()
                         };
-                        format!(
-                            "F{origin}_{params}_{}_b{borrow}_r{region}",
-                            key(
-                                function.ret,
-                                tagged_types,
-                                structs,
-                                enums,
-                                tuples,
-                                fn_types,
-                                include_fn_origin,
-                                tagged_visiting,
-                                fn_visiting
-                            )
-                        )
-                    },
-                );
-                fn_visiting.remove(&id);
-                result
-            }
-            Ty::Fn(_) => "F_cycle".to_string(),
-            other => ty_name(other),
+                        let mut sequence = vec![Work::Text(format!("F{origin}_"))];
+                        for (index, (mode, ty)) in function.params.iter().enumerate() {
+                            if index > 0 {
+                                sequence.push(Work::Text("_".to_string()));
+                            }
+                            let mode = match mode {
+                                ast::ParamMode::ByValue => "v",
+                                ast::ParamMode::Out => "o",
+                                ast::ParamMode::Borrow => "b",
+                                ast::ParamMode::BorrowMut => "m",
+                            };
+                            sequence.push(Work::Text(mode.to_string()));
+                            sequence.push(Work::Type(scalar_to_ty(*ty)));
+                        }
+                        sequence.push(Work::Text("_".to_string()));
+                        sequence.push(Work::Type(function.ret));
+                        sequence.push(Work::Text(format!(
+                            "_b{borrow}_r{region}"
+                        )));
+                        sequence.push(Work::ExitFn(id));
+                        push_sequence(&mut work, sequence);
+                    }
+                },
+                Ty::Fn(_) => output.push_str("F_cycle"),
+                other => output.push_str(&ty_name(other)),
+            },
         }
     }
-    key(
-        ty,
-        tagged_types,
-        structs,
-        enums,
-        tuples,
-        fn_types,
-        include_fn_origin,
-        &mut HashSet::new(),
-        &mut HashSet::new(),
-    )
+
+    output
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -33636,6 +33620,33 @@ fn main() -> i32 = 0
             }))
             .collect::<Vec<_>>();
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[]);
+        assert!(tagged_mangle.len() > DEPTH * 2);
+
+        let fn_types = (0..DEPTH)
+            .map(|id| hir::FnTy {
+                params: Vec::new(),
+                ret: if id + 1 == DEPTH {
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })
+                } else {
+                    Ty::Fn((id + 1) as u32)
+                },
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                effect: std::cell::Cell::new(FnEffect::Unknown),
+            })
+            .collect::<Vec<_>>();
+        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types);
+        assert!(fn_mangle.len() > DEPTH * 3);
+        assert_ne!(
+            fn_mangle,
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types),
+            "concrete function origins remain part of the internal mangle"
+        );
+
         let mut tagged_params = tagged.clone();
         tagged_params[DEPTH - 1] =
             hir::TaggedType::Option(Scalar::Param(0));
