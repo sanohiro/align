@@ -351,9 +351,11 @@ successful Wait, and seven adjacent ledger contradictions also required one cohe
 The first revised-HEAD review then found five closure details: depth preflight had to precede every
 body pass, differing control states needed an exact Task-proof remap, task-error mirrors retained
 the obsolete i32-code ABI, two extern cross-class collision rows were absent, and optional probe
-names were over-reserved. The second coherent follow-up is authored and mechanically verified; the
-design PR still needs a fresh clean review, its repository gate, and merge before implementation
-begins.
+names were over-reserved. The next independent pass found one final closure omission: a differing
+am-w join allocated fresh generation and proof-epoch tokens without explicitly assigning them as
+the active state. That assignment and its post-join Wait/TaskGet owner evidence are now authored;
+the design PR still needs final verification, a fresh clean review, its repository gate, and merge
+before implementation begins.
 The reviewed order is am-d checked-HIR body/type-DAG stack safety, am-e exact entry ABI,
 am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
@@ -361,7 +363,7 @@ extern invocation, am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. The twenty-three/twenty-seven
-counts become project truth when this reviewed ledger merges. Do not begin am-e before then.
+counts become project truth when this reviewed ledger merges. Do not begin am-d before then.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
 checked HIR, so a later handcrafted-HIR preflight could not replay parallel purity independently.

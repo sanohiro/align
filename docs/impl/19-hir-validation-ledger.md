@@ -293,15 +293,17 @@ trusting the stored bits:
     independently, if every reachable
     predecessor has byte-identical group counters, completion, unresolved set,
     and local proof records, retain them verbatim. Otherwise allocate one fresh
-    `join_generation` and `join_proof_epoch`, clear the joined unresolved set
-    and every WaitProof, set `valid_from = join_generation`, and set
+    `join_generation` and `join_proof_epoch`, assign
+    `current_generation = join_generation` and
+    `proof_epoch = join_proof_epoch`, clear the joined unresolved set and every
+    WaitProof, set `valid_from = join_generation`, and set
     `completed_generation = Some(join_generation)` iff every predecessor had
-    `completed_generation == Some(current_generation)`; otherwise set it to
-    None. For each Task-valued local/result independently, retain a joined
+    `completed_generation == Some(predecessor.current_generation)`; otherwise
+    set it to None. For each Task-valued local/result independently, retain a joined
     `TaskProof { group, born_generation: join_generation }` iff every reachable
     predecessor carries a TaskProof for that same active group, its
-    `born_generation >= valid_from`, and no unresolved Wait on that predecessor
-    covers its born generation. The predecessor handles may differ: a
+    `born_generation >= predecessor.valid_from`, and no unresolved Wait on that
+    predecessor covers its born generation. The predecessor handles may differ: a
     value-producing branch may select either Task. Failure of any predicate
     clears only that Task proof. This exact remap accepts a completed
     Spawn+Wait/no-Spawn asymmetric join, rejects `get()` after an incomplete
