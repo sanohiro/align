@@ -15102,6 +15102,14 @@ impl<'a> MoveCheck<'a> {
                 invalidates_owner: bool,
                 index_complete: bool,
             },
+            BlockExprSequence {
+                prefix: &'e [Stmt],
+                suffix: &'e [Stmt],
+                tail: Option<&'e Expr>,
+                tail_consuming: bool,
+                tail_direct: bool,
+                prefix_complete: bool,
+            },
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15138,6 +15146,79 @@ impl<'a> MoveCheck<'a> {
                     )
                 } else {
                     match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if !block.stmts.is_empty()
+                            && block
+                                .stmts
+                                .iter()
+                                .all(|statement| {
+                                    matches!(statement, Stmt::Expr(_))
+                                }) =>
+                    {
+                        let mut selected = 0;
+                        let mut selected_size = 0;
+                        for (index, statement) in
+                            block.stmts.iter().enumerate()
+                        {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression-statement guard")
+                            };
+                            let size =
+                                hir_depth::expr_postorder(expression).len();
+                            if size > selected_size {
+                                selected = index;
+                                selected_size = size;
+                            }
+                        }
+                        let tail_selected = block
+                            .value
+                            .as_deref()
+                            .is_some_and(|tail| {
+                                hir_depth::expr_postorder(tail).len()
+                                    > selected_size
+                            });
+                        let (child, child_consuming, child_direct,
+                            prefix, suffix, tail) = if tail_selected {
+                            (
+                                block.value.as_deref().expect("selected tail"),
+                                current_consuming,
+                                current_direct,
+                                block.stmts.as_slice(),
+                                &[][..],
+                                None,
+                            )
+                        } else {
+                            let Stmt::Expr(child) = &block.stmts[selected]
+                            else {
+                                unreachable!("selected expression statement")
+                            };
+                            (
+                                child,
+                                false,
+                                false,
+                                &block.stmts[..selected],
+                                &block.stmts[selected + 1..],
+                                block.value.as_deref(),
+                            )
+                        };
+                        (
+                            child,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            child_consuming,
+                            child_direct,
+                            Post::BlockExprSequence {
+                                prefix,
+                                suffix,
+                                tail,
+                                tail_consuming: current_consuming,
+                                tail_direct: current_direct,
+                                prefix_complete: false,
+                            },
+                        )
+                    }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
                     | ExprKind::TaskGroup(block)
@@ -15992,6 +16073,30 @@ impl<'a> MoveCheck<'a> {
                         }
                         *index_complete = true;
                     }
+                    Post::BlockExprSequence {
+                        prefix,
+                        prefix_complete,
+                        ..
+                    } => {
+                        for statement in *prefix {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression prefix")
+                            };
+                            if !self.expr(
+                                expression,
+                                moved,
+                                false,
+                                false,
+                            ) {
+                                prefix_falls_through = Some(false);
+                                break;
+                            }
+                        }
+                        if prefix_falls_through.is_some() {
+                            break;
+                        }
+                        *prefix_complete = true;
+                    }
                     Post::IfAfterThen {
                         condition,
                         incoming,
@@ -16555,6 +16660,42 @@ impl<'a> MoveCheck<'a> {
                             self.invalidate_owner(base);
                         }
                         self.join_local_borrow_fallback(base, value);
+                    }
+                    None
+                }
+                Post::BlockExprSequence {
+                    suffix,
+                    tail,
+                    tail_consuming,
+                    tail_direct,
+                    prefix_complete,
+                    ..
+                } => {
+                    if prefix_complete && falls_through {
+                        for statement in suffix {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression suffix")
+                            };
+                            falls_through = self.expr(
+                                expression,
+                                moved,
+                                false,
+                                false,
+                            );
+                            if !falls_through {
+                                break;
+                            }
+                        }
+                        if falls_through
+                            && let Some(tail) = tail
+                        {
+                            falls_through = self.expr(
+                                tail,
+                                moved,
+                                tail_consuming,
+                                tail_direct,
+                            );
+                        }
                     }
                     None
                 }

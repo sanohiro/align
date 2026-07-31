@@ -1020,6 +1020,7 @@ mod tests {
         BlockAssignIndexIndex,
         BlockAssignElemValue,
         BlockAssignElemIndex,
+        BlockExprSequence,
     }
 
     fn int_ty() -> Ty {
@@ -1367,7 +1368,8 @@ mod tests {
             | MoveControlShape::BlockAssignIndexValue
             | MoveControlShape::BlockAssignIndexIndex
             | MoveControlShape::BlockAssignElemValue
-            | MoveControlShape::BlockAssignElemIndex => 3,
+            | MoveControlShape::BlockAssignElemIndex
+            | MoveControlShape::BlockExprSequence => 3,
         };
         let mut expression = Expr {
             kind: ExprKind::StrBorrow(Box::new(Expr {
@@ -1680,6 +1682,16 @@ mod tests {
                         value: None,
                     })
                 }
+                MoveControlShape::BlockExprSequence => {
+                    ExprKind::Block(Block {
+                        stmts: vec![
+                            Stmt::Expr(leaf()),
+                            Stmt::Expr(expression),
+                            Stmt::Expr(leaf()),
+                        ],
+                        value: None,
+                    })
+                }
             };
             expression = Expr {
                 kind,
@@ -1709,7 +1721,8 @@ mod tests {
                     | MoveControlShape::BlockAssignIndexValue
                     | MoveControlShape::BlockAssignIndexIndex
                     | MoveControlShape::BlockAssignElemValue
-                    | MoveControlShape::BlockAssignElemIndex => Ty::Unit,
+                    | MoveControlShape::BlockAssignElemIndex
+                    | MoveControlShape::BlockExprSequence => Ty::Unit,
                 },
                 span,
             };
@@ -1897,6 +1910,9 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::BlockAssignElemIndex,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockExprSequence,
                     ),
                 ]);
                 for move_program in move_programs {
