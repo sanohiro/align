@@ -15075,6 +15075,14 @@ impl<'a> MoveCheck<'a> {
                 was_moved: bool,
             },
             BlockReturn(&'e Expr),
+            BlockLetTuple {
+                locals: &'e [Option<LocalId>],
+                init: &'e Expr,
+            },
+            BlockBreak {
+                value: &'e Expr,
+                accepted: bool,
+            },
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15111,6 +15119,63 @@ impl<'a> MoveCheck<'a> {
                     )
                 } else {
                     match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::LetTuple { .. }]
+                            ) =>
+                    {
+                        let [Stmt::LetTuple {
+                            locals,
+                            init,
+                            ..
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single tuple let guard")
+                        };
+                        (
+                            init,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockLetTuple { locals, init },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Break {
+                                    value: Some(_),
+                                    ..
+                                }]
+                            ) =>
+                    {
+                        let [Stmt::Break {
+                            value: Some(value),
+                            accepted,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single value break guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockBreak {
+                                value,
+                                accepted: *accepted,
+                            },
+                        )
+                    }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
                     | ExprKind::TaskGroup(block)
@@ -16132,6 +16197,72 @@ impl<'a> MoveCheck<'a> {
                         );
                         self.return_roots
                             .extend(self.borrow_sources(value));
+                    }
+                    falls_through = false;
+                    None
+                }
+                Post::BlockLetTuple { locals, init } => {
+                    if falls_through {
+                        let fact = self.borrow_fact(init);
+                        for (index, local) in
+                            locals.iter().enumerate()
+                        {
+                            let Some(local) = local else { continue };
+                            let local_fact = if self
+                                .local_may_borrow(*local)
+                            {
+                                let selected = self.project_fact_or_flatten(
+                                    init.ty,
+                                    fact.clone(),
+                                    &[BorrowProjection::TupleElement(
+                                        index as u32,
+                                    )],
+                                    self.f.locals[*local as usize].ty,
+                                );
+                                self.normalize_borrow_fact(
+                                    self.f.locals[*local as usize].ty,
+                                    selected,
+                                )
+                            } else {
+                                BorrowFact::default()
+                            };
+                            self.borrows.assign(*local, local_fact);
+                            clear_moved(moved, *local);
+                        }
+                    }
+                    None
+                }
+                Post::BlockBreak { value, accepted } => {
+                    if falls_through && accepted {
+                        let value_key = Self::expr_key(value);
+                        self.validate_value_snapshot(
+                            value_key,
+                            value_key,
+                            value.span,
+                        );
+                        let fact = self.borrow_fact(value);
+                        if let Some(frame) =
+                            self.loop_value_breaks.last_mut()
+                        {
+                            *frame = frame.join(&fact);
+                        }
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(moved.clone());
+                        }
+                        let mut at_break = self.borrows.clone();
+                        if let Some(drops) = self.loop_iter_drops.last() {
+                            let depth = self.loop_iter_drops.len() as u32;
+                            Self::invalidate_iteration_drops(
+                                &mut at_break,
+                                drops,
+                                depth,
+                            );
+                        }
+                        if let Some(frame) =
+                            self.loop_borrow_breaks.last_mut()
+                        {
+                            frame.push(at_break);
+                        }
                     }
                     falls_through = false;
                     None
