@@ -278,6 +278,15 @@ the pre-PR gate before a draft PR is opened:
    `gh pr create` bypasses the local guard and is prohibited for agent-driven
    work. CI rejects an absent or stale HEAD-bound attestation.
 
+Finish ordinary PR-body edits before refreshing the final-SHA attestation.
+If the body changes after `scripts/update-pr-preflight.sh` but before post-open
+review is recorded, rerun that updater. If it changes after post-open review is
+recorded, rerun both `scripts/update-pr-preflight.sh` and
+`scripts/record-post-review.sh`; each preserves the other marker family.
+`scripts/record-post-review.sh` is the only expected later body mutation in the
+normal flow because it preserves existing preflight markers while adding the
+post-review markers.
+
 Every code PR must still receive one independent review cycle after it is
 opened and before it is merged:
 

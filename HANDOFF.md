@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #678. Draft PR #679 is the
-active L2b-a2-am-d checked-HIR/type-DAG stack-safety implementation.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #679. L2b-a2-am-d
+checked-HIR/type-DAG stack safety is complete; am-e exact entry ABI is next.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -218,6 +218,35 @@ fix, no repeated broad gate on an unchanged tree, a 60-minute implementation
 checkpoint, and a 500-line target for implementation PRs. Exceptions are
 limited to materially risky redesigns or explicit user direction.
 
+### PR #679 delivery retrospective
+
+PR #679 was squash-merged as `b194703`. Its earliest commit-to-merge proxy was
+16h12m across 58 commits; the public PR was open for 3h31m. The atomic am-d
+vertical changed 11 files by +14,242/-5,033 because every already-active
+checked-HIR body and type-DAG consumer had to become stack-safe together; the
+plan of record documents why splitting that consumer closure would have merged
+an accepted graph that could still overflow in a later phase.
+
+The avoidable delay was proof closure, not the iterative implementation alone.
+The initial deep fixtures did not fully reproduce sema-owned allocation facts,
+exact Result/Error identities, owned endpoints, or proportional control-flow
+evidence. That caused the high-risk repeated-review exception, including P1
+findings and one matrix reopen. The corrected closure matrix and exact owner
+tests now make those producer-validity facts author-side obligations. The final
+local gate also spent about 35 minutes on macOS test-binary startup and locked
+workspace all-target Clippy; that was slow but continuously progressing and is
+not a reason to narrow required verification.
+
+One separate operational error was generalizable: a normal `gh pr edit` after
+the preflight refresh deleted its hidden markers and failed CI. `CLAUDE.md` now
+requires all ordinary PR-body edits before `scripts/update-pr-preflight.sh`;
+only the marker-preserving post-review recorder may mutate the body afterward.
+If a later full-body overwrite occurs after post-review recording, both the
+preflight updater and post-review recorder must be rerun because each restores
+only its own marker family.
+No additional rule was added for the implementation findings because the
+existing cross-cutting closure-matrix gate already states their durable fix.
+
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
 direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
@@ -361,9 +390,9 @@ the following host continuation then reopened the matrix for a missing loop-head
 point and a conflicting Wait-coverage sentence. The ledger now uses stable syntax-site tokens,
 computes loop headers to a monotone fixed point before joining breaks, and keeps established
 completion across a later unhandled no-task Wait. The final review, repository gate, and merge
-completed in #678. Draft PR #679 now implements am-d; its post-open review is closing the exact
-producer-valid depth owners before merge.
-The reviewed order is am-d checked-HIR body/type-DAG stack safety, am-e exact entry ABI,
+completed in #678. PR #679 completes am-d with exact producer-valid depth owners and
+stack-safe checked-HIR/type-DAG consumers.
+The remaining reviewed order is am-e exact entry ABI,
 am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
 extern invocation, am-p placement, am-n nominal/link, am-h
@@ -560,7 +589,7 @@ Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate. #679 implements a2-am-d; the
+L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate and a2-am-d. #679 completes am-d; the
 remaining sequence is a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
