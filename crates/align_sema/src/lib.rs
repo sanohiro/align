@@ -15889,6 +15889,10 @@ struct Checker<'a, 't> {
     /// Set while checking a lambda body — lets a reference to an enclosing local become a capture
     /// (a synthetic value parameter of the lifted function, passed at the call site).
     capture: Option<CaptureScope>,
+    /// True only while one node from the explicit finalization worklist is being processed.
+    /// Recursive calls in the legacy exhaustive node match become no-ops because every child has
+    /// already been finalized in postorder.
+    finalize_node_active: bool,
     /// The builtin modules `import`ed by this file (validated module paths, e.g. `core.json`).
     /// The prefix-accessed builtin namespaces (`json`/`fs`/`io`) must be imported before use —
     /// the "capability header" rule (`open-questions.md` module system).
@@ -15999,6 +16003,7 @@ impl<'a, 't> Checker<'a, 't> {
             instantiations: Vec::new(),
             lifted: Vec::new(),
             capture: None,
+            finalize_node_active: false,
         }
     }
 
@@ -27854,27 +27859,46 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn finalize_expr(&mut self, e: &mut Expr) {
-        if matches!(e.kind, ExprKind::Binary { .. } | ExprKind::IntArith { .. }) {
-            let mut work = vec![e];
-            while let Some(node) = work.pop() {
-                if !matches!(
-                    node.kind,
-                    ExprKind::Binary { .. } | ExprKind::IntArith { .. }
-                ) {
-                    self.finalize_expr(node);
-                    continue;
-                }
-                node.ty = self.finalize(node.ty);
-                let (lhs, rhs) = match &mut node.kind {
-                    ExprKind::Binary { lhs, rhs, .. }
-                    | ExprKind::IntArith { lhs, rhs, .. } => (lhs.as_mut(), rhs.as_mut()),
-                    _ => unreachable!("binary worklist contains only binary nodes"),
-                };
-                work.push(rhs);
-                work.push(lhs);
-            }
+        if self.finalize_node_active {
             return;
         }
+
+        let nodes = hir_depth::expr_postorder_mut(e);
+        // A literal negation chain is one semantic unit: only its outermost `-` emits the unsigned
+        // or range diagnostic. Mark every direct child of such a chain for type-only finalization;
+        // transitivity marks the whole inner chain, including its literal leaf.
+        let mut neg_chain_inners = HashSet::new();
+        for &node in &nodes {
+            // SAFETY: `expr_postorder_mut` finishes all shared traversal before returning and
+            // finalization never changes the expression topology.
+            let node_ref = unsafe { &*node };
+            if let ExprKind::Unary {
+                op: UnOp::Neg,
+                expr,
+            } = &node_ref.kind
+                && peel_neg_literal(expr).is_some()
+            {
+                neg_chain_inners.insert(expr.as_ref() as *const Expr as *mut Expr);
+            }
+        }
+
+        for node in nodes {
+            // SAFETY: every pointer belongs to `e`; the child-first list contains each node once,
+            // and no finalization arm replaces an expression, block, or child vector.
+            let node = unsafe { &mut *node };
+            if neg_chain_inners.contains(&(node as *mut Expr)) {
+                node.ty = self.finalize(node.ty);
+                continue;
+            }
+            self.finalize_node_active = true;
+            self.finalize_expr_node(node);
+            self.finalize_node_active = false;
+        }
+    }
+
+    /// Finalize one expression after all of its children. Child calls remain in this exhaustive
+    /// match as a local audit of the HIR shape, but are suppressed by `finalize_node_active`.
+    fn finalize_expr_node(&mut self, e: &mut Expr) {
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
         let span = e.span;
@@ -27962,9 +27986,7 @@ impl<'a, 't> Checker<'a, 't> {
                     ));
                 }
             }
-            ExprKind::Binary { .. } | ExprKind::IntArith { .. } => {
-                unreachable!("binary trees are finalized by the explicit worklist")
-            }
+            ExprKind::Binary { .. } | ExprKind::IntArith { .. } => {}
             ExprKind::Call { func, args, type_args } => {
                 for a in args {
                     self.finalize_expr(a);

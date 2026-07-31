@@ -9,6 +9,7 @@ enum BodyRecord<'a> {
     Block(&'a Block),
     Stmt(&'a Stmt),
     Expr(&'a Expr),
+    ExprExit(&'a Expr),
     MatchArm(&'a MatchArm),
     Stage(&'a Stage),
     TemplatePart(&'a TemplatePart),
@@ -20,14 +21,35 @@ enum BodyRecord<'a> {
 /// exhaustive: adding a record-bearing expression must update the depth proof in the same change.
 pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
     for function in &program.fns {
-        let mut work = vec![(BodyRecord::Block(&function.body), 1usize)];
-        while let Some((record, depth)) = work.pop() {
-            if depth > MAX_CHECKED_HIR_DEPTH {
-                return false;
-            }
-            let child_depth = depth + 1;
-            let child_start = work.len();
-            match record {
+        if !walk_body_records(
+            BodyRecord::Block(&function.body),
+            MAX_CHECKED_HIR_DEPTH,
+            &mut |_| {},
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn walk_body_records(
+    root: BodyRecord<'_>,
+    max_depth: usize,
+    on_expr_exit: &mut impl FnMut(&Expr),
+) -> bool {
+    let mut work = vec![(root, 1usize)];
+    while let Some((record, depth)) = work.pop() {
+        if depth > max_depth {
+            return false;
+        }
+        let exit_expr = match record {
+            BodyRecord::Expr(expr) => Some(expr),
+            _ => None,
+        };
+        let child_depth = depth + 1;
+        let child_start = work.len();
+        match record {
+                BodyRecord::ExprExit(expr) => on_expr_exit(expr),
                 BodyRecord::Block(block) => {
                     work.extend(
                         block
@@ -780,12 +802,31 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
                     }
                 },
             }
+            if let Some(expr) = exit_expr {
+                work.push((BodyRecord::ExprExit(expr), depth));
+            }
             // Children were appended in producer order. Reverse only this record's suffix so the
             // LIFO worklist completes the first child before starting the next one.
             work[child_start..].reverse();
         }
-    }
     true
+}
+
+/// Stable child-first expression order for one mutable HIR root.
+///
+/// Collection itself holds only shared references. The returned pointers are used after the walk
+/// completes; finalization changes types and metadata but never replaces an `Expr`, child vector, or
+/// block, so their addresses stay valid for the duration of that pass.
+pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
+    let mut nodes = Vec::new();
+    let root = &*root;
+    let valid = walk_body_records(
+        BodyRecord::Expr(root),
+        usize::MAX,
+        &mut |expr| nodes.push(expr as *const Expr as *mut Expr),
+    );
+    debug_assert!(valid);
+    nodes
 }
 
 #[cfg(test)]
