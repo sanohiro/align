@@ -431,7 +431,8 @@ The outer dispatcher reaches the existing file, reader, array-builder, process-c
 regex, and HTTP helpers without retaining the giant recursive frame; strict string wrappers stay
 on the eager worklist. Operation-specific MIR assertions cover mixed eager/call, string trim,
 producer-valid path/regex chains whose individually owned temporary strings end in an owned return,
-self-buffering reader, a producer-valid `Result<str, Error>` `StrBytes`/`BytesAsStr`/`Try` cycle,
+self-buffering reader plus file/command/HTTP producers whose every Move-valued node carries its
+individual-allocation fact, a producer-valid `Result<str, Error>` `StrBytes`/`BytesAsStr`/`Try` cycle,
 template spines cloned from their hidden views into an owned return, file create, array-builder push,
 process-command construction, HTTP request construction, block/statement sentinel reachability,
 proportional `if` and binary/wildcard `match` CFG evidence, independently counted `else` and

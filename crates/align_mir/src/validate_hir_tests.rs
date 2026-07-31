@@ -241,6 +241,43 @@ enum MirOwner {
     If,
 }
 
+#[derive(Clone, Copy, Default)]
+struct HirOwnerEvidence {
+    ifs: usize,
+    binary_matches: usize,
+    wildcard_matches: usize,
+    short_circuits: usize,
+    else_unwraps: usize,
+}
+
+fn hir_owner_evidence(program: &hir::Program) -> HirOwnerEvidence {
+    let mut evidence = HirOwnerEvidence::default();
+    let mut work = program
+        .fns
+        .iter()
+        .filter_map(|function| function.body.value.as_deref())
+        .collect::<Vec<_>>();
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            hir::ExprKind::If { .. } => evidence.ifs += 1,
+            hir::ExprKind::Match { arms, .. } if arms.len() == 1 && arms[0].variants.is_empty() => {
+                evidence.wildcard_matches += 1;
+            }
+            hir::ExprKind::Match { arms, .. } if arms.len() == 2 => {
+                evidence.binary_matches += 1;
+            }
+            hir::ExprKind::Binary {
+                op: align_ast::BinOp::And | align_ast::BinOp::Or,
+                ..
+            } => evidence.short_circuits += 1,
+            hir::ExprKind::ElseUnwrap { .. } => evidence.else_unwraps += 1,
+            _ => {}
+        }
+        work.extend(align_sema::direct_expr_children(expression));
+    }
+    evidence
+}
+
 fn rvalues(program: &Program) -> impl Iterator<Item = &Rvalue> {
     program
         .fns
@@ -386,7 +423,7 @@ fn assert_result_rvalue_contract(label: &str, program: &Program) {
     }
 }
 
-fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
+fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner, evidence: HirOwnerEvidence) {
     let values: Vec<&Rvalue> = rvalues(program).collect();
     let has = |predicate: fn(&Rvalue) -> bool| values.iter().copied().any(predicate);
     let count =
@@ -464,8 +501,37 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
         MirOwner::ArrayBuilder => has(|rv| matches!(rv, Rvalue::ArrayBuilderPush { .. })),
         MirOwner::Command => has(|rv| matches!(rv, Rvalue::Command { .. })),
         MirOwner::Http => has(|rv| matches!(rv, Rvalue::HttpRequest { .. })),
-        MirOwner::Match => has(|rv| matches!(rv, Rvalue::OptionIsSome(..))),
-        MirOwner::Conditional => option_test_count > 0 && branch_count > option_test_count,
+        MirOwner::Match => {
+            assert!(
+                evidence.binary_matches > 0,
+                "{label}: binary-match fixture contains no binary Match node"
+            );
+            assert_eq!(
+                option_test_count, evidence.binary_matches,
+                "{label}: binary Match nodes did not each emit one Option test"
+            );
+            assert_eq!(
+                branch_count, evidence.binary_matches,
+                "{label}: binary Match nodes did not each emit one branch"
+            );
+            true
+        }
+        MirOwner::Conditional => {
+            assert!(
+                evidence.short_circuits > 0 && evidence.else_unwraps > 0,
+                "{label}: conditional fixture lacks one of its independent control families"
+            );
+            assert_eq!(
+                option_test_count, evidence.else_unwraps,
+                "{label}: else-unwrap nodes did not each emit one Option test"
+            );
+            assert_eq!(
+                branch_count,
+                evidence.short_circuits + evidence.else_unwraps,
+                "{label}: short-circuit and else-unwrap nodes did not each emit one branch"
+            );
+            true
+        }
         MirOwner::Scoped => {
             has(|rv| matches!(rv, Rvalue::ArenaBegin)) && has(|rv| matches!(rv, Rvalue::TgBegin))
         }
@@ -482,8 +548,25 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
         MirOwner::BlockStatement => has_call("dep$block_stmt_sentinel"),
         // A wildcard-only match has no tag test. Its sentinel proves the selected arm was lowered,
         // and the join edge proves the wildcard-match spine completed its parent action.
-        MirOwner::WildcardMatch => has_call("dep$wildcard_sentinel") && goto_count > 0,
-        MirOwner::If => branch_count > 0,
+        MirOwner::WildcardMatch => {
+            assert!(
+                evidence.wildcard_matches > 0,
+                "{label}: wildcard fixture contains no wildcard Match node"
+            );
+            assert_eq!(
+                goto_count, evidence.wildcard_matches,
+                "{label}: wildcard Match nodes did not each complete their join edge"
+            );
+            has_call("dep$wildcard_sentinel")
+        }
+        MirOwner::If => {
+            assert!(evidence.ifs > 0, "{label}: if fixture contains no If node");
+            assert_eq!(
+                branch_count, evidence.ifs,
+                "{label}: If nodes did not each emit one branch"
+            );
+            true
+        }
     };
     if !owned {
         let (conversions, result_tests, result_unwraps) = bytes_str_counts();
@@ -531,6 +614,41 @@ fn assert_hir_owner_contract(label: &str, program: &hir::Program, owner: MirOwne
                 "{label}: cloned template result lacks individual ownership"
             );
         }
+        MirOwner::Reader | MirOwner::File | MirOwner::Command | MirOwner::Http => {
+            let mut work = function
+                .body
+                .value
+                .as_deref()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut owned_expressions = 0;
+            while let Some(expression) = work.pop() {
+                if align_sema::needs_drop_flag(
+                    expression.ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ) {
+                    owned_expressions += 1;
+                    assert_eq!(
+                        function.drop_individual_exprs.get(&expression.span),
+                        Some(&true),
+                        "{label}: owned producer lacks sema-equivalent individual ownership"
+                    );
+                }
+                work.extend(align_sema::direct_expr_children(expression));
+            }
+            assert!(
+                owned_expressions > 0,
+                "{label}: Move-producing fixture contains no owned expression"
+            );
+            assert_eq!(
+                function.drop_individual_exprs.len(),
+                owned_expressions,
+                "{label}: ownership table contains stale or aliased producer facts"
+            );
+        }
         _ => {}
     }
     if matches!(owner, MirOwner::Regex | MirOwner::ArrayBuilder) {
@@ -553,6 +671,7 @@ fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOw
     if let Some(owner) = owner {
         assert_hir_owner_contract(label, program, owner);
     }
+    let evidence = hir_owner_evidence(program);
     let source_map = SourceMap::new();
     for lowered in [
         lower_program(program),
@@ -566,7 +685,7 @@ fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOw
         );
         assert_result_rvalue_contract(label, &lowered);
         if let Some(owner) = owner {
-            assert_mir_owner(label, &lowered, owner);
+            assert_mir_owner(label, &lowered, owner, evidence);
         }
     }
 }
@@ -835,10 +954,12 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
 fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let mut expr = hir::Expr {
         kind: hir::ExprKind::ReaderStdin,
         ty: Ty::Reader,
-        span,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
     };
     for _ in 2..depth {
         expr = hir::Expr {
@@ -846,7 +967,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
                 reader: Box::new(expr),
             },
             ty: Ty::Reader,
-            span,
+            span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
         };
     }
     let mut program = baseline_program();
@@ -866,7 +987,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
@@ -1122,12 +1243,14 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     let error_id = push_builtin_error(&mut program);
     let result_ty = Ty::Result(Scalar::File, Scalar::Enum(error_id));
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let expr = hir::Expr {
         kind: hir::ExprKind::FileCreateRw {
             path: Box::new(str_trim_expr_depth(depth - 2)),
         },
         ty: result_ty,
-        span,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
     };
     program.fns.push(hir::Fn {
         name: "deep_file".to_string(),
@@ -1145,7 +1268,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
@@ -1209,6 +1332,8 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
     );
     let span = align_span::Span::new(0, 0, 0);
     let argv_ty = Ty::Slice(Scalar::Str);
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let expr = hir::Expr {
         kind: hir::ExprKind::ProcessCommand {
             cmd: Box::new(str_trim_expr_depth(depth - 2)),
@@ -1219,7 +1344,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
             }),
         },
         ty: Ty::Command,
-        span,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
     };
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
@@ -1245,7 +1370,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
@@ -1257,6 +1382,8 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         "the root Block, HTTP Expr, and method need depth three"
     );
     let span = align_span::Span::new(0, 0, 0);
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let expr = hir::Expr {
         kind: hir::ExprKind::HttpRequest {
             method: Box::new(str_trim_expr_depth(depth - 2)),
@@ -1267,7 +1394,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
             }),
         },
         ty: Ty::HttpRequest,
-        span,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
     };
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
@@ -1286,7 +1413,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
