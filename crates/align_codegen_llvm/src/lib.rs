@@ -4215,8 +4215,8 @@ fn scalar_type<'c>(
         // its representation IS the `http_request_ctx` pointer, so it must lower to `ptr`. Missing
         // this arm is silent: the `_ =>` below falls through to `int_type`'s own `_ => i32`, which
         // truncates a pointer to 4 bytes — the exact bug that already happened once for `Ty::Fn`.
-        // Derived from `is_move_handle`, not re-listed: sema's `ty_size_align` answers 8 bytes off
-        // that same predicate, and a hand-copied list here would let a future handle type land in
+        // Derived from `is_move_handle`, not re-listed: sema's type-layout engine answers 8 bytes
+        // off that same predicate, and a hand-copied list here would let a future handle type land in
         // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
         // table happens to have a row.
         Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
@@ -14886,11 +14886,11 @@ mod tests {
         assert!(function_body(&soa, "main").contains("@align_rt_alloc_size_fail"), "SoA alignment bump overflow must fail:\n{soa}");
     }
 
-    /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /
-    /// `struct_size_align`, which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
+    /// Layout parity: the sema `(size, align)` computation (the shared iterative type-layout engine,
+    /// which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
     /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
-    /// `logical_to_physical`). This pins the two independent hand-written layout computations
-    /// (`field_abi_align` here vs `ty_size_align` in sema) against LLVM ground truth, so any future
+    /// `logical_to_physical`). This pins `field_abi_align` and sema layout against LLVM ground truth,
+    /// so any future
     /// drift — or a new wider-aligned field type added to `is_field_ok` without updating both — fails
     /// loudly. Covers every valid struct-field type, mixed widths that force a reorder, `str`/`string`
     /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-aligned
@@ -14906,7 +14906,7 @@ mod tests {
         fn f(bits: u8) -> Ty {
             Ty::Float(FloatTy { bits })
         }
-        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (ty_size_align ↔
+        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (sema layout ↔
         // option_struct_type) across scalar / str / nested-struct payloads and reorder cases.
         fn opt(ty: Ty) -> Ty {
             Ty::Option(align_sema::ty_to_scalar(ty).expect("option payload is a scalar"))
@@ -14978,7 +14978,7 @@ mod tests {
             sdef("ArrStruct", false, &[i(64, true), Ty::DynStructArray(2, Layout::Aos)]), // { i64, {ptr,len} }
             sdef("ArrScalar", false, &[Ty::Bool, Ty::DynArray(align_sema::Scalar::Int(IntTy { bits: 64, signed: true }))]),
             // Sum-type (`enum`) fields (JSON completeness J1b): an enum lowers to `{ i32 tag, payloads
-            // flattened }`, so its field alignment/size must agree between sema (`enum_size_align`) and
+            // flattened }`, so its field alignment/size must agree between sema's layout engine and
             // LLVM. `EScalar`/`EStr`/`EObj` (enum ids 0/1/2 below) cover scalar-only (align 4),
             // `str`-view (align 8), and object (struct payload) shapes, plus a reorder (`SEnum1`).
             sdef("SEnumScalar", false, &[Ty::Enum(0)]),                  // { i32, i32, i8 } → (12, 4)
@@ -14992,7 +14992,7 @@ mod tests {
             // `Ty::Fn` closure field and a `slice<T>` view field really are 16 bytes. Mixed with an
             // i8 so the reorder path is exercised too.
             sdef("HandleField", false, &[i(8, true), Ty::HttpRequestCtx]),   // { ptr, i8 } → (16, 8)
-            // A SECOND Move handle, because `ty_size_align` answers the whole family through
+            // A SECOND Move handle, because sema layout answers the whole family through
             // `is_move_handle` and `scalar_type` lowers all of them to `ptr`: one row per arm would
             // pin only the arm it names, and this table is hand-written — nothing else notices a
             // family member drifting.

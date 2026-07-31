@@ -567,7 +567,7 @@ pub enum Ty {
     /// `json.doc` lane, never a Move handle: it owns nothing, is never dropped, and never makes its
     /// enclosing struct Move (which is the whole point — pkg.web's Copy `Ctx` carries it as a field).
     /// Its representation IS the `http_request_ctx` pointer (a **bare 8-byte pointer** — the only Copy
-    /// type that is one, hence its own `ty_size_align` arm), so `ctx.headers()` lowers to a pointer
+    /// type that is one, hence its own type-layout arm), so `ctx.headers()` lowers to a pointer
     /// copy and `hs.get(name)` reuses the existing `align_rt_http_ctx_header` call: no runtime code is
     /// added at all. Region-bound to the ctx it was minted from; `hs.get(name)` yields an `Option<str>`
     /// view that **inherits** the view's region. Deliberately has **no `Scalar` variant**, which keeps
@@ -1703,169 +1703,26 @@ const HUGE_STRUCT_BYTES: u64 = 128;
 /// lint prefers silence to noise and fires only where the default plausibly costs real bandwidth.
 const DEFAULT_ELEM_LITERAL_ARRAY_LEN: u32 = 64;
 
-/// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1). The bitwise form
-/// (vs `div_ceil`) is the standard branch-free align-up; the `a <= 1` guard also avoids the `a - 1`
-/// underflow a stray `a == 0` would cause.
-fn align_up(n: u64, a: u64) -> u64 {
-    if a <= 1 { n } else { (n + a - 1) & !(a - 1) }
-}
-
-/// Natural-alignment `(size, align)` in bytes of `ty`, matching the layout codegen emits via LLVM.
-/// Scalars are their machine width; a `{ptr, len}` view or owned handle
-/// (`str`/`string`/array/slice/soa/box/builder/…) is two 64-bit words. Used by the huge-struct-copy
-/// lint and by [`struct_size_align`], which consults it per field; the `_ => (16, 8)` fallback is a
-/// safe default for any composite that is not a current struct-field type. Cycle-safe (`visiting`),
-/// like [`struct_is_move`].
-///
-/// **Alignment parity with codegen's `field_abi_align`.** The per-field *alignment* this returns is
-/// the sort key both here and in `align_codegen_llvm::logical_to_physical` use to order fields by
-/// descending alignment, so the two must agree on the alignment of every **valid struct-field type**
-/// (`is_field_ok`: `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`/`Option`/`array<T>`/
-/// sum-type `Enum`). They do — for that domain both give width-or-8-for-a-pointer, take a nested
-/// struct's alignment as the max of its members, and take a sum type's alignment as `max(4, payloads)`
-/// (`enum_size_align` ↔ `field_abi_align`'s `Ty::Enum` arm). The branches where they *differ*
-/// (`Unit` → here 1, there 4; `Array` → here 8, there
-/// `scalar_bytes.min(8)`) are all types `is_field_ok` **rejects**, so they never reach struct
-/// ordering; the divergence is unreachable, not a bug. `tests/…`/`layout_parity` (in the codegen
-/// crate) pins this against the real LLVM ABI size/align so any future drift — or a new wider-aligned
-/// field type (e.g. a `vecN<T>` field, 16-byte aligned) added to `is_field_ok` without updating
-/// **both** functions — fails loudly. Scalars top out at 64-bit (no `i128`/`f128`), so no field is
-/// wider than 8-byte aligned today.
-fn ty_size_align(
-    ty: Ty,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    _visiting: &mut Vec<u32>,
-) -> (u64, u64) {
-    match ty {
-        Ty::Int(it) => {
-            let b = (it.bits / 8).max(1) as u64;
-            (b, b)
-        }
-        Ty::Float(ft) => {
-            let b = (ft.bits / 8).max(1) as u64;
-            (b, b)
-        }
-        Ty::Bool => (1, 1),
-        Ty::Char => (4, 4),
-        Ty::Unit => (0, 1),
-        Ty::Tagged(id) => ty_abi_layout(Ty::Tagged(id), structs, enums, tagged_types),
-        Ty::Struct(id) => ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types),
-        // A sum type lowers to codegen's non-union tagged struct `{ i32 tag, <every variant's payload
-        // flattened in variant order> }` (`enum_types`), natural alignment, **declaration order** (not
-        // reordered — unlike a struct). Must stay the exact dual of codegen's `field_abi_align`/
-        // `enum_types` (pinned by `layout_parity`). J1b: an enum is a valid struct field.
-        Ty::Enum(id) => enum_size_align(id, structs, enums, tagged_types, _visiting),
-        // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
-        // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
-        // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
-        Ty::Option(payload) => ty_abi_layout(Ty::Option(payload), structs, enums, tagged_types),
-        Ty::Result(ok, err) => ty_abi_layout(Ty::Result(ok, err), structs, enums, tagged_types),
-        // A **bare 8-byte pointer** field: every Move handle, plus the Copy `http_headers` view whose
-        // representation IS one. Codegen lowers all of them to a plain `ptr` (`scalar_type`'s pointer
-        // arm), so the `(16, 8)` catch-all below over-reports them by 8 bytes — harmless for safety
-        // (the real layout comes from `scalar_type` + `field_abi_align`), but the huge-struct-copy
-        // lint is this function's consumer and it should see the truth. Keep this arm and that one in
-        // step; `sema_and_codegen_struct_layout_agree` pins them against the real LLVM ABI.
-        Ty::HttpHeaders => (8, 8),
-        _ if is_move_handle(ty) => (8, 8),
-        // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
-        // (A struct can hold only scalar / `str` / `Option` / nested-struct fields today; the rest are
-        // a defensive default.)
-        _ => (16, 8),
-    }
-}
-
 /// Natural-alignment `(size, align)` of a struct as codegen lays it out (the dual of
-/// [`struct_is_move`]). A non-`layout(C)` struct's fields are **reordered by descending alignment** to
-/// eliminate padding (matching `logical_to_physical` in `align_codegen_llvm`); a `layout(C)` struct
-/// keeps declaration order. An `align(N)` over-alignment pads the reported *size* up to `N` (a tight
-/// array stride), but the reported *alignment* stays natural — the over-alignment lives at the
-/// storage seam (`type_align`), not in the aggregate type. Cycle-safe.
+/// [`struct_is_move`]). The shared type-layout engine is iterative, memoized, cycle-safe, and is the
+/// single semantic dual of LLVM's struct/enum/option/result layout. `visiting` remains in this
+/// private wrapper's signature so the huge-struct-copy lint can keep its existing call shape; the
+/// common engine owns its own explicit active sets.
 fn struct_size_align(
     id: u32,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
+    _visiting: &mut Vec<u32>,
 ) -> (u64, u64) {
-    if visiting.contains(&id) {
-        return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
-    }
-    let Some(def) = structs.get(id as usize) else {
-        return (0, 1);
-    };
-    visiting.push(id);
-    // Per-field `(size, align)` in declaration order.
-    let mut fields: Vec<(u64, u64)> = def
-        .fields
-        .iter()
-        .map(|f| {
-            let (fsz, fal) = ty_size_align(f.ty, structs, enums, tagged_types, visiting);
-            (fsz, fal.max(1))
-        })
-        .collect();
-    // A non-`layout(C)` struct is laid out in descending alignment (stable → declaration order on
-    // ties), the same padding-eliminating order codegen emits. `layout(C)` keeps declaration order.
-    if !def.c_repr {
-        fields.sort_by_key(|&(_, fal)| std::cmp::Reverse(fal));
-    }
-    let mut size = 0u64;
-    let mut align = 1u64;
-    for (fsz, fal) in fields {
-        size = align_up(size, fal) + fsz;
-        align = align.max(fal);
-    }
-    // Pad the type's *size* up to its **effective** alignment — the natural aggregate alignment,
-    // raised by any `align(N)` over-alignment. This is what C does, and matches codegen: an `align(N)`
-    // struct gets an `[K x i8]` size-padding tail so a tight `[N x %S]` array has an over-aligned
-    // element stride. Crucially the returned *alignment* stays the **natural** aggregate alignment
-    // (`align`, not `effective`): the `align(N)` over-alignment is applied at the storage seam
-    // (`type_align`, the alloca/global), never baked into the aggregate type, so the padding field is
-    // `align 1` and the LLVM type's ABI alignment is unchanged. Reporting the natural alignment here
-    // keeps this the exact dual of the LLVM type (pinned by `layout_parity`).
-    let effective = def.align.map_or(align, |a| align.max(a as u64));
-    visiting.pop();
-    (align_up(size, effective), align)
-}
-
-/// Natural-alignment `(size, align)` of a sum type as codegen lays it out (`enum_types`): the
-/// non-union tagged struct `{ i32 tag, <every variant's payload flattened in **variant declaration
-/// order**> }`, `packed=false`. Unlike a struct, an enum's payload fields are **not** reordered by
-/// alignment — codegen emits them in variant order — so this walks them in order with natural
-/// padding. The exact dual of codegen's `enum_types` construction + `field_abi_align`'s `Ty::Enum`
-/// arm (pinned by `layout_parity`). Cycle-safe through the shared struct `visiting` set (a payload
-/// struct that loops back stops there; such a graph is rejected by `struct_acyclic` regardless).
-fn enum_size_align(
-    id: u32,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
-) -> (u64, u64) {
-    let Some(def) = enums.get(id as usize) else {
-        return (4, 4); // an unresolved enum id — size as a bare tag (defensive; reported elsewhere)
-    };
-    // Field 0 is the i32 tag; then each variant's payload scalars, in order.
-    let mut size = 4u64;
-    let mut align = 4u64;
-    for v in &def.variants {
-        for &s in &v.payload {
-            let (fsz, fal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
-            let fal = fal.max(1);
-            size = align_up(size, fal) + fsz;
-            align = align.max(fal);
-        }
-    }
-    (align_up(size, align), align)
+    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
 }
 
 /// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
 /// non-`layout(C)` struct; declaration order for `layout(C)`). Public wrapper over
-/// [`struct_size_align`] for the cross-crate layout-parity test in `align_codegen_llvm`, which checks
-/// this against the real LLVM ABI size/alignment so the two hand-written layout computations
-/// (`ty_size_align` here, `field_abi_align` there) can never silently drift.
+/// the shared iterative type-layout engine for the cross-crate layout-parity test in
+/// `align_codegen_llvm`, which checks this against the real LLVM ABI size/alignment so semantic
+/// layout and `field_abi_align` can never silently drift.
 pub fn struct_abi_layout(
     id: u32,
     structs: &[StructDef],
@@ -30322,7 +30179,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         Ty::HttpHeaders => {}
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
-        // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
+        // buffer (16 bytes / 8-align — `abi_type`/the type-layout engine already size it), owns no heap
         // (its DropPlan is `None`, so the enclosing struct stays non-Move) and needs no
         // drop. It region-ties the enclosing struct to the borrowed buffer: `region_of(StructLit)`
         // folds in each field value's region, so a struct holding a slice field cannot outlive the
@@ -30331,7 +30188,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         Ty::Slice(_) => {}
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
-        // `abi_type`/`ty_size_align` already size it), owns no heap (its DropPlan is `None`,
+        // `abi_type`/the type-layout engine already size it), owns no heap (its DropPlan is `None`,
         // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
