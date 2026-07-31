@@ -14869,6 +14869,43 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::ReaderBuffered { reader: child } => {
                         (child.as_ref(), false, true, true, Post::None)
                     }
+                    ExprKind::Call { func, args, .. } if args.len() == 1 => {
+                        if let Some(dependencies) =
+                            self.summary_dependencies.as_deref_mut()
+                        {
+                            dependencies.insert(func.clone());
+                        }
+                        let consumes = func != "print";
+                        (&args[0], false, consumes, consumes, Post::None)
+                    }
+                    ExprKind::CallFnValue { callee, args } if args.is_empty() => {
+                        (callee.as_ref(), false, false, false, Post::None)
+                    }
+                    ExprKind::Closure { captures, .. } if captures.len() == 1 => {
+                        (&captures[0], false, false, false, Post::None)
+                    }
+                    ExprKind::StructLit { fields, .. } if fields.len() == 1 => {
+                        (&fields[0], false, true, true, Post::None)
+                    }
+                    ExprKind::Tuple { elems, .. }
+                    | ExprKind::ArrayLit { elems, .. }
+                    | ExprKind::VecLit { elems, .. }
+                        if elems.len() == 1 =>
+                    {
+                        (&elems[0], false, true, true, Post::None)
+                    }
+                    ExprKind::EnumValue { payload, .. } if payload.len() == 1 => {
+                        (&payload[0], false, true, true, Post::None)
+                    }
+                    ExprKind::MathOp { operands, .. } if operands.len() == 1 => {
+                        (&operands[0], false, false, false, Post::None)
+                    }
+                    ExprKind::ArrayZip { sources, .. } if sources.len() == 1 => {
+                        (&sources[0], false, false, false, Post::None)
+                    }
+                    ExprKind::BuilderNew {
+                        capacity: Some(child),
+                    } => (child.as_ref(), false, false, false, Post::None),
                     ExprKind::Unary { expr: child, .. }
                     | ExprKind::Cast(child)
                     | ExprKind::RawAlloc(child)
