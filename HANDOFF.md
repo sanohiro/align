@@ -5,14 +5,16 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-31. `main` includes the shipped wave through #675.
+_Last updated: 2026-07-31. `main` includes the shipped wave through #678. Draft PR #679 is the
+active L2b-a2-am-d checked-HIR/type-DAG stack-safety implementation.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
 #672 carries L2a parameter modes and explicit empty return-provenance facts through AST, HIR, MIR,
 interfaces, caches, and separate compilation without enabling the borrow ABI.
 #673 infers named direct/imported parameter-root provenance; #674 refines product projections; #675
-closes MIR continuation after every terminating eager child.
+closes MIR continuation after every terminating eager child; #677 validates the global HIR type
+domain; #678 fixes and closes the am-r public-contract ledger and implementation order.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -338,9 +340,10 @@ borrow-preserving `if`/`match` sources retain selected owner roots until action;
 success payload and a value-producing loop instead transfer and null their old container/source.
 Terminating return and outer-break paths remove the analysis snapshot from current and saved loop
 states.
-L2b-a2-s is complete in #674, L2b-a2-ac in #675, and L2b-a2-am-g-t in #677. Am-g-t validates only
+L2b-a2-s is complete in #674, L2b-a2-ac in #675, L2b-a2-am-g-t in #677, and the am-r design gate in
+#678. Am-g-t validates only
 the global type domain, concrete roots, references, template reachability, and inline cycles before
-direct handcrafted-HIR lowering. The next gate is the design-only L2b-a2-am-r ledger. Its first
+direct handcrafted-HIR lowering. The am-r ledger's first
 fresh adversarial review was not clean. The revised draft addresses those findings: all 239
 expression and every helper
 discriminator have exact rows in `docs/impl/19-hir-validation-ledger.md`; native ABI,
@@ -357,16 +360,17 @@ the active state. That assignment and its post-join Wait/TaskGet owner evidence 
 the following host continuation then reopened the matrix for a missing loop-header/backedge fixed
 point and a conflicting Wait-coverage sentence. The ledger now uses stable syntax-site tokens,
 computes loop headers to a monotone fixed point before joining breaks, and keeps established
-completion across a later unhandled no-task Wait. The design PR still needs final verification, a
-fresh clean review, its repository gate, and merge before implementation begins.
+completion across a later unhandled no-task Wait. The final review, repository gate, and merge
+completed in #678. Draft PR #679 now implements am-d; its post-open review is closing the exact
+producer-valid depth owners before merge.
 The reviewed order is am-d checked-HIR body/type-DAG stack safety, am-e exact entry ABI,
 am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
 extern invocation, am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
-Am-c follows am-b4 because it consumes body-validated callable facts. The twenty-three/twenty-seven
-counts become project truth when this reviewed ledger merges. Do not begin am-d before then.
+Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
+twenty-three/twenty-seven counts as project truth.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
 checked HIR, so a later handcrafted-HIR preflight could not replay parallel purity independently.
@@ -425,10 +429,12 @@ spines, immediate parent-owned continuations for multi-child ownership boundarie
 out-of-line structured-control and specialized-operation frames bounded by the fixed 259 ceiling.
 The outer dispatcher reaches the existing file, reader, array-builder, process-command, path,
 regex, and HTTP helpers without retaining the giant recursive frame; strict string wrappers stay
-on the eager worklist. Mixed eager/call, string/path/regex, self-buffering reader, the
-`StrBytes`/`BytesAsStr`/`Try` reader-helper cycle,
-block/template, `if`, binary/wildcard `match`, `else`, short-circuit, loop, and arena/task-group
-boundary owners run on the 2 MiB test stack. Reachability replay propagates strict-child divergence
+on the eager worklist. Operation-specific MIR assertions cover mixed eager/call,
+string/path/regex, self-buffering reader, a producer-valid `Result<str, Error>`
+`StrBytes`/`BytesAsStr`/`Try` cycle, file create, array-builder push, process-command construction,
+HTTP request construction, block/template, `if`, binary/wildcard `match`, `else`, short-circuit,
+loop, and arena/task-group boundary owners on the 2 MiB test stack. Result construction and
+inspection instructions are also checked against their MIR value types. Reachability replay propagates strict-child divergence
 through transparent stage/template records before visiting later siblings and preserves the
 non-fallthrough status of `process.exit`/`process.abort`. The final raw/optimized
 LLVM owner uses the same accepted record boundary, and the deep owned-leaf codegen owner emits the
@@ -500,8 +506,8 @@ the broad contract was first split as L2b-a2-am-g/am-b. A second revised-matrix 
 action-only validation still omitted callable symbol uniqueness and universal
 `Expr.ty`/operator consistency. Implementation then proved the global half itself too broad: the
 combined type plus nominal/link checkpoint measured 1,535 changed hand-written lines. Type-domain
-validation has no atomic dependency on nominal/link validation, so am-g-t is now the only
-authorized next slice. It returns a canonical all-empty MIR program only for an invalid global type
+validation has no atomic dependency on nominal/link validation, so am-g-t was the only
+authorized next slice at that checkpoint. It returns a canonical all-empty MIR program only for an invalid global type
 domain and leaves every placement, nominal, namespace, declaration/header, and body predicate
 unchanged.
 
@@ -516,7 +522,7 @@ found two more missing invariants: graph-valid types still need exact per-positi
 admissibility, and callable validation must cover logical runtime lookup keys plus body-generated
 `$fnval`, `$clos`, task-trampoline, and parallel-kernel identities. It also found that rejecting
 source-accepted exact compiler/runtime spellings as malformed HIR would be a hidden semantic
-change. The draft am-r ledger preserves those spellings by separating typed program, runtime, and
+change. The completed am-r ledger preserves those spellings by separating typed program, runtime, and
 generated call registries; proposes injective compiler-owned identities for non-exported Align and
 private generated helpers; inventories the 277 existing runtime lookup keys, all 239 `ExprKind`
 variants, and every helper discriminator. The revised native ledger promotes the four previously
@@ -527,14 +533,14 @@ remain ordinary program/extern/export spellings, and probe-feature runtime fixtu
 artifacts. Runtime feature selection changes no compiler input, source acceptance, or cache
 identity. `task-group-probe` adds no unmangled export. Exact LLVM
 types/attributes and verification presence policy live in
-`docs/impl/20-runtime-abi-ledger.md`. The draft
+`docs/impl/20-runtime-abi-ledger.md`. The completed ledger
 also records every placement predicate and gives every body discriminator an envelope/child/type/
 ownership row in `docs/impl/19-hir-validation-ledger.md`; any body failure returns the same
 canonical all-empty program as a global failure. Concrete MIR call-target types, structural
 generated-identity bytes, and semantic/byte goldens are now recorded in the am-r ledger. Body
-construction remains proposed as three dormant exhaustive validator PRs and one atomic activation
-PR so no partial malformed-HIR claim is exposed. The twenty-three/twenty-seven counts and strategy
-become project truth when the clean reviewed ledger passes the repository gate and merges.
+construction remains scheduled as three dormant exhaustive validator PRs and one atomic activation
+PR so no partial malformed-HIR claim is exposed. #678 fixed the twenty-three/twenty-seven counts and
+strategy after the clean reviewed ledger passed the repository gate.
 
 Am-g-t's type-domain implementation is preserved separately. The split applies the existing
 review-size and closure-matrix rules; it does not justify a new process rule.
@@ -549,15 +555,14 @@ Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t. The am-r ledger proposes
-a2-am-d/a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate. #679 implements a2-am-d; the
+remaining sequence is a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
-exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. Treat that remaining sequence
-and both counts as merge-pending until the clean reviewed am-r ledger passes the repository gate
-and merges. The required milestone order
+exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
+#678; after am-d, am-e is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and

@@ -72,6 +72,98 @@ fn baseline_program() -> hir::Program {
     }
 }
 
+fn push_builtin_error(program: &mut hir::Program) -> u32 {
+    let id = program.enums.len() as u32;
+    program.enums.push(EnumDef {
+        name: "Error".to_string(),
+        source_name: "Error".to_string(),
+        variants: vec![
+            EnumVariant {
+                name: "NotFound".to_string(),
+                payload: Vec::new(),
+                field_base: 1,
+            },
+            EnumVariant {
+                name: "Invalid".to_string(),
+                payload: Vec::new(),
+                field_base: 1,
+            },
+            EnumVariant {
+                name: "Denied".to_string(),
+                payload: Vec::new(),
+                field_base: 1,
+            },
+            EnumVariant {
+                name: "Timeout".to_string(),
+                payload: Vec::new(),
+                field_base: 1,
+            },
+            EnumVariant {
+                name: "Code".to_string(),
+                payload: vec![Scalar::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                })],
+                field_base: 1,
+            },
+        ],
+    });
+    id
+}
+
+fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
+    ImportedFn {
+        name: name.to_string(),
+        param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
+        params,
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+    }
+}
+
+fn unary_int_expr_depth(depth: usize, ty: Ty) -> hir::Expr {
+    assert!(depth >= 1);
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Int(0),
+        ty,
+        span,
+    };
+    for _ in 1..depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            ty,
+            span,
+        };
+    }
+    expr
+}
+
+fn str_trim_expr_depth(depth: usize) -> hir::Expr {
+    assert!(depth >= 1);
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Str("x".to_string()),
+        ty: Ty::Str,
+        span,
+    };
+    for _ in 1..depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrTrim {
+                kind: hir::StrTrimKind::Both,
+                recv: Box::new(expr),
+            },
+            ty: Ty::Str,
+            span,
+        };
+    }
+    expr
+}
+
 fn with_return(ty: Ty) -> hir::Program {
     let mut program = baseline_program();
     program.imported_fns.push(ImportedFn {
@@ -115,7 +207,153 @@ fn assert_rejected(label: &str, program: &hir::Program) {
     }
 }
 
-fn assert_accepted(label: &str, program: &hir::Program) {
+#[derive(Clone, Copy)]
+enum MirOwner {
+    Unary,
+    MixedEager,
+    StrTrim,
+    Path,
+    Reader,
+    BytesStrTry,
+    Regex,
+    Template,
+    File,
+    ArrayBuilder,
+    Command,
+    Http,
+    Match,
+    Conditional,
+    Scoped,
+    Loop,
+    Stage,
+    Structural,
+}
+
+fn rvalues(program: &Program) -> impl Iterator<Item = &Rvalue> {
+    program
+        .fns
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            Stmt::Let(_, rvalue) => Some(rvalue),
+            _ => None,
+        })
+}
+
+fn is_result_ty(program: &Program, ty: Ty) -> bool {
+    match ty {
+        Ty::Result(..) => true,
+        Ty::Tagged(id) => matches!(
+            program.tagged_types.get(id as usize),
+            Some(TaggedType::Result(..))
+        ),
+        _ => false,
+    }
+}
+
+fn assert_result_rvalue_contract(label: &str, program: &Program) {
+    for function in &program.fns {
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                let Stmt::Let(value, rvalue) = stmt else {
+                    continue;
+                };
+                let value_ty = function.value_tys[*value as usize];
+                match rvalue {
+                    Rvalue::ResultOk(_) | Rvalue::ResultErr(_) => assert!(
+                        is_result_ty(program, value_ty),
+                        "{label}: Result construction has non-Result MIR type {value_ty:?}"
+                    ),
+                    Rvalue::ResultIsOk(result)
+                    | Rvalue::ResultUnwrapOk(result)
+                    | Rvalue::ResultUnwrapErr(result) => {
+                        let operand_ty = function.operand_ty(result);
+                        assert!(
+                            is_result_ty(program, operand_ty),
+                            "{label}: Result inspection received non-Result MIR operand {operand_ty:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
+    let values: Vec<&Rvalue> = rvalues(program).collect();
+    let has = |predicate: fn(&Rvalue) -> bool| values.iter().copied().any(predicate);
+    let count =
+        |predicate: fn(&Rvalue) -> bool| values.iter().copied().filter(|rv| predicate(rv)).count();
+    let bytes_str_counts = || {
+        (
+            count(|rv| matches!(rv, Rvalue::BytesAsStr { .. })),
+            count(|rv| matches!(rv, Rvalue::ResultIsOk(..))),
+            count(|rv| matches!(rv, Rvalue::ResultUnwrapOk(..))),
+        )
+    };
+    let owned = match owner {
+        MirOwner::Unary => has(|rv| matches!(rv, Rvalue::Un(..))),
+        MirOwner::MixedEager => {
+            has(|rv| matches!(rv, Rvalue::Un(..)))
+                && has(|rv| matches!(rv, Rvalue::Bin(..)))
+                && has(|rv| matches!(rv, Rvalue::Cast { .. }))
+                && has(|rv| matches!(rv, Rvalue::Call(..)))
+        }
+        MirOwner::StrTrim => has(|rv| matches!(rv, Rvalue::StrTrim { .. })),
+        MirOwner::Path => {
+            has(|rv| matches!(rv, Rvalue::PathJoin { .. }))
+                && has(|rv| matches!(rv, Rvalue::PathComponent { .. }))
+                && has(|rv| matches!(rv, Rvalue::PathNormalize { .. }))
+        }
+        MirOwner::Reader => has(|rv| matches!(rv, Rvalue::ReaderBuffered(..))),
+        MirOwner::BytesStrTry => {
+            let (conversions, result_tests, result_unwraps) = bytes_str_counts();
+            conversions > 0 && result_tests > 0 && result_unwraps > 0
+        }
+        MirOwner::Regex => has(|rv| matches!(rv, Rvalue::RegexReplace { .. })),
+        MirOwner::Template => has(|rv| matches!(rv, Rvalue::Template(..))),
+        MirOwner::File => has(|rv| matches!(rv, Rvalue::FileCreateRw { .. })),
+        MirOwner::ArrayBuilder => has(|rv| matches!(rv, Rvalue::ArrayBuilderPush { .. })),
+        MirOwner::Command => has(|rv| matches!(rv, Rvalue::Command { .. })),
+        MirOwner::Http => has(|rv| matches!(rv, Rvalue::HttpRequest { .. })),
+        MirOwner::Match => has(|rv| matches!(rv, Rvalue::OptionIsSome(..))),
+        MirOwner::Conditional => {
+            has(|rv| matches!(rv, Rvalue::OptionIsSome(..)))
+                && program.fns.iter().any(|function| {
+                    function
+                        .blocks
+                        .iter()
+                        .any(|block| matches!(block.term, Term::Branch(..)))
+                })
+        }
+        MirOwner::Scoped => {
+            has(|rv| matches!(rv, Rvalue::ArenaBegin)) && has(|rv| matches!(rv, Rvalue::TgBegin))
+        }
+        MirOwner::Loop => program.fns.iter().any(|function| {
+            function
+                .blocks
+                .iter()
+                .any(|block| matches!(block.term, Term::Goto(_)))
+        }),
+        MirOwner::Stage => has(|rv| matches!(rv, Rvalue::Call(name, _) if name == "dep$stage_id")),
+        // Block/statement wrappers can be semantically transparent and therefore emit no MIR
+        // instruction of their own. Their exact record depth is owned by the HIR preflight above;
+        // successful function construction proves the structural lowering path completed.
+        MirOwner::Structural => !program.fns.is_empty(),
+    };
+    if !owned {
+        let (conversions, result_tests, result_unwraps) = bytes_str_counts();
+        let arenas = count(|rv| matches!(rv, Rvalue::ArenaBegin));
+        let task_groups = count(|rv| matches!(rv, Rvalue::TgBegin));
+        panic!(
+            "{label}: expected specialized MIR owner was not emitted (bytes.as_str={conversions}, ResultIsOk={result_tests}, ResultUnwrapOk={result_unwraps}, arenas={arenas}, task_groups={task_groups})"
+        );
+    }
+}
+
+fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOwner>) {
     assert!(
         validate_hir::global_type_metadata_is_valid(program),
         "{label}: validator rejected valid metadata"
@@ -131,7 +369,19 @@ fn assert_accepted(label: &str, program: &hir::Program) {
             !is_empty(&lowered),
             "{label}: valid metadata did not reach an entrypoint"
         );
+        assert_result_rvalue_contract(label, &lowered);
+        if let Some(owner) = owner {
+            assert_mir_owner(label, &lowered, owner);
+        }
     }
+}
+
+fn assert_accepted(label: &str, program: &hir::Program) {
+    assert_accepted_impl(label, program, None);
+}
+
+fn assert_owned_accepted(label: &str, program: &hir::Program, owner: MirOwner) {
+    assert_accepted_impl(label, program, Some(owner));
 }
 
 fn with_unary_body_depth(depth: usize) -> hir::Program {
@@ -217,7 +467,11 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
             }
             _ => hir::Expr {
                 kind: hir::ExprKind::Call {
-                    func: "id".to_string(),
+                    func: if ty == int(32) {
+                        "dep$id_i32".to_string()
+                    } else {
+                        "dep$id_i64".to_string()
+                    },
                     args: vec![expr],
                     type_args: Vec::new(),
                 },
@@ -228,6 +482,12 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
     }
     let ret = expr.ty;
     let mut program = baseline_program();
+    program
+        .imported_fns
+        .push(imported_fn("dep$id_i32", vec![int(32)], int(32)));
+    program
+        .imported_fns
+        .push(imported_fn("dep$id_i64", vec![int(64)], int(64)));
     program.fns.push(hir::Fn {
         name: "deep_mixed_eager".to_string(),
         lifted_capture_count: None,
@@ -253,21 +513,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
 fn with_str_trim_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
-    let mut expr = hir::Expr {
-        kind: hir::ExprKind::Str("x".to_string()),
-        ty: Ty::Str,
-        span,
-    };
-    for _ in 2..depth {
-        expr = hir::Expr {
-            kind: hir::ExprKind::StrTrim {
-                kind: hir::StrTrimKind::Both,
-                recv: Box::new(expr),
-            },
-            ty: Ty::Str,
-            span,
-        };
-    }
+    let expr = str_trim_expr_depth(depth - 1);
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_str_trim".to_string(),
@@ -409,13 +655,20 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         bits: 8,
         signed: false,
     }));
-    let result_ty = Ty::Result(Scalar::Str, Scalar::Enum(0));
+    let mut program = baseline_program();
+    let error_id = push_builtin_error(&mut program);
+    let result_ty = Ty::Result(Scalar::Str, Scalar::Enum(error_id));
+    let target_expr_depth = depth - 1;
+    let cycle_depth = (1..=target_expr_depth)
+        .rev()
+        .find(|candidate| candidate.is_multiple_of(3) && candidate % 2 == target_expr_depth % 2)
+        .expect("every requested boundary depth has a Result-ending cycle prefix");
     let mut expr = hir::Expr {
         kind: hir::ExprKind::Str("x".to_string()),
         ty: Ty::Str,
         span,
     };
-    for _ in 2..depth {
+    for _ in 1..cycle_depth {
         expr = match expr.ty {
             Ty::Str => hir::Expr {
                 kind: hir::ExprKind::StrBytes {
@@ -439,13 +692,26 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
             other => panic!("unexpected bytes/string cycle type: {other:?}"),
         };
     }
-    let mut program = baseline_program();
+    assert_eq!(expr.ty, result_ty);
+    let mut expr_depth = cycle_depth;
+    while expr_depth < target_expr_depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(expr)),
+            }),
+            ty: result_ty,
+            span,
+        };
+        expr_depth += 2;
+    }
+    assert_eq!(expr_depth, target_expr_depth);
     program.fns.push(hir::Fn {
         name: "deep_bytes_str_cycle".to_string(),
         lifted_capture_count: None,
         params: Vec::new(),
         param_modes: Vec::new(),
-        ret: expr.ty,
+        ret: result_ty,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
@@ -521,8 +787,8 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
             value: Some(Box::new(expr)),
         },
         span,
-        drop_locals: Vec::new(),
-        drop_individual_locals: Vec::new(),
+        drop_locals: vec![0],
+        drop_individual_locals: vec![0],
         drop_individual_exprs: Default::default(),
         exportable: false,
     });
@@ -565,6 +831,185 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Str,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_file_body_depth(depth: usize) -> hir::Program {
+    assert!(
+        depth >= 3,
+        "the root Block, file Expr, and path need depth three"
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let mut program = baseline_program();
+    let error_id = push_builtin_error(&mut program);
+    let result_ty = Ty::Result(Scalar::File, Scalar::Enum(error_id));
+    let expr = hir::Expr {
+        kind: hir::ExprKind::FileCreateRw {
+            path: Box::new(str_trim_expr_depth(depth - 2)),
+        },
+        ty: result_ty,
+        span,
+    };
+    program.fns.push(hir::Fn {
+        name: "deep_file".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: result_ty,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_array_builder_body_depth(depth: usize) -> hir::Program {
+    assert!(
+        depth >= 3,
+        "the root Block, array-builder Expr, and value need depth three"
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let elem = scalar_int(64);
+    let builder_ty = Ty::ArrayBuilder(elem);
+    let expr = hir::Expr {
+        kind: hir::ExprKind::ArrayBuilderPush {
+            builder: Box::new(hir::Expr {
+                kind: hir::ExprKind::Local(0),
+                ty: builder_ty,
+                span,
+            }),
+            value: Box::new(unary_int_expr_depth(depth - 2, int(64))),
+            moves_value: false,
+        },
+        ty: Ty::Unit,
+        span,
+    };
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_array_builder".to_string(),
+        lifted_capture_count: None,
+        params: vec![0],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: Ty::Unit,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: vec![hir::Local {
+            id: 0,
+            name: "builder".to_string(),
+            ty: builder_ty,
+            is_mut: true,
+            is_param: true,
+            align: None,
+        }],
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: vec![0],
+        drop_individual_locals: vec![0],
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_process_command_body_depth(depth: usize) -> hir::Program {
+    assert!(
+        depth >= 3,
+        "the root Block, process-command Expr, and command need depth three"
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let argv_ty = Ty::Slice(Scalar::Str);
+    let expr = hir::Expr {
+        kind: hir::ExprKind::ProcessCommand {
+            cmd: Box::new(str_trim_expr_depth(depth - 2)),
+            args: Box::new(hir::Expr {
+                kind: hir::ExprKind::Local(0),
+                ty: argv_ty,
+                span,
+            }),
+        },
+        ty: Ty::Command,
+        span,
+    };
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_process_command".to_string(),
+        lifted_capture_count: None,
+        params: vec![0],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: Ty::Command,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: vec![hir::Local {
+            id: 0,
+            name: "argv".to_string(),
+            ty: argv_ty,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }],
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_http_body_depth(depth: usize) -> hir::Program {
+    assert!(
+        depth >= 3,
+        "the root Block, HTTP Expr, and method need depth three"
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let expr = hir::Expr {
+        kind: hir::ExprKind::HttpRequest {
+            method: Box::new(str_trim_expr_depth(depth - 2)),
+            url: Box::new(hir::Expr {
+                kind: hir::ExprKind::Str("https://example.invalid".to_string()),
+                ty: Ty::Str,
+                span,
+            }),
+        },
+        ty: Ty::HttpRequest,
+        span,
+    };
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_http".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::HttpRequest,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
@@ -703,7 +1148,10 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
 }
 
 fn with_if_branch_body_depth(depth: usize) -> hir::Program {
-    assert!(depth >= 3, "the root Block, If, and branch Expr need depth three");
+    assert!(
+        depth >= 3,
+        "the root Block, If, and branch Expr need depth three"
+    );
     let span = align_span::Span::new(0, 0, 0);
     let target_expr_depth = depth - 1;
     let option_unit = Ty::Option(Scalar::Unit);
@@ -724,7 +1172,11 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
             span,
         }
     };
-    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     while expr_depth < target_expr_depth {
         let ty = expr.ty;
         let else_value = hir::Expr {
@@ -782,7 +1234,10 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
 }
 
 fn with_binary_match_body_depth(depth: usize) -> hir::Program {
-    assert!(depth >= 3, "the root Block, Match, and arm Expr need depth three");
+    assert!(
+        depth >= 3,
+        "the root Block, Match, and arm Expr need depth three"
+    );
     let span = align_span::Span::new(0, 0, 0);
     let target_expr_depth = depth - 1;
     let option_unit = Ty::Option(Scalar::Unit);
@@ -803,7 +1258,11 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
             span,
         }
     };
-    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     while expr_depth < target_expr_depth {
         let ty = expr.ty;
         let default_body = hir::Expr {
@@ -952,7 +1411,11 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
             span,
         }
     };
-    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     while expr_depth < target_expr_depth {
         let ty = expr.ty;
         let block = hir::Block {
@@ -960,7 +1423,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
             value: Some(Box::new(expr)),
         };
         expr = hir::Expr {
-            kind: if expr_depth.is_multiple_of(4) {
+            kind: if expr_depth % 4 < 2 {
                 hir::ExprKind::Arena(block)
             } else {
                 hir::ExprKind::TaskGroup(block)
@@ -1073,7 +1536,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
             }),
             stages: vec![hir::Stage {
                 kind: hir::StageKind::Map {
-                    func: "id".to_string(),
+                    func: "dep$stage_id".to_string(),
                     captures: vec![hir::Expr {
                         kind: hir::ExprKind::Int(1),
                         ty: int(64),
@@ -1099,11 +1562,14 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         expr_depth += 1;
     }
     let mut program = baseline_program();
+    program
+        .imported_fns
+        .push(imported_fn("dep$stage_id", vec![int(64), int(64)], int(64)));
     program.fns.push(hir::Fn {
         name: "deep_stage".to_string(),
         lifted_capture_count: None,
-        params: Vec::new(),
-        param_modes: Vec::new(),
+        params: vec![0],
+        param_modes: vec![align_ast::ParamMode::ByValue],
         ret: int(64),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
@@ -1112,7 +1578,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
             name: "xs".to_string(),
             ty: array_ty,
             is_mut: false,
-            is_param: false,
+            is_param: true,
             align: None,
         }],
         body: hir::Block {
@@ -1128,67 +1594,147 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+#[derive(Clone, Copy)]
+struct DepthFixture {
+    name: &'static str,
+    make: fn(usize) -> hir::Program,
+    owner: MirOwner,
+}
+
+fn depth_fixtures() -> Vec<DepthFixture> {
+    vec![
+        DepthFixture {
+            name: "unary",
+            make: with_unary_body_depth,
+            owner: MirOwner::Unary,
+        },
+        DepthFixture {
+            name: "mixed eager",
+            make: with_mixed_eager_body_depth,
+            owner: MirOwner::MixedEager,
+        },
+        DepthFixture {
+            name: "string trim",
+            make: with_str_trim_body_depth,
+            owner: MirOwner::StrTrim,
+        },
+        DepthFixture {
+            name: "path",
+            make: with_path_string_body_depth,
+            owner: MirOwner::Path,
+        },
+        DepthFixture {
+            name: "reader",
+            make: with_reader_buffered_body_depth,
+            owner: MirOwner::Reader,
+        },
+        DepthFixture {
+            name: "bytes/string/Try",
+            make: with_bytes_str_cycle_body_depth,
+            owner: MirOwner::BytesStrTry,
+        },
+        DepthFixture {
+            name: "regex",
+            make: with_regex_string_body_depth,
+            owner: MirOwner::Regex,
+        },
+        DepthFixture {
+            name: "template",
+            make: with_template_body_depth,
+            owner: MirOwner::Template,
+        },
+        DepthFixture {
+            name: "file",
+            make: with_file_body_depth,
+            owner: MirOwner::File,
+        },
+        DepthFixture {
+            name: "array builder",
+            make: with_array_builder_body_depth,
+            owner: MirOwner::ArrayBuilder,
+        },
+        DepthFixture {
+            name: "process command",
+            make: with_process_command_body_depth,
+            owner: MirOwner::Command,
+        },
+        DepthFixture {
+            name: "HTTP",
+            make: with_http_body_depth,
+            owner: MirOwner::Http,
+        },
+        DepthFixture {
+            name: "block/statement",
+            make: with_block_stmt_body_depth,
+            owner: MirOwner::Structural,
+        },
+        DepthFixture {
+            name: "wildcard match",
+            make: with_match_arm_body_depth,
+            owner: MirOwner::Structural,
+        },
+        DepthFixture {
+            name: "if",
+            make: with_if_branch_body_depth,
+            owner: MirOwner::Structural,
+        },
+        DepthFixture {
+            name: "binary match",
+            make: with_binary_match_body_depth,
+            owner: MirOwner::Match,
+        },
+        DepthFixture {
+            name: "conditional operand",
+            make: with_conditional_operand_body_depth,
+            owner: MirOwner::Conditional,
+        },
+        DepthFixture {
+            name: "arena/task-group",
+            make: with_scoped_control_body_depth,
+            owner: MirOwner::Scoped,
+        },
+        DepthFixture {
+            name: "loop",
+            make: with_loop_body_depth,
+            owner: MirOwner::Loop,
+        },
+        DepthFixture {
+            name: "stage",
+            make: with_stage_body_depth,
+            owner: MirOwner::Stage,
+        },
+    ]
+}
+
 #[test]
 fn checked_hir_depth_closure_matrix() {
     std::thread::Builder::new()
         .name("checked-hir-depth-mir-owner".to_string())
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {
-            for make_program in [
-                with_unary_body_depth as fn(usize) -> hir::Program,
-                with_mixed_eager_body_depth,
-                with_str_trim_body_depth,
-                with_path_string_body_depth,
-                with_reader_buffered_body_depth,
-                with_bytes_str_cycle_body_depth,
-                with_regex_string_body_depth,
-                with_template_body_depth,
-                with_block_stmt_body_depth,
-                with_match_arm_body_depth,
-                with_if_branch_body_depth,
-                with_binary_match_body_depth,
-                with_conditional_operand_body_depth,
-                with_scoped_control_body_depth,
-                with_loop_body_depth,
-                with_stage_body_depth,
-            ] {
+            for fixture in depth_fixtures() {
                 for depth in [
                     align_sema::MAX_CHECKED_HIR_DEPTH - 1,
                     align_sema::MAX_CHECKED_HIR_DEPTH,
                 ] {
-                    let program = make_program(depth);
+                    let program = (fixture.make)(depth);
                     assert!(
                         align_sema::checked_hir_body_depth_is_valid(&program),
-                        "valid checked-HIR depth {depth} was rejected"
+                        "{}: valid checked-HIR depth {depth} was rejected",
+                        fixture.name
                     );
-                    assert_accepted("checked-HIR depth boundary", &program);
+                    assert_owned_accepted(fixture.name, &program, fixture.owner);
                 }
             }
 
             let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
             let source_map = SourceMap::new();
-            for make_program in [
-                with_unary_body_depth as fn(usize) -> hir::Program,
-                with_mixed_eager_body_depth,
-                with_str_trim_body_depth,
-                with_path_string_body_depth,
-                with_reader_buffered_body_depth,
-                with_bytes_str_cycle_body_depth,
-                with_regex_string_body_depth,
-                with_template_body_depth,
-                with_block_stmt_body_depth,
-                with_match_arm_body_depth,
-                with_if_branch_body_depth,
-                with_binary_match_body_depth,
-                with_conditional_operand_body_depth,
-                with_scoped_control_body_depth,
-                with_loop_body_depth,
-                with_stage_body_depth,
-            ] {
-                let program = make_program(depth);
+            for fixture in depth_fixtures() {
+                let program = (fixture.make)(depth);
                 assert!(
                     !align_sema::checked_hir_body_depth_is_valid(&program),
-                    "over-bound checked-HIR depth {depth} was accepted"
+                    "{}: over-bound checked-HIR depth {depth} was accepted",
+                    fixture.name
                 );
                 for lowered in [
                     lower_program(&program),
@@ -1198,7 +1744,8 @@ fn checked_hir_depth_closure_matrix() {
                 ] {
                     assert!(
                         is_empty(&lowered),
-                        "an over-bound body published partial MIR"
+                        "{}: an over-bound body published partial MIR",
+                        fixture.name
                     );
                 }
             }
@@ -1233,11 +1780,13 @@ fn deep_type_consumer_closure_matrix() {
                 })
                 .collect();
             program.tagged_types = (0..DEPTH)
-                .map(|index| TaggedType::Option(if index + 1 == DEPTH {
-                    Scalar::Struct(0)
-                } else {
-                    Scalar::Tagged((index + 1) as u32)
-                }))
+                .map(|index| {
+                    TaggedType::Option(if index + 1 == DEPTH {
+                        Scalar::Struct(0)
+                    } else {
+                        Scalar::Tagged((index + 1) as u32)
+                    })
+                })
                 .collect();
             program.fn_types[0].ret = Ty::Tagged(0);
             assert_accepted("deep nominal/tagged type consumer", &program);
