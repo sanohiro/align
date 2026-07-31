@@ -354,8 +354,11 @@ the obsolete i32-code ABI, two extern cross-class collision rows were absent, an
 names were over-reserved. The next independent pass found one final closure omission: a differing
 am-w join allocated fresh generation and proof-epoch tokens without explicitly assigning them as
 the active state. That assignment and its post-join Wait/TaskGet owner evidence are now authored;
-the design PR still needs final verification, a fresh clean review, its repository gate, and merge
-before implementation begins.
+the following host continuation then reopened the matrix for a missing loop-header/backedge fixed
+point and a conflicting Wait-coverage sentence. The ledger now uses stable syntax-site tokens,
+computes loop headers to a monotone fixed point before joining breaks, and keeps established
+completion across a later unhandled no-task Wait. The design PR still needs final verification, a
+fresh clean review, its repository gate, and merge before implementation begins.
 The reviewed order is am-d checked-HIR body/type-DAG stack safety, am-e exact entry ABI,
 am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
@@ -390,14 +393,18 @@ generation and stales prior Wait proofs; with an unresolved Wait it also invalid
 while after success one later Wait reauthorizes old and new handles. The settled stored-result form that exhaustively handles every
 covering Wait Result before reading a task remains valid. Calls, returns,
 captures, imported values, and aggregate reconstruction do not synthesize provenance, and every
-Spawn clears all aliases for that group. Each Move Task handle separately carries its originating
+Spawn stales all WaitProof aliases for that group. Each Move Task handle separately carries its originating
 group through transparent local/control transfer. Nested entry preserves outer facts; inner Wait
 cannot authorize an outer Task, while handling an outer Wait Result inside the inner group updates
 the outer fact. Exit clears proofs naming the inner group, including proof on its Result block
 value, but preserves outer proofs; handling that cleared Result outside cannot authorize an outer
 Task. Current primitive `TaskGet` is non-consuming and repeatable, and its rejection diagnostic
 uses the originating group's fallibility rather than the innermost group. The current
-match/loop gaps can otherwise admit `TaskGet` from an uninitialized result slot. Am-v requires a
+match/loop gaps can otherwise admit `TaskGet` from an uninitialized result slot. The final
+post-review closure assigns stable tokens per syntax site, computes each loop header from entry and
+reachable fallthrough to a fixed point before joining breaks, and preserves an established
+completion across a later unhandled no-task Wait. This prevents an earlier iteration's unresolved
+or failed Wait from disappearing while keeping initialized slots readable. Am-v requires a
 bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
 those five producer paths currently accept equal-typed temporaries and immutable buffers even
 though the runtime writes through them. Am-u rejects extern declarations as first-class function

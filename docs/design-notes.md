@@ -406,6 +406,10 @@ that generation is complete; a later empty Wait cannot erase an unresolved or fa
 Failure invalidates the covered generation. Every Spawn advances the current task generation and
 stales prior Wait proofs. With an unresolved Wait it also invalidates old Tasks; otherwise a later
 successful Wait can cover old and new tasks.
+Once completion exists, a later no-task Wait cannot make an initialized result slot unsafe, so its
+unhandled Result does not revoke the earlier fact. Loops use stable syntax-site proof tokens and a
+header fixed point before joining breaks; this both converges and prevents traversal order from
+erasing an earlier iteration's unresolved or failed Wait.
 This lets stored Result handling remain ordinary source code while keeping `get()` safety visible
 and mechanically local.
 The Task handle carries a separate compiler-only origin for the group and generation that created it. Because the

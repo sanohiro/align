@@ -224,24 +224,34 @@ trusting the stored bits:
    is constructed.
 10. Re-run the producer's per-`task_group` successful-wait dominance fact.
     A group starts with no completed task generation. Each group has one
-    compiler-only preorder `group: usize`, monotonically increasing
-    `current_generation` and `proof_epoch`, optional `completed_generation`,
-    `valid_from`, and a sparse ordered set of unresolved fallible-wait ids.
-    These are indices or counters in function-analysis-owned vectors and have
-    no HIR/interface/wire form. Every `Spawn` increments
-    `current_generation` and `proof_epoch`, so every earlier WaitProof becomes
-    stale and completion no longer covers the current generation. If any Wait
-    was unresolved, that Spawn also clears the old unresolved set and sets
-    `valid_from` to the new generation, invalidating every older TaskProof in
-    O(1); otherwise old TaskProofs remain eligible and the next successful Wait
-    can reauthorize old and new handles.
+    compiler-only preorder `group: usize`, abstract `current_generation` and
+    `proof_epoch` tokens, optional `completed_generation`, `valid_from`, and a
+    sparse ordered set of unresolved fallible-wait ids. These are indices in
+    function-analysis-owned vectors and have no HIR/interface/wire form.
+    The function owns one deterministic interner. A Spawn output is keyed by
+    `(spawn syntax site, incoming generation, incoming proof epoch,
+    incoming valid_from)`, a Wait id by
+    `(wait syntax site, incoming generation, incoming proof epoch)`, an Err
+    epoch/invalidation frontier pair by its Wait id and coverage, and a
+    differing control join's generation/epoch pair by
+    `(active group, syntactic join site)`. First construction appends one
+    index; every worklist revisit reuses it. Token creation therefore never
+    depends on traversal count or ambient state. A forward `Spawn` advances
+    `current_generation` and `proof_epoch` to its interned output, so every
+    earlier WaitProof becomes stale and completion no longer covers the current
+    generation. If any Wait was unresolved, that Spawn also clears the old
+    unresolved set and sets `valid_from` to the new generation, invalidating
+    every older TaskProof in O(1); otherwise old TaskProofs remain eligible and
+    the next successful Wait can reauthorize old and new handles.
     An infallible group has no unresolved set and its `Wait` sets
     `completed_generation = Some(current_generation)`.
-    Each fallible `Wait` registers one fresh ordered wait id before producing
+    Each fallible `Wait` registers its interned ordered wait id, fresh for a
+    previously unseen key, before producing
     `WaitProof { group: usize, proof_epoch: usize, wait: usize,
     covers_through: usize }`, where `covers_through` is the current task
-    generation. Evaluating
-    that Result alone does not establish completion. Handling its `Ok` edge
+    generation. Evaluating that Result alone does not establish completion and
+    does not revoke completion already established for the same current
+    generation. Handling its `Ok` edge
     resolves that exact id idempotently; it establishes completion only when
     every earlier Wait registered in that proof epoch is also proved `Ok` and
     no later Spawn changed the epoch. It then sets
@@ -251,8 +261,10 @@ trusting the stored bits:
     past `covers_through`, invalidating
     every affected TaskProof and WaitProof in O(1).
     Therefore a second empty Wait cannot reauthorize task slots while an
-    earlier drained Wait Result is unresolved or failed. The proof propagates
-    through a bare Result local,
+    earlier drained Wait Result is unresolved or failed. Conversely, once one
+    successful Wait established completion, evaluating a later no-task Wait
+    without handling its Result does not make initialized slots unreadable.
+    The proof propagates through a bare Result local,
     let/copy/reassignment, a block tail, `ResultMapErr`, and value-producing
     `if`/`match`/`else`/loop only when every reachable result predecessor carries
     that same group/proof-epoch/wait/coverage proof. Overwrite with an unrelated
@@ -291,9 +303,9 @@ trusting the stored bits:
     `If`, ordinary `Match`/`ElseUnwrap` facts, and all other control joins start
     alternatives from their incoming group state. For each active group
     independently, if every reachable
-    predecessor has byte-identical group counters, completion, unresolved set,
-    and local proof records, retain them verbatim. Otherwise allocate one fresh
-    `join_generation` and `join_proof_epoch`, assign
+    predecessor has byte-identical group tokens, completion, unresolved set,
+    and local proof records, retain them verbatim. Otherwise use that syntactic
+    join site's one stable `join_generation` and `join_proof_epoch`, assign
     `current_generation = join_generation` and
     `proof_epoch = join_proof_epoch`, clear the joined unresolved set and every
     WaitProof, set `valid_from = join_generation`, and set
@@ -309,19 +321,34 @@ trusting the stored bits:
     Spawn+Wait/no-Spawn asymmetric join, rejects `get()` after an incomplete
     asymmetric join until a later Wait completes the join generation, and
     prevents a drained unresolved Wait from being hidden by the join.
-    A loop records the ambient fact and every result/local proof independently
-    on each reachable accepted `Break`; an exit retains only facts present on
-    every reachable break. A body-only state never escapes by traversal order.
-    A terminating alternative contributes no post-join edge.
+    A loop computes its header before its exit. Start with the entry state,
+    analyze the body, and join the entry state with every reachable body
+    fallthrough backedge at the loop header's stable syntactic join site.
+    Reanalyze until that header state is byte-identical. Stable interned
+    transfer/join tokens and the differing-join proof clearing above make this
+    a finite fixed point; no revisit allocates another token. After the header
+    first adopts its site tokens, generation, epoch, `valid_from`, unresolved
+    set, and WaitProof set are fixed. Completion and each candidate TaskProof
+    can then only change from retained to cleared, so a header performs at most
+    one canonicalization plus one state change per such fact. Then analyze once
+    from the stable header, record the ambient fact and every result/local proof
+    independently on each reachable accepted `Break`, and join only those
+    break states for the exit. A `Return`, propagated Err, process termination,
+    accepted `Break`, or diverging nested construct contributes no backedge; a
+    terminating alternative contributes no exit join. A body-only state never
+    escapes by traversal order. Thus an unresolved or failed Wait on an earlier
+    iteration reaches every later iteration and cannot be hidden by a later
+    break plus an empty Wait.
     `TaskGet` requires its operand's TaskProof group to remain active and that
     `born_generation >= valid_from` and
     `completed_generation == Some(current_generation)`. It does not consult
     merely the innermost group: an inner Wait can never authorize an outer
     Task. An outer Task may be read inside a nested group only if its born generation
     is still valid and the group's current generation has completed a successful
-    Wait with no unresolved or failed earlier
-    Wait can still cover that task, including when the outer Wait Result is
-    handled while the inner group is active. A failed check chooses its fallible/infallible diagnostic
+    Wait with no unresolved or failed Wait preceding that successful Wait able
+    to cover the task. An outer Wait Result may establish this fact while
+    handled inside the inner group; a later no-task Wait does not revoke it. A
+    failed check chooses its fallible/infallible diagnostic
     from `TaskProof.group`, never from the innermost group. Current Spawn
     results are primitive Copy values, so a successful `TaskGet` reads without
     consuming the Move handle, preserves its TaskProof, and may be repeated.

@@ -504,6 +504,10 @@ and stales old Wait proofs. If a Wait was unresolved it also invalidates the cov
 otherwise the next successful Wait reauthorizes old and new Task handles. An unrelated
 overwrite clears the local proof. Calls, returns, closure captures, imported values, and aggregate reconstruction do not
 transport it; passing a Copy Result leaves only the caller's original local proof intact.
+A later no-task Wait does not revoke completion already established for that generation, even when
+its Result is left unhandled. Loop fallthrough reaches a fixed point before accepted breaks form the
+exit, so an unresolved or failed Wait from an earlier iteration remains visible at every later
+break.
 Each Task is a Move handle whose compiler-known origin names its spawning group and generation. Local moves,
 reassignment, block tails, and value-producing control flow preserve that origin; calls, returns,
 captures, imports, and aggregate reconstruction do not. `get()` checks that exact still-active

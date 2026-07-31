@@ -1415,8 +1415,8 @@ rather than a second, special-cased one (*One way*). It returns a `Task<R>` hand
 the single error boundary (it joins every task and propagates the lowest-spawn-index `Err`), and `a.get()`
 reads a task's result after the join.
 
-For a fallible group, `get()` requires control to be on the successful edge of the latest
-`wait()` since the latest `spawn`. The Result may be handled immediately or first kept in a bare
+For a fallible group, `get()` requires control to have passed through a successful `wait()` that
+covers the current task generation. The Result may be handled immediately or first kept in a bare
 local, copied/reassigned, passed through a block tail, `map_err`, or value-producing
 `if`/`match`/`else`/`loop`; the success proof survives only when every reachable value predecessor
 has the same group, proof epoch, Wait id, and covered task generation. `?`, an exhaustive Result `match`, or Result `else`
@@ -1429,6 +1429,11 @@ successful Wait can reauthorize both old and new Task handles. An unrelated over
 local proof. Calls, returns, closure captures, imported values, and aggregate
 reconstruction do not transport the proof. Passing a Copy Result does not erase the caller's
 original local, but no callee result acquires its provenance.
+A later `wait()` with no pending task cannot undo a completion already established for that
+generation, so leaving that later Result unhandled does not make initialized slots unreadable.
+Loop analysis carries fallthrough state through a fixed point before joining reachable `break`
+states; an unresolved or failed Wait from an earlier iteration therefore cannot disappear at a
+later break.
 
 Each `Task<R>` is a Move handle whose compiler-only origin names the `task_group` and task
 generation that spawned it.

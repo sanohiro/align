@@ -154,6 +154,10 @@ every item below has since completed as recorded in the per-milestone sections, 
    control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and
    requires every earlier Wait for that drained generation to resolve Ok. A later empty Wait cannot
    hide an unresolved or failed first Wait; Err invalidates every Wait/Task proof it covered.
+   A later no-task Wait Result left unhandled does not revoke completion already established for
+   that generation. Loop headers join entry and reachable body fallthrough to a stable-token fixed
+   point before accepted breaks form the exit, so an earlier iteration's unresolved or failed Wait
+   reaches every later break.
    Every Spawn advances the current generation and stales old Wait proofs; with an unresolved Wait
    it also invalidates covered Tasks, while after completion one later Wait can reauthorize old and
    new handles.
