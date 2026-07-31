@@ -14606,51 +14606,73 @@ impl<'a> MoveCheck<'a> {
     /// result sources during their own single evaluation when they fill a Move-typed join slot, so
     /// this helper deliberately does not re-enter them.
     fn consume_match_result(&mut self, e: &Expr, moved: &mut MovedSet, direct: bool) {
-        match &e.kind {
-            ExprKind::Local(id) if self.is_move(*id) => {
-                if !direct {
-                    let name = &self.f.locals[*id as usize].name;
-                    self.diags.error(
-                        format!(
-                            "cannot move owned value '{name}' out through a conditional \
-                             expression yet; bind the `if`/`else` result to a local first"
-                        ),
-                        e.span,
-                    );
+        let mut expression = e;
+        loop {
+            match &expression.kind {
+                ExprKind::Local(id) if self.is_move(*id) => {
+                    if !direct {
+                        let name = &self.f.locals[*id as usize].name;
+                        self.diags.error(
+                            format!(
+                                "cannot move owned value '{name}' out through a conditional \
+                                 expression yet; bind the `if`/`else` result to a local first"
+                            ),
+                            expression.span,
+                        );
+                    }
+                    self.invalidate_owner(*id);
+                    moved.insert(MovedKey::Whole(*id));
+                    return;
                 }
-                self.invalidate_owner(*id);
-                moved.insert(MovedKey::Whole(*id));
-            }
-            ExprKind::Field { root, path } if path.len() == 1 => {
-                let field = path[0];
-                if e.ty == Ty::String
-                    || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                        && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
-                            .needs_drop())
-                    || is_move_handle(e.ty)
-                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types))
-                {
-                    self.invalidate_owner(*root);
-                    moved.insert(MovedKey::Field(*root, field));
-                } else if self.is_move_ty(e.ty) {
-                    self.diags.error(
-                        "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
-                        e.span,
-                    );
+                ExprKind::Field { root, path } if path.len() == 1 => {
+                    let field = path[0];
+                    if expression.ty == Ty::String
+                        || (matches!(
+                            expression.ty,
+                            Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
+                        ) && drop_plan(
+                            expression.ty,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        .needs_drop())
+                        || is_move_handle(expression.ty)
+                        || matches!(
+                            expression.ty,
+                            Ty::Enum(id)
+                                if enum_is_move(
+                                    id,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                        )
+                    {
+                        self.invalidate_owner(*root);
+                        moved.insert(MovedKey::Field(*root, field));
+                    } else if self.is_move_ty(expression.ty) {
+                        self.diags.error(
+                            "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                            expression.span,
+                        );
+                    }
+                    return;
                 }
-            }
-            ExprKind::Block(block)
-            | ExprKind::Arena(block)
-            | ExprKind::TaskGroup(block)
-            | ExprKind::Unsafe(block) => {
-                if let Some(value) = &block.value {
-                    self.consume_match_result(value, moved, direct);
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block) => {
+                    let Some(value) = block.value.as_deref() else {
+                        return;
+                    };
+                    expression = value;
                 }
+                // Constructors consume their payloads during ordinary evaluation; loop `break`
+                // values and Move-typed control results transfer theirs while filling their join
+                // slot. Fresh results and Copy places own no source slot for the outer match.
+                _ => return,
             }
-            // Constructors consume their payloads during ordinary evaluation; loop `break` values
-            // and Move-typed control results transfer theirs while filling their join slot. Fresh
-            // results and Copy places own no source slot for the outer match to clear.
-            _ => {}
         }
     }
 
