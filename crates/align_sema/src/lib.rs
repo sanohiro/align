@@ -6709,59 +6709,58 @@ impl EffectScan<'_> {
     /// A path/type disagreement is an internal loss of provenance and therefore returns Unknown.
     fn projected_type_effect(
         &self,
-        ty: Ty,
+        mut ty: Ty,
         path: &[FnEffectProjection],
     ) -> Option<FnEffect> {
-        let Some((projection, rest)) = path.split_first() else {
-            return Some(self.type_effect(ty));
-        };
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        let next = match (ty, *projection) {
-            (Ty::Struct(id), FnEffectProjection::StructField(index)) => self
-                .structs
-                .get(id as usize)
-                .and_then(|def| def.fields.get(index as usize))
-                .map(|field| field.ty),
-            (Ty::Tuple(id), FnEffectProjection::TupleElement(index)) => self
-                .tuples
-                .get(id as usize)
-                .and_then(|def| def.elems.get(index as usize))
-                .copied()
-                .map(scalar_to_ty),
-            (
-                Ty::Enum(id),
-                FnEffectProjection::EnumPayload { variant, index },
-            ) => self
-                .enums
-                .get(id as usize)
-                .and_then(|def| def.variants.get(variant as usize))
-                .and_then(|variant| variant.payload.get(index as usize))
-                .copied()
-                .map(scalar_to_ty),
-            (Ty::Option(payload), FnEffectProjection::OptionSome) => {
-                Some(scalar_to_ty(payload))
-            }
-            (Ty::Result(ok, _), FnEffectProjection::ResultOk) => {
-                Some(scalar_to_ty(ok))
-            }
-            (Ty::Result(_, err), FnEffectProjection::ResultErr) => {
-                Some(scalar_to_ty(err))
-            }
-            (Ty::StructArray(id, _), FnEffectProjection::ArrayElement)
-            | (Ty::DynStructArray(id, _), FnEffectProjection::ArrayElement) => {
-                Some(Ty::Struct(id))
-            }
-            (Ty::Array(payload, _), FnEffectProjection::ArrayElement)
-            | (Ty::DynArray(payload), FnEffectProjection::ArrayElement)
-            | (Ty::Slice(payload), FnEffectProjection::ArrayElement) => {
-                Some(scalar_to_ty(payload))
-            }
-            _ => None,
-        };
-        match next {
-            Some(next) => self.projected_type_effect(next, rest),
-            None => Some(FnEffect::Unknown),
+        for &projection in path {
+            let next = match (expand_tagged_ty(ty, self.tagged_types), projection) {
+                (Ty::Struct(id), FnEffectProjection::StructField(index)) => self
+                    .structs
+                    .get(id as usize)
+                    .and_then(|def| def.fields.get(index as usize))
+                    .map(|field| field.ty),
+                (Ty::Tuple(id), FnEffectProjection::TupleElement(index)) => self
+                    .tuples
+                    .get(id as usize)
+                    .and_then(|def| def.elems.get(index as usize))
+                    .copied()
+                    .map(scalar_to_ty),
+                (
+                    Ty::Enum(id),
+                    FnEffectProjection::EnumPayload { variant, index },
+                ) => self
+                    .enums
+                    .get(id as usize)
+                    .and_then(|def| def.variants.get(variant as usize))
+                    .and_then(|variant| variant.payload.get(index as usize))
+                    .copied()
+                    .map(scalar_to_ty),
+                (Ty::Option(payload), FnEffectProjection::OptionSome) => {
+                    Some(scalar_to_ty(payload))
+                }
+                (Ty::Result(ok, _), FnEffectProjection::ResultOk) => {
+                    Some(scalar_to_ty(ok))
+                }
+                (Ty::Result(_, err), FnEffectProjection::ResultErr) => {
+                    Some(scalar_to_ty(err))
+                }
+                (Ty::StructArray(id, _), FnEffectProjection::ArrayElement)
+                | (Ty::DynStructArray(id, _), FnEffectProjection::ArrayElement) => {
+                    Some(Ty::Struct(id))
+                }
+                (Ty::Array(payload, _), FnEffectProjection::ArrayElement)
+                | (Ty::DynArray(payload), FnEffectProjection::ArrayElement)
+                | (Ty::Slice(payload), FnEffectProjection::ArrayElement) => {
+                    Some(scalar_to_ty(payload))
+                }
+                _ => None,
+            };
+            let Some(next) = next else {
+                return Some(FnEffect::Unknown);
+            };
+            ty = next;
         }
+        Some(self.type_effect(ty))
     }
 
     /// Effect at one function-valued leaf of `expr`. `None` means this runtime variant has no such
@@ -15323,71 +15322,126 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn source_ty_matches(&self, a: Ty, b: Ty) -> bool {
-        let (a, b) = (self.resolve(a), self.resolve(b));
-        if a == b {
-            return true;
+        #[derive(Clone, Copy)]
+        enum Work {
+            Enter(Ty, Ty),
+            Exit(Ty, Ty),
         }
-        match (a, b) {
-            (Ty::Fn(aid), Ty::Fn(bid)) => self
-                .fn_types
-                .get(aid as usize)
-                .zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| {
-                    a.params.len() == b.params.len()
-                        && a.params.iter().zip(&b.params).all(
-                            |((a_mode, a_ty), (b_mode, b_ty))| {
-                                a_mode == b_mode
-                                    && self.source_scalar_matches(*a_ty, *b_ty)
-                            },
-                        )
-                        && self.source_ty_matches(a.ret, b.ret)
-                }),
-            (Ty::Struct(aid), Ty::Struct(bid)) => self
-                .structs
-                .get(aid as usize)
-                .zip(self.structs.get(bid as usize))
-                .is_some_and(|(a, b)| a.source_name == b.source_name),
-            (Ty::Enum(aid), Ty::Enum(bid)) => self
-                .enums
-                .get(aid as usize)
-                .zip(self.enums.get(bid as usize))
-                .is_some_and(|(a, b)| a.source_name == b.source_name),
-            (Ty::Tuple(aid), Ty::Tuple(bid)) => self
-                .tuples
-                .get(aid as usize)
-                .zip(self.tuples.get(bid as usize))
-                .is_some_and(|(a, b)| {
-                    a.elems.len() == b.elems.len()
-                        && a.elems
-                            .iter()
-                            .zip(&b.elems)
-                            .all(|(a, b)| self.source_scalar_matches(*a, *b))
-                }),
-            (Ty::Option(a), Ty::Option(b))
-            | (Ty::Box(a), Ty::Box(b))
-            | (Ty::Slice(a), Ty::Slice(b))
-            | (Ty::DynArray(a), Ty::DynArray(b))
-            | (Ty::Task(a), Ty::Task(b)) => self.source_scalar_matches(a, b),
-            (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
-                self.source_scalar_matches(a_ok, b_ok)
-                    && self.source_scalar_matches(a_err, b_err)
+
+        let mut work = vec![Work::Enter(a, b)];
+        let mut active = HashSet::new();
+        let mut complete = HashSet::new();
+        while let Some(item) = work.pop() {
+            let (a, b) = match item {
+                Work::Enter(a, b) => (self.resolve(a), self.resolve(b)),
+                Work::Exit(a, b) => {
+                    active.remove(&(a, b));
+                    complete.insert((a, b));
+                    continue;
+                }
+            };
+            if a == b || complete.contains(&(a, b)) {
+                continue;
             }
-            (Ty::Array(a, an), Ty::Array(b, bn))
-            | (Ty::Vec(a, an), Ty::Vec(b, bn))
-            | (Ty::Mask(a, an), Ty::Mask(b, bn)) => {
-                an == bn && self.source_scalar_matches(a, b)
+            if !active.insert((a, b)) {
+                return false;
             }
-            (Ty::StructArray(a, an), Ty::StructArray(b, bn)) => {
-                an == bn && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
+
+            let mut children = Vec::new();
+            let matches = match (a, b) {
+                (Ty::Fn(aid), Ty::Fn(bid)) => self
+                    .fn_types
+                    .get(aid as usize)
+                    .zip(self.fn_types.get(bid as usize))
+                    .is_some_and(|(a, b)| {
+                        if a.params.len() != b.params.len()
+                            || a.params
+                                .iter()
+                                .zip(&b.params)
+                                .any(|((a_mode, _), (b_mode, _))| a_mode != b_mode)
+                        {
+                            return false;
+                        }
+                        children.extend(
+                            a.params
+                                .iter()
+                                .zip(&b.params)
+                                .map(|((_, a), (_, b))| (scalar_to_ty(*a), scalar_to_ty(*b))),
+                        );
+                        children.push((a.ret, b.ret));
+                        true
+                    }),
+                (Ty::Struct(aid), Ty::Struct(bid)) => self
+                    .structs
+                    .get(aid as usize)
+                    .zip(self.structs.get(bid as usize))
+                    .is_some_and(|(a, b)| a.source_name == b.source_name),
+                (Ty::Enum(aid), Ty::Enum(bid)) => self
+                    .enums
+                    .get(aid as usize)
+                    .zip(self.enums.get(bid as usize))
+                    .is_some_and(|(a, b)| a.source_name == b.source_name),
+                (Ty::Tuple(aid), Ty::Tuple(bid)) => self
+                    .tuples
+                    .get(aid as usize)
+                    .zip(self.tuples.get(bid as usize))
+                    .is_some_and(|(a, b)| {
+                        if a.elems.len() != b.elems.len() {
+                            return false;
+                        }
+                        children.extend(
+                            a.elems
+                                .iter()
+                                .zip(&b.elems)
+                                .map(|(a, b)| (scalar_to_ty(*a), scalar_to_ty(*b))),
+                        );
+                        true
+                    }),
+                (Ty::Option(a), Ty::Option(b))
+                | (Ty::Box(a), Ty::Box(b))
+                | (Ty::Slice(a), Ty::Slice(b))
+                | (Ty::DynArray(a), Ty::DynArray(b))
+                | (Ty::Task(a), Ty::Task(b)) => {
+                    children.push((scalar_to_ty(a), scalar_to_ty(b)));
+                    true
+                }
+                (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
+                    children.push((scalar_to_ty(a_ok), scalar_to_ty(b_ok)));
+                    children.push((scalar_to_ty(a_err), scalar_to_ty(b_err)));
+                    true
+                }
+                (Ty::Array(a, an), Ty::Array(b, bn))
+                | (Ty::Vec(a, an), Ty::Vec(b, bn))
+                | (Ty::Mask(a, an), Ty::Mask(b, bn)) => {
+                    children.push((scalar_to_ty(a), scalar_to_ty(b)));
+                    an == bn
+                }
+                (Ty::StructArray(a, an), Ty::StructArray(b, bn)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    an == bn
+                }
+                (Ty::DynStructArray(a, al), Ty::DynStructArray(b, bl)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    al == bl
+                }
+                (Ty::Soa(a), Ty::Soa(b)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    true
+                }
+                _ => false,
+            };
+            if !matches {
+                return false;
             }
-            (Ty::DynStructArray(a, al), Ty::DynStructArray(b, bl)) => {
-                al == bl && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
-            }
-            (Ty::Soa(a), Ty::Soa(b)) => {
-                self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
-            }
-            _ => false,
+            work.push(Work::Exit(a, b));
+            work.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(a, b)| Work::Enter(a, b)),
+            );
         }
+        true
     }
 
     fn source_scalar_matches(&self, a: Scalar, b: Scalar) -> bool {
@@ -15436,37 +15490,119 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// A user-facing type name that resolves struct/enum ids to their declared source names —
     /// unlike the free `ty_name`, which has no name tables and prints `struct#0` / `enum#0`. Used
-    /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. Recurses into composite
-    /// payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`).
+    /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. An explicit token worklist
+    /// renders composite payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`) without using
+    /// the process stack.
     fn ty_display(&self, ty: Ty) -> String {
-        match ty {
-            Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
-            Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
-            Ty::Option(s) => format!("Option<{}>", self.scalar_display(s)),
-            Ty::Result(o, e) => format!(
-                "Result<{}, {}>",
-                self.scalar_display(o),
-                self.scalar_display(e)
-            ),
-            Ty::Tagged(_) => self.ty_display(expand_tagged_ty(ty, self.tagged_types)),
-            Ty::Box(s) => format!("box<{}>", self.scalar_display(s)),
-            Ty::Task(s) => format!("Task<{}>", self.scalar_display(s)),
-            Ty::Array(s, n) => format!("array<{}>[{n}]", self.scalar_display(s)),
-            Ty::Slice(s) => format!("slice<{}>", self.scalar_display(s)),
-            Ty::DynArray(s) => format!("array<{}>", self.scalar_display(s)),
-            Ty::StructArray(id, n) => format!("array<{}>[{n}]", self.ty_display(Ty::Struct(id))),
-            Ty::DynStructArray(id, _) => format!("array<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::Soa(id) => format!("soa<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::JsonScanner(id) => format!("json.scanner<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::DictEncoded(id, _) => format!("dict_encoded<{}>", self.ty_display(Ty::Struct(id))),
-            // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
-            _ => ty_name(ty),
+        enum Work {
+            Type(Ty),
+            Text(String),
+            ExitTagged(u32),
         }
-    }
 
-    /// [`ty_display`] for a scalar payload (an `Option`/`Result`/`box` element may itself be an enum).
-    fn scalar_display(&self, s: Scalar) -> String {
-        self.ty_display(scalar_to_ty(s))
+        let mut work = vec![Work::Type(ty)];
+        let mut output = String::new();
+        let mut active_tagged = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Text(text) => output.push_str(&text),
+                Work::ExitTagged(id) => {
+                    active_tagged.remove(&id);
+                }
+                Work::Type(ty) => match ty {
+                    Ty::Struct(id) => output.push_str(
+                        &self
+                            .structs
+                            .get(id as usize)
+                            .map(|definition| definition.source_name.clone())
+                            .unwrap_or_else(|| ty_name(ty)),
+                    ),
+                    Ty::Enum(id) => output.push_str(
+                        &self
+                            .enums
+                            .get(id as usize)
+                            .map(|definition| definition.source_name.clone())
+                            .unwrap_or_else(|| ty_name(ty)),
+                    ),
+                    Ty::Tagged(id) => {
+                        if active_tagged.insert(id) {
+                            work.push(Work::ExitTagged(id));
+                            work.push(Work::Type(expand_tagged_ty(
+                                Ty::Tagged(id),
+                                self.tagged_types,
+                            )));
+                        } else {
+                            output.push_str(&ty_name(ty));
+                        }
+                    }
+                    Ty::Option(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("Option<".to_string()));
+                    }
+                    Ty::Result(ok, err) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(err)));
+                        work.push(Work::Text(", ".to_string()));
+                        work.push(Work::Type(scalar_to_ty(ok)));
+                        work.push(Work::Text("Result<".to_string()));
+                    }
+                    Ty::Box(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("box<".to_string()));
+                    }
+                    Ty::Task(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("Task<".to_string()));
+                    }
+                    Ty::Array(payload, len) => {
+                        work.push(Work::Text(format!(">[{len}]")));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::Slice(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("slice<".to_string()));
+                    }
+                    Ty::DynArray(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::StructArray(id, len) => {
+                        work.push(Work::Text(format!(">[{len}]")));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::DynStructArray(id, _) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::Soa(id) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("soa<".to_string()));
+                    }
+                    Ty::JsonScanner(id) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("json.scanner<".to_string()));
+                    }
+                    Ty::DictEncoded(id, _) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("dict_encoded<".to_string()));
+                    }
+                    // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
+                    _ => output.push_str(&ty_name(ty)),
+                },
+            }
+        }
+        output
     }
 
     /// Constrain `ty` to an expected type if one is given.
