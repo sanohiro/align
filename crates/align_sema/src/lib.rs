@@ -17,6 +17,8 @@ pub mod hir;
 pub use hir::*;
 mod hir_depth;
 pub use hir_depth::{MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid};
+mod type_layout;
+pub use type_layout::ty_abi_layout;
 
 /// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1317,91 +1319,45 @@ fn ty_mentions_slice(
     tuples: &[hir::TupleDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    match ty {
-        Ty::Slice(_) => true,
-        Ty::Tagged(id) => {
-            ty_mentions_slice(expand_tagged_ty(Ty::Tagged(id), tagged_types), structs, tuples, tagged_types)
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Slice(_) => return true,
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Struct(id) if visited_structs.insert(id) => {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            // Missing ids and malformed cycles terminate defensively. Keep aggregate arms explicit
+            // so a future aggregate cannot bypass escape checking through a recursive default.
+            _ => {}
         }
-        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples, tagged_types),
-        Ty::Result(o, e) => {
-            ty_mentions_slice(scalar_to_ty(o), structs, tuples, tagged_types)
-                || ty_mentions_slice(scalar_to_ty(e), structs, tuples, tagged_types)
-        }
-        Ty::Tuple(id) => tuples[id as usize]
-            .elems
-            .iter()
-            .any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples, tagged_types)),
-        Ty::Struct(id) => structs[id as usize]
-            .fields
-            .iter()
-            .any(|f| ty_mentions_slice(f.ty, structs, tuples, tagged_types)),
-        // The remaining types do not contain a `slice` payload in the current type model. Keep the
-        // list exhaustive so a future aggregate cannot bypass escape checking by default.
-        Ty::Int(_)
-        | Ty::Param(_)
-        | Ty::IntVar(_)
-        | Ty::Float(_)
-        | Ty::FloatVar(_)
-        | Ty::Bool
-        | Ty::Char
-        | Ty::Box(_)
-        | Ty::Array(..)
-        | Ty::Vec(..)
-        | Ty::Mask(..)
-        | Ty::StructArray(..)
-        | Ty::DynStructArray(..)
-        | Ty::Soa(_)
-        | Ty::DynSliceArray(_)
-        | Ty::DynArray(_)
-        | Ty::DynResponseArray
-        | Ty::Str
-        | Ty::String
-        | Ty::ArenaHandle
-        | Ty::Raw
-        | Ty::Builder
-        | Ty::Writer
-        | Ty::Reader
-        | Ty::Buffer
-        | Ty::ArrayBuilder(_)
-        | Ty::File
-        | Ty::Rng
-        | Ty::Regex
-        | Ty::Captures
-        | Ty::CliCommand
-        | Ty::CliParsed
-        | Ty::TcpConn
-        | Ty::TcpListener
-        | Ty::UdpSocket
-        | Ty::Child
-        | Ty::HttpRequest
-        | Ty::HttpResponse
-        | Ty::HttpClient
-        | Ty::HttpServer
-        | Ty::HttpRequestCtx
-        | Ty::ResponseBuilder
-        | Ty::HttpStream
-        // `command`/`run_output` are opaque owned handles — they hold no slice (`run_output`'s
-        // `.stdout()`/`.stderr()` views are separate `str` exprs, escape-checked via `region_of`).
-        | Ty::Command
-        | Ty::RunOutput
-        // A `http_headers` view is a bare ctx pointer, not a `slice<T>`; like `json.doc` below, its
-        // escape is enforced through `tracks_region`, not `mentions_slice`.
-        | Ty::HttpHeaders
-        // A `json.doc` is a `{tape,node}` handle, not a `slice<T>` payload; its escape is enforced
-        // through `tracks_region`, not `mentions_slice`.
-        | Ty::JsonDoc
-        // A `json.scanner<Row>` is a `{ptr,len}` input view; like `json.doc`, its escape is enforced
-        // through `tracks_region`, not `mentions_slice`.
-        | Ty::JsonScanner(_)
-        // The compiler-internal `str_finder` plan is an opaque owned handle; it holds no slice.
-        | Ty::StrFinder
-        | Ty::DictEncoded(..)
-        | Ty::Enum(_)
-        | Ty::Task(_)
-        | Ty::Fn(_)
-        | Ty::Error
-        | Ty::Unit => false,
     }
+    false
 }
 
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
@@ -1604,7 +1560,7 @@ fn ty_size_align(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
+    _visiting: &mut Vec<u32>,
 ) -> (u64, u64) {
     match ty {
         Ty::Int(it) => {
@@ -1618,38 +1574,18 @@ fn ty_size_align(
         Ty::Bool => (1, 1),
         Ty::Char => (4, 4),
         Ty::Unit => (0, 1),
-        Ty::Tagged(id) => ty_size_align(
-            expand_tagged_ty(Ty::Tagged(id), tagged_types),
-            structs,
-            enums,
-            tagged_types,
-            visiting,
-        ),
-        Ty::Struct(id) => struct_size_align(id, structs, enums, tagged_types, visiting),
+        Ty::Tagged(id) => ty_abi_layout(Ty::Tagged(id), structs, enums, tagged_types),
+        Ty::Struct(id) => ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types),
         // A sum type lowers to codegen's non-union tagged struct `{ i32 tag, <every variant's payload
         // flattened in variant order> }` (`enum_types`), natural alignment, **declaration order** (not
         // reordered — unlike a struct). Must stay the exact dual of codegen's `field_abi_align`/
         // `enum_types` (pinned by `layout_parity`). J1b: an enum is a valid struct field.
-        Ty::Enum(id) => enum_size_align(id, structs, enums, tagged_types, visiting),
+        Ty::Enum(id) => enum_size_align(id, structs, enums, tagged_types, _visiting),
         // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
         // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
         // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
-        Ty::Option(s) => {
-            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
-            let pal = pal.max(1);
-            let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
-            (align_up(payload_off + psz, pal), pal)
-        }
-        Ty::Result(ok, err) => {
-            let (ok_size, ok_align) =
-                ty_size_align(scalar_to_ty(ok), structs, enums, tagged_types, visiting);
-            let (err_size, err_align) =
-                ty_size_align(scalar_to_ty(err), structs, enums, tagged_types, visiting);
-            let align = ok_align.max(err_align).max(1);
-            let ok_offset = align_up(1, ok_align.max(1));
-            let err_offset = align_up(ok_offset + ok_size, err_align.max(1));
-            (align_up(err_offset + err_size, align), align)
-        }
+        Ty::Option(payload) => ty_abi_layout(Ty::Option(payload), structs, enums, tagged_types),
+        Ty::Result(ok, err) => ty_abi_layout(Ty::Result(ok, err), structs, enums, tagged_types),
         // A **bare 8-byte pointer** field: every Move handle, plus the Copy `http_headers` view whose
         // representation IS one. Codegen lowers all of them to a plain `ptr` (`scalar_type`'s pointer
         // arm), so the `(16, 8)` catch-all below over-reports them by 8 bytes — harmless for safety
@@ -1760,7 +1696,7 @@ pub fn struct_abi_layout(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
-    struct_size_align(id, structs, enums, tagged_types, &mut Vec::new())
+    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
@@ -34206,5 +34142,51 @@ fn main() -> i32 = 0
             ),
             "source tuple identity recursively erases nested callback origins"
         );
+    }
+
+    #[test]
+    fn deep_type_consumer_closure_matrix() {
+        const DEPTH: usize = 4096;
+        let mut structs = (0..DEPTH)
+            .map(|id| StructDef {
+                name: format!("Deep{id}"),
+                source_name: format!("Deep{id}"),
+                fields: vec![hir::FieldDef {
+                    name: "next".to_string(),
+                    ty: if id + 1 == DEPTH {
+                        Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))
+                    } else {
+                        Ty::Struct((id + 1) as u32)
+                    },
+                }],
+                align: None,
+                c_repr: false,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+        assert!(ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (16, 8));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::String;
+        assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+        assert!(!ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
+        assert!(struct_is_move(0, &structs, &[], &[]));
+
+        let tagged = (0..DEPTH)
+            .map(|id| hir::TaggedType::Option(if id + 1 == DEPTH {
+                Scalar::Int(IntTy { bits: 64, signed: true })
+            } else {
+                Scalar::Tagged((id + 1) as u32)
+            }))
+            .collect::<Vec<_>>();
+        assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Struct(0);
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+        assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Struct(DEPTH as u32 + 7);
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
     }
 }

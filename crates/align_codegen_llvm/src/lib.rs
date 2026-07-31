@@ -4568,85 +4568,16 @@ fn task_tramp_key(ty: Ty) -> String {
     }
 }
 
-/// The natural ABI alignment (in bytes) of a struct field, used only to *order* fields for padding
-/// elimination — the actual byte offsets are always read back from the built LLVM struct type via
-/// `offset_of_element`, so a slightly-off estimate can never miscompile, only leave padding. Scalars
-/// use their width; a nested aggregate takes the max of its members; pointer-like views (`str`,
-/// `slice`, `string`, `box`, `soa`, dynamic arrays, …) are pointer-aligned (8).
-///
-/// The *valid* struct-field domain (`is_field_ok` in `align_sema`) is
-/// `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`; on that domain this **must** return the
-/// same alignment as `align_sema::ty_size_align` (the ordering must agree, or the sema huge-struct-copy
-/// lint's size would diverge from the real layout). It does. The `Unit` (→ 4, vs sema's 1) and `Array`
-/// (→ `scalar_bytes.min(8)`, vs sema's 8) arms below are for types `is_field_ok` **rejects**, so they
-/// never reach field ordering — kept only so the function is total. Scalars top out at 64-bit, so no
-/// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
-/// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
-/// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
+/// The natural ABI alignment (in bytes) of a struct field, used only to order fields for padding
+/// elimination. Sema owns the single iterative layout traversal so deep nominal/tagged graphs cannot
+/// overflow either compiler layer and field ordering cannot drift from the huge-copy lint's layout.
 fn field_abi_align(
     ty: Ty,
     structs: &[StructDef],
     enums: &[EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> u64 {
-    match ty {
-        Ty::Int(it) => (it.bits / 8).max(1) as u64,
-        Ty::Float(ft) => (ft.bits / 8) as u64,
-        Ty::Bool => 1,
-        Ty::Char => 4,
-        Ty::Unit => 4,
-        Ty::Struct(id) | Ty::StructArray(id, _) => structs[id as usize]
-            .fields
-            .iter()
-            .map(|f| field_abi_align(f.ty, structs, enums, tagged_types))
-            .max()
-            .unwrap_or(1),
-        // A sum type lowers to `{ i32 tag, <payloads flattened> }` (`enum_types`), so its ABI
-        // alignment is the max of the i32 tag (4) and every payload scalar's alignment (J1b: an enum
-        // is a valid struct field). Must match sema's `enum_size_align`.
-        Ty::Enum(id) => enums.get(id as usize).map_or(4, |e| {
-            e.variants
-                .iter()
-                .flat_map(|v| v.payload.iter())
-                .map(|&s| field_abi_align(scalar_to_ty(s), structs, enums, tagged_types))
-                .fold(4, u64::max)
-        }),
-        Ty::Option(payload) => {
-            field_abi_align(scalar_to_ty(payload), structs, enums, tagged_types)
-        }
-        Ty::Result(ok, err) => field_abi_align(
-            scalar_to_ty(ok),
-            structs,
-            enums,
-            tagged_types,
-        )
-        .max(field_abi_align(
-            scalar_to_ty(err),
-            structs,
-            enums,
-            tagged_types,
-        )),
-        Ty::Tagged(id) => match tagged_types.get(id as usize) {
-            Some(hir::TaggedType::Option(payload)) => {
-                field_abi_align(scalar_to_ty(*payload), structs, enums, tagged_types)
-            }
-            Some(hir::TaggedType::Result(ok, err)) => field_abi_align(
-                scalar_to_ty(*ok),
-                structs,
-                enums,
-                tagged_types,
-            )
-            .max(field_abi_align(
-                scalar_to_ty(*err),
-                structs,
-                enums,
-                tagged_types,
-            )),
-            None => 1,
-        },
-        Ty::Array(s, _) => scalar_bytes(s).clamp(1, 8),
-        _ => 8,
-    }
+    align_sema::ty_abi_layout(ty, structs, enums, tagged_types).1
 }
 
 /// The logical→physical field-index map for a struct. A non-`layout(C)` struct is laid out in
@@ -15415,6 +15346,61 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    #[test]
+    fn deep_type_consumer_closure_matrix() {
+        const DEPTH: usize = 4096;
+        std::thread::Builder::new()
+            .name("deep-type-codegen-owner".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let structs = (0..DEPTH)
+                    .map(|id| StructDef {
+                        name: format!("Deep{id}"),
+                        source_name: format!("Deep{id}"),
+                        fields: vec![align_sema::hir::FieldDef {
+                            name: "next".to_string(),
+                            ty: if id + 1 == DEPTH {
+                                i64_ty
+                            } else {
+                                Ty::Struct((id + 1) as u32)
+                            },
+                        }],
+                        align: None,
+                        c_repr: false,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(field_abi_align(Ty::Struct(0), &structs, &[], &[]), 8);
+
+                let ctx = Context::create();
+                let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+                    .expect("target machine");
+                let target_data = tm.get_target_data();
+                let struct_types = structs
+                    .iter()
+                    .map(|structure| ctx.opaque_struct_type(&structure.name))
+                    .collect::<Vec<_>>();
+                for (structure, llvm_ty) in structs.iter().zip(&struct_types) {
+                    let permutation = logical_to_physical(structure, &structs, &[], &[]);
+                    set_struct_body(
+                        &ctx,
+                        *llvm_ty,
+                        structure,
+                        &permutation,
+                        &struct_types,
+                        &[],
+                        &[],
+                        &target_data,
+                    );
+                }
+                assert_eq!(target_data.get_abi_alignment(&struct_types[0]), 8);
+                assert_eq!(target_data.get_abi_size(&struct_types[0]), 8);
+            })
+            .expect("spawn deep type codegen owner")
+            .join()
+            .expect("deep type codegen owner");
     }
 
     #[test]
