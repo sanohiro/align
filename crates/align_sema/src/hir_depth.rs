@@ -48,6 +48,7 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
             MAX_CHECKED_HIR_DEPTH,
             None,
             false,
+            None,
         ) {
             return false;
         }
@@ -60,6 +61,7 @@ fn walk_body_records<'a>(
     max_depth: usize,
     mut events: Option<&mut Vec<BodyEvent<'a>>>,
     reachable_only: bool,
+    stop_below_expression: Option<&'a Expr>,
 ) -> bool {
     let mut work = vec![(root, 1usize)];
     while let Some((record, depth)) = work.pop() {
@@ -89,6 +91,18 @@ fn walk_body_records<'a>(
                 | BodyRecord::Stage(_)
                 | BodyRecord::TemplatePart(_) => {}
             }
+        }
+        if let (Some(root_expression), BodyRecord::Expr(expression)) =
+            (stop_below_expression, record)
+            && !std::ptr::eq(root_expression, expression)
+        {
+            if let Some(events) = events.as_mut() {
+                events.push(BodyEvent::ExprExit {
+                    expression,
+                    children_completed: true,
+                });
+            }
+            continue;
         }
         let child_depth = depth + 1;
         let child_start = work.len();
@@ -910,6 +924,7 @@ pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
         usize::MAX,
         Some(&mut events),
         false,
+        None,
     );
     debug_assert!(valid);
     events
@@ -934,6 +949,7 @@ pub(crate) fn expr_postorder(root: &Expr) -> Vec<&Expr> {
         usize::MAX,
         Some(&mut events),
         false,
+        None,
     );
     debug_assert!(valid);
     events
@@ -948,6 +964,47 @@ pub(crate) fn expr_postorder(root: &Expr) -> Vec<&Expr> {
         .collect()
 }
 
+/// Direct expression children in producer order.
+///
+/// Non-expression body records (blocks, statements, stages, and template parts) are transparent
+/// here. The first expression entered below `root` is therefore a direct recursive HIR child of
+/// that root, while its descendants are skipped until the matching exit event. MIR lowering uses
+/// this relation to schedule eager child lowering without consuming the native call stack.
+pub fn direct_expr_children(root: &Expr) -> Vec<&Expr> {
+    let mut events = Vec::new();
+    let valid = walk_body_records(
+        BodyRecord::Expr(root),
+        usize::MAX,
+        Some(&mut events),
+        false,
+        Some(root),
+    );
+    debug_assert!(valid);
+
+    let mut expression_depth = 0usize;
+    let mut children = Vec::new();
+    for event in events {
+        match event {
+            BodyEvent::ExprEnter(expression) => {
+                if expression_depth == 1 {
+                    children.push(expression);
+                }
+                expression_depth += 1;
+            }
+            BodyEvent::ExprExit { .. } => {
+                expression_depth = expression_depth
+                    .checked_sub(1)
+                    .expect("expression exits follow their enters");
+            }
+            BodyEvent::StmtEnter(_)
+            | BodyEvent::StmtExit(_)
+            | BodyEvent::MatchArmEnter { .. } => {}
+        }
+    }
+    debug_assert_eq!(expression_depth, 0);
+    children
+}
+
 pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
     let mut events = Vec::new();
     let valid = walk_body_records(
@@ -955,6 +1012,7 @@ pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
         usize::MAX,
         Some(&mut events),
         false,
+        None,
     );
     debug_assert!(valid);
     events
@@ -972,6 +1030,7 @@ pub(crate) fn reachable_body_events(root: &Block) -> Vec<BodyEvent<'_>> {
         usize::MAX,
         Some(&mut events),
         true,
+        None,
     );
     debug_assert!(valid);
     events

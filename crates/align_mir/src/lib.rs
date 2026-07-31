@@ -1512,7 +1512,14 @@ pub fn lower_program(program: &hir::Program) -> Program {
 /// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
 /// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), false)
+    if !hir_program_is_valid(program) {
+        return empty_program();
+    }
+    lower_program_unchecked(
+        program,
+        Some(Rc::new(SourceLines::from_map(sm))),
+        false,
+    )
 }
 
 /// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
@@ -1534,19 +1541,29 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// now compiles each unit in isolation and needs both the debug locations (for remark attribution)
 /// and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), true)
+    if !hir_program_is_valid(program) {
+        return empty_program();
+    }
+    lower_program_unchecked(
+        program,
+        Some(Rc::new(SourceLines::from_map(sm))),
+        true,
+    )
 }
 
 // Inlined into the two thin entry points above so a normal build gains no extra call frame at the
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
-    if !align_sema::checked_hir_body_depth_is_valid(program)
-        || !validate_hir::global_type_metadata_is_valid(program)
-    {
+    if !hir_program_is_valid(program) {
         return empty_program();
     }
     lower_program_unchecked(program, lines, per_unit)
+}
+
+fn hir_program_is_valid(program: &hir::Program) -> bool {
+    align_sema::checked_hir_body_depth_is_valid(program)
+        && validate_hir::global_type_metadata_is_valid(program)
 }
 
 fn empty_program() -> Program {
@@ -2501,6 +2518,11 @@ struct BuilderCtx {
     /// Sema function-type facts used to make function-value and indirect-call signatures explicit
     /// in MIR. Kept behind the existing box to preserve recursive lowering stack headroom.
     fn_types: Rc<[hir::FnTy]>,
+    /// Results produced by the active eager-expression worklist, keyed by stable HIR address.
+    /// Recursive child requests consume these operands without re-entering `lower_expr`.
+    eager_expr_results: std::collections::HashMap<usize, Operand>,
+    /// Whether an outer `lower_expr` invocation currently owns `eager_expr_results`.
+    eager_expr_active: bool,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -2804,6 +2826,8 @@ fn lower_fn(
             slot_borrow_owners: std::collections::HashMap::new(),
             dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
             fn_types: Rc::clone(fn_types),
+            eager_expr_results: std::collections::HashMap::new(),
+            eager_expr_active: false,
         }),
     };
     let entry = b.new_block();
@@ -4152,7 +4176,206 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     operand
 }
 
-fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+/// Expressions whose parent-specific child protocol must run outside the giant eager dispatcher.
+/// This includes structured control/scopes and multi-child ownership boundaries such as calls.
+fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
+    matches!(
+        &e.kind,
+        hir::ExprKind::Binary { op: BinOp::And | BinOp::Or, .. }
+        | hir::ExprKind::Call { .. }
+        | hir::ExprKind::CallFnValue { .. }
+        | hir::ExprKind::ResultMapErr { .. }
+        | hir::ExprKind::If { .. }
+        | hir::ExprKind::Match { .. }
+        | hir::ExprKind::ElseUnwrap { .. }
+        | hir::ExprKind::Loop { .. }
+        | hir::ExprKind::Block(_)
+        | hir::ExprKind::Unsafe(_)
+        | hir::ExprKind::Arena(_)
+        | hir::ExprKind::TaskGroup(_)
+        | hir::ExprKind::Template(_)
+    )
+}
+
+/// Unary eager wrappers have exactly one unconditionally evaluated child and perform no parent
+/// action before that child completes. They can therefore share a heterogeneous worklist without
+/// disturbing the required-child ownership/termination protocol used by multi-child operations.
+fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or),
+        hir::ExprKind::IntArith { .. }
+        | hir::ExprKind::MathOp { .. }
+        | hir::ExprKind::RawLoad { .. }
+        | hir::ExprKind::RawStore { .. }
+        | hir::ExprKind::RawOffset { .. }
+        | hir::ExprKind::Unary { .. }
+            | hir::ExprKind::Cast(_)
+            | hir::ExprKind::TaskGet(_)
+            | hir::ExprKind::OptionSome(_)
+            | hir::ExprKind::ResultOk(_)
+            | hir::ExprKind::ResultErr(_)
+            | hir::ExprKind::Try(_)
+            | hir::ExprKind::RawAlloc(_)
+            | hir::ExprKind::RawFree(_)
+            | hir::ExprKind::HeapNew(_)
+            | hir::ExprKind::BoxGet(_)
+            | hir::ExprKind::BoxClone(_)
+            | hir::ExprKind::StrClone(_)
+            | hir::ExprKind::StrBorrow(_)
+            | hir::ExprKind::BuilderToString(_)
+            | hir::ExprKind::ArrayToSlice(_)
+            | hir::ExprKind::Len(_)
+            | hir::ExprKind::ArrayBuilderBuild(_) => true,
+        _ => false,
+    }
+}
+
+/// Dispatch parent-specific roots without retaining the giant eager-expression match frame.
+/// Nested control is bounded by the checked-HIR ceiling, while calls preserve their inter-child
+/// ownership protocol. Retaining the eager dispatcher on each level would multiply its debug-build
+/// frame by that depth and overflow the 2 MiB owner stack.
+#[inline(never)]
+fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::Binary { op, lhs, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
+            lower_short_circuit(b, *op, lhs, rhs)
+        }
+        hir::ExprKind::Call { .. } => lower_direct_call(b, e),
+        hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
+        hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
+        hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => {
+            lower_else_unwrap(b, opt, fallback, e.ty, false)
+        }
+        hir::ExprKind::Loop { .. } => lower_loop(b, e),
+        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
+        hir::ExprKind::Arena(block) => lower_arena_block(b, block),
+        hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
+        hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        _ => unreachable!("out-of-line dispatcher received an eager expression"),
+    }
+}
+
+#[inline(never)]
+fn lower_arena_block(b: &mut Builder, block: &hir::Block) -> Operand {
+    let handle = b.fresh_value(Ty::ArenaHandle);
+    b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+    b.arenas.push(handle);
+    let tail = lower_block(b, block);
+    b.arenas.pop();
+    if !lowering_continues(b) {
+        terminated_operand()
+    } else {
+        b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+        tail.unwrap_or(Operand::Const(Const::Unit))
+    }
+}
+
+#[inline(never)]
+fn lower_task_group_block(b: &mut Builder, block: &hir::Block) -> Operand {
+    let handle = b.fresh_value(Ty::ArenaHandle);
+    b.push(Stmt::Let(handle, Rvalue::TgBegin));
+    b.task_groups.push(handle);
+    let tail = lower_block(b, block);
+    b.task_groups.pop();
+    if !lowering_continues(b) {
+        terminated_operand()
+    } else {
+        b.push(Stmt::TgWait(Operand::Value(handle)));
+        b.push(Stmt::TgEnd(Operand::Value(handle)));
+        tail.unwrap_or(Operand::Const(Const::Unit))
+    }
+}
+
+/// Lower one expression with explicit child-first work items for every eager HIR edge.
+///
+/// Structured control remains in its dedicated lowering helpers because its children occupy
+/// distinct MIR blocks. Those helpers re-enter this function for each selected child; eager chains
+/// below those boundaries still use this worklist rather than native recursion.
+fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    let key = root as *const hir::Expr as usize;
+    if b.ctx.eager_expr_active
+        && let Some(result) = b.ctx.eager_expr_results.get(&key)
+    {
+        return result.clone();
+    }
+
+    let owns_results = !b.ctx.eager_expr_active;
+    if owns_results {
+        b.ctx.eager_expr_active = true;
+        debug_assert!(b.ctx.eager_expr_results.is_empty());
+    }
+
+    enum Work<'a> {
+        Enter(&'a hir::Expr),
+        Exit(&'a hir::Expr),
+    }
+
+    let mut work = vec![Work::Enter(root)];
+    let mut terminated = false;
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(expression) => {
+                let expression_key = expression as *const hir::Expr as usize;
+                if b.ctx.eager_expr_results.contains_key(&expression_key) {
+                    continue;
+                }
+                if expression_uses_out_of_line_dispatch(expression) {
+                    let result = lower_out_of_line_expr(b, expression);
+                    b.ctx.eager_expr_results.insert(expression_key, result);
+                    if !lowering_continues(b) {
+                        terminated = true;
+                        break;
+                    }
+                    continue;
+                }
+                if !expression_uses_eager_worklist(expression) {
+                    let result = lower_expr_recursive(b, expression);
+                    b.ctx.eager_expr_results.insert(expression_key, result);
+                    if !lowering_continues(b) {
+                        terminated = true;
+                        break;
+                    }
+                    continue;
+                }
+                work.push(Work::Exit(expression));
+                let children = align_sema::direct_expr_children(expression);
+                work.extend(children.into_iter().rev().map(Work::Enter));
+            }
+            Work::Exit(expression) => {
+                let result = lower_expr_recursive(b, expression);
+                b.ctx
+                    .eager_expr_results
+                    .insert(expression as *const hir::Expr as usize, result);
+                if !lowering_continues(b) {
+                    terminated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let result = if terminated {
+        terminated_operand()
+    } else {
+        b.ctx
+            .eager_expr_results
+            .get(&key)
+            .cloned()
+            .expect("the eager worklist lowers its root")
+    };
+    if owns_results {
+        b.ctx.eager_expr_results.clear();
+        b.ctx.eager_expr_active = false;
+    }
+    result
+}
+
+fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
     'lower_expr: {
         // Keep every required-child failure in this giant recursive dispatcher on one common exit.
         // Separate `return Const::Unit` expansions make debug LLVM reserve one return temporary per
@@ -13701,6 +13924,8 @@ mod tests {
                 slot_borrow_owners: Default::default(),
                 dbg: None,
                 fn_types: Rc::from(Vec::<hir::FnTy>::new()),
+                eager_expr_results: std::collections::HashMap::new(),
+                eager_expr_active: false,
             }),
         };
         let entry = builder.new_block();

@@ -175,6 +175,81 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Int(0),
+        ty: int(32),
+        span,
+    };
+    for expression_depth in 2..depth {
+        let ty = expr.ty;
+        expr = match expression_depth % 4 {
+            0 => hir::Expr {
+                kind: hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Add,
+                    lhs: Box::new(expr),
+                    rhs: Box::new(hir::Expr {
+                        kind: hir::ExprKind::Int(1),
+                        ty,
+                        span,
+                    }),
+                },
+                ty,
+                span,
+            },
+            1 => hir::Expr {
+                kind: hir::ExprKind::Unary {
+                    op: align_ast::UnOp::Neg,
+                    expr: Box::new(expr),
+                },
+                ty,
+                span,
+            },
+            2 => {
+                let ty = if ty == int(32) { int(64) } else { int(32) };
+                hir::Expr {
+                    kind: hir::ExprKind::Cast(Box::new(expr)),
+                    ty,
+                    span,
+                }
+            }
+            _ => hir::Expr {
+                kind: hir::ExprKind::Call {
+                    func: "id".to_string(),
+                    args: vec![expr],
+                    type_args: Vec::new(),
+                },
+                ty,
+                span,
+            },
+        };
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_mixed_eager".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 fn with_template_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
@@ -348,6 +423,360 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_if_branch_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 3, "the root Block, If, and branch Expr need depth three");
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let option_unit = Ty::Option(Scalar::Unit);
+    let mut expr = if target_expr_depth.is_multiple_of(2) {
+        hir::Expr {
+            kind: hir::ExprKind::OptionSome(Box::new(hir::Expr {
+                kind: hir::ExprKind::Unit,
+                ty: Ty::Unit,
+                span,
+            })),
+            ty: option_unit,
+            span,
+        }
+    } else {
+        hir::Expr {
+            kind: hir::ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        }
+    };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    while expr_depth < target_expr_depth {
+        let ty = expr.ty;
+        let else_value = hir::Expr {
+            kind: if ty == option_unit {
+                hir::ExprKind::OptionNone
+            } else {
+                hir::ExprKind::Unit
+            },
+            ty,
+            span,
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::If {
+                cond: Box::new(hir::Expr {
+                    kind: hir::ExprKind::Bool(true),
+                    ty: Ty::Bool,
+                    span,
+                }),
+                then: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(expr)),
+                },
+                els: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(else_value)),
+                },
+            },
+            ty,
+            span,
+        };
+        expr_depth += 2;
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_if_branch".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_binary_match_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 3, "the root Block, Match, and arm Expr need depth three");
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let option_unit = Ty::Option(Scalar::Unit);
+    let mut expr = if target_expr_depth.is_multiple_of(2) {
+        hir::Expr {
+            kind: hir::ExprKind::OptionSome(Box::new(hir::Expr {
+                kind: hir::ExprKind::Unit,
+                ty: Ty::Unit,
+                span,
+            })),
+            ty: option_unit,
+            span,
+        }
+    } else {
+        hir::Expr {
+            kind: hir::ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        }
+    };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    while expr_depth < target_expr_depth {
+        let ty = expr.ty;
+        let default_body = hir::Expr {
+            kind: if ty == option_unit {
+                hir::ExprKind::OptionNone
+            } else {
+                hir::ExprKind::Unit
+            },
+            ty,
+            span,
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::Match {
+                scrutinee: Box::new(hir::Expr {
+                    kind: hir::ExprKind::OptionNone,
+                    ty: option_unit,
+                    span,
+                }),
+                arms: vec![
+                    hir::MatchArm {
+                        variants: vec![0],
+                        bindings: Vec::new(),
+                        body: expr,
+                    },
+                    hir::MatchArm {
+                        variants: Vec::new(),
+                        bindings: Vec::new(),
+                        body: default_body,
+                    },
+                ],
+            },
+            ty,
+            span,
+        };
+        expr_depth += 2;
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_binary_match".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let option_bool = Ty::Option(Scalar::Bool);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Bool(true),
+        ty: Ty::Bool,
+        span,
+    };
+    for expression_depth in 2..depth {
+        expr = if expression_depth.is_multiple_of(2) {
+            hir::Expr {
+                kind: hir::ExprKind::Binary {
+                    op: align_ast::BinOp::And,
+                    lhs: Box::new(hir::Expr {
+                        kind: hir::ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    }),
+                    rhs: Box::new(expr),
+                },
+                ty: Ty::Bool,
+                span,
+            }
+        } else {
+            hir::Expr {
+                kind: hir::ExprKind::ElseUnwrap {
+                    opt: Box::new(hir::Expr {
+                        kind: hir::ExprKind::OptionSome(Box::new(hir::Expr {
+                            kind: hir::ExprKind::Bool(false),
+                            ty: Ty::Bool,
+                            span,
+                        })),
+                        ty: option_bool,
+                        span,
+                    }),
+                    fallback: Box::new(expr),
+                },
+                ty: Ty::Bool,
+                span,
+            }
+        };
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_conditional_operand".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::Bool,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let option_unit = Ty::Option(Scalar::Unit);
+    let mut expr = if target_expr_depth.is_multiple_of(2) {
+        hir::Expr {
+            kind: hir::ExprKind::OptionSome(Box::new(hir::Expr {
+                kind: hir::ExprKind::Unit,
+                ty: Ty::Unit,
+                span,
+            })),
+            ty: option_unit,
+            span,
+        }
+    } else {
+        hir::Expr {
+            kind: hir::ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        }
+    };
+    let mut expr_depth = if target_expr_depth.is_multiple_of(2) { 2 } else { 1 };
+    while expr_depth < target_expr_depth {
+        let ty = expr.ty;
+        let block = hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        };
+        expr = hir::Expr {
+            kind: if expr_depth.is_multiple_of(4) {
+                hir::ExprKind::Arena(block)
+            } else {
+                hir::ExprKind::TaskGroup(block)
+            },
+            ty,
+            span,
+        };
+        expr_depth += 2;
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_scoped_control".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_loop_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Int(0),
+        ty: int(64),
+        span,
+    };
+    let mut expr_depth = 1usize;
+    for _ in 0..(target_expr_depth - 1) % 3 {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            ty: int(64),
+            span,
+        };
+        expr_depth += 1;
+    }
+    while expr_depth < target_expr_depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Break {
+                        value: Some(expr),
+                        accepted: true,
+                    }],
+                    value: None,
+                },
+                diverges: false,
+                body_locals: 0..0,
+            },
+            ty: int(64),
+            span,
+        };
+        expr_depth += 3;
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_loop".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: int(64),
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 fn with_stage_body_depth(depth: usize) -> hir::Program {
     assert!(
         depth >= 4,
@@ -422,52 +851,72 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
 
 #[test]
 fn checked_hir_depth_closure_matrix() {
-    for make_program in [
-        with_unary_body_depth as fn(usize) -> hir::Program,
-        with_template_body_depth,
-        with_block_stmt_body_depth,
-        with_match_arm_body_depth,
-        with_stage_body_depth,
-    ] {
-        for depth in [
-            align_sema::MAX_CHECKED_HIR_DEPTH - 1,
-            align_sema::MAX_CHECKED_HIR_DEPTH,
-        ] {
-            let program = make_program(depth);
-            assert!(
-                align_sema::checked_hir_body_depth_is_valid(&program),
-                "valid checked-HIR depth {depth} was rejected"
-            );
-            assert_accepted("checked-HIR depth boundary", &program);
-        }
-    }
+    std::thread::Builder::new()
+        .name("checked-hir-depth-mir-owner".to_string())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for make_program in [
+                with_unary_body_depth as fn(usize) -> hir::Program,
+                with_mixed_eager_body_depth,
+                with_template_body_depth,
+                with_block_stmt_body_depth,
+                with_match_arm_body_depth,
+                with_if_branch_body_depth,
+                with_binary_match_body_depth,
+                with_conditional_operand_body_depth,
+                with_scoped_control_body_depth,
+                with_loop_body_depth,
+                with_stage_body_depth,
+            ] {
+                for depth in [
+                    align_sema::MAX_CHECKED_HIR_DEPTH - 1,
+                    align_sema::MAX_CHECKED_HIR_DEPTH,
+                ] {
+                    let program = make_program(depth);
+                    assert!(
+                        align_sema::checked_hir_body_depth_is_valid(&program),
+                        "valid checked-HIR depth {depth} was rejected"
+                    );
+                    assert_accepted("checked-HIR depth boundary", &program);
+                }
+            }
 
-    let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
-    let source_map = SourceMap::new();
-    for make_program in [
-        with_unary_body_depth as fn(usize) -> hir::Program,
-        with_template_body_depth,
-        with_block_stmt_body_depth,
-        with_match_arm_body_depth,
-        with_stage_body_depth,
-    ] {
-        let program = make_program(depth);
-        assert!(
-            !align_sema::checked_hir_body_depth_is_valid(&program),
-            "over-bound checked-HIR depth {depth} was accepted"
-        );
-        for lowered in [
-            lower_program(&program),
-            lower_program_located(&program, &source_map),
-            lower_program_per_unit(&program),
-            lower_program_per_unit_located(&program, &source_map),
-        ] {
-            assert!(
-                is_empty(&lowered),
-                "an over-bound body published partial MIR"
-            );
-        }
-    }
+            let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
+            let source_map = SourceMap::new();
+            for make_program in [
+                with_unary_body_depth as fn(usize) -> hir::Program,
+                with_mixed_eager_body_depth,
+                with_template_body_depth,
+                with_block_stmt_body_depth,
+                with_match_arm_body_depth,
+                with_if_branch_body_depth,
+                with_binary_match_body_depth,
+                with_conditional_operand_body_depth,
+                with_scoped_control_body_depth,
+                with_loop_body_depth,
+                with_stage_body_depth,
+            ] {
+                let program = make_program(depth);
+                assert!(
+                    !align_sema::checked_hir_body_depth_is_valid(&program),
+                    "over-bound checked-HIR depth {depth} was accepted"
+                );
+                for lowered in [
+                    lower_program(&program),
+                    lower_program_located(&program, &source_map),
+                    lower_program_per_unit(&program),
+                    lower_program_per_unit_located(&program, &source_map),
+                ] {
+                    assert!(
+                        is_empty(&lowered),
+                        "an over-bound body published partial MIR"
+                    );
+                }
+            }
+        })
+        .expect("spawn checked-HIR depth MIR owner")
+        .join()
+        .expect("checked-HIR depth MIR owner");
 }
 
 #[test]

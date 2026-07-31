@@ -419,9 +419,15 @@ The same review found a separate stack-safety closure. The constructor/parser au
 proved conservative checked-HIR producer ceiling; it does not claim a syntactic program reaches the
 minimum possible ceiling. This avoids relying on apparent maximum-depth shapes that the shared
 parser recursion counter or template-hole grammar cannot construct. Am-d accepts handcrafted depth
-259, rejects depth 260 before semantic consumption, and converts producer replay
-and all four MIR-lowering paths to explicit enter/exit worklists; 258/259/260 raw, coercion,
-structural, whole/per-unit, and LLVM owners run on the 2 MiB test stack. Am-g-t intentionally
+259, rejects depth 260 before semantic consumption, and converts producer replay to explicit
+enter/exit worklists. All four MIR-lowering paths use a heterogeneous worklist for strict eager
+spines, immediate parent-owned continuations for multi-child ownership boundaries, and small
+out-of-line structured-control frames bounded by the fixed 259 ceiling; mixed eager/call,
+block/template, `if`, binary/wildcard `match`, `else`, short-circuit, loop, and arena/task-group
+boundary owners run on the 2 MiB test stack. The final raw/optimized LLVM owner uses the same
+accepted record boundary, and the deep owned-leaf codegen owner emits the actual recursive Drop on
+that same stack.
+Am-g-t intentionally
 admits every finite header-mediated type DAG with no depth cap, so
 am-d also establishes one common iterative type traversal. Am-p placement, am-n shape comparison,
 am-h signature/summary validation, am-b1–b4 body type relations, and am-c canonical codecs each

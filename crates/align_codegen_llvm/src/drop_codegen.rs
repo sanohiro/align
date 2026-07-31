@@ -1,5 +1,74 @@
 use super::*;
 
+fn index_drop_plan(
+    cache: &mut HashMap<Ty, DropPlan>,
+    root_ty: Ty,
+    root: &DropPlan,
+    structs: &[StructDef],
+    enums: &[EnumDef],
+    tagged: &[hir::TaggedType],
+) {
+    let mut work = vec![(root_ty, root)];
+    while let Some((ty, plan)) = work.pop() {
+        if cache.insert(ty, plan.clone()).is_some() {
+            continue;
+        }
+        match (ty, plan) {
+            (Ty::Tagged(id), _) => {
+                let Some(expanded) = tagged.get(id as usize).map(|entry| match *entry {
+                    hir::TaggedType::Option(payload) => Ty::Option(payload),
+                    hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
+                }) else {
+                    continue;
+                };
+                work.push((expanded, plan));
+            }
+            (Ty::Struct(id), DropPlan::Struct { fields, .. }) => {
+                let Some(definition) = structs.get(id as usize) else {
+                    continue;
+                };
+                for (index, child) in fields.iter().rev() {
+                    if let Some(field) = definition.fields.get(*index as usize) {
+                        work.push((field.ty, child.as_ref()));
+                    }
+                }
+            }
+            (Ty::Option(payload), DropPlan::Option(child)) => {
+                work.push((scalar_to_ty(payload), child.as_ref()));
+            }
+            (Ty::Result(ok, err), DropPlan::Result { ok: ok_plan, err: err_plan }) => {
+                work.push((scalar_to_ty(err), err_plan.as_ref()));
+                work.push((scalar_to_ty(ok), ok_plan.as_ref()));
+            }
+            (Ty::Enum(id), DropPlan::Enum { variants, .. }) => {
+                let Some(definition) = enums.get(id as usize) else {
+                    continue;
+                };
+                for (variant, plans) in definition.variants.iter().zip(variants).rev() {
+                    for (payload, child) in variant.payload.iter().zip(plans).rev() {
+                        work.push((scalar_to_ty(*payload), child.as_ref()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cached_plan_needs_drop(
+    cache: &mut HashMap<Ty, DropPlan>,
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[EnumDef],
+    tagged: &[hir::TaggedType],
+) -> bool {
+    if !cache.contains_key(&ty) {
+        let plan = drop_plan(ty, structs, enums, tagged);
+        index_drop_plan(cache, ty, &plan, structs, enums, tagged);
+    }
+    cache.get(&ty).is_none_or(DropPlan::needs_drop)
+}
+
 impl<'c, 'a> FnGen<'c, 'a> {
     /// Emit recursive cleanup with compiler-owned frames instead of the process stack.
     ///
@@ -50,6 +119,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             },
         }
 
+        let mut drop_plans = HashMap::new();
+        let _ = cached_plan_needs_drop(
+            &mut drop_plans,
+            ty,
+            self.structs,
+            self.enums,
+            self.tagged_defs,
+        );
         let mut work = vec![Work::Drop { base, ty }];
         while let Some(item) = work.pop() {
             match item {
@@ -120,8 +197,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let branches = candidates
                             .into_iter()
                             .filter(|(_, _, ty, _)| {
-                                drop_plan(*ty, self.structs, self.enums, self.tagged_defs)
-                                    .needs_drop()
+                                cached_plan_needs_drop(
+                                    &mut drop_plans,
+                                    *ty,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_defs,
+                                )
                             })
                             .map(|(tag, field, ty, name)| {
                                 (tag, field, ty, self.ctx.append_basic_block(self.func, name))
@@ -177,8 +259,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                     .enumerate()
                                     .filter_map(|(payload_index, scalar)| {
                                         let ty = scalar_to_ty(*scalar);
-                                        drop_plan(ty, self.structs, self.enums, self.tagged_defs)
-                                            .needs_drop()
+                                        cached_plan_needs_drop(
+                                            &mut drop_plans,
+                                            ty,
+                                            self.structs,
+                                            self.enums,
+                                            self.tagged_defs,
+                                        )
                                             .then_some((
                                                 variant.field_base + payload_index as u32,
                                                 ty,
@@ -407,7 +494,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             )
                     );
                     if !fixed_move_array
-                        && !drop_plan(ty, self.structs, self.enums, self.tagged_defs).needs_drop()
+                        && !cached_plan_needs_drop(
+                            &mut drop_plans,
+                            ty,
+                            self.structs,
+                            self.enums,
+                            self.tagged_defs,
+                        )
                     {
                         continue;
                     }

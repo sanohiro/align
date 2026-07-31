@@ -27,7 +27,7 @@ mod drop_codegen;
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{
-    ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
+    DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
@@ -13225,38 +13225,109 @@ mod tests {
         program
     }
 
+    fn mixed_hir_at_body_depth(depth: usize) -> hir::Program {
+        assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+        let mut program = unary_hir_at_body_depth(2);
+        let function = &mut program.fns[0];
+        let span = function.span;
+        let mut expression = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: Ty::Int(align_sema::IntTy {
+                bits: 32,
+                signed: true,
+            }),
+            span,
+        };
+        for expression_depth in 2..depth {
+            let ty = expression.ty;
+            expression = match expression_depth % 3 {
+                0 => hir::Expr {
+                    kind: hir::ExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(expression),
+                        rhs: Box::new(hir::Expr {
+                            kind: hir::ExprKind::Int(1),
+                            ty,
+                            span,
+                        }),
+                    },
+                    ty,
+                    span,
+                },
+                1 => hir::Expr {
+                    kind: hir::ExprKind::Unary {
+                        op: align_ast::UnOp::Neg,
+                        expr: Box::new(expression),
+                    },
+                    ty,
+                    span,
+                },
+                _ => {
+                    let ty = match ty {
+                        Ty::Int(align_sema::IntTy { bits: 32, .. }) => {
+                            Ty::Int(align_sema::IntTy {
+                                bits: 64,
+                                signed: true,
+                            })
+                        }
+                        _ => Ty::Int(align_sema::IntTy {
+                            bits: 32,
+                            signed: true,
+                        }),
+                    };
+                    hir::Expr {
+                        kind: hir::ExprKind::Cast(Box::new(expression)),
+                        ty,
+                        span,
+                    }
+                }
+            };
+        }
+        function.ret = expression.ty;
+        function.body = hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        };
+        program
+    }
+
     #[test]
     fn checked_hir_depth_closure_matrix() {
         std::thread::Builder::new()
             .name("checked-hir-depth-codegen-owner".to_string())
             .stack_size(2 * 1024 * 1024)
             .spawn(|| {
-                for depth in [
-                    align_sema::MAX_CHECKED_HIR_DEPTH - 1,
-                    align_sema::MAX_CHECKED_HIR_DEPTH,
+                for make_hir in [
+                    unary_hir_at_body_depth as fn(usize) -> hir::Program,
+                    mixed_hir_at_body_depth,
                 ] {
-                    let hir = unary_hir_at_body_depth(depth);
-                    assert!(
-                        align_sema::checked_hir_body_depth_is_valid(&hir),
-                        "valid checked-HIR depth {depth} was rejected"
-                    );
-                    let mir = lower_program(&hir);
-                    assert!(!mir.fns.is_empty(), "valid depth {depth} did not reach MIR");
-                    for optimized in [false, true] {
-                        let llvm = emit_llvm_ir(
-                            &mir,
-                            &BuildTarget::Baseline,
-                            optimized,
-                            &[],
-                            None,
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("depth {depth}, optimized={optimized}: {error}")
-                        });
+                    for depth in [
+                        align_sema::MAX_CHECKED_HIR_DEPTH - 1,
+                        align_sema::MAX_CHECKED_HIR_DEPTH,
+                    ] {
+                        let hir = make_hir(depth);
                         assert!(
-                            llvm.contains("define") && llvm.contains("@main("),
-                            "depth {depth}, optimized={optimized}: main was not emitted"
+                            align_sema::checked_hir_body_depth_is_valid(&hir),
+                            "valid checked-HIR depth {depth} was rejected"
                         );
+                        let mir = lower_program(&hir);
+                        assert!(!mir.fns.is_empty(), "valid depth {depth} did not reach MIR");
+                        for optimized in [false, true] {
+                            let llvm = emit_llvm_ir(
+                                &mir,
+                                &BuildTarget::Baseline,
+                                optimized,
+                                &[],
+                                None,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("depth {depth}, optimized={optimized}: {error}")
+                            });
+                            assert!(
+                                llvm.contains("define") && llvm.contains("@main("),
+                                "depth {depth}, optimized={optimized}: main was not emitted"
+                            );
+                        }
                     }
                 }
 
@@ -15256,7 +15327,7 @@ mod tests {
         const DEPTH: usize = 4096;
         std::thread::Builder::new()
             .name("deep-type-codegen-owner".to_string())
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(2 * 1024 * 1024)
             .spawn(|| {
                 let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
                 let structs = (0..DEPTH)

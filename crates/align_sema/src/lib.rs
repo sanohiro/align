@@ -16,7 +16,9 @@ use align_span::Span;
 pub mod hir;
 pub use hir::*;
 mod hir_depth;
-pub use hir_depth::{MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid};
+pub use hir_depth::{
+    MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
+};
 mod type_layout;
 pub use type_layout::{TypeLayoutCache, ty_abi_layout};
 
@@ -976,23 +978,74 @@ fn json_encodable_scalar(s: Scalar) -> bool {
 /// *how* each leaf is lowered, while this plan is the single answer to which live children need
 /// cleanup. `Option`/`Result`/sum nodes retain their tag shape even when all current payloads are
 /// Copy, so admitting another finite Move payload cannot silently bypass the recursive walk.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DropPlanRef(Option<std::sync::Arc<DropPlan>>);
+
+impl DropPlanRef {
+    fn new(plan: DropPlan) -> Self {
+        Self(Some(std::sync::Arc::new(plan)))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        match (&left.0, &right.0) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl AsRef<DropPlan> for DropPlanRef {
+    fn as_ref(&self) -> &DropPlan {
+        self.0
+            .as_deref()
+            .expect("a live DropPlan reference has one node")
+    }
+}
+
+impl Clone for DropPlanRef {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for DropPlanRef {
+    type Target = DropPlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl Drop for DropPlanRef {
+    fn drop(&mut self) {
+        let Some(root) = self.0.take() else { return };
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            let Ok(mut plan) = std::sync::Arc::try_unwrap(node) else {
+                continue;
+            };
+            plan.take_owned_children(&mut work);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DropPlan {
     None,
     Leaf(Ty),
     Struct {
         id: u32,
-        fields: Vec<(u32, std::sync::Arc<DropPlan>)>,
+        fields: Vec<(u32, DropPlanRef)>,
         needs_drop: bool,
     },
-    Option(std::sync::Arc<DropPlan>),
+    Option(DropPlanRef),
     Result {
-        ok: std::sync::Arc<DropPlan>,
-        err: std::sync::Arc<DropPlan>,
+        ok: DropPlanRef,
+        err: DropPlanRef,
     },
     Enum {
         id: u32,
-        variants: Vec<Vec<std::sync::Arc<DropPlan>>>,
+        variants: Vec<Vec<DropPlanRef>>,
         needs_drop: bool,
     },
     /// A malformed or cyclic resolved definition. Sema diagnoses the definition separately; the
@@ -1001,6 +1054,34 @@ pub enum DropPlan {
 }
 
 impl DropPlan {
+    fn take_owned_children(&mut self, work: &mut Vec<std::sync::Arc<DropPlan>>) {
+        let mut take = |reference: &mut DropPlanRef| {
+            if let Some(node) = reference.0.take() {
+                work.push(node);
+            }
+        };
+        match self {
+            DropPlan::Struct { fields, .. } => {
+                for (_, field) in fields {
+                    take(field);
+                }
+            }
+            DropPlan::Option(payload) => take(payload),
+            DropPlan::Result { ok, err } => {
+                take(ok);
+                take(err);
+            }
+            DropPlan::Enum { variants, .. } => {
+                for variant in variants {
+                    for payload in variant {
+                        take(payload);
+                    }
+                }
+            }
+            DropPlan::None | DropPlan::Leaf(_) | DropPlan::Invalid => {}
+        }
+    }
+
     pub fn needs_drop(&self) -> bool {
         let mut work = vec![self];
         while let Some(plan) = work.pop() {
@@ -1070,7 +1151,7 @@ pub fn drop_plan(
 ) -> DropPlan {
     #[derive(Clone)]
     struct Built {
-        plan: std::sync::Arc<DropPlan>,
+        plan: DropPlanRef,
         needs_drop: bool,
     }
 
@@ -1084,11 +1165,11 @@ pub fn drop_plan(
     }
 
     let none = || Built {
-        plan: std::sync::Arc::new(DropPlan::None),
+        plan: DropPlanRef::new(DropPlan::None),
         needs_drop: false,
     };
     let invalid = || Built {
-        plan: std::sync::Arc::new(DropPlan::Invalid),
+        plan: DropPlanRef::new(DropPlan::Invalid),
         needs_drop: true,
     };
     let mut struct_cache = HashMap::<u32, Built>::new();
@@ -1220,7 +1301,7 @@ pub fn drop_plan(
                 ) =>
             {
                 built.push(Built {
-                    plan: std::sync::Arc::new(DropPlan::Leaf(ty)),
+                    plan: DropPlanRef::new(DropPlan::Leaf(ty)),
                     needs_drop: true,
                 });
             }
@@ -1235,7 +1316,7 @@ pub fn drop_plan(
                 let children = built.drain(start..).collect::<Vec<_>>();
                 let needs_drop = children.iter().any(|child| child.needs_drop);
                 let plan = Built {
-                    plan: std::sync::Arc::new(DropPlan::Struct {
+                    plan: DropPlanRef::new(DropPlan::Struct {
                         id,
                         fields: children
                             .into_iter()
@@ -1253,7 +1334,7 @@ pub fn drop_plan(
             Work::ExitOption => {
                 let payload = built.pop().expect("option child plan");
                 built.push(Built {
-                    plan: std::sync::Arc::new(DropPlan::Option(payload.plan)),
+                    plan: DropPlanRef::new(DropPlan::Option(payload.plan)),
                     needs_drop: payload.needs_drop,
                 });
             }
@@ -1262,7 +1343,7 @@ pub fn drop_plan(
                 let ok = built.pop().expect("result ok plan");
                 let needs_drop = ok.needs_drop || err.needs_drop;
                 built.push(Built {
-                    plan: std::sync::Arc::new(DropPlan::Result {
+                    plan: DropPlanRef::new(DropPlan::Result {
                         ok: ok.plan,
                         err: err.plan,
                     }),
@@ -1286,7 +1367,7 @@ pub fn drop_plan(
                     })
                     .collect();
                 let plan = Built {
-                    plan: std::sync::Arc::new(DropPlan::Enum {
+                    plan: DropPlanRef::new(DropPlan::Enum {
                         id,
                         variants,
                         needs_drop,
@@ -36613,44 +36694,59 @@ fn main() -> i32 = 0
             panic!("root plan must be a struct");
         };
         assert!(
-            std::sync::Arc::ptr_eq(&fields[0].1, &fields[1].1),
+            DropPlanRef::ptr_eq(&fields[0].1, &fields[1].1),
             "repeated nominal children must share one memoized DropPlan node"
         );
     }
 
     #[test]
     fn drop_plan_handles_a_deep_linear_nominal_chain() {
-        let mut structs = vec![StructDef {
-            name: "S0".to_string(),
-            source_name: "S0".to_string(),
-            fields: vec![FieldDef {
-                name: "copy".to_string(),
-                ty: Ty::Bool,
-            }],
-            align: None,
-            c_repr: false,
-        }];
-        for depth in 1..4_096 {
-            structs.push(StructDef {
-                name: format!("S{depth}"),
-                source_name: format!("S{depth}"),
-                fields: vec![FieldDef {
-                    name: "next".to_string(),
-                    ty: Ty::Struct((depth - 1) as u32),
-                }],
-                align: None,
-                c_repr: false,
-            });
-        }
-        let plan = drop_plan(Ty::Struct(4_095), &structs, &[], &[]);
-        assert!(
-            plan.is_valid(),
-            "a deep finite DropPlan must remain valid without recursive inspection"
-        );
-        assert!(
-            !plan.needs_drop(),
-            "ID-indexed visitation must classify a deep Copy chain without path scans"
-        );
+        std::thread::Builder::new()
+            .name("deep-drop-plan-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 65_536;
+                let mut structs = vec![StructDef {
+                    name: "S0".to_string(),
+                    source_name: "S0".to_string(),
+                    fields: vec![FieldDef {
+                        name: "copy".to_string(),
+                        ty: Ty::Bool,
+                    }],
+                    align: None,
+                    c_repr: false,
+                }];
+                for depth in 1..DEPTH {
+                    structs.push(StructDef {
+                        name: format!("S{depth}"),
+                        source_name: format!("S{depth}"),
+                        fields: vec![FieldDef {
+                            name: "next".to_string(),
+                            ty: Ty::Struct((depth - 1) as u32),
+                        }],
+                        align: None,
+                        c_repr: false,
+                    });
+                }
+                let plan = drop_plan(
+                    Ty::Struct((DEPTH - 1) as u32),
+                    &structs,
+                    &[],
+                    &[],
+                );
+                assert!(
+                    plan.is_valid(),
+                    "a deep finite DropPlan must remain valid without recursive inspection"
+                );
+                assert!(
+                    !plan.needs_drop(),
+                    "ID-indexed visitation must classify a deep Copy chain without path scans"
+                );
+                drop(plan);
+            })
+            .expect("spawn deep DropPlan owner")
+            .join()
+            .expect("deep DropPlan owner");
     }
 
     #[test]
