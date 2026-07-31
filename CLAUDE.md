@@ -335,6 +335,10 @@ formatting churn, or elapsed agent activity.
 
 - After the narrow source-of-truth read, reach a compiling, owner-test-backed
   implementation checkpoint within 60 minutes.
+- Before coding an exact public or compiler-boundary slice, translate every
+  `every`/`exact` acceptance phrase and every named build path into an explicit
+  owner-test closure checklist. Enumerate the Cartesian cells and mutate malformed
+  records one field at a time; representative samples do not close an exact contract.
 - Keep the existing two-hour PR-ready limit. If the checkpoint cannot be made
   mergeable by then, reduce it to the next smaller correct vertical slice and
   record the reason in `HANDOFF.md`.
