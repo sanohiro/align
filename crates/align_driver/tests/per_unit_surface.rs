@@ -100,7 +100,7 @@ fn n1_object_and_exe_identical_across_all_profiles() {
     }
     // A tiny single-file program (keeps the emit×profile matrix fast). Its `pub` fn stays internal in
     // the entry unit (nothing imports the entry), so the per-unit object equals the whole-program one.
-    let src = "pub fn helper(x: i64) -> i64 = x + 1\nfn main() -> i64 {\n  return helper(41)\n}\n";
+    let src = "pub fn helper(x: i64) -> i64 = x + 1\nfn main() -> i32 {\n  return helper(41) as i32\n}\n";
 
     let mut sm_wp = SourceMap::new();
     let checked = check(&mut sm_wp, "n1.align", src);
@@ -250,7 +250,7 @@ fn cli_build_run_size_match_library_reference() {
 // ---- 3. emit-obj multi-file (filenames, visibility, --export) ------------------------------------
 
 const MATH_UNIT: &str = "module util.math\nfn sq(x: i64) -> i64 = x * x\npub fn cube(x: i64) -> i64 = sq(x) * x\n";
-const APP_UNIT: &str = "module main\nimport util.math\nfn helper(x: i64) -> i64 = x + 1\nfn main() -> i64 {\n  return util.math.cube(3) + helper(1)\n}\n";
+const APP_UNIT: &str = "module main\nimport util.math\nfn helper(x: i64) -> i64 = x + 1\nfn main() -> i32 {\n  return (util.math.cube(3) + helper(1)) as i32\n}\n";
 
 fn math_app_proj(tag: &str) -> Proj {
     Proj::new(tag, &[("util/math.align", MATH_UNIT), ("main.align", APP_UNIT)])
@@ -352,7 +352,7 @@ fn emit_llvm_n1_has_no_banner_and_matches_whole_program() {
     if !backend() {
         return;
     }
-    let src = "fn main() -> i64 {\n  return [1, 2, 3].sum()\n}\n";
+    let src = "fn main() -> i32 {\n  return [1, 2, 3].sum() as i32\n}\n";
     let proj = Proj::new("emit-llvm-n1", &[("solo.align", src)]);
     let cli = proj.run(&["emit-llvm", "solo.align"]);
     assert!(cli.status.success(), "emit-llvm failed: {}", String::from_utf8_lossy(&cli.stderr));
@@ -391,7 +391,7 @@ fn emit_llvm_optimized_leaves_cross_unit_call_opaque() {
 // ---- 5. explain-opt multi-file -------------------------------------------------------------------
 
 const SCALE_UNIT: &str = "module util.math\npub fn scale(xs: array<i64>) -> i64 = xs.map(dbl).sum()\nfn dbl(x: i64) -> i64 = x * 2\n";
-const SCALE_MAIN: &str = "module main\nimport util.math\nfn main() -> i64 {\n  return util.math.scale([1, 2, 3, 4, 5, 6, 7, 8].to_array())\n}\n";
+const SCALE_MAIN: &str = "module main\nimport util.math\nfn main() -> i32 {\n  return util.math.scale([1, 2, 3, 4, 5, 6, 7, 8].to_array()) as i32\n}\n";
 
 #[test]
 fn explain_opt_multi_file_has_per_unit_sections() {
@@ -417,7 +417,7 @@ fn explain_opt_single_file_has_no_section_header() {
     if !backend() {
         return;
     }
-    let src = "fn main() -> i64 {\n  return [1, 2, 3].sum()\n}\n";
+    let src = "fn main() -> i32 {\n  return [1, 2, 3].sum() as i32\n}\n";
     let proj = Proj::new("explain-solo", &[("solo.align", src)]);
     let out = proj.run(&["explain-opt", "solo.align"]);
     assert!(out.status.success(), "explain-opt failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -455,7 +455,7 @@ fn size_multi_file_reports_the_final_executable() {
 const DAG_C: &str = "module c\npub fn base() -> i64 = 1\n";
 const DAG_A: &str = "module a\nimport c\npub fn av() -> i64 = c.base() + 1\n";
 const DAG_B: &str = "module b\nimport c\npub fn bv() -> i64 = c.base() + 2\n";
-const DAG_MAIN: &str = "module main\nimport a\nimport b\nfn main() -> i64 {\n  return a.av() + b.bv()\n}\n";
+const DAG_MAIN: &str = "module main\nimport a\nimport b\nfn main() -> i32 {\n  return (a.av() + b.bv()) as i32\n}\n";
 
 #[test]
 fn multi_unit_dag_builds_byte_identically_twice() {

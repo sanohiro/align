@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #679. L2b-a2-am-d
-checked-HIR/type-DAG stack safety is complete; am-e exact entry ABI is next.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #679. The current
+branch completes the exact L2b-a2-am-e source/C entry ABI; am-f return completeness is next.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -391,9 +391,10 @@ point and a conflicting Wait-coverage sentence. The ledger now uses stable synta
 computes loop headers to a monotone fixed point before joining breaks, and keeps established
 completion across a later unhandled no-task Wait. The final review, repository gate, and merge
 completed in #678. PR #679 completes am-d with exact producer-valid depth owners and
-stack-safe checked-HIR/type-DAG consumers.
-The remaining reviewed order is am-e exact entry ABI,
-am-f non-Unit return completeness, am-w
+stack-safe checked-HIR/type-DAG consumers. This implementation completes am-e by restricting
+the entry producer to Unit, signed i32, or exact `Result<(), Error>`, preserving exact whole/per-unit
+and ThinLTO C entry behavior, and rejecting malformed MIR entry ABI before LLVM construction.
+The remaining reviewed order is am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
 extern invocation, am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
@@ -589,14 +590,14 @@ Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate and a2-am-d. #679 completes am-d; the
-remaining sequence is a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, and a2-am-e. #679 completes
+am-d and this implementation completes am-e; the remaining sequence is a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; after am-d, am-e is the next implementation slice. The required milestone order
+#678; after am-e, am-f is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and

@@ -4230,7 +4230,7 @@ pub fn check_program_with_interface_facts(
         }
         // `main` is the program entry; it cannot be a generic template (no concrete instance would
         // be generated, so the entry point would vanish).
-        if f.name.name == "main" && !tparams.is_empty() {
+        if mangled == "main" && !tparams.is_empty() {
             diags.error("main cannot be generic".to_string(), f.span);
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
@@ -18870,7 +18870,21 @@ impl<'a, 't> Checker<'a, 't> {
                         work.push(Work::Type(Ty::Struct(id)));
                         work.push(Work::Text("dict_encoded<".to_string()));
                     }
-                    // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
+                    Ty::Tuple(id) => {
+                        let Some(definition) = self.tuples.get(id as usize) else {
+                            output.push_str(&ty_name(ty));
+                            continue;
+                        };
+                        output.push('(');
+                        work.push(Work::Text(")".to_string()));
+                        for (index, &element) in definition.elems.iter().enumerate().rev() {
+                            work.push(Work::Type(scalar_to_ty(element)));
+                            if index > 0 {
+                                work.push(Work::Text(", ".to_string()));
+                            }
+                        }
+                    }
+                    // No id (primitives), or no source name to resolve (fn#) — the free form is fine.
                     _ => output.push_str(&ty_name(ty)),
                 },
             }
@@ -18988,7 +19002,7 @@ impl<'a, 't> Checker<'a, 't> {
                 *t = subst_param_ty(*t, &self.mono_args, self.tagged_types);
             }
         }
-        if f.name.name == "main" {
+        if mangled == "main" {
             let ret_span = f.ret.as_ref().map(|t| t.span()).unwrap_or(f.span);
             // A fallible `main` returns exactly `Result<(), Error>` (draft.md §17): the `Ok`
             // payload must be `()` and the error must be the builtin `Error`. The C-`main`
@@ -19013,6 +19027,20 @@ impl<'a, 't> Checker<'a, 't> {
                         ret_span,
                     );
                 }
+            } else if ret != Ty::Unit
+                && ret != Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                })
+                && ret != Ty::Error
+            {
+                self.diags.error(
+                    format!(
+                        "main returns only (), i32, or Result<(), Error>; got {}",
+                        self.ty_display(ret)
+                    ),
+                    ret_span,
+                );
             }
             // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
             // `Result<(), Error>` return — the argv form is the only one the C-`main` wrapper
@@ -19020,7 +19048,8 @@ impl<'a, 't> Checker<'a, 't> {
             // follow-up). The `Ok`/`E` shape is validated above, so this checks only the parameter
             // shape and that the return is *some* `Result` (one error per root cause).
             if !f.params.is_empty() {
-                let params_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)];
+                let params_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
+                    && sig.param_modes.as_slice() == [ast::ParamMode::ByValue];
                 if !params_ok || !matches!(ret, Ty::Result(..)) {
                     self.diags.error(
                         "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
@@ -36601,6 +36630,253 @@ fn exit_branch(flag: bool) -> i64 {
         // `main(args)` must return Result (the only form the wrapper marshals argv into).
         let (_r, noresult) = check("fn main(args: array<str>) -> i32 = 0\n");
         assert!(noresult.has_errors(), "main(args) with a non-Result return must error");
+    }
+
+    #[test]
+    fn main_signature_matrix() {
+        for (name, source) in [
+            ("implicit-unit", "fn main() {}\n"),
+            ("explicit-unit", "fn main() -> () {}\n"),
+            ("i32", "fn main() -> i32 = 0\n"),
+            (
+                "result",
+                "fn main() -> Result<(), Error> { return Ok(()) }\n",
+            ),
+            (
+                "argv-result",
+                "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{name} is an admitted entry signature: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let rejected = [
+            ("i8", ""),
+            ("i16", ""),
+            ("i64", ""),
+            ("u8", ""),
+            ("u16", ""),
+            ("u32", ""),
+            ("u64", ""),
+            ("f32", ""),
+            ("f64", ""),
+            ("bool", ""),
+            ("char", ""),
+            ("str", ""),
+            ("string", ""),
+            ("raw", ""),
+            ("array<i64>", ""),
+            ("slice<i64>", ""),
+            ("vec4<i64>", ""),
+            ("mask4<i64>", ""),
+            ("Option<i64>", ""),
+            ("(i64, i64)", ""),
+            ("Record", "Record { value: i64 }\n"),
+            ("array<Record>", "Record { value: i64 }\n"),
+            ("soa<Record>", "Record { value: i64 }\n"),
+            ("json.scanner<Record>", "Record { value: i64 }\n"),
+            ("Choice", "Choice { A, B }\n"),
+            ("json.doc", ""),
+            ("writer", ""),
+            ("reader", ""),
+            ("buffer", ""),
+            ("array_builder<i64>", ""),
+            ("file", ""),
+            ("rng", ""),
+            ("regex", ""),
+            ("captures", ""),
+            ("tcp_conn", ""),
+            ("tcp_listener", ""),
+            ("udp_socket", ""),
+            ("child", ""),
+            ("http_request_ctx", ""),
+            ("http_headers", ""),
+            ("response_builder", ""),
+            ("http_stream", ""),
+        ];
+        for (return_type, prelude) in rejected {
+            let source = format!(
+                "{prelude}fn main() -> {return_type} {{ loop {{}} }}\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                errors.len(),
+                1,
+                "{return_type} must produce exactly one entry-return diagnostic: {:?}",
+                errors
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                errors[0].message,
+                format!(
+                    "main returns only (), i32, or Result<(), Error>; got {return_type}"
+                )
+            );
+            let span = errors[0].span.expect("entry return diagnostic has a span");
+            assert_eq!(
+                &source[span.lo as usize..span.hi as usize],
+                return_type,
+                "entry return diagnostic must point at the return type"
+            );
+        }
+
+        let (_, wrong_result) = check(
+            "MyErr { Bad }\nfn main() -> Result<i32, MyErr> { loop {} }\n",
+        );
+        let messages = wrong_result
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "main's Ok type must be `()` — a fallible main returns `Result<(), Error>`; use `-> i32` to return a value",
+                "main's error type must be the builtin `Error`; user-defined error types in main's return will be allowed once the full Error design lands",
+            ],
+            "wrong Result payload diagnostics keep Ok-before-Error order"
+        );
+
+        let (_, non_result_bad_param) =
+            check("fn main(value: i64) -> i64 { loop {} }\n");
+        let messages = non_result_bad_param
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "main returns only (), i32, or Result<(), Error>; got i64",
+                "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return",
+            ],
+            "return diagnostics precede the parameter-shape diagnostic"
+        );
+
+        let (_, result_bad_param) = check(
+            "fn main(value: i64) -> Result<(), Error> { loop {} }\n",
+        );
+        assert_eq!(result_bad_param.error_count(), 1);
+        assert_eq!(
+            result_bad_param.iter().next().unwrap().message,
+            "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return"
+        );
+
+        for (name, parameters, prelude) in [
+            ("scalar", "value: i64", ""),
+            ("slice", "args: slice<str>", ""),
+            ("wrong-array-element", "args: array<i64>", ""),
+            (
+                "struct-array",
+                "args: array<Record>",
+                "Record { value: i64 }\n",
+            ),
+            (
+                "arity",
+                "first: array<str>, second: array<str>",
+                "",
+            ),
+            ("out-slice", "out args: slice<str>", ""),
+        ] {
+            let source = format!(
+                "{prelude}fn main({parameters}) -> Result<(), Error> {{ loop {{}} }}\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            assert_eq!(
+                errors[0].message,
+                "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return"
+            );
+            let span = errors[0].span.expect("parameter-shape diagnostic has a span");
+            assert_eq!(
+                span.lo as usize,
+                source.find("fn main").unwrap(),
+                "{name} points at the function header"
+            );
+            assert_eq!(
+                &source[span.lo as usize..span.hi as usize],
+                source[source.find("fn main").unwrap()..].trim_end(),
+                "{name} covers the complete function declaration"
+            );
+        }
+
+        let (_, out_argv) = check(
+            "fn main(out args: array<str>) -> Result<(), Error> { loop {} }\n",
+        );
+        let messages = out_argv
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return",
+                "an `out` parameter must be a slice (a writable output buffer), got array<str>",
+            ]
+        );
+
+        let (_, unresolved) = check("fn main() -> Missing { loop {} }\n");
+        assert_eq!(unresolved.error_count(), 1);
+        assert!(unresolved
+            .iter()
+            .all(|diagnostic| !diagnostic.message.starts_with("main returns only")));
+
+        let mut diagnostics = Diagnostics::new();
+        let lib_tokens = tokenize(
+            1,
+            "module lib\npub fn main<T>(value: T) -> T = value\n",
+            &mut diagnostics,
+        );
+        let lib = parse_file(lib_tokens, &mut diagnostics);
+        let entry_tokens = tokenize(
+            0,
+            "module main\nimport lib\nfn main() -> i32 = if lib.main(true) { 0 } else { 1 }\n",
+            &mut diagnostics,
+        );
+        let entry = parse_file(entry_tokens, &mut diagnostics);
+        let modules = [
+            Module {
+                path: "lib".to_string(),
+                file: &lib,
+                is_entry: false,
+                interface_only: false,
+            },
+            Module {
+                path: "main".to_string(),
+                file: &entry,
+                is_entry: true,
+                interface_only: false,
+            },
+        ];
+        let program = check_program(&modules, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "a non-entry generic `main` is an ordinary module function: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(program
+            .fns
+            .iter()
+            .any(|function| function.name.starts_with("lib$main$")));
     }
 
     #[test]

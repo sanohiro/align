@@ -89,7 +89,7 @@ fn no_paren_payload_ctor_rejected() {
 fn binding_count_mismatch_rejected() {
     assert!(check_errs(
         "enum-bindcount",
-        "Shape { Circle(f64) }\nfn main() -> f64 {\n  s := Shape.Circle(1.0)\n  return match s { Circle => 0.0 }\n}\n"
+        "Shape { Circle(f64) }\nfn main() -> i32 {\n  s := Shape.Circle(1.0)\n  return match s { Circle => 0 }\n}\n"
     ));
 }
 

@@ -258,12 +258,33 @@ fn main() {
   print(hot.eq_count(data))
 }
 ";
+    let main_result = "\
+import lib
+fn main() -> Result<(), Error> {
+  print(lib.sumv(lib.mk(20, 22)))
+  return Err(error(23))
+}
+";
+    let main_i32 = "\
+import lib
+fn main() -> i32 = lib.sumv(lib.mk(20, 22)) as i32
+";
+    let main_argv = "\
+import lib
+fn main(args: array<str>) -> Result<(), Error> {
+  print(lib.sumv(lib.mk(20, 22)) + args.len())
+  return Ok(())
+}
+";
 
     #[allow(clippy::type_complexity)]
     let corpus: &[(&str, &[(&str, &str)], &str)] = &[
         ("cp-structgen", &[("lib.align", lib_b), ("main.align", main_b)], "main.align"),
         ("cp-hotfilter", &[("hot.align", hot), ("main.align", main_hot)], "main.align"),
         ("cp-tuple", &[("lib.align", LIB2), ("main.align", MAIN2)], "main.align"),
+        ("cp-i32", &[("lib.align", lib_b), ("main.align", main_i32)], "main.align"),
+        ("cp-result", &[("lib.align", lib_b), ("main.align", main_result)], "main.align"),
+        ("cp-argv", &[("lib.align", lib_b), ("main.align", main_argv)], "main.align"),
     ];
 
     for (name, files, entry) in corpus {

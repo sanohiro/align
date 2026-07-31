@@ -128,7 +128,7 @@ fn verbose_shows_raw_passthrough() {
 /// A compile error → exit 1 (not a report), with a diagnostic, never a panic.
 #[test]
 fn compile_error_exits_one() {
-    let src = write_src("bad", "fn main() -> i64 = no_such_fn()\n");
+    let src = write_src("bad", "fn main() -> i32 = no_such_fn()\n");
     let out = alignc().args(["explain-opt"]).arg(src.path()).output().expect("run alignc");
     assert_eq!(out.status.code(), Some(1), "a compile error must fail cleanly");
     let err = String::from_utf8_lossy(&out.stderr);

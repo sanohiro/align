@@ -368,14 +368,14 @@ Type representation in the compiler (keeps `Ty: Copy`)
   int/float literal defaults there, exactly like a bare literal). This sidesteps
   inference variables living inside a composite type — acceptable for M2.
 
-Runtime ABI for Result-returning main (locked; am-e correction pending)
+Runtime ABI for Result-returning main (locked; am-e correction shipped)
 - The locked entry family supersedes M2's original no-argument-only
   restriction. A no-argument `main` returns only `()`, exact signed `i32`, or
   `Result<(), Error>`. The argv form is exactly
   `main(args: array<str>) -> Result<(), Error>`. Every other return or parameter
   shape must be rejected before HIR/codegen; it must never become an external C
-  `main` with a non-C return ABI. The current checker still accepts that invalid
-  corner; am-e is the pending producer correction.
+  `main` with a non-C return ABI. Am-e rejects that invalid corner before HIR and
+  independently fail-closes malformed MIR before LLVM construction.
 - `fn main() -> i32` stays the C entry unchanged (M0/M1 behavior preserved).
 - `fn main() -> ()` is lowered under the symbol `align_main`; codegen emits a C
   `main` wrapper that calls it and returns 0.
