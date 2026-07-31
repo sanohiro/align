@@ -348,6 +348,78 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_stage_body_depth(depth: usize) -> hir::Program {
+    assert!(
+        depth >= 4,
+        "the root Block, pipeline Expr, Stage, and capture need depth four"
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let array_ty = Ty::Array(scalar_int(64), 1);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::ArraySum {
+            source: Box::new(hir::Expr {
+                kind: hir::ExprKind::Local(0),
+                ty: array_ty,
+                span,
+            }),
+            stages: vec![hir::Stage {
+                kind: hir::StageKind::Map {
+                    func: "id".to_string(),
+                    captures: vec![hir::Expr {
+                        kind: hir::ExprKind::Int(1),
+                        ty: int(64),
+                        span,
+                    }],
+                },
+                out_ty: int(64),
+            }],
+        },
+        ty: int(64),
+        span,
+    };
+    let mut expr_depth = 3;
+    while expr_depth < target_expr_depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            ty: int(64),
+            span,
+        };
+        expr_depth += 1;
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_stage".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: int(64),
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: vec![hir::Local {
+            id: 0,
+            name: "xs".to_string(),
+            ty: array_ty,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 #[test]
 fn checked_hir_depth_closure_matrix() {
     for make_program in [
@@ -355,6 +427,7 @@ fn checked_hir_depth_closure_matrix() {
         with_template_body_depth,
         with_block_stmt_body_depth,
         with_match_arm_body_depth,
+        with_stage_body_depth,
     ] {
         for depth in [
             align_sema::MAX_CHECKED_HIR_DEPTH - 1,
@@ -376,6 +449,7 @@ fn checked_hir_depth_closure_matrix() {
         with_template_body_depth,
         with_block_stmt_body_depth,
         with_match_arm_body_depth,
+        with_stage_body_depth,
     ] {
         let program = make_program(depth);
         assert!(
