@@ -402,6 +402,66 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let bytes_ty = Ty::Slice(Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    }));
+    let result_ty = Ty::Result(Scalar::Str, Scalar::Enum(0));
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Str("x".to_string()),
+        ty: Ty::Str,
+        span,
+    };
+    for _ in 2..depth {
+        expr = match expr.ty {
+            Ty::Str => hir::Expr {
+                kind: hir::ExprKind::StrBytes {
+                    inner: Box::new(expr),
+                },
+                ty: bytes_ty,
+                span,
+            },
+            ty if ty == bytes_ty => hir::Expr {
+                kind: hir::ExprKind::BytesAsStr {
+                    bytes: Box::new(expr),
+                },
+                ty: result_ty,
+                span,
+            },
+            ty if ty == result_ty => hir::Expr {
+                kind: hir::ExprKind::Try(Box::new(expr)),
+                ty: Ty::Str,
+                span,
+            },
+            other => panic!("unexpected bytes/string cycle type: {other:?}"),
+        };
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_bytes_str_cycle".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: expr.ty,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 fn with_regex_string_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
@@ -1080,6 +1140,7 @@ fn checked_hir_depth_closure_matrix() {
                 with_str_trim_body_depth,
                 with_path_string_body_depth,
                 with_reader_buffered_body_depth,
+                with_bytes_str_cycle_body_depth,
                 with_regex_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,
@@ -1112,6 +1173,7 @@ fn checked_hir_depth_closure_matrix() {
                 with_str_trim_body_depth,
                 with_path_string_body_depth,
                 with_reader_buffered_body_depth,
+                with_bytes_str_cycle_body_depth,
                 with_regex_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,

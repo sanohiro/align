@@ -12545,6 +12545,11 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                     ExprKind::Loop { diverges, .. } => {
                         work.push(HirDivergenceWork::Value(*diverges));
                     }
+                    // Both operations terminate the process after their operands (if any) have
+                    // been evaluated. They are Unit-typed only because Align has no Never type.
+                    ExprKind::ProcessExit { .. } | ExprKind::ProcessAbort => {
+                        work.push(HirDivergenceWork::Value(true));
+                    }
                     // Only the left/receiver operand is guaranteed to run. The right/fallback
                     // expression is conditional and cannot make the whole expression always
                     // diverge.
@@ -34964,6 +34969,137 @@ fn wrapper() -> i64 {
             Some(&FnEffect::Pure),
             "the nested diverging first hole must suppress the later impure hole and statement"
         );
+    }
+
+    #[test]
+    fn effect_scan_prunes_transitively_diverging_stage_captures() {
+        let (mut program, diagnostics) = check(
+            "\
+fn id(value: i64) -> i64 = value
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn wrapper() -> i64 {
+  first := 1
+  second := 2
+  [1].map(fn value { impure(value + first + second) }).sum()
+  print(3)
+  return 0
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::ArraySum { stages, .. },
+            ..
+        }) = &mut wrapper.body.stmts[2]
+        else {
+            panic!("wrapper pipeline statement");
+        };
+        let StageKind::Map { captures, .. } = &mut stages[0].kind else {
+            panic!("wrapper map stage");
+        };
+        assert_eq!(captures.len(), 2, "the lambda must capture both locals");
+        let capture_span = captures[0].span;
+        captures[0] = Expr {
+            kind: ExprKind::Call {
+                func: "id".to_string(),
+                args: vec![Expr {
+                    kind: ExprKind::Loop {
+                        body: Block {
+                            stmts: Vec::new(),
+                            value: None,
+                        },
+                        diverges: true,
+                        body_locals: 0..0,
+                    },
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span: capture_span,
+                }],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span: capture_span,
+        };
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new()).get("wrapper"),
+            Some(&FnEffect::Pure),
+            "the first diverging capture must suppress later captures, callback action, and statements"
+        );
+    }
+
+    #[test]
+    fn process_termination_is_known_non_fallthrough_at_joins() {
+        let (program, diagnostics) = check(
+            "\
+import std.process
+fn abort_branch(flag: bool) -> i64 {
+  value := \"abort\".clone()
+  if flag {
+    consumed := value
+    process.abort()
+  }
+  return value.len()
+}
+fn exit_branch(flag: bool) -> i64 {
+  value := \"exit\".clone()
+  if flag {
+    consumed := value
+    process.exit(1)
+  }
+  return value.len()
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "a move on a terminating branch must not poison its join: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        for name in ["abort_branch", "exit_branch"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            let Stmt::Expr(Expr {
+                kind: ExprKind::If { then, .. },
+                ..
+            }) = &function.body.stmts[1]
+            else {
+                panic!("{name} if statement");
+            };
+            let termination = then
+                .value
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} termination value"));
+            assert!(
+                hir_expr_diverges(termination),
+                "{name} termination must be non-fallthrough"
+            );
+        }
     }
 
     #[test]
