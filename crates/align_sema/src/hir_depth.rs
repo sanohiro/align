@@ -1016,6 +1016,10 @@ mod tests {
         BlockBreak,
         BlockAssignField,
         BlockAssignVecLane,
+        BlockAssignIndexValue,
+        BlockAssignIndexIndex,
+        BlockAssignElemValue,
+        BlockAssignElemIndex,
     }
 
     fn int_ty() -> Ty {
@@ -1359,7 +1363,11 @@ mod tests {
             | MoveControlShape::BlockLetTuple
             | MoveControlShape::BlockBreak
             | MoveControlShape::BlockAssignField
-            | MoveControlShape::BlockAssignVecLane => 3,
+            | MoveControlShape::BlockAssignVecLane
+            | MoveControlShape::BlockAssignIndexValue
+            | MoveControlShape::BlockAssignIndexIndex
+            | MoveControlShape::BlockAssignElemValue
+            | MoveControlShape::BlockAssignElemIndex => 3,
         };
         let mut expression = Expr {
             kind: ExprKind::StrBorrow(Box::new(Expr {
@@ -1628,6 +1636,50 @@ mod tests {
                         value: None,
                     })
                 }
+                MoveControlShape::BlockAssignIndexValue => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignIndex {
+                            base: 0,
+                            index: leaf(),
+                            value: expression,
+                        }],
+                        value: None,
+                    })
+                }
+                MoveControlShape::BlockAssignIndexIndex => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignIndex {
+                            base: 0,
+                            index: expression,
+                            value: leaf(),
+                        }],
+                        value: None,
+                    })
+                }
+                MoveControlShape::BlockAssignElemValue => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignElem {
+                            base: 0,
+                            index: leaf(),
+                            struct_id: 0,
+                            soa: false,
+                            value: expression,
+                        }],
+                        value: None,
+                    })
+                }
+                MoveControlShape::BlockAssignElemIndex => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::AssignElem {
+                            base: 0,
+                            index: expression,
+                            struct_id: 0,
+                            soa: false,
+                            value: leaf(),
+                        }],
+                        value: None,
+                    })
+                }
             };
             expression = Expr {
                 kind,
@@ -1653,7 +1705,11 @@ mod tests {
                     | MoveControlShape::BlockLetTuple
                     | MoveControlShape::BlockBreak
                     | MoveControlShape::BlockAssignField
-                    | MoveControlShape::BlockAssignVecLane => Ty::Unit,
+                    | MoveControlShape::BlockAssignVecLane
+                    | MoveControlShape::BlockAssignIndexValue
+                    | MoveControlShape::BlockAssignIndexIndex
+                    | MoveControlShape::BlockAssignElemValue
+                    | MoveControlShape::BlockAssignElemIndex => Ty::Unit,
                 },
                 span,
             };
@@ -1829,6 +1885,18 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::BlockAssignVecLane,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignIndexValue,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignIndexIndex,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignElemValue,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssignElemIndex,
                     ),
                 ]);
                 for move_program in move_programs {

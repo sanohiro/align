@@ -15089,6 +15089,19 @@ impl<'a> MoveCheck<'a> {
                 value: &'e Expr,
                 self_assign: bool,
             },
+            BlockPairAfterIndex {
+                base: LocalId,
+                value: &'e Expr,
+                value_consuming: bool,
+                invalidates_owner: bool,
+            },
+            BlockPairAfterValue {
+                base: LocalId,
+                index: &'e Expr,
+                value: &'e Expr,
+                invalidates_owner: bool,
+                index_complete: bool,
+            },
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15125,6 +15138,129 @@ impl<'a> MoveCheck<'a> {
                     )
                 } else {
                     match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignIndex { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignIndex {
+                            base,
+                            index,
+                            value,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single index assign guard")
+                        };
+                        self.check_borrow_use(*base, index.span);
+                        if whole_moved(moved, *base) {
+                            let name = &self.f.locals[*base as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                index.span,
+                            );
+                        }
+                        if hir_depth::expr_postorder(index).len()
+                            >= hir_depth::expr_postorder(value).len()
+                        {
+                            (
+                                index,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterIndex {
+                                    base: *base,
+                                    value,
+                                    value_consuming: false,
+                                    invalidates_owner: false,
+                                },
+                            )
+                        } else {
+                            (
+                                value,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterValue {
+                                    base: *base,
+                                    index,
+                                    value,
+                                    invalidates_owner: false,
+                                    index_complete: false,
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignElemField { .. }
+                                    | Stmt::AssignElem { .. }]
+                            ) =>
+                    {
+                        let (base, index, value) = match &block.stmts[0]
+                        {
+                            Stmt::AssignElemField {
+                                base,
+                                index,
+                                value,
+                                ..
+                            }
+                            | Stmt::AssignElem {
+                                base,
+                                index,
+                                value,
+                                ..
+                            } => (*base, index, value),
+                            _ => unreachable!("single element assign guard"),
+                        };
+                        self.check_borrow_use(base, index.span);
+                        if whole_moved(moved, base) {
+                            let name = &self.f.locals[base as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                index.span,
+                            );
+                        }
+                        if hir_depth::expr_postorder(index).len()
+                            >= hir_depth::expr_postorder(value).len()
+                        {
+                            (
+                                index,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterIndex {
+                                    base,
+                                    value,
+                                    value_consuming: true,
+                                    invalidates_owner: true,
+                                },
+                            )
+                        } else {
+                            (
+                                value,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                true,
+                                true,
+                                Post::BlockPairAfterValue {
+                                    base,
+                                    index,
+                                    value,
+                                    invalidates_owner: true,
+                                    index_complete: false,
+                                },
+                            )
+                        }
+                    }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
                     | ExprKind::TaskGroup(block)
@@ -15845,6 +15981,17 @@ impl<'a> MoveCheck<'a> {
                         );
                         *prepared = Some(match_state);
                     }
+                    Post::BlockPairAfterValue {
+                        index,
+                        index_complete,
+                        ..
+                    } => {
+                        if !self.expr(index, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *index_complete = true;
+                    }
                     Post::IfAfterThen {
                         condition,
                         incoming,
@@ -16367,6 +16514,47 @@ impl<'a> MoveCheck<'a> {
                                 value,
                             );
                         }
+                    }
+                    None
+                }
+                Post::BlockPairAfterIndex {
+                    base,
+                    value,
+                    value_consuming,
+                    invalidates_owner,
+                } => {
+                    if falls_through {
+                        falls_through = self.expr(
+                            value,
+                            moved,
+                            value_consuming,
+                            value_consuming,
+                        );
+                        if falls_through {
+                            if invalidates_owner
+                                && self.is_move_ty(value.ty)
+                            {
+                                self.invalidate_owner(base);
+                            }
+                            self.join_local_borrow_fallback(base, value);
+                        }
+                    }
+                    None
+                }
+                Post::BlockPairAfterValue {
+                    base,
+                    value,
+                    invalidates_owner,
+                    index_complete,
+                    ..
+                } => {
+                    if index_complete && falls_through {
+                        if invalidates_owner
+                            && self.is_move_ty(value.ty)
+                        {
+                            self.invalidate_owner(base);
+                        }
+                        self.join_local_borrow_fallback(base, value);
                     }
                     None
                 }
