@@ -4666,6 +4666,8 @@ pub fn check_program_with_interface_facts(
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -4832,6 +4834,8 @@ fn infer_return_provenance(
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -12554,6 +12558,10 @@ struct MoveCheck<'a> {
     /// completed child instead of recursing through the native stack.
     borrow_fact_cache:
         std::cell::RefCell<Option<std::collections::HashMap<usize, BorrowFact>>>,
+    /// Direct child requests captured from the exhaustive expression match while an eager node is
+    /// being lowered onto the explicit Move worklist.
+    collecting_move_children: bool,
+    move_children: Vec<(&'a Expr, bool, bool)>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -14261,7 +14269,7 @@ impl<'a> MoveCheck<'a> {
     #[inline(never)]
     fn loop_moves(
         &mut self,
-        body: &Block,
+        body: &'a Block,
         body_locals: &std::ops::Range<LocalId>,
         span: Span,
         moved: &mut MovedSet,
@@ -14389,7 +14397,7 @@ impl<'a> MoveCheck<'a> {
     /// local through an `if`/`else` arm is rejected here (deferred — bind it to a local first).
     fn block(
         &mut self,
-        b: &Block,
+        b: &'a Block,
         moved: &mut MovedSet,
         tail_consuming: bool,
         tail_direct: bool,
@@ -14592,7 +14600,7 @@ impl<'a> MoveCheck<'a> {
     /// Move-check a `file` op's sub-exprs (A4) — all borrowed (the file is never consumed).
     /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn move_file_op(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
+    fn move_file_op(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::FilePread { file, buffer, offset } => {
                 move_expr!(self, file, moved, false, false);
@@ -14616,7 +14624,7 @@ impl<'a> MoveCheck<'a> {
     /// recursive [`Self::expr`] frame (#296). The builder is borrowed by push/append (grown in place);
     /// push's value is consumed (a `string` moves in); build consumes the builder.
     #[inline(never)]
-    fn move_array_builder(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
+    fn move_array_builder(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::ArrayBuilderNew { .. } => {}
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
@@ -14715,11 +14723,15 @@ impl<'a> MoveCheck<'a> {
 
     fn expr(
         &mut self,
-        e: &Expr,
+        e: &'a Expr,
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
     ) -> bool {
+        if self.collecting_move_children {
+            self.move_children.push((e, consuming, direct));
+            return true;
+        }
         if let Some(falls_through) =
             self.expr_transparent_spine(e, moved, consuming, direct)
         {
@@ -14731,6 +14743,9 @@ impl<'a> MoveCheck<'a> {
                 self.non_fallthrough.insert(e.span);
             }
             return falls_through;
+        }
+        if self.expr_uses_eager_worklist(e) {
+            return self.expr_eager_worklist(e, moved, consuming, direct);
         }
         if matches!(
             e.kind,
@@ -14800,12 +14815,185 @@ impl<'a> MoveCheck<'a> {
         falls_through
     }
 
+    fn expr_uses_eager_worklist(&self, expression: &Expr) -> bool {
+        if pipeline_stages(&expression.kind).is_some() {
+            return false;
+        }
+        !matches!(
+            expression.kind,
+            ExprKind::Block(_)
+                | ExprKind::Arena(_)
+                | ExprKind::TaskGroup(_)
+                | ExprKind::Unsafe(_)
+                | ExprKind::Loop { .. }
+                | ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::ElseUnwrap { .. }
+                | ExprKind::Try(_)
+                | ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                }
+        )
+    }
+
+    fn expr_eager_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> bool {
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            Children {
+                children: Vec<(&'e Expr, bool, bool)>,
+                index: usize,
+                own_falls_through: bool,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                may_borrow: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    if !self.expr_uses_eager_worklist(expression) {
+                        values.push(self.expr(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                        ));
+                        continue;
+                    }
+                    let may_borrow = ty_may_borrow(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    );
+                    let key = Self::expr_key(expression);
+                    if may_borrow {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.value_snapshot_frames.push(Vec::new());
+                    debug_assert!(!self.collecting_move_children);
+                    debug_assert!(self.move_children.is_empty());
+                    self.collecting_move_children = true;
+                    let own_falls_through = self.expr_inner(
+                        expression,
+                        moved,
+                        consuming,
+                        direct,
+                    );
+                    self.collecting_move_children = false;
+                    let children = std::mem::take(&mut self.move_children);
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        may_borrow,
+                    });
+                    work.push(Work::Children {
+                        children,
+                        index: 0,
+                        own_falls_through,
+                    });
+                }
+                Work::Children {
+                    children,
+                    index,
+                    own_falls_through,
+                } => {
+                    if index > 0
+                        && !values.pop().expect("Move child result")
+                    {
+                        values.push(false);
+                    } else if let Some(&(child, consuming, direct)) =
+                        children.get(index)
+                    {
+                        work.push(Work::Children {
+                            children,
+                            index: index + 1,
+                            own_falls_through,
+                        });
+                        work.push(Work::Eval(child, consuming, direct));
+                    } else {
+                        values.push(own_falls_through);
+                    }
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    may_borrow,
+                } => {
+                    let falls_through =
+                        values.pop().expect("Move expression result");
+                    if falls_through {
+                        self.finish_eager_move_action(expression);
+                    }
+                    let child_snapshots = self
+                        .value_snapshot_frames
+                        .pop()
+                        .expect("value snapshot frame for eager expression");
+                    if falls_through
+                        && !Self::defers_child_snapshot_validation(
+                            &expression.kind,
+                        )
+                    {
+                        for snapshot in child_snapshots {
+                            self.validate_value_snapshot(
+                                key,
+                                snapshot,
+                                expression.span,
+                            );
+                        }
+                    }
+                    if !falls_through {
+                        self.non_fallthrough.insert(expression.span);
+                    } else if may_borrow {
+                        let fact = self.borrow_fact(expression);
+                        self.borrows
+                            .begin_value_source(key, fact.live_roots());
+                        self.walked_value_facts.insert(key, fact);
+                        if let Some(parent) =
+                            self.value_snapshot_frames.last_mut()
+                        {
+                            parent.push(key);
+                        }
+                    }
+                    values.push(falls_through);
+                }
+            }
+        }
+        values.pop().expect("Move root result")
+    }
+
+    fn finish_eager_move_action(&mut self, expression: &Expr) {
+        match &expression.kind {
+            ExprKind::ReaderReadLine { buffer, .. } => {
+                self.invalidate_storage(buffer);
+            }
+            ExprKind::BufferPut { buffer, .. }
+            | ExprKind::BufferAppend { buffer, .. } => {
+                self.invalidate_storage(buffer);
+            }
+            _ => {}
+        }
+    }
+
     /// Evaluate a one-child expression spine without one native call frame per wrapper. Each frame
     /// records the exact child consuming/direct mode and post-action; transparent blocks preserve
     /// the caller mode, while constructors consume their payload and view operators borrow it.
     fn expr_transparent_spine(
         &mut self,
-        root: &Expr,
+        root: &'a Expr,
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
@@ -15095,7 +15283,7 @@ impl<'a> MoveCheck<'a> {
 
     fn expr_non_borrowing_binary_tree(
         &mut self,
-        root: &Expr,
+        root: &'a Expr,
         moved: &mut MovedSet,
     ) -> bool {
         let mut work = vec![root];
@@ -15119,7 +15307,7 @@ impl<'a> MoveCheck<'a> {
 
     fn expr_inner(
         &mut self,
-        e: &Expr,
+        e: &'a Expr,
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
@@ -15332,7 +15520,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderReadLine { reader, buffer } => {
                 move_expr!(self, reader, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             // `r.buffered()` **consumes** the reader (Move — one fd, one owner; the buffered handle
             // takes it over), exactly like `array_builder.build()`.
@@ -15367,12 +15557,16 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BufferPut { buffer, value, .. } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, value, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             ExprKind::BufferAppend { buffer, data } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, data, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             ExprKind::BufferNew { capacity } => move_expr!(self, capacity, moved, false, false),
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
@@ -32102,6 +32296,8 @@ fn main() -> i32 = 0
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
