@@ -1541,7 +1541,9 @@ pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) ->
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
-    if !validate_hir::global_type_metadata_is_valid(program) {
+    if !align_sema::checked_hir_body_depth_is_valid(program)
+        || !validate_hir::global_type_metadata_is_valid(program)
+    {
         return empty_program();
     }
     lower_program_unchecked(program, lines, per_unit)
@@ -3779,6 +3781,31 @@ fn terminated_operand() -> Operand {
     Operand::Const(Const::Unit)
 }
 
+/// Lower an eager unary spine without one native [`lower_expr`] frame per HIR record.
+///
+/// The leaf is evaluated once before results are rebuilt from the inside out, preserving the
+/// recursive lowering order while keeping the accepted checked-HIR boundary stack-safe.
+#[inline(never)]
+fn lower_unary_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    let mut frames = Vec::new();
+    let mut leaf = root;
+    while let hir::ExprKind::Unary { op, expr } = &leaf.kind {
+        frames.push((*op, leaf.ty));
+        leaf = expr;
+    }
+
+    let mut operand = lower_expr(b, leaf);
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    while let Some((op, ty)) = frames.pop() {
+        let value = b.fresh_value(ty);
+        b.push(Stmt::Let(value, Rvalue::Un(op, operand)));
+        operand = Operand::Value(value);
+    }
+    operand
+}
+
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     'lower_expr: {
         // Keep every required-child failure in this giant recursive dispatcher on one common exit.
@@ -4762,12 +4789,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::Load(*id)));
                 Operand::Value(v)
             }
-            hir::ExprKind::Unary { op, expr } => {
-                lower_required_binding!(b, a = lower_expr(b, expr), Operand::Const(Const::Unit));
-                let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::Un(*op, a)));
-                Operand::Value(v)
-            }
+            hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
             hir::ExprKind::Cast(inner) => {
                 let from = inner.ty;
                 let operand = lower_expr(b, inner);

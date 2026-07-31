@@ -134,6 +134,81 @@ fn assert_accepted(label: &str, program: &hir::Program) {
     }
 }
 
+fn with_unary_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Int(0),
+        ty: int(64),
+        span,
+    };
+    for _ in 2..depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            ty: int(64),
+            span,
+        };
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: int(64),
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+#[test]
+fn checked_hir_depth_closure_matrix() {
+    for depth in [
+        align_sema::MAX_CHECKED_HIR_DEPTH - 1,
+        align_sema::MAX_CHECKED_HIR_DEPTH,
+    ] {
+        let program = with_unary_body_depth(depth);
+        assert!(
+            align_sema::checked_hir_body_depth_is_valid(&program),
+            "valid checked-HIR depth {depth} was rejected"
+        );
+        assert_accepted("checked-HIR depth boundary", &program);
+    }
+
+    let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
+    let program = with_unary_body_depth(depth);
+    assert!(
+        !align_sema::checked_hir_body_depth_is_valid(&program),
+        "over-bound checked-HIR depth {depth} was accepted"
+    );
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&program),
+        lower_program_located(&program, &source_map),
+        lower_program_per_unit(&program),
+        lower_program_per_unit_located(&program, &source_map),
+    ] {
+        assert!(
+            is_empty(&lowered),
+            "an over-bound body published partial MIR"
+        );
+    }
+}
+
 #[test]
 fn malformed_hir_global_type_metadata_fails_closed() {
     for (label, ty) in [
