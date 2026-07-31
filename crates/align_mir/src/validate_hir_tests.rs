@@ -286,12 +286,75 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_match_arm_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let option_unit = Ty::Option(Scalar::Unit);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Unit,
+        ty: Ty::Unit,
+        span,
+    };
+    let mut expr_depth = 1;
+    if target_expr_depth.is_multiple_of(2) {
+        expr = hir::Expr {
+            kind: hir::ExprKind::OptionSome(Box::new(expr)),
+            ty: option_unit,
+            span,
+        };
+        expr_depth += 1;
+    }
+    while expr_depth < target_expr_depth {
+        let result_ty = expr.ty;
+        expr = hir::Expr {
+            kind: hir::ExprKind::Match {
+                scrutinee: Box::new(hir::Expr {
+                    kind: hir::ExprKind::OptionNone,
+                    ty: option_unit,
+                    span,
+                }),
+                arms: vec![hir::MatchArm {
+                    variants: Vec::new(),
+                    bindings: Vec::new(),
+                    body: expr,
+                }],
+            },
+            ty: result_ty,
+            span,
+        };
+        expr_depth += 2;
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_match_arm".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: expr.ty,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 #[test]
 fn checked_hir_depth_closure_matrix() {
     for make_program in [
         with_unary_body_depth as fn(usize) -> hir::Program,
         with_template_body_depth,
         with_block_stmt_body_depth,
+        with_match_arm_body_depth,
     ] {
         for depth in [
             align_sema::MAX_CHECKED_HIR_DEPTH - 1,
@@ -312,6 +375,7 @@ fn checked_hir_depth_closure_matrix() {
         with_unary_body_depth as fn(usize) -> hir::Program,
         with_template_body_depth,
         with_block_stmt_body_depth,
+        with_match_arm_body_depth,
     ] {
         let program = make_program(depth);
         assert!(

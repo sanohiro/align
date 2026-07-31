@@ -4050,6 +4050,113 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     operand
 }
 
+struct WildcardMatchFrame<'a> {
+    body: &'a hir::Expr,
+    ty: Ty,
+    result_slot: Option<Slot>,
+    result_flag: Option<Slot>,
+    result_temp_flag: Option<Slot>,
+    join: BlockId,
+}
+
+fn wildcard_match_parts<'a>(
+    b: &Builder,
+    expr: &'a hir::Expr,
+) -> Option<(&'a hir::Expr, &'a hir::Expr)> {
+    let hir::ExprKind::Match { scrutinee, arms } = &expr.kind else {
+        return None;
+    };
+    let [arm] = arms.as_slice() else {
+        return None;
+    };
+    if !arm.variants.is_empty()
+        || !arm.bindings.is_empty()
+        || !matches!(scrutinee.ty, Ty::Enum(_) | Ty::Option(_) | Ty::Result(..))
+        || needs_drop_flag(
+            scrutinee.ty,
+            &b.structs,
+            &b.tuples,
+            &b.enums,
+            &b.tagged_types,
+        )
+    {
+        return None;
+    }
+    Some((scrutinee, &arm.body))
+}
+
+/// Lower single-wildcard match spines with explicit join frames.
+#[inline(never)]
+fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    let mut frames = Vec::new();
+    let mut current = root;
+    let mut started = false;
+    let mut terminated_while_descending = false;
+    loop {
+        let Some((scrutinee, body)) = wildcard_match_parts(b, current) else {
+            break;
+        };
+        started = true;
+        let (result_slot, result_flag, result_temp_flag) =
+            control_result_slots(b, current.ty);
+        let _scrutinee = lower_expr_for_borrow(b, scrutinee);
+        if !lowering_continues(b) {
+            terminated_while_descending = true;
+            break;
+        }
+        let join = b.new_block();
+        frames.push(WildcardMatchFrame {
+            body,
+            ty: current.ty,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join,
+        });
+        current = body;
+    }
+
+    if !started {
+        let hir::ExprKind::Match { scrutinee, arms } = &root.kind else {
+            unreachable!("a wildcard match spine starts at Match")
+        };
+        return lower_match(b, scrutinee, arms, root.ty, false);
+    }
+
+    let mut operand = if terminated_while_descending {
+        terminated_operand()
+    } else {
+        lower_expr(b, current)
+    };
+    while let Some(frame) = frames.pop() {
+        if lowering_continues(b) {
+            store_control_result(
+                b,
+                frame.result_slot,
+                frame.result_flag,
+                frame.result_temp_flag,
+                frame.body,
+                operand,
+                false,
+            );
+            b.terminate(Term::Goto(frame.join));
+        }
+        b.cur = frame.join;
+        operand = if lowering_continues(b) {
+            load_control_result(
+                b,
+                frame.ty,
+                frame.result_slot,
+                frame.result_flag,
+                frame.result_temp_flag,
+            )
+        } else {
+            terminated_operand()
+        };
+    }
+    operand
+}
+
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     'lower_expr: {
         // Keep every required-child failure in this giant recursive dispatcher on one common exit.
@@ -5049,9 +5156,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 finish_consumed_aggregate(b, payload, owners);
                 Operand::Value(v)
             }
-            hir::ExprKind::Match { scrutinee, arms } => {
-                lower_match(b, scrutinee, arms, e.ty, false)
-            }
+            hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
             hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
             hir::ExprKind::Field { root, path } => {
                 let v = b.fresh_value(e.ty);
