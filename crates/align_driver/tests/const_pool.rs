@@ -285,11 +285,11 @@ fn const_array_values_are_part_of_printed_mir() {
     // A dynamic index keeps the Rvalue::ConstArray in MIR (a constant index folds it away).
     let ca = mir_text_of(
         "const_print_a",
-        "T := [7, 8, 9]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i64 = pick(2)\n",
+        "T := [7, 8, 9]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i32 = pick(2) as i32\n",
     );
     let cb = mir_text_of(
         "const_print_b",
-        "T := [7, 8, 42]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i64 = pick(2)\n",
+        "T := [7, 8, 42]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i32 = pick(2) as i32\n",
     );
     assert_ne!(ca, cb, "aggregate-constant value edits must change the printed MIR");
 }

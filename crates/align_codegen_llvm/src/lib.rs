@@ -3212,6 +3212,80 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         Ok(())
     }
 
+    fn builtin_error_enum_is_exact(program: &Program, id: u32) -> bool {
+        let Some(definition) = program.enums.get(id as usize) else {
+            return false;
+        };
+        if definition.name != "Error"
+            || definition.source_name != "Error"
+            || definition.variants.len() != 5
+        {
+            return false;
+        }
+        let tag_only = |index: usize, name: &str| {
+            let variant = &definition.variants[index];
+            variant.name == name && variant.payload.is_empty() && variant.field_base == 1
+        };
+        let code = &definition.variants[ERROR_VARIANT_CODE as usize];
+        tag_only(0, "NotFound")
+            && tag_only(1, "Invalid")
+            && tag_only(2, "Denied")
+            && tag_only(3, "Timeout")
+            && code.name == "Code"
+            && code.payload.as_slice()
+                == [Scalar::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                })]
+            && code.field_base == 1
+    }
+
+    fn main_result_is_exact(program: &Program, ret: Ty) -> bool {
+        matches!(
+            ret,
+            Ty::Result(Scalar::Unit, Scalar::Enum(id))
+                if builtin_error_enum_is_exact(program, id)
+        )
+    }
+
+    fn validate_main_abi(
+        function: &Function,
+        param_types: &[Ty],
+        program: &Program,
+    ) -> Result<(), CodegenError> {
+        if function.name != "main" {
+            return Ok(());
+        }
+        if function.exportable {
+            return Err(CodegenError::Lowering(
+                "entry function `main` cannot be a per-unit export".to_string(),
+            ));
+        }
+        let exact_i32 = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let valid = match param_types {
+            [] => {
+                function.ret == Ty::Unit
+                    || function.ret == exact_i32
+                    || main_result_is_exact(program, function.ret)
+            }
+            [Ty::DynArray(Scalar::Str)] => {
+                function.param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                    && main_result_is_exact(program, function.ret)
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(CodegenError::Lowering(format!(
+                "entry function `main` has invalid C ABI: modes {:?}, parameters {param_types:?}, return {:?}",
+                function.param_modes, function.ret
+            )));
+        }
+        Ok(())
+    }
+
     fn named_signature<'a>(
         program: &'a Program,
         name: &str,
@@ -3816,6 +3890,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             &mut type_graph,
         )?;
         check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
+        validate_main_abi(f, &param_types, program)?;
         check_ty(f.ret, &mut type_graph)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {
             check_ty(ty, &mut type_graph)?;
@@ -13184,13 +13259,17 @@ mod tests {
     use align_parser::parse_file;
     use align_sema::check_file;
 
-    fn ir(src: &str) -> String {
+    fn mir(src: &str) -> Program {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[], None).unwrap()
+        lower_program(&hir)
+    }
+
+    fn ir(src: &str) -> String {
+        emit_llvm_ir(&mir(src), &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
     fn unary_hir_at_body_depth(depth: usize) -> hir::Program {
@@ -15396,6 +15475,148 @@ mod tests {
     }
 
     #[test]
+    fn main_abi_matrix() {
+        let direct = ir("fn main() -> i32 = 7\n");
+        assert!(direct.contains("define i32 @main()"));
+        assert!(!direct.contains("@align_main"));
+
+        let unit = ir("fn main() {}\n");
+        assert!(unit.contains("define internal void @align_main()"));
+        assert!(unit.contains("define i32 @main()"));
+        assert!(unit.contains("call void @align_main()"));
+        assert!(unit.contains("ret i32 0"));
+
+        let result = ir("fn main() -> Result<(), Error> { return Ok(()) }\n");
+        assert!(result.contains("define internal"));
+        assert!(result.contains("@align_main()"));
+        assert!(result.contains("define i32 @main()"));
+
+        let argv = ir(
+            "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
+        );
+        assert!(argv.contains("@align_main({ ptr, i64 }"));
+        assert!(argv.contains("define i32 @main(i32"));
+        assert!(argv.contains("ptr %1"));
+
+        let rejects = |name: &str, program: &Program| {
+            let error = validate_tagged_program(program)
+                .expect_err("a malformed entry ABI must fail before LLVM construction");
+            assert!(
+                error.to_string().contains("main")
+                    || error.to_string().contains("parameter"),
+                "{name} produced an unrelated preflight error: {error}"
+            );
+        };
+
+        let direct_program = mir("fn main() -> i32 = 0\n");
+        for (name, ret) in [
+            (
+                "unsigned-i32",
+                Ty::Int(IntTy {
+                    bits: 32,
+                    signed: false,
+                }),
+            ),
+            (
+                "signed-i64",
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            ),
+            ("unit-like-bool", Ty::Bool),
+        ] {
+            let mut malformed = direct_program.clone();
+            malformed.fns[0].ret = ret;
+            rejects(name, &malformed);
+        }
+        let mut exported_main = direct_program.clone();
+        exported_main.fns[0].exportable = true;
+        rejects("exportable-main", &exported_main);
+
+        let result_program = mir(
+            "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
+        );
+        let Ty::Result(Scalar::Unit, Scalar::Enum(error_id)) = result_program.fns[0].ret
+        else {
+            panic!("fixture must use the builtin Error")
+        };
+
+        let mut wrong_param_type = result_program.clone();
+        wrong_param_type.fns[0].slots[0] = Ty::Slice(Scalar::Str);
+        rejects("argv-type", &wrong_param_type);
+
+        let mut wrong_param_mode = result_program.clone();
+        wrong_param_mode.fns[0].param_modes[0] = align_ast::ParamMode::Out;
+        rejects("argv-mode", &wrong_param_mode);
+
+        let mut wrong_ok = result_program.clone();
+        wrong_ok.fns[0].ret = Ty::Result(
+            Scalar::Int(IntTy {
+                bits: 32,
+                signed: true,
+            }),
+            Scalar::Enum(error_id),
+        );
+        rejects("result-ok", &wrong_ok);
+
+        let mut wrong_name = result_program.clone();
+        wrong_name.enums[error_id as usize].name = "Other".to_string();
+        rejects("error-name", &wrong_name);
+        let mut wrong_source_name = result_program.clone();
+        wrong_source_name.enums[error_id as usize].source_name = "Other".to_string();
+        rejects("error-source-name", &wrong_source_name);
+        let mut wrong_order = result_program.clone();
+        wrong_order.enums[error_id as usize].variants.swap(0, 1);
+        rejects("error-order", &wrong_order);
+
+        for index in 0..5 {
+            let mut malformed = result_program.clone();
+            malformed.enums[error_id as usize].variants[index].name = format!("Wrong{index}");
+            rejects(&format!("error-variant-{index}-name"), &malformed);
+
+            let mut malformed = result_program.clone();
+            malformed.enums[error_id as usize].variants[index].field_base = 0;
+            rejects(&format!("error-variant-{index}-field-base"), &malformed);
+        }
+        for index in 0..ERROR_VARIANT_CODE as usize {
+            let mut malformed = result_program.clone();
+            malformed.enums[error_id as usize].variants[index]
+                .payload
+                .push(Scalar::Bool);
+            rejects(&format!("error-category-{index}-payload"), &malformed);
+        }
+
+        let mut missing_code_payload = result_program.clone();
+        missing_code_payload.enums[error_id as usize].variants[ERROR_VARIANT_CODE as usize]
+            .payload
+            .clear();
+        rejects("error-code-payload-missing", &missing_code_payload);
+        let mut extra_code_payload = result_program.clone();
+        extra_code_payload.enums[error_id as usize].variants[ERROR_VARIANT_CODE as usize]
+            .payload
+            .push(Scalar::Bool);
+        rejects("error-code-payload-extra", &extra_code_payload);
+        let mut wrong_code_width = result_program.clone();
+        wrong_code_width.enums[error_id as usize].variants[ERROR_VARIANT_CODE as usize]
+            .payload[0] = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        rejects("error-code-payload-width", &wrong_code_width);
+        let mut wrong_code_signedness = result_program.clone();
+        wrong_code_signedness.enums[error_id as usize].variants[ERROR_VARIANT_CODE as usize]
+            .payload[0] = Scalar::Int(IntTy {
+            bits: 32,
+            signed: false,
+        });
+        rejects("error-code-payload-signedness", &wrong_code_signedness);
+        let mut missing_variant = result_program.clone();
+        missing_variant.enums[error_id as usize].variants.pop();
+        rejects("error-variant-count", &missing_variant);
+    }
+
+    #[test]
     fn align_functions_are_marked_nounwind() {
         // Align functions never unwind, so codegen marks them `nounwind` (drops exception edges /
         // unwind tables, enables more inlining). Every Align-defined function carries it...
@@ -15937,7 +16158,7 @@ mod tests {
         // A user sum type lowers to a non-union tagged struct with an i32 tag.
         let sum_ir = ir("Shape { Circle(i64), Square(i64) }\n\
              fn area(s: Shape) -> i64 = match s {\n    Circle(r) => r,\n    Square(w) => w,\n  }\n\
-             fn main() -> i64 = area(Shape.Circle(3))\n");
+             fn main() -> i32 = area(Shape.Circle(3)) as i32\n");
         assert!(sum_ir.contains("{ i32,"), "a user sum type must carry an i32 tag:\n{sum_ir}");
     }
 
