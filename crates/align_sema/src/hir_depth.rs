@@ -1012,5 +1012,24 @@ mod tests {
                 "{shape:?} depth {depth} was accepted"
             );
         }
+
+        let program = program_with_depth(Shape::BlockStmt, MAX_CHECKED_HIR_DEPTH);
+        std::thread::Builder::new()
+            .name("checked-hir-divergence-depth".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let root = program.fns[0]
+                    .body
+                    .value
+                    .as_deref()
+                    .expect("deep body value");
+                assert!(
+                    !crate::hir_expr_diverges(root),
+                    "nested expression statements do not make the body diverge"
+                );
+            })
+            .expect("spawn checked-HIR divergence owner")
+            .join()
+            .expect("checked-HIR divergence owner");
     }
 }

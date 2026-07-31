@@ -11625,57 +11625,124 @@ impl UnnecessaryHeapScan {
     }
 }
 
-/// Whether a single HIR statement always diverges (control never proceeds to the next statement).
-/// A `return` always diverges; a `let`/assignment/expression statement diverges iff the value it
-/// evaluates does.
-fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
-    match s {
-        // `return` leaves the function; `break` leaves the loop — either way control never falls
-        // through to the next statement in this block.
-        hir::Stmt::Return(_) | hir::Stmt::Break { .. } => true,
-        hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
-        hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::AssignIndex { index, value, .. }
-        | hir::Stmt::AssignElemField { index, value, .. }
-        | hir::Stmt::AssignElem { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
-        hir::Stmt::AssignVecLane { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::Expr(e) => hir_expr_diverges(e),
-    }
-}
-
 /// Whether a HIR block **always diverges** (never falls through to its end) — used by `MoveCheck`
 /// to drop a diverging branch's moves at an `if` join (they happen on a path that never reaches
 /// past the `if`). Conservative: only `true` when divergence is certain (any statement that always
 /// diverges — including an intermediate one, after which the rest is dead — or a tail `if`/block
 /// that itself diverges); anything else is `false`, falling back to the safe union.
+#[cfg(test)]
+fn hir_stmt_diverges(statement: &hir::Stmt) -> bool {
+    hir_diverges(HirDivergenceNode::Stmt(statement))
+}
+
 fn hir_block_diverges(b: &hir::Block) -> bool {
-    if b.stmts.iter().any(hir_stmt_diverges) {
-        return true;
-    }
-    if let Some(v) = &b.value {
-        return hir_expr_diverges(v);
-    }
-    false
+    hir_diverges(HirDivergenceNode::Block(b))
 }
 
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
 /// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
 /// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
 fn hir_expr_diverges(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
-        ExprKind::Block(b)
-        | ExprKind::Arena(b)
-        | ExprKind::TaskGroup(b)
-        | ExprKind::Unsafe(b) => hir_block_diverges(b),
-        ExprKind::Match { arms, .. } => {
-            !arms.is_empty() && arms.iter().all(|arm| hir_expr_diverges(&arm.body))
+    hir_diverges(HirDivergenceNode::Expr(e))
+}
+
+#[derive(Clone, Copy)]
+enum HirDivergenceNode<'a> {
+    Expr(&'a Expr),
+    Block(&'a Block),
+    Stmt(&'a Stmt),
+}
+
+#[derive(Clone, Copy)]
+enum HirDivergenceWork<'a> {
+    Eval(HirDivergenceNode<'a>),
+    Value(bool),
+    Any(usize),
+    All(usize),
+}
+
+/// Evaluate the conservative HIR divergence predicate without using the process stack.
+fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
+    let mut work = vec![HirDivergenceWork::Eval(root)];
+    let mut values = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            HirDivergenceWork::Value(value) => values.push(value),
+            HirDivergenceWork::Any(count) | HirDivergenceWork::All(count) => {
+                let start = values.len() - count;
+                let value = match item {
+                    HirDivergenceWork::Any(_) => values[start..].iter().any(|value| *value),
+                    HirDivergenceWork::All(_) => values[start..].iter().all(|value| *value),
+                    _ => unreachable!(),
+                };
+                values.truncate(start);
+                values.push(value);
+            }
+            HirDivergenceWork::Eval(HirDivergenceNode::Block(block)) => {
+                let count = block.stmts.len() + usize::from(block.value.is_some());
+                work.push(HirDivergenceWork::Any(count));
+                if let Some(value) = block.value.as_deref() {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                }
+                for statement in block.stmts.iter().rev() {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Stmt(statement)));
+                }
+            }
+            HirDivergenceWork::Eval(HirDivergenceNode::Stmt(statement)) => match statement {
+                // `return` leaves the function; `break` leaves the loop — either way control never
+                // falls through to the next statement in this block.
+                Stmt::Return(_) | Stmt::Break { .. } => {
+                    work.push(HirDivergenceWork::Value(true));
+                }
+                Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(init)));
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::AssignField { value, .. }
+                | Stmt::AssignVecLane { value, .. } => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                }
+                Stmt::AssignIndex { index, value, .. }
+                | Stmt::AssignElemField { index, value, .. }
+                | Stmt::AssignElem { index, value, .. } => {
+                    work.push(HirDivergenceWork::Any(2));
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(index)));
+                }
+                Stmt::Expr(expression) => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)));
+                }
+            },
+            HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)) => {
+                match &expression.kind {
+                    ExprKind::If { then, els, .. } => {
+                        work.push(HirDivergenceWork::All(2));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(els)));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(then)));
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block) => {
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(block)));
+                    }
+                    ExprKind::Match { arms, .. } if !arms.is_empty() => {
+                        work.push(HirDivergenceWork::All(arms.len()));
+                        for arm in arms.iter().rev() {
+                            work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(&arm.body)));
+                        }
+                    }
+                    // A loop with no `break` never yields and control never reaches past it.
+                    ExprKind::Loop { diverges, .. } => {
+                        work.push(HirDivergenceWork::Value(*diverges));
+                    }
+                    _ => work.push(HirDivergenceWork::Value(false)),
+                }
+            }
         }
-        // A `loop` with no `break` never yields and control never reaches past it (it either loops
-        // forever or exits the function via `return`/`?`). A loop *with* a `break` may fall through.
-        ExprKind::Loop { diverges, .. } => *diverges,
-        _ => false,
     }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().unwrap_or(false)
 }
 
 /// Flow analysis that flags use-after-move. A Move-typed value (M3: `box<T>`) is
