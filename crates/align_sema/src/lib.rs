@@ -21,7 +21,7 @@ mod type_layout;
 pub use type_layout::{TypeLayoutCache, ty_abi_layout};
 
 /// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct IntTy {
     pub bits: u8,
     pub signed: bool,
@@ -34,7 +34,7 @@ impl IntTy {
 }
 
 /// Floating-point width. `f64` = `FloatTy { bits: 64 }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FloatTy {
     pub bits: u8,
 }
@@ -47,7 +47,7 @@ impl FloatTy {
 
 /// A variable-free scalar type — the only payloads M2 allows inside `Option`/`Result`.
 /// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scalar {
     Int(IntTy),
     Float(FloatTy),
@@ -228,7 +228,7 @@ impl Scalar {
 /// The element of an owned-`array<T>` payload ([`Scalar::DynArray`]). A primitive scalar only —
 /// a deliberately small, `Copy`, **non-recursive** subset of [`Scalar`] so an `array` can sit
 /// inside an `Option`/`Result` payload without making [`Scalar`]/[`Ty`] recursive (MMv2 slice 8b).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrimScalar {
     Int(IntTy),
     Float(FloatTy),
@@ -281,7 +281,7 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
 /// (column-oriented, `soa array<T>`) joins at M6. Keeping it in the type **now** means adding
 /// `Soa` later turns every place that must handle the new layout into a compile error — the
 /// layout decision can never be silently forgotten.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Layout {
     /// Array-of-structs: elements are contiguous whole structs (`[... %Struct ...]`). Field access
     /// GEPs `element, field`.
@@ -293,7 +293,7 @@ pub enum Layout {
 }
 
 /// sema-internal type representation (`03-types.md` §1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     Int(IntTy),
     /// A generic type parameter, by its index in the enclosing function's `<...>` list
@@ -1481,6 +1481,136 @@ fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -
         }
     }
     false
+}
+
+fn borrow_leaf_paths_for_type(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Vec<Vec<BorrowProjection>> {
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter {
+            ty: Ty,
+            projection: Option<BorrowProjection>,
+        },
+        Exit {
+            ty: Ty,
+            pop_projection: bool,
+        },
+    }
+
+    let mut work = vec![Work::Enter {
+        ty: root,
+        projection: None,
+    }];
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
+    let mut paths = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit { ty, pop_projection } => {
+                visiting.remove(&ty);
+                if pop_projection {
+                    path.pop();
+                }
+            }
+            Work::Enter { ty, projection } => {
+                if let Some(projection) = projection {
+                    path.push(projection);
+                }
+                let pop_projection = projection.is_some();
+                let ty = expand_tagged_ty(ty, tagged_types);
+                let aggregate = matches!(
+                    ty,
+                    Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
+                );
+                if aggregate && !visiting.insert(ty) {
+                    // Malformed cycles retain a conservative whole-value leaf at the cycle edge.
+                    paths.push(path.clone());
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let mut children = Vec::new();
+                match ty {
+                    Ty::Struct(id) => {
+                        if let Some(definition) = structs.get(id as usize) {
+                            children.extend(definition.fields.iter().enumerate().map(
+                                |(index, field)| {
+                                    (
+                                        BorrowProjection::StructField(index as u32),
+                                        field.ty,
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Tuple(id) => {
+                        if let Some(definition) = tuples.get(id as usize) {
+                            children.extend(definition.elems.iter().enumerate().map(
+                                |(index, element)| {
+                                    (
+                                        BorrowProjection::TupleElement(index as u32),
+                                        scalar_to_ty(*element),
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Enum(id) => {
+                        if let Some(definition) = enums.get(id as usize) {
+                            for (variant_index, variant) in
+                                definition.variants.iter().enumerate()
+                            {
+                                children.extend(variant.payload.iter().enumerate().map(
+                                    |(payload_index, payload)| {
+                                        (
+                                            BorrowProjection::EnumPayload {
+                                                variant: variant_index as u32,
+                                                index: payload_index as u32,
+                                            },
+                                            scalar_to_ty(*payload),
+                                        )
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Ty::Option(payload) => children.push((
+                        BorrowProjection::OptionSome,
+                        scalar_to_ty(payload),
+                    )),
+                    Ty::Result(ok, err) => {
+                        children.push((BorrowProjection::ResultOk, scalar_to_ty(ok)));
+                        children.push((BorrowProjection::ResultErr, scalar_to_ty(err)));
+                    }
+                    _ => {
+                        if ty_may_borrow(ty, structs, tuples, enums, tagged_types) {
+                            paths.push(path.clone());
+                        }
+                        if pop_projection {
+                            path.pop();
+                        }
+                        continue;
+                    }
+                }
+
+                work.push(Work::Exit { ty, pop_projection });
+                for (projection, child) in children.into_iter().rev() {
+                    work.push(Work::Enter {
+                        ty: child,
+                        projection: Some(projection),
+                    });
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
@@ -12351,81 +12481,14 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn borrow_leaf_paths_inner(
-        &self,
-        ty: Ty,
-        visiting: &mut Vec<Ty>,
-    ) -> Vec<Vec<BorrowProjection>> {
-        if !ty_may_borrow(
-            ty,
+    fn borrow_leaf_paths(&self, root: Ty) -> Vec<Vec<BorrowProjection>> {
+        borrow_leaf_paths_for_type(
+            root,
             self.structs,
             self.tuples,
             self.enums,
             self.tagged_types,
-        ) {
-            return Vec::new();
-        }
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        if visiting.contains(&ty) {
-            return vec![Vec::new()];
-        }
-        visiting.push(ty);
-        let mut paths = Vec::new();
-        let mut append = |projection: BorrowProjection, child: Ty| {
-            let children = self.borrow_leaf_paths_inner(child, visiting);
-            for mut path in children {
-                path.insert(0, projection);
-                paths.push(path);
-            }
-        };
-        match ty {
-            Ty::Struct(id) => {
-                if let Some(def) = self.structs.get(id as usize) {
-                    for (index, field) in def.fields.iter().enumerate() {
-                        append(BorrowProjection::StructField(index as u32), field.ty);
-                    }
-                }
-            }
-            Ty::Tuple(id) => {
-                if let Some(def) = self.tuples.get(id as usize) {
-                    for (index, element) in def.elems.iter().enumerate() {
-                        append(
-                            BorrowProjection::TupleElement(index as u32),
-                            scalar_to_ty(*element),
-                        );
-                    }
-                }
-            }
-            Ty::Enum(id) => {
-                if let Some(def) = self.enums.get(id as usize) {
-                    for (variant_index, variant) in def.variants.iter().enumerate() {
-                        for (payload_index, payload) in variant.payload.iter().enumerate() {
-                            append(
-                                BorrowProjection::EnumPayload {
-                                    variant: variant_index as u32,
-                                    index: payload_index as u32,
-                                },
-                                scalar_to_ty(*payload),
-                            );
-                        }
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                append(BorrowProjection::OptionSome, scalar_to_ty(payload));
-            }
-            Ty::Result(ok, err) => {
-                append(BorrowProjection::ResultOk, scalar_to_ty(ok));
-                append(BorrowProjection::ResultErr, scalar_to_ty(err));
-            }
-            _ => paths.push(Vec::new()),
-        }
-        visiting.pop();
-        if paths.is_empty() {
-            vec![Vec::new()]
-        } else {
-            paths
-        }
+        )
     }
 
     fn normalize_borrow_fact(&self, ty: Ty, fact: BorrowFact) -> BorrowFact {
@@ -12446,8 +12509,7 @@ impl<'a> MoveCheck<'a> {
                 out.direct.extend(roots);
                 continue;
             };
-            let suffixes =
-                self.borrow_leaf_paths_inner(selected_ty, &mut Vec::new());
+            let suffixes = self.borrow_leaf_paths(selected_ty);
             for suffix in suffixes {
                 let mut destination = path.clone();
                 destination.extend(suffix);
@@ -33635,11 +33697,19 @@ fn main() -> i32 = 0
         assert!(struct_is_move(0, &structs, &[], &[]));
 
         structs[DEPTH - 1].fields[0].ty = Ty::Str;
+        let paths = borrow_leaf_paths_for_type(Ty::Struct(0), &structs, &[], &[], &[]);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), DEPTH);
         structs[0].fields.push(hir::FieldDef {
             name: "malformed_later".to_string(),
             ty: Ty::Struct(DEPTH as u32 + 9),
         });
         assert!(struct_contains_str(0, &structs, &[]));
+        assert_eq!(
+            borrow_leaf_paths_for_type(Ty::Struct(0), &structs, &[], &[], &[]),
+            paths,
+            "a malformed later sibling must not reorder or erase the valid borrow leaf"
+        );
         structs[0].fields.pop();
 
         let tagged = (0..DEPTH)
