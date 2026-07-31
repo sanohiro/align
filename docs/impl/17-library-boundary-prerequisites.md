@@ -2582,7 +2582,7 @@ owners to the shared focused targets. Every implementation slice retains the sco
 | scope boundary | Indirect calls, closure captures, function-value joins/moves, target-relative capture slots, and direct calls without a settled named/imported summary—including unanalyzed extern targets—retain the documented all-compatible-input fallback. No `borrow`, `borrow mut`, cleanup ABI, resource, region, or database surface is enabled. | existing deferred-function-value and compatibility/extern fixtures plus disabled-mode regressions |
 
 L2b-a2-s, L2b-a2-ac, L2b-a2-am-g-t, the am-r design gate, am-d, and am-e are fixed completed verticals.
-PR #679 implements am-d and this implementation completes am-e. After it, the mandatory remaining sequence is am-f, am-w, am-v,
+PR #679 implements am-d and #681 implements am-e. After it, the mandatory remaining sequence is am-f, am-w, am-v,
 am-u, am-p, am-n, am-h, am-b1, am-b2, am-b3, am-b4, am-c, af, ar, ap, and t. The first PR
 publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
 retain the shipped flattened result. It must include product construction, reads, partial writes,
