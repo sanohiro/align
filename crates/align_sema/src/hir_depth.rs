@@ -1009,6 +1009,9 @@ mod tests {
         MatchFirst,
         MatchSecond,
         MatchScrutinee,
+        BlockLet,
+        BlockAssign,
+        BlockReturn,
     }
 
     fn int_ty() -> Ty {
@@ -1345,7 +1348,10 @@ mod tests {
             | MoveControlShape::MatchFirst
             | MoveControlShape::MatchSecond => 2,
             MoveControlShape::LoopBreak
-            | MoveControlShape::LoopRepeat => 3,
+            | MoveControlShape::LoopRepeat
+            | MoveControlShape::BlockLet
+            | MoveControlShape::BlockAssign
+            | MoveControlShape::BlockReturn => 3,
         };
         let mut expression = Expr {
             kind: ExprKind::StrBorrow(Box::new(Expr {
@@ -1555,6 +1561,28 @@ mod tests {
                         body: leaf(),
                     }],
                 },
+                MoveControlShape::BlockLet => ExprKind::Block(Block {
+                    stmts: vec![Stmt::Let {
+                        local: 0,
+                        init: expression,
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssign => {
+                    ExprKind::Block(Block {
+                        stmts: vec![Stmt::Assign {
+                            local: 0,
+                            value: expression,
+                            drop_old: std::cell::Cell::new(false),
+                            drop_new: std::cell::Cell::new(false),
+                        }],
+                        value: None,
+                    })
+                }
+                MoveControlShape::BlockReturn => ExprKind::Block(Block {
+                    stmts: vec![Stmt::Return(Some(expression))],
+                    value: None,
+                }),
             };
             expression = Expr {
                 kind,
@@ -1574,6 +1602,9 @@ mod tests {
                     | MoveControlShape::MatchFirst
                     | MoveControlShape::MatchSecond
                     | MoveControlShape::MatchScrutinee => int_ty(),
+                    MoveControlShape::BlockLet
+                    | MoveControlShape::BlockAssign
+                    | MoveControlShape::BlockReturn => Ty::Unit,
                 },
                 span,
             };
@@ -1728,6 +1759,15 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::MatchScrutinee,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockLet,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockAssign,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::BlockReturn,
                     ),
                 ]);
                 for move_program in move_programs {

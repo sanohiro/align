@@ -15064,6 +15064,17 @@ impl<'a> MoveCheck<'a> {
                 prepared: Option<MoveMatchPrepared>,
                 join: MoveMatchJoin,
             },
+            BlockLet {
+                local: LocalId,
+                init: &'e Expr,
+            },
+            BlockAssign {
+                local: LocalId,
+                value: &'e Expr,
+                drop_old: &'e std::cell::Cell<bool>,
+                was_moved: bool,
+            },
+            BlockReturn(&'e Expr),
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15100,6 +15111,87 @@ impl<'a> MoveCheck<'a> {
                     )
                 } else {
                     match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Let { .. }]
+                            ) =>
+                    {
+                        let [Stmt::Let { local, init }] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single let statement guard")
+                        };
+                        (
+                            init,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockLet {
+                                local: *local,
+                                init,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Assign { .. }]
+                            ) =>
+                    {
+                        let [Stmt::Assign {
+                            local,
+                            value,
+                            drop_old,
+                            ..
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single assign statement guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockAssign {
+                                local: *local,
+                                value,
+                                drop_old,
+                                was_moved: whole_moved(moved, *local),
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Return(Some(_))]
+                            ) =>
+                    {
+                        let [Stmt::Return(Some(value))] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single return statement guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockReturn(value),
+                        )
+                    }
                     ExprKind::Block(block)
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
@@ -15687,9 +15779,6 @@ impl<'a> MoveCheck<'a> {
         for (wrapper, opens_arena, post) in
             wrappers.into_iter().rev()
         {
-            if opens_arena {
-                self.arena_depth -= 1;
-            }
             let key = Self::expr_key(wrapper);
             let try_result = match post {
                 Post::OptionalAfterFirst {
@@ -16006,8 +16095,52 @@ impl<'a> MoveCheck<'a> {
                     }
                     None
                 }
+                Post::BlockLet { local, init } => {
+                    if falls_through {
+                        self.assign_borrow(local, init);
+                        clear_moved(moved, local);
+                    }
+                    None
+                }
+                Post::BlockAssign {
+                    local,
+                    value,
+                    drop_old,
+                    was_moved,
+                } => {
+                    if falls_through {
+                        let consumed_by_rhs =
+                            whole_moved(moved, local) && !was_moved;
+                        drop_old.set(
+                            self.is_move(local) && !consumed_by_rhs,
+                        );
+                        if self.local_owns_view_storage(local) {
+                            self.invalidate_owner(local);
+                        }
+                        self.assign_borrow(local, value);
+                        clear_moved(moved, local);
+                    }
+                    None
+                }
+                Post::BlockReturn(value) => {
+                    if falls_through {
+                        let value_key = Self::expr_key(value);
+                        self.validate_value_snapshot(
+                            value_key,
+                            value_key,
+                            value.span,
+                        );
+                        self.return_roots
+                            .extend(self.borrow_sources(value));
+                    }
+                    falls_through = false;
+                    None
+                }
                 Post::None => None,
             };
+            if opens_arena {
+                self.arena_depth -= 1;
+            }
             let child_snapshots = self
                 .value_snapshot_frames
                 .pop()
