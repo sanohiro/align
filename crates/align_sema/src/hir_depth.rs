@@ -998,6 +998,7 @@ mod tests {
         ElseUnwrap,
         If,
         LoopBreak,
+        LoopRepeat,
     }
 
     fn int_ty() -> Ty {
@@ -1323,7 +1324,8 @@ mod tests {
             MoveControlShape::ShortCircuit
             | MoveControlShape::ElseUnwrap => 1,
             MoveControlShape::If => 2,
-            MoveControlShape::LoopBreak => 3,
+            MoveControlShape::LoopBreak
+            | MoveControlShape::LoopRepeat => 3,
         };
         let mut expression = Expr {
             kind: ExprKind::StrBorrow(Box::new(Expr {
@@ -1383,6 +1385,14 @@ mod tests {
                     diverges: false,
                     body_locals: 0..0,
                 },
+                MoveControlShape::LoopRepeat => ExprKind::Loop {
+                    body: Block {
+                        stmts: vec![Stmt::Expr(expression)],
+                        value: None,
+                    },
+                    diverges: true,
+                    body_locals: 0..0,
+                },
             };
             expression = Expr {
                 kind,
@@ -1390,7 +1400,8 @@ mod tests {
                     MoveControlShape::ShortCircuit => Ty::Bool,
                     MoveControlShape::ElseUnwrap
                     | MoveControlShape::If
-                    | MoveControlShape::LoopBreak => int_ty(),
+                    | MoveControlShape::LoopBreak
+                    | MoveControlShape::LoopRepeat => int_ty(),
                 },
                 span,
             };
@@ -1512,6 +1523,9 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::LoopBreak,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::LoopRepeat,
                     ),
                 ]);
                 for move_program in move_programs {

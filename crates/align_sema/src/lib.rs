@@ -15001,7 +15001,8 @@ impl<'a> MoveCheck<'a> {
         enum Post<'e> {
             None,
             Try(&'e Expr),
-            LoopBreak(&'e Expr),
+            LoopBreak(Option<&'e Expr>),
+            LoopDiverge,
             JoinIncoming {
                 moved: MovedSet,
                 borrows: BorrowState,
@@ -15184,7 +15185,56 @@ impl<'a> MoveCheck<'a> {
                             false,
                             true,
                             true,
-                            Post::LoopBreak(child),
+                            Post::LoopBreak(Some(child)),
+                        )
+                    }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(
+                            body.stmts.as_slice(),
+                            [Stmt::Expr(_), Stmt::Break {
+                                value: None,
+                                accepted: true,
+                            }]
+                        ) =>
+                    {
+                        let [Stmt::Expr(child), Stmt::Break {
+                            value: None,
+                            accepted: true,
+                        }] = body.stmts.as_slice()
+                        else {
+                            unreachable!("single-expression break loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            false,
+                            false,
+                            Post::LoopBreak(None),
+                        )
+                    }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(body.stmts.as_slice(), [Stmt::Expr(child)] if hir_expr_diverges(child)) =>
+                    {
+                        let [Stmt::Expr(child)] = body.stmts.as_slice()
+                        else {
+                            unreachable!("single diverging expression loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            false,
+                            false,
+                            Post::LoopDiverge,
                         )
                     }
                     ExprKind::OptionSome(child)
@@ -15331,9 +15381,18 @@ impl<'a> MoveCheck<'a> {
                 Post::Try(result) => Some(result),
                 Post::LoopBreak(value) => {
                     if falls_through {
-                        let key = Self::expr_key(value);
-                        self.validate_value_snapshot(key, key, value.span);
-                        let fact = self.borrow_fact(value);
+                        let fact = value.map_or_else(
+                            BorrowFact::default,
+                            |value| {
+                                let key = Self::expr_key(value);
+                                self.validate_value_snapshot(
+                                    key,
+                                    key,
+                                    value.span,
+                                );
+                                self.borrow_fact(value)
+                            },
+                        );
                         if fact.is_empty() {
                             self.loop_value_facts.remove(&wrapper.span);
                         } else {
@@ -15342,6 +15401,10 @@ impl<'a> MoveCheck<'a> {
                     } else {
                         self.loop_value_facts.remove(&wrapper.span);
                     }
+                    None
+                }
+                Post::LoopDiverge => {
+                    self.loop_value_facts.remove(&wrapper.span);
                     None
                 }
                 Post::None => None,
