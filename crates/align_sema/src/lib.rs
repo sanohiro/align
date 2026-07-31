@@ -28869,88 +28869,77 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
 fn mark_nested_params(ty: Ty, nested: &mut [bool], tagged_types: &[hir::TaggedType]) {
-    fn mark_scalar(
-        scalar: Scalar,
-        nested: &mut [bool],
-        tagged_types: &[hir::TaggedType],
-        visiting: &mut HashSet<u32>,
-    ) {
+    let mut work = Vec::new();
+    match ty {
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
+            work.push(s);
+        }
+        Ty::Result(ok, err) => {
+            work.push(err);
+            work.push(ok);
+        }
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
+    }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
         match scalar {
             Scalar::Param(p) => {
                 if let Some(slot) = nested.get_mut(p as usize) {
                     *slot = true;
                 }
             }
-            Scalar::Tagged(id) if visiting.insert(id) => {
+            Scalar::Tagged(id) if visited.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
-                        hir::TaggedType::Option(payload) => {
-                            mark_scalar(payload, nested, tagged_types, visiting);
-                        }
+                        hir::TaggedType::Option(payload) => work.push(payload),
                         hir::TaggedType::Result(ok, err) => {
-                            mark_scalar(ok, nested, tagged_types, visiting);
-                            mark_scalar(err, nested, tagged_types, visiting);
+                            work.push(err);
+                            work.push(ok);
                         }
                     }
                 }
-                visiting.remove(&id);
             }
             _ => {}
         }
     }
-    let mut visiting = HashSet::new();
-    match ty {
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
-            mark_scalar(s, nested, tagged_types, &mut visiting);
-        }
-        Ty::Result(o, e) => {
-            mark_scalar(o, nested, tagged_types, &mut visiting);
-            mark_scalar(e, nested, tagged_types, &mut visiting);
-        }
-        Ty::Tagged(id) => mark_scalar(Scalar::Tagged(id), nested, tagged_types, &mut visiting),
-        _ => {}
-    }
 }
 
 fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    fn scalar_mentions(
-        scalar: Scalar,
-        tagged_types: &[hir::TaggedType],
-        visiting: &mut HashSet<u32>,
-    ) -> bool {
-        match scalar {
-            Scalar::Param(_) => true,
-            Scalar::Tagged(id) if visiting.insert(id) => {
-                let mentions = tagged_types
-                    .get(id as usize)
-                    .is_some_and(|tagged| match *tagged {
-                        hir::TaggedType::Option(payload) => {
-                            scalar_mentions(payload, tagged_types, visiting)
-                        }
-                        hir::TaggedType::Result(ok, err) => {
-                            scalar_mentions(ok, tagged_types, visiting)
-                                || scalar_mentions(err, tagged_types, visiting)
-                        }
-                    });
-                visiting.remove(&id);
-                mentions
-            }
-            _ => false,
-        }
+    if matches!(ty, Ty::Param(_)) {
+        return true;
     }
-    let mut visiting = HashSet::new();
+    let mut work = Vec::new();
     match ty {
-        Ty::Param(_) => true,
         Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
-            scalar_mentions(s, tagged_types, &mut visiting)
+            work.push(s);
         }
         Ty::Result(ok, err) => {
-            scalar_mentions(ok, tagged_types, &mut visiting)
-                || scalar_mentions(err, tagged_types, &mut visiting)
+            work.push(err);
+            work.push(ok);
         }
-        Ty::Tagged(id) => scalar_mentions(Scalar::Tagged(id), tagged_types, &mut visiting),
-        _ => false,
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
     }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
+        match scalar {
+            Scalar::Param(_) => return true,
+            Scalar::Tagged(id) if visited.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(payload),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(err);
+                            work.push(ok);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
@@ -33611,6 +33600,13 @@ fn main() -> i32 = 0
             }))
             .collect::<Vec<_>>();
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+        let mut tagged_params = tagged.clone();
+        tagged_params[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Param(0));
+        let mut nested = [false];
+        mark_nested_params(Ty::Tagged(0), &mut nested, &tagged_params);
+        assert!(nested[0]);
+        assert!(ty_mentions_param(Ty::Tagged(0), &tagged_params));
 
         structs[DEPTH - 1].fields[0].ty = Ty::Fn(7);
         let tables = EffectTypeTables {
