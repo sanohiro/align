@@ -28830,36 +28830,72 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
 /// Substitute a `Scalar::Param(i)` with the scalar form of `args[i]` (a generic enum's variant
 /// payload, or a composite payload). A non-`Param` scalar is unchanged.
 fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Scalar {
-    match s {
-        Scalar::Param(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
-            Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
-                tagged_types,
-                hir::TaggedType::Option(payload),
-            )),
-            Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
-                tagged_types,
-                hir::TaggedType::Result(ok, err),
-            )),
-            ty => ty_to_scalar(ty).unwrap_or(s),
-        },
-        Scalar::Tagged(id) => {
-            let Some(tagged) = tagged_types.get(id as usize).copied() else {
-                return s;
-            };
-            let concrete = match tagged {
-                hir::TaggedType::Option(payload) => {
-                    hir::TaggedType::Option(subst_scalar(payload, args, tagged_types))
-                }
-                hir::TaggedType::Result(ok, err) => {
-                    let ok = subst_scalar(ok, args, tagged_types);
-                    let err = subst_scalar(err, args, tagged_types);
-                    hir::TaggedType::Result(ok, err)
-                }
-            };
-            Scalar::Tagged(intern_tagged_type(tagged_types, concrete))
-        }
-        other => other,
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter(Scalar),
+        FinishOption(u32),
+        FinishResult(u32),
     }
+
+    let mut work = vec![Work::Enter(s)];
+    let mut values = Vec::new();
+    let mut visiting = HashSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Scalar::Param(index)) => {
+                let original = Scalar::Param(index);
+                let value = match args.get(index as usize).copied().unwrap_or(Ty::Error) {
+                    Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                        tagged_types,
+                        hir::TaggedType::Option(payload),
+                    )),
+                    Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                        tagged_types,
+                        hir::TaggedType::Result(ok, err),
+                    )),
+                    ty => ty_to_scalar(ty).unwrap_or(original),
+                };
+                values.push(value);
+            }
+            Work::Enter(Scalar::Tagged(id)) if visiting.insert(id) => {
+                match tagged_types.get(id as usize).copied() {
+                    Some(hir::TaggedType::Option(payload)) => {
+                        work.push(Work::FinishOption(id));
+                        work.push(Work::Enter(payload));
+                    }
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        work.push(Work::FinishResult(id));
+                        work.push(Work::Enter(err));
+                        work.push(Work::Enter(ok));
+                    }
+                    None => {
+                        visiting.remove(&id);
+                        values.push(Scalar::Tagged(id));
+                    }
+                }
+            }
+            Work::Enter(other) => values.push(other),
+            Work::FinishOption(id) => {
+                let payload = values.pop().expect("substituted option payload");
+                visiting.remove(&id);
+                values.push(Scalar::Tagged(intern_tagged_type(
+                    tagged_types,
+                    hir::TaggedType::Option(payload),
+                )));
+            }
+            Work::FinishResult(id) => {
+                let err = values.pop().expect("substituted result error");
+                let ok = values.pop().expect("substituted result success");
+                visiting.remove(&id);
+                values.push(Scalar::Tagged(intern_tagged_type(
+                    tagged_types,
+                    hir::TaggedType::Result(ok, err),
+                )));
+            }
+        }
+    }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().unwrap_or(s)
 }
 
 /// Whether a type carries a generic `Param` — bare, or nested one level in a scalar-payload
@@ -33607,6 +33643,19 @@ fn main() -> i32 = 0
         mark_nested_params(Ty::Tagged(0), &mut nested, &tagged_params);
         assert!(nested[0]);
         assert!(ty_mentions_param(Ty::Tagged(0), &tagged_params));
+        let mut substituted_tagged = tagged_params;
+        let substituted = subst_scalar(
+            Scalar::Tagged(0),
+            &[Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            })],
+            &mut substituted_tagged,
+        );
+        assert!(!ty_mentions_param(
+            scalar_to_ty(substituted),
+            &substituted_tagged
+        ));
 
         structs[DEPTH - 1].fields[0].ty = Ty::Fn(7);
         let tables = EffectTypeTables {
