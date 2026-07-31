@@ -15009,6 +15009,15 @@ impl<'a> MoveCheck<'a> {
         let mut current_consuming = consuming;
         let mut current_direct = direct;
         loop {
+            if let Some(child) =
+                self.transparent_pipeline_capture(current)
+            {
+                wrappers.push((current, false, Post::None));
+                current = child;
+                current_consuming = false;
+                current_direct = false;
+                continue;
+            }
             let (child, opens_arena, child_consuming, child_direct, post) =
                 match &current.kind {
                     ExprKind::Block(block)
@@ -15024,12 +15033,54 @@ impl<'a> MoveCheck<'a> {
                             Post::None,
                         )
                     }
+                    ExprKind::Block(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Expr(_)]
+                            ) =>
+                    {
+                        let [Stmt::Expr(child)] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single expression statement guard")
+                        };
+                        (child, false, false, false, Post::None)
+                    }
                     ExprKind::Arena(block)
                         if block.stmts.is_empty() && block.value.is_some() =>
                     {
                         (
                             block.value.as_deref().expect("checked arena value"),
                             true,
+                            current_consuming,
+                            current_direct,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::Arena(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Expr(_)]
+                            ) =>
+                    {
+                        let [Stmt::Expr(child)] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single expression statement guard")
+                        };
+                        (child, true, false, false, Post::None)
+                    }
+                    ExprKind::Match { scrutinee, arms }
+                        if arms.len() == 1
+                            && arms[0].bindings.is_empty()
+                            && self.expr_is_move_neutral(scrutinee)
+                            && !hir_expr_diverges(scrutinee) =>
+                    {
+                        (
+                            &arms[0].body,
+                            false,
                             current_consuming,
                             current_direct,
                             Post::None,
@@ -15196,6 +15247,35 @@ impl<'a> MoveCheck<'a> {
             }
         }
         Some(falls_through)
+    }
+
+    fn transparent_pipeline_capture(
+        &self,
+        expression: &'a Expr,
+    ) -> Option<&'a Expr> {
+        let (source, stages) = match &expression.kind {
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. } => {
+                (source.as_ref(), stages.as_slice())
+            }
+            _ => return None,
+        };
+        if !node_captures(&expression.kind).is_empty()
+            || !self.expr_is_move_neutral(source)
+            || hir_expr_diverges(source)
+        {
+            return None;
+        }
+        let mut captures = stage_capture_exprs(stages);
+        let capture = captures.next()?;
+        captures.next().is_none().then_some(capture)
     }
 
     /// Whether the complete expression tree can neither observe nor change Move/borrow state.

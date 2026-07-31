@@ -1238,6 +1238,74 @@ mod tests {
         }
     }
 
+    fn move_shape_program_at_boundary(shape: Shape) -> hir::Program {
+        let span = Span::new(0, 0, 0);
+        let target_expression_depth = MAX_CHECKED_HIR_DEPTH - 1;
+        let delta = match shape {
+            Shape::BlockStmt => 3,
+            Shape::MatchArm | Shape::Stage | Shape::TemplatePart => 2,
+        };
+        let mut expression = Expr {
+            kind: ExprKind::Local(0),
+            ty: Ty::String,
+            span,
+        };
+        let mut expression_depth = 1;
+        while expression_depth + delta <= target_expression_depth {
+            (expression, _) = wrap(shape, expression);
+            expression_depth += delta;
+        }
+        while expression_depth < target_expression_depth {
+            expression = Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: int_ty(),
+                span,
+            };
+            expression_depth += 1;
+        }
+        assert_eq!(expression_depth, target_expression_depth);
+        let ret = expression.ty;
+        hir::Program {
+            fns: vec![hir::Fn {
+                name: "deep_move_shape".to_string(),
+                lifted_capture_count: None,
+                params: vec![0],
+                param_modes: vec![align_ast::ParamMode::ByValue],
+                ret,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                locals: vec![hir::Local {
+                    id: 0,
+                    name: "value".to_string(),
+                    ty: Ty::String,
+                    is_mut: false,
+                    is_param: true,
+                    align: None,
+                }],
+                body: Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(expression)),
+                },
+                span,
+                drop_locals: Vec::new(),
+                drop_individual_locals: Vec::new(),
+                drop_individual_exprs: Default::default(),
+                exportable: false,
+            }],
+            externs: Vec::new(),
+            link_libs: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            tagged_types: Vec::new(),
+            tuples: Vec::new(),
+            fn_types: Vec::new(),
+            imported_fns: Vec::new(),
+        }
+    }
+
     #[test]
     fn checked_hir_depth_closure_matrix() {
         for shape in [
@@ -1283,10 +1351,17 @@ mod tests {
                     "the accepted checked-HIR boundary must scan effects without process-stack recursion"
                 );
 
-                for move_program in [
+                let mut move_programs = vec![
                     move_program_at_boundary(),
                     move_call_program_at_boundary(),
-                ] {
+                ];
+                move_programs.extend([
+                    move_shape_program_at_boundary(Shape::BlockStmt),
+                    move_shape_program_at_boundary(Shape::MatchArm),
+                    move_shape_program_at_boundary(Shape::Stage),
+                    move_shape_program_at_boundary(Shape::TemplatePart),
+                ]);
+                for move_program in move_programs {
                     assert!(checked_hir_body_depth_is_valid(&move_program));
                     let mut diagnostics = crate::Diagnostics::new();
                     let named_return_borrow = std::collections::HashMap::new();
