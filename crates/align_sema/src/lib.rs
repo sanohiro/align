@@ -992,32 +992,60 @@ pub enum DropPlan {
 
 impl DropPlan {
     pub fn needs_drop(&self) -> bool {
-        match self {
-            DropPlan::None => false,
-            DropPlan::Leaf(_) | DropPlan::Invalid => true,
-            DropPlan::Struct { needs_drop, .. } | DropPlan::Enum { needs_drop, .. } => *needs_drop,
-            DropPlan::Option(payload) => payload.needs_drop(),
-            DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
+        let mut work = vec![self];
+        while let Some(plan) = work.pop() {
+            match plan {
+                DropPlan::None => {}
+                DropPlan::Leaf(_) | DropPlan::Invalid => return true,
+                DropPlan::Struct { needs_drop, .. }
+                | DropPlan::Enum { needs_drop, .. } => {
+                    if *needs_drop {
+                        return true;
+                    }
+                }
+                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::Result { ok, err } => {
+                    work.push(err);
+                    work.push(ok);
+                }
+            }
         }
+        false
     }
 
     /// Whether every recursively embedded definition exists and the complete by-value graph is
     /// acyclic. Codegen uses this on decoded/hand-built MIR before layout recursion; sema reports
     /// the source-facing cycle diagnostic earlier for ordinary programs.
     pub fn is_valid(&self) -> bool {
-        match self {
-            DropPlan::Invalid => false,
-            DropPlan::None | DropPlan::Leaf(_) => true,
-            DropPlan::Struct { fields, .. } => {
-                fields.iter().all(|(_, plan)| plan.is_valid())
+        let mut work = vec![self];
+        let mut visited = HashSet::new();
+        while let Some(plan) = work.pop() {
+            if !visited.insert(plan as *const DropPlan as usize) {
+                continue;
             }
-            DropPlan::Option(payload) => payload.is_valid(),
-            DropPlan::Result { ok, err } => ok.is_valid() && err.is_valid(),
-            DropPlan::Enum { variants, .. } => variants
-                .iter()
-                .flatten()
-                .all(|plan| plan.is_valid()),
+            match plan {
+                DropPlan::Invalid => return false,
+                DropPlan::None | DropPlan::Leaf(_) => {}
+                DropPlan::Struct { fields, .. } => {
+                    work.extend(fields.iter().rev().map(|(_, plan)| plan.as_ref()));
+                }
+                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::Result { ok, err } => {
+                    work.push(err);
+                    work.push(ok);
+                }
+                DropPlan::Enum { variants, .. } => {
+                    work.extend(
+                        variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.iter().rev())
+                            .map(|plan| plan.as_ref()),
+                    );
+                }
+            }
         }
+        true
     }
 }
 
@@ -1030,252 +1058,238 @@ pub fn drop_plan(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> DropPlan {
-    // Keep traversal state sparse. `drop_plan` is queried from per-expression analyses, and most
-    // roots are primitive or touch only a small nominal subgraph; zeroing four vectors sized to
-    // every definition on every query made those common classifications quadratic in program
-    // size. ID-keyed sets/maps retain constant-time cycle/cache checks while allocating only for
-    // nominal nodes reachable from this root.
-    let mut struct_cache = HashMap::new();
-    let mut enum_cache = HashMap::new();
+    #[derive(Clone)]
+    struct Built {
+        plan: std::sync::Arc<DropPlan>,
+        needs_drop: bool,
+    }
+
+    enum Work {
+        Enter(Ty),
+        ExitTagged(u32),
+        ExitStruct { id: u32, fields: usize },
+        ExitOption,
+        ExitResult,
+        ExitEnum { id: u32, variants: Vec<usize> },
+    }
+
+    let none = || Built {
+        plan: std::sync::Arc::new(DropPlan::None),
+        needs_drop: false,
+    };
+    let invalid = || Built {
+        plan: std::sync::Arc::new(DropPlan::Invalid),
+        needs_drop: true,
+    };
+    let mut struct_cache = HashMap::<u32, Built>::new();
+    let mut enum_cache = HashMap::<u32, Built>::new();
+    let mut tagged_cache = HashMap::<u32, Built>::new();
     let mut struct_active = HashSet::new();
     let mut enum_active = HashSet::new();
     let mut tagged_active = HashSet::new();
-    let mut tagged_cache = HashMap::new();
-    drop_plan_rec(
-        ty,
-        structs,
-        enums,
-        tagged_types,
-        &mut struct_active,
-        &mut enum_active,
-        &mut tagged_active,
-        &mut struct_cache,
-        &mut enum_cache,
-        &mut tagged_cache,
-    )
-    .as_ref()
-    .clone()
-}
+    let mut work = vec![Work::Enter(ty)];
+    let mut built = Vec::<Built>::new();
 
-// The recursive classifier deliberately keeps the three definition tables, three active sets,
-// and three memo tables as separate axes; bundling them would hide which graph owns each id.
-#[allow(clippy::too_many_arguments)]
-fn drop_plan_rec(
-    ty: Ty,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    struct_active: &mut HashSet<u32>,
-    enum_active: &mut HashSet<u32>,
-    tagged_active: &mut HashSet<u32>,
-    struct_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-    enum_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-    tagged_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-) -> std::sync::Arc<DropPlan> {
-    match ty {
-        Ty::Tagged(id) => {
-            if let Some(plan) = tagged_cache.get(&id) {
-                return plan.clone();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Ty::Tagged(id)) => {
+                if let Some(plan) = tagged_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !tagged_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(expanded) = tagged_types.get(id as usize).map(|tagged| match *tagged {
+                    hir::TaggedType::Option(payload) => Ty::Option(payload),
+                    hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
+                }) else {
+                    tagged_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                work.push(Work::ExitTagged(id));
+                work.push(Work::Enter(expanded));
             }
-            if !tagged_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
+            Work::Enter(Ty::Struct(id)) => {
+                if let Some(plan) = struct_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !struct_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(definition) = structs.get(id as usize) else {
+                    struct_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                work.push(Work::ExitStruct {
+                    id,
+                    fields: definition.fields.len(),
+                });
+                for field in definition.fields.iter().rev() {
+                    work.push(Work::Enter(field.ty));
+                }
             }
-            let Some(expanded) = tagged_types.get(id as usize).map(|tagged| match *tagged {
-                hir::TaggedType::Option(payload) => Ty::Option(payload),
-                hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
-            }) else {
+            Work::Enter(Ty::Option(payload)) => {
+                work.push(Work::ExitOption);
+                work.push(Work::Enter(scalar_to_ty(payload)));
+            }
+            Work::Enter(Ty::Result(ok, err)) => {
+                work.push(Work::ExitResult);
+                work.push(Work::Enter(scalar_to_ty(err)));
+                work.push(Work::Enter(scalar_to_ty(ok)));
+            }
+            Work::Enter(Ty::Enum(id)) => {
+                if let Some(plan) = enum_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !enum_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(definition) = enums.get(id as usize) else {
+                    enum_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                let variants = definition
+                    .variants
+                    .iter()
+                    .map(|variant| variant.payload.len())
+                    .collect::<Vec<_>>();
+                work.push(Work::ExitEnum { id, variants });
+                for payload in definition
+                    .variants
+                    .iter()
+                    .rev()
+                    .flat_map(|variant| variant.payload.iter().rev())
+                {
+                    work.push(Work::Enter(scalar_to_ty(*payload)));
+                }
+            }
+            Work::Enter(ty)
+                if matches!(
+                    ty,
+                    Ty::Box(_)
+                        | Ty::Task(_)
+                        | Ty::DynArray(_)
+                        | Ty::DynStructArray(..)
+                        | Ty::DynSliceArray(_)
+                        | Ty::DynResponseArray
+                        | Ty::String
+                        | Ty::Builder
+                        | Ty::StrFinder
+                        | Ty::Writer
+                        | Ty::Reader
+                        | Ty::Buffer
+                        | Ty::ArrayBuilder(_)
+                        | Ty::Regex
+                        | Ty::Captures
+                        | Ty::CliCommand
+                        | Ty::CliParsed
+                        | Ty::TcpConn
+                        | Ty::TcpListener
+                        | Ty::UdpSocket
+                        | Ty::Child
+                        | Ty::File
+                        | Ty::HttpRequest
+                        | Ty::HttpResponse
+                        | Ty::HttpClient
+                        | Ty::HttpServer
+                        | Ty::HttpRequestCtx
+                        | Ty::ResponseBuilder
+                        | Ty::HttpStream
+                        | Ty::Command
+                        | Ty::RunOutput
+                        | Ty::DictEncoded(..)
+                ) =>
+            {
+                built.push(Built {
+                    plan: std::sync::Arc::new(DropPlan::Leaf(ty)),
+                    needs_drop: true,
+                });
+            }
+            Work::Enter(_) => built.push(none()),
+            Work::ExitTagged(id) => {
+                let plan = built.last().expect("tagged child plan").clone();
                 tagged_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let plan = drop_plan_rec(
-                expanded,
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            );
-            tagged_active.remove(&id);
-            tagged_cache.insert(id, plan.clone());
-            plan
-        }
-        Ty::Struct(id) => {
-            if let Some(plan) = struct_cache.get(&id) {
-                return plan.clone();
+                tagged_cache.insert(id, plan);
             }
-            if !struct_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
-            }
-            let Some(def) = structs.get(id as usize) else {
+            Work::ExitStruct { id, fields } => {
+                let start = built.len().checked_sub(fields).expect("struct child plans");
+                let children = built.drain(start..).collect::<Vec<_>>();
+                let needs_drop = children.iter().any(|child| child.needs_drop);
+                let plan = Built {
+                    plan: std::sync::Arc::new(DropPlan::Struct {
+                        id,
+                        fields: children
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, child)| (index as u32, child.plan))
+                            .collect(),
+                        needs_drop,
+                    }),
+                    needs_drop,
+                };
                 struct_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    (
-                        index as u32,
-                        drop_plan_rec(
-                            field.ty,
-                            structs,
-                            enums,
-                            tagged_types,
-                            struct_active,
-                            enum_active,
-                            tagged_active,
-                            struct_cache,
-                            enum_cache,
-                            tagged_cache,
-                        ),
-                    )
-                })
-                .collect();
-            struct_active.remove(&id);
-            let needs_drop = fields
-                .iter()
-                .any(|(_, plan)| plan.needs_drop());
-            let plan = std::sync::Arc::new(DropPlan::Struct {
-                id,
-                fields,
-                needs_drop,
-            });
-            struct_cache.insert(id, plan.clone());
-            plan
-        }
-        Ty::Option(payload) => std::sync::Arc::new(DropPlan::Option(drop_plan_rec(
-            scalar_to_ty(payload),
-            structs,
-            enums,
-            tagged_types,
-            struct_active,
-            enum_active,
-            tagged_active,
-            struct_cache,
-            enum_cache,
-            tagged_cache,
-        ))),
-        Ty::Result(ok, err) => std::sync::Arc::new(DropPlan::Result {
-            ok: drop_plan_rec(
-                scalar_to_ty(ok),
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            ),
-            err: drop_plan_rec(
-                scalar_to_ty(err),
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            ),
-        }),
-        Ty::Enum(id) => {
-            if let Some(plan) = enum_cache.get(&id) {
-                return plan.clone();
+                struct_cache.insert(id, plan.clone());
+                built.push(plan);
             }
-            if !enum_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
+            Work::ExitOption => {
+                let payload = built.pop().expect("option child plan");
+                built.push(Built {
+                    plan: std::sync::Arc::new(DropPlan::Option(payload.plan)),
+                    needs_drop: payload.needs_drop,
+                });
             }
-            let Some(def) = enums.get(id as usize) else {
+            Work::ExitResult => {
+                let err = built.pop().expect("result err plan");
+                let ok = built.pop().expect("result ok plan");
+                let needs_drop = ok.needs_drop || err.needs_drop;
+                built.push(Built {
+                    plan: std::sync::Arc::new(DropPlan::Result {
+                        ok: ok.plan,
+                        err: err.plan,
+                    }),
+                    needs_drop,
+                });
+            }
+            Work::ExitEnum { id, variants } => {
+                let count = variants.iter().sum::<usize>();
+                let start = built.len().checked_sub(count).expect("enum child plans");
+                let children = built.drain(start..).collect::<Vec<_>>();
+                let needs_drop = children.iter().any(|child| child.needs_drop);
+                let mut children = children.into_iter();
+                let variants = variants
+                    .into_iter()
+                    .map(|count| {
+                        children
+                            .by_ref()
+                            .take(count)
+                            .map(|child| child.plan)
+                            .collect()
+                    })
+                    .collect();
+                let plan = Built {
+                    plan: std::sync::Arc::new(DropPlan::Enum {
+                        id,
+                        variants,
+                        needs_drop,
+                    }),
+                    needs_drop,
+                };
                 enum_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
-                .variants
-                .iter()
-                .map(|variant| {
-                    variant
-                        .payload
-                        .iter()
-                        .map(|payload| {
-                            drop_plan_rec(
-                                scalar_to_ty(*payload),
-                                structs,
-                                enums,
-                                tagged_types,
-                                struct_active,
-                                enum_active,
-                                tagged_active,
-                                struct_cache,
-                                enum_cache,
-                                tagged_cache,
-                            )
-                        })
-                        .collect()
-                })
-                .collect();
-            enum_active.remove(&id);
-            let needs_drop = variants
-                .iter()
-                .flatten()
-                .any(|plan| plan.needs_drop());
-            let plan = std::sync::Arc::new(DropPlan::Enum {
-                id,
-                variants,
-                needs_drop,
-            });
-            enum_cache.insert(id, plan.clone());
-            plan
+                enum_cache.insert(id, plan.clone());
+                built.push(plan);
+            }
         }
-        // These types have an existing, non-recursive cleanup leaf. Aggregate layout is not
-        // encoded here: codegen's leaf lowering remains the representation source of truth.
-        ty if matches!(
-            ty,
-            Ty::Box(_)
-                | Ty::Task(_)
-                | Ty::DynArray(_)
-                | Ty::DynStructArray(..)
-                | Ty::DynSliceArray(_)
-                | Ty::DynResponseArray
-                | Ty::String
-                | Ty::Builder
-                | Ty::StrFinder
-                | Ty::Writer
-                | Ty::Reader
-                | Ty::Buffer
-                | Ty::ArrayBuilder(_)
-                | Ty::Regex
-                | Ty::Captures
-                | Ty::CliCommand
-                | Ty::CliParsed
-                | Ty::TcpConn
-                | Ty::TcpListener
-                | Ty::UdpSocket
-                | Ty::Child
-                | Ty::File
-                | Ty::HttpRequest
-                | Ty::HttpResponse
-                | Ty::HttpClient
-                | Ty::HttpServer
-                | Ty::HttpRequestCtx
-                | Ty::ResponseBuilder
-                | Ty::HttpStream
-                | Ty::Command
-                | Ty::RunOutput
-                | Ty::DictEncoded(..)
-        ) =>
-        {
-            std::sync::Arc::new(DropPlan::Leaf(ty))
-        }
-        _ => std::sync::Arc::new(DropPlan::None),
     }
+    built.pop().unwrap_or_else(none).plan.as_ref().clone()
 }
 
 /// Whether `ty` is a tuple with at least one owned (Move) element — i.e. a Move tuple. Needs the
@@ -33954,7 +33968,7 @@ fn main() -> i32 = 0
             align: None,
             c_repr: false,
         }];
-        for depth in 1..512 {
+        for depth in 1..4_096 {
             structs.push(StructDef {
                 name: format!("S{depth}"),
                 source_name: format!("S{depth}"),
@@ -33966,8 +33980,13 @@ fn main() -> i32 = 0
                 c_repr: false,
             });
         }
+        let plan = drop_plan(Ty::Struct(4_095), &structs, &[], &[]);
         assert!(
-            !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
+            plan.is_valid(),
+            "a deep finite DropPlan must remain valid without recursive inspection"
+        );
+        assert!(
+            !plan.needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
         );
     }
