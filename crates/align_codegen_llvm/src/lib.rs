@@ -13193,6 +13193,97 @@ mod tests {
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
+    fn unary_hir_at_body_depth(depth: usize) -> hir::Program {
+        assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(0, "fn main() -> i32 = 0\n", &mut diagnostics);
+        let file = parse_file(tokens, &mut diagnostics);
+        let mut program = check_file(&file, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+
+        let function = &mut program.fns[0];
+        let span = function.span;
+        let mut expression = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: function.ret,
+            span,
+        };
+        for _ in 2..depth {
+            expression = hir::Expr {
+                kind: hir::ExprKind::Unary {
+                    op: align_ast::UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: function.ret,
+                span,
+            };
+        }
+        function.body = hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        };
+        program
+    }
+
+    #[test]
+    fn checked_hir_depth_closure_matrix() {
+        std::thread::Builder::new()
+            .name("checked-hir-depth-codegen-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for depth in [
+                    align_sema::MAX_CHECKED_HIR_DEPTH - 1,
+                    align_sema::MAX_CHECKED_HIR_DEPTH,
+                ] {
+                    let hir = unary_hir_at_body_depth(depth);
+                    assert!(
+                        align_sema::checked_hir_body_depth_is_valid(&hir),
+                        "valid checked-HIR depth {depth} was rejected"
+                    );
+                    let mir = lower_program(&hir);
+                    assert!(!mir.fns.is_empty(), "valid depth {depth} did not reach MIR");
+                    for optimized in [false, true] {
+                        let llvm = emit_llvm_ir(
+                            &mir,
+                            &BuildTarget::Baseline,
+                            optimized,
+                            &[],
+                            None,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("depth {depth}, optimized={optimized}: {error}")
+                        });
+                        assert!(
+                            llvm.contains("define") && llvm.contains("@main("),
+                            "depth {depth}, optimized={optimized}: main was not emitted"
+                        );
+                    }
+                }
+
+                let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
+                let hir = unary_hir_at_body_depth(depth);
+                assert!(
+                    !align_sema::checked_hir_body_depth_is_valid(&hir),
+                    "over-bound checked-HIR depth {depth} was accepted"
+                );
+                let mir = lower_program(&hir);
+                assert!(
+                    mir.fns.is_empty()
+                        && mir.externs.is_empty()
+                        && mir.imported_fns.is_empty()
+                        && mir.link_libs.is_empty()
+                        && mir.structs.is_empty()
+                        && mir.enums.is_empty()
+                        && mir.tagged_types.is_empty()
+                        && mir.tuples.is_empty(),
+                    "an over-bound body published partial MIR"
+                );
+            })
+            .expect("spawn checked-HIR depth codegen owner")
+            .join()
+            .expect("checked-HIR depth codegen owner");
+    }
+
     // -- Build profiles reach the backend (Codex audit item 3) ------------------------------------
 
     #[test]
