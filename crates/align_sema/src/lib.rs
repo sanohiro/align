@@ -12789,6 +12789,22 @@ struct BorrowState {
     invalid_value_sources: std::collections::HashMap<usize, EndedRoots>,
 }
 
+#[derive(Clone)]
+struct MoveMatchPrepared {
+    incoming_borrows: BorrowState,
+    evaluated: MovedSet,
+    evaluated_borrows: BorrowState,
+    consumed: Option<MovedSet>,
+    consumed_borrows: Option<BorrowState>,
+    scrutinee_roots: BorrowRoots,
+}
+
+#[derive(Default)]
+struct MoveMatchJoin {
+    moved: Option<MovedSet>,
+    borrows: Option<BorrowState>,
+}
+
 impl BorrowState {
     fn assign(&mut self, local: LocalId, fact: BorrowFact) {
         self.invalid.remove(&local);
@@ -15029,6 +15045,25 @@ impl<'a> MoveCheck<'a> {
                 then_result:
                     Option<(bool, MovedSet, BorrowState, BorrowFact)>,
             },
+            MatchAfterScrutinee {
+                scrutinee: &'e Expr,
+                arms: &'e [MatchArm],
+                consuming: bool,
+                direct: bool,
+                incoming_borrows: BorrowState,
+                consuming_control: bool,
+            },
+            MatchAfterArm {
+                scrutinee: &'e Expr,
+                arms: &'e [MatchArm],
+                selected: usize,
+                consuming: bool,
+                direct: bool,
+                incoming_borrows: BorrowState,
+                consuming_control: bool,
+                prepared: Option<MoveMatchPrepared>,
+                join: MoveMatchJoin,
+            },
             OptionalAfterFirst {
                 second: &'e Expr,
                 consuming: bool,
@@ -15118,18 +15153,65 @@ impl<'a> MoveCheck<'a> {
                         (child, true, false, false, Post::None)
                     }
                     ExprKind::Match { scrutinee, arms }
-                        if arms.len() == 1
-                            && arms[0].bindings.is_empty()
-                            && self.expr_is_move_neutral(scrutinee)
-                            && !hir_expr_diverges(scrutinee) =>
+                        if !arms.is_empty() =>
                     {
-                        (
-                            &arms[0].body,
-                            false,
-                            current_consuming,
-                            current_direct,
-                            Post::None,
-                        )
+                        let has_move_binding = arms
+                            .iter()
+                            .flat_map(|arm| &arm.bindings)
+                            .any(|binding| self.is_move(*binding));
+                        let consuming_control = has_move_binding
+                            && match_scrutinee_materializes_result(
+                                scrutinee,
+                            );
+                        let scrutinee_size =
+                            hir_depth::expr_postorder(scrutinee).len();
+                        let (selected, selected_size) = arms
+                            .iter()
+                            .enumerate()
+                            .map(|(index, arm)| {
+                                (
+                                    index,
+                                    hir_depth::expr_postorder(&arm.body)
+                                        .len(),
+                                )
+                            })
+                            .max_by_key(|&(_, size)| size)
+                            .expect("non-empty match arms");
+                        let incoming_borrows = self.borrows.clone();
+                        if scrutinee_size >= selected_size {
+                            (
+                                scrutinee.as_ref(),
+                                false,
+                                consuming_control,
+                                consuming_control,
+                                Post::MatchAfterScrutinee {
+                                    scrutinee,
+                                    arms,
+                                    consuming: current_consuming,
+                                    direct: current_direct,
+                                    incoming_borrows,
+                                    consuming_control,
+                                },
+                            )
+                        } else {
+                            (
+                                &arms[selected].body,
+                                false,
+                                current_consuming,
+                                current_direct,
+                                Post::MatchAfterArm {
+                                    scrutinee,
+                                    arms,
+                                    selected,
+                                    consuming: current_consuming,
+                                    direct: current_direct,
+                                    incoming_borrows,
+                                    consuming_control,
+                                    prepared: None,
+                                    join: MoveMatchJoin::default(),
+                                },
+                            )
+                        }
                     }
                     ExprKind::Binary {
                         op: BinOp::And | BinOp::Or,
@@ -15475,6 +15557,62 @@ impl<'a> MoveCheck<'a> {
                             self.borrows.clone(),
                         ));
                     }
+                    Post::MatchAfterArm {
+                        scrutinee,
+                        arms,
+                        selected,
+                        consuming,
+                        direct,
+                        incoming_borrows,
+                        consuming_control,
+                        prepared,
+                        join,
+                    } => {
+                        if !self.expr(
+                            scrutinee,
+                            moved,
+                            *consuming_control,
+                            *consuming_control,
+                        ) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        let match_state =
+                            self.prepare_match_after_scrutinee(
+                                scrutinee,
+                                arms,
+                                moved,
+                                incoming_borrows.clone(),
+                                *consuming_control,
+                            );
+                        for arm in &arms[..*selected] {
+                            self.begin_match_arm(
+                                &match_state,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                *consuming,
+                                *direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        self.begin_match_arm(
+                            &match_state,
+                            &arms[*selected],
+                            moved,
+                        );
+                        *prepared = Some(match_state);
+                    }
                     Post::IfAfterThen {
                         condition,
                         incoming,
@@ -15637,6 +15775,100 @@ impl<'a> MoveCheck<'a> {
                             snapshot,
                             wrapper.span,
                             falls_through,
+                        );
+                    }
+                    None
+                }
+                Post::MatchAfterScrutinee {
+                    scrutinee,
+                    arms,
+                    consuming,
+                    direct,
+                    incoming_borrows,
+                    consuming_control,
+                } => {
+                    if falls_through {
+                        let prepared =
+                            self.prepare_match_after_scrutinee(
+                                scrutinee,
+                                arms,
+                                moved,
+                                incoming_borrows,
+                                consuming_control,
+                            );
+                        let mut join = MoveMatchJoin::default();
+                        for arm in arms {
+                            self.begin_match_arm(
+                                &prepared,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                consuming,
+                                direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    &mut join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        falls_through = self.finish_match_join(
+                            &prepared,
+                            join,
+                            moved,
+                        );
+                    }
+                    None
+                }
+                Post::MatchAfterArm {
+                    arms,
+                    selected,
+                    consuming,
+                    direct,
+                    prepared,
+                    mut join,
+                    ..
+                } => {
+                    if let Some(prepared) = prepared {
+                        if falls_through {
+                            let arm_borrows = self.borrows.clone();
+                            self.join_match_arm(
+                                &mut join,
+                                moved,
+                                &arm_borrows,
+                            );
+                        }
+                        for arm in &arms[selected + 1..] {
+                            self.begin_match_arm(
+                                &prepared,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                consuming,
+                                direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    &mut join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        falls_through = self.finish_match_join(
+                            &prepared,
+                            join,
+                            moved,
                         );
                     }
                     None
@@ -15864,6 +16096,122 @@ impl<'a> MoveCheck<'a> {
             (false, false) => incoming_borrows,
         };
         then_falls || else_falls
+    }
+
+    fn prepare_match_after_scrutinee(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        moved: &MovedSet,
+        incoming_borrows: BorrowState,
+        consuming_control: bool,
+    ) -> MoveMatchPrepared {
+        let evaluated = moved.clone();
+        let evaluated_borrows = self.borrows.clone();
+        let has_move_binding = arms
+            .iter()
+            .flat_map(|arm| &arm.bindings)
+            .any(|binding| self.is_move(*binding));
+        let (consumed, consumed_borrows) = if has_move_binding {
+            if consuming_control {
+                (
+                    Some(evaluated.clone()),
+                    Some(evaluated_borrows.clone()),
+                )
+            } else {
+                let mut state = evaluated.clone();
+                self.borrows = evaluated_borrows.clone();
+                self.consume_match_result(scrutinee, &mut state, true);
+                (Some(state), Some(self.borrows.clone()))
+            }
+        } else {
+            (None, None)
+        };
+        self.borrows = evaluated_borrows.clone();
+        let scrutinee_roots = self.borrow_sources(scrutinee);
+        MoveMatchPrepared {
+            incoming_borrows,
+            evaluated,
+            evaluated_borrows,
+            consumed,
+            consumed_borrows,
+            scrutinee_roots,
+        }
+    }
+
+    fn begin_match_arm(
+        &mut self,
+        prepared: &MoveMatchPrepared,
+        arm: &MatchArm,
+        moved: &mut MovedSet,
+    ) {
+        let arm_moves_payload = arm
+            .bindings
+            .iter()
+            .any(|binding| self.is_move(*binding));
+        *moved = if arm_moves_payload {
+            prepared
+                .consumed
+                .as_ref()
+                .expect("Move binding has consumed state")
+                .clone()
+        } else {
+            prepared.evaluated.clone()
+        };
+        self.borrows = if arm_moves_payload {
+            prepared
+                .consumed_borrows
+                .as_ref()
+                .expect("Move binding has consumed borrow state")
+                .clone()
+        } else {
+            prepared.evaluated_borrows.clone()
+        };
+        for binding in &arm.bindings {
+            let roots = if self.local_may_borrow(*binding) {
+                prepared.scrutinee_roots.clone()
+            } else {
+                BorrowRoots::new()
+            };
+            self.borrows
+                .assign(*binding, BorrowFact::from_direct(roots));
+            clear_moved(moved, *binding);
+        }
+    }
+
+    fn join_match_arm(
+        &self,
+        join: &mut MoveMatchJoin,
+        moved: &MovedSet,
+        borrows: &BorrowState,
+    ) {
+        join.moved = Some(match join.moved.take() {
+            None => moved.clone(),
+            Some(previous) => &previous | moved,
+        });
+        join.borrows = Some(match join.borrows.take() {
+            None => borrows.clone(),
+            Some(previous) => BorrowState::join(&previous, borrows),
+        });
+    }
+
+    fn finish_match_join(
+        &mut self,
+        prepared: &MoveMatchPrepared,
+        join: MoveMatchJoin,
+        moved: &mut MovedSet,
+    ) -> bool {
+        if let Some(joined) = join.moved {
+            *moved = joined;
+            self.borrows = join
+                .borrows
+                .expect("fallthrough match arm has borrow state");
+            true
+        } else {
+            *moved = prepared.evaluated.clone();
+            self.borrows = prepared.incoming_borrows.clone();
+            false
+        }
     }
 
     fn transparent_pipeline_child(

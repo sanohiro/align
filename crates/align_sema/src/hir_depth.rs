@@ -1006,6 +1006,9 @@ mod tests {
         ReduceInit,
         ScanInit,
         MapIntoDst,
+        MatchFirst,
+        MatchSecond,
+        MatchScrutinee,
     }
 
     fn int_ty() -> Ty {
@@ -1335,9 +1338,12 @@ mod tests {
             | MoveControlShape::ReduceInit
             | MoveControlShape::ScanInit
             | MoveControlShape::MapIntoDst => 1,
+            MoveControlShape::MatchScrutinee => 1,
             MoveControlShape::If
             | MoveControlShape::IfElse
-            | MoveControlShape::IfCondition => 2,
+            | MoveControlShape::IfCondition
+            | MoveControlShape::MatchFirst
+            | MoveControlShape::MatchSecond => 2,
             MoveControlShape::LoopBreak
             | MoveControlShape::LoopRepeat => 3,
         };
@@ -1495,6 +1501,60 @@ mod tests {
                     dst: Box::new(expression),
                     elem: int_ty(),
                 },
+                MoveControlShape::MatchFirst => ExprKind::Match {
+                    scrutinee: Box::new(leaf()),
+                    arms: vec![
+                        MatchArm {
+                            variants: Vec::new(),
+                            bindings: Vec::new(),
+                            body: expression,
+                        },
+                        MatchArm {
+                            variants: Vec::new(),
+                            bindings: Vec::new(),
+                            body: Expr {
+                                kind: ExprKind::StrBorrow(Box::new(Expr {
+                                    kind: ExprKind::Local(0),
+                                    ty: Ty::String,
+                                    span,
+                                })),
+                                ty: Ty::Str,
+                                span,
+                            },
+                        },
+                    ],
+                },
+                MoveControlShape::MatchSecond => ExprKind::Match {
+                    scrutinee: Box::new(leaf()),
+                    arms: vec![
+                        MatchArm {
+                            variants: Vec::new(),
+                            bindings: Vec::new(),
+                            body: Expr {
+                                kind: ExprKind::StrBorrow(Box::new(Expr {
+                                    kind: ExprKind::Local(0),
+                                    ty: Ty::String,
+                                    span,
+                                })),
+                                ty: Ty::Str,
+                                span,
+                            },
+                        },
+                        MatchArm {
+                            variants: Vec::new(),
+                            bindings: Vec::new(),
+                            body: expression,
+                        },
+                    ],
+                },
+                MoveControlShape::MatchScrutinee => ExprKind::Match {
+                    scrutinee: Box::new(expression),
+                    arms: vec![MatchArm {
+                        variants: Vec::new(),
+                        bindings: Vec::new(),
+                        body: leaf(),
+                    }],
+                },
             };
             expression = Expr {
                 kind,
@@ -1510,7 +1570,10 @@ mod tests {
                     | MoveControlShape::LoopRepeat
                     | MoveControlShape::ReduceInit
                     | MoveControlShape::ScanInit
-                    | MoveControlShape::MapIntoDst => int_ty(),
+                    | MoveControlShape::MapIntoDst
+                    | MoveControlShape::MatchFirst
+                    | MoveControlShape::MatchSecond
+                    | MoveControlShape::MatchScrutinee => int_ty(),
                 },
                 span,
             };
@@ -1656,6 +1719,15 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::MapIntoDst,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::MatchFirst,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::MatchSecond,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::MatchScrutinee,
                     ),
                 ]);
                 for move_program in move_programs {
