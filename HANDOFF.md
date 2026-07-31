@@ -422,9 +422,12 @@ parser recursion counter or template-hole grammar cannot construct. Am-d accepts
 259, rejects depth 260 before semantic consumption, and converts producer replay to explicit
 enter/exit worklists. All four MIR-lowering paths use a heterogeneous worklist for strict eager
 spines, immediate parent-owned continuations for multi-child ownership boundaries, and small
-out-of-line structured-control frames bounded by the fixed 259 ceiling; mixed eager/call,
-block/template, `if`, binary/wildcard `match`, `else`, short-circuit, loop, and arena/task-group
-boundary owners run on the 2 MiB test stack. The final raw/optimized LLVM owner uses the same
+out-of-line structured-control and specialized-operation frames bounded by the fixed 259 ceiling.
+The outer dispatcher reaches the existing file, reader, array-builder, process-command, path,
+regex, and HTTP helpers without retaining the giant recursive frame; strict string wrappers stay
+on the eager worklist. Mixed eager/call, string/path, block/template, `if`, binary/wildcard `match`,
+`else`, short-circuit, loop, and arena/task-group boundary owners run on the 2 MiB test stack. The
+final raw/optimized LLVM owner uses the same
 accepted record boundary, and the deep owned-leaf codegen owner emits the actual recursive Drop on
 that same stack.
 Am-g-t intentionally

@@ -4195,6 +4195,69 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
         | hir::ExprKind::Arena(_)
         | hir::ExprKind::TaskGroup(_)
         | hir::ExprKind::Template(_)
+        | hir::ExprKind::FileCreateRw { .. }
+        | hir::ExprKind::FileOpenRw { .. }
+        | hir::ExprKind::FilePread { .. }
+        | hir::ExprKind::FilePwrite { .. }
+        | hir::ExprKind::FileLen { .. }
+        | hir::ExprKind::ReaderBuffered { .. }
+        | hir::ExprKind::ReaderReadLine { .. }
+        | hir::ExprKind::BytesAsStr { .. }
+        | hir::ExprKind::ArrayBuilderNew { .. }
+        | hir::ExprKind::ArrayBuilderPush { .. }
+        | hir::ExprKind::ArrayBuilderAppend { .. }
+        | hir::ExprKind::ArrayBuilderBuild(_)
+        | hir::ExprKind::ProcessCommand { .. }
+        | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandEnv { .. }
+        | hir::ExprKind::CommandEnvClear { .. }
+        | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::RunOutputCode { .. }
+        | hir::ExprKind::RunOutputStdout { .. }
+        | hir::ExprKind::RunOutputStderr { .. }
+        | hir::ExprKind::PathJoin { .. }
+        | hir::ExprKind::PathComponent { .. }
+        | hir::ExprKind::PathNormalize { .. }
+        | hir::ExprKind::RegexCompile { .. }
+        | hir::ExprKind::RegexIsMatch { .. }
+        | hir::ExprKind::RegexFind { .. }
+        | hir::ExprKind::RegexFindAll { .. }
+        | hir::ExprKind::RegexSplit { .. }
+        | hir::ExprKind::RegexReplace { .. }
+        | hir::ExprKind::RegexCaptures { .. }
+        | hir::ExprKind::RegexGroupCount { .. }
+        | hir::ExprKind::RegexGroupIndex { .. }
+        | hir::ExprKind::CapturesGroup { .. }
+        | hir::ExprKind::HttpRequest { .. }
+        | hir::ExprKind::HttpHeader { .. }
+        | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpRequestTimeout { .. }
+        | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpParse { .. }
+        | hir::ExprKind::HttpRespStatus { .. }
+        | hir::ExprKind::HttpRespHeader { .. }
+        | hir::ExprKind::HttpRespBody { .. }
+        | hir::ExprKind::HttpClient
+        | hir::ExprKind::HttpClientGet { .. }
+        | hir::ExprKind::HttpClientPost { .. }
+        | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpGetMany { .. }
+        | hir::ExprKind::HttpServe { .. }
+        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpCtxMethod { .. }
+        | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeaders { .. }
+        | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpCtxBody { .. }
+        | hir::ExprKind::HttpResponseBuilder { .. }
+        | hir::ExprKind::HttpRbHeader { .. }
+        | hir::ExprKind::HttpRbBody { .. }
+        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamReject { .. }
+        | hir::ExprKind::HttpStreamSend { .. }
+        | hir::ExprKind::HttpStreamFinish { .. }
     )
 }
 
@@ -4221,7 +4284,9 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
         | hir::ExprKind::BoxGet(_)
         | hir::ExprKind::BoxClone(_)
         | hir::ExprKind::StrClone(_)
+        | hir::ExprKind::StrTrim { .. }
         | hir::ExprKind::StrBorrow(_)
+        | hir::ExprKind::StrBytes { .. }
         | hir::ExprKind::BuilderToString(_) => true,
         _ => false,
     }
@@ -4251,6 +4316,69 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::FileCreateRw { .. }
+        | hir::ExprKind::FileOpenRw { .. }
+        | hir::ExprKind::FilePread { .. }
+        | hir::ExprKind::FilePwrite { .. }
+        | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
+        hir::ExprKind::ReaderBuffered { .. }
+        | hir::ExprKind::ReaderReadLine { .. }
+        | hir::ExprKind::BytesAsStr { .. } => lower_reader_line_expr(b, e),
+        hir::ExprKind::ArrayBuilderNew { .. }
+        | hir::ExprKind::ArrayBuilderPush { .. }
+        | hir::ExprKind::ArrayBuilderAppend { .. }
+        | hir::ExprKind::ArrayBuilderBuild(_) => lower_array_builder_expr(b, e),
+        hir::ExprKind::ProcessCommand { .. }
+        | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandEnv { .. }
+        | hir::ExprKind::CommandEnvClear { .. }
+        | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::RunOutputCode { .. }
+        | hir::ExprKind::RunOutputStdout { .. }
+        | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
+        hir::ExprKind::PathJoin { .. }
+        | hir::ExprKind::PathComponent { .. }
+        | hir::ExprKind::PathNormalize { .. } => lower_path_expr(b, e),
+        hir::ExprKind::RegexCompile { .. }
+        | hir::ExprKind::RegexIsMatch { .. }
+        | hir::ExprKind::RegexFind { .. }
+        | hir::ExprKind::RegexFindAll { .. }
+        | hir::ExprKind::RegexSplit { .. }
+        | hir::ExprKind::RegexReplace { .. }
+        | hir::ExprKind::RegexCaptures { .. }
+        | hir::ExprKind::RegexGroupCount { .. }
+        | hir::ExprKind::RegexGroupIndex { .. }
+        | hir::ExprKind::CapturesGroup { .. } => lower_regex_expr(b, e),
+        hir::ExprKind::HttpRequest { .. }
+        | hir::ExprKind::HttpHeader { .. }
+        | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpRequestTimeout { .. }
+        | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpParse { .. }
+        | hir::ExprKind::HttpRespStatus { .. }
+        | hir::ExprKind::HttpRespHeader { .. }
+        | hir::ExprKind::HttpRespBody { .. }
+        | hir::ExprKind::HttpClient
+        | hir::ExprKind::HttpClientGet { .. }
+        | hir::ExprKind::HttpClientPost { .. }
+        | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpGetMany { .. }
+        | hir::ExprKind::HttpServe { .. }
+        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpCtxMethod { .. }
+        | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeaders { .. }
+        | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpCtxBody { .. }
+        | hir::ExprKind::HttpResponseBuilder { .. }
+        | hir::ExprKind::HttpRbHeader { .. }
+        | hir::ExprKind::HttpRbBody { .. }
+        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamReject { .. }
+        | hir::ExprKind::HttpStreamSend { .. }
+        | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
         _ => unreachable!("out-of-line dispatcher received an eager expression"),
     }
 }
@@ -11878,6 +12006,43 @@ fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) ->
     let r = b.fresh_value(result_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+/// The three `std.path` operations stay outside the giant recursive expression dispatcher. Their
+/// string/`str` results can form producer-valid chains with `str.borrow`, so retaining the giant
+/// dispatcher frame at each path operation would exceed the 2 MiB owner stack at the accepted HIR
+/// depth boundary.
+#[inline(never)]
+fn lower_path_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::PathJoin { a, b: pb } => {
+            let ao = lower_required!(b, lower_expr(b, a), Operand::Const(Const::Unit));
+            let bo = lower_required!(b, lower_expr(b, pb), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathJoin { a: ao, b: bo }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::PathComponent { kind, path } => {
+            let po = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            inherit_borrow_owners(b, v, [&po]);
+            b.push(Stmt::Let(
+                v,
+                Rvalue::PathComponent {
+                    kind: *kind,
+                    path: po,
+                },
+            ));
+            Operand::Value(v)
+        }
+        hir::ExprKind::PathNormalize { path } => {
+            let po = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
+            Operand::Value(v)
+        }
+        _ => unreachable!("lower_path_expr on a non-path operation"),
+    }
 }
 
 /// The three A7 line-read ops off `lower_expr`'s hot path (the #296 expr-depth lesson): `.buffered()`

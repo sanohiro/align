@@ -250,6 +250,118 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
     program
 }
 
+fn with_str_trim_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Str("x".to_string()),
+        ty: Ty::Str,
+        span,
+    };
+    for _ in 2..depth {
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrTrim {
+                kind: hir::StrTrimKind::Both,
+                recv: Box::new(expr),
+            },
+            ty: Ty::Str,
+            span,
+        };
+    }
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_str_trim".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::Str,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
+fn with_path_string_body_depth(depth: usize) -> hir::Program {
+    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    let span = align_span::Span::new(0, 0, 0);
+    let mut expr = hir::Expr {
+        kind: hir::ExprKind::Str("x".to_string()),
+        ty: Ty::Str,
+        span,
+    };
+    for expression_depth in 2..depth {
+        expr = if expr.ty == Ty::String {
+            hir::Expr {
+                kind: hir::ExprKind::StrBorrow(Box::new(expr)),
+                ty: Ty::Str,
+                span,
+            }
+        } else {
+            match expression_depth % 4 {
+                0 | 2 => hir::Expr {
+                    kind: hir::ExprKind::PathComponent {
+                        kind: hir::PathComponentKind::Base,
+                        path: Box::new(expr),
+                    },
+                    ty: Ty::Str,
+                    span,
+                },
+                1 => hir::Expr {
+                    kind: hir::ExprKind::PathNormalize {
+                        path: Box::new(expr),
+                    },
+                    ty: Ty::String,
+                    span,
+                },
+                _ => hir::Expr {
+                    kind: hir::ExprKind::PathJoin {
+                        a: Box::new(expr),
+                        b: Box::new(hir::Expr {
+                            kind: hir::ExprKind::Str("y".to_string()),
+                            ty: Ty::Str,
+                            span,
+                        }),
+                    },
+                    ty: Ty::String,
+                    span,
+                },
+            }
+        };
+    }
+    let ret = expr.ty;
+    let mut program = baseline_program();
+    program.fns.push(hir::Fn {
+        name: "deep_path_string".to_string(),
+        lifted_capture_count: None,
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: Vec::new(),
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expr)),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+        exportable: false,
+    });
+    program
+}
+
 fn with_template_body_depth(depth: usize) -> hir::Program {
     assert!(depth >= 2, "the root Block and leaf Expr need depth two");
     let span = align_span::Span::new(0, 0, 0);
@@ -858,6 +970,8 @@ fn checked_hir_depth_closure_matrix() {
             for make_program in [
                 with_unary_body_depth as fn(usize) -> hir::Program,
                 with_mixed_eager_body_depth,
+                with_str_trim_body_depth,
+                with_path_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,
                 with_match_arm_body_depth,
@@ -886,6 +1000,8 @@ fn checked_hir_depth_closure_matrix() {
             for make_program in [
                 with_unary_body_depth as fn(usize) -> hir::Program,
                 with_mixed_eager_body_depth,
+                with_str_trim_body_depth,
+                with_path_string_body_depth,
                 with_template_body_depth,
                 with_block_stmt_body_depth,
                 with_match_arm_body_depth,
