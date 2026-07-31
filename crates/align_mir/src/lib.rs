@@ -3806,6 +3806,250 @@ fn lower_unary_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     operand
 }
 
+struct TemplateFrame<'a> {
+    expr: &'a hir::Expr,
+    parts: &'a [hir::TemplatePart],
+    next: usize,
+    pieces: Vec<TemplatePiece>,
+    pending: Option<&'a hir::TemplatePart>,
+    owner: Option<Slot>,
+}
+
+fn template_frame<'a>(b: &mut Builder, expr: &'a hir::Expr) -> TemplateFrame<'a> {
+    let hir::ExprKind::Template(parts) = &expr.kind else {
+        unreachable!("a template frame starts at a Template expression")
+    };
+    // Register before holes: a `?` inside one may emit an early cleanup edge.
+    let owner =
+        owns_hidden_string(expr, !b.arenas.is_empty()).then(|| b.new_synthetic_owner(Ty::String));
+    TemplateFrame {
+        expr,
+        parts,
+        next: 0,
+        pieces: Vec::new(),
+        pending: None,
+        owner,
+    }
+}
+
+fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
+    match part {
+        hir::TemplatePart::Hole(hole) => {
+            // The piece is picked by sema's single display classification. An owned `string` is
+            // already a borrowed `str` here (`StrBorrow`), so it uses the one string path.
+            match align_sema::print_kind(hole.ty) {
+                Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(operand),
+                Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(operand),
+                Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(operand),
+                Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(operand),
+                // An erroring program never reaches MIR; the only `None` is the poison sentinel.
+                Some(align_sema::PrintKind::Int) | None => TemplatePiece::IntHole(operand),
+            }
+        }
+        hir::TemplatePart::JsonStr(_) => TemplatePiece::JsonStrHole(operand),
+        hir::TemplatePart::OptionField { name, .. } => TemplatePiece::OptionField {
+            opt: operand,
+            name: name.clone(),
+        },
+        hir::TemplatePart::OptionStructField {
+            name, struct_id, ..
+        } => TemplatePiece::OptionStructField {
+            opt: operand,
+            name: name.clone(),
+            struct_id: *struct_id,
+        },
+        hir::TemplatePart::StructArrayField { struct_id, .. } => {
+            TemplatePiece::StructArrayField {
+                array: operand,
+                struct_id: *struct_id,
+            }
+        }
+        hir::TemplatePart::ScalarArrayField { elem, .. } => TemplatePiece::ScalarArrayField {
+            array: operand,
+            elem: *elem,
+        },
+        hir::TemplatePart::UnionValue { enum_id, .. } => TemplatePiece::UnionValue {
+            value: operand,
+            enum_id: *enum_id,
+        },
+        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {
+            unreachable!("a static template part has no operand")
+        }
+    }
+}
+
+fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
+    match part {
+        hir::TemplatePart::Hole(expr)
+        | hir::TemplatePart::JsonStr(expr)
+        | hir::TemplatePart::OptionField { access: expr, .. }
+        | hir::TemplatePart::OptionStructField { access: expr, .. }
+        | hir::TemplatePart::StructArrayField { access: expr, .. }
+        | hir::TemplatePart::ScalarArrayField { access: expr, .. }
+        | hir::TemplatePart::UnionValue { access: expr, .. } => Some(expr),
+        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => None,
+    }
+}
+
+/// Lower nested templates with explicit frames while preserving part evaluation and owner order.
+#[inline(never)]
+fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    enum Action<'a> {
+        Finish,
+        Text(&'a str),
+        PopComma,
+        Child(&'a hir::TemplatePart, &'a hir::Expr),
+    }
+
+    let mut frames = vec![template_frame(b, root)];
+    let mut completed = None;
+    loop {
+        if let Some(operand) = completed.take() {
+            let Some(parent) = frames.last_mut() else {
+                return operand;
+            };
+            let part = parent
+                .pending
+                .take()
+                .expect("a nested template result has a parent part");
+            parent.pieces.push(template_piece(part, operand));
+            continue;
+        }
+
+        let action = {
+            let frame = frames.last_mut().expect("the root frame returns directly");
+            if frame.next == frame.parts.len() {
+                Action::Finish
+            } else {
+                let part = &frame.parts[frame.next];
+                frame.next += 1;
+                match part {
+                    hir::TemplatePart::Text(text) => Action::Text(text),
+                    hir::TemplatePart::PopComma => Action::PopComma,
+                    _ => Action::Child(
+                        part,
+                        template_part_expr(part).expect("an operand part has one expression"),
+                    ),
+                }
+            }
+        };
+
+        match action {
+            Action::Finish => {
+                let frame = frames.pop().expect("one template frame is active");
+                let arena = b.arenas.last().map(|handle| Operand::Value(*handle));
+                let result = b.fresh_value(frame.expr.ty);
+                b.push(Stmt::Let(
+                    result,
+                    Rvalue::Template(frame.pieces, arena),
+                ));
+                if let Some(owner) = frame.owner {
+                    b.push(Stmt::Store(owner, Operand::Value(result)));
+                    b.set_drop_flag(owner, true);
+                    b.attach_borrow_owners(result, [owner]);
+                }
+                completed = Some(Operand::Value(result));
+            }
+            Action::Text(text) => frames
+                .last_mut()
+                .expect("a part belongs to an active frame")
+                .pieces
+                .push(TemplatePiece::Static(text.to_string())),
+            Action::PopComma => frames
+                .last_mut()
+                .expect("a part belongs to an active frame")
+                .pieces
+                .push(TemplatePiece::PopComma),
+            Action::Child(part, child) => {
+                if matches!(child.kind, hir::ExprKind::Template(_)) {
+                    frames
+                        .last_mut()
+                        .expect("a nested template has a parent frame")
+                        .pending = Some(part);
+                    frames.push(template_frame(b, child));
+                } else {
+                    let operand = lower_expr(b, child);
+                    if !lowering_continues(b) {
+                        return terminated_operand();
+                    }
+                    frames
+                        .last_mut()
+                        .expect("a part belongs to an active frame")
+                        .pieces
+                        .push(template_piece(part, operand));
+                }
+            }
+        }
+    }
+}
+
+/// Lower transparent block tails and Copy/Unit expression-statement spines without native
+/// `lower_expr -> lower_block -> lower_stmt` recursion.
+#[inline(never)]
+fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    #[derive(Clone, Copy)]
+    enum Post {
+        Tail,
+        ExprStmt,
+    }
+
+    let mut posts = Vec::new();
+    let mut current = root;
+    loop {
+        let block = match &current.kind {
+            hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block,
+            _ => break,
+        };
+        if block.stmts.is_empty()
+            && let Some(value) = block.value.as_deref()
+        {
+            b.set_span(value.span);
+            posts.push(Post::Tail);
+            current = value;
+            continue;
+        }
+        if block.value.is_none()
+            && let [hir::Stmt::Expr(expr)] = block.stmts.as_slice()
+            && !needs_drop_flag(
+                expr.ty,
+                &b.structs,
+                &b.tuples,
+                &b.enums,
+                &b.tagged_types,
+            )
+        {
+            b.set_span(expr.span);
+            posts.push(Post::ExprStmt);
+            current = expr;
+            continue;
+        }
+        break;
+    }
+
+    if posts.is_empty() {
+        let block = match &root.kind {
+            hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block,
+            _ => unreachable!("a plain block spine starts at Block or Unsafe"),
+        };
+        return lower_block(b, block).unwrap_or(Operand::Const(Const::Unit));
+    }
+
+    let mut operand = lower_expr(b, current);
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    while let Some(post) = posts.pop() {
+        match post {
+            Post::Tail => {}
+            Post::ExprStmt => {
+                drop_borrow_owners(b, &operand);
+                operand = Operand::Const(Const::Unit);
+            }
+        }
+    }
+    operand
+}
+
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     'lower_expr: {
         // Keep every required-child failure in this giant recursive dispatcher on one common exit.
@@ -3851,129 +4095,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 elem,
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
-            hir::ExprKind::Template(parts) => {
-                // Outside an explicit arena, retain the produced bytes in a hidden owned string.
-                // Its view inherits this owner through scalar/view consumers and loop/function
-                // cleanup. Register before holes: a `?` inside one may emit an early cleanup edge.
-                // The condition is sema's (`owns_hidden_string`), shared so `MoveCheck`'s borrow
-                // liveness ends a template view's generation at exactly the loop edge where this
-                // owner is freed.
-                let owner = owns_hidden_string(e, !b.arenas.is_empty())
-                    .then(|| b.new_synthetic_owner(Ty::String));
-                let mut pieces = Vec::new();
-                for p in parts {
-                    match p {
-                        hir::TemplatePart::Text(s) => {
-                            pieces.push(TemplatePiece::Static(s.clone()));
-                        }
-                        hir::TemplatePart::Hole(h) => {
-                            let ty = h.ty;
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, h),
-                                Operand::Const(Const::Unit)
-                            );
-                            // The piece is picked by sema's SINGLE display classification
-                            // (`print_kind`), never by a local catch-all: a printable type sema
-                            // accepts but this match forgot used to fall into `IntHole` and hand
-                            // codegen a `{ptr,len}` aggregate where it demanded an integer. An
-                            // owned `string` is already a borrowed `str` here (sema's
-                            // `StrBorrow`), so it renders through the one string path.
-                            pieces.push(match align_sema::print_kind(ty) {
-                                Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(op),
-                                Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(op),
-                                Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(op),
-                                Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(op),
-                                // `Int`, plus the poisoned `Ty::Error` hole — unprintable holes
-                                // are a sema error, and an erroring program never reaches MIR, so
-                                // the only `None` here is the error sentinel, which codegen renders
-                                // as an int.
-                                Some(align_sema::PrintKind::Int) | None => {
-                                    TemplatePiece::IntHole(op)
-                                }
-                            });
-                        }
-                        hir::TemplatePart::JsonStr(h) => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, h),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::JsonStrHole(op));
-                        }
-                        hir::TemplatePart::OptionField { access, name } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::OptionField {
-                                opt: op,
-                                name: name.clone(),
-                            });
-                        }
-                        hir::TemplatePart::OptionStructField {
-                            access,
-                            name,
-                            struct_id,
-                        } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::OptionStructField {
-                                opt: op,
-                                name: name.clone(),
-                                struct_id: *struct_id,
-                            });
-                        }
-                        hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
-                        hir::TemplatePart::StructArrayField { access, struct_id } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::StructArrayField {
-                                array: op,
-                                struct_id: *struct_id,
-                            });
-                        }
-                        hir::TemplatePart::ScalarArrayField { access, elem } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::ScalarArrayField {
-                                array: op,
-                                elem: *elem,
-                            });
-                        }
-                        hir::TemplatePart::UnionValue { access, enum_id } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::UnionValue {
-                                value: op,
-                                enum_id: *enum_id,
-                            });
-                        }
-                    }
-                }
-                let arena = b.arenas.last().map(|h| Operand::Value(*h));
-                let r = b.fresh_value(e.ty);
-                b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
-                if let Some(owner) = owner {
-                    b.push(Stmt::Store(owner, Operand::Value(r)));
-                    b.set_drop_flag(owner, true);
-                    b.attach_borrow_owners(r, [owner]);
-                }
-                Operand::Value(r)
-            }
+            hir::ExprKind::Template(_) => lower_template_spine(b, e),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode(b, *struct_id, input, e.ty)
             }
@@ -4996,12 +5118,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            hir::ExprKind::Block(blk) => lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit)),
+            hir::ExprKind::Block(_) => lower_plain_block_spine(b, e),
             // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
             // inner block; the enforcement + impurity were handled in sema.
-            hir::ExprKind::Unsafe(blk) => {
-                lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit))
-            }
+            hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
             // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
             hir::ExprKind::RawAlloc(size) => {
                 lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
