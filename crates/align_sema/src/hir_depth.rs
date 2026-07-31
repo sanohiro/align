@@ -926,6 +926,28 @@ pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
         .collect()
 }
 
+/// Stable child-first expression order for a shared HIR root.
+pub(crate) fn expr_postorder(root: &Expr) -> Vec<&Expr> {
+    let mut events = Vec::new();
+    let valid = walk_body_records(
+        BodyRecord::Expr(root),
+        usize::MAX,
+        Some(&mut events),
+        false,
+    );
+    debug_assert!(valid);
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            BodyEvent::ExprExit { expression, .. } => Some(expression),
+            BodyEvent::StmtEnter(_)
+            | BodyEvent::StmtExit(_)
+            | BodyEvent::ExprEnter(_)
+            | BodyEvent::MatchArmEnter { .. } => None,
+        })
+        .collect()
+}
+
 pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
     let mut events = Vec::new();
     let valid = walk_body_records(
@@ -1130,6 +1152,39 @@ mod tests {
                     effects.get("deep"),
                     Some(&crate::FnEffect::Pure),
                     "the accepted checked-HIR boundary must scan effects without process-stack recursion"
+                );
+
+                let mut diagnostics = crate::Diagnostics::new();
+                let named_return_borrow = std::collections::HashMap::new();
+                crate::MoveCheck {
+                    f: &program.fns[0],
+                    diags: &mut diagnostics,
+                    named_return_borrow: &named_return_borrow,
+                    summary_dependencies: None,
+                    tuples: &program.tuples,
+                    structs: &program.structs,
+                    enums: &program.enums,
+                    tagged_types: &program.tagged_types,
+                    loop_breaks: Vec::new(),
+                    borrows: crate::BorrowState::default(),
+                    next_pipeline_snapshot: 0,
+                    loop_borrow_breaks: Vec::new(),
+                    loop_value_breaks: Vec::new(),
+                    loop_value_facts: std::collections::HashMap::new(),
+                    control_value_facts: std::collections::HashMap::new(),
+                    walked_value_facts: std::collections::HashMap::new(),
+                    value_snapshot_frames: Vec::new(),
+                    reported_invalid_value_actions: std::collections::HashSet::new(),
+                    loop_iter_drops: Vec::new(),
+                    arena_depth: 0,
+                    return_roots: crate::BorrowRoots::new(),
+                    non_fallthrough: std::collections::HashSet::new(),
+                    borrow_fact_cache: std::cell::RefCell::new(None),
+                }
+                .check();
+                assert!(
+                    !diagnostics.has_errors(),
+                    "the accepted checked-HIR boundary must check moves and borrows without process-stack recursion"
                 );
 
                 let mut diagnostics = crate::Diagnostics::new();

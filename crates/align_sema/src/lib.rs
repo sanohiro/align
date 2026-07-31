@@ -4665,6 +4665,7 @@ pub fn check_program_with_interface_facts(
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -4830,6 +4831,7 @@ fn infer_return_provenance(
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -12548,6 +12550,10 @@ struct MoveCheck<'a> {
     /// Expressions proven not to reach their result edge during this exact source-order walk.
     /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
     non_fallthrough: std::collections::HashSet<Span>,
+    /// Per-query postorder facts. While populated, nested provenance lookups read an already
+    /// completed child instead of recursing through the native stack.
+    borrow_fact_cache:
+        std::cell::RefCell<Option<std::collections::HashMap<usize, BorrowFact>>>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -13245,6 +13251,37 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn borrow_fact(&self, e: &Expr) -> BorrowFact {
+        if let Some(fact) = self
+            .borrow_fact_cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&Self::expr_key(e)))
+            .cloned()
+        {
+            return fact;
+        }
+        if self.borrow_fact_cache.borrow().is_some() {
+            panic!("borrow fact dependency was not completed before its parent");
+        }
+
+        *self.borrow_fact_cache.borrow_mut() =
+            Some(std::collections::HashMap::new());
+        for expression in hir_depth::expr_postorder(e) {
+            let fact = self.borrow_fact_one(expression);
+            self.borrow_fact_cache
+                .borrow_mut()
+                .as_mut()
+                .expect("active borrow fact cache")
+                .insert(Self::expr_key(expression), fact);
+        }
+        self.borrow_fact_cache
+            .borrow_mut()
+            .take()
+            .and_then(|mut cache| cache.remove(&Self::expr_key(e)))
+            .expect("borrow fact root result")
+    }
+
+    fn borrow_fact_one(&self, e: &Expr) -> BorrowFact {
         let mut fact = BorrowFact::default();
         if self.non_fallthrough.contains(&e.span) {
             return fact;
@@ -14683,6 +14720,13 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
+        if self.expr_is_move_neutral(e) {
+            let falls_through = !hir_expr_diverges(e);
+            if !falls_through {
+                self.non_fallthrough.insert(e.span);
+            }
+            return falls_through;
+        }
         if matches!(
             e.kind,
             ExprKind::Binary {
@@ -14749,6 +14793,61 @@ impl<'a> MoveCheck<'a> {
             }
         }
         falls_through
+    }
+
+    /// Whether the complete expression tree can neither observe nor change Move/borrow state.
+    /// This lane is intentionally narrow: every value is Copy and non-borrowing, blocks contain
+    /// expression statements only, and place projections that could observe a moved aggregate are
+    /// excluded. Such a tree has no MoveCheck transfer to replay, so its fallthrough is exactly the
+    /// shared iterative divergence result.
+    fn expr_is_move_neutral(&self, root: &Expr) -> bool {
+        for expression in hir_depth::expr_postorder(root) {
+            if self.is_move_ty(expression.ty)
+                || ty_may_borrow(
+                    expression.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                )
+            {
+                return false;
+            }
+            match &expression.kind {
+                ExprKind::Field { .. }
+                | ExprKind::SoaColumn { .. }
+                | ExprKind::IndexField { .. } => return false,
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block)
+                | ExprKind::Loop { body: block, .. }
+                    if block
+                        .stmts
+                        .iter()
+                        .any(|statement| !matches!(statement, Stmt::Expr(_))) =>
+                {
+                    return false;
+                }
+                ExprKind::If { then, els, .. }
+                    if [then, els].into_iter().any(|block| {
+                        block
+                            .stmts
+                            .iter()
+                            .any(|statement| !matches!(statement, Stmt::Expr(_)))
+                    }) =>
+                {
+                    return false;
+                }
+                ExprKind::Match { arms, .. }
+                    if arms.iter().any(|arm| !arm.bindings.is_empty()) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     fn eager_binary_tree_is_non_borrowing(&self, root: &Expr) -> bool {
@@ -31787,6 +31886,7 @@ fn main() -> i32 = 0
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
