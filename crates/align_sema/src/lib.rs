@@ -15001,6 +15001,7 @@ impl<'a> MoveCheck<'a> {
         enum Post<'e> {
             None,
             Try(&'e Expr),
+            LoopBreak(&'e Expr),
             JoinIncoming {
                 moved: MovedSet,
                 borrows: BorrowState,
@@ -15157,6 +15158,35 @@ impl<'a> MoveCheck<'a> {
                             },
                         )
                     }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(
+                            body.stmts.as_slice(),
+                            [Stmt::Break {
+                                value: Some(_),
+                                accepted: true,
+                            }]
+                        ) =>
+                    {
+                        let [Stmt::Break {
+                            value: Some(child),
+                            accepted: true,
+                        }] = body.stmts.as_slice()
+                        else {
+                            unreachable!("accepted single-break loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            true,
+                            true,
+                            Post::LoopBreak(child),
+                        )
+                    }
                     ExprKind::OptionSome(child)
                     | ExprKind::ResultOk(child)
                     | ExprKind::ResultErr(child)
@@ -15299,6 +15329,21 @@ impl<'a> MoveCheck<'a> {
                     None
                 }
                 Post::Try(result) => Some(result),
+                Post::LoopBreak(value) => {
+                    if falls_through {
+                        let key = Self::expr_key(value);
+                        self.validate_value_snapshot(key, key, value.span);
+                        let fact = self.borrow_fact(value);
+                        if fact.is_empty() {
+                            self.loop_value_facts.remove(&wrapper.span);
+                        } else {
+                            self.loop_value_facts.insert(wrapper.span, fact);
+                        }
+                    } else {
+                        self.loop_value_facts.remove(&wrapper.span);
+                    }
+                    None
+                }
                 Post::None => None,
             };
             if !falls_through {
