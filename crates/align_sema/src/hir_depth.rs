@@ -15,6 +15,13 @@ enum BodyRecord<'a> {
     TemplatePart(&'a TemplatePart),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BodyEvent<'a> {
+    StmtEnter(&'a Stmt),
+    ExprEnter(&'a Expr),
+    ExprExit(&'a Expr),
+}
+
 /// Check every stored function body before a recursive checked-HIR consumer can run.
 ///
 /// Every body is an independent root at depth one. The match over [`ExprKind`] is deliberately
@@ -24,7 +31,7 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
         if !walk_body_records(
             BodyRecord::Block(&function.body),
             MAX_CHECKED_HIR_DEPTH,
-            &mut |_| {},
+            None,
         ) {
             return false;
         }
@@ -32,10 +39,10 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
     true
 }
 
-fn walk_body_records(
-    root: BodyRecord<'_>,
+fn walk_body_records<'a>(
+    root: BodyRecord<'a>,
     max_depth: usize,
-    on_expr_exit: &mut impl FnMut(&Expr),
+    mut events: Option<&mut Vec<BodyEvent<'a>>>,
 ) -> bool {
     let mut work = vec![(root, 1usize)];
     while let Some((record, depth)) = work.pop() {
@@ -46,10 +53,21 @@ fn walk_body_records(
             BodyRecord::Expr(expr) => Some(expr),
             _ => None,
         };
+        if let Some(events) = events.as_mut() {
+            match record {
+                BodyRecord::Stmt(stmt) => events.push(BodyEvent::StmtEnter(stmt)),
+                BodyRecord::Expr(expr) => events.push(BodyEvent::ExprEnter(expr)),
+                BodyRecord::ExprExit(expr) => events.push(BodyEvent::ExprExit(expr)),
+                BodyRecord::Block(_)
+                | BodyRecord::MatchArm(_)
+                | BodyRecord::Stage(_)
+                | BodyRecord::TemplatePart(_) => {}
+            }
+        }
         let child_depth = depth + 1;
         let child_start = work.len();
         match record {
-                BodyRecord::ExprExit(expr) => on_expr_exit(expr),
+                BodyRecord::ExprExit(_) => {}
                 BodyRecord::Block(block) => {
                     work.extend(
                         block
@@ -818,15 +836,28 @@ fn walk_body_records(
 /// completes; finalization changes types and metadata but never replaces an `Expr`, child vector, or
 /// block, so their addresses stay valid for the duration of that pass.
 pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
-    let mut nodes = Vec::new();
+    let mut events = Vec::new();
     let root = &*root;
+    let valid = walk_body_records(BodyRecord::Expr(root), usize::MAX, Some(&mut events));
+    debug_assert!(valid);
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            BodyEvent::ExprExit(expr) => Some(expr as *const Expr as *mut Expr),
+            BodyEvent::StmtEnter(_) | BodyEvent::ExprEnter(_) => None,
+        })
+        .collect()
+}
+
+pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
+    let mut events = Vec::new();
     let valid = walk_body_records(
-        BodyRecord::Expr(root),
+        BodyRecord::Block(root),
         usize::MAX,
-        &mut |expr| nodes.push(expr as *const Expr as *mut Expr),
+        Some(&mut events),
     );
     debug_assert!(valid);
-    nodes
+    events
 }
 
 #[cfg(test)]
