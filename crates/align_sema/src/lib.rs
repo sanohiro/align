@@ -15,9 +15,15 @@ use align_span::Span;
 
 pub mod hir;
 pub use hir::*;
+mod hir_depth;
+pub use hir_depth::{
+    MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
+};
+mod type_layout;
+pub use type_layout::{TypeLayoutCache, ty_abi_layout};
 
 /// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct IntTy {
     pub bits: u8,
     pub signed: bool,
@@ -30,7 +36,7 @@ impl IntTy {
 }
 
 /// Floating-point width. `f64` = `FloatTy { bits: 64 }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FloatTy {
     pub bits: u8,
 }
@@ -43,7 +49,7 @@ impl FloatTy {
 
 /// A variable-free scalar type — the only payloads M2 allows inside `Option`/`Result`.
 /// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scalar {
     Int(IntTy),
     Float(FloatTy),
@@ -224,7 +230,7 @@ impl Scalar {
 /// The element of an owned-`array<T>` payload ([`Scalar::DynArray`]). A primitive scalar only —
 /// a deliberately small, `Copy`, **non-recursive** subset of [`Scalar`] so an `array` can sit
 /// inside an `Option`/`Result` payload without making [`Scalar`]/[`Ty`] recursive (MMv2 slice 8b).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrimScalar {
     Int(IntTy),
     Float(FloatTy),
@@ -277,7 +283,7 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
 /// (column-oriented, `soa array<T>`) joins at M6. Keeping it in the type **now** means adding
 /// `Soa` later turns every place that must handle the new layout into a compile error — the
 /// layout decision can never be silently forgotten.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Layout {
     /// Array-of-structs: elements are contiguous whole structs (`[... %Struct ...]`). Field access
     /// GEPs `element, field`.
@@ -289,7 +295,7 @@ pub enum Layout {
 }
 
 /// sema-internal type representation (`03-types.md` §1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     Int(IntTy),
     /// A generic type parameter, by its index in the enclosing function's `<...>` list
@@ -563,7 +569,7 @@ pub enum Ty {
     /// `json.doc` lane, never a Move handle: it owns nothing, is never dropped, and never makes its
     /// enclosing struct Move (which is the whole point — pkg.web's Copy `Ctx` carries it as a field).
     /// Its representation IS the `http_request_ctx` pointer (a **bare 8-byte pointer** — the only Copy
-    /// type that is one, hence its own `ty_size_align` arm), so `ctx.headers()` lowers to a pointer
+    /// type that is one, hence its own type-layout arm), so `ctx.headers()` lowers to a pointer
     /// copy and `hs.get(name)` reuses the existing `align_rt_http_ctx_header` call: no runtime code is
     /// added at all. Region-bound to the ctx it was minted from; `hs.get(name)` yields an `Option<str>`
     /// view that **inherits** the view's region. Deliberately has **no `Scalar` variant**, which keeps
@@ -919,6 +925,12 @@ enum JsonDir {
     Encode,
 }
 
+#[derive(Clone, Copy)]
+enum JsonShapeRoot {
+    Struct(u32),
+    Enum(u32),
+}
+
 impl JsonDir {
     /// The builtin's name, for a diagnostic.
     fn name(self) -> &'static str {
@@ -966,23 +978,74 @@ fn json_encodable_scalar(s: Scalar) -> bool {
 /// *how* each leaf is lowered, while this plan is the single answer to which live children need
 /// cleanup. `Option`/`Result`/sum nodes retain their tag shape even when all current payloads are
 /// Copy, so admitting another finite Move payload cannot silently bypass the recursive walk.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DropPlanRef(Option<std::sync::Arc<DropPlan>>);
+
+impl DropPlanRef {
+    fn new(plan: DropPlan) -> Self {
+        Self(Some(std::sync::Arc::new(plan)))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        match (&left.0, &right.0) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl AsRef<DropPlan> for DropPlanRef {
+    fn as_ref(&self) -> &DropPlan {
+        self.0
+            .as_deref()
+            .expect("a live DropPlan reference has one node")
+    }
+}
+
+impl Clone for DropPlanRef {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for DropPlanRef {
+    type Target = DropPlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl Drop for DropPlanRef {
+    fn drop(&mut self) {
+        let Some(root) = self.0.take() else { return };
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            let Ok(mut plan) = std::sync::Arc::try_unwrap(node) else {
+                continue;
+            };
+            plan.take_owned_children(&mut work);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DropPlan {
     None,
     Leaf(Ty),
     Struct {
         id: u32,
-        fields: Vec<(u32, std::sync::Arc<DropPlan>)>,
+        fields: Vec<(u32, DropPlanRef)>,
         needs_drop: bool,
     },
-    Option(std::sync::Arc<DropPlan>),
+    Option(DropPlanRef),
     Result {
-        ok: std::sync::Arc<DropPlan>,
-        err: std::sync::Arc<DropPlan>,
+        ok: DropPlanRef,
+        err: DropPlanRef,
     },
     Enum {
         id: u32,
-        variants: Vec<Vec<std::sync::Arc<DropPlan>>>,
+        variants: Vec<Vec<DropPlanRef>>,
         needs_drop: bool,
     },
     /// A malformed or cyclic resolved definition. Sema diagnoses the definition separately; the
@@ -991,33 +1054,89 @@ pub enum DropPlan {
 }
 
 impl DropPlan {
-    pub fn needs_drop(&self) -> bool {
+    fn take_owned_children(&mut self, work: &mut Vec<std::sync::Arc<DropPlan>>) {
+        let mut take = |reference: &mut DropPlanRef| {
+            if let Some(node) = reference.0.take() {
+                work.push(node);
+            }
+        };
         match self {
-            DropPlan::None => false,
-            DropPlan::Leaf(_) | DropPlan::Invalid => true,
-            DropPlan::Struct { needs_drop, .. } | DropPlan::Enum { needs_drop, .. } => *needs_drop,
-            DropPlan::Option(payload) => payload.needs_drop(),
-            DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
+            DropPlan::Struct { fields, .. } => {
+                for (_, field) in fields {
+                    take(field);
+                }
+            }
+            DropPlan::Option(payload) => take(payload),
+            DropPlan::Result { ok, err } => {
+                take(ok);
+                take(err);
+            }
+            DropPlan::Enum { variants, .. } => {
+                for variant in variants {
+                    for payload in variant {
+                        take(payload);
+                    }
+                }
+            }
+            DropPlan::None | DropPlan::Leaf(_) | DropPlan::Invalid => {}
         }
+    }
+
+    pub fn needs_drop(&self) -> bool {
+        let mut work = vec![self];
+        while let Some(plan) = work.pop() {
+            match plan {
+                DropPlan::None => {}
+                DropPlan::Leaf(_) | DropPlan::Invalid => return true,
+                DropPlan::Struct { needs_drop, .. }
+                | DropPlan::Enum { needs_drop, .. } => {
+                    if *needs_drop {
+                        return true;
+                    }
+                }
+                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::Result { ok, err } => {
+                    work.push(err);
+                    work.push(ok);
+                }
+            }
+        }
+        false
     }
 
     /// Whether every recursively embedded definition exists and the complete by-value graph is
     /// acyclic. Codegen uses this on decoded/hand-built MIR before layout recursion; sema reports
     /// the source-facing cycle diagnostic earlier for ordinary programs.
     pub fn is_valid(&self) -> bool {
-        match self {
-            DropPlan::Invalid => false,
-            DropPlan::None | DropPlan::Leaf(_) => true,
-            DropPlan::Struct { fields, .. } => {
-                fields.iter().all(|(_, plan)| plan.is_valid())
+        let mut work = vec![self];
+        let mut visited = HashSet::new();
+        while let Some(plan) = work.pop() {
+            if !visited.insert(plan as *const DropPlan as usize) {
+                continue;
             }
-            DropPlan::Option(payload) => payload.is_valid(),
-            DropPlan::Result { ok, err } => ok.is_valid() && err.is_valid(),
-            DropPlan::Enum { variants, .. } => variants
-                .iter()
-                .flatten()
-                .all(|plan| plan.is_valid()),
+            match plan {
+                DropPlan::Invalid => return false,
+                DropPlan::None | DropPlan::Leaf(_) => {}
+                DropPlan::Struct { fields, .. } => {
+                    work.extend(fields.iter().rev().map(|(_, plan)| plan.as_ref()));
+                }
+                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::Result { ok, err } => {
+                    work.push(err);
+                    work.push(ok);
+                }
+                DropPlan::Enum { variants, .. } => {
+                    work.extend(
+                        variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.iter().rev())
+                            .map(|plan| plan.as_ref()),
+                    );
+                }
+            }
         }
+        true
     }
 }
 
@@ -1030,252 +1149,238 @@ pub fn drop_plan(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> DropPlan {
-    // Keep traversal state sparse. `drop_plan` is queried from per-expression analyses, and most
-    // roots are primitive or touch only a small nominal subgraph; zeroing four vectors sized to
-    // every definition on every query made those common classifications quadratic in program
-    // size. ID-keyed sets/maps retain constant-time cycle/cache checks while allocating only for
-    // nominal nodes reachable from this root.
-    let mut struct_cache = HashMap::new();
-    let mut enum_cache = HashMap::new();
+    #[derive(Clone)]
+    struct Built {
+        plan: DropPlanRef,
+        needs_drop: bool,
+    }
+
+    enum Work {
+        Enter(Ty),
+        ExitTagged(u32),
+        ExitStruct { id: u32, fields: usize },
+        ExitOption,
+        ExitResult,
+        ExitEnum { id: u32, variants: Vec<usize> },
+    }
+
+    let none = || Built {
+        plan: DropPlanRef::new(DropPlan::None),
+        needs_drop: false,
+    };
+    let invalid = || Built {
+        plan: DropPlanRef::new(DropPlan::Invalid),
+        needs_drop: true,
+    };
+    let mut struct_cache = HashMap::<u32, Built>::new();
+    let mut enum_cache = HashMap::<u32, Built>::new();
+    let mut tagged_cache = HashMap::<u32, Built>::new();
     let mut struct_active = HashSet::new();
     let mut enum_active = HashSet::new();
     let mut tagged_active = HashSet::new();
-    let mut tagged_cache = HashMap::new();
-    drop_plan_rec(
-        ty,
-        structs,
-        enums,
-        tagged_types,
-        &mut struct_active,
-        &mut enum_active,
-        &mut tagged_active,
-        &mut struct_cache,
-        &mut enum_cache,
-        &mut tagged_cache,
-    )
-    .as_ref()
-    .clone()
-}
+    let mut work = vec![Work::Enter(ty)];
+    let mut built = Vec::<Built>::new();
 
-// The recursive classifier deliberately keeps the three definition tables, three active sets,
-// and three memo tables as separate axes; bundling them would hide which graph owns each id.
-#[allow(clippy::too_many_arguments)]
-fn drop_plan_rec(
-    ty: Ty,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    struct_active: &mut HashSet<u32>,
-    enum_active: &mut HashSet<u32>,
-    tagged_active: &mut HashSet<u32>,
-    struct_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-    enum_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-    tagged_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
-) -> std::sync::Arc<DropPlan> {
-    match ty {
-        Ty::Tagged(id) => {
-            if let Some(plan) = tagged_cache.get(&id) {
-                return plan.clone();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Ty::Tagged(id)) => {
+                if let Some(plan) = tagged_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !tagged_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(expanded) = tagged_types.get(id as usize).map(|tagged| match *tagged {
+                    hir::TaggedType::Option(payload) => Ty::Option(payload),
+                    hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
+                }) else {
+                    tagged_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                work.push(Work::ExitTagged(id));
+                work.push(Work::Enter(expanded));
             }
-            if !tagged_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
+            Work::Enter(Ty::Struct(id)) => {
+                if let Some(plan) = struct_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !struct_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(definition) = structs.get(id as usize) else {
+                    struct_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                work.push(Work::ExitStruct {
+                    id,
+                    fields: definition.fields.len(),
+                });
+                for field in definition.fields.iter().rev() {
+                    work.push(Work::Enter(field.ty));
+                }
             }
-            let Some(expanded) = tagged_types.get(id as usize).map(|tagged| match *tagged {
-                hir::TaggedType::Option(payload) => Ty::Option(payload),
-                hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
-            }) else {
+            Work::Enter(Ty::Option(payload)) => {
+                work.push(Work::ExitOption);
+                work.push(Work::Enter(scalar_to_ty(payload)));
+            }
+            Work::Enter(Ty::Result(ok, err)) => {
+                work.push(Work::ExitResult);
+                work.push(Work::Enter(scalar_to_ty(err)));
+                work.push(Work::Enter(scalar_to_ty(ok)));
+            }
+            Work::Enter(Ty::Enum(id)) => {
+                if let Some(plan) = enum_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !enum_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(definition) = enums.get(id as usize) else {
+                    enum_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                let variants = definition
+                    .variants
+                    .iter()
+                    .map(|variant| variant.payload.len())
+                    .collect::<Vec<_>>();
+                work.push(Work::ExitEnum { id, variants });
+                for payload in definition
+                    .variants
+                    .iter()
+                    .rev()
+                    .flat_map(|variant| variant.payload.iter().rev())
+                {
+                    work.push(Work::Enter(scalar_to_ty(*payload)));
+                }
+            }
+            Work::Enter(ty)
+                if matches!(
+                    ty,
+                    Ty::Box(_)
+                        | Ty::Task(_)
+                        | Ty::DynArray(_)
+                        | Ty::DynStructArray(..)
+                        | Ty::DynSliceArray(_)
+                        | Ty::DynResponseArray
+                        | Ty::String
+                        | Ty::Builder
+                        | Ty::StrFinder
+                        | Ty::Writer
+                        | Ty::Reader
+                        | Ty::Buffer
+                        | Ty::ArrayBuilder(_)
+                        | Ty::Regex
+                        | Ty::Captures
+                        | Ty::CliCommand
+                        | Ty::CliParsed
+                        | Ty::TcpConn
+                        | Ty::TcpListener
+                        | Ty::UdpSocket
+                        | Ty::Child
+                        | Ty::File
+                        | Ty::HttpRequest
+                        | Ty::HttpResponse
+                        | Ty::HttpClient
+                        | Ty::HttpServer
+                        | Ty::HttpRequestCtx
+                        | Ty::ResponseBuilder
+                        | Ty::HttpStream
+                        | Ty::Command
+                        | Ty::RunOutput
+                        | Ty::DictEncoded(..)
+                ) =>
+            {
+                built.push(Built {
+                    plan: DropPlanRef::new(DropPlan::Leaf(ty)),
+                    needs_drop: true,
+                });
+            }
+            Work::Enter(_) => built.push(none()),
+            Work::ExitTagged(id) => {
+                let plan = built.last().expect("tagged child plan").clone();
                 tagged_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let plan = drop_plan_rec(
-                expanded,
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            );
-            tagged_active.remove(&id);
-            tagged_cache.insert(id, plan.clone());
-            plan
-        }
-        Ty::Struct(id) => {
-            if let Some(plan) = struct_cache.get(&id) {
-                return plan.clone();
+                tagged_cache.insert(id, plan);
             }
-            if !struct_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
-            }
-            let Some(def) = structs.get(id as usize) else {
+            Work::ExitStruct { id, fields } => {
+                let start = built.len().checked_sub(fields).expect("struct child plans");
+                let children = built.drain(start..).collect::<Vec<_>>();
+                let needs_drop = children.iter().any(|child| child.needs_drop);
+                let plan = Built {
+                    plan: DropPlanRef::new(DropPlan::Struct {
+                        id,
+                        fields: children
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, child)| (index as u32, child.plan))
+                            .collect(),
+                        needs_drop,
+                    }),
+                    needs_drop,
+                };
                 struct_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    (
-                        index as u32,
-                        drop_plan_rec(
-                            field.ty,
-                            structs,
-                            enums,
-                            tagged_types,
-                            struct_active,
-                            enum_active,
-                            tagged_active,
-                            struct_cache,
-                            enum_cache,
-                            tagged_cache,
-                        ),
-                    )
-                })
-                .collect();
-            struct_active.remove(&id);
-            let needs_drop = fields
-                .iter()
-                .any(|(_, plan)| plan.needs_drop());
-            let plan = std::sync::Arc::new(DropPlan::Struct {
-                id,
-                fields,
-                needs_drop,
-            });
-            struct_cache.insert(id, plan.clone());
-            plan
-        }
-        Ty::Option(payload) => std::sync::Arc::new(DropPlan::Option(drop_plan_rec(
-            scalar_to_ty(payload),
-            structs,
-            enums,
-            tagged_types,
-            struct_active,
-            enum_active,
-            tagged_active,
-            struct_cache,
-            enum_cache,
-            tagged_cache,
-        ))),
-        Ty::Result(ok, err) => std::sync::Arc::new(DropPlan::Result {
-            ok: drop_plan_rec(
-                scalar_to_ty(ok),
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            ),
-            err: drop_plan_rec(
-                scalar_to_ty(err),
-                structs,
-                enums,
-                tagged_types,
-                struct_active,
-                enum_active,
-                tagged_active,
-                struct_cache,
-                enum_cache,
-                tagged_cache,
-            ),
-        }),
-        Ty::Enum(id) => {
-            if let Some(plan) = enum_cache.get(&id) {
-                return plan.clone();
+                struct_cache.insert(id, plan.clone());
+                built.push(plan);
             }
-            if !enum_active.insert(id) {
-                return std::sync::Arc::new(DropPlan::Invalid);
+            Work::ExitOption => {
+                let payload = built.pop().expect("option child plan");
+                built.push(Built {
+                    plan: DropPlanRef::new(DropPlan::Option(payload.plan)),
+                    needs_drop: payload.needs_drop,
+                });
             }
-            let Some(def) = enums.get(id as usize) else {
+            Work::ExitResult => {
+                let err = built.pop().expect("result err plan");
+                let ok = built.pop().expect("result ok plan");
+                let needs_drop = ok.needs_drop || err.needs_drop;
+                built.push(Built {
+                    plan: DropPlanRef::new(DropPlan::Result {
+                        ok: ok.plan,
+                        err: err.plan,
+                    }),
+                    needs_drop,
+                });
+            }
+            Work::ExitEnum { id, variants } => {
+                let count = variants.iter().sum::<usize>();
+                let start = built.len().checked_sub(count).expect("enum child plans");
+                let children = built.drain(start..).collect::<Vec<_>>();
+                let needs_drop = children.iter().any(|child| child.needs_drop);
+                let mut children = children.into_iter();
+                let variants = variants
+                    .into_iter()
+                    .map(|count| {
+                        children
+                            .by_ref()
+                            .take(count)
+                            .map(|child| child.plan)
+                            .collect()
+                    })
+                    .collect();
+                let plan = Built {
+                    plan: DropPlanRef::new(DropPlan::Enum {
+                        id,
+                        variants,
+                        needs_drop,
+                    }),
+                    needs_drop,
+                };
                 enum_active.remove(&id);
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
-                .variants
-                .iter()
-                .map(|variant| {
-                    variant
-                        .payload
-                        .iter()
-                        .map(|payload| {
-                            drop_plan_rec(
-                                scalar_to_ty(*payload),
-                                structs,
-                                enums,
-                                tagged_types,
-                                struct_active,
-                                enum_active,
-                                tagged_active,
-                                struct_cache,
-                                enum_cache,
-                                tagged_cache,
-                            )
-                        })
-                        .collect()
-                })
-                .collect();
-            enum_active.remove(&id);
-            let needs_drop = variants
-                .iter()
-                .flatten()
-                .any(|plan| plan.needs_drop());
-            let plan = std::sync::Arc::new(DropPlan::Enum {
-                id,
-                variants,
-                needs_drop,
-            });
-            enum_cache.insert(id, plan.clone());
-            plan
+                enum_cache.insert(id, plan.clone());
+                built.push(plan);
+            }
         }
-        // These types have an existing, non-recursive cleanup leaf. Aggregate layout is not
-        // encoded here: codegen's leaf lowering remains the representation source of truth.
-        ty if matches!(
-            ty,
-            Ty::Box(_)
-                | Ty::Task(_)
-                | Ty::DynArray(_)
-                | Ty::DynStructArray(..)
-                | Ty::DynSliceArray(_)
-                | Ty::DynResponseArray
-                | Ty::String
-                | Ty::Builder
-                | Ty::StrFinder
-                | Ty::Writer
-                | Ty::Reader
-                | Ty::Buffer
-                | Ty::ArrayBuilder(_)
-                | Ty::Regex
-                | Ty::Captures
-                | Ty::CliCommand
-                | Ty::CliParsed
-                | Ty::TcpConn
-                | Ty::TcpListener
-                | Ty::UdpSocket
-                | Ty::Child
-                | Ty::File
-                | Ty::HttpRequest
-                | Ty::HttpResponse
-                | Ty::HttpClient
-                | Ty::HttpServer
-                | Ty::HttpRequestCtx
-                | Ty::ResponseBuilder
-                | Ty::HttpStream
-                | Ty::Command
-                | Ty::RunOutput
-                | Ty::DictEncoded(..)
-        ) =>
-        {
-            std::sync::Arc::new(DropPlan::Leaf(ty))
-        }
-        _ => std::sync::Arc::new(DropPlan::None),
     }
+    built.pop().unwrap_or_else(none).plan.as_ref().clone()
 }
 
 /// Whether `ty` is a tuple with at least one owned (Move) element — i.e. a Move tuple. Needs the
@@ -1301,91 +1406,45 @@ fn ty_mentions_slice(
     tuples: &[hir::TupleDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    match ty {
-        Ty::Slice(_) => true,
-        Ty::Tagged(id) => {
-            ty_mentions_slice(expand_tagged_ty(Ty::Tagged(id), tagged_types), structs, tuples, tagged_types)
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Slice(_) => return true,
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Struct(id) if visited_structs.insert(id) => {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            // Missing ids and malformed cycles terminate defensively. Keep aggregate arms explicit
+            // so a future aggregate cannot bypass escape checking through a recursive default.
+            _ => {}
         }
-        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples, tagged_types),
-        Ty::Result(o, e) => {
-            ty_mentions_slice(scalar_to_ty(o), structs, tuples, tagged_types)
-                || ty_mentions_slice(scalar_to_ty(e), structs, tuples, tagged_types)
-        }
-        Ty::Tuple(id) => tuples[id as usize]
-            .elems
-            .iter()
-            .any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples, tagged_types)),
-        Ty::Struct(id) => structs[id as usize]
-            .fields
-            .iter()
-            .any(|f| ty_mentions_slice(f.ty, structs, tuples, tagged_types)),
-        // The remaining types do not contain a `slice` payload in the current type model. Keep the
-        // list exhaustive so a future aggregate cannot bypass escape checking by default.
-        Ty::Int(_)
-        | Ty::Param(_)
-        | Ty::IntVar(_)
-        | Ty::Float(_)
-        | Ty::FloatVar(_)
-        | Ty::Bool
-        | Ty::Char
-        | Ty::Box(_)
-        | Ty::Array(..)
-        | Ty::Vec(..)
-        | Ty::Mask(..)
-        | Ty::StructArray(..)
-        | Ty::DynStructArray(..)
-        | Ty::Soa(_)
-        | Ty::DynSliceArray(_)
-        | Ty::DynArray(_)
-        | Ty::DynResponseArray
-        | Ty::Str
-        | Ty::String
-        | Ty::ArenaHandle
-        | Ty::Raw
-        | Ty::Builder
-        | Ty::Writer
-        | Ty::Reader
-        | Ty::Buffer
-        | Ty::ArrayBuilder(_)
-        | Ty::File
-        | Ty::Rng
-        | Ty::Regex
-        | Ty::Captures
-        | Ty::CliCommand
-        | Ty::CliParsed
-        | Ty::TcpConn
-        | Ty::TcpListener
-        | Ty::UdpSocket
-        | Ty::Child
-        | Ty::HttpRequest
-        | Ty::HttpResponse
-        | Ty::HttpClient
-        | Ty::HttpServer
-        | Ty::HttpRequestCtx
-        | Ty::ResponseBuilder
-        | Ty::HttpStream
-        // `command`/`run_output` are opaque owned handles — they hold no slice (`run_output`'s
-        // `.stdout()`/`.stderr()` views are separate `str` exprs, escape-checked via `region_of`).
-        | Ty::Command
-        | Ty::RunOutput
-        // A `http_headers` view is a bare ctx pointer, not a `slice<T>`; like `json.doc` below, its
-        // escape is enforced through `tracks_region`, not `mentions_slice`.
-        | Ty::HttpHeaders
-        // A `json.doc` is a `{tape,node}` handle, not a `slice<T>` payload; its escape is enforced
-        // through `tracks_region`, not `mentions_slice`.
-        | Ty::JsonDoc
-        // A `json.scanner<Row>` is a `{ptr,len}` input view; like `json.doc`, its escape is enforced
-        // through `tracks_region`, not `mentions_slice`.
-        | Ty::JsonScanner(_)
-        // The compiler-internal `str_finder` plan is an opaque owned handle; it holds no slice.
-        | Ty::StrFinder
-        | Ty::DictEncoded(..)
-        | Ty::Enum(_)
-        | Ty::Task(_)
-        | Ty::Fn(_)
-        | Ty::Error
-        | Ty::Unit => false,
     }
+    false
 }
 
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
@@ -1469,6 +1528,176 @@ pub fn ty_may_borrow(
         }
     }
     false
+}
+
+/// Whether a struct transitively contains a zero-copy `str` view.
+///
+/// This is intentionally narrower than [`ty_may_borrow`]: it classifies decoded struct/SoA
+/// storage whose string columns borrow an input buffer. Header-mediated struct and enum edges use
+/// one explicit worklist, so every finite validated graph is independent of the process stack.
+fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    let mut work = vec![Ty::Struct(id)];
+    let mut visited_structs = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Str | Ty::Option(Scalar::Str) | Ty::Slice(Scalar::Str) => return true,
+            Ty::Struct(id)
+            | Ty::Option(Scalar::Struct(id))
+            | Ty::Slice(Scalar::Struct(id))
+                if visited_structs.insert(id) =>
+            {
+                if let Some(definition) = structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(definition) = enums.get(id as usize) {
+                    for variant in definition.variants.iter().rev() {
+                        for payload in variant.payload.iter().rev() {
+                            match *payload {
+                                Scalar::Str => return true,
+                                Scalar::Struct(id) => work.push(Ty::Struct(id)),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn borrow_leaf_paths_for_type(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Vec<Vec<BorrowProjection>> {
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter {
+            ty: Ty,
+            projection: Option<BorrowProjection>,
+        },
+        Exit {
+            ty: Ty,
+            pop_projection: bool,
+        },
+    }
+
+    let mut work = vec![Work::Enter {
+        ty: root,
+        projection: None,
+    }];
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
+    let mut paths = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit { ty, pop_projection } => {
+                visiting.remove(&ty);
+                if pop_projection {
+                    path.pop();
+                }
+            }
+            Work::Enter { ty, projection } => {
+                if let Some(projection) = projection {
+                    path.push(projection);
+                }
+                let pop_projection = projection.is_some();
+                let ty = expand_tagged_ty(ty, tagged_types);
+                let aggregate = matches!(
+                    ty,
+                    Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
+                );
+                if aggregate && !visiting.insert(ty) {
+                    // Malformed cycles retain a conservative whole-value leaf at the cycle edge.
+                    paths.push(path.clone());
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let mut children = Vec::new();
+                match ty {
+                    Ty::Struct(id) => {
+                        if let Some(definition) = structs.get(id as usize) {
+                            children.extend(definition.fields.iter().enumerate().map(
+                                |(index, field)| {
+                                    (
+                                        BorrowProjection::StructField(index as u32),
+                                        field.ty,
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Tuple(id) => {
+                        if let Some(definition) = tuples.get(id as usize) {
+                            children.extend(definition.elems.iter().enumerate().map(
+                                |(index, element)| {
+                                    (
+                                        BorrowProjection::TupleElement(index as u32),
+                                        scalar_to_ty(*element),
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Enum(id) => {
+                        if let Some(definition) = enums.get(id as usize) {
+                            for (variant_index, variant) in
+                                definition.variants.iter().enumerate()
+                            {
+                                children.extend(variant.payload.iter().enumerate().map(
+                                    |(payload_index, payload)| {
+                                        (
+                                            BorrowProjection::EnumPayload {
+                                                variant: variant_index as u32,
+                                                index: payload_index as u32,
+                                            },
+                                            scalar_to_ty(*payload),
+                                        )
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Ty::Option(payload) => children.push((
+                        BorrowProjection::OptionSome,
+                        scalar_to_ty(payload),
+                    )),
+                    Ty::Result(ok, err) => {
+                        children.push((BorrowProjection::ResultOk, scalar_to_ty(ok)));
+                        children.push((BorrowProjection::ResultErr, scalar_to_ty(err)));
+                    }
+                    _ => {
+                        if ty_may_borrow(ty, structs, tuples, enums, tagged_types) {
+                            paths.push(path.clone());
+                        }
+                        if pop_projection {
+                            path.pop();
+                        }
+                        continue;
+                    }
+                }
+
+                work.push(Work::Exit { ty, pop_projection });
+                for (projection, child) in children.into_iter().rev() {
+                    work.push(Work::Enter {
+                        ty: child,
+                        projection: Some(projection),
+                    });
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
@@ -1555,196 +1784,33 @@ const HUGE_STRUCT_BYTES: u64 = 128;
 /// lint prefers silence to noise and fires only where the default plausibly costs real bandwidth.
 const DEFAULT_ELEM_LITERAL_ARRAY_LEN: u32 = 64;
 
-/// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1). The bitwise form
-/// (vs `div_ceil`) is the standard branch-free align-up; the `a <= 1` guard also avoids the `a - 1`
-/// underflow a stray `a == 0` would cause.
-fn align_up(n: u64, a: u64) -> u64 {
-    if a <= 1 { n } else { (n + a - 1) & !(a - 1) }
-}
-
-/// Natural-alignment `(size, align)` in bytes of `ty`, matching the layout codegen emits via LLVM.
-/// Scalars are their machine width; a `{ptr, len}` view or owned handle
-/// (`str`/`string`/array/slice/soa/box/builder/…) is two 64-bit words. Used by the huge-struct-copy
-/// lint and by [`struct_size_align`], which consults it per field; the `_ => (16, 8)` fallback is a
-/// safe default for any composite that is not a current struct-field type. Cycle-safe (`visiting`),
-/// like [`struct_is_move`].
-///
-/// **Alignment parity with codegen's `field_abi_align`.** The per-field *alignment* this returns is
-/// the sort key both here and in `align_codegen_llvm::logical_to_physical` use to order fields by
-/// descending alignment, so the two must agree on the alignment of every **valid struct-field type**
-/// (`is_field_ok`: `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`/`Option`/`array<T>`/
-/// sum-type `Enum`). They do — for that domain both give width-or-8-for-a-pointer, take a nested
-/// struct's alignment as the max of its members, and take a sum type's alignment as `max(4, payloads)`
-/// (`enum_size_align` ↔ `field_abi_align`'s `Ty::Enum` arm). The branches where they *differ*
-/// (`Unit` → here 1, there 4; `Array` → here 8, there
-/// `scalar_bytes.min(8)`) are all types `is_field_ok` **rejects**, so they never reach struct
-/// ordering; the divergence is unreachable, not a bug. `tests/…`/`layout_parity` (in the codegen
-/// crate) pins this against the real LLVM ABI size/align so any future drift — or a new wider-aligned
-/// field type (e.g. a `vecN<T>` field, 16-byte aligned) added to `is_field_ok` without updating
-/// **both** functions — fails loudly. Scalars top out at 64-bit (no `i128`/`f128`), so no field is
-/// wider than 8-byte aligned today.
-fn ty_size_align(
-    ty: Ty,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
-) -> (u64, u64) {
-    match ty {
-        Ty::Int(it) => {
-            let b = (it.bits / 8).max(1) as u64;
-            (b, b)
-        }
-        Ty::Float(ft) => {
-            let b = (ft.bits / 8).max(1) as u64;
-            (b, b)
-        }
-        Ty::Bool => (1, 1),
-        Ty::Char => (4, 4),
-        Ty::Unit => (0, 1),
-        Ty::Tagged(id) => ty_size_align(
-            expand_tagged_ty(Ty::Tagged(id), tagged_types),
-            structs,
-            enums,
-            tagged_types,
-            visiting,
-        ),
-        Ty::Struct(id) => struct_size_align(id, structs, enums, tagged_types, visiting),
-        // A sum type lowers to codegen's non-union tagged struct `{ i32 tag, <every variant's payload
-        // flattened in variant order> }` (`enum_types`), natural alignment, **declaration order** (not
-        // reordered — unlike a struct). Must stay the exact dual of codegen's `field_abi_align`/
-        // `enum_types` (pinned by `layout_parity`). J1b: an enum is a valid struct field.
-        Ty::Enum(id) => enum_size_align(id, structs, enums, tagged_types, visiting),
-        // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
-        // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
-        // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
-        Ty::Option(s) => {
-            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
-            let pal = pal.max(1);
-            let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
-            (align_up(payload_off + psz, pal), pal)
-        }
-        Ty::Result(ok, err) => {
-            let (ok_size, ok_align) =
-                ty_size_align(scalar_to_ty(ok), structs, enums, tagged_types, visiting);
-            let (err_size, err_align) =
-                ty_size_align(scalar_to_ty(err), structs, enums, tagged_types, visiting);
-            let align = ok_align.max(err_align).max(1);
-            let ok_offset = align_up(1, ok_align.max(1));
-            let err_offset = align_up(ok_offset + ok_size, err_align.max(1));
-            (align_up(err_offset + err_size, align), align)
-        }
-        // A **bare 8-byte pointer** field: every Move handle, plus the Copy `http_headers` view whose
-        // representation IS one. Codegen lowers all of them to a plain `ptr` (`scalar_type`'s pointer
-        // arm), so the `(16, 8)` catch-all below over-reports them by 8 bytes — harmless for safety
-        // (the real layout comes from `scalar_type` + `field_abi_align`), but the huge-struct-copy
-        // lint is this function's consumer and it should see the truth. Keep this arm and that one in
-        // step; `sema_and_codegen_struct_layout_agree` pins them against the real LLVM ABI.
-        Ty::HttpHeaders => (8, 8),
-        _ if is_move_handle(ty) => (8, 8),
-        // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
-        // (A struct can hold only scalar / `str` / `Option` / nested-struct fields today; the rest are
-        // a defensive default.)
-        _ => (16, 8),
-    }
-}
-
 /// Natural-alignment `(size, align)` of a struct as codegen lays it out (the dual of
-/// [`struct_is_move`]). A non-`layout(C)` struct's fields are **reordered by descending alignment** to
-/// eliminate padding (matching `logical_to_physical` in `align_codegen_llvm`); a `layout(C)` struct
-/// keeps declaration order. An `align(N)` over-alignment pads the reported *size* up to `N` (a tight
-/// array stride), but the reported *alignment* stays natural — the over-alignment lives at the
-/// storage seam (`type_align`), not in the aggregate type. Cycle-safe.
+/// [`struct_is_move`]). The shared type-layout engine is iterative, memoized, cycle-safe, and is the
+/// single semantic dual of LLVM's struct/enum/option/result layout. `visiting` remains in this
+/// private wrapper's signature so the huge-struct-copy lint can keep its existing call shape; the
+/// common engine owns its own explicit active sets.
 fn struct_size_align(
     id: u32,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
+    _visiting: &mut Vec<u32>,
 ) -> (u64, u64) {
-    if visiting.contains(&id) {
-        return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
-    }
-    let Some(def) = structs.get(id as usize) else {
-        return (0, 1);
-    };
-    visiting.push(id);
-    // Per-field `(size, align)` in declaration order.
-    let mut fields: Vec<(u64, u64)> = def
-        .fields
-        .iter()
-        .map(|f| {
-            let (fsz, fal) = ty_size_align(f.ty, structs, enums, tagged_types, visiting);
-            (fsz, fal.max(1))
-        })
-        .collect();
-    // A non-`layout(C)` struct is laid out in descending alignment (stable → declaration order on
-    // ties), the same padding-eliminating order codegen emits. `layout(C)` keeps declaration order.
-    if !def.c_repr {
-        fields.sort_by_key(|&(_, fal)| std::cmp::Reverse(fal));
-    }
-    let mut size = 0u64;
-    let mut align = 1u64;
-    for (fsz, fal) in fields {
-        size = align_up(size, fal) + fsz;
-        align = align.max(fal);
-    }
-    // Pad the type's *size* up to its **effective** alignment — the natural aggregate alignment,
-    // raised by any `align(N)` over-alignment. This is what C does, and matches codegen: an `align(N)`
-    // struct gets an `[K x i8]` size-padding tail so a tight `[N x %S]` array has an over-aligned
-    // element stride. Crucially the returned *alignment* stays the **natural** aggregate alignment
-    // (`align`, not `effective`): the `align(N)` over-alignment is applied at the storage seam
-    // (`type_align`, the alloca/global), never baked into the aggregate type, so the padding field is
-    // `align 1` and the LLVM type's ABI alignment is unchanged. Reporting the natural alignment here
-    // keeps this the exact dual of the LLVM type (pinned by `layout_parity`).
-    let effective = def.align.map_or(align, |a| align.max(a as u64));
-    visiting.pop();
-    (align_up(size, effective), align)
-}
-
-/// Natural-alignment `(size, align)` of a sum type as codegen lays it out (`enum_types`): the
-/// non-union tagged struct `{ i32 tag, <every variant's payload flattened in **variant declaration
-/// order**> }`, `packed=false`. Unlike a struct, an enum's payload fields are **not** reordered by
-/// alignment — codegen emits them in variant order — so this walks them in order with natural
-/// padding. The exact dual of codegen's `enum_types` construction + `field_abi_align`'s `Ty::Enum`
-/// arm (pinned by `layout_parity`). Cycle-safe through the shared struct `visiting` set (a payload
-/// struct that loops back stops there; such a graph is rejected by `struct_acyclic` regardless).
-fn enum_size_align(
-    id: u32,
-    structs: &[StructDef],
-    enums: &[hir::EnumDef],
-    tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
-) -> (u64, u64) {
-    let Some(def) = enums.get(id as usize) else {
-        return (4, 4); // an unresolved enum id — size as a bare tag (defensive; reported elsewhere)
-    };
-    // Field 0 is the i32 tag; then each variant's payload scalars, in order.
-    let mut size = 4u64;
-    let mut align = 4u64;
-    for v in &def.variants {
-        for &s in &v.payload {
-            let (fsz, fal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
-            let fal = fal.max(1);
-            size = align_up(size, fal) + fsz;
-            align = align.max(fal);
-        }
-    }
-    (align_up(size, align), align)
+    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
 }
 
 /// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
 /// non-`layout(C)` struct; declaration order for `layout(C)`). Public wrapper over
-/// [`struct_size_align`] for the cross-crate layout-parity test in `align_codegen_llvm`, which checks
-/// this against the real LLVM ABI size/alignment so the two hand-written layout computations
-/// (`ty_size_align` here, `field_abi_align` there) can never silently drift.
+/// the shared iterative type-layout engine for the cross-crate layout-parity test in
+/// `align_codegen_llvm`, which checks this against the real LLVM ABI size/alignment so semantic
+/// layout and `field_abi_align` can never silently drift.
 pub fn struct_abi_layout(
     id: u32,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
-    struct_size_align(id, structs, enums, tagged_types, &mut Vec::new())
+    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
@@ -3744,7 +3810,7 @@ pub fn check_program_with_interface_facts(
                     &structs,
                     &enums,
                     &tagged_types,
-                    &mut vec![i as u32],
+                    &[i as u32],
                 ) {
                     diags.error(
                         format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
@@ -3872,7 +3938,7 @@ pub fn check_program_with_interface_facts(
             &structs,
             &enums,
             &tagged_types,
-            &mut Vec::new(),
+            &[],
         ) {
             let span = decl.2.fields.iter().find(|sf| sf.name.name == enum_field.name).map_or(decl.2.span, |sf| sf.span);
             diags.error(
@@ -4680,6 +4746,9 @@ pub fn check_program_with_interface_facts(
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -4702,6 +4771,8 @@ pub fn check_program_with_interface_facts(
                 flow: EscapeFlowCfg::new(),
                 flow_current: 0,
                 loop_exit_blocks: Vec::new(),
+                collecting_walk_children: false,
+                walk_children: Vec::new(),
             };
             ec.check();
             (ec.drop_region, ec.drop_individual, ec.drop_individual_exprs)
@@ -4843,6 +4914,9 @@ fn infer_return_provenance(
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -5621,6 +5695,156 @@ struct EffectTypeTables<'a> {
     tagged_types: &'a [hir::TaggedType],
 }
 
+fn fn_effect_leaf_paths(
+    root: Ty,
+    tables: EffectTypeTables<'_>,
+    concrete_only: bool,
+) -> Vec<(Vec<FnEffectProjection>, u32)> {
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter {
+            ty: Ty,
+            projection: Option<FnEffectProjection>,
+        },
+        Exit {
+            ty: Ty,
+            pop_projection: bool,
+        },
+    }
+
+    let mut work = vec![Work::Enter {
+        ty: root,
+        projection: None,
+    }];
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
+    let mut leaves = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit { ty, pop_projection } => {
+                visiting.remove(&ty);
+                if pop_projection {
+                    path.pop();
+                }
+            }
+            Work::Enter { ty, projection } => {
+                if let Some(projection) = projection {
+                    path.push(projection);
+                }
+                let pop_projection = projection.is_some();
+                let ty = expand_tagged_ty(ty, tables.tagged_types);
+                if let Ty::Fn(id) = ty {
+                    leaves.push((path.clone(), id));
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+                if !matches!(
+                    ty,
+                    Ty::Struct(_)
+                        | Ty::Tuple(_)
+                        | Ty::Enum(_)
+                        | Ty::Option(_)
+                        | Ty::Result(..)
+                        | Ty::StructArray(..)
+                        | Ty::DynStructArray(..)
+                        | Ty::Array(..)
+                        | Ty::DynArray(_)
+                        | Ty::Slice(_)
+                ) || !visiting.insert(ty)
+                {
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let mut children = Vec::new();
+                match ty {
+                    Ty::Struct(id) => {
+                        if let Some(definition) = tables.structs.get(id as usize)
+                            && (!concrete_only
+                                || definition.name != definition.source_name)
+                        {
+                            children.extend(definition.fields.iter().enumerate().map(
+                                |(index, field)| {
+                                    (
+                                        FnEffectProjection::StructField(index as u32),
+                                        field.ty,
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Tuple(id) => {
+                        if let Some(definition) = tables.tuples.get(id as usize) {
+                            children.extend(definition.elems.iter().enumerate().map(
+                                |(index, element)| {
+                                    (
+                                        FnEffectProjection::TupleElement(index as u32),
+                                        scalar_to_ty(*element),
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                    Ty::Enum(id) => {
+                        if let Some(definition) = tables.enums.get(id as usize)
+                            && (!concrete_only
+                                || definition.name != definition.source_name)
+                        {
+                            for (variant_index, variant) in
+                                definition.variants.iter().enumerate()
+                            {
+                                children.extend(variant.payload.iter().enumerate().map(
+                                    |(payload_index, payload)| {
+                                        (
+                                            FnEffectProjection::EnumPayload {
+                                                variant: variant_index as u32,
+                                                index: payload_index as u32,
+                                            },
+                                            scalar_to_ty(*payload),
+                                        )
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Ty::Option(payload) => children.push((
+                        FnEffectProjection::OptionSome,
+                        scalar_to_ty(payload),
+                    )),
+                    Ty::Result(ok, err) => {
+                        children.push((FnEffectProjection::ResultOk, scalar_to_ty(ok)));
+                        children.push((FnEffectProjection::ResultErr, scalar_to_ty(err)));
+                    }
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => children.push((
+                        FnEffectProjection::ArrayElement,
+                        Ty::Struct(id),
+                    )),
+                    Ty::Array(payload, _) | Ty::DynArray(payload) | Ty::Slice(payload) => {
+                        children.push((
+                            FnEffectProjection::ArrayElement,
+                            scalar_to_ty(payload),
+                        ));
+                    }
+                    _ => {}
+                }
+
+                work.push(Work::Exit { ty, pop_projection });
+                for (projection, child) in children.into_iter().rev() {
+                    work.push(Work::Enter {
+                        ty: child,
+                        projection: Some(projection),
+                    });
+                }
+            }
+        }
+    }
+    leaves
+}
+
 /// Per-function callback-origin cells for written source aggregates such as
 /// `Holder<fn(i64) -> i64>`. Their shared source type must remain immutable: storing call/return
 /// origins in it would let one unrelated function poison every peer with the same annotation.
@@ -5761,155 +5985,9 @@ fn effect_boundary_leaves(
     ty: Ty,
     tables: EffectTypeTables<'_>,
 ) -> Vec<EffectBoundaryLeaf> {
-    fn walk(
-        ty: Ty,
-        tables: EffectTypeTables<'_>,
-        path: &mut Vec<FnEffectProjection>,
-        visiting: &mut Vec<Ty>,
-        paths: &mut Vec<Vec<FnEffectProjection>>,
-    ) {
-        let ty = expand_tagged_ty(ty, tables.tagged_types);
-        if matches!(ty, Ty::Fn(_)) {
-            paths.push(path.clone());
-            return;
-        }
-        if !matches!(
-            ty,
-            Ty::Struct(_)
-                | Ty::Tuple(_)
-                | Ty::Enum(_)
-                | Ty::Option(_)
-                | Ty::Result(..)
-                | Ty::StructArray(..)
-                | Ty::DynStructArray(..)
-                | Ty::Array(..)
-                | Ty::DynArray(_)
-                | Ty::Slice(_)
-        ) || visiting.contains(&ty)
-        {
-            return;
-        }
-        visiting.push(ty);
-        match ty {
-            Ty::Struct(id) => {
-                if let Some(def) = tables.structs.get(id as usize) {
-                    for (index, field) in def.fields.iter().enumerate() {
-                        path.push(FnEffectProjection::StructField(index as u32));
-                        walk(field.ty, tables, path, visiting, paths);
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Tuple(id) => {
-                if let Some(def) = tables.tuples.get(id as usize) {
-                    for (index, element) in def.elems.iter().enumerate() {
-                        path.push(FnEffectProjection::TupleElement(index as u32));
-                        walk(
-                            scalar_to_ty(*element),
-                            tables,
-                            path,
-                            visiting,
-                            paths,
-                        );
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Enum(id) => {
-                if let Some(def) = tables.enums.get(id as usize) {
-                    for (variant_index, variant) in
-                        def.variants.iter().enumerate()
-                    {
-                        for (payload_index, payload) in
-                            variant.payload.iter().enumerate()
-                        {
-                            path.push(FnEffectProjection::EnumPayload {
-                                variant: variant_index as u32,
-                                index: payload_index as u32,
-                            });
-                            walk(
-                                scalar_to_ty(*payload),
-                                tables,
-                                path,
-                                visiting,
-                                paths,
-                            );
-                            path.pop();
-                        }
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                path.push(FnEffectProjection::OptionSome);
-                walk(
-                    scalar_to_ty(payload),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::Result(ok, err) => {
-                path.push(FnEffectProjection::ResultOk);
-                walk(
-                    scalar_to_ty(ok),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-                path.push(FnEffectProjection::ResultErr);
-                walk(
-                    scalar_to_ty(err),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                path.push(FnEffectProjection::ArrayElement);
-                walk(
-                    Ty::Struct(id),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            Ty::Array(payload, _)
-            | Ty::DynArray(payload)
-            | Ty::Slice(payload) => {
-                path.push(FnEffectProjection::ArrayElement);
-                walk(
-                    scalar_to_ty(payload),
-                    tables,
-                    path,
-                    visiting,
-                    paths,
-                );
-                path.pop();
-            }
-            _ => {}
-        }
-        visiting.pop();
-    }
-
-    let mut paths = Vec::new();
-    walk(
-        ty,
-        tables,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &mut paths,
-    );
-    paths
+    fn_effect_leaf_paths(ty, tables, false)
         .into_iter()
-        .map(|path| EffectBoundaryLeaf {
+        .map(|(path, _)| EffectBoundaryLeaf {
             path,
             seed: None,
             effect: std::cell::Cell::new(None),
@@ -6156,8 +6234,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 scalar_to_ty(error),
                 result,
-                &mut vec![FnEffectProjection::ResultErr],
-                &mut Vec::new(),
+                &[FnEffectProjection::ResultErr],
             );
         }
     }
@@ -6221,8 +6298,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 *param,
                 capture,
-                &mut Vec::new(),
-                &mut Vec::new(),
+                &[],
             );
         }
     }
@@ -6245,39 +6321,8 @@ impl EffectScan<'_> {
         }
     }
 
-    fn form_node_captures(&mut self, kind: &ExprKind) -> bool {
-        for capture in node_captures(kind) {
-            if !self.expr(capture) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn form_stage_captures(&mut self, stages: &[Stage]) -> bool {
-        for stage in stages {
-            match &stage.kind {
-                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
-                    for capture in captures {
-                        if !self.expr(capture) {
-                            return false;
-                        }
-                    }
-                }
-                StageKind::WhereStrContains { needle } => {
-                    if !self.expr(needle) {
-                        return false;
-                    }
-                }
-                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
-            }
-        }
-        true
-    }
-
-    /// Join the callback actions only after every source/stage/terminal operand has formed.
-    /// Capture expressions were already walked by `form_stage_captures`, so this must never
-    /// re-evaluate them.
+    /// Join callback actions after the iterative event walk has formed every source, stage capture,
+    /// and terminal operand. This action phase must never re-evaluate those expressions.
     fn join_stage_actions<'a>(
         &mut self,
         source: &'a Expr,
@@ -6321,201 +6366,249 @@ impl EffectScan<'_> {
     /// initializer/payload retains effects produced before its terminator but prevents the
     /// statement's own boundary transfer and every later statement/tail.
     fn block(&mut self, b: &Block) -> bool {
-        for s in &b.stmts {
-            match s {
-                Stmt::Let { local, init } => {
-                    if !self.expr(init) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *local,
-                            init,
-                            &[],
-                            &[],
+        for event in hir_depth::reachable_body_events(b) {
+            match event {
+                hir_depth::BodyEvent::StmtEnter(_) => {}
+                hir_depth::BodyEvent::StmtExit(statement) => {
+                    self.finish_stmt_effect(statement);
+                }
+                hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } => {
+                    self.enter_match_arm_effect(scrutinee, arm);
+                }
+                hir_depth::BodyEvent::ExprEnter(expression) => {
+                    if matches!(expression.kind, ExprKind::Loop { .. }) {
+                        let key = effect_expression_key(expression);
+                        self.boundaries.ensure_expression(
+                            key,
+                            expression.ty,
+                            EffectTypeTables {
+                                structs: self.structs,
+                                enums: self.enums,
+                                tuples: self.tuples,
+                                tagged_types: self.tagged_types,
+                            },
                         );
-                        self.set_local_effect(*local, self.fn_value_effect(init), false);
-                        self.join_concrete_type_effects(*local, init);
+                        self.loop_results.push((expression.ty, key));
                     }
                 }
-                Stmt::Assign { local, value, .. } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *local,
-                            value,
-                            &[],
-                            &[],
-                        );
-                        self.set_local_effect(*local, self.fn_value_effect(value), true);
-                        self.join_concrete_type_effects(*local, value);
-                    }
-                }
-                Stmt::AssignField { root, path, value } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        let destination: Vec<FnEffectProjection> = path
-                            .iter()
-                            .copied()
-                            .map(FnEffectProjection::StructField)
-                            .collect();
-                        self.join_current_local_boundary(
-                            *root,
-                            value,
-                            &[],
-                            &destination,
-                        );
-                        self.join_concrete_struct_field_effect(*root, path, value);
-                    }
-                }
-                Stmt::LetTuple { locals, init, .. } => {
-                    if !self.expr(init) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        for (index, local) in locals.iter().enumerate() {
-                            let Some(local) = *local
-                            else {
-                                continue;
-                            };
-                            let Some(ty) = self
-                                .locals
-                                .get(local as usize)
-                                .map(|local| local.ty)
-                            else {
-                                continue;
-                            };
-                            let source = [FnEffectProjection::TupleElement(
-                                index as u32,
-                            )];
-                            self.join_current_local_boundary(
-                                local,
-                                init,
-                                &source,
-                                &[],
-                            );
-                            self.join_concrete_effects(
-                                ty,
-                                init,
-                                &mut vec![FnEffectProjection::TupleElement(
-                                    index as u32,
-                                )],
-                                &mut Vec::new(),
-                            );
-                        }
-                    }
-                }
-                Stmt::AssignIndex { base, index, value } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
-                    }
-                    self.mark_view_write(*base);
-                }
-                Stmt::AssignElemField {
-                    base,
-                    index,
-                    path,
-                    struct_id,
-                    value,
-                    ..
+                hir_depth::BodyEvent::ExprExit {
+                    expression,
+                    children_completed,
                 } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
+                    let falls_through = self.finish_expr_effect(
+                        expression,
+                        children_completed,
+                    );
+                    if matches!(expression.kind, ExprKind::Loop { .. }) {
+                        self.loop_results.pop();
                     }
-                    self.mark_view_write(*base);
-                    if self.known_effects.is_some() {
-                        let mut destination =
-                            Vec::with_capacity(path.len() + 1);
-                        destination.push(FnEffectProjection::ArrayElement);
-                        destination.extend(
-                            path.iter()
-                                .copied()
-                                .map(FnEffectProjection::StructField),
-                        );
-                        self.join_current_local_boundary(
-                            *base,
-                            value,
-                            &[],
-                            &destination,
-                        );
-                        self.join_concrete_struct_id_field_effect(*struct_id, path, value);
+                    if falls_through {
+                        self.fallthrough_expressions
+                            .insert(effect_expression_key(expression));
                     }
-                }
-                Stmt::AssignElem {
-                    base,
-                    index,
-                    struct_id,
-                    value,
-                    ..
-                } => {
-                    if !self.expr(index) || !self.expr(value) {
-                        return false;
-                    }
-                    self.mark_view_write(*base);
-                    if self.known_effects.is_some() {
-                        self.join_current_local_boundary(
-                            *base,
-                            value,
-                            &[],
-                            &[FnEffectProjection::ArrayElement],
-                        );
-                        self.join_concrete_struct_id_effects(*struct_id, value);
-                    }
-                }
-                Stmt::AssignVecLane { value, .. } => {
-                    if !self.expr(value) {
-                        return false;
-                    }
-                }
-                Stmt::Return(Some(e)) => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                    if self.known_effects.is_some() {
-                        self.join_return_effects(e);
-                    }
-                    return false;
-                }
-                Stmt::Break {
-                    value: Some(e),
-                    accepted,
-                } => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                    if *accepted
-                        && self.known_effects.is_some()
-                        && let Some((loop_ty, loop_key)) =
-                            self.loop_results.last().copied()
-                    {
-                        self.join_expression_boundary(loop_key, e);
-                        self.join_concrete_effects(
-                            loop_ty,
-                            e,
-                            &mut Vec::new(),
-                            &mut Vec::new(),
-                        );
-                    }
-                    return false;
-                }
-                Stmt::Expr(e) => {
-                    if !self.expr(e) {
-                        return false;
-                    }
-                }
-                Stmt::Return(None) | Stmt::Break { value: None, .. } => {
-                    return false;
                 }
             }
         }
-        if let Some(v) = &b.value {
-            return self.expr(v);
+        !hir_block_diverges(b)
+    }
+
+    fn finish_stmt_effect(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::Let { local, init } => {
+                if hir_expr_diverges(init) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(*local, init, &[], &[]);
+                    self.set_local_effect(*local, self.fn_value_effect(init), false);
+                    self.join_concrete_type_effects(*local, init);
+                }
+            }
+            Stmt::Assign { local, value, .. } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(*local, value, &[], &[]);
+                    self.set_local_effect(*local, self.fn_value_effect(value), true);
+                    self.join_concrete_type_effects(*local, value);
+                }
+            }
+            Stmt::AssignField { root, path, value } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    let destination = path
+                        .iter()
+                        .copied()
+                        .map(FnEffectProjection::StructField)
+                        .collect::<Vec<_>>();
+                    self.join_current_local_boundary(
+                        *root,
+                        value,
+                        &[],
+                        &destination,
+                    );
+                    self.join_concrete_struct_field_effect(*root, path, value);
+                }
+            }
+            Stmt::LetTuple { locals, init, .. } => {
+                if hir_expr_diverges(init) {
+                    return;
+                }
+                if self.known_effects.is_some() {
+                    for (index, local) in locals.iter().enumerate() {
+                        let Some(local) = *local else {
+                            continue;
+                        };
+                        let Some(ty) = self
+                            .locals
+                            .get(local as usize)
+                            .map(|local| local.ty)
+                        else {
+                            continue;
+                        };
+                        let source = [FnEffectProjection::TupleElement(index as u32)];
+                        self.join_current_local_boundary(
+                            local,
+                            init,
+                            &source,
+                            &[],
+                        );
+                        self.join_concrete_effects(
+                            ty,
+                            init,
+                            &[FnEffectProjection::TupleElement(index as u32)],
+                        );
+                    }
+                }
+            }
+            Stmt::AssignIndex { base, index, value } => {
+                if !hir_expr_diverges(index) && !hir_expr_diverges(value) {
+                    self.mark_view_write(*base);
+                }
+            }
+            Stmt::AssignElemField {
+                base,
+                index,
+                path,
+                struct_id,
+                value,
+                ..
+            } => {
+                if hir_expr_diverges(index) || hir_expr_diverges(value) {
+                    return;
+                }
+                self.mark_view_write(*base);
+                if self.known_effects.is_some() {
+                    let mut destination = Vec::with_capacity(path.len() + 1);
+                    destination.push(FnEffectProjection::ArrayElement);
+                    destination.extend(
+                        path.iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    self.join_current_local_boundary(
+                        *base,
+                        value,
+                        &[],
+                        &destination,
+                    );
+                    self.join_concrete_struct_id_field_effect(
+                        *struct_id,
+                        path,
+                        value,
+                    );
+                }
+            }
+            Stmt::AssignElem {
+                base,
+                index,
+                struct_id,
+                value,
+                ..
+            } => {
+                if hir_expr_diverges(index) || hir_expr_diverges(value) {
+                    return;
+                }
+                self.mark_view_write(*base);
+                if self.known_effects.is_some() {
+                    self.join_current_local_boundary(
+                        *base,
+                        value,
+                        &[],
+                        &[FnEffectProjection::ArrayElement],
+                    );
+                    self.join_concrete_struct_id_effects(*struct_id, value);
+                }
+            }
+            Stmt::Return(Some(value)) => {
+                if !hir_expr_diverges(value) && self.known_effects.is_some() {
+                    self.join_return_effects(value);
+                }
+            }
+            Stmt::Break {
+                value: Some(value),
+                accepted,
+            } => {
+                if hir_expr_diverges(value) {
+                    return;
+                }
+                if *accepted
+                    && self.known_effects.is_some()
+                    && let Some((loop_ty, loop_key)) =
+                        self.loop_results.last().copied()
+                {
+                    self.join_expression_boundary(loop_key, value);
+                    self.join_concrete_effects(
+                        loop_ty,
+                        value,
+                        &[],
+                    );
+                }
+            }
+            Stmt::AssignVecLane { .. }
+            | Stmt::Expr(_)
+            | Stmt::Return(None)
+            | Stmt::Break { value: None, .. } => {}
         }
-        true
+    }
+
+    fn enter_match_arm_effect(&mut self, scrutinee: &Expr, arm: &hir::MatchArm) {
+        if self.known_effects.is_none() {
+            return;
+        }
+        let [variant] = arm.variants.as_slice() else {
+            return;
+        };
+        for (index, binding) in arm.bindings.iter().enumerate() {
+            let Some(ty) = self
+                .locals
+                .get(*binding as usize)
+                .map(|local| local.ty)
+            else {
+                continue;
+            };
+            let Some(projection) = self.match_payload_projection(
+                scrutinee.ty,
+                *variant,
+                index as u32,
+            ) else {
+                continue;
+            };
+            self.join_current_local_boundary(
+                *binding,
+                scrutinee,
+                &[projection],
+                &[],
+            );
+            self.join_concrete_effects(
+                ty,
+                scrutinee,
+                &[projection],
+            );
+        }
     }
 
     fn named_effect(&self, name: &str) -> FnEffect {
@@ -6536,155 +6629,574 @@ impl EffectScan<'_> {
             .unwrap_or(FnEffect::Unknown)
     }
 
-    fn block_value_effect(&self, block: &Block) -> Option<FnEffect> {
-        block
-            .value
-            .as_deref()
-            .filter(|value| {
-                self.fallthrough_expressions
-                    .contains(&effect_expression_key(value))
-            })
-            .map(|value| self.fn_value_effect(value))
+    fn eval_fn_effect(
+        &self,
+        root: &Expr,
+        root_path: &[FnEffectProjection],
+    ) -> Option<FnEffect> {
+        enum Work<'a> {
+            Eval {
+                expression: &'a Expr,
+                path: Vec<FnEffectProjection>,
+            },
+            Value(Option<FnEffect>),
+            Join(usize),
+        }
+
+        let mut work = vec![Work::Eval {
+            expression: root,
+            path: root_path.to_vec(),
+        }];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            let Work::Eval { expression, path } = item else {
+                match item {
+                    Work::Value(value) => values.push(value),
+                    Work::Join(count) => {
+                        let start = values.len().saturating_sub(count);
+                        let joined = values
+                            .drain(start..)
+                            .fold(None, Self::join_optional_effect);
+                        values.push(joined);
+                    }
+                    Work::Eval { .. } => unreachable!(),
+                }
+                continue;
+            };
+
+            if path.is_empty() {
+                match &expression.kind {
+                    ExprKind::Local(id) => {
+                        let effect = self
+                            .boundary_local_effect(*id, &[])
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*id as usize)
+                                    .map(|local| self.type_effect(local.ty))
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::Field {
+                        root,
+                        path: field_path,
+                    } => {
+                        let path = field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField)
+                            .collect::<Vec<_>>();
+                        let effect = self
+                            .boundary_local_effect(*root, &path)
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*root as usize)
+                                    .and_then(|local| {
+                                        self.projected_type_effect(local.ty, &path)
+                                    })
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::Index { recv, .. } => {
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path: vec![FnEffectProjection::ArrayElement],
+                        });
+                    }
+                    ExprKind::IndexField {
+                        base,
+                        path: field_path,
+                        ..
+                    } => {
+                        let mut path = Vec::with_capacity(field_path.len() + 1);
+                        path.push(FnEffectProjection::ArrayElement);
+                        path.extend(
+                            field_path
+                                .iter()
+                                .copied()
+                                .map(FnEffectProjection::StructField),
+                        );
+                        let effect = self
+                            .boundary_local_effect(*base, &path)
+                            .map(|effect| effect.unwrap_or(FnEffect::Unknown))
+                            .or_else(|| {
+                                self.locals
+                                    .get(*base as usize)
+                                    .and_then(|local| {
+                                        self.projected_type_effect(local.ty, &path)
+                                    })
+                            })
+                            .unwrap_or(FnEffect::Unknown);
+                        work.push(Work::Value(Some(effect)));
+                    }
+                    ExprKind::ElemField {
+                        recv,
+                        path: field_path,
+                        ..
+                    } => {
+                        let mut path = Vec::with_capacity(field_path.len() + 1);
+                        path.push(FnEffectProjection::ArrayElement);
+                        path.extend(
+                            field_path
+                                .iter()
+                                .copied()
+                                .map(FnEffectProjection::StructField),
+                        );
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path,
+                        });
+                    }
+                    ExprKind::TupleIndex { recv, index } => {
+                        work.push(Work::Eval {
+                            expression: recv,
+                            path: vec![FnEffectProjection::TupleElement(*index)],
+                        });
+                    }
+                    ExprKind::If { then, els, .. } => {
+                        let children = [then, els]
+                            .into_iter()
+                            .filter_map(|block| block.value.as_deref())
+                            .filter(|value| {
+                                self.fallthrough_expressions
+                                    .contains(&effect_expression_key(value))
+                            })
+                            .collect::<Vec<_>>();
+                        work.push(Work::Join(children.len()));
+                        work.extend(children.into_iter().rev().map(|expression| {
+                            Work::Eval {
+                                expression,
+                                path: Vec::new(),
+                            }
+                        }));
+                    }
+                    ExprKind::Match { arms, .. } => {
+                        let children = arms
+                            .iter()
+                            .map(|arm| &arm.body)
+                            .filter(|body| {
+                                self.fallthrough_expressions
+                                    .contains(&effect_expression_key(body))
+                            })
+                            .collect::<Vec<_>>();
+                        work.push(Work::Join(children.len()));
+                        work.extend(children.into_iter().rev().map(|expression| {
+                            Work::Eval {
+                                expression,
+                                path: Vec::new(),
+                            }
+                        }));
+                    }
+                    ExprKind::Loop { .. } => {
+                        work.push(Work::Value(Some(
+                            self.boundary_expression_effect(
+                                effect_expression_key(expression),
+                                &[],
+                            )
+                            .flatten()
+                            .unwrap_or(FnEffect::Unknown),
+                        )));
+                    }
+                    ExprKind::ElseUnwrap { opt, fallback } => {
+                        let success = match expand_tagged_ty(
+                            opt.ty,
+                            self.tagged_types,
+                        ) {
+                            Ty::Option(_) => {
+                                Some(FnEffectProjection::OptionSome)
+                            }
+                            Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                            _ => None,
+                        };
+                        let fallback_live = self
+                            .fallthrough_expressions
+                            .contains(&effect_expression_key(fallback));
+                        let count = 1 + usize::from(fallback_live);
+                        work.push(Work::Join(count));
+                        if fallback_live {
+                            work.push(Work::Eval {
+                                expression: fallback,
+                                path: Vec::new(),
+                            });
+                        }
+                        if let Some(success) = success {
+                            work.push(Work::Eval {
+                                expression: opt,
+                                path: vec![success],
+                            });
+                        } else {
+                            work.push(Work::Value(Some(FnEffect::Unknown)));
+                        }
+                    }
+                    ExprKind::Try(result) => {
+                        work.push(Work::Eval {
+                            expression: result,
+                            path: vec![FnEffectProjection::ResultOk],
+                        });
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::Unsafe(block)
+                    | ExprKind::TaskGroup(block) => {
+                        if let Some(value) = block.value.as_deref().filter(|value| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(value))
+                        }) {
+                            work.push(Work::Eval {
+                                expression: value,
+                                path: Vec::new(),
+                            });
+                        } else {
+                            work.push(Work::Value(None));
+                        }
+                    }
+                    _ => work.push(Work::Value(Some(
+                        self.type_effect(expression.ty),
+                    ))),
+                }
+                continue;
+            }
+
+            let projection = path[0];
+            let rest = path[1..].to_vec();
+            match (&expression.kind, projection) {
+                (
+                    ExprKind::StructLit { fields, .. },
+                    FnEffectProjection::StructField(field),
+                ) => {
+                    if let Some(value) = fields.get(field as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (
+                    ExprKind::Tuple { elems, .. },
+                    FnEffectProjection::TupleElement(index),
+                ) => {
+                    if let Some(value) = elems.get(index as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (
+                    ExprKind::EnumValue {
+                        variant,
+                        payload,
+                        ..
+                    },
+                    FnEffectProjection::EnumPayload {
+                        variant: projected_variant,
+                        index,
+                    },
+                ) => {
+                    if *variant != projected_variant {
+                        work.push(Work::Value(None));
+                    } else if let Some(value) = payload.get(index as usize) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path: rest,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (ExprKind::OptionSome(value), FnEffectProjection::OptionSome)
+                | (ExprKind::ResultOk(value), FnEffectProjection::ResultOk)
+                | (ExprKind::ResultErr(value), FnEffectProjection::ResultErr) => {
+                    work.push(Work::Eval {
+                        expression: value,
+                        path: rest,
+                    });
+                }
+                (ExprKind::OptionNone, FnEffectProjection::OptionSome)
+                | (ExprKind::ResultOk(_), FnEffectProjection::ResultErr)
+                | (ExprKind::ResultErr(_), FnEffectProjection::ResultOk) => {
+                    work.push(Work::Value(None));
+                }
+                (
+                    ExprKind::ArrayLit { elems, .. },
+                    FnEffectProjection::ArrayElement,
+                ) => {
+                    work.push(Work::Join(elems.len()));
+                    work.extend(elems.iter().rev().map(|expression| Work::Eval {
+                        expression,
+                        path: rest.clone(),
+                    }));
+                }
+                (
+                    ExprKind::ArrayToArray { source, stages, .. },
+                    FnEffectProjection::ArrayElement,
+                ) if stages.is_empty() => {
+                    work.push(Work::Eval {
+                        expression: source,
+                        path,
+                    });
+                }
+                (
+                    ExprKind::SliceRange { recv, .. }
+                    | ExprKind::ArrayToSlice(recv),
+                    FnEffectProjection::ArrayElement,
+                ) => {
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path,
+                    });
+                }
+                (ExprKind::Index { recv, .. }, _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::Field { root, path: field_path }, _) => {
+                    let Some(root_ty) =
+                        self.locals.get(*root as usize).map(|local| local.ty)
+                    else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                        continue;
+                    };
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len());
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    let effect = self
+                        .boundary_local_effect(*root, &wrapped)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(root_ty, &wrapped)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::IndexField { base, path: field_path, .. }, _) => {
+                    let Some(base_ty) =
+                        self.locals.get(*base as usize).map(|local| local.ty)
+                    else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                        continue;
+                    };
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    let effect = self
+                        .boundary_local_effect(*base, &wrapped)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(base_ty, &wrapped)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::ElemField { recv, path: field_path, .. }, _) => {
+                    let mut wrapped =
+                        Vec::with_capacity(field_path.len() + path.len() + 1);
+                    wrapped.push(FnEffectProjection::ArrayElement);
+                    wrapped.extend(
+                        field_path
+                            .iter()
+                            .copied()
+                            .map(FnEffectProjection::StructField),
+                    );
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::TupleIndex { recv, index }, _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::TupleElement(*index));
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: recv,
+                        path: wrapped,
+                    });
+                }
+                (
+                    ExprKind::ResultMapErr { result, .. },
+                    FnEffectProjection::ResultOk,
+                ) => {
+                    work.push(Work::Eval {
+                        expression: result,
+                        path,
+                    });
+                }
+                (
+                    ExprKind::ResultMapErr { f, .. },
+                    FnEffectProjection::ResultErr,
+                ) => {
+                    let effect = self
+                        .static_fn_target(f)
+                        .and_then(|target| {
+                            self.boundary_result_effect(target, &rest)
+                        })
+                        .unwrap_or(Some(FnEffect::Unknown));
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::ElseUnwrap { opt, fallback }, _) => {
+                    let success = match expand_tagged_ty(
+                        opt.ty,
+                        self.tagged_types,
+                    ) {
+                        Ty::Option(_) => Some(FnEffectProjection::OptionSome),
+                        Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                        _ => None,
+                    };
+                    let fallback_live = self
+                        .fallthrough_expressions
+                        .contains(&effect_expression_key(fallback));
+                    let count = 1 + usize::from(fallback_live);
+                    work.push(Work::Join(count));
+                    if fallback_live {
+                        work.push(Work::Eval {
+                            expression: fallback,
+                            path: path.clone(),
+                        });
+                    }
+                    if let Some(success) = success {
+                        let mut wrapped = Vec::with_capacity(path.len() + 1);
+                        wrapped.push(success);
+                        wrapped.extend(path);
+                        work.push(Work::Eval {
+                            expression: opt,
+                            path: wrapped,
+                        });
+                    } else {
+                        work.push(Work::Value(Some(FnEffect::Unknown)));
+                    }
+                }
+                (ExprKind::Try(result), _) => {
+                    let mut wrapped = Vec::with_capacity(path.len() + 1);
+                    wrapped.push(FnEffectProjection::ResultOk);
+                    wrapped.extend(path);
+                    work.push(Work::Eval {
+                        expression: result,
+                        path: wrapped,
+                    });
+                }
+                (ExprKind::Call { func, .. }, _) => {
+                    let effect = self
+                        .boundary_result_effect(func, &path)
+                        .unwrap_or_else(|| {
+                            self.projected_type_effect(expression.ty, &path)
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::Loop { .. }, _) => {
+                    work.push(Work::Value(
+                        self.boundary_expression_effect(
+                            effect_expression_key(expression),
+                            &path,
+                        )
+                        .unwrap_or(Some(FnEffect::Unknown)),
+                    ));
+                }
+                (ExprKind::Local(local), _) => {
+                    let effect = self
+                        .boundary_local_effect(*local, &path)
+                        .unwrap_or_else(|| {
+                            self.locals
+                                .get(*local as usize)
+                                .and_then(|local| {
+                                    self.projected_type_effect(local.ty, &path)
+                                })
+                                .unwrap_or(FnEffect::Unknown)
+                                .into()
+                        });
+                    work.push(Work::Value(effect));
+                }
+                (ExprKind::If { then, els, .. }, _) => {
+                    let children = [then, els]
+                        .into_iter()
+                        .filter_map(|block| block.value.as_deref())
+                        .filter(|value| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(value))
+                        })
+                        .collect::<Vec<_>>();
+                    work.push(Work::Join(children.len()));
+                    work.extend(children.into_iter().rev().map(|expression| {
+                        Work::Eval {
+                            expression,
+                            path: path.clone(),
+                        }
+                    }));
+                }
+                (ExprKind::Match { arms, .. }, _) => {
+                    let children = arms
+                        .iter()
+                        .map(|arm| &arm.body)
+                        .filter(|body| {
+                            self.fallthrough_expressions
+                                .contains(&effect_expression_key(body))
+                        })
+                        .collect::<Vec<_>>();
+                    work.push(Work::Join(children.len()));
+                    work.extend(children.into_iter().rev().map(|expression| {
+                        Work::Eval {
+                            expression,
+                            path: path.clone(),
+                        }
+                    }));
+                }
+                (
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::Unsafe(block)
+                    | ExprKind::TaskGroup(block),
+                    _,
+                ) => {
+                    if let Some(value) = block.value.as_deref().filter(|value| {
+                        self.fallthrough_expressions
+                            .contains(&effect_expression_key(value))
+                    }) {
+                        work.push(Work::Eval {
+                            expression: value,
+                            path,
+                        });
+                    } else {
+                        work.push(Work::Value(None));
+                    }
+                }
+                _ => work.push(Work::Value(Some(FnEffect::Unknown))),
+            }
+        }
+        debug_assert_eq!(values.len(), 1);
+        values.pop().unwrap_or(Some(FnEffect::Unknown))
     }
 
-    /// Effect of invoking the function value produced by `expr`. Origins are resolved only in the
-    /// refinement walk and stored in `FnTy`; indirect-call consumers otherwise read the type bit.
-    fn fn_value_effect(&self, expr: &Expr) -> FnEffect {
-        match &expr.kind {
-            ExprKind::Local(id) => {
-                if let Some(effect) = self.boundary_local_effect(*id, &[]) {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*id as usize)
-                    .map(|local| self.type_effect(local.ty))
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Field {
-                root,
-                path: field_path,
-            } => {
-                let path: Vec<FnEffectProjection> = field_path
-                    .iter()
-                    .copied()
-                    .map(FnEffectProjection::StructField)
-                    .collect();
-                if let Some(effect) =
-                    self.boundary_local_effect(*root, &path)
-                {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*root as usize)
-                    .and_then(|local| {
-                        self.projected_type_effect(local.ty, &path)
-                    })
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Index { recv, .. } => self
-                .projected_fn_effect(
-                    recv,
-                    &[FnEffectProjection::ArrayElement],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::IndexField {
-                base,
-                path: field_path,
-                ..
-            } => {
-                let mut path = Vec::with_capacity(field_path.len() + 1);
-                path.push(FnEffectProjection::ArrayElement);
-                path.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                if let Some(effect) =
-                    self.boundary_local_effect(*base, &path)
-                {
-                    return effect.unwrap_or(FnEffect::Unknown);
-                }
-                self.locals
-                    .get(*base as usize)
-                    .and_then(|local| {
-                        self.projected_type_effect(local.ty, &path)
-                    })
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::ElemField {
-                recv,
-                path: field_path,
-                ..
-            } => {
-                let mut path = Vec::with_capacity(field_path.len() + 1);
-                path.push(FnEffectProjection::ArrayElement);
-                path.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                self.projected_fn_effect(recv, &path)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::TupleIndex { recv, index } => self
-                .projected_fn_effect(
-                    recv,
-                    &[FnEffectProjection::TupleElement(*index)],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::If { then, els, .. } => Self::join_optional_effect(
-                self.block_value_effect(then),
-                self.block_value_effect(els),
-            )
-            .unwrap_or(FnEffect::Unknown),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .filter(|arm| {
-                    self.fallthrough_expressions
-                        .contains(&effect_expression_key(&arm.body))
-                })
-                .map(|arm| self.fn_value_effect(&arm.body))
-                .reduce(FnEffect::join)
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::Loop { .. } => self
-                .boundary_expression_effect(
-                    effect_expression_key(expr),
-                    &[],
-                )
-                .flatten()
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
-                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
-                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
-                    _ => None,
-                };
-                let from_success = success
-                    .map(|projection| {
-                        self.projected_fn_effect(opt, &[projection])
-                    })
-                    .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = self
-                    .fallthrough_expressions
-                    .contains(&effect_expression_key(fallback))
-                    .then(|| self.fn_value_effect(fallback));
-                Self::join_optional_effect(from_success, from_fallback)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            ExprKind::Try(result) => self
-                .projected_fn_effect(
-                    result,
-                    &[FnEffectProjection::ResultOk],
-                )
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) | ExprKind::TaskGroup(block) => {
-                self.block_value_effect(block)
-                    .unwrap_or(FnEffect::Unknown)
-            }
-            _ => self.type_effect(expr.ty),
-        }
+    /// Effect of invoking the function value produced by `expression`.
+    fn fn_value_effect(&self, expression: &Expr) -> FnEffect {
+        self.eval_fn_effect(expression, &[])
+            .unwrap_or(FnEffect::Unknown)
     }
 
     fn set_local_effect(&self, local: LocalId, incoming: FnEffect, join: bool) {
@@ -6699,8 +7211,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             self.return_ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -6720,304 +7231,70 @@ impl EffectScan<'_> {
     /// A path/type disagreement is an internal loss of provenance and therefore returns Unknown.
     fn projected_type_effect(
         &self,
-        ty: Ty,
+        mut ty: Ty,
         path: &[FnEffectProjection],
     ) -> Option<FnEffect> {
-        let Some((projection, rest)) = path.split_first() else {
-            return Some(self.type_effect(ty));
-        };
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        let next = match (ty, *projection) {
-            (Ty::Struct(id), FnEffectProjection::StructField(index)) => self
-                .structs
-                .get(id as usize)
-                .and_then(|def| def.fields.get(index as usize))
-                .map(|field| field.ty),
-            (Ty::Tuple(id), FnEffectProjection::TupleElement(index)) => self
-                .tuples
-                .get(id as usize)
-                .and_then(|def| def.elems.get(index as usize))
-                .copied()
-                .map(scalar_to_ty),
-            (
-                Ty::Enum(id),
-                FnEffectProjection::EnumPayload { variant, index },
-            ) => self
-                .enums
-                .get(id as usize)
-                .and_then(|def| def.variants.get(variant as usize))
-                .and_then(|variant| variant.payload.get(index as usize))
-                .copied()
-                .map(scalar_to_ty),
-            (Ty::Option(payload), FnEffectProjection::OptionSome) => {
-                Some(scalar_to_ty(payload))
-            }
-            (Ty::Result(ok, _), FnEffectProjection::ResultOk) => {
-                Some(scalar_to_ty(ok))
-            }
-            (Ty::Result(_, err), FnEffectProjection::ResultErr) => {
-                Some(scalar_to_ty(err))
-            }
-            (Ty::StructArray(id, _), FnEffectProjection::ArrayElement)
-            | (Ty::DynStructArray(id, _), FnEffectProjection::ArrayElement) => {
-                Some(Ty::Struct(id))
-            }
-            (Ty::Array(payload, _), FnEffectProjection::ArrayElement)
-            | (Ty::DynArray(payload), FnEffectProjection::ArrayElement)
-            | (Ty::Slice(payload), FnEffectProjection::ArrayElement) => {
-                Some(scalar_to_ty(payload))
-            }
-            _ => None,
-        };
-        match next {
-            Some(next) => self.projected_type_effect(next, rest),
-            None => Some(FnEffect::Unknown),
+        for &projection in path {
+            let next = match (expand_tagged_ty(ty, self.tagged_types), projection) {
+                (Ty::Struct(id), FnEffectProjection::StructField(index)) => self
+                    .structs
+                    .get(id as usize)
+                    .and_then(|def| def.fields.get(index as usize))
+                    .map(|field| field.ty),
+                (Ty::Tuple(id), FnEffectProjection::TupleElement(index)) => self
+                    .tuples
+                    .get(id as usize)
+                    .and_then(|def| def.elems.get(index as usize))
+                    .copied()
+                    .map(scalar_to_ty),
+                (
+                    Ty::Enum(id),
+                    FnEffectProjection::EnumPayload { variant, index },
+                ) => self
+                    .enums
+                    .get(id as usize)
+                    .and_then(|def| def.variants.get(variant as usize))
+                    .and_then(|variant| variant.payload.get(index as usize))
+                    .copied()
+                    .map(scalar_to_ty),
+                (Ty::Option(payload), FnEffectProjection::OptionSome) => {
+                    Some(scalar_to_ty(payload))
+                }
+                (Ty::Result(ok, _), FnEffectProjection::ResultOk) => {
+                    Some(scalar_to_ty(ok))
+                }
+                (Ty::Result(_, err), FnEffectProjection::ResultErr) => {
+                    Some(scalar_to_ty(err))
+                }
+                (Ty::StructArray(id, _), FnEffectProjection::ArrayElement)
+                | (Ty::DynStructArray(id, _), FnEffectProjection::ArrayElement) => {
+                    Some(Ty::Struct(id))
+                }
+                (Ty::Array(payload, _), FnEffectProjection::ArrayElement)
+                | (Ty::DynArray(payload), FnEffectProjection::ArrayElement)
+                | (Ty::Slice(payload), FnEffectProjection::ArrayElement) => {
+                    Some(scalar_to_ty(payload))
+                }
+                _ => None,
+            };
+            let Some(next) = next else {
+                return Some(FnEffect::Unknown);
+            };
+            ty = next;
         }
+        Some(self.type_effect(ty))
     }
 
     /// Effect at one function-valued leaf of `expr`. `None` means this runtime variant has no such
     /// payload; `Some(Unknown)` means the payload exists but its origin cannot be proved.
+    /// Effect at one function-valued leaf of `expression`. `None` means the live variant has no
+    /// such payload; `Some(Unknown)` means the payload exists but its origin cannot be proved.
     fn projected_fn_effect(
         &self,
-        expr: &Expr,
+        expression: &Expr,
         path: &[FnEffectProjection],
     ) -> Option<FnEffect> {
-        let Some((projection, rest)) = path.split_first() else {
-            return Some(self.fn_value_effect(expr));
-        };
-        match (&expr.kind, *projection) {
-            (
-                ExprKind::StructLit { fields, .. },
-                FnEffectProjection::StructField(field),
-            ) => fields
-                .get(field as usize)
-                .map(|value| self.projected_fn_effect(value, rest))
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (
-                ExprKind::Tuple { elems, .. },
-                FnEffectProjection::TupleElement(index),
-            ) => elems
-                .get(index as usize)
-                .map(|value| self.projected_fn_effect(value, rest))
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (
-                ExprKind::EnumValue {
-                    variant,
-                    payload,
-                    ..
-                },
-                FnEffectProjection::EnumPayload {
-                    variant: projected_variant,
-                    index,
-                },
-            ) => {
-                if *variant != projected_variant {
-                    None
-                } else {
-                    payload
-                        .get(index as usize)
-                        .map(|value| self.projected_fn_effect(value, rest))
-                        .unwrap_or(Some(FnEffect::Unknown))
-                }
-            }
-            (ExprKind::OptionSome(value), FnEffectProjection::OptionSome)
-            | (ExprKind::ResultOk(value), FnEffectProjection::ResultOk)
-            | (ExprKind::ResultErr(value), FnEffectProjection::ResultErr) => {
-                self.projected_fn_effect(value, rest)
-            }
-            (ExprKind::OptionNone, FnEffectProjection::OptionSome) => None,
-            (ExprKind::ResultOk(_), FnEffectProjection::ResultErr)
-            | (ExprKind::ResultErr(_), FnEffectProjection::ResultOk) => None,
-            (ExprKind::ArrayLit { elems, .. }, FnEffectProjection::ArrayElement) => {
-                elems
-                    .iter()
-                    .map(|value| self.projected_fn_effect(value, rest))
-                    .fold(None, Self::join_optional_effect)
-            }
-            (
-                ExprKind::ArrayToArray { source, stages, .. },
-                FnEffectProjection::ArrayElement,
-            ) if stages.is_empty() => self.projected_fn_effect(source, path),
-            (
-                ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv),
-                FnEffectProjection::ArrayElement,
-            ) => self.projected_fn_effect(recv, path),
-            (ExprKind::Index { recv, .. }, _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (ExprKind::Field { root, path: field_path }, _) => {
-                let Some(root_ty) =
-                    self.locals.get(*root as usize).map(|local| local.ty)
-                else {
-                    return Some(FnEffect::Unknown);
-                };
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len());
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                if let Some(effect) =
-                    self.boundary_local_effect(*root, &wrapped)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(root_ty, &wrapped)
-            }
-            (ExprKind::IndexField { base, path: field_path, .. }, _) => {
-                let Some(base_ty) =
-                    self.locals.get(*base as usize).map(|local| local.ty)
-                else {
-                    return Some(FnEffect::Unknown);
-                };
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                if let Some(effect) =
-                    self.boundary_local_effect(*base, &wrapped)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(base_ty, &wrapped)
-            }
-            (ExprKind::ElemField { recv, path: field_path, .. }, _) => {
-                let mut wrapped =
-                    Vec::with_capacity(field_path.len() + path.len() + 1);
-                wrapped.push(FnEffectProjection::ArrayElement);
-                wrapped.extend(
-                    field_path
-                        .iter()
-                        .copied()
-                        .map(FnEffectProjection::StructField),
-                );
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (ExprKind::TupleIndex { recv, index }, _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::TupleElement(*index));
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(recv, &wrapped)
-            }
-            (
-                ExprKind::ResultMapErr { result, .. },
-                FnEffectProjection::ResultOk,
-            ) => self.projected_fn_effect(result, path),
-            (
-                ExprKind::ResultMapErr { f, .. },
-                FnEffectProjection::ResultErr,
-            ) => self
-                .static_fn_target(f)
-                .and_then(|target| {
-                    self.boundary_result_effect(target, rest)
-                })
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (ExprKind::ElseUnwrap { opt, fallback }, _) => {
-                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
-                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
-                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
-                    _ => None,
-                };
-                let from_success = success
-                    .map(|success| {
-                        let mut wrapped = Vec::with_capacity(path.len() + 1);
-                        wrapped.push(success);
-                        wrapped.extend_from_slice(path);
-                        self.projected_fn_effect(opt, &wrapped)
-                    })
-                    .unwrap_or(Some(FnEffect::Unknown));
-                let from_fallback = self
-                    .fallthrough_expressions
-                    .contains(&effect_expression_key(fallback))
-                    .then(|| self.projected_fn_effect(fallback, path))
-                    .flatten();
-                Self::join_optional_effect(from_success, from_fallback)
-            }
-            (ExprKind::Try(result), _) => {
-                let mut wrapped = Vec::with_capacity(path.len() + 1);
-                wrapped.push(FnEffectProjection::ResultOk);
-                wrapped.extend_from_slice(path);
-                self.projected_fn_effect(result, &wrapped)
-            }
-            (ExprKind::Call { func, .. }, _) => {
-                if let Some(effect) =
-                    self.boundary_result_effect(func, path)
-                {
-                    return effect;
-                }
-                self.projected_type_effect(expr.ty, path)
-            }
-            (ExprKind::Loop { .. }, _) => self
-                .boundary_expression_effect(
-                    effect_expression_key(expr),
-                    path,
-                )
-                .unwrap_or(Some(FnEffect::Unknown)),
-            (ExprKind::Local(local), _) => {
-                if let Some(effect) =
-                    self.boundary_local_effect(*local, path)
-                {
-                    return effect;
-                }
-                self.locals
-                    .get(*local as usize)
-                    .map(|local| self.projected_type_effect(local.ty, path))
-                    .unwrap_or(Some(FnEffect::Unknown))
-            }
-            (ExprKind::If { then, els, .. }, _) => Self::join_optional_effect(
-                self.block_projected_fn_effect(then, path),
-                self.block_projected_fn_effect(els, path),
-            ),
-            (ExprKind::Match { arms, .. }, _) => arms
-                .iter()
-                .filter(|arm| {
-                    self.fallthrough_expressions
-                        .contains(&effect_expression_key(&arm.body))
-                })
-                .map(|arm| self.projected_fn_effect(&arm.body, path))
-                .fold(None, Self::join_optional_effect),
-            (
-                ExprKind::Block(block)
-                | ExprKind::Arena(block)
-                | ExprKind::Unsafe(block)
-                | ExprKind::TaskGroup(block),
-                _,
-            ) => self.block_projected_fn_effect(block, path),
-            // Transforming pipelines and indirect calls do not yet carry recursive return-origin
-            // summaries (L2b). Reading their result type here could select one syntactic origin
-            // even when another runtime path produced the value, so every unhandled producer fails
-            // closed. Same-program direct calls are handled above after their explicit returns and
-            // concrete call arguments have joined the callee's private effect cells.
-            _ => Some(FnEffect::Unknown),
-        }
-    }
-
-    fn block_projected_fn_effect(
-        &self,
-        block: &Block,
-        path: &[FnEffectProjection],
-    ) -> Option<FnEffect> {
-        block
-            .value
-            .as_deref()
-            .filter(|value| {
-                self.fallthrough_expressions
-                    .contains(&effect_expression_key(value))
-            })
-            .and_then(|value| self.projected_fn_effect(value, path))
+        self.eval_fn_effect(expression, path)
     }
 
     fn join_concrete_type_effects(&self, local: LocalId, incoming: &Expr) {
@@ -7027,8 +7304,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -7045,8 +7321,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 field.ty,
                 incoming,
-                &mut vec![FnEffectProjection::StructField(index as u32)],
-                &mut vec![Ty::Struct(id)],
+                &[FnEffectProjection::StructField(index as u32)],
             );
         }
     }
@@ -7097,8 +7372,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             *ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -7106,138 +7380,24 @@ impl EffectScan<'_> {
         &self,
         ty: Ty,
         incoming: &Expr,
-        path: &mut Vec<FnEffectProjection>,
-        visiting: &mut Vec<Ty>,
+        path: &[FnEffectProjection],
     ) {
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        if let Ty::Fn(id) = ty {
+        let tables = EffectTypeTables {
+            structs: self.structs,
+            enums: self.enums,
+            tuples: self.tuples,
+            tagged_types: self.tagged_types,
+        };
+        for (suffix, id) in fn_effect_leaf_paths(ty, tables, true) {
             let Some(function) = self.fn_types.get(id as usize) else {
-                return;
+                continue;
             };
-            if let Some(incoming) = self.projected_fn_effect(incoming, path) {
-                function
-                    .effect
-                    .set(function.effect.get().join(incoming));
+            let mut full_path = path.to_vec();
+            full_path.extend(suffix);
+            if let Some(incoming) = self.projected_fn_effect(incoming, &full_path) {
+                function.effect.set(function.effect.get().join(incoming));
             }
-            return;
         }
-        if !matches!(
-            ty,
-            Ty::Struct(_)
-                | Ty::Tuple(_)
-                | Ty::Enum(_)
-                | Ty::Option(_)
-                | Ty::Result(..)
-                | Ty::StructArray(..)
-                | Ty::DynStructArray(..)
-                | Ty::Array(..)
-                | Ty::DynArray(_)
-                | Ty::Slice(_)
-        ) {
-            return;
-        }
-        if visiting.contains(&ty) {
-            return;
-        }
-        visiting.push(ty);
-        match ty {
-            Ty::Struct(id) => {
-                let Some(def) = self.structs.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                if def.name == def.source_name {
-                    visiting.pop();
-                    return;
-                }
-                for (index, field) in def.fields.iter().enumerate() {
-                    path.push(FnEffectProjection::StructField(index as u32));
-                    self.join_concrete_effects(field.ty, incoming, path, visiting);
-                    path.pop();
-                }
-            }
-            Ty::Tuple(id) => {
-                let Some(def) = self.tuples.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                for (index, element) in def.elems.iter().enumerate() {
-                    path.push(FnEffectProjection::TupleElement(index as u32));
-                    self.join_concrete_effects(
-                        scalar_to_ty(*element),
-                        incoming,
-                        path,
-                        visiting,
-                    );
-                    path.pop();
-                }
-            }
-            Ty::Enum(id) => {
-                let Some(def) = self.enums.get(id as usize) else {
-                    visiting.pop();
-                    return;
-                };
-                if def.name == def.source_name {
-                    visiting.pop();
-                    return;
-                }
-                for (variant_index, variant) in def.variants.iter().enumerate() {
-                    for (payload_index, payload) in variant.payload.iter().enumerate() {
-                        path.push(FnEffectProjection::EnumPayload {
-                            variant: variant_index as u32,
-                            index: payload_index as u32,
-                        });
-                        self.join_concrete_effects(
-                            scalar_to_ty(*payload),
-                            incoming,
-                            path,
-                            visiting,
-                        );
-                        path.pop();
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                path.push(FnEffectProjection::OptionSome);
-                self.join_concrete_effects(
-                    scalar_to_ty(payload),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            Ty::Result(ok, err) => {
-                path.push(FnEffectProjection::ResultOk);
-                self.join_concrete_effects(scalar_to_ty(ok), incoming, path, visiting);
-                path.pop();
-                path.push(FnEffectProjection::ResultErr);
-                self.join_concrete_effects(
-                    scalar_to_ty(err),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                path.push(FnEffectProjection::ArrayElement);
-                self.join_concrete_effects(Ty::Struct(id), incoming, path, visiting);
-                path.pop();
-            }
-            Ty::Array(payload, _) | Ty::DynArray(payload) | Ty::Slice(payload) => {
-                path.push(FnEffectProjection::ArrayElement);
-                self.join_concrete_effects(
-                    scalar_to_ty(payload),
-                    incoming,
-                    path,
-                    visiting,
-                );
-                path.pop();
-            }
-            _ => {}
-        }
-        visiting.pop();
     }
 
     fn consume_fn_value(&mut self, expr: &Expr) {
@@ -7256,23 +7416,27 @@ impl EffectScan<'_> {
         }
     }
 
-    fn erased_target_may_be_internal(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Local(local) => self
-                .locals
-                .get(*local as usize)
-                .is_none_or(|local| !local.is_param),
-            ExprKind::Field { root, .. }
-            | ExprKind::IndexField { base: root, .. } => self
-                .locals
-                .get(*root as usize)
-                .is_none_or(|local| !local.is_param),
-            ExprKind::TupleIndex { recv, .. }
-            | ExprKind::Index { recv, .. }
-            | ExprKind::ElemField { recv, .. } => {
-                self.erased_target_may_be_internal(recv)
+    fn erased_target_may_be_internal(&self, mut expression: &Expr) -> bool {
+        loop {
+            match &expression.kind {
+                ExprKind::Local(local) => {
+                    return self
+                        .locals
+                        .get(*local as usize)
+                        .is_none_or(|local| !local.is_param);
+                }
+                ExprKind::Field { root, .. }
+                | ExprKind::IndexField { base: root, .. } => {
+                    return self
+                        .locals
+                        .get(*root as usize)
+                        .is_none_or(|local| !local.is_param);
+                }
+                ExprKind::TupleIndex { recv, .. }
+                | ExprKind::Index { recv, .. }
+                | ExprKind::ElemField { recv, .. } => expression = recv,
+                _ => return true,
             }
-            _ => true,
         }
     }
 
@@ -7313,112 +7477,34 @@ impl EffectScan<'_> {
         .is_empty()
     }
 
-    /// Effect of a `file` op (`pread`/`pwrite`/`len`, A4): each is a syscall → Impure. Split out
-    /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
-    #[inline(never)]
-    fn effect_file_op(&mut self, kind: &ExprKind) -> bool {
-        let falls_through = match kind {
-            ExprKind::FilePread { file, buffer, offset } => {
-                self.expr(file) && self.expr(buffer) && self.expr(offset)
-            }
-            ExprKind::FilePwrite { file, data, offset } => {
-                self.expr(file) && self.expr(data) && self.expr(offset)
-            }
-            ExprKind::FileLen { file } => self.expr(file),
-            _ => unreachable!("effect_file_op on a non-file op"),
-        };
-        if falls_through {
-            self.impure_direct = true;
-        }
-        falls_through
-    }
-
-    /// Walk an `array_builder` op's sub-exprs for the effect check (all pure). `#[inline(never)]` so
-    /// its arm locals stay out of the recursive [`Self::expr`] frame (#296).
-    #[inline(never)]
-    fn effect_array_builder(&mut self, kind: &ExprKind) -> bool {
-        match kind {
-            ExprKind::ArrayBuilderNew { .. } => true,
-            ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.expr(builder) && self.expr(value)
-            }
-            ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.expr(builder) && self.expr(data)
-            }
-            ExprKind::ArrayBuilderBuild(i) => self.expr(i),
-            _ => unreachable!("effect_array_builder on a non-array_builder op"),
+    fn effect_children_form(
+        &self,
+        expression: &Expr,
+        children_completed: bool,
+    ) -> bool {
+        match &expression.kind {
+            ExprKind::Binary {
+                op: align_ast::BinOp::And | align_ast::BinOp::Or,
+                lhs,
+                ..
+            } => !hir_expr_diverges(lhs),
+            ExprKind::ElseUnwrap { opt, .. } => !hir_expr_diverges(opt),
+            _ => children_completed,
         }
     }
 
-    /// Scan one loop until every callback-origin cell reaches a backedge fixpoint. Function-value
-    /// effects form a finite three-point lattice. Boundary cells additionally begin uninitialized,
-    /// so three transitions per cell are a conservative convergence bound. Ordinary effect
-    /// collection does not mutate these cells and needs only one structural pass.
-    fn loop_body(&mut self, expression: &Expr, body: &Block) {
-        let key = effect_expression_key(expression);
-        self.boundaries.ensure_expression(
-            key,
-            expression.ty,
-            EffectTypeTables {
-                structs: self.structs,
-                enums: self.enums,
-                tuples: self.tuples,
-                tagged_types: self.tagged_types,
-            },
-        );
-        self.loop_results.push((expression.ty, key));
-        if self.known_effects.is_some() {
-            let mut passes = 0usize;
-            loop {
-                let before: Vec<FnEffect> = self
-                    .fn_types
-                    .iter()
-                    .map(|function| function.effect.get())
-                    .collect();
-                let before_boundaries = self.boundaries.snapshot();
-                self.block(body);
-                passes = passes.saturating_add(1);
-                if self
-                    .fn_types
-                    .iter()
-                    .map(|function| function.effect.get())
-                    .eq(before)
-                    && self.boundaries.snapshot() == before_boundaries
-                {
-                    break;
-                }
-                let max_passes = self
-                    .fn_types
-                    .len()
-                    .saturating_add(self.boundaries.leaf_count())
-                    .saturating_mul(3)
-                    .saturating_add(1);
-                if passes >= max_passes {
-                    break;
-                }
-            }
-        } else {
-            self.block(body);
+    fn finish_expr_effect(
+        &mut self,
+        e: &Expr,
+        children_completed: bool,
+    ) -> bool {
+        if !self.effect_children_form(e, children_completed) {
+            return false;
         }
-        self.loop_results.pop();
-    }
-
-    fn expr(&mut self, e: &Expr) -> bool {
-        let falls_through = self.expr_inner(e);
-        if falls_through {
-            self.fallthrough_expressions
-                .insert(effect_expression_key(e));
-        }
-        falls_through
-    }
-
-    fn expr_inner(&mut self, e: &Expr) -> bool {
         macro_rules! walk {
-            ($child:expr) => {
-                if !self.expr($child) {
-                    return false;
-                }
-            };
+            ($child:expr) => {{
+                let _ = $child;
+            }};
         }
 
         match &e.kind {
@@ -7444,8 +7530,7 @@ impl EffectScan<'_> {
                         self.join_concrete_effects(
                             *param,
                             arg,
-                            &mut Vec::new(),
-                            &mut Vec::new(),
+                            &[],
                         );
                     }
                 }
@@ -7506,8 +7591,7 @@ impl EffectScan<'_> {
                             self.join_concrete_effects(
                                 scalar_to_ty(*param),
                                 arg,
-                                &mut Vec::new(),
-                                &mut Vec::new(),
+                                &[],
                             );
                         }
                     }
@@ -7560,12 +7644,8 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
-            // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
-            // (the #296 expr-depth lesson).
             ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => {
-                if !self.effect_file_op(&e.kind) {
-                    return false;
-                }
+                self.impure_direct = true;
             }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
             // a field read.
@@ -7585,14 +7665,11 @@ impl EffectScan<'_> {
                 walk!(buffer);
                 walk!(data);
             }
-            // `array_builder` new/push/append/build are all pure in-memory growth; walk the sub-exprs
-            // in an `#[inline(never)]` helper so the arm locals stay out of this recursive frame (#296).
-            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => {
-                if !self.effect_array_builder(k) {
-                    return false;
-                }
-            }
+            // `array_builder` new/push/append/build are all pure in-memory growth.
+            ExprKind::ArrayBuilderNew { .. }
+            | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. }
+            | ExprKind::ArrayBuilderBuild(_) => {}
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -8007,17 +8084,11 @@ impl EffectScan<'_> {
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 self.join_stage_actions(source, stages);
             }
             ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 self.join_stage_actions(source, stages);
             }
             // `map_into` writes each post-stage element into caller-provided storage. It is an
@@ -8025,9 +8096,6 @@ impl EffectScan<'_> {
             // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 walk!(dst);
                 self.join_stage_actions(source, stages);
                 self.impure_direct = true;
@@ -8036,12 +8104,6 @@ impl EffectScan<'_> {
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -8068,13 +8130,7 @@ impl EffectScan<'_> {
                 ..
             } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
                 walk!(init);
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -8099,12 +8155,6 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayParMap { source, stages, func, .. } => {
                 walk!(source);
-                if !self.form_stage_captures(stages) {
-                    return false;
-                }
-                if !self.form_node_captures(&e.kind) {
-                    return false;
-                }
                 let origin = self.join_stage_actions(source, stages);
                 self.join_node_capture_effects(&e.kind);
                 self.calls.push(func.clone());
@@ -8150,7 +8200,7 @@ impl EffectScan<'_> {
                 walk!(lhs);
                 // The RHS is conditionally reachable, but the short path remains a continuation
                 // even when the RHS terminates.
-                let _ = self.expr(rhs);
+                let _ = rhs;
                 return true;
             }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -8159,9 +8209,7 @@ impl EffectScan<'_> {
             }
             ExprKind::If { cond, then, els } => {
                 walk!(cond);
-                let then_falls_through = self.block(then);
-                let else_falls_through = self.block(els);
-                return then_falls_through || else_falls_through;
+                return !hir_block_diverges(then) || !hir_block_diverges(els);
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
@@ -8218,7 +8266,7 @@ impl EffectScan<'_> {
                 walk!(opt);
                 // The fallback is conditionally reachable. Its effects remain reachable, while the
                 // successful unwrap edge keeps the expression fallthrough even if fallback exits.
-                let _ = self.expr(fallback);
+                let _ = fallback;
                 return true;
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
@@ -8226,18 +8274,15 @@ impl EffectScan<'_> {
                 walk!(arg);
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
-                return self.block(b);
+                return !hir_block_diverges(b);
             }
-            ExprKind::Loop { body, diverges, .. } => {
-                self.loop_body(e, body);
-                return !*diverges;
-            }
+            ExprKind::Loop { diverges, .. } => return !*diverges,
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
             ExprKind::Unsafe(b) => {
                 self.impure_direct = true;
-                return self.block(b);
+                return !hir_block_diverges(b);
             }
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
                 walk!(e);
@@ -8269,46 +8314,9 @@ impl EffectScan<'_> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 walk!(scrutinee);
-                let mut any_fallthrough = false;
-                for a in arms {
-                    if self.known_effects.is_some()
-                        && let [variant] = a.variants.as_slice()
-                    {
-                        for (index, binding) in a.bindings.iter().enumerate() {
-                            let Some(ty) = self
-                                .locals
-                                .get(*binding as usize)
-                                .map(|local| local.ty)
-                            else {
-                                continue;
-                            };
-                            let Some(projection) =
-                                self.match_payload_projection(
-                                    scrutinee.ty,
-                                    *variant,
-                                    index as u32,
-                                )
-                            else {
-                                continue;
-                            };
-                            let source = [projection];
-                            self.join_current_local_boundary(
-                                *binding,
-                                scrutinee,
-                                &source,
-                                &[],
-                            );
-                            self.join_concrete_effects(
-                                ty,
-                                scrutinee,
-                                &mut vec![projection],
-                                &mut Vec::new(),
-                            );
-                        }
-                    }
-                    any_fallthrough |= self.expr(&a.body);
-                }
-                return any_fallthrough;
+                return arms
+                    .iter()
+                    .any(|arm| !hir_expr_diverges(&arm.body));
             }
             ExprKind::ResultMapErr { result, f } => {
                 walk!(result);
@@ -8574,6 +8582,75 @@ enum EscapeFlowOp<'a> {
     ReturnEscape(&'a Expr, u32),
 }
 
+enum EscapeWalkItem<'a> {
+    Expr(&'a Expr, u32),
+    ExprExit(&'a Expr, u32),
+    Block(&'a Block, u32),
+    Stmt(&'a Stmt, u32),
+    StmtExit(&'a Stmt, u32),
+    Op(EscapeFlowOp<'a>),
+    ArenaDone {
+        block: &'a Block,
+        inner: u32,
+        target: Region,
+    },
+    TaskGroupDone {
+        block: &'a Block,
+        inner: u32,
+        target: Region,
+    },
+    LoopDone {
+        body: &'a Block,
+        head: EscapeFlowBlockId,
+        exit: EscapeFlowBlockId,
+    },
+    IfAfterCond {
+        then: &'a Block,
+        els: &'a Block,
+        depth: u32,
+    },
+    IfThenDone {
+        then_diverges: bool,
+        else_entry: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+    },
+    IfDone {
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+        then_diverges: bool,
+        else_diverges: bool,
+    },
+    MatchAfterScrutinee {
+        scrutinee: &'a Expr,
+        arms: &'a [hir::MatchArm],
+        depth: u32,
+    },
+    MatchArmStart {
+        scrutinee: &'a Expr,
+        arm: &'a hir::MatchArm,
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+        depth: u32,
+    },
+    MatchArmDone {
+        arm: &'a hir::MatchArm,
+        join: EscapeFlowBlockId,
+    },
+    MatchDone {
+        arms: &'a [hir::MatchArm],
+        branch: EscapeFlowBlockId,
+        join: EscapeFlowBlockId,
+    },
+    ElseAfterOpt {
+        fallback: &'a Expr,
+        depth: u32,
+    },
+    ElseDone {
+        fallback: &'a Expr,
+        join: EscapeFlowBlockId,
+    },
+}
+
 impl<'a> EscapeFlowCfg<'a> {
     fn new() -> Self {
         Self {
@@ -8653,6 +8730,11 @@ struct EscapeCheck<'a> {
     flow_current: EscapeFlowBlockId,
     /// CFG exit block for each active loop, innermost last.
     loop_exit_blocks: Vec<EscapeFlowBlockId>,
+    /// Direct expression children collected by the exhaustive operand match. The outer walk drains
+    /// them onto its explicit worklist; recursive-looking calls made while this flag is set only
+    /// append here and return immediately.
+    collecting_walk_children: bool,
+    walk_children: Vec<(&'a Expr, u32)>,
 }
 
 impl<'a> EscapeCheck<'a> {
@@ -8668,7 +8750,7 @@ impl<'a> EscapeCheck<'a> {
                 self.state.individual_may.insert(param, true);
             }
         }
-        self.lower_block(&self.f.body, 0);
+        self.walk_block(&self.f.body, 0);
         // The body's trailing value is the function's return value (single-expression
         // bodies and fall-through blocks), so apply the same escape check there.
         if let Some(v) = &self.f.body.value {
@@ -8815,59 +8897,87 @@ impl<'a> EscapeCheck<'a> {
     /// aggregate region/cleanup bit cannot hide mixed heap and arena members; bound locals use the
     /// path-sensitive ownership fact joined in [`EscapeState`].
     fn call_transfer_contains_arena_owned(&mut self, e: &Expr, depth: u32) -> bool {
-        if !needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) || matches!(e.ty, Ty::DynSliceArray(_))
-        {
-            return false;
-        }
-        match &e.kind {
-            ExprKind::Local(local) => !self.state.individual.get(local).copied().unwrap_or_else(|| {
-                !matches!(self.region_of(e, depth), Region::Arena(_))
-            }),
-            ExprKind::Tuple { elems, .. } => elems
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::OptionSome(inner)
-            | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner)
-            | ExprKind::TaskGet(inner) => self.call_transfer_contains_arena_owned(inner, depth),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth + 1)),
-            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
-                block
-                    .value
-                    .as_ref()
-                    .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth))
-            }),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.call_transfer_contains_arena_owned(&arm.body, depth)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.call_transfer_contains_arena_owned(opt, depth)
-                    || self.call_transfer_contains_arena_owned(fallback, depth)
+        let mut work = vec![(e, depth)];
+        while let Some((expression, depth)) = work.pop() {
+            if !needs_drop_flag(
+                expression.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) || matches!(expression.ty, Ty::DynSliceArray(_))
+            {
+                continue;
             }
-            // A function result cannot borrow arena-owned storage across its own return boundary.
-            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => false,
-            _ => !self.drop_is_individual(e, depth),
+            match &expression.kind {
+                ExprKind::Local(local) => {
+                    let individual = self
+                        .state
+                        .individual
+                        .get(local)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            !matches!(
+                                self.region_of(expression, depth),
+                                Region::Arena(_)
+                            )
+                        });
+                    if !individual {
+                        return true;
+                    }
+                }
+                ExprKind::Tuple { elems, .. }
+                | ExprKind::ArrayLit { elems, .. } => {
+                    work.extend(elems.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::EnumValue { payload, .. } => {
+                    work.extend(payload.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::StructLit { fields, .. } => {
+                    work.extend(fields.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::OptionSome(inner)
+                | ExprKind::ResultOk(inner)
+                | ExprKind::ResultErr(inner)
+                | ExprKind::Try(inner)
+                | ExprKind::TaskGet(inner) => work.push((inner, depth)),
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
+                }
+                ExprKind::If { then, els, .. } => {
+                    for block in [els, then] {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push((value, depth));
+                        }
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                ExprKind::ElseUnwrap { opt, fallback } => {
+                    work.push((fallback, depth));
+                    work.push((opt, depth));
+                }
+                // A function result cannot borrow arena-owned storage across its own return boundary.
+                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => {}
+                _ if !self.drop_is_individual(expression, depth) => {
+                    return true;
+                }
+                _ => {}
+            }
         }
+        false
     }
 
     /// Check the implicit Err return edge of `?` for a borrowed payload. This is independent of
@@ -8877,38 +8987,46 @@ impl<'a> EscapeCheck<'a> {
     /// Fresh constructors preserve variant precision. A bound or control-flow Result uses its
     /// conservative joined region because L1a has no per-variant borrow-provenance bit.
     fn check_try_error_borrow_escape(&mut self, result: &Expr, depth: u32) {
-        let Ty::Result(_, err) = result.ty else {
-            return;
-        };
-        if !self.region_bearing(scalar_to_ty(err)) {
-            return;
-        }
-        match &result.kind {
-            ExprKind::ResultOk(_) => {}
-            ExprKind::ResultErr(error) => self.check_return_escape(error, depth),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
-                if let Some(value) = &block.value {
-                    self.check_try_error_borrow_escape(value, depth);
-                }
+        let mut work = vec![(result, depth)];
+        while let Some((result, depth)) = work.pop() {
+            let Ty::Result(_, err) = result.ty else {
+                continue;
+            };
+            if !self.region_bearing(scalar_to_ty(err)) {
+                continue;
             }
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
-                if let Some(value) = &block.value {
-                    self.check_try_error_borrow_escape(value, depth + 1);
+            match &result.kind {
+                ExprKind::ResultOk(_) => {}
+                ExprKind::ResultErr(error) => {
+                    self.check_return_escape(error, depth);
                 }
-            }
-            ExprKind::If { then, els, .. } => {
-                for block in [then, els] {
-                    if let Some(value) = &block.value {
-                        self.check_try_error_borrow_escape(value, depth);
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
                     }
                 }
-            }
-            ExprKind::Match { arms, .. } => {
-                for arm in arms {
-                    self.check_try_error_borrow_escape(&arm.body, depth);
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
                 }
+                ExprKind::If { then, els, .. } => {
+                    if let Some(value) = els.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                    if let Some(value) = then.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                _ => self.check_return_escape(result, depth),
             }
-            _ => self.check_return_escape(result, depth),
         }
     }
 
@@ -8916,46 +9034,63 @@ impl<'a> EscapeCheck<'a> {
     /// precision for fresh constructors; a bound/control-flow Result uses the conservative joined
     /// ownership bit because L1a has only one cleanup-provenance bit for the aggregate.
     fn try_error_contains_arena_owned(&mut self, result: &Expr, depth: u32) -> bool {
-        let Ty::Result(_, err) = result.ty else {
-            return false;
-        };
-        if !needs_drop_flag(
-            scalar_to_ty(err),
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            return false;
-        }
-        match &result.kind {
-            ExprKind::ResultOk(_) => false,
-            ExprKind::ResultErr(error) => {
-                self.call_transfer_contains_arena_owned(error, depth)
+        let mut work = vec![(result, depth)];
+        while let Some((result, depth)) = work.pop() {
+            let Ty::Result(_, err) = result.ty else {
+                continue;
+            };
+            if !needs_drop_flag(
+                scalar_to_ty(err),
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                continue;
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth + 1)),
-            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
-                block
-                    .value
-                    .as_ref()
-                    .is_some_and(|value| self.try_error_contains_arena_owned(value, depth))
-            }),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.try_error_contains_arena_owned(&arm.body, depth)),
-            // A callee cannot return arena-owned storage across its own function boundary.
-            ExprKind::Call { .. }
-            | ExprKind::CallFnValue { .. }
-            | ExprKind::ResultMapErr { .. } => false,
-            _ => self.call_transfer_contains_arena_owned(result, depth),
+            match &result.kind {
+                ExprKind::ResultOk(_) => {}
+                ExprKind::ResultErr(error) => {
+                    if self.call_transfer_contains_arena_owned(error, depth) {
+                        return true;
+                    }
+                }
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
+                }
+                ExprKind::If { then, els, .. } => {
+                    if let Some(value) = els.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                    if let Some(value) = then.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                // A callee cannot return arena-owned storage across its own function boundary.
+                ExprKind::Call { .. }
+                | ExprKind::CallFnValue { .. }
+                | ExprKind::ResultMapErr { .. } => {}
+                _ if self.call_transfer_contains_arena_owned(result, depth) => {
+                    return true;
+                }
+                _ => {}
+            }
         }
+        false
     }
 
     /// A resource-owning slot has one runtime cleanup bit, so every directly owned member of one
@@ -9070,34 +9205,52 @@ impl<'a> EscapeCheck<'a> {
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(&self, ty: Ty) -> bool {
-        match ty {
-            Ty::Tagged(id) => {
-                self.tracks_region(expand_tagged_ty(Ty::Tagged(id), self.tagged_types))
+        let mut work = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(ty) = work.pop() {
+            if !seen.insert(ty) {
+                continue;
             }
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
+            match ty {
+            Ty::Tagged(id) => work.push(expand_tagged_ty(
+                Ty::Tagged(id),
+                self.tagged_types,
+            )),
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => return true,
             // An owned `array<response>` is escape-checked in the same lane as every owned collection.
             // It borrows nothing, so its `region_of` is explicitly `Static` — the check passes and
             // the array is freely returnable (like `array<string>` from `fs.read_dir`); tracking keeps
             // it from silently skipping the escape pass if a future producer gives it a region.
-            Ty::DynResponseArray => true,
+            Ty::DynResponseArray => return true,
             // A `dict_encoded` value's `dict`/`source` slices borrow the source AoS, so it is
             // region-tracked — it must not outlive the array it encodes.
-            Ty::DictEncoded(..) => true,
+            Ty::DictEncoded(..) => return true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
-            Ty::Soa(_) => true,
+            Ty::Soa(_) => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
             // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
-            Ty::HttpHeaders => true,
+            Ty::HttpHeaders => return true,
             // A `json.doc` view borrows the arena tape + the JSON input (min of the two), so it is
             // region-tracked — it (and any str/sub-doc read of it) must not outlive either (J4).
-            Ty::JsonDoc => true,
+            Ty::JsonDoc => return true,
             // A `json.scanner<Row>` view borrows the JSON input it streams over, so it is
             // region-tracked — it must not outlive that input (J5).
-            Ty::JsonScanner(_) => true,
+            Ty::JsonScanner(_) => return true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
-            Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
+            Ty::Tuple(id) => {
+                if let Some(definition) = self.tuples.get(id as usize) {
+                    work.extend(
+                        definition
+                            .elems
+                            .iter()
+                            .rev()
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
             // A *fixed* `array<T>` (a stack value) is region-tracked iff its element is — an
             // `array<str>` holds `str` views (so an array of arena strs is arena-regioned and must
             // not escape), while an `array<i64>` is plain Copy data (Static, freely returnable).
@@ -9105,22 +9258,34 @@ impl<'a> EscapeCheck<'a> {
             // separately by the local-backed-slice check). A fixed `array<Struct>` (AoS) always
             // tracks, like `Struct` itself — a struct may hold a region-tracked `str` field, so an
             // element / element-field read must inherit the array's region.
-            Ty::Array(s, _) | Ty::Slice(s) => self.tracks_region(scalar_to_ty(s)),
-            Ty::StructArray(..) => true,
+            Ty::Array(s, _) | Ty::Slice(s) => work.push(scalar_to_ty(s)),
+            Ty::StructArray(..) => return true,
             // An `Option`/`Result` is region-tracked iff its payload is. A `Struct` payload (e.g. a
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
-            Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
-            Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
+            Ty::Option(s) => work.push(scalar_to_ty(s)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
             // A sum type is region-tracked iff any variant payload is (J1: a `str`-view or
             // `str`-bearing-struct payload makes the enum a borrow — `Content.Text(view)` must not
             // outlive the view; scalar-only enums stay Copy / `Static`, freely returnable).
-            Ty::Enum(id) => self
-                .enums
-                .get(id as usize)
-                .is_some_and(|e| e.variants.iter().any(|v| v.payload.iter().any(|s| self.tracks_region(scalar_to_ty(*s))))),
+            Ty::Enum(id) => {
+                if let Some(definition) = self.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter())
+                            .rev()
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
             // `Task<R>` (④b) is a box in the task_group region — region-tracked like `box<T>`, so
             // a task handle cannot escape its `task_group` scope.
-            Ty::Task(_) => true,
+            Ty::Task(_) => return true,
             // A `reader`/`writer` is region-tracked *because* it can be a **borrow**: `c.reader()` /
             // `c.writer()` on a `tcp_conn` hand back a reader/writer over the conn's fd
             // (`owns_fd: false`), region-bound to `c` (see `region_of` — `ConnReader`/`ConnWriter`),
@@ -9138,7 +9303,7 @@ impl<'a> EscapeCheck<'a> {
             // summaries, independently of the intraprocedural region-flow CFG. This arm only makes
             // the escape check *consult* the region either way. (A `tcp_conn` itself is always
             // owned, never a borrow, so it is deliberately NOT here.)
-            Ty::Reader | Ty::Writer | Ty::Fn(_) => true,
+            Ty::Reader | Ty::Writer | Ty::Fn(_) => return true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
             Ty::Int(_)
@@ -9181,8 +9346,10 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Command
             | Ty::RunOutput
             | Ty::Error
-            | Ty::Unit => false,
+            | Ty::Unit => {}
+            }
         }
+        false
     }
 
     /// Whether a value of `ty` must be escape-checked against its inferred [`Region`]: it is
@@ -9202,111 +9369,199 @@ impl<'a> EscapeCheck<'a> {
     /// Whether an owned expression's storage is individually released rather than arena-bulk
     /// released. This is allocation provenance, deliberately separate from borrow/escape Region.
     fn drop_is_individual(&mut self, e: &Expr, depth: u32) -> bool {
-        let individual = if matches!(e.ty, Ty::DynSliceArray(_)) {
-            true
-        } else {
-            match &e.kind {
-                // A callee cannot return arena-owned storage across its function boundary, even when
-                // `region_of(Call)` is shortened by an arena-borrowing argument.
-                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
-                ExprKind::OptionSome(inner)
-                | ExprKind::ResultOk(inner)
-                | ExprKind::ResultErr(inner)
-                | ExprKind::Try(inner)
-                | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
-                // `map_err` passes the Ok payload through and a callee-produced Move error is always
-                // free-standing. The source therefore determines whether every owning runtime variant
-                // is individual; MIR carries the selected variant's exact bit.
-                ExprKind::ResultMapErr { result, .. } => self.drop_is_individual(result, depth),
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                    .value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth)),
-                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                    .value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
-                // A value-carrying branch is statically individual only when every continuing arm is.
-                // Each arm is still recorded separately below, so MIR can select its exact constant or
-                // a moved local's runtime flag alongside the selected value.
-                ExprKind::If { then, els, .. } => {
-                    let then_individual = then
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_is_individual(value, depth));
-                    let else_individual = els
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_is_individual(value, depth));
-                    then_individual && else_individual
-                }
-                ExprKind::Match { arms, .. } => arms
-                    .iter()
-                    .all(|arm| self.drop_is_individual(&arm.body, depth)),
-                ExprKind::ElseUnwrap { opt, fallback } => {
-                    self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
-                }
-                // One aggregate slot has one cleanup bit. Determine it only from directly owned
-                // members: borrowed members may shorten Region but do not affect allocation mode. The
-                // separate mixed-mode diagnostic rejects the case where this conjunction would lose
-                // a free-standing member.
-                ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::EnumValue { payload, .. } => payload
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::StructLit { fields, .. } => fields
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::ArrayParMap { source, stages, .. }
-                    if par_map_parallelizable(
-                        source.ty,
-                        stages,
-                        self.structs,
-                        self.enums,
-                        self.tagged_types,
-                    ) && par_map_result_is_plain_primitive(e.ty) =>
-                {
-                    true
-                }
-                _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            All(Vec<(&'e Expr, u32)>, usize),
+            Record(&'e Expr),
+        }
+        fn push_all<'e>(
+            work: &mut Vec<Work<'e>>,
+            values: &mut Vec<bool>,
+            children: Vec<(&'e Expr, u32)>,
+        ) {
+            if children.is_empty() {
+                values.push(true);
+            } else {
+                work.push(Work::All(children, 0));
             }
-        };
-        // The same syntax node can be replayed at more than one CFG state. Retain the conservative
-        // conjunction; runtime local moves do not consume this static entry.
-        self.drop_individual_exprs
-            .entry(e.span)
-            .and_modify(|known| *known &= individual)
-            .or_insert(individual);
-        individual
+        }
+
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    work.push(Work::Record(expression));
+                    if matches!(expression.ty, Ty::DynSliceArray(_)) {
+                        values.push(true);
+                        continue;
+                    }
+                    match &expression.kind {
+                        // A callee cannot return arena-owned storage across its function boundary,
+                        // even when `region_of(Call)` is shortened by an arena-borrowing argument.
+                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::OptionSome(inner)
+                        | ExprKind::ResultOk(inner)
+                        | ExprKind::ResultErr(inner)
+                        | ExprKind::Try(inner)
+                        | ExprKind::TaskGet(inner) => {
+                            work.push(Work::Eval(inner, depth));
+                        }
+                        // `map_err` passes the Ok payload through and a callee-produced Move error is
+                        // always free-standing. The source therefore determines whether every owning
+                        // runtime variant is individual; MIR carries the selected variant's exact bit.
+                        ExprKind::ResultMapErr { result, .. } => {
+                            work.push(Work::Eval(result, depth));
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                block
+                                    .value
+                                    .as_deref()
+                                    .map(|value| vec![(value, depth)])
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                block
+                                    .value
+                                    .as_deref()
+                                    .map(|value| vec![(value, depth + 1)])
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        // A value-carrying branch is statically individual only when every continuing
+                        // arm is. Short-circuit in source order exactly as the recursive evaluator did.
+                        ExprKind::If { then, els, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                [then, els]
+                                    .into_iter()
+                                    .filter_map(|block| {
+                                        block.value.as_deref().map(|value| (value, depth))
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::Match { arms, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                arms.iter().map(|arm| (&arm.body, depth)).collect(),
+                            );
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                vec![(opt, depth), (fallback, depth)],
+                            );
+                        }
+                        // One aggregate slot has one cleanup bit. Determine it only from directly
+                        // owned members: borrowed members may shorten Region but do not affect
+                        // allocation mode.
+                        ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                elems
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::EnumValue { payload, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                payload
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::StructLit { fields, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                fields
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::ArrayParMap { source, stages, .. }
+                            if par_map_parallelizable(
+                                source.ty,
+                                stages,
+                                self.structs,
+                                self.enums,
+                                self.tagged_types,
+                            ) && par_map_result_is_plain_primitive(expression.ty) =>
+                        {
+                            values.push(true);
+                        }
+                        _ => values.push(!matches!(
+                            self.region_of(expression, depth),
+                            Region::Arena(_)
+                        )),
+                    }
+                }
+                Work::All(children, index) => {
+                    if index > 0 && !values.pop().expect("ownership child result") {
+                        values.push(false);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::All(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(true);
+                    }
+                }
+                Work::Record(expression) => {
+                    let individual = *values.last().expect("ownership expression result");
+                    // The same syntax node can be replayed at more than one CFG state. Retain the
+                    // conservative conjunction; runtime local moves do not consume this static entry.
+                    self.drop_individual_exprs
+                        .entry(expression.span)
+                        .and_modify(|known| *known &= individual)
+                        .or_insert(individual);
+                }
+            }
+        }
+        values.pop().expect("ownership result")
     }
 
     /// Whether an owned expression may be individually allocated on any reaching path. Paired
@@ -9314,94 +9569,171 @@ impl<'a> EscapeCheck<'a> {
     /// `(true,true)` is definitely individual, `(false,false)` definitely arena, and
     /// `(false,true)` path-dependent. Mutating an aggregate requires a definite mode.
     fn drop_may_be_individual(&mut self, e: &Expr, depth: u32) -> bool {
-        if matches!(e.ty, Ty::DynSliceArray(_)) {
-            return true;
+        enum Work<'a> {
+            Eval(&'a Expr, u32),
+            All(Vec<(&'a Expr, u32)>, usize),
+            Any(Vec<(&'a Expr, u32)>, usize),
         }
-        match &e.kind {
-            ExprKind::Local(local) => self
-                .state
-                .individual_may
-                .get(local)
-                .copied()
-                .unwrap_or_else(|| !matches!(self.region_of(e, depth), Region::Arena(_))),
-            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
-            ExprKind::OptionSome(inner)
-            | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner)
-            | ExprKind::TaskGet(inner) => self.drop_may_be_individual(inner, depth),
-            ExprKind::ResultMapErr { result, .. } => {
-                self.drop_may_be_individual(result, depth)
-                    || matches!(e.ty, Ty::Result(_, err) if needs_drop_flag(
-                        scalar_to_ty(err),
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    ))
+
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    if matches!(expression.ty, Ty::DynSliceArray(_)) {
+                        values.push(true);
+                        continue;
+                    }
+                    match &expression.kind {
+                        ExprKind::Local(local) => values.push(
+                            self.state
+                                .individual_may
+                                .get(local)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    !matches!(
+                                        self.region_of(expression, depth),
+                                        Region::Arena(_)
+                                    )
+                                }),
+                        ),
+                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::OptionSome(inner)
+                        | ExprKind::ResultOk(inner)
+                        | ExprKind::ResultErr(inner)
+                        | ExprKind::Try(inner)
+                        | ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
+                        ExprKind::ResultMapErr { result, .. } => {
+                            if matches!(
+                                expression.ty,
+                                Ty::Result(_, err) if needs_drop_flag(
+                                    scalar_to_ty(err),
+                                    self.structs,
+                                    self.tuples,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                            ) {
+                                values.push(true);
+                            } else {
+                                work.push(Work::Eval(result, depth));
+                            }
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            if let Some(value) = block.value.as_deref() {
+                                work.push(Work::Eval(value, depth));
+                            } else {
+                                values.push(true);
+                            }
+                        }
+                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                            if let Some(value) = block.value.as_deref() {
+                                work.push(Work::Eval(value, depth + 1));
+                            } else {
+                                values.push(true);
+                            }
+                        }
+                        ExprKind::If { then, els, .. } => {
+                            let children = [then, els]
+                                .into_iter()
+                                .filter_map(|block| {
+                                    block.value.as_deref().map(|value| (value, depth))
+                                })
+                                .collect();
+                            work.push(Work::Any(children, 0));
+                        }
+                        ExprKind::Match { arms, .. } => {
+                            work.push(Work::Any(
+                                arms.iter().map(|arm| (&arm.body, depth)).collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            work.push(Work::Any(vec![(opt, depth), (fallback, depth)], 0));
+                        }
+                        ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                            work.push(Work::All(
+                                elems
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::EnumValue { payload, .. } => {
+                            work.push(Work::All(
+                                payload
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::StructLit { fields, .. } => {
+                            work.push(Work::All(
+                                fields
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        _ => values.push(!matches!(
+                            self.region_of(expression, depth),
+                            Region::Arena(_)
+                        )),
+                    }
+                }
+                Work::All(children, index) => {
+                    if index > 0 && !values.pop().expect("ownership child result") {
+                        values.push(false);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::All(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(true);
+                    }
+                }
+                Work::Any(children, index) => {
+                    if index > 0 && values.pop().expect("ownership child result") {
+                        values.push(true);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::Any(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(false);
+                    }
+                }
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_may_be_individual(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_may_be_individual(value, depth + 1)),
-            ExprKind::If { then, els, .. } => {
-                then.value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_may_be_individual(value, depth))
-                    || els
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_may_be_individual(value, depth))
-            }
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.drop_may_be_individual(&arm.body, depth)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.drop_may_be_individual(opt, depth)
-                    || self.drop_may_be_individual(fallback, depth)
-            }
-            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
         }
+        values.pop().expect("ownership result")
     }
 
     /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
@@ -9426,34 +9758,31 @@ impl<'a> EscapeCheck<'a> {
     /// control-flow expression that may select one are frame-capped so a derived view cannot escape
     /// and dangle when the hidden owner is dropped.
     fn unbound_owned_temporary(&self, e: &Expr) -> bool {
-        if !needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            return false;
-        }
-        match &e.kind {
-            ExprKind::Local(_)
-            | ExprKind::Field { .. }
-            | ExprKind::TupleIndex { .. }
-            | ExprKind::Index { .. }
-            | ExprKind::ElemField { .. } => false,
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
-                block.value.as_ref().is_some_and(|value| self.unbound_owned_temporary(value))
+        let mut expression = e;
+        loop {
+            if !needs_drop_flag(
+                expression.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                return false;
             }
-            _ => true,
-        }
-    }
-
-    fn borrowed_storage_region(&self, owner: &Expr, depth: u32) -> Region {
-        let region = self.region_of(owner, depth);
-        if self.unbound_owned_temporary(owner) {
-            region.shorter(Region::Frame)
-        } else {
-            region
+            match &expression.kind {
+                ExprKind::Local(_)
+                | ExprKind::Field { .. }
+                | ExprKind::TupleIndex { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::ElemField { .. } => return false,
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    let Some(value) = block.value.as_deref() else {
+                        return false;
+                    };
+                    expression = value;
+                }
+                _ => return true,
+            }
         }
     }
 
@@ -9462,125 +9791,65 @@ impl<'a> EscapeCheck<'a> {
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
     /// a primitive-only one is free to escape the arena (`s[i]` gather returns a Copy POD value).
     fn struct_has_str(&self, id: u32) -> bool {
-        self.struct_has_str_rec(id, &mut Vec::new())
-    }
-
-    /// Whether struct `id` holds a `str` field at any nesting depth — a decoded nested struct's `str`
-    /// fields are zero-copy views into the JSON input, so a struct that (transitively) contains one is
-    /// region-tied to that input and cannot outlive it (`region_of`). Cycle-safe (`stack`) even though
-    /// the struct graph is acyclic (`struct_acyclic`), so a mis-built graph can't loop forever.
-    fn struct_has_str_rec(&self, id: u32, stack: &mut Vec<u32>) -> bool {
-        if stack.contains(&id) {
-            return false;
-        }
-        stack.push(id);
-        let mut found = false;
-        for f in &self.structs[id as usize].fields {
-            let has = match f.ty {
-                Ty::Str => true,
-                Ty::Struct(nid) => self.struct_has_str_rec(nid, stack),
-                // An `Option<str>` field holds a `str` view when `Some`; an `Option<Struct>` field can
-                // hold a str-bearing struct — both make the enclosing struct input-region-tied.
-                Ty::Option(Scalar::Str) => true,
-                Ty::Option(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
-                // A `slice<str>` field holds `str` views into a backing buffer, so the enclosing
-                // struct is region-tied exactly like a direct `str` field (F1③, the pkg.web param
-                // slots). A `slice<struct>` recurses into a str-bearing element struct; other slice
-                // elements (`slice<i64>`) carry no `str` view (their backing-buffer region-tie is
-                // handled by the `region_of(StructLit)` field fold, not here — this predicate is
-                // specifically about `str` views).
-                Ty::Slice(Scalar::Str) => true,
-                Ty::Slice(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
-                // A sum-type (`enum`) field holds a `str` view when its live variant carries one — a
-                // `Content.Text(view)` field makes the enclosing struct input-region-tied, exactly like
-                // a direct `str` field (J1b). Recurse into a `str`-bearing struct payload too; a
-                // scalar-only enum contributes no region (stays `Static`, freely returnable).
-                Ty::Enum(eid) => self.enums.get(eid as usize).is_some_and(|e| {
-                    e.variants.iter().any(|v| {
-                        v.payload.iter().any(|&s| match s {
-                            Scalar::Str => true,
-                            Scalar::Struct(nid) => self.struct_has_str_rec(nid, stack),
-                            _ => false,
-                        })
-                    })
-                }),
-                _ => false,
-            };
-            if has {
-                found = true;
-                break;
-            }
-        }
-        stack.pop();
-        found
+        struct_contains_str(id, self.structs, self.enums)
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
-    fn mapped_return_region(
-        &self,
-        summary: &hir::ReturnRegionSummary,
-        args: &[Expr],
-        depth: u32,
-    ) -> Region {
-        let hir::ReturnRegionSummary::Roots {
-            params,
-            captures: _,
-        } = summary
-        else {
-            return Region::Static;
-        };
-        let mut region = Region::Static;
-        for &index in params {
-            if let Some(value) = args.get(index as usize) {
-                region = region.shorter(self.region_of(value, depth));
+    fn region_of(&self, e: &Expr, depth: u32) -> Region {
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            Shorter(usize, Region),
+            Cap(Region),
+        }
+        fn push_fold<'e>(
+            work: &mut Vec<Work<'e>>,
+            initial: Region,
+            children: Vec<(&'e Expr, u32, Option<Region>)>,
+        ) {
+            work.push(Work::Shorter(children.len(), initial));
+            for (child, depth, cap) in children.into_iter().rev() {
+                if let Some(cap) = cap {
+                    work.push(Work::Cap(cap));
+                }
+                work.push(Work::Eval(child, depth));
             }
         }
-        region
-    }
 
-    fn mapped_return_slice_is_local(
-        &self,
-        summary: &hir::ReturnRegionSummary,
-        args: &[Expr],
-    ) -> bool {
-        let hir::ReturnRegionSummary::Roots {
-            params,
-            captures: _,
-        } = summary
-        else {
-            return false;
-        };
-        params.iter().any(|&index| {
-            args.get(index as usize)
-                .is_some_and(|value| self.slice_is_local(value))
-        })
-    }
-
-    fn region_of(&self, e: &Expr, depth: u32) -> Region {
-        match &e.kind {
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => match &expression.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
             // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
             // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => self.allocation_region(e),
-            ExprKind::Template(_) => self
-                .allocation_region_by_expr
-                .get(&Self::expr_key(e))
-                .copied()
-                .unwrap_or(Region::Frame),
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => {
+                values.push(self.allocation_region(expression));
+            }
+            ExprKind::Template(_) => values.push(
+                self.allocation_region_by_expr
+                    .get(&Self::expr_key(expression))
+                    .copied()
+                    .unwrap_or(Region::Frame),
+            ),
             // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
             // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
             // / `fs.remove` return owned / non-region values and stay explicitly `Static` below.
-            ExprKind::FsReadFileView { .. } => self.allocation_region(e),
+            ExprKind::FsReadFileView { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `fs.read_bytes_view(p)` returns a `bytes` (`slice<u8>`) view of the same mmap, so it is
             // arena-bound exactly like `read_file_view`'s `str` view. Unlike a `str`, a `slice<u8>` is
             // not `tracks_region` (its element is numeric), so `region_bearing` is what routes the
             // escape check here — this arm gives the view its Arena region.
-            ExprKind::FsReadBytesView { .. } => self.allocation_region(e),
+            ExprKind::FsReadBytesView { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // A spawned task's handle is a box in the enclosing `task_group` region.
-            ExprKind::Spawn { .. } => Region::arena(depth),
+            ExprKind::Spawn { .. } => values.push(Region::arena(depth)),
             // `.to_array()` and these other producers use the explicit enclosing arena when one
             // exists and otherwise create free-standing owned storage. `reduce` follows the same
             // rule for a region-tracked accumulator. A task_group's private runtime region never
@@ -9588,10 +9857,17 @@ impl<'a> EscapeCheck<'a> {
             // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
             // also borrows its source/input, so it needs the shorter of the two regions.)
             ExprKind::ArrayToArray { source, stages, .. } => {
-                let from_source =
-                    self.allocation_region(e).shorter(self.region_of(source, depth));
-                stage_capture_exprs(stages)
-                    .fold(from_source, |acc, capture| acc.shorter(self.region_of(capture, depth)))
+                let mut children = Vec::with_capacity(1 + stages.len());
+                children.push((source.as_ref(), depth, None));
+                children.extend(
+                    stage_capture_exprs(stages)
+                        .map(|capture| (capture, depth, None)),
+                );
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    children,
+                );
             }
             ExprKind::ArrayReduce {
                 source,
@@ -9607,99 +9883,166 @@ impl<'a> EscapeCheck<'a> {
                 init,
                 ..
             } => {
-                let from_values = self
-                    .allocation_region(e)
-                    .shorter(self.region_of(source, depth))
-                    .shorter(self.region_of(init, depth));
-                stage_capture_exprs(stages)
-                    .chain(captures)
-                    .fold(from_values, |acc, capture| {
-                        acc.shorter(self.region_of(capture, depth))
-                    })
+                let mut children =
+                    Vec::with_capacity(2 + stages.len() + captures.len());
+                children.push((source.as_ref(), depth, None));
+                children.push((init.as_ref(), depth, None));
+                children.extend(
+                    stage_capture_exprs(stages)
+                        .chain(captures)
+                        .map(|capture| (capture, depth, None)),
+                );
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    children,
+                );
             }
-            ExprKind::ArrayPartition { .. } | ExprKind::ArraySort { .. } | ExprKind::ArraySortBy { .. } => self.allocation_region(e),
+            ExprKind::ArrayPartition { .. }
+            | ExprKind::ArraySort { .. }
+            | ExprKind::ArraySortBy { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // The range-kernel runtime always returns a fresh malloc-backed primitive array, even
             // when the source expression is nested inside an arena. It carries no source views (the
             // checked `par_map` result is primitive), so it is freely returnable and individually
             // dropped. Unsupported shapes use the arena-aware sequential collector below.
             ExprKind::ArrayParMap { source, stages, .. }
                 if par_map_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types)
-                    && par_map_result_is_plain_primitive(e.ty) => Region::Static,
-            ExprKind::ArrayParMap { .. } => self.allocation_region(e),
+                    && par_map_result_is_plain_primitive(expression.ty) => {
+                values.push(Region::Static);
+            }
+            ExprKind::ArrayParMap { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
             // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
-            ExprKind::JsonDecode { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonDecode { input, .. } => work.push(Work::Eval(input, depth)),
             // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
             // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
-            ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonDecodeStructArray { input, .. } => {
+                work.push(Work::Eval(input, depth));
+            }
             // A decoded shape-directed union (J1b): a `str`-payload variant is a zero-copy view into
             // the input, so a `str`-bearing union carries the input's region; a scalar-only union
             // borrows nothing and stays `Static` (freely returnable), mirroring `tracks_region`'s
             // precision at the enum level (the region change is opt-in on a borrowing payload).
-            ExprKind::JsonDecodeUnion { input, enum_id } if self.tracks_region(Ty::Enum(*enum_id)) => self.region_of(input, depth),
-            ExprKind::JsonDecodeUnion { .. } => Region::Static,
+            ExprKind::JsonDecodeUnion { input, enum_id }
+                if self.tracks_region(Ty::Enum(*enum_id)) =>
+            {
+                work.push(Work::Eval(input, depth));
+            }
+            ExprKind::JsonDecodeUnion { .. } => values.push(Region::Static),
             // `json.decode → soa`: the column buffer is arena-allocated, and a `str` column holds
             // zero-copy views into the JSON input (like the AoS decode). So a str-bearing soa is
             // bound to BOTH — the arena buffer and the input — i.e. the shorter of the two regions.
             // (A primitive-only soa borrows nothing and stays purely arena-regioned via the group
             // arm above, so it is self-contained and free to escape the input.)
             ExprKind::JsonDecodeSoa { input, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(input, depth).shorter(self.allocation_region(e))
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    vec![(input, depth, None)],
+                );
             }
-            ExprKind::JsonDecodeSoa { .. } => self.allocation_region(e),
+            ExprKind::JsonDecodeSoa { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
-            ExprKind::JsonDoc { input } => self
-                .region_of(input, depth)
-                .shorter(self.allocation_region(e)),
+            ExprKind::JsonDoc { input } => push_fold(
+                &mut work,
+                self.allocation_region(expression),
+                vec![(input, depth, None)],
+            ),
             // `json.scan(input)` (J5): the scanner is a `{ptr,len}` view of the input (no arena tape),
             // and the rows it streams borrow the input. So it is region-tied to the input alone — it
             // cannot outlive it (a scanner escaping its input view is caught, like a `str`).
-            ExprKind::JsonScan { input, .. } => self.region_of(input, depth),
+            ExprKind::JsonScan { input, .. } => work.push(Work::Eval(input, depth)),
             // `d.get(k)` / `d.at(i)` yield another `json.doc` viewing the same tape; `d.as_str()` a
             // `str` view into the input (or the arena, for an escaped string). All live exactly as long
             // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
             // (`d.kind()` / `d.as_i64/f64/bool()` copy out a Copy scalar → the `Static` list below.)
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => self.region_of(doc, depth),
+            ExprKind::JsonDocGet { doc, .. }
+            | ExprKind::JsonDocAt { doc, .. }
+            | ExprKind::JsonDocAsStr { doc }
+            | ExprKind::JsonDocKey { doc, .. } => work.push(Work::Eval(doc, depth)),
             // `d.elems()` bump-allocates the handle buffer in the enclosing arena, and each element
             // handle views the same tape (the doc's region). So the slice is region-tied to BOTH — the
             // arena and the doc — i.e. the shorter of the two (like `json.decode → soa` / `to_array`).
-            ExprKind::JsonDocElems { doc } => self
-                .region_of(doc, depth)
-                .shorter(self.allocation_region(e)),
+            ExprKind::JsonDocElems { doc } => push_fold(
+                &mut work,
+                self.allocation_region(expression),
+                vec![(doc, depth, None)],
+            ),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
             // source (the shorter of the two). A primitive-only `to_soa` borrows nothing → the group
             // arm below binds it purely to the arena (self-contained, like `to_array`'s buffer).
             ExprKind::ArrayToSoa { source, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(source, depth).shorter(self.allocation_region(e))
+                push_fold(
+                    &mut work,
+                    self.allocation_region(expression),
+                    vec![(source, depth, None)],
+                );
             }
-            ExprKind::ArrayToSoa { .. } => self.allocation_region(e),
+            ExprKind::ArrayToSoa { .. } => {
+                values.push(self.allocation_region(expression));
+            }
             // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
-            ExprKind::ElemField { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::ElemField { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // `s[i]` on a `soa` *gathers* a whole struct. A primitive-only struct is copied
             // column-by-column into a fresh POD value that borrows nothing → `Static` (returnable).
             // A struct with a `str` column gathers `str` views that borrow the soa's buffer/input,
             // so the gathered value inherits the soa's region (it must not outlive it).
             ExprKind::Index { recv, .. } if matches!(recv.ty, Ty::Soa(_)) => match recv.ty {
-                Ty::Soa(sid) if self.struct_has_str(sid) => self.region_of(recv, depth),
-                _ => Region::Static,
+                Ty::Soa(sid) if self.struct_has_str(sid) => {
+                    work.push(Work::Eval(recv, depth));
+                }
+                _ => values.push(Region::Static),
             },
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
-            ExprKind::Index { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::Index { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
-            ExprKind::SliceRange { recv, .. } => self.borrowed_storage_region(recv, depth),
+            ExprKind::SliceRange { recv, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    recv,
+                    depth,
+                    self.unbound_owned_temporary(recv)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // An array literal lives as long as its shortest-lived element — a `[str]` of arena
             // `str` views is arena-regioned (the same rule as a struct literal over its fields). A
             // Move-struct array literal, however, *owns* its elements' heap buffers (its `.clone()`
@@ -9707,30 +10050,52 @@ impl<'a> EscapeCheck<'a> {
             // frame-local — the temporary's buffers die within the frame — so cap it at `Frame`, the
             // same bound a bound Move-struct array gets at its `let` (else the view could be returned).
             ExprKind::ArrayLit { elems, .. } => {
-                let r = elems
-                    .iter()
-                    .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth)));
-                if matches!(e.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums, self.tagged_types)) {
-                    r.shorter(Region::Frame)
-                } else {
-                    r
+                if matches!(
+                    expression.ty,
+                    Ty::StructArray(sid, _)
+                        if struct_is_move(
+                            sid,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                ) {
+                    work.push(Work::Cap(Region::Frame));
                 }
+                push_fold(
+                    &mut work,
+                    Region::Static,
+                    elems
+                        .iter()
+                        .map(|element| (element, depth, None))
+                        .collect(),
+                );
             }
-            ExprKind::ArrayZip { .. } => Region::Static,
+            ExprKind::ArrayZip { .. } => values.push(Region::Static),
             // A tuple lives as long as its shortest-lived element (same rule as an array literal):
             // a tuple holding an arena `str` view is arena-regioned and cannot escape.
-            ExprKind::Tuple { elems, .. } => elems
-                .iter()
-                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            ExprKind::Tuple { elems, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                elems
+                    .iter()
+                    .map(|element| (element, depth, None))
+                    .collect(),
+            ),
             // A sum-type value lives as long as its shortest-lived payload (J1: `Content.Text(view)`
             // is bound to `view`'s region — a scalar-only variant folds to `Static`, freely
             // returnable). Same rule as a tuple / struct literal over its members.
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            ExprKind::EnumValue { payload, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                payload
+                    .iter()
+                    .map(|element| (element, depth, None))
+                    .collect(),
+            ),
             // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
             // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
-            ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
+            ExprKind::TupleIndex { recv, .. } => work.push(Work::Eval(recv, depth)),
             // `chunks` makes an `array<slice<T>>` (`DynSliceArray`) whose slice headers borrow the
             // source's **backing storage**. That storage region is distinct from the *element*
             // region `region_of(source)` returns for reads: `arr[i]` of an `array<str>` yields a
@@ -9740,28 +10105,80 @@ impl<'a> EscapeCheck<'a> {
             // use-after-free of the frame slot). So bind the chunks result to its source's storage
             // region (see `chunks_source_storage_region`), and also to the element region (`shorter`)
             // so an `array<str>` of arena strings is bounded by both its slot and that arena.
-            ExprKind::ArrayChunks { source, .. } => self
-                .chunks_source_storage_region(source, depth)
-                .shorter(self.region_of(source, depth)),
+            ExprKind::ArrayChunks { source, .. } => {
+                let (initial, mut children) = match &source.kind {
+                    ExprKind::Local(p)
+                        if matches!(
+                            source.ty,
+                            Ty::Array(..) | Ty::StructArray(..)
+                        ) =>
+                    {
+                        (
+                            self.decl_depth.get(p).map_or(
+                                Region::Static,
+                                |declaration_depth| {
+                                    Region::Frame.shorter(Region::arena(
+                                        *declaration_depth,
+                                    ))
+                                },
+                            ),
+                            Vec::new(),
+                        )
+                    }
+                    ExprKind::Local(p)
+                        if self.state.local_backed_slice.contains(p) =>
+                    {
+                        (Region::Frame, Vec::new())
+                    }
+                    ExprKind::ArrayLit { .. } => (
+                        Region::Frame.shorter(Region::arena(depth)),
+                        Vec::new(),
+                    ),
+                    _ => (
+                        Region::Static,
+                        vec![(
+                            source.as_ref(),
+                            depth,
+                            self.unbound_owned_temporary(source)
+                                .then_some(Region::Frame),
+                        )],
+                    ),
+                };
+                children.push((source.as_ref(), depth, None));
+                push_fold(&mut work, initial, children);
+            }
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
-            ExprKind::ArrayToSlice(inner) => self.borrowed_storage_region(inner, depth),
+            ExprKind::ArrayToSlice(inner) => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    inner,
+                    depth,
+                    self.unbound_owned_temporary(inner)
+                        .then_some(Region::Frame),
+                )],
+            ),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
             ExprKind::Try(inner)
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
+            | ExprKind::ResultErr(inner) => work.push(Work::Eval(inner, depth)),
             // `map_err` passes the `Ok` payload through unchanged, while its mapped error may
             // borrow the mapper closure's environment. The result can outlive neither source.
-            ExprKind::ResultMapErr { result, f } => self
-                .region_of(result, depth)
-                .shorter(self.region_of(f, depth)),
+            ExprKind::ResultMapErr { result, f } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(result, depth, None), (f, depth, None)],
+            ),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
-            }
+            ExprKind::ElseUnwrap { opt, fallback } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(opt, depth, None), (fallback, depth, None)],
+            ),
             // A `str` borrow of an owned `string` (slice 7b) views storage owned by *this* frame
             // (the `string` is `Drop`-freed at frame exit), so the view is `Frame`-regioned — it
             // must not escape the frame. This feeds `region_of(Call)`: passing a borrowed string
@@ -9770,54 +10187,74 @@ impl<'a> EscapeCheck<'a> {
             // `string` is heap-owned (`Static`), so this is exactly `Frame`; but if a later slice
             // arena-allocates a `string` (`Arena(k)`, shorter than `Frame`), the borrow must not
             // outlive that arena — taking the shorter keeps it sound for free.
-            ExprKind::StrBorrow(inner) => Region::Frame.shorter(self.region_of(inner, depth)),
+            ExprKind::StrBorrow(inner) => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(inner, depth, None)],
+            ),
             // `str.bytes()` is a zero-copy re-view of exactly the same `{ptr,len}` storage, so it
             // inherits the receiver's region. An owned `string` receiver was first `StrBorrow`ed,
             // which supplies the required Frame bound.
-            ExprKind::StrBytes { inner } => self.region_of(inner, depth),
+            ExprKind::StrBytes { inner } => work.push(Work::Eval(inner, depth)),
             // A trim yields a sub-`str` of its receiver (same bytes), so the view lives exactly as
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
-            ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
+            ExprKind::StrTrim { recv, .. } => work.push(Work::Eval(recv, depth)),
             // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
             // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
             // explicit arm the default classification used to mis-infer `Static`, letting a view of
             // an arena/frame `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned
             // strings and are explicitly `Static`.
-            ExprKind::PathComponent { path, .. } => self.region_of(path, depth),
+            ExprKind::PathComponent { path, .. } => work.push(Work::Eval(path, depth)),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
-            ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
+            ExprKind::BufferBytes { buffer } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(buffer, depth, None)],
+            ),
             // `bytes.as_str()` is a zero-copy `str` view of the SAME storage `bytes` viewed, so it
             // lives exactly as long as its receiver — inherit its region directly (like `StrTrim` /
             // `PathComponent`). A view of `buf.bytes()` (Frame) stays Frame; a view of an arena
             // `read_bytes_view` (Arena) stays Arena. `?` preserves it (the `Try` arm above). Without
             // this arm a `Static` classification would let a view of a dropped buffer escape (#297).
-            ExprKind::BytesAsStr { bytes } => self.region_of(bytes, depth),
+            ExprKind::BytesAsStr { bytes } => work.push(Work::Eval(bytes, depth)),
             // `r.buffered()` yields an owned `reader` over the source reader's fd, so it inherits the
             // source's region (a `c.reader().buffered()` stays conn-bound; a `fs.open(...)` reader is
             // owned/`Static`). A plain `read_line` result is a Copy `i64` (not region-tracked → the
             // explicitly `Static`), so no provenance arm is needed for it.
-            ExprKind::ReaderBuffered { reader } => self.region_of(reader, depth),
+            ExprKind::ReaderBuffered { reader } => work.push(Work::Eval(reader, depth)),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
             // frame. Without this explicit arm a `Static` classification would let the view
             // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
-            ExprKind::CliGetStr { parsed, .. } => Region::Frame.shorter(self.region_of(parsed, depth)),
+            ExprKind::CliGetStr { parsed, .. } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(parsed, depth, None)],
+            ),
             // `resp.header(name)` returns `Option<str>` and `resp.body()` a `slice<u8>`, both **views**
             // into the `http response` handle's owned buffer (freed at frame exit). Like `CliGetStr` /
             // `BufferBytes`, they are `Frame`-regioned and bound to `resp` (or shorter if `resp` is
             // arena-scoped) — an escape past `resp`'s `Drop` reads freed memory (#297). Without these
             // arms a `Static` classification is unsound; `.clone()` (header) / a copy-out copies past `resp`.
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
-                Region::Frame.shorter(self.region_of(resp, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(resp, depth, None)],
+                );
             }
             // `out.stdout()`/`out.stderr()` are `str` **views** into the `run_output` handle's owned
             // buffers (freed at frame exit), so — like the `resp.*` / `p.get_str` views — they are
             // `Frame`-regioned and bound to `out` (or shorter if `out` is arena-scoped). An escape past
             // `out`'s `Drop` reads freed memory (#297, P9). `.clone()` copies past `out`.
             ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                Region::Frame.shorter(self.region_of(out, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(out, depth, None)],
+                );
             }
             // `ctx.method()`/`path()`/`body()`/`headers()` are the read-duals: `str` / `slice<u8>` /
             // header-table **views** into the `http_request_ctx` handle's owned buffer (freed at frame
@@ -9828,14 +10265,20 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => Region::Frame.shorter(self.region_of(ctx, depth)),
+            | ExprKind::HttpCtxHeaders { ctx } => push_fold(
+                &mut work,
+                Region::Frame,
+                vec![(ctx, depth, None)],
+            ),
             // `hs.get(name)` **inherits** its receiver's region instead of re-capping at `Frame` — the
             // one line the whole `ctx.headers()` design turns on (http.md item 10 ④). Through a
             // parameter (`fn header(c: Ctx, name: str) = c.headers.get(name)`) the caller provably
             // outlives the call, so the view is `Static` there and the wrapper compiles; minted from a
             // local handle the receiver is already `Frame`-capped by the arm above, so the lookup is
             // too. This is the rule `str`/`slice` views already follow through parameters.
-            ExprKind::HttpCtxHeader { headers, .. } => self.region_of(headers, depth),
+            ExprKind::HttpCtxHeader { headers, .. } => {
+                work.push(Work::Eval(headers, depth));
+            }
             // `c.reader()` / `c.writer()` borrow the `tcp_conn`'s fd (`owns_fd: false` — only `c`'s
             // `Drop` closes it), so — like `BufferBytes` / `CliGetStr` — the returned stream is
             // region-bound to `c`: `Frame` (or shorter if `c` lives in an arena). It must not escape
@@ -9843,16 +10286,37 @@ impl<'a> EscapeCheck<'a> {
             // explicit arm a `Static` classification would let the stream outlive
             // the connection. (`c` is a bound local — the receiver gate in `check_conn_stream`.)
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => {
-                Region::Frame.shorter(self.region_of(conn, depth))
+                push_fold(
+                    &mut work,
+                    Region::Frame,
+                    vec![(conn, depth, None)],
+                );
             }
-            ExprKind::Local(p) => self.state.region.get(p).copied().unwrap_or(Region::Static),
+            ExprKind::Local(p) => values.push(
+                self.state
+                    .region
+                    .get(p)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
+            ExprKind::StructLit { fields, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                fields
+                    .iter()
+                    .map(|field| (field, depth, None))
+                    .collect(),
+            ),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { root, .. } => self.state.region.get(root).copied().unwrap_or(Region::Static),
+            ExprKind::Field { root, .. } => values.push(
+                self.state
+                    .region
+                    .get(root)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
             // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
@@ -9865,71 +10329,129 @@ impl<'a> EscapeCheck<'a> {
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
             // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
             // so inheriting is harmless — never checked.)
-            | ExprKind::SoaColumn { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
-            ExprKind::Block(b) => self.region_of_block(b, depth),
+            | ExprKind::SoaColumn { base, .. } => values.push(
+                self.state
+                    .region
+                    .get(base)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
+            ExprKind::Block(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // `unsafe {}` is a plain marker block — its value's region is the tail value's region (no
             // new region opened, unlike `arena {}`). Explicit so an arena value returned from an
             // unsafe block isn't incorrectly classified `Static` and allowed to escape.
-            ExprKind::Unsafe(b) => self.region_of_block(b, depth),
+            ExprKind::Unsafe(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
             // be inferred `Static` and could then escape undetected (a use-after-free across
             // nested arenas); the per-block walk only checks the immediate boundary, not a
             // later escape of the binding.
-            ExprKind::Arena(b) => self.region_of_block(b, depth + 1),
+            ExprKind::Arena(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth + 1));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             ExprKind::If { then, els, .. } => {
-                self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
+                push_fold(
+                    &mut work,
+                    Region::Static,
+                    [then, els]
+                        .into_iter()
+                        .filter_map(|block| {
+                            block
+                                .value
+                                .as_deref()
+                                .map(|value| (value, depth, None))
+                        })
+                        .collect(),
+                );
             }
             // A `match` yields one of its arms' values, so it lives only as long as the
             // shortest-lived arm (the same rule as `if`/`else`). Without this, an arena value
             // returned through a match arm is inferred `Static` and escapes undetected (a
             // use-after-free — `region_of` must not classify this value as `Static`).
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(&a.body, depth))),
+            ExprKind::Match { arms, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                arms
+                    .iter()
+                    .map(|arm| (&arm.body, depth, None))
+                    .collect(),
+            ),
             // An indirect call's result may borrow one of its arguments (`g := id; g(s)`) or its
             // closure environment (`f := fn { captured_view }; f()`). It therefore lives no longer
             // than either the callee or the shortest-lived argument. Without the callee fold, a
             // zero-argument closure can return an arena capture after that arena is freed.
-            ExprKind::CallFnValue { callee, args } => args.iter().fold(
-                self.region_of(callee, depth),
-                |region, arg| {
-                    region.shorter(self.region_of(arg, depth))
-                },
+            ExprKind::CallFnValue { callee, args } => push_fold(
+                &mut work,
+                Region::Static,
+                std::iter::once((callee.as_ref(), depth, None))
+                    .chain(args.iter().map(|argument| (argument, depth, None)))
+                    .collect(),
             ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
-            ExprKind::IndexField { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
+            ExprKind::IndexField { base, .. } => values.push(
+                self.state
+                    .region
+                    .get(base)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
-            ExprKind::TaskGet(inner) => self.region_of(inner, depth),
+            ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
             // A `task_group {}` opens a region for its spawned tasks (like `arena {}`), so its value
             // is evaluated one level deeper — else a binding capturing a task_group's value (a `Task`
             // handle / box) is inferred `Static` and escapes the group undetected (use-after-free).
-            ExprKind::TaskGroup(b) => self.region_of_block(b, depth + 1),
+            ExprKind::TaskGroup(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth + 1));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
             // A call's result may be a view borrowing one of its arguments (`fn id(s: str) -> str
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
             // `f(arena_str)` out of the arena slips the escape check → use-after-free of the
             // freed buffer. L2b-a1 maps only the named function's settled parameter roots.
             // Non-tracked args (ints, literals) are `Static` and don't shorten.
-            ExprKind::Call { func, args, .. } => self
-                .named_return_region
-                .get(func)
-                .map_or_else(
-                    || {
-                        args.iter().fold(Region::Static, |region, arg| {
-                            region.shorter(self.region_of(arg, depth))
-                        })
-                    },
-                    |summary| self.mapped_return_region(summary, args, depth),
-                ),
+            ExprKind::Call { func, args, .. } => {
+                let children = match self.named_return_region.get(func) {
+                    Some(hir::ReturnRegionSummary::Roots { params, .. }) => params
+                        .iter()
+                        .filter_map(|&index| args.get(index as usize))
+                        .map(|argument| (argument, depth, None))
+                        .collect(),
+                    Some(hir::ReturnRegionSummary::None) => Vec::new(),
+                    None => args
+                        .iter()
+                        .map(|argument| (argument, depth, None))
+                        .collect(),
+                };
+                push_fold(&mut work, Region::Static, children);
+            }
             // A `loop` yields one of its `break` values (scattered as `Stmt::Break` in the body, not
             // reachable from this node). Each is escape-checked directly (`check_break_escape`), which
             // requires a `break` value to be `Static` — so the loop's value is provably `Static` here.
             // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
             // this must become the shorter of the break values' regions instead.)
-            ExprKind::Loop { .. } => Region::Static,
+            ExprKind::Loop { .. } => values.push(Region::Static),
             // A closure `{fn_ptr, env_ptr}`: if it captures anything, codegen copies the captures into
             // a **frame-local** environment buffer (see align_mir lowering), so the value lives no
             // longer than the current frame — it must be `Frame`, NOT `Static`, even when every
@@ -9940,10 +10462,17 @@ impl<'a> EscapeCheck<'a> {
             // further. A **non-capturing** closure has a null env and is genuinely `Static` (returnable)
             // — the same as a bare named-fn `FnValue`, which is why a fn-payload route table of named
             // functions stays legal.
-            ExprKind::Closure { captures, .. } if captures.is_empty() => Region::Static,
-            ExprKind::Closure { captures, .. } => captures
-                .iter()
-                .fold(Region::Frame, |acc, c| acc.shorter(self.region_of(c, depth))),
+            ExprKind::Closure { captures, .. } if captures.is_empty() => {
+                values.push(Region::Static);
+            }
+            ExprKind::Closure { captures, .. } => push_fold(
+                &mut work,
+                Region::Frame,
+                captures
+                    .iter()
+                    .map(|capture| (capture, depth, None))
+                    .collect(),
+            ),
             // Producers that own their result, return a scalar, or otherwise carry no borrow
             // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
             // expression must force its escape semantics to be classified here instead of falling
@@ -10118,12 +10647,25 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
-            | ExprKind::ArrayGroupAggMulti { .. } => Region::Static,
+            | ExprKind::ArrayGroupAggMulti { .. } => values.push(Region::Static),
+                },
+                Work::Shorter(count, initial) => {
+                    let start = values
+                        .len()
+                        .checked_sub(count)
+                        .expect("region child results");
+                    let region = values
+                        .drain(start..)
+                        .fold(initial, Region::shorter);
+                    values.push(region);
+                }
+                Work::Cap(cap) => {
+                    let region = values.pop().expect("region child result");
+                    values.push(region.shorter(cap));
+                }
+            }
         }
-    }
-
-    fn region_of_block(&self, b: &Block, depth: u32) -> Region {
-        b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(Region::Static)
+        values.pop().expect("region result")
     }
 
     /// General allocation region for `e`. Task-group storage is intentionally absent: only spawned
@@ -10140,99 +10682,101 @@ impl<'a> EscapeCheck<'a> {
         e as *const Expr as usize
     }
 
-    /// The region of the **backing storage** a `chunks` source borrows — deliberately distinct from
-    /// the source's *element/value* region ([`Self::region_of`]). A fixed stack `array<T>` / AoS
-    /// `array<Struct>` bound as a `Let`-local owns a **frame slot**, scoped to the arena it was
-    /// declared in (`Frame.shorter(arena(decl_depth))`); a fixed-array *parameter* borrows the caller
-    /// (never in `decl_depth` → `Static`, so chunking a param array stays returnable). An array
-    /// literal materializes a frame temporary at the current depth. A `slice` that itself borrows a
-    /// frame-local array (`local_backed_slice`) re-borrows that frame storage. Any other source (an
-    /// owned `array<T>`/`slice` producer, a slice param, a nested value expression) borrows storage
-    /// that `region_of` already places correctly — use it as-is. `chunks` restricts a fixed-`array`
-    /// source to a literal or a bare local (`check_array_chunks`), so no nested-expression fixed
-    /// array reaches here.
-    fn chunks_source_storage_region(&self, source: &Expr, depth: u32) -> Region {
-        match &source.kind {
-            ExprKind::Local(p) if matches!(source.ty, Ty::Array(..) | Ty::StructArray(..)) => self
-                .decl_depth
-                .get(p)
-                .map_or(Region::Static, |d| Region::Frame.shorter(Region::arena(*d))),
-            ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => Region::Frame,
-            ExprKind::ArrayLit { .. } => Region::Frame.shorter(Region::arena(depth)),
-            _ => self.borrowed_storage_region(source, depth),
-        }
-    }
-
     /// Whether a slice-bearing expression contains a borrow of *function-local* storage (and so
     /// cannot be returned). An array literal / local array materializes in this frame; a slice
     /// parameter borrows the caller (safe). Wrappers preserve this provenance, as do calls (a
     /// callee can only re-borrow its arguments) and value-carrying control-flow expressions.
     fn slice_is_local(&self, e: &Expr) -> bool {
-        match &e.kind {
+        let mut work = vec![e];
+        while let Some(expression) = work.pop() {
+            match &expression.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
             // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
             // `resp.body()` is a `slice<u8>` view into the `http response` handle's frame-local buffer
             // — local-backed like `buf.bytes()`, so returning it is rejected (its region arm above also
             // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
             // local-backed check is the one that catches its escape).
-            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
-            ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
-            ExprKind::Call { func, args, .. } => self
-                .named_return_region
-                .get(func)
-                .map_or_else(
-                    || args.iter().any(|arg| self.slice_is_local(arg)),
-                    |summary| self.mapped_return_slice_is_local(summary, args),
-                ),
-            ExprKind::ArrayZip { sources, .. } => sources.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::ArrayToSlice(_)
+            | ExprKind::ArrayLit { .. }
+            | ExprKind::BufferBytes { .. }
+            | ExprKind::HttpRespBody { .. }
+            | ExprKind::HttpCtxBody { .. } => return true,
+            ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => return true,
+            ExprKind::Local(_) => {}
+            ExprKind::Call { func, args, .. } => {
+                if let Some(hir::ReturnRegionSummary::Roots { params, .. }) =
+                    self.named_return_region.get(func)
+                {
+                    work.extend(
+                        params
+                            .iter()
+                            .rev()
+                            .filter_map(|&index| args.get(index as usize)),
+                    );
+                } else if !matches!(
+                    self.named_return_region.get(func),
+                    Some(hir::ReturnRegionSummary::None)
+                ) {
+                    work.extend(args.iter().rev());
+                }
+            }
+            ExprKind::ArrayZip { sources, .. } => work.extend(sources.iter().rev()),
             ExprKind::CallFnValue { callee, args } => {
-                self.slice_is_local(callee)
-                    || args.iter().any(|arg| self.slice_is_local(arg))
+                work.extend(args.iter().rev());
+                work.push(callee);
             }
             ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner) => self.slice_is_local(inner),
+            | ExprKind::Try(inner) => work.push(inner),
             ExprKind::ResultMapErr { result, f } => {
-                self.slice_is_local(result) || self.slice_is_local(f)
+                work.push(f);
+                work.push(result);
             }
-            ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
-            ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
-            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.slice_is_local(recv),
-            ExprKind::StructLit { fields, .. } => fields.iter().any(|f| self.slice_is_local(f)),
-            ExprKind::Field { root, .. } => self.state.local_backed_slice.contains(root),
-            ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
+            ExprKind::Tuple { elems, .. } => work.extend(elems.iter().rev()),
+            ExprKind::TupleIndex { recv, .. }
+            | ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. } => work.push(recv),
+            ExprKind::StructLit { fields, .. } => work.extend(fields.iter().rev()),
+            ExprKind::Field { root, .. } if self.state.local_backed_slice.contains(root) => {
+                return true;
+            }
+            ExprKind::Field { .. } => {}
+            ExprKind::Block(b) => work.extend(b.value.as_deref()),
             ExprKind::If { then, els, .. } => {
-                then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
-                    || els.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                work.extend(els.value.as_deref());
+                work.extend(then.value.as_deref());
             }
             // A range slice `recv[a..b]` borrows the receiver's storage, so it is frame-local iff
             // the receiver is (a sub-slice of a local array is still a view of that stack array).
             // Without this, `return xs[0..2]` over a local array returns a dangling slice.
-            ExprKind::SliceRange { recv, .. } => self.slice_is_local(recv),
+            ExprKind::SliceRange { recv, .. } => work.push(recv),
             // A `match`/`else` yields one of its arms, so it is frame-local if any arm is (like the
             // `if`/`else` arm above — a local-backed slice must not escape through either).
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.slice_is_local(&a.body)),
+            ExprKind::Match { arms, .. } => {
+                work.extend(arms.iter().rev().map(|arm| &arm.body));
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.slice_is_local(opt) || self.slice_is_local(fallback)
+                work.push(fallback);
+                work.push(opt);
             }
             // An `arena` / `unsafe` / `task_group` block yields its block value, which is frame-local
             // if the inner value is (like the plain `Block` arm above). Without these a local-backed
             // slice returned through such a block escapes the function undetected (dangling slice).
             ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
-                b.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                work.extend(b.value.as_deref());
             }
             // A closure may return a captured local-backed slice. Its callable value carries those
             // captures into an indirect call or `map_err`, so preserve that provenance.
             ExprKind::Closure { captures, .. } => {
-                captures.iter().any(|capture| self.slice_is_local(capture))
+                work.extend(captures.iter().rev());
             }
             // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
             // the body, not reachable from this node. Each `break` value is escape-checked directly
             // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
             // value is provably never local-backed, and `false` here is sound. (If the `break`-escape
             // rule is ever loosened to let a frame-local view escape the loop, revisit this arm.)
-            ExprKind::Loop { .. } => false,
+            ExprKind::Loop { .. } => {}
             // These forms do not introduce or forward a function-local slice. Keep the list
             // exhaustive so a new HIR expression cannot silently default to non-local provenance.
             ExprKind::Unit
@@ -10458,54 +11002,393 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
-            | ExprKind::CryptoArgon2 { .. } => false,
+            | ExprKind::CryptoArgon2 { .. } => {}
+            }
         }
+        false
     }
 
-    fn lower_block(&mut self, b: &'a Block, depth: u32) {
-        for s in &b.stmts {
-            self.lower_stmt(s, depth);
-        }
-        if let Some(v) = &b.value {
-            self.walk(v, depth);
-        }
+    fn walk_block(&mut self, block: &'a Block, depth: u32) {
+        self.walk_items(vec![EscapeWalkItem::Block(block, depth)]);
     }
 
-    fn lower_stmt(&mut self, stmt: &'a Stmt, depth: u32) {
-        match stmt {
-            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
-                self.walk(init, depth)
-            }
-            Stmt::AssignIndex { index, value, .. }
-            | Stmt::AssignElemField { index, value, .. }
-            | Stmt::AssignElem { index, value, .. } => {
-                self.walk(index, depth);
-                self.walk(value, depth);
-            }
-            Stmt::AssignVecLane { value, .. }
-            | Stmt::Assign { value, .. }
-            | Stmt::AssignField { value, .. } => self.walk(value, depth),
-            Stmt::Return(Some(value)) | Stmt::Expr(value) => self.walk(value, depth),
-            Stmt::Return(None) => {}
-            Stmt::Break { value, .. } => {
-                if let Some(value) = value {
-                    self.walk(value, depth);
+    fn walk_items(&mut self, mut work: Vec<EscapeWalkItem<'a>>) {
+        while let Some(item) = work.pop() {
+            match item {
+                EscapeWalkItem::Expr(expression, depth) => {
+                    if let Some(region) = self.allocation_regions.last().copied() {
+                        self.allocation_region_by_expr
+                            .insert(Self::expr_key(expression), region);
+                    }
+                    match &expression.kind {
+                        ExprKind::Arena(block) => {
+                            let inner = depth + 1;
+                            self.allocation_regions.push(Region::arena(inner));
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::ArenaDone {
+                                block,
+                                inner,
+                                target: Region::arena(depth),
+                            });
+                            work.push(EscapeWalkItem::Block(block, inner));
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Block(block, depth));
+                        }
+                        ExprKind::Loop { body, .. } => {
+                            let before = self.flow_current;
+                            let head = self.flow.new_block();
+                            let exit = self.flow.new_block();
+                            self.flow.add_edge(before, head);
+                            self.flow_current = head;
+                            self.loop_exit_blocks.push(exit);
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::LoopDone { body, head, exit });
+                            work.push(EscapeWalkItem::Block(body, depth));
+                        }
+                        ExprKind::TaskGroup(block) => {
+                            let inner = depth + 1;
+                            self.task_group_regions.push(Region::arena(inner));
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::TaskGroupDone {
+                                block,
+                                inner,
+                                target: Region::arena(depth),
+                            });
+                            work.push(EscapeWalkItem::Block(block, inner));
+                        }
+                        ExprKind::Spawn { closure, .. } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Expr(closure, depth));
+                            if let Some(group) =
+                                self.task_group_regions.last().copied()
+                            {
+                                self.push_flow_op(EscapeFlowOp::SpawnCapture {
+                                    closure,
+                                    group,
+                                    depth,
+                                });
+                            }
+                        }
+                        ExprKind::Match { scrutinee, arms } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::MatchAfterScrutinee {
+                                scrutinee,
+                                arms,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(scrutinee, depth));
+                        }
+                        ExprKind::ResultMapErr { result, f } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            if let Ty::Result(_, err) = result.ty
+                                && needs_drop_flag(
+                                    scalar_to_ty(err),
+                                    self.structs,
+                                    self.tuples,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                            {
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::CallTransfer(result, depth),
+                                ));
+                            }
+                            work.push(EscapeWalkItem::Expr(f, depth));
+                            work.push(EscapeWalkItem::Expr(result, depth));
+                        }
+                        ExprKind::If { cond, then, els } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::IfAfterCond {
+                                then,
+                                els,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(cond, depth));
+                        }
+                        ExprKind::Call { func, args, .. } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let borrows_args =
+                                matches!(func.as_str(), "print" | "hash64" | "hash128");
+                            for argument in args.iter().rev() {
+                                if !borrows_args {
+                                    work.push(EscapeWalkItem::Op(
+                                        EscapeFlowOp::CallTransfer(argument, depth),
+                                    ));
+                                }
+                                work.push(EscapeWalkItem::Expr(argument, depth));
+                            }
+                        }
+                        ExprKind::CallFnValue { callee, args } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            for argument in args.iter().rev() {
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::CallTransfer(argument, depth),
+                                ));
+                                work.push(EscapeWalkItem::Expr(argument, depth));
+                            }
+                            work.push(EscapeWalkItem::Expr(callee, depth));
+                        }
+                        ExprKind::Try(result) => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::Op(
+                                EscapeFlowOp::TryErrEscape(result, depth),
+                            ));
+                            work.push(EscapeWalkItem::Expr(result, depth));
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::ElseAfterOpt {
+                                fallback,
+                                depth,
+                            });
+                            work.push(EscapeWalkItem::Expr(opt, depth));
+                        }
+                        _ => {
+                            debug_assert!(!self.collecting_walk_children);
+                            debug_assert!(self.walk_children.is_empty());
+                            self.collecting_walk_children = true;
+                            self.collect_expr_children(expression, depth);
+                            self.collecting_walk_children = false;
+                            let children = std::mem::take(&mut self.walk_children);
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.extend(
+                                children
+                                    .into_iter()
+                                    .rev()
+                                    .map(|(child, depth)| {
+                                        EscapeWalkItem::Expr(child, depth)
+                                    }),
+                            );
+                        }
+                    }
+                }
+                EscapeWalkItem::ExprExit(expression, depth) => {
+                    if needs_drop_flag(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) {
+                        self.push_flow_op(EscapeFlowOp::DropProvenance(
+                            expression,
+                            depth,
+                        ));
+                    }
+                }
+                EscapeWalkItem::Block(block, depth) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(EscapeWalkItem::Expr(value, depth));
+                    }
+                    work.extend(
+                        block
+                            .stmts
+                            .iter()
+                            .rev()
+                            .map(|statement| {
+                                EscapeWalkItem::Stmt(statement, depth)
+                            }),
+                    );
+                }
+                EscapeWalkItem::Stmt(statement, depth) => {
+                    work.push(EscapeWalkItem::StmtExit(statement, depth));
+                    match statement {
+                        Stmt::Let { init, .. }
+                        | Stmt::LetTuple { init, .. } => {
+                            work.push(EscapeWalkItem::Expr(init, depth));
+                        }
+                        Stmt::AssignIndex { index, value, .. }
+                        | Stmt::AssignElemField { index, value, .. }
+                        | Stmt::AssignElem { index, value, .. } => {
+                            work.push(EscapeWalkItem::Expr(value, depth));
+                            work.push(EscapeWalkItem::Expr(index, depth));
+                        }
+                        Stmt::AssignVecLane { value, .. }
+                        | Stmt::Assign { value, .. }
+                        | Stmt::AssignField { value, .. }
+                        | Stmt::Return(Some(value))
+                        | Stmt::Expr(value) => {
+                            work.push(EscapeWalkItem::Expr(value, depth));
+                        }
+                        Stmt::Return(None) => {}
+                        Stmt::Break { value, .. } => {
+                            if let Some(value) = value {
+                                work.push(EscapeWalkItem::Expr(value, depth));
+                            }
+                        }
+                    }
+                }
+                EscapeWalkItem::StmtExit(statement, depth) => {
+                    self.push_flow_op(EscapeFlowOp::Stmt(statement, depth));
+                    if let Stmt::Break { accepted, .. } = statement {
+                        let break_block = self.flow_current;
+                        if *accepted
+                            && let Some(exit) =
+                                self.loop_exit_blocks.last().copied()
+                        {
+                            self.flow.add_edge(break_block, exit);
+                        }
+                        // Retain unreachable syntax for diagnostics without letting it mutate the
+                        // accepted break edge's state.
+                        self.flow_current = self.flow.new_block();
+                    }
+                }
+                EscapeWalkItem::Op(op) => self.push_flow_op(op),
+                EscapeWalkItem::ArenaDone {
+                    block,
+                    inner,
+                    target,
+                } => {
+                    self.allocation_regions.pop();
+                    if let Some(value) = block.value.as_deref() {
+                        self.push_flow_op(EscapeFlowOp::ArenaExit {
+                            value,
+                            value_depth: inner,
+                            target,
+                        });
+                    }
+                }
+                EscapeWalkItem::TaskGroupDone {
+                    block,
+                    inner,
+                    target,
+                } => {
+                    self.task_group_regions.pop();
+                    if let Some(value) = block.value.as_deref() {
+                        self.push_flow_op(EscapeFlowOp::TaskGroupExit {
+                            value,
+                            value_depth: inner,
+                            target,
+                        });
+                    }
+                }
+                EscapeWalkItem::LoopDone { body, head, exit } => {
+                    self.loop_exit_blocks.pop();
+                    if !hir_block_diverges(body) {
+                        self.flow.add_edge(self.flow_current, head);
+                    }
+                    self.flow_current = exit;
+                }
+                EscapeWalkItem::IfAfterCond { then, els, depth } => {
+                    let branch = self.flow_current;
+                    let then_entry = self.flow.new_block();
+                    let else_entry = self.flow.new_block();
+                    let join = self.flow.new_block();
+                    self.flow.add_edge(branch, then_entry);
+                    self.flow.add_edge(branch, else_entry);
+                    self.flow_current = then_entry;
+                    work.push(EscapeWalkItem::IfDone {
+                        branch,
+                        join,
+                        then_diverges: hir_block_diverges(then),
+                        else_diverges: hir_block_diverges(els),
+                    });
+                    work.push(EscapeWalkItem::Block(els, depth));
+                    work.push(EscapeWalkItem::IfThenDone {
+                        then_diverges: hir_block_diverges(then),
+                        else_entry,
+                        join,
+                    });
+                    work.push(EscapeWalkItem::Block(then, depth));
+                }
+                EscapeWalkItem::IfThenDone {
+                    then_diverges,
+                    else_entry,
+                    join,
+                } => {
+                    if !then_diverges {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    self.flow_current = else_entry;
+                }
+                EscapeWalkItem::IfDone {
+                    branch,
+                    join,
+                    then_diverges,
+                    else_diverges,
+                } => {
+                    if !else_diverges {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    if then_diverges && else_diverges {
+                        self.flow.add_edge(branch, join);
+                    }
+                    self.flow_current = join;
+                }
+                EscapeWalkItem::MatchAfterScrutinee {
+                    scrutinee,
+                    arms,
+                    depth,
+                } => {
+                    let branch = self.flow_current;
+                    let join = self.flow.new_block();
+                    work.push(EscapeWalkItem::MatchDone {
+                        arms,
+                        branch,
+                        join,
+                    });
+                    work.extend(arms.iter().rev().map(|arm| {
+                        EscapeWalkItem::MatchArmStart {
+                            scrutinee,
+                            arm,
+                            branch,
+                            join,
+                            depth,
+                        }
+                    }));
+                }
+                EscapeWalkItem::MatchArmStart {
+                    scrutinee,
+                    arm,
+                    branch,
+                    join,
+                    depth,
+                } => {
+                    let entry = self.flow.new_block();
+                    self.flow.add_edge(branch, entry);
+                    self.flow_current = entry;
+                    self.push_flow_op(EscapeFlowOp::MatchBindings {
+                        scrutinee,
+                        bindings: &arm.bindings,
+                        depth,
+                    });
+                    work.push(EscapeWalkItem::MatchArmDone { arm, join });
+                    work.push(EscapeWalkItem::Expr(&arm.body, depth));
+                }
+                EscapeWalkItem::MatchArmDone { arm, join } => {
+                    if !hir_expr_diverges(&arm.body) {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                }
+                EscapeWalkItem::MatchDone {
+                    arms,
+                    branch,
+                    join,
+                } => {
+                    if !arms.iter().any(|arm| !hir_expr_diverges(&arm.body)) {
+                        self.flow.add_edge(branch, join);
+                    }
+                    self.flow_current = join;
+                }
+                EscapeWalkItem::ElseAfterOpt { fallback, depth } => {
+                    let branch = self.flow_current;
+                    let fallback_entry = self.flow.new_block();
+                    let join = self.flow.new_block();
+                    self.flow.add_edge(branch, join);
+                    self.flow.add_edge(branch, fallback_entry);
+                    self.flow_current = fallback_entry;
+                    work.push(EscapeWalkItem::ElseDone { fallback, join });
+                    work.push(EscapeWalkItem::Expr(fallback, depth));
+                }
+                EscapeWalkItem::ElseDone { fallback, join } => {
+                    if !hir_expr_diverges(fallback) {
+                        self.flow.add_edge(self.flow_current, join);
+                    }
+                    self.flow_current = join;
                 }
             }
-        }
-        self.push_flow_op(EscapeFlowOp::Stmt(stmt, depth));
-        if let Stmt::Break { accepted, .. } = stmt {
-            let break_block = self.flow_current;
-            if *accepted
-                && let Some(exit) = self.loop_exit_blocks.last().copied()
-            {
-                self.flow.add_edge(break_block, exit);
-            }
-            // Keep lowering unreachable syntax for diagnostics, but isolate it from the break edge:
-            // the CFG solver never replays this predecessor-less block, so successors observe the
-            // state exactly at an accepted `break`, never mutations written afterward.
-            let unreachable = self.flow.new_block();
-            self.flow_current = unreachable;
         }
     }
 
@@ -10806,8 +11689,7 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
-    /// recursive [`Self::walk`] frame (#296).
+    /// Collect a `file` op's sub-expressions (A4).
     #[inline(never)]
     fn walk_file_op(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
@@ -10826,8 +11708,7 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Walk an `array_builder` op's sub-exprs for the escape walk. `#[inline(never)]` so its arm
-    /// locals stay out of the recursive [`Self::walk`] frame (#296).
+    /// Collect an `array_builder` op's sub-expressions for the escape walk.
     #[inline(never)]
     fn walk_array_builder(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
@@ -10848,9 +11729,17 @@ impl<'a> EscapeCheck<'a> {
     /// Lower every checked-HIR value position into the compact escape CFG. This match is exhaustive:
     /// adding syntax requires either explicit control-flow edges or explicit operand recursion.
     fn walk(&mut self, e: &'a Expr, depth: u32) {
-        if let Some(region) = self.allocation_regions.last().copied() {
-            self.allocation_region_by_expr.insert(Self::expr_key(e), region);
+        if self.collecting_walk_children {
+            self.walk_children.push((e, depth));
+            return;
         }
+        self.walk_items(vec![EscapeWalkItem::Expr(e, depth)]);
+    }
+
+    /// Exhaustive direct-operand inventory for expression forms without escape-CFG control.
+    /// Calls to [`Self::walk`] append to `walk_children` while this method is active; the outer
+    /// explicit worklist later evaluates those children in source order.
+    fn collect_expr_children(&mut self, e: &'a Expr, depth: u32) {
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
@@ -10863,150 +11752,39 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
-            ExprKind::Arena(b) => {
-                let inner = depth + 1;
-                self.allocation_regions.push(Region::arena(inner));
-                self.lower_block(b, inner);
-                self.allocation_regions.pop();
-                if let Some(v) = &b.value {
-                    self.push_flow_op(EscapeFlowOp::ArenaExit {
-                        value: v,
-                        value_depth: inner,
-                        target: Region::arena(depth),
-                    });
-                }
+            ExprKind::Arena(_)
+            | ExprKind::Block(_)
+            | ExprKind::Loop { .. }
+            | ExprKind::Unsafe(_) => {
+                unreachable!("escape control expressions use explicit walk items");
             }
-            ExprKind::Block(b) => self.lower_block(b, depth),
-            ExprKind::Loop { body, .. } => {
-                let before = self.flow_current;
-                let head = self.flow.new_block();
-                let exit = self.flow.new_block();
-                self.flow.add_edge(before, head);
-                self.flow_current = head;
-                self.loop_exit_blocks.push(exit);
-                self.lower_block(body, depth);
-                self.loop_exit_blocks.pop();
-                if !hir_block_diverges(body) {
-                    self.flow.add_edge(self.flow_current, head);
-                }
-                // Only a semantically accepted `break` adds a predecessor to `exit`. A rejected or
-                // break-less loop leaves it unreachable, so later syntax receives no escape state.
-                self.flow_current = exit;
-            }
-            // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
-            ExprKind::Unsafe(b) => self.lower_block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
             // region value (e.g. a `Task` handle) cannot escape as the block's value.
-            ExprKind::TaskGroup(b) => {
-                let inner = depth + 1;
-                self.task_group_regions.push(Region::arena(inner));
-                self.lower_block(b, inner);
-                self.task_group_regions.pop();
-                if let Some(v) = &b.value {
-                    self.push_flow_op(EscapeFlowOp::TaskGroupExit {
-                        value: v,
-                        value_depth: inner,
-                        target: Region::arena(depth),
-                    });
-                }
-            }
-            ExprKind::Spawn { closure, .. } => {
-                if let Some(group) = self.task_group_regions.last().copied() {
-                    self.push_flow_op(EscapeFlowOp::SpawnCapture {
-                        closure,
-                        group,
-                        depth,
-                    });
-                }
-                self.walk(closure, depth);
+            ExprKind::TaskGroup(_)
+            | ExprKind::Spawn { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
                     self.walk(p, depth);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
-                self.walk(scrutinee, depth);
-                let branch = self.flow_current;
-                let join = self.flow.new_block();
-                let mut continuing = false;
-                for a in arms {
-                    let arm = self.flow.new_block();
-                    self.flow.add_edge(branch, arm);
-                    self.flow_current = arm;
-                    self.push_flow_op(EscapeFlowOp::MatchBindings {
-                        scrutinee,
-                        bindings: &a.bindings,
-                        depth,
-                    });
-                    self.walk(&a.body, depth);
-                    if !hir_expr_diverges(&a.body) {
-                        self.flow.add_edge(self.flow_current, join);
-                        continuing = true;
-                    }
-                }
-                if !continuing {
-                    self.flow.add_edge(branch, join);
-                }
-                self.flow_current = join;
-            }
-            ExprKind::ResultMapErr { result, f } => {
-                self.walk(result, depth);
-                self.walk(f, depth);
-                // `map_err` synthesizes a real call with the `Err` payload as a by-value
-                // argument. A Move error therefore obeys the same ownership-transfer rule as an
-                // explicit call. Result slots carry one cleanup-provenance bit, so a non-
-                // individual result must fail closed even when its runtime variant may be `Ok`.
-                if let Ty::Result(_, err) = result.ty
-                    && needs_drop_flag(
-                        scalar_to_ty(err),
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                {
-                    self.push_flow_op(EscapeFlowOp::CallTransfer(result, depth));
-                }
+            ExprKind::Match { .. }
+            | ExprKind::ResultMapErr { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
-            ExprKind::If { cond, then, els } => {
-                self.walk(cond, depth);
-                let branch = self.flow_current;
-                let then_entry = self.flow.new_block();
-                let else_entry = self.flow.new_block();
-                let join = self.flow.new_block();
-                self.flow.add_edge(branch, then_entry);
-                self.flow.add_edge(branch, else_entry);
-                self.flow_current = then_entry;
-                self.lower_block(then, depth);
-                if !hir_block_diverges(then) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                self.flow_current = else_entry;
-                self.lower_block(els, depth);
-                if !hir_block_diverges(els) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                if hir_block_diverges(then) && hir_block_diverges(els) {
-                    self.flow.add_edge(branch, join);
-                }
-                self.flow_current = join;
+            ExprKind::If { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.walk(expr, depth),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.walk(lhs, depth);
                 self.walk(rhs, depth);
             }
-            ExprKind::Call { func, args, .. } => {
-                let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
-                for a in args {
-                    self.walk(a, depth);
-                    if !borrows_args {
-                        self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
-                    }
-                }
+            ExprKind::Call { .. } => {
+                unreachable!("escape calls use explicit walk items");
             }
             // A fn value is a `Static` pointer (no region); an indirect call recurses its parts.
             ExprKind::FnValue(_) => {}
@@ -11018,12 +11796,8 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(c, depth);
                 }
             }
-            ExprKind::CallFnValue { callee, args } => {
-                self.walk(callee, depth);
-                for a in args {
-                    self.walk(a, depth);
-                    self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
-                }
+            ExprKind::CallFnValue { .. } => {
+                unreachable!("escape calls use explicit walk items");
             }
             ExprKind::StructLit { fields, .. } => {
                 // No per-field rejection: the struct *carries* the region of its fields
@@ -11033,9 +11807,8 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(f, depth);
                 }
             }
-            ExprKind::Try(i) => {
-                self.walk(i, depth);
-                self.push_flow_op(EscapeFlowOp::TryErrEscape(i, depth));
+            ExprKind::Try(_) => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
@@ -11147,19 +11920,8 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.walk(opt, depth);
-                let branch = self.flow_current;
-                let fallback_entry = self.flow.new_block();
-                let join = self.flow.new_block();
-                self.flow.add_edge(branch, join);
-                self.flow.add_edge(branch, fallback_entry);
-                self.flow_current = fallback_entry;
-                self.walk(fallback, depth);
-                if !hir_expr_diverges(fallback) {
-                    self.flow.add_edge(self.flow_current, join);
-                }
-                self.flow_current = join;
+            ExprKind::ElseUnwrap { .. } => {
+                unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::Template(parts) => {
                 for p in parts {
@@ -11557,15 +12319,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
-        if needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            self.push_flow_op(EscapeFlowOp::DropProvenance(e, depth));
-        }
     }
 }
 
@@ -11604,651 +12357,6 @@ impl UnnecessaryHeapScan {
         *self.other_uses.entry(l).or_insert(0) += 1;
     }
 
-    fn block(&mut self, b: &Block) {
-        for s in &b.stmts {
-            self.stmt(s);
-        }
-        if let Some(v) = &b.value {
-            self.visit(v);
-        }
-    }
-
-    fn stmt(&mut self, s: &Stmt) {
-        match s {
-            // The defining binding: `local` is a definition, not a use, so it is never recorded. A
-            // `heap.new` init makes `local` a candidate; visit the init either way (its boxed value
-            // may itself reference locals).
-            Stmt::Let { local, init } => {
-                if matches!(init.kind, ExprKind::HeapNew(_)) {
-                    self.candidates.insert(*local, init.span);
-                }
-                self.visit(init);
-            }
-            // `local = value` — a reassignment target is a use of the local (it needs a live binding);
-            // for a box that is an "other" occurrence that suppresses the lint.
-            Stmt::Assign { local, value, .. } => {
-                self.record_other(*local);
-                self.visit(value);
-            }
-            Stmt::AssignVecLane { local, value, .. } => {
-                self.record_other(*local);
-                self.visit(value);
-            }
-            // The remaining assignment targets (a struct field root / array or soa base) are never a
-            // box local — a box has no fields, no indexing — but recording them costs nothing and keeps
-            // the "every LocalId target counts as other" rule uniform.
-            Stmt::AssignField { root, value, .. } => {
-                self.record_other(*root);
-                self.visit(value);
-            }
-            Stmt::AssignIndex { base, index, value }
-            | Stmt::AssignElemField { base, index, value, .. }
-            | Stmt::AssignElem { base, index, value, .. } => {
-                self.record_other(*base);
-                self.visit(index);
-                self.visit(value);
-            }
-            // Destructure binds fresh locals (definitions, and never `box` — no producer yields a
-            // tuple of boxes); just visit the init.
-            Stmt::LetTuple { init, .. } => self.visit(init),
-            Stmt::Return(Some(e))
-            | Stmt::Break { value: Some(e), .. }
-            | Stmt::Expr(e) => self.visit(e),
-            Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
-        }
-    }
-
-    /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
-    /// recursive [`Self::visit`] frame (#296).
-    #[inline(never)]
-    fn visit_file_op(&mut self, kind: &ExprKind) {
-        match kind {
-            ExprKind::FilePread { file, buffer, offset } => {
-                self.visit(file);
-                self.visit(buffer);
-                self.visit(offset);
-            }
-            ExprKind::FilePwrite { file, data, offset } => {
-                self.visit(file);
-                self.visit(data);
-                self.visit(offset);
-            }
-            ExprKind::FileLen { file } => self.visit(file),
-            _ => unreachable!("visit_file_op on a non-file op"),
-        }
-    }
-
-    /// Visit an `array_builder` op's sub-exprs. `#[inline(never)]` so its arm locals stay out of the
-    /// recursive [`Self::visit`] frame (#296).
-    #[inline(never)]
-    fn visit_array_builder(&mut self, kind: &ExprKind) {
-        match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
-            ExprKind::ArrayBuilderPush { builder, value, .. } => {
-                self.visit(builder);
-                self.visit(value);
-            }
-            ExprKind::ArrayBuilderAppend { builder, data } => {
-                self.visit(builder);
-                self.visit(data);
-            }
-            ExprKind::ArrayBuilderBuild(i) => self.visit(i),
-            _ => unreachable!("visit_array_builder on a non-array_builder op"),
-        }
-    }
-
-    fn visit(&mut self, e: &Expr) {
-        match &e.kind {
-            // `p.get()` — the one occurrence that does *not* need a heap box. When the receiver is a
-            // bare local, record it as a get and do NOT recurse into the receiver (so the inner
-            // `Local` is not double-counted as an "other" use). Any other receiver (e.g. the inline
-            // `heap.new(x).get()`, handled by the narrow lint) recurses normally.
-            ExprKind::BoxGet(inner) => {
-                if let ExprKind::Local(l) = inner.kind {
-                    self.record_get(l);
-                } else {
-                    self.visit(inner);
-                }
-            }
-            // Any bare appearance of a local is an "other" use of it.
-            ExprKind::Local(l) => self.record_other(*l),
-            ExprKind::Tuple { elems, .. } => {
-                for el in elems {
-                    self.visit(el);
-                }
-            }
-            ExprKind::MathOp { operands, .. } => {
-                for o in operands {
-                    self.visit(o);
-                }
-            }
-            ExprKind::TupleIndex { recv, .. } => self.visit(recv),
-            ExprKind::Arena(b) | ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) | ExprKind::Loop { body: b, .. } => {
-                self.block(b);
-            }
-            ExprKind::Spawn { closure, .. } => self.visit(closure),
-            ExprKind::EnumValue { payload, .. } => {
-                for p in payload {
-                    self.visit(p);
-                }
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                self.visit(scrutinee);
-                for a in arms {
-                    self.visit(&a.body);
-                }
-            }
-            ExprKind::ResultMapErr { result, f } => {
-                self.visit(result);
-                self.visit(f);
-            }
-            ExprKind::TaskGet(inner) => self.visit(inner),
-            ExprKind::Wait => {}
-            ExprKind::If { cond, then, els } => {
-                self.visit(cond);
-                self.block(then);
-                self.block(els);
-            }
-            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.visit(expr),
-            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.visit(lhs);
-                self.visit(rhs);
-            }
-            ExprKind::Call { args, .. } => {
-                for a in args {
-                    self.visit(a);
-                }
-            }
-            ExprKind::FnValue(_) => {}
-            ExprKind::Closure { captures, .. } => {
-                for c in captures {
-                    self.visit(c);
-                }
-            }
-            ExprKind::CallFnValue { callee, args } => {
-                self.visit(callee);
-                for a in args {
-                    self.visit(a);
-                }
-            }
-            ExprKind::StructLit { fields, .. } => {
-                for f in fields {
-                    self.visit(f);
-                }
-            }
-            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
-            | ExprKind::Len(i) => self.visit(i),
-            ExprKind::ArraySum { source, stages }
-            | ExprKind::ArrayCount { source, stages }
-            | ExprKind::ArrayAnyAll { source, stages, .. }
-            | ExprKind::ArrayMinMax { source, stages, .. }
-            | ExprKind::ArrayToArray { source, stages, .. }
-            | ExprKind::ArrayPartition { source, stages, .. }
-            | ExprKind::ArrayParMap { source, stages, .. }
-            | ExprKind::ArraySort { source, stages, .. }
-            | ExprKind::ArraySortBy { source, stages, .. } => {
-                self.visit(source);
-                for capture in stage_capture_exprs(stages) {
-                    self.visit(capture);
-                }
-                for capture in node_captures(&e.kind) {
-                    self.visit(capture);
-                }
-            }
-            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
-                self.visit(recv);
-                self.visit(index);
-            }
-            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
-                self.visit(ptr);
-                self.visit(offset);
-            }
-            ExprKind::RawStore { ptr, offset, value } => {
-                self.visit(ptr);
-                self.visit(offset);
-                self.visit(value);
-            }
-            ExprKind::SliceRange { recv, start, end } => {
-                self.visit(recv);
-                if let Some(s) = start { self.visit(s); }
-                if let Some(en) = end { self.visit(en); }
-            }
-            ExprKind::BuilderWrite { builder, arg, .. } => {
-                self.visit(builder);
-                self.visit(arg);
-            }
-            ExprKind::StrPredicate { haystack, needle, .. } => {
-                self.visit(haystack);
-                self.visit(needle);
-            }
-            ExprKind::StrTrim { recv, .. } => self.visit(recv),
-            ExprKind::ArrayReduce { source, stages, init, .. }
-            | ExprKind::ArrayScan { source, stages, init, .. } => {
-                self.visit(source);
-                for capture in stage_capture_exprs(stages) {
-                    self.visit(capture);
-                }
-                self.visit(init);
-                for capture in node_captures(&e.kind) {
-                    self.visit(capture);
-                }
-            }
-            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
-                self.visit(source);
-                for capture in stage_capture_exprs(stages) {
-                    self.visit(capture);
-                }
-                self.visit(dst);
-            }
-            ExprKind::ArrayDot { a, b, .. } => {
-                self.visit(a);
-                self.visit(b);
-            }
-            ExprKind::ArrayChunks { source, n, .. } => {
-                self.visit(source);
-                self.visit(n);
-            }
-            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
-                for el in elems {
-                    self.visit(el);
-                }
-            }
-            ExprKind::ArrayZip { sources, .. } => {
-                for source in sources {
-                    self.visit(source);
-                }
-            }
-            ExprKind::Select { mask, a, b } => {
-                self.visit(mask);
-                self.visit(a);
-                self.visit(b);
-            }
-            ExprKind::VecSumWhere { vec, mask } => {
-                self.visit(vec);
-                self.visit(mask);
-            }
-            ExprKind::VecDot { a, b } => {
-                self.visit(a);
-                self.visit(b);
-            }
-            ExprKind::VecMinMax { vec, .. } => self.visit(vec),
-            ExprKind::VecSum { vec } => self.visit(vec),
-            ExprKind::VecLoad { src, index, .. } => {
-                self.visit(src);
-                self.visit(index);
-            }
-            ExprKind::VecStore { dst, index, value, .. } => {
-                self.visit(dst);
-                self.visit(index);
-                self.visit(value);
-            }
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.visit(opt);
-                self.visit(fallback);
-            }
-            ExprKind::Template(parts) => {
-                for p in parts {
-                    match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
-                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
-                    }
-                }
-            }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
-            ExprKind::JsonDoc { input } => self.visit(input),
-            ExprKind::JsonScan { input, .. } => self.visit(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.visit(doc),
-            ExprKind::JsonDocGet { doc, key } => {
-                self.visit(doc);
-                self.visit(key);
-            }
-            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
-                self.visit(doc);
-                self.visit(index);
-            }
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
-            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.visit(path),
-            ExprKind::DnsResolve { host } => self.visit(host),
-            ExprKind::TcpConnect { host, port } => {
-                self.visit(host);
-                self.visit(port);
-            }
-            ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.visit(conn),
-            ExprKind::TcpListen { host, port } => {
-                self.visit(host);
-                self.visit(port);
-            }
-            ExprKind::TcpAccept { listener } => self.visit(listener),
-            ExprKind::UdpBind { host, port } => {
-                self.visit(host);
-                self.visit(port);
-            }
-            ExprKind::UdpSendTo { sock, data, host, port } => {
-                self.visit(sock);
-                self.visit(data);
-                self.visit(host);
-                self.visit(port);
-            }
-            ExprKind::UdpRecvFrom { sock, buffer } => {
-                self.visit(sock);
-                self.visit(buffer);
-            }
-            ExprKind::FsWriteFile { path, data, .. } => {
-                self.visit(path);
-                self.visit(data);
-            }
-            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.visit(path),
-            ExprKind::PathJoin { a, b } => {
-                self.visit(a);
-                self.visit(b);
-            }
-            ExprKind::EnvGet { name } => self.visit(name),
-            ExprKind::EnvSet { name, value } => {
-                self.visit(name);
-                self.visit(value);
-            }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
-            ExprKind::TimeSleep { ns } => self.visit(ns),
-            ExprKind::ProcessExit { code } => self.visit(code),
-            ExprKind::ProcessAbort => {}
-            ExprKind::ProcessSpawn { cmd, args } => {
-                self.visit(cmd);
-                self.visit(args);
-            }
-            ExprKind::ChildWait { child } => self.visit(child),
-            ExprKind::ChildKill { child, sig } => {
-                self.visit(child);
-                self.visit(sig);
-            }
-            ExprKind::ProcessExec { cmd, args } => {
-                self.visit(cmd);
-                self.visit(args);
-            }
-            // `std.process` Slice 4 — recurse into the operands (the handles own their result / are
-            // borrowed; a `run_output` view's escape is governed by `region_of`).
-            ExprKind::ProcessCommand { cmd, args } => {
-                self.visit(cmd);
-                self.visit(args);
-            }
-            ExprKind::CommandCwd { command, dir } => {
-                self.visit(command);
-                self.visit(dir);
-            }
-            ExprKind::CommandTimeout { command, ns } => {
-                self.visit(command);
-                self.visit(ns);
-            }
-            // `c.read_timeout_ns` / `c.write_timeout_ns` — recurse into the operands (the conn is
-            // borrowed in place, the ns is Copy; no escape), like `CommandTimeout`.
-            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
-                self.visit(conn);
-                self.visit(ns);
-            }
-            ExprKind::CommandEnv { command, name, value } => {
-                self.visit(command);
-                self.visit(name);
-                self.visit(value);
-            }
-            ExprKind::CommandEnvClear { command } => self.visit(command),
-            ExprKind::CommandRun { command } => self.visit(command),
-            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
-                self.visit(out)
-            }
-            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
-            ExprKind::EncodingDecode { input, .. } => self.visit(input),
-            // `std.compress` — recurse into the subexpressions (no heap-narrowing pattern of its own).
-            ExprKind::Compress { data, level, .. } => {
-                self.visit(data);
-                self.visit(level);
-            }
-            ExprKind::Decompress { data, .. } => self.visit(data),
-            // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
-            ExprKind::RandSeed => {}
-            ExprKind::RandSeedWith { seed } => self.visit(seed),
-            ExprKind::RandNext { rng } => self.visit(rng),
-            ExprKind::RandRange { rng, lo, hi } => {
-                self.visit(rng);
-                self.visit(lo);
-                self.visit(hi);
-            }
-            ExprKind::RandShuffle { rng, xs, .. } => {
-                self.visit(rng);
-                self.visit(xs);
-            }
-            ExprKind::RandSample { rng, xs, k, .. } => {
-                self.visit(rng);
-                self.visit(xs);
-                self.visit(k);
-            }
-            ExprKind::RegexCompile { pattern } => self.visit(pattern),
-            ExprKind::RegexIsMatch { regex, text }
-            | ExprKind::RegexFindAll { regex, text }
-            | ExprKind::RegexSplit { regex, text } => {
-                self.visit(regex);
-                self.visit(text);
-            }
-            ExprKind::RegexFind { regex, text, start } => {
-                self.visit(regex);
-                self.visit(text);
-                if let Some(s) = start {
-                    self.visit(s);
-                }
-            }
-            ExprKind::RegexReplace { regex, text, repl, .. } => {
-                self.visit(regex);
-                self.visit(text);
-                self.visit(repl);
-            }
-            ExprKind::RegexCaptures { regex, text } | ExprKind::RegexGroupIndex { regex, name: text } => {
-                self.visit(regex);
-                self.visit(text);
-            }
-            ExprKind::RegexGroupCount { regex } => self.visit(regex),
-            ExprKind::CapturesGroup { caps, index } => {
-                self.visit(caps);
-                self.visit(index);
-            }
-            // `std.cli` — no heap-narrowing pattern of its own; recurse into the operands.
-            ExprKind::CliCommand { name } => self.visit(name),
-            ExprKind::CliFlag { cmd, name, default, .. } => {
-                self.visit(cmd);
-                self.visit(name);
-                if let Some(d) = default {
-                    self.visit(d);
-                }
-            }
-            ExprKind::CliParse { cmd, args } => {
-                self.visit(cmd);
-                self.visit(args);
-            }
-            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
-                self.visit(parsed);
-                self.visit(name);
-            }
-            ExprKind::CliUsage { cmd } => self.visit(cmd),
-            // `std.http` — no heap-narrowing pattern of its own; recurse into the operands.
-            ExprKind::HttpRequest { method, url } => {
-                self.visit(method);
-                self.visit(url);
-            }
-            ExprKind::HttpHeader { req, name, value } => {
-                self.visit(req);
-                self.visit(name);
-                self.visit(value);
-            }
-            ExprKind::HttpBody { req, data } => {
-                self.visit(req);
-                self.visit(data);
-            }
-            ExprKind::HttpRequestTimeout { req, ns } => {
-                self.visit(req);
-                self.visit(ns);
-            }
-            ExprKind::HttpClientTimeout { client, ns } => {
-                self.visit(client);
-                self.visit(ns);
-            }
-            ExprKind::HttpParse { data } => self.visit(data),
-            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.visit(resp),
-            ExprKind::HttpRespHeader { resp, name } => {
-                self.visit(resp);
-                self.visit(name);
-            }
-            ExprKind::HttpClient => {}
-            ExprKind::HttpClientGet { client, url } => {
-                self.visit(client);
-                self.visit(url);
-            }
-            ExprKind::HttpClientPost { client, url, body } => {
-                self.visit(client);
-                self.visit(url);
-                self.visit(body);
-            }
-            ExprKind::HttpClientRequest { client, req } => {
-                self.visit(client);
-                self.visit(req);
-            }
-            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
-                self.visit(client);
-                self.visit(urls);
-                self.visit(max_concurrency);
-            }
-            // `std.http` (Slice 4) — no heap-narrowing pattern of its own; recurse into the operands.
-            ExprKind::HttpServe { host, port, .. } => {
-                self.visit(host);
-                self.visit(port);
-            }
-            ExprKind::HttpAccept { server } => self.visit(server),
-            ExprKind::HttpRespond { ctx, rb } => {
-                self.visit(ctx);
-                self.visit(rb);
-            }
-            ExprKind::HttpRespondStream { ctx, rb } => {
-                self.visit(ctx);
-                self.visit(rb);
-            }
-            ExprKind::HttpStreamSend { stream, chunk, .. } => {
-                self.visit(stream);
-                self.visit(chunk);
-            }
-            ExprKind::HttpStreamFinish { stream } => self.visit(stream),
-            ExprKind::HttpStreamReject { stream, rb } => {
-                self.visit(stream);
-                self.visit(rb);
-            }
-            ExprKind::HttpResponseBuilder { status } => self.visit(status),
-            ExprKind::HttpRbHeader { rb, name, value } => {
-                self.visit(rb);
-                self.visit(name);
-                self.visit(value);
-            }
-            ExprKind::HttpRbBody { rb, data } => {
-                self.visit(rb);
-                self.visit(data);
-            }
-            ExprKind::HttpCtxMethod { ctx }
-            | ExprKind::HttpCtxPath { ctx }
-            | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.visit(ctx),
-            ExprKind::HttpCtxHeader { headers, name } => {
-                self.visit(headers);
-                self.visit(name);
-            }
-            // `std.crypto` — recurse into the subexpressions (no heap-narrowing pattern of its own).
-            ExprKind::CryptoCtEqual { a, b } => {
-                self.visit(a);
-                self.visit(b);
-            }
-            ExprKind::CryptoRandom { out } => self.visit(out),
-            ExprKind::CryptoHash { data, .. } => self.visit(data),
-            ExprKind::CryptoHmac { key, data } => {
-                self.visit(key);
-                self.visit(data);
-            }
-            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
-                self.visit(salt);
-                self.visit(ikm);
-                self.visit(info);
-                self.visit(len);
-            }
-            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
-                self.visit(key);
-                self.visit(nonce);
-                self.visit(input);
-                self.visit(aad);
-            }
-            ExprKind::CryptoArgon2 { password, salt, params } => {
-                self.visit(password);
-                self.visit(salt);
-                self.visit(params);
-            }
-            ExprKind::WriterWrite { writer, arg, .. } => {
-                self.visit(writer);
-                self.visit(arg);
-            }
-            ExprKind::WriterFlush { writer } => self.visit(writer),
-            ExprKind::ReaderRead { reader, buffer } => {
-                self.visit(reader);
-                self.visit(buffer);
-            }
-            ExprKind::ReaderReadLine { reader, buffer } => {
-                self.visit(reader);
-                self.visit(buffer);
-            }
-            ExprKind::ReaderBuffered { reader } => self.visit(reader),
-            ExprKind::BytesAsStr { bytes } => self.visit(bytes),
-            ExprKind::IoCopy { reader, writer } => {
-                self.visit(reader);
-                self.visit(writer);
-            }
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.visit_file_op(&e.kind),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.visit(buffer),
-            ExprKind::BytesRead { bytes, offset, .. } => {
-                self.visit(bytes);
-                self.visit(offset);
-            }
-            ExprKind::BufferPut { buffer, value, .. } => {
-                self.visit(buffer);
-                self.visit(value);
-            }
-            ExprKind::BufferAppend { buffer, data } => {
-                self.visit(buffer);
-                self.visit(data);
-            }
-            ExprKind::BufferNew { capacity } => self.visit(capacity),
-            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.visit_array_builder(k),
-            ExprKind::BuilderNew { capacity } => {
-                if let Some(c) = capacity {
-                    self.visit(c);
-                }
-            }
-            // Leaves and nodes whose only local references (a `Field`/`SoaColumn`/`IndexField` /
-            // group-agg base) are never a box local — a box has no fields, columns, or indexing.
-            // A `ConstArray`'s elements are folded literals, never a box local.
-            ExprKind::Unit
-            | ExprKind::Int(_)
-            | ExprKind::Float(_)
-            | ExprKind::Char(_)
-            | ExprKind::Str(_)
-            | ExprKind::ConstArray { .. }
-            | ExprKind::Bool(_)
-            | ExprKind::OptionNone
-            | ExprKind::WriterStd { .. }
-            | ExprKind::ReaderStdin
-            | ExprKind::Field { .. }
-            | ExprKind::SoaColumn { .. }
-            | ExprKind::ArrayGroupAgg { .. }
-            | ExprKind::ArrayGroupAggMulti { .. }
-            | ExprKind::ArrayDictEncode { .. }
-            | ExprKind::IndexField { .. } => {}
-        }
-    }
 
     /// Run the scan over a function body and emit one warning per unnecessary box local.
     fn run(body: &Block, diags: &mut Diagnostics) {
@@ -12257,7 +12365,49 @@ impl UnnecessaryHeapScan {
             get_uses: std::collections::HashMap::new(),
             other_uses: std::collections::HashMap::new(),
         };
-        scan.block(body);
+        // One source-ordered worklist replaces the former recursive block/statement/expression
+        // visitor. A direct `.get()` receiver is the only expression occurrence that does not need
+        // the box itself, so suppress exactly that child `Local` event.
+        let mut direct_get_receivers = HashSet::new();
+        for event in hir_depth::body_events(body) {
+            match event {
+                hir_depth::BodyEvent::StmtEnter(stmt) => match stmt {
+                    Stmt::Let { local, init } => {
+                        if matches!(init.kind, ExprKind::HeapNew(_)) {
+                            scan.candidates.insert(*local, init.span);
+                        }
+                    }
+                    Stmt::Assign { local, .. } | Stmt::AssignVecLane { local, .. } => {
+                        scan.record_other(*local);
+                    }
+                    Stmt::AssignField { root, .. } => scan.record_other(*root),
+                    Stmt::AssignIndex { base, .. }
+                    | Stmt::AssignElemField { base, .. }
+                    | Stmt::AssignElem { base, .. } => scan.record_other(*base),
+                    Stmt::LetTuple { .. }
+                    | Stmt::Return(_)
+                    | Stmt::Break { .. }
+                    | Stmt::Expr(_) => {}
+                },
+                hir_depth::BodyEvent::ExprEnter(expr) => match &expr.kind {
+                    ExprKind::BoxGet(inner) => {
+                        if let ExprKind::Local(local) = inner.kind {
+                            scan.record_get(local);
+                            direct_get_receivers.insert(inner.as_ref() as *const Expr);
+                        }
+                    }
+                    ExprKind::Local(local)
+                        if !direct_get_receivers.remove(&(expr as *const Expr)) =>
+                    {
+                        scan.record_other(*local);
+                    }
+                    _ => {}
+                },
+                hir_depth::BodyEvent::StmtExit(_)
+                | hir_depth::BodyEvent::ExprExit { .. }
+                | hir_depth::BodyEvent::MatchArmEnter { .. } => {}
+            }
+        }
         // Emit in a deterministic order (by span start) so diagnostics are stable.
         let mut fire: Vec<Span> = scan
             .candidates
@@ -12278,57 +12428,159 @@ impl UnnecessaryHeapScan {
     }
 }
 
-/// Whether a single HIR statement always diverges (control never proceeds to the next statement).
-/// A `return` always diverges; a `let`/assignment/expression statement diverges iff the value it
-/// evaluates does.
-fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
-    match s {
-        // `return` leaves the function; `break` leaves the loop — either way control never falls
-        // through to the next statement in this block.
-        hir::Stmt::Return(_) | hir::Stmt::Break { .. } => true,
-        hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
-        hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::AssignIndex { index, value, .. }
-        | hir::Stmt::AssignElemField { index, value, .. }
-        | hir::Stmt::AssignElem { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
-        hir::Stmt::AssignVecLane { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::Expr(e) => hir_expr_diverges(e),
-    }
-}
-
 /// Whether a HIR block **always diverges** (never falls through to its end) — used by `MoveCheck`
 /// to drop a diverging branch's moves at an `if` join (they happen on a path that never reaches
 /// past the `if`). Conservative: only `true` when divergence is certain (any statement that always
 /// diverges — including an intermediate one, after which the rest is dead — or a tail `if`/block
 /// that itself diverges); anything else is `false`, falling back to the safe union.
+fn hir_stmt_diverges(statement: &hir::Stmt) -> bool {
+    hir_diverges(HirDivergenceNode::Stmt(statement))
+}
+
 fn hir_block_diverges(b: &hir::Block) -> bool {
-    if b.stmts.iter().any(hir_stmt_diverges) {
-        return true;
-    }
-    if let Some(v) = &b.value {
-        return hir_expr_diverges(v);
-    }
-    false
+    hir_diverges(HirDivergenceNode::Block(b))
 }
 
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
 /// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
 /// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
 fn hir_expr_diverges(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
-        ExprKind::Block(b)
-        | ExprKind::Arena(b)
-        | ExprKind::TaskGroup(b)
-        | ExprKind::Unsafe(b) => hir_block_diverges(b),
-        ExprKind::Match { arms, .. } => {
-            !arms.is_empty() && arms.iter().all(|arm| hir_expr_diverges(&arm.body))
+    hir_diverges(HirDivergenceNode::Expr(e))
+}
+
+#[derive(Clone, Copy)]
+enum HirDivergenceNode<'a> {
+    Expr(&'a Expr),
+    Block(&'a Block),
+    Stmt(&'a Stmt),
+}
+
+#[derive(Clone, Copy)]
+enum HirDivergenceWork<'a> {
+    Eval(HirDivergenceNode<'a>),
+    Value(bool),
+    Any(usize),
+    All(usize),
+}
+
+/// Evaluate the conservative HIR divergence predicate without using the process stack.
+fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
+    let mut work = vec![HirDivergenceWork::Eval(root)];
+    let mut values = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            HirDivergenceWork::Value(value) => values.push(value),
+            HirDivergenceWork::Any(count) | HirDivergenceWork::All(count) => {
+                let start = values.len() - count;
+                let value = match item {
+                    HirDivergenceWork::Any(_) => values[start..].iter().any(|value| *value),
+                    HirDivergenceWork::All(_) => values[start..].iter().all(|value| *value),
+                    _ => unreachable!(),
+                };
+                values.truncate(start);
+                values.push(value);
+            }
+            HirDivergenceWork::Eval(HirDivergenceNode::Block(block)) => {
+                let count = block.stmts.len() + usize::from(block.value.is_some());
+                work.push(HirDivergenceWork::Any(count));
+                if let Some(value) = block.value.as_deref() {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                }
+                for statement in block.stmts.iter().rev() {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Stmt(statement)));
+                }
+            }
+            HirDivergenceWork::Eval(HirDivergenceNode::Stmt(statement)) => match statement {
+                // `return` leaves the function; `break` leaves the loop — either way control never
+                // falls through to the next statement in this block.
+                Stmt::Return(_) | Stmt::Break { .. } => {
+                    work.push(HirDivergenceWork::Value(true));
+                }
+                Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(init)));
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::AssignField { value, .. }
+                | Stmt::AssignVecLane { value, .. } => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                }
+                Stmt::AssignIndex { index, value, .. }
+                | Stmt::AssignElemField { index, value, .. }
+                | Stmt::AssignElem { index, value, .. } => {
+                    work.push(HirDivergenceWork::Any(2));
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(index)));
+                }
+                Stmt::Expr(expression) => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)));
+                }
+            },
+            HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)) => {
+                match &expression.kind {
+                    ExprKind::If { cond, then, els } => {
+                        // The condition is strict. If it diverges the branches are unreachable;
+                        // otherwise the `if` diverges only when both alternatives do.
+                        work.push(HirDivergenceWork::Any(2));
+                        work.push(HirDivergenceWork::All(2));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(els)));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(then)));
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(cond)));
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block) => {
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(block)));
+                    }
+                    ExprKind::Match { scrutinee, arms } if !arms.is_empty() => {
+                        // The scrutinee is strict; arm bodies are alternatives.
+                        work.push(HirDivergenceWork::Any(2));
+                        work.push(HirDivergenceWork::All(arms.len()));
+                        for arm in arms.iter().rev() {
+                            work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(&arm.body)));
+                        }
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(scrutinee)));
+                    }
+                    // A loop with no `break` never yields and control never reaches past it.
+                    ExprKind::Loop { diverges, .. } => {
+                        work.push(HirDivergenceWork::Value(*diverges));
+                    }
+                    // Both operations terminate the process after their operands (if any) have
+                    // been evaluated. They are Unit-typed only because Align has no Never type.
+                    ExprKind::ProcessExit { .. } | ExprKind::ProcessAbort => {
+                        work.push(HirDivergenceWork::Value(true));
+                    }
+                    // Only the left/receiver operand is guaranteed to run. The right/fallback
+                    // expression is conditional and cannot make the whole expression always
+                    // diverge.
+                    ExprKind::Binary {
+                        op: align_ast::BinOp::And | align_ast::BinOp::Or,
+                        lhs,
+                        ..
+                    } => work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(lhs))),
+                    ExprKind::ElseUnwrap { opt, .. } => {
+                        work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(opt)));
+                    }
+                    // Every remaining direct HIR child is evaluated strictly in producer order.
+                    // Propagating `Any` is what makes a wrapper such as `id(loop {})`, a template
+                    // hole, or a pipeline capture diverge before its parent's later siblings.
+                    _ => {
+                        let children = hir_depth::direct_expr_children(expression);
+                        if children.is_empty() {
+                            work.push(HirDivergenceWork::Value(false));
+                        } else {
+                            work.push(HirDivergenceWork::Any(children.len()));
+                            for child in children.into_iter().rev() {
+                                work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(child)));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        // A `loop` with no `break` never yields and control never reaches past it (it either loops
-        // forever or exits the function via `return`/`?`). A loop *with* a `break` may fall through.
-        ExprKind::Loop { diverges, .. } => *diverges,
-        _ => false,
     }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().unwrap_or(false)
 }
 
 /// Flow analysis that flags use-after-move. A Move-typed value (M3: `box<T>`) is
@@ -12407,6 +12659,14 @@ struct MoveCheck<'a> {
     /// Expressions proven not to reach their result edge during this exact source-order walk.
     /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
     non_fallthrough: std::collections::HashSet<Span>,
+    /// Per-query postorder facts. While populated, nested provenance lookups read an already
+    /// completed child instead of recursing through the native stack.
+    borrow_fact_cache:
+        std::cell::RefCell<Option<std::collections::HashMap<usize, BorrowFact>>>,
+    /// Direct child requests captured from the exhaustive expression match while an eager node is
+    /// being lowered onto the explicit Move worklist.
+    collecting_move_children: bool,
+    move_children: Vec<(&'a Expr, bool, bool)>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -12632,6 +12892,22 @@ struct BorrowState {
     invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
     value_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_value_sources: std::collections::HashMap<usize, EndedRoots>,
+}
+
+#[derive(Clone)]
+struct MoveMatchPrepared {
+    incoming_borrows: BorrowState,
+    evaluated: MovedSet,
+    evaluated_borrows: BorrowState,
+    consumed: Option<MovedSet>,
+    consumed_borrows: Option<BorrowState>,
+    scrutinee_roots: BorrowRoots,
+}
+
+#[derive(Default)]
+struct MoveMatchJoin {
+    moved: Option<MovedSet>,
+    borrows: Option<BorrowState>,
 }
 
 impl BorrowState {
@@ -12947,81 +13223,14 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn borrow_leaf_paths_inner(
-        &self,
-        ty: Ty,
-        visiting: &mut Vec<Ty>,
-    ) -> Vec<Vec<BorrowProjection>> {
-        if !ty_may_borrow(
-            ty,
+    fn borrow_leaf_paths(&self, root: Ty) -> Vec<Vec<BorrowProjection>> {
+        borrow_leaf_paths_for_type(
+            root,
             self.structs,
             self.tuples,
             self.enums,
             self.tagged_types,
-        ) {
-            return Vec::new();
-        }
-        let ty = expand_tagged_ty(ty, self.tagged_types);
-        if visiting.contains(&ty) {
-            return vec![Vec::new()];
-        }
-        visiting.push(ty);
-        let mut paths = Vec::new();
-        let mut append = |projection: BorrowProjection, child: Ty| {
-            let children = self.borrow_leaf_paths_inner(child, visiting);
-            for mut path in children {
-                path.insert(0, projection);
-                paths.push(path);
-            }
-        };
-        match ty {
-            Ty::Struct(id) => {
-                if let Some(def) = self.structs.get(id as usize) {
-                    for (index, field) in def.fields.iter().enumerate() {
-                        append(BorrowProjection::StructField(index as u32), field.ty);
-                    }
-                }
-            }
-            Ty::Tuple(id) => {
-                if let Some(def) = self.tuples.get(id as usize) {
-                    for (index, element) in def.elems.iter().enumerate() {
-                        append(
-                            BorrowProjection::TupleElement(index as u32),
-                            scalar_to_ty(*element),
-                        );
-                    }
-                }
-            }
-            Ty::Enum(id) => {
-                if let Some(def) = self.enums.get(id as usize) {
-                    for (variant_index, variant) in def.variants.iter().enumerate() {
-                        for (payload_index, payload) in variant.payload.iter().enumerate() {
-                            append(
-                                BorrowProjection::EnumPayload {
-                                    variant: variant_index as u32,
-                                    index: payload_index as u32,
-                                },
-                                scalar_to_ty(*payload),
-                            );
-                        }
-                    }
-                }
-            }
-            Ty::Option(payload) => {
-                append(BorrowProjection::OptionSome, scalar_to_ty(payload));
-            }
-            Ty::Result(ok, err) => {
-                append(BorrowProjection::ResultOk, scalar_to_ty(ok));
-                append(BorrowProjection::ResultErr, scalar_to_ty(err));
-            }
-            _ => paths.push(Vec::new()),
-        }
-        visiting.pop();
-        if paths.is_empty() {
-            vec![Vec::new()]
-        } else {
-            paths
-        }
+        )
     }
 
     fn normalize_borrow_fact(&self, ty: Ty, fact: BorrowFact) -> BorrowFact {
@@ -13042,8 +13251,7 @@ impl<'a> MoveCheck<'a> {
                 out.direct.extend(roots);
                 continue;
             };
-            let suffixes =
-                self.borrow_leaf_paths_inner(selected_ty, &mut Vec::new());
+            let suffixes = self.borrow_leaf_paths(selected_ty);
             for suffix in suffixes {
                 let mut destination = path.clone();
                 destination.extend(suffix);
@@ -13172,6 +13380,37 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn borrow_fact(&self, e: &Expr) -> BorrowFact {
+        if let Some(fact) = self
+            .borrow_fact_cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&Self::expr_key(e)))
+            .cloned()
+        {
+            return fact;
+        }
+        if self.borrow_fact_cache.borrow().is_some() {
+            panic!("borrow fact dependency was not completed before its parent");
+        }
+
+        *self.borrow_fact_cache.borrow_mut() =
+            Some(std::collections::HashMap::new());
+        for expression in hir_depth::expr_postorder(e) {
+            let fact = self.borrow_fact_one(expression);
+            self.borrow_fact_cache
+                .borrow_mut()
+                .as_mut()
+                .expect("active borrow fact cache")
+                .insert(Self::expr_key(expression), fact);
+        }
+        self.borrow_fact_cache
+            .borrow_mut()
+            .take()
+            .and_then(|mut cache| cache.remove(&Self::expr_key(e)))
+            .expect("borrow fact root result")
+    }
+
+    fn borrow_fact_one(&self, e: &Expr) -> BorrowFact {
         let mut fact = BorrowFact::default();
         if self.non_fallthrough.contains(&e.span) {
             return fact;
@@ -14151,7 +14390,7 @@ impl<'a> MoveCheck<'a> {
     #[inline(never)]
     fn loop_moves(
         &mut self,
-        body: &Block,
+        body: &'a Block,
         body_locals: &std::ops::Range<LocalId>,
         span: Span,
         moved: &mut MovedSet,
@@ -14279,7 +14518,7 @@ impl<'a> MoveCheck<'a> {
     /// local through an `if`/`else` arm is rejected here (deferred — bind it to a local first).
     fn block(
         &mut self,
-        b: &Block,
+        b: &'a Block,
         moved: &mut MovedSet,
         tail_consuming: bool,
         tail_direct: bool,
@@ -14482,7 +14721,7 @@ impl<'a> MoveCheck<'a> {
     /// Move-check a `file` op's sub-exprs (A4) — all borrowed (the file is never consumed).
     /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
     #[inline(never)]
-    fn move_file_op(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
+    fn move_file_op(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::FilePread { file, buffer, offset } => {
                 move_expr!(self, file, moved, false, false);
@@ -14506,7 +14745,7 @@ impl<'a> MoveCheck<'a> {
     /// recursive [`Self::expr`] frame (#296). The builder is borrowed by push/append (grown in place);
     /// push's value is consumed (a `string` moves in); build consumes the builder.
     #[inline(never)]
-    fn move_array_builder(&mut self, kind: &ExprKind, moved: &mut MovedSet) -> bool {
+    fn move_array_builder(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
             ExprKind::ArrayBuilderNew { .. } => {}
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
@@ -14533,61 +14772,127 @@ impl<'a> MoveCheck<'a> {
     /// result sources during their own single evaluation when they fill a Move-typed join slot, so
     /// this helper deliberately does not re-enter them.
     fn consume_match_result(&mut self, e: &Expr, moved: &mut MovedSet, direct: bool) {
-        match &e.kind {
-            ExprKind::Local(id) if self.is_move(*id) => {
-                if !direct {
-                    let name = &self.f.locals[*id as usize].name;
-                    self.diags.error(
-                        format!(
-                            "cannot move owned value '{name}' out through a conditional \
-                             expression yet; bind the `if`/`else` result to a local first"
-                        ),
-                        e.span,
-                    );
+        let mut expression = e;
+        loop {
+            match &expression.kind {
+                ExprKind::Local(id) if self.is_move(*id) => {
+                    if !direct {
+                        let name = &self.f.locals[*id as usize].name;
+                        self.diags.error(
+                            format!(
+                                "cannot move owned value '{name}' out through a conditional \
+                                 expression yet; bind the `if`/`else` result to a local first"
+                            ),
+                            expression.span,
+                        );
+                    }
+                    self.invalidate_owner(*id);
+                    moved.insert(MovedKey::Whole(*id));
+                    return;
                 }
-                self.invalidate_owner(*id);
-                moved.insert(MovedKey::Whole(*id));
-            }
-            ExprKind::Field { root, path } if path.len() == 1 => {
-                let field = path[0];
-                if e.ty == Ty::String
-                    || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                        && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
-                            .needs_drop())
-                    || is_move_handle(e.ty)
-                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types))
-                {
-                    self.invalidate_owner(*root);
-                    moved.insert(MovedKey::Field(*root, field));
-                } else if self.is_move_ty(e.ty) {
-                    self.diags.error(
-                        "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
-                        e.span,
-                    );
+                ExprKind::Field { root, path } if path.len() == 1 => {
+                    let field = path[0];
+                    if expression.ty == Ty::String
+                        || (matches!(
+                            expression.ty,
+                            Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
+                        ) && drop_plan(
+                            expression.ty,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        .needs_drop())
+                        || is_move_handle(expression.ty)
+                        || matches!(
+                            expression.ty,
+                            Ty::Enum(id)
+                                if enum_is_move(
+                                    id,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                        )
+                    {
+                        self.invalidate_owner(*root);
+                        moved.insert(MovedKey::Field(*root, field));
+                    } else if self.is_move_ty(expression.ty) {
+                        self.diags.error(
+                            "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                            expression.span,
+                        );
+                    }
+                    return;
                 }
-            }
-            ExprKind::Block(block)
-            | ExprKind::Arena(block)
-            | ExprKind::TaskGroup(block)
-            | ExprKind::Unsafe(block) => {
-                if let Some(value) = &block.value {
-                    self.consume_match_result(value, moved, direct);
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block) => {
+                    let Some(value) = block.value.as_deref() else {
+                        return;
+                    };
+                    expression = value;
                 }
+                // Constructors consume their payloads during ordinary evaluation; loop `break`
+                // values and Move-typed control results transfer theirs while filling their join
+                // slot. Fresh results and Copy places own no source slot for the outer match.
+                _ => return,
             }
-            // Constructors consume their payloads during ordinary evaluation; loop `break` values
-            // and Move-typed control results transfer theirs while filling their join slot. Fresh
-            // results and Copy places own no source slot for the outer match to clear.
-            _ => {}
         }
     }
 
     fn expr(
         &mut self,
-        e: &Expr,
+        e: &'a Expr,
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
     ) -> bool {
+        if self.collecting_move_children {
+            self.move_children.push((e, consuming, direct));
+            return true;
+        }
+        if let Some(falls_through) =
+            self.expr_transparent_spine(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
+        if self.expr_is_move_neutral(e) {
+            let falls_through = !hir_expr_diverges(e);
+            if !falls_through {
+                self.non_fallthrough.insert(e.span);
+            }
+            return falls_through;
+        }
+        if self.expr_uses_eager_worklist(e) {
+            return self.expr_eager_worklist(e, moved, consuming, direct);
+        }
+        if matches!(
+            e.kind,
+            ExprKind::Binary {
+                op: BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr,
+                ..
+            } | ExprKind::IntArith { .. }
+        ) && self.eager_binary_tree_is_non_borrowing(e)
+        {
+            return self.expr_non_borrowing_binary_tree(e, moved);
+        }
         let may_borrow = ty_may_borrow(
             e.ty,
             self.structs,
@@ -14631,9 +14936,2267 @@ impl<'a> MoveCheck<'a> {
         falls_through
     }
 
+    fn expr_uses_eager_worklist(&self, expression: &Expr) -> bool {
+        if pipeline_stages(&expression.kind).is_some() {
+            return false;
+        }
+        !matches!(
+            expression.kind,
+            ExprKind::Block(_)
+                | ExprKind::Arena(_)
+                | ExprKind::TaskGroup(_)
+                | ExprKind::Unsafe(_)
+                | ExprKind::Loop { .. }
+                | ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::ElseUnwrap { .. }
+                | ExprKind::Try(_)
+                | ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                }
+        )
+    }
+
+    fn expr_eager_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> bool {
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            Children {
+                children: Vec<(&'e Expr, bool, bool)>,
+                index: usize,
+                own_falls_through: bool,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                may_borrow: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    if !self.expr_uses_eager_worklist(expression) {
+                        values.push(self.expr(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                        ));
+                        continue;
+                    }
+                    let may_borrow = ty_may_borrow(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    );
+                    let key = Self::expr_key(expression);
+                    if may_borrow {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.value_snapshot_frames.push(Vec::new());
+                    debug_assert!(!self.collecting_move_children);
+                    debug_assert!(self.move_children.is_empty());
+                    self.collecting_move_children = true;
+                    let own_falls_through = self.expr_inner(
+                        expression,
+                        moved,
+                        consuming,
+                        direct,
+                    );
+                    self.collecting_move_children = false;
+                    let children = std::mem::take(&mut self.move_children);
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        may_borrow,
+                    });
+                    work.push(Work::Children {
+                        children,
+                        index: 0,
+                        own_falls_through,
+                    });
+                }
+                Work::Children {
+                    children,
+                    index,
+                    own_falls_through,
+                } => {
+                    if index > 0
+                        && !values.pop().expect("Move child result")
+                    {
+                        values.push(false);
+                    } else if let Some(&(child, consuming, direct)) =
+                        children.get(index)
+                    {
+                        work.push(Work::Children {
+                            children,
+                            index: index + 1,
+                            own_falls_through,
+                        });
+                        work.push(Work::Eval(child, consuming, direct));
+                    } else {
+                        values.push(own_falls_through);
+                    }
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    may_borrow,
+                } => {
+                    let falls_through =
+                        values.pop().expect("Move expression result");
+                    if falls_through {
+                        self.finish_eager_move_action(expression);
+                    }
+                    let child_snapshots = self
+                        .value_snapshot_frames
+                        .pop()
+                        .expect("value snapshot frame for eager expression");
+                    if falls_through
+                        && !Self::defers_child_snapshot_validation(
+                            &expression.kind,
+                        )
+                    {
+                        for snapshot in child_snapshots {
+                            self.validate_value_snapshot(
+                                key,
+                                snapshot,
+                                expression.span,
+                            );
+                        }
+                    }
+                    if !falls_through {
+                        self.non_fallthrough.insert(expression.span);
+                    } else if may_borrow {
+                        let fact = self.borrow_fact(expression);
+                        self.borrows
+                            .begin_value_source(key, fact.live_roots());
+                        self.walked_value_facts.insert(key, fact);
+                        if let Some(parent) =
+                            self.value_snapshot_frames.last_mut()
+                        {
+                            parent.push(key);
+                        }
+                    }
+                    values.push(falls_through);
+                }
+            }
+        }
+        values.pop().expect("Move root result")
+    }
+
+    fn finish_eager_move_action(&mut self, expression: &Expr) {
+        match &expression.kind {
+            ExprKind::ReaderReadLine { buffer, .. } => {
+                self.invalidate_storage(buffer);
+            }
+            ExprKind::BufferPut { buffer, .. }
+            | ExprKind::BufferAppend { buffer, .. } => {
+                self.invalidate_storage(buffer);
+            }
+            _ => {}
+        }
+    }
+
+    /// Evaluate a one-child expression spine without one native call frame per wrapper. Each frame
+    /// records the exact child consuming/direct mode and post-action; transparent blocks preserve
+    /// the caller mode, while constructors consume their payload and view operators borrow it.
+    fn expr_transparent_spine(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        enum Post<'e> {
+            None,
+            Try(&'e Expr),
+            LoopBreak(Option<&'e Expr>),
+            LoopDiverge,
+            Pipeline {
+                source: &'e Expr,
+                snapshots_source: bool,
+                snapshot: Option<Option<usize>>,
+            },
+            IfAfterCondition {
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+            },
+            IfAfterThen {
+                condition: &'e Expr,
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
+            },
+            IfAfterElse {
+                condition: &'e Expr,
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
+                then_result:
+                    Box<Option<(bool, MovedSet, BorrowState, BorrowFact)>>,
+            },
+            MatchAfterScrutinee {
+                scrutinee: &'e Expr,
+                arms: &'e [MatchArm],
+                consuming: bool,
+                direct: bool,
+                incoming_borrows: BorrowState,
+                consuming_control: bool,
+            },
+            MatchAfterArm {
+                scrutinee: &'e Expr,
+                arms: &'e [MatchArm],
+                selected: usize,
+                consuming: bool,
+                direct: bool,
+                incoming_borrows: BorrowState,
+                consuming_control: bool,
+                prepared: Option<Box<MoveMatchPrepared>>,
+                join: Box<MoveMatchJoin>,
+            },
+            BlockLet {
+                local: LocalId,
+                init: &'e Expr,
+            },
+            BlockAssign {
+                local: LocalId,
+                value: &'e Expr,
+                drop_old: &'e std::cell::Cell<bool>,
+                was_moved: bool,
+            },
+            BlockReturn(&'e Expr),
+            BlockLetTuple {
+                locals: &'e [Option<LocalId>],
+                init: &'e Expr,
+            },
+            BlockBreak {
+                value: &'e Expr,
+                accepted: bool,
+            },
+            BlockAssignField {
+                root: LocalId,
+                path: &'e [u32],
+                value: &'e Expr,
+                self_assign: bool,
+            },
+            BlockPairAfterIndex {
+                base: LocalId,
+                value: &'e Expr,
+                value_consuming: bool,
+                invalidates_owner: bool,
+            },
+            BlockPairAfterValue {
+                base: LocalId,
+                index: &'e Expr,
+                value: &'e Expr,
+                invalidates_owner: bool,
+                index_complete: bool,
+            },
+            BlockExprSequence {
+                prefix: &'e [Stmt],
+                suffix: &'e [Stmt],
+                tail: Option<&'e Expr>,
+                tail_consuming: bool,
+                tail_direct: bool,
+                prefix_complete: bool,
+            },
+            OptionalAfterFirst {
+                second: &'e Expr,
+                consuming: bool,
+                direct: bool,
+            },
+            OptionalAfterSecond {
+                first: &'e Expr,
+                first_consuming: bool,
+                first_direct: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
+            },
+        }
+
+        let mut wrappers = Vec::new();
+        let mut current = root;
+        let mut current_consuming = consuming;
+        let mut current_direct = direct;
+        let mut prefix_falls_through = None;
+        loop {
+            let (child, opens_arena, child_consuming, child_direct, post) =
+                if let Some((source, child, snapshots_source)) =
+                    self.transparent_pipeline_child(current)
+                {
+                    (
+                        child,
+                        false,
+                        false,
+                        false,
+                        Post::Pipeline {
+                            source,
+                            snapshots_source,
+                            snapshot: None,
+                        },
+                    )
+                } else {
+                    match &current.kind {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if !block.stmts.is_empty()
+                            && block
+                                .stmts
+                                .iter()
+                                .all(|statement| {
+                                    matches!(statement, Stmt::Expr(_))
+                                }) =>
+                    {
+                        let mut selected = 0;
+                        let mut selected_size = 0;
+                        for (index, statement) in
+                            block.stmts.iter().enumerate()
+                        {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression-statement guard")
+                            };
+                            let size =
+                                hir_depth::expr_postorder(expression).len();
+                            if size > selected_size {
+                                selected = index;
+                                selected_size = size;
+                            }
+                        }
+                        let tail_selected = block
+                            .value
+                            .as_deref()
+                            .is_some_and(|tail| {
+                                hir_depth::expr_postorder(tail).len()
+                                    > selected_size
+                            });
+                        let (child, child_consuming, child_direct,
+                            prefix, suffix, tail) = if tail_selected {
+                            (
+                                block.value.as_deref().expect("selected tail"),
+                                current_consuming,
+                                current_direct,
+                                block.stmts.as_slice(),
+                                &[][..],
+                                None,
+                            )
+                        } else {
+                            let Stmt::Expr(child) = &block.stmts[selected]
+                            else {
+                                unreachable!("selected expression statement")
+                            };
+                            (
+                                child,
+                                false,
+                                false,
+                                &block.stmts[..selected],
+                                &block.stmts[selected + 1..],
+                                block.value.as_deref(),
+                            )
+                        };
+                        (
+                            child,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            child_consuming,
+                            child_direct,
+                            Post::BlockExprSequence {
+                                prefix,
+                                suffix,
+                                tail,
+                                tail_consuming: current_consuming,
+                                tail_direct: current_direct,
+                                prefix_complete: false,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignIndex { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignIndex {
+                            base,
+                            index,
+                            value,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single index assign guard")
+                        };
+                        self.check_borrow_use(*base, index.span);
+                        if whole_moved(moved, *base) {
+                            let name = &self.f.locals[*base as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                index.span,
+                            );
+                        }
+                        if hir_depth::expr_postorder(index).len()
+                            >= hir_depth::expr_postorder(value).len()
+                        {
+                            (
+                                index,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterIndex {
+                                    base: *base,
+                                    value,
+                                    value_consuming: false,
+                                    invalidates_owner: false,
+                                },
+                            )
+                        } else {
+                            (
+                                value,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterValue {
+                                    base: *base,
+                                    index,
+                                    value,
+                                    invalidates_owner: false,
+                                    index_complete: false,
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignElemField { .. }
+                                    | Stmt::AssignElem { .. }]
+                            ) =>
+                    {
+                        let (base, index, value) = match &block.stmts[0]
+                        {
+                            Stmt::AssignElemField {
+                                base,
+                                index,
+                                value,
+                                ..
+                            }
+                            | Stmt::AssignElem {
+                                base,
+                                index,
+                                value,
+                                ..
+                            } => (*base, index, value),
+                            _ => unreachable!("single element assign guard"),
+                        };
+                        self.check_borrow_use(base, index.span);
+                        if whole_moved(moved, base) {
+                            let name = &self.f.locals[base as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                index.span,
+                            );
+                        }
+                        if hir_depth::expr_postorder(index).len()
+                            >= hir_depth::expr_postorder(value).len()
+                        {
+                            (
+                                index,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                false,
+                                false,
+                                Post::BlockPairAfterIndex {
+                                    base,
+                                    value,
+                                    value_consuming: true,
+                                    invalidates_owner: true,
+                                },
+                            )
+                        } else {
+                            (
+                                value,
+                                matches!(&current.kind, ExprKind::Arena(_)),
+                                true,
+                                true,
+                                Post::BlockPairAfterValue {
+                                    base,
+                                    index,
+                                    value,
+                                    invalidates_owner: true,
+                                    index_complete: false,
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignField { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignField {
+                            root,
+                            path,
+                            value,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single field assign guard")
+                        };
+                        self.check_borrow_use(*root, value.span);
+                        if whole_moved(moved, *root) {
+                            let name = &self.f.locals[*root as usize].name;
+                            self.diags.error(
+                                format!("use of moved value '{name}'"),
+                                value.span,
+                            );
+                        }
+                        let self_assign = matches!(
+                            &value.kind,
+                            ExprKind::Field {
+                                root: source,
+                                path: source_path,
+                            } if source == root && source_path == path
+                        );
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            !self_assign,
+                            !self_assign,
+                            Post::BlockAssignField {
+                                root: *root,
+                                path,
+                                value,
+                                self_assign,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::AssignVecLane { .. }]
+                            ) =>
+                    {
+                        let [Stmt::AssignVecLane { value, .. }] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single vector lane assign guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            false,
+                            false,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::LetTuple { .. }]
+                            ) =>
+                    {
+                        let [Stmt::LetTuple {
+                            locals,
+                            init,
+                            ..
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single tuple let guard")
+                        };
+                        (
+                            init,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockLetTuple { locals, init },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Break {
+                                    value: Some(_),
+                                    ..
+                                }]
+                            ) =>
+                    {
+                        let [Stmt::Break {
+                            value: Some(value),
+                            accepted,
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single value break guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockBreak {
+                                value,
+                                accepted: *accepted,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Let { .. }]
+                            ) =>
+                    {
+                        let [Stmt::Let { local, init }] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single let statement guard")
+                        };
+                        (
+                            init,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockLet {
+                                local: *local,
+                                init,
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Assign { .. }]
+                            ) =>
+                    {
+                        let [Stmt::Assign {
+                            local,
+                            value,
+                            drop_old,
+                            ..
+                        }] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single assign statement guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockAssign {
+                                local: *local,
+                                value,
+                                drop_old,
+                                was_moved: whole_moved(moved, *local),
+                            },
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Return(Some(_))]
+                            ) =>
+                    {
+                        let [Stmt::Return(Some(value))] =
+                            block.stmts.as_slice()
+                        else {
+                            unreachable!("single return statement guard")
+                        };
+                        (
+                            value,
+                            matches!(&current.kind, ExprKind::Arena(_)),
+                            true,
+                            true,
+                            Post::BlockReturn(value),
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.stmts.is_empty() && block.value.is_some() =>
+                    {
+                        (
+                            block.value.as_deref().expect("checked block value"),
+                            false,
+                            current_consuming,
+                            current_direct,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::Block(block)
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Expr(_)]
+                            ) =>
+                    {
+                        let [Stmt::Expr(child)] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single expression statement guard")
+                        };
+                        (child, false, false, false, Post::None)
+                    }
+                    ExprKind::Arena(block)
+                        if block.stmts.is_empty() && block.value.is_some() =>
+                    {
+                        (
+                            block.value.as_deref().expect("checked arena value"),
+                            true,
+                            current_consuming,
+                            current_direct,
+                            Post::None,
+                        )
+                    }
+                    ExprKind::Arena(block)
+                        if block.value.is_none()
+                            && matches!(
+                                block.stmts.as_slice(),
+                                [Stmt::Expr(_)]
+                            ) =>
+                    {
+                        let [Stmt::Expr(child)] = block.stmts.as_slice()
+                        else {
+                            unreachable!("single expression statement guard")
+                        };
+                        (child, true, false, false, Post::None)
+                    }
+                    ExprKind::Match { scrutinee, arms }
+                        if !arms.is_empty() =>
+                    {
+                        let has_move_binding = arms
+                            .iter()
+                            .flat_map(|arm| &arm.bindings)
+                            .any(|binding| self.is_move(*binding));
+                        let consuming_control = has_move_binding
+                            && match_scrutinee_materializes_result(
+                                scrutinee,
+                            );
+                        let scrutinee_size =
+                            hir_depth::expr_postorder(scrutinee).len();
+                        let (selected, selected_size) = arms
+                            .iter()
+                            .enumerate()
+                            .map(|(index, arm)| {
+                                (
+                                    index,
+                                    hir_depth::expr_postorder(&arm.body)
+                                        .len(),
+                                )
+                            })
+                            .max_by_key(|&(_, size)| size)
+                            .expect("non-empty match arms");
+                        let incoming_borrows = self.borrows.clone();
+                        if scrutinee_size >= selected_size {
+                            (
+                                scrutinee.as_ref(),
+                                false,
+                                consuming_control,
+                                consuming_control,
+                                Post::MatchAfterScrutinee {
+                                    scrutinee,
+                                    arms,
+                                    consuming: current_consuming,
+                                    direct: current_direct,
+                                    incoming_borrows,
+                                    consuming_control,
+                                },
+                            )
+                        } else {
+                            (
+                                &arms[selected].body,
+                                false,
+                                current_consuming,
+                                current_direct,
+                                Post::MatchAfterArm {
+                                    scrutinee,
+                                    arms,
+                                    selected,
+                                    consuming: current_consuming,
+                                    direct: current_direct,
+                                    incoming_borrows,
+                                    consuming_control,
+                                    prepared: None,
+                                    join: Box::default(),
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::Binary {
+                        op: BinOp::And | BinOp::Or,
+                        lhs,
+                        rhs,
+                    } =>
+                    {
+                        if hir_depth::expr_postorder(lhs).len()
+                            >= hir_depth::expr_postorder(rhs).len()
+                        {
+                            (
+                                lhs.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::OptionalAfterFirst {
+                                    second: rhs,
+                                    consuming: false,
+                                    direct: false,
+                                },
+                            )
+                        } else {
+                            (
+                                rhs.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::OptionalAfterSecond {
+                                    first: lhs,
+                                    first_consuming: false,
+                                    first_direct: false,
+                                    incoming: None,
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::ElseUnwrap { opt, fallback } =>
+                    {
+                        if hir_depth::expr_postorder(opt).len()
+                            >= hir_depth::expr_postorder(fallback).len()
+                        {
+                            (
+                                opt.as_ref(),
+                                false,
+                                true,
+                                true,
+                                Post::OptionalAfterFirst {
+                                    second: fallback,
+                                    consuming: current_consuming,
+                                    direct: false,
+                                },
+                            )
+                        } else {
+                            (
+                                fallback.as_ref(),
+                                false,
+                                current_consuming,
+                                false,
+                                Post::OptionalAfterSecond {
+                                    first: opt,
+                                    first_consuming: true,
+                                    first_direct: true,
+                                    incoming: None,
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::If { cond, then, els }
+                        if then.stmts.is_empty()
+                            && els.stmts.is_empty()
+                            && then.value.is_some()
+                            && els.value.is_some() =>
+                    {
+                        let then_value = then
+                            .value
+                            .as_deref()
+                            .expect("guarded then value");
+                        let else_value = els
+                            .value
+                            .as_deref()
+                            .expect("guarded else value");
+                        let condition_size =
+                            hir_depth::expr_postorder(cond).len();
+                        let then_size =
+                            hir_depth::expr_postorder(then_value).len();
+                        let else_size =
+                            hir_depth::expr_postorder(else_value).len();
+                        if condition_size >= then_size
+                            && condition_size >= else_size
+                        {
+                            (
+                                cond.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::IfAfterCondition {
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                },
+                            )
+                        } else if then_size >= else_size {
+                            (
+                                then_value,
+                                false,
+                                current_consuming,
+                                false,
+                                Post::IfAfterThen {
+                                    condition: cond,
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                    incoming: None,
+                                },
+                            )
+                        } else {
+                            (
+                                else_value,
+                                false,
+                                current_consuming,
+                                false,
+                                Post::IfAfterElse {
+                                    condition: cond,
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                    incoming: None,
+                                    then_result: Box::default(),
+                                },
+                            )
+                        }
+                    }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(
+                            body.stmts.as_slice(),
+                            [Stmt::Break {
+                                value: Some(_),
+                                accepted: true,
+                            }]
+                        ) =>
+                    {
+                        let [Stmt::Break {
+                            value: Some(child),
+                            accepted: true,
+                        }] = body.stmts.as_slice()
+                        else {
+                            unreachable!("accepted single-break loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            true,
+                            true,
+                            Post::LoopBreak(Some(child)),
+                        )
+                    }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(
+                            body.stmts.as_slice(),
+                            [Stmt::Expr(_), Stmt::Break {
+                                value: None,
+                                accepted: true,
+                            }]
+                        ) =>
+                    {
+                        let [Stmt::Expr(child), Stmt::Break {
+                            value: None,
+                            accepted: true,
+                        }] = body.stmts.as_slice()
+                        else {
+                            unreachable!("single-expression break loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            false,
+                            false,
+                            Post::LoopBreak(None),
+                        )
+                    }
+                    ExprKind::Loop {
+                        body,
+                        body_locals,
+                        ..
+                    } if body_locals.is_empty()
+                        && body.value.is_none()
+                        && matches!(body.stmts.as_slice(), [Stmt::Expr(child)] if hir_expr_diverges(child)) =>
+                    {
+                        let [Stmt::Expr(child)] = body.stmts.as_slice()
+                        else {
+                            unreachable!("single diverging expression loop guard")
+                        };
+                        (
+                            child,
+                            false,
+                            false,
+                            false,
+                            Post::LoopDiverge,
+                        )
+                    }
+                    ExprKind::OptionSome(child)
+                    | ExprKind::ResultOk(child)
+                    | ExprKind::ResultErr(child)
+                    | ExprKind::HeapNew(child)
+                    | ExprKind::BuilderToString(child) => {
+                        (child.as_ref(), false, true, true, Post::None)
+                    }
+                    ExprKind::Try(child) => {
+                        (child.as_ref(), false, true, true, Post::Try(child))
+                    }
+                    ExprKind::TaskGet(child) => {
+                        let consumes = is_owned_droppable(
+                            current.ty,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        );
+                        (child.as_ref(), false, consumes, consumes, Post::None)
+                    }
+                    ExprKind::ReaderBuffered { reader: child } => {
+                        (child.as_ref(), false, true, true, Post::None)
+                    }
+                    ExprKind::Call { func, args, .. } if args.len() == 1 => {
+                        if let Some(dependencies) =
+                            self.summary_dependencies.as_deref_mut()
+                        {
+                            dependencies.insert(func.clone());
+                        }
+                        let consumes = func != "print";
+                        (&args[0], false, consumes, consumes, Post::None)
+                    }
+                    ExprKind::CallFnValue { callee, args } if args.is_empty() => {
+                        (callee.as_ref(), false, false, false, Post::None)
+                    }
+                    ExprKind::Closure { captures, .. } if captures.len() == 1 => {
+                        (&captures[0], false, false, false, Post::None)
+                    }
+                    ExprKind::StructLit { fields, .. } if fields.len() == 1 => {
+                        (&fields[0], false, true, true, Post::None)
+                    }
+                    ExprKind::Tuple { elems, .. }
+                    | ExprKind::ArrayLit { elems, .. }
+                    | ExprKind::VecLit { elems, .. }
+                        if elems.len() == 1 =>
+                    {
+                        (&elems[0], false, true, true, Post::None)
+                    }
+                    ExprKind::EnumValue { payload, .. } if payload.len() == 1 => {
+                        (&payload[0], false, true, true, Post::None)
+                    }
+                    ExprKind::MathOp { operands, .. } if operands.len() == 1 => {
+                        (&operands[0], false, false, false, Post::None)
+                    }
+                    ExprKind::ArrayZip { sources, .. } if sources.len() == 1 => {
+                        (&sources[0], false, false, false, Post::None)
+                    }
+                    ExprKind::BuilderNew {
+                        capacity: Some(child),
+                    } => (child.as_ref(), false, false, false, Post::None),
+                    ExprKind::Unary { expr: child, .. }
+                    | ExprKind::Cast(child)
+                    | ExprKind::RawAlloc(child)
+                    | ExprKind::RawFree(child)
+                    | ExprKind::BoxGet(child)
+                    | ExprKind::BoxClone(child)
+                    | ExprKind::StrClone(child)
+                    | ExprKind::StrBorrow(child)
+                    | ExprKind::ArrayToSlice(child)
+                    | ExprKind::Len(child) => {
+                        (child.as_ref(), false, false, false, Post::None)
+                    }
+                    ExprKind::StrBytes { inner: child }
+                    | ExprKind::StrTrim { recv: child, .. }
+                    | ExprKind::BufferBytes { buffer: child }
+                    | ExprKind::BufferLen { buffer: child }
+                    | ExprKind::BytesAsStr { bytes: child } => {
+                        (child.as_ref(), false, false, false, Post::None)
+                    }
+                    _ => break,
+                    }
+                };
+            let may_borrow = ty_may_borrow(
+                current.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            );
+            if may_borrow {
+                self.clear_value_snapshot(Self::expr_key(current));
+            }
+            self.value_snapshot_frames.push(Vec::new());
+            if opens_arena {
+                self.arena_depth += 1;
+            };
+            wrappers.push((current, opens_arena, post));
+            if let Some((_, _, post)) = wrappers.last_mut() {
+                match post {
+                    Post::Pipeline {
+                        source,
+                        snapshots_source,
+                        snapshot,
+                    } => {
+                        if !self.expr(source, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        if *snapshots_source {
+                            *snapshot = Some(
+                                self.begin_pipeline_source_snapshot(
+                                    source,
+                                ),
+                            );
+                        }
+                    }
+                    Post::OptionalAfterSecond {
+                        first,
+                        first_consuming,
+                        first_direct,
+                        incoming,
+                    } => {
+                        if !self.expr(
+                            first,
+                            moved,
+                            *first_consuming,
+                            *first_direct,
+                        ) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *incoming = Some((
+                            moved.clone(),
+                            self.borrows.clone(),
+                        ));
+                    }
+                    Post::MatchAfterArm {
+                        scrutinee,
+                        arms,
+                        selected,
+                        consuming,
+                        direct,
+                        incoming_borrows,
+                        consuming_control,
+                        prepared,
+                        join,
+                    } => {
+                        if !self.expr(
+                            scrutinee,
+                            moved,
+                            *consuming_control,
+                            *consuming_control,
+                        ) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        let match_state =
+                            self.prepare_match_after_scrutinee(
+                                scrutinee,
+                                arms,
+                                moved,
+                                incoming_borrows.clone(),
+                                *consuming_control,
+                            );
+                        for arm in &arms[..*selected] {
+                            self.begin_match_arm(
+                                &match_state,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                *consuming,
+                                *direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        self.begin_match_arm(
+                            &match_state,
+                            &arms[*selected],
+                            moved,
+                        );
+                        *prepared = Some(Box::new(match_state));
+                    }
+                    Post::BlockPairAfterValue {
+                        index,
+                        index_complete,
+                        ..
+                    } => {
+                        if !self.expr(index, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *index_complete = true;
+                    }
+                    Post::BlockExprSequence {
+                        prefix,
+                        prefix_complete,
+                        ..
+                    } => {
+                        for statement in *prefix {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression prefix")
+                            };
+                            if !self.expr(
+                                expression,
+                                moved,
+                                false,
+                                false,
+                            ) {
+                                prefix_falls_through = Some(false);
+                                break;
+                            }
+                        }
+                        if prefix_falls_through.is_some() {
+                            break;
+                        }
+                        *prefix_complete = true;
+                    }
+                    Post::IfAfterThen {
+                        condition,
+                        incoming,
+                        ..
+                    } => {
+                        if !self.expr(condition, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *incoming = Some((
+                            moved.clone(),
+                            self.borrows.clone(),
+                        ));
+                    }
+                    Post::IfAfterElse {
+                        condition,
+                        then,
+                        consuming,
+                        incoming,
+                        then_result,
+                        ..
+                    } => {
+                        if !self.expr(condition, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut then_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let then_falls = self.block(
+                            then,
+                            &mut then_moved,
+                            *consuming,
+                            false,
+                        );
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        **then_result = Some((
+                            then_falls,
+                            then_moved,
+                            self.borrows.clone(),
+                            then_fact,
+                        ));
+                        *incoming = Some((
+                            incoming_moved.clone(),
+                            incoming_borrows.clone(),
+                        ));
+                        *moved = incoming_moved;
+                        self.borrows = incoming_borrows;
+                    }
+                    _ => {}
+                }
+            }
+            current = child;
+            current_consuming = child_consuming;
+            current_direct = child_direct;
+        }
+        if wrappers.is_empty() {
+            return None;
+        }
+
+        let mut falls_through = prefix_falls_through.unwrap_or_else(|| {
+            self.expr(
+                current,
+                moved,
+                current_consuming,
+                current_direct,
+            )
+        });
+        for (wrapper, opens_arena, post) in
+            wrappers.into_iter().rev()
+        {
+            let key = Self::expr_key(wrapper);
+            let try_result = match post {
+                Post::OptionalAfterFirst {
+                    second,
+                    consuming,
+                    direct,
+                } => {
+                    if falls_through {
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut second_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let second_falls = self.expr(
+                            second,
+                            &mut second_moved,
+                            consuming,
+                            direct,
+                        );
+                        if second_falls {
+                            *moved = &incoming_moved | &second_moved;
+                            self.borrows = BorrowState::join(
+                                &incoming_borrows,
+                                &self.borrows,
+                            );
+                        } else {
+                            *moved = incoming_moved;
+                            self.borrows = incoming_borrows;
+                        }
+                        falls_through = true;
+                    }
+                    None
+                }
+                Post::OptionalAfterSecond { incoming, .. } => {
+                    if let Some((incoming_moved, incoming_borrows)) =
+                        incoming
+                    {
+                        if falls_through {
+                            *moved = &incoming_moved | &*moved;
+                            self.borrows = BorrowState::join(
+                                &incoming_borrows,
+                                &self.borrows,
+                            );
+                        } else {
+                            *moved = incoming_moved;
+                            self.borrows = incoming_borrows;
+                        }
+                        falls_through = true;
+                    }
+                    None
+                }
+                Post::Try(result) => Some(result),
+                Post::LoopBreak(value) => {
+                    if falls_through {
+                        let fact = value.map_or_else(
+                            BorrowFact::default,
+                            |value| {
+                                let key = Self::expr_key(value);
+                                self.validate_value_snapshot(
+                                    key,
+                                    key,
+                                    value.span,
+                                );
+                                self.borrow_fact(value)
+                            },
+                        );
+                        if fact.is_empty() {
+                            self.loop_value_facts.remove(&wrapper.span);
+                        } else {
+                            self.loop_value_facts.insert(wrapper.span, fact);
+                        }
+                    } else {
+                        self.loop_value_facts.remove(&wrapper.span);
+                    }
+                    None
+                }
+                Post::LoopDiverge => {
+                    self.loop_value_facts.remove(&wrapper.span);
+                    None
+                }
+                Post::Pipeline { snapshot, .. } => {
+                    if let Some(snapshot) = snapshot {
+                        self.finish_pipeline_source_snapshot(
+                            snapshot,
+                            wrapper.span,
+                            falls_through,
+                        );
+                    }
+                    None
+                }
+                Post::MatchAfterScrutinee {
+                    scrutinee,
+                    arms,
+                    consuming,
+                    direct,
+                    incoming_borrows,
+                    consuming_control,
+                } => {
+                    if falls_through {
+                        let prepared =
+                            self.prepare_match_after_scrutinee(
+                                scrutinee,
+                                arms,
+                                moved,
+                                incoming_borrows,
+                                consuming_control,
+                            );
+                        let mut join = MoveMatchJoin::default();
+                        for arm in arms {
+                            self.begin_match_arm(
+                                &prepared,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                consuming,
+                                direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    &mut join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        falls_through = self.finish_match_join(
+                            &prepared,
+                            join,
+                            moved,
+                        );
+                    }
+                    None
+                }
+                Post::MatchAfterArm {
+                    arms,
+                    selected,
+                    consuming,
+                    direct,
+                    prepared,
+                    mut join,
+                    ..
+                } => {
+                    if let Some(prepared) = prepared {
+                        if falls_through {
+                            let arm_borrows = self.borrows.clone();
+                            self.join_match_arm(
+                                &mut join,
+                                moved,
+                                &arm_borrows,
+                            );
+                        }
+                        for arm in &arms[selected + 1..] {
+                            self.begin_match_arm(
+                                &prepared,
+                                arm,
+                                moved,
+                            );
+                            let arm_falls = self.expr(
+                                &arm.body,
+                                moved,
+                                consuming,
+                                direct,
+                            );
+                            if arm_falls {
+                                let arm_borrows = self.borrows.clone();
+                                self.join_match_arm(
+                                    &mut join,
+                                    moved,
+                                    &arm_borrows,
+                                );
+                            }
+                        }
+                        falls_through = self.finish_match_join(
+                            &prepared,
+                            *join,
+                            moved,
+                        );
+                    }
+                    None
+                }
+                Post::IfAfterCondition {
+                    then,
+                    els,
+                    consuming,
+                } => {
+                    if falls_through {
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut then_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let then_falls = self.block(
+                            then,
+                            &mut then_moved,
+                            consuming,
+                            false,
+                        );
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        let then_borrows = self.borrows.clone();
+                        let mut else_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let else_falls = self.block(
+                            els,
+                            &mut else_moved,
+                            consuming,
+                            false,
+                        );
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        let else_borrows = self.borrows.clone();
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
+                Post::IfAfterThen {
+                    then,
+                    els,
+                    consuming,
+                    incoming,
+                    ..
+                } => {
+                    if let Some((incoming_moved, incoming_borrows)) =
+                        incoming
+                    {
+                        let then_falls = falls_through;
+                        let then_moved = moved.clone();
+                        let then_borrows = self.borrows.clone();
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        let mut else_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let else_falls = self.block(
+                            els,
+                            &mut else_moved,
+                            consuming,
+                            false,
+                        );
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        let else_borrows = self.borrows.clone();
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
+                Post::IfAfterElse {
+                    els,
+                    incoming,
+                    then_result,
+                    ..
+                } => {
+                    if let (
+                        Some((incoming_moved, incoming_borrows)),
+                        Some((
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                        )),
+                    ) = (incoming, *then_result)
+                    {
+                        let else_falls = falls_through;
+                        let else_moved = moved.clone();
+                        let else_borrows = self.borrows.clone();
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
+                Post::BlockLet { local, init } => {
+                    if falls_through {
+                        self.assign_borrow(local, init);
+                        clear_moved(moved, local);
+                    }
+                    None
+                }
+                Post::BlockAssign {
+                    local,
+                    value,
+                    drop_old,
+                    was_moved,
+                } => {
+                    if falls_through {
+                        let consumed_by_rhs =
+                            whole_moved(moved, local) && !was_moved;
+                        drop_old.set(
+                            self.is_move(local) && !consumed_by_rhs,
+                        );
+                        if self.local_owns_view_storage(local) {
+                            self.invalidate_owner(local);
+                        }
+                        self.assign_borrow(local, value);
+                        clear_moved(moved, local);
+                    }
+                    None
+                }
+                Post::BlockReturn(value) => {
+                    if falls_through {
+                        let value_key = Self::expr_key(value);
+                        self.validate_value_snapshot(
+                            value_key,
+                            value_key,
+                            value.span,
+                        );
+                        self.return_roots
+                            .extend(self.borrow_sources(value));
+                    }
+                    falls_through = false;
+                    None
+                }
+                Post::BlockLetTuple { locals, init } => {
+                    if falls_through {
+                        let fact = self.borrow_fact(init);
+                        for (index, local) in
+                            locals.iter().enumerate()
+                        {
+                            let Some(local) = local else { continue };
+                            let local_fact = if self
+                                .local_may_borrow(*local)
+                            {
+                                let selected = self.project_fact_or_flatten(
+                                    init.ty,
+                                    fact.clone(),
+                                    &[BorrowProjection::TupleElement(
+                                        index as u32,
+                                    )],
+                                    self.f.locals[*local as usize].ty,
+                                );
+                                self.normalize_borrow_fact(
+                                    self.f.locals[*local as usize].ty,
+                                    selected,
+                                )
+                            } else {
+                                BorrowFact::default()
+                            };
+                            self.borrows.assign(*local, local_fact);
+                            clear_moved(moved, *local);
+                        }
+                    }
+                    None
+                }
+                Post::BlockBreak { value, accepted } => {
+                    if falls_through && accepted {
+                        let value_key = Self::expr_key(value);
+                        self.validate_value_snapshot(
+                            value_key,
+                            value_key,
+                            value.span,
+                        );
+                        let fact = self.borrow_fact(value);
+                        if let Some(frame) =
+                            self.loop_value_breaks.last_mut()
+                        {
+                            *frame = frame.join(&fact);
+                        }
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(moved.clone());
+                        }
+                        let mut at_break = self.borrows.clone();
+                        if let Some(drops) = self.loop_iter_drops.last() {
+                            let depth = self.loop_iter_drops.len() as u32;
+                            Self::invalidate_iteration_drops(
+                                &mut at_break,
+                                drops,
+                                depth,
+                            );
+                        }
+                        if let Some(frame) =
+                            self.loop_borrow_breaks.last_mut()
+                        {
+                            frame.push(at_break);
+                        }
+                    }
+                    falls_through = false;
+                    None
+                }
+                Post::BlockAssignField {
+                    root,
+                    path,
+                    value,
+                    self_assign,
+                } => {
+                    if falls_through {
+                        if let [field] = path {
+                            moved.remove(&MovedKey::Field(root, *field));
+                        }
+                        if !self_assign && self.is_move_ty(value.ty) {
+                            self.invalidate_owner(root);
+                        }
+                        if !self_assign {
+                            let projections = path
+                                .iter()
+                                .copied()
+                                .map(BorrowProjection::StructField)
+                                .collect::<Vec<_>>();
+                            self.replace_local_borrow_projection(
+                                root,
+                                &projections,
+                                value,
+                            );
+                        }
+                    }
+                    None
+                }
+                Post::BlockPairAfterIndex {
+                    base,
+                    value,
+                    value_consuming,
+                    invalidates_owner,
+                } => {
+                    if falls_through {
+                        falls_through = self.expr(
+                            value,
+                            moved,
+                            value_consuming,
+                            value_consuming,
+                        );
+                        if falls_through {
+                            if invalidates_owner
+                                && self.is_move_ty(value.ty)
+                            {
+                                self.invalidate_owner(base);
+                            }
+                            self.join_local_borrow_fallback(base, value);
+                        }
+                    }
+                    None
+                }
+                Post::BlockPairAfterValue {
+                    base,
+                    value,
+                    invalidates_owner,
+                    index_complete,
+                    ..
+                } => {
+                    if index_complete && falls_through {
+                        if invalidates_owner
+                            && self.is_move_ty(value.ty)
+                        {
+                            self.invalidate_owner(base);
+                        }
+                        self.join_local_borrow_fallback(base, value);
+                    }
+                    None
+                }
+                Post::BlockExprSequence {
+                    suffix,
+                    tail,
+                    tail_consuming,
+                    tail_direct,
+                    prefix_complete,
+                    ..
+                } => {
+                    if prefix_complete && falls_through {
+                        for statement in suffix {
+                            let Stmt::Expr(expression) = statement else {
+                                unreachable!("expression suffix")
+                            };
+                            falls_through = self.expr(
+                                expression,
+                                moved,
+                                false,
+                                false,
+                            );
+                            if !falls_through {
+                                break;
+                            }
+                        }
+                        if falls_through
+                            && let Some(tail) = tail
+                        {
+                            falls_through = self.expr(
+                                tail,
+                                moved,
+                                tail_consuming,
+                                tail_direct,
+                            );
+                        }
+                    }
+                    None
+                }
+                Post::None => None,
+            };
+            if opens_arena {
+                self.arena_depth -= 1;
+            }
+            let child_snapshots = self
+                .value_snapshot_frames
+                .pop()
+                .expect("value snapshot frame for transparent expression");
+            if !falls_through {
+                self.non_fallthrough.insert(wrapper.span);
+            } else {
+                if let Some(result) = try_result
+                    && ty_may_borrow(
+                        self.f.ret,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                {
+                    self.return_roots.extend(self.borrow_sources(result));
+                }
+                if !Self::defers_child_snapshot_validation(&wrapper.kind) {
+                    for snapshot in child_snapshots {
+                        self.validate_value_snapshot(
+                            key,
+                            snapshot,
+                            wrapper.span,
+                        );
+                    }
+                }
+                if ty_may_borrow(
+                    wrapper.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    let fact = self.borrow_fact(wrapper);
+                    self.borrows.begin_value_source(key, fact.live_roots());
+                    self.walked_value_facts.insert(key, fact);
+                    if let Some(parent) = self.value_snapshot_frames.last_mut() {
+                        parent.push(key);
+                    }
+                }
+            }
+        }
+        Some(falls_through)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_if_move_join(
+        &mut self,
+        span: Span,
+        moved: &mut MovedSet,
+        incoming_moved: MovedSet,
+        incoming_borrows: BorrowState,
+        then_falls: bool,
+        then_moved: MovedSet,
+        then_borrows: BorrowState,
+        then_fact: BorrowFact,
+        else_falls: bool,
+        else_moved: MovedSet,
+        else_borrows: BorrowState,
+        else_fact: BorrowFact,
+    ) -> bool {
+        let value_fact = match (then_falls, else_falls) {
+            (true, true) => then_fact.join(&else_fact),
+            (true, false) => then_fact,
+            (false, true) => else_fact,
+            (false, false) => BorrowFact::default(),
+        };
+        if value_fact.is_empty() {
+            self.control_value_facts.remove(&span);
+        } else {
+            self.control_value_facts.insert(span, value_fact);
+        }
+        *moved = match (then_falls, else_falls) {
+            (true, true) => &then_moved | &else_moved,
+            (true, false) => then_moved,
+            (false, true) => else_moved,
+            (false, false) => incoming_moved,
+        };
+        self.borrows = match (then_falls, else_falls) {
+            (true, true) => {
+                BorrowState::join(&then_borrows, &else_borrows)
+            }
+            (true, false) => then_borrows,
+            (false, true) => else_borrows,
+            (false, false) => incoming_borrows,
+        };
+        then_falls || else_falls
+    }
+
+    fn prepare_match_after_scrutinee(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        moved: &MovedSet,
+        incoming_borrows: BorrowState,
+        consuming_control: bool,
+    ) -> MoveMatchPrepared {
+        let evaluated = moved.clone();
+        let evaluated_borrows = self.borrows.clone();
+        let has_move_binding = arms
+            .iter()
+            .flat_map(|arm| &arm.bindings)
+            .any(|binding| self.is_move(*binding));
+        let (consumed, consumed_borrows) = if has_move_binding {
+            if consuming_control {
+                (
+                    Some(evaluated.clone()),
+                    Some(evaluated_borrows.clone()),
+                )
+            } else {
+                let mut state = evaluated.clone();
+                self.borrows = evaluated_borrows.clone();
+                self.consume_match_result(scrutinee, &mut state, true);
+                (Some(state), Some(self.borrows.clone()))
+            }
+        } else {
+            (None, None)
+        };
+        self.borrows = evaluated_borrows.clone();
+        let scrutinee_roots = self.borrow_sources(scrutinee);
+        MoveMatchPrepared {
+            incoming_borrows,
+            evaluated,
+            evaluated_borrows,
+            consumed,
+            consumed_borrows,
+            scrutinee_roots,
+        }
+    }
+
+    fn begin_match_arm(
+        &mut self,
+        prepared: &MoveMatchPrepared,
+        arm: &MatchArm,
+        moved: &mut MovedSet,
+    ) {
+        let arm_moves_payload = arm
+            .bindings
+            .iter()
+            .any(|binding| self.is_move(*binding));
+        *moved = if arm_moves_payload {
+            prepared
+                .consumed
+                .as_ref()
+                .expect("Move binding has consumed state")
+                .clone()
+        } else {
+            prepared.evaluated.clone()
+        };
+        self.borrows = if arm_moves_payload {
+            prepared
+                .consumed_borrows
+                .as_ref()
+                .expect("Move binding has consumed borrow state")
+                .clone()
+        } else {
+            prepared.evaluated_borrows.clone()
+        };
+        for binding in &arm.bindings {
+            let roots = if self.local_may_borrow(*binding) {
+                prepared.scrutinee_roots.clone()
+            } else {
+                BorrowRoots::new()
+            };
+            self.borrows
+                .assign(*binding, BorrowFact::from_direct(roots));
+            clear_moved(moved, *binding);
+        }
+    }
+
+    fn join_match_arm(
+        &self,
+        join: &mut MoveMatchJoin,
+        moved: &MovedSet,
+        borrows: &BorrowState,
+    ) {
+        join.moved = Some(match join.moved.take() {
+            None => moved.clone(),
+            Some(previous) => &previous | moved,
+        });
+        join.borrows = Some(match join.borrows.take() {
+            None => borrows.clone(),
+            Some(previous) => BorrowState::join(&previous, borrows),
+        });
+    }
+
+    fn finish_match_join(
+        &mut self,
+        prepared: &MoveMatchPrepared,
+        join: MoveMatchJoin,
+        moved: &mut MovedSet,
+    ) -> bool {
+        if let Some(joined) = join.moved {
+            *moved = joined;
+            self.borrows = join
+                .borrows
+                .expect("fallthrough match arm has borrow state");
+            true
+        } else {
+            *moved = prepared.evaluated.clone();
+            self.borrows = prepared.incoming_borrows.clone();
+            false
+        }
+    }
+
+    fn transparent_pipeline_child(
+        &self,
+        expression: &'a Expr,
+    ) -> Option<(&'a Expr, &'a Expr, bool)> {
+        let (source, child, snapshots_source) = match &expression.kind {
+            ExprKind::ArraySum { source, stages }
+            | ExprKind::ArrayCount { source, stages }
+            | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArrayAnyAll { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. } => {
+                if !node_captures(&expression.kind).is_empty() {
+                    return None;
+                }
+                let mut captures = stage_capture_exprs(stages);
+                let capture = captures.next()?;
+                if captures.next().is_some() {
+                    return None;
+                }
+                (source.as_ref(), capture, false)
+            }
+            ExprKind::ArrayReduce {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            }
+            | ExprKind::ArrayScan {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            } if stage_capture_exprs(stages).next().is_none()
+                && captures.is_empty() =>
+            {
+                (source.as_ref(), init.as_ref(), true)
+            }
+            ExprKind::ArrayMapInto {
+                source,
+                stages,
+                dst,
+                ..
+            } if stage_capture_exprs(stages).next().is_none() => {
+                (source.as_ref(), dst.as_ref(), true)
+            }
+            _ => return None,
+        };
+        if hir_depth::expr_postorder(source).len() != 1
+            || hir_expr_diverges(source)
+        {
+            return None;
+        }
+        Some((source, child, snapshots_source))
+    }
+
+    /// Whether the complete expression tree can neither observe nor change Move/borrow state.
+    /// This lane is intentionally narrow: every value is Copy and non-borrowing, blocks contain
+    /// expression statements only, and place projections that could observe a moved aggregate are
+    /// excluded. Such a tree has no MoveCheck transfer to replay, so its fallthrough is exactly the
+    /// shared iterative divergence result.
+    fn expr_is_move_neutral(&self, root: &Expr) -> bool {
+        for expression in hir_depth::expr_postorder(root) {
+            if self.is_move_ty(expression.ty)
+                || ty_may_borrow(
+                    expression.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                )
+            {
+                return false;
+            }
+            match &expression.kind {
+                ExprKind::Field { .. }
+                | ExprKind::SoaColumn { .. }
+                | ExprKind::IndexField { .. } => return false,
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block)
+                | ExprKind::Loop { body: block, .. }
+                    if block
+                        .stmts
+                        .iter()
+                        .any(|statement| !matches!(statement, Stmt::Expr(_))) =>
+                {
+                    return false;
+                }
+                ExprKind::If { then, els, .. }
+                    if [then, els].into_iter().any(|block| {
+                        block
+                            .stmts
+                            .iter()
+                            .any(|statement| !matches!(statement, Stmt::Expr(_)))
+                    }) =>
+                {
+                    return false;
+                }
+                ExprKind::Match { arms, .. }
+                    if arms.iter().any(|arm| !arm.bindings.is_empty()) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn eager_binary_tree_is_non_borrowing(&self, root: &Expr) -> bool {
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if ty_may_borrow(
+                node.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                return false;
+            }
+            match &node.kind {
+                ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                } => return false,
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::IntArith { lhs, rhs, .. } => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn expr_non_borrowing_binary_tree(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+    ) -> bool {
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            match &node.kind {
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::IntArith { lhs, rhs, .. } => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                _ => {
+                    if !self.expr(node, moved, false, false) {
+                        self.non_fallthrough.insert(root.span);
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn expr_inner(
         &mut self,
-        e: &Expr,
+        e: &'a Expr,
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
@@ -14846,7 +17409,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderReadLine { reader, buffer } => {
                 move_expr!(self, reader, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             // `r.buffered()` **consumes** the reader (Move — one fd, one owner; the buffered handle
             // takes it over), exactly like `array_builder.build()`.
@@ -14881,12 +17446,16 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BufferPut { buffer, value, .. } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, value, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             ExprKind::BufferAppend { buffer, data } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, data, moved, false, false);
-                self.invalidate_storage(buffer);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
             }
             ExprKind::BufferNew { capacity } => move_expr!(self, capacity, moved, false, false),
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
@@ -15847,6 +18416,10 @@ struct Checker<'a, 't> {
     /// Set while checking a lambda body — lets a reference to an enclosing local become a capture
     /// (a synthetic value parameter of the lifted function, passed at the call site).
     capture: Option<CaptureScope>,
+    /// True only while one node from the explicit finalization worklist is being processed.
+    /// Recursive calls in the legacy exhaustive node match become no-ops because every child has
+    /// already been finalized in postorder.
+    finalize_node_active: bool,
     /// The builtin modules `import`ed by this file (validated module paths, e.g. `core.json`).
     /// The prefix-accessed builtin namespaces (`json`/`fs`/`io`) must be imported before use —
     /// the "capability header" rule (`open-questions.md` module system).
@@ -15957,6 +18530,7 @@ impl<'a, 't> Checker<'a, 't> {
             instantiations: Vec::new(),
             lifted: Vec::new(),
             capture: None,
+            finalize_node_active: false,
         }
     }
 
@@ -16021,71 +18595,126 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn source_ty_matches(&self, a: Ty, b: Ty) -> bool {
-        let (a, b) = (self.resolve(a), self.resolve(b));
-        if a == b {
-            return true;
+        #[derive(Clone, Copy)]
+        enum Work {
+            Enter(Ty, Ty),
+            Exit(Ty, Ty),
         }
-        match (a, b) {
-            (Ty::Fn(aid), Ty::Fn(bid)) => self
-                .fn_types
-                .get(aid as usize)
-                .zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| {
-                    a.params.len() == b.params.len()
-                        && a.params.iter().zip(&b.params).all(
-                            |((a_mode, a_ty), (b_mode, b_ty))| {
-                                a_mode == b_mode
-                                    && self.source_scalar_matches(*a_ty, *b_ty)
-                            },
-                        )
-                        && self.source_ty_matches(a.ret, b.ret)
-                }),
-            (Ty::Struct(aid), Ty::Struct(bid)) => self
-                .structs
-                .get(aid as usize)
-                .zip(self.structs.get(bid as usize))
-                .is_some_and(|(a, b)| a.source_name == b.source_name),
-            (Ty::Enum(aid), Ty::Enum(bid)) => self
-                .enums
-                .get(aid as usize)
-                .zip(self.enums.get(bid as usize))
-                .is_some_and(|(a, b)| a.source_name == b.source_name),
-            (Ty::Tuple(aid), Ty::Tuple(bid)) => self
-                .tuples
-                .get(aid as usize)
-                .zip(self.tuples.get(bid as usize))
-                .is_some_and(|(a, b)| {
-                    a.elems.len() == b.elems.len()
-                        && a.elems
-                            .iter()
-                            .zip(&b.elems)
-                            .all(|(a, b)| self.source_scalar_matches(*a, *b))
-                }),
-            (Ty::Option(a), Ty::Option(b))
-            | (Ty::Box(a), Ty::Box(b))
-            | (Ty::Slice(a), Ty::Slice(b))
-            | (Ty::DynArray(a), Ty::DynArray(b))
-            | (Ty::Task(a), Ty::Task(b)) => self.source_scalar_matches(a, b),
-            (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
-                self.source_scalar_matches(a_ok, b_ok)
-                    && self.source_scalar_matches(a_err, b_err)
+
+        let mut work = vec![Work::Enter(a, b)];
+        let mut active = HashSet::new();
+        let mut complete = HashSet::new();
+        while let Some(item) = work.pop() {
+            let (a, b) = match item {
+                Work::Enter(a, b) => (self.resolve(a), self.resolve(b)),
+                Work::Exit(a, b) => {
+                    active.remove(&(a, b));
+                    complete.insert((a, b));
+                    continue;
+                }
+            };
+            if a == b || complete.contains(&(a, b)) {
+                continue;
             }
-            (Ty::Array(a, an), Ty::Array(b, bn))
-            | (Ty::Vec(a, an), Ty::Vec(b, bn))
-            | (Ty::Mask(a, an), Ty::Mask(b, bn)) => {
-                an == bn && self.source_scalar_matches(a, b)
+            if !active.insert((a, b)) {
+                return false;
             }
-            (Ty::StructArray(a, an), Ty::StructArray(b, bn)) => {
-                an == bn && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
+
+            let mut children = Vec::new();
+            let matches = match (a, b) {
+                (Ty::Fn(aid), Ty::Fn(bid)) => self
+                    .fn_types
+                    .get(aid as usize)
+                    .zip(self.fn_types.get(bid as usize))
+                    .is_some_and(|(a, b)| {
+                        if a.params.len() != b.params.len()
+                            || a.params
+                                .iter()
+                                .zip(&b.params)
+                                .any(|((a_mode, _), (b_mode, _))| a_mode != b_mode)
+                        {
+                            return false;
+                        }
+                        children.extend(
+                            a.params
+                                .iter()
+                                .zip(&b.params)
+                                .map(|((_, a), (_, b))| (scalar_to_ty(*a), scalar_to_ty(*b))),
+                        );
+                        children.push((a.ret, b.ret));
+                        true
+                    }),
+                (Ty::Struct(aid), Ty::Struct(bid)) => self
+                    .structs
+                    .get(aid as usize)
+                    .zip(self.structs.get(bid as usize))
+                    .is_some_and(|(a, b)| a.source_name == b.source_name),
+                (Ty::Enum(aid), Ty::Enum(bid)) => self
+                    .enums
+                    .get(aid as usize)
+                    .zip(self.enums.get(bid as usize))
+                    .is_some_and(|(a, b)| a.source_name == b.source_name),
+                (Ty::Tuple(aid), Ty::Tuple(bid)) => self
+                    .tuples
+                    .get(aid as usize)
+                    .zip(self.tuples.get(bid as usize))
+                    .is_some_and(|(a, b)| {
+                        if a.elems.len() != b.elems.len() {
+                            return false;
+                        }
+                        children.extend(
+                            a.elems
+                                .iter()
+                                .zip(&b.elems)
+                                .map(|(a, b)| (scalar_to_ty(*a), scalar_to_ty(*b))),
+                        );
+                        true
+                    }),
+                (Ty::Option(a), Ty::Option(b))
+                | (Ty::Box(a), Ty::Box(b))
+                | (Ty::Slice(a), Ty::Slice(b))
+                | (Ty::DynArray(a), Ty::DynArray(b))
+                | (Ty::Task(a), Ty::Task(b)) => {
+                    children.push((scalar_to_ty(a), scalar_to_ty(b)));
+                    true
+                }
+                (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
+                    children.push((scalar_to_ty(a_ok), scalar_to_ty(b_ok)));
+                    children.push((scalar_to_ty(a_err), scalar_to_ty(b_err)));
+                    true
+                }
+                (Ty::Array(a, an), Ty::Array(b, bn))
+                | (Ty::Vec(a, an), Ty::Vec(b, bn))
+                | (Ty::Mask(a, an), Ty::Mask(b, bn)) => {
+                    children.push((scalar_to_ty(a), scalar_to_ty(b)));
+                    an == bn
+                }
+                (Ty::StructArray(a, an), Ty::StructArray(b, bn)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    an == bn
+                }
+                (Ty::DynStructArray(a, al), Ty::DynStructArray(b, bl)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    al == bl
+                }
+                (Ty::Soa(a), Ty::Soa(b)) => {
+                    children.push((Ty::Struct(a), Ty::Struct(b)));
+                    true
+                }
+                _ => false,
+            };
+            if !matches {
+                return false;
             }
-            (Ty::DynStructArray(a, al), Ty::DynStructArray(b, bl)) => {
-                al == bl && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
-            }
-            (Ty::Soa(a), Ty::Soa(b)) => {
-                self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
-            }
-            _ => false,
+            work.push(Work::Exit(a, b));
+            work.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(a, b)| Work::Enter(a, b)),
+            );
         }
+        true
     }
 
     fn source_scalar_matches(&self, a: Scalar, b: Scalar) -> bool {
@@ -16134,37 +18763,119 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// A user-facing type name that resolves struct/enum ids to their declared source names —
     /// unlike the free `ty_name`, which has no name tables and prints `struct#0` / `enum#0`. Used
-    /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. Recurses into composite
-    /// payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`).
+    /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. An explicit token worklist
+    /// renders composite payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`) without using
+    /// the process stack.
     fn ty_display(&self, ty: Ty) -> String {
-        match ty {
-            Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
-            Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
-            Ty::Option(s) => format!("Option<{}>", self.scalar_display(s)),
-            Ty::Result(o, e) => format!(
-                "Result<{}, {}>",
-                self.scalar_display(o),
-                self.scalar_display(e)
-            ),
-            Ty::Tagged(_) => self.ty_display(expand_tagged_ty(ty, self.tagged_types)),
-            Ty::Box(s) => format!("box<{}>", self.scalar_display(s)),
-            Ty::Task(s) => format!("Task<{}>", self.scalar_display(s)),
-            Ty::Array(s, n) => format!("array<{}>[{n}]", self.scalar_display(s)),
-            Ty::Slice(s) => format!("slice<{}>", self.scalar_display(s)),
-            Ty::DynArray(s) => format!("array<{}>", self.scalar_display(s)),
-            Ty::StructArray(id, n) => format!("array<{}>[{n}]", self.ty_display(Ty::Struct(id))),
-            Ty::DynStructArray(id, _) => format!("array<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::Soa(id) => format!("soa<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::JsonScanner(id) => format!("json.scanner<{}>", self.ty_display(Ty::Struct(id))),
-            Ty::DictEncoded(id, _) => format!("dict_encoded<{}>", self.ty_display(Ty::Struct(id))),
-            // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
-            _ => ty_name(ty),
+        enum Work {
+            Type(Ty),
+            Text(String),
+            ExitTagged(u32),
         }
-    }
 
-    /// [`ty_display`] for a scalar payload (an `Option`/`Result`/`box` element may itself be an enum).
-    fn scalar_display(&self, s: Scalar) -> String {
-        self.ty_display(scalar_to_ty(s))
+        let mut work = vec![Work::Type(ty)];
+        let mut output = String::new();
+        let mut active_tagged = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Text(text) => output.push_str(&text),
+                Work::ExitTagged(id) => {
+                    active_tagged.remove(&id);
+                }
+                Work::Type(ty) => match ty {
+                    Ty::Struct(id) => output.push_str(
+                        &self
+                            .structs
+                            .get(id as usize)
+                            .map(|definition| definition.source_name.clone())
+                            .unwrap_or_else(|| ty_name(ty)),
+                    ),
+                    Ty::Enum(id) => output.push_str(
+                        &self
+                            .enums
+                            .get(id as usize)
+                            .map(|definition| definition.source_name.clone())
+                            .unwrap_or_else(|| ty_name(ty)),
+                    ),
+                    Ty::Tagged(id) => {
+                        if active_tagged.insert(id) {
+                            work.push(Work::ExitTagged(id));
+                            work.push(Work::Type(expand_tagged_ty(
+                                Ty::Tagged(id),
+                                self.tagged_types,
+                            )));
+                        } else {
+                            output.push_str(&ty_name(ty));
+                        }
+                    }
+                    Ty::Option(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("Option<".to_string()));
+                    }
+                    Ty::Result(ok, err) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(err)));
+                        work.push(Work::Text(", ".to_string()));
+                        work.push(Work::Type(scalar_to_ty(ok)));
+                        work.push(Work::Text("Result<".to_string()));
+                    }
+                    Ty::Box(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("box<".to_string()));
+                    }
+                    Ty::Task(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("Task<".to_string()));
+                    }
+                    Ty::Array(payload, len) => {
+                        work.push(Work::Text(format!(">[{len}]")));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::Slice(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("slice<".to_string()));
+                    }
+                    Ty::DynArray(payload) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::StructArray(id, len) => {
+                        work.push(Work::Text(format!(">[{len}]")));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::DynStructArray(id, _) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::Soa(id) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("soa<".to_string()));
+                    }
+                    Ty::JsonScanner(id) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("json.scanner<".to_string()));
+                    }
+                    Ty::DictEncoded(id, _) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Struct(id)));
+                        work.push(Work::Text("dict_encoded<".to_string()));
+                    }
+                    // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
+                    _ => output.push_str(&ty_name(ty)),
+                },
+            }
+        }
+        output
     }
 
     /// Constrain `ty` to an expected type if one is given.
@@ -17935,35 +20646,200 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Check the right operand of a binary op, supporting a scalar–vector broadcast in either order.
-    /// Normally the rhs is hinted with the lhs type (so a literal adopts it). But if the lhs is a
-    /// scalar and the rhs turns out to be a vector (`2.0 + a`), that hint mis-constrains, so the
-    /// speculative diagnostics are rolled back and the rhs is re-checked unhinted (the scalar then
-    /// broadcasts against the vector in [`Self::vec_binop`]).
-    fn check_binop_rhs(&mut self, lhs_ty: Ty, rhs: &ast::Expr) -> Expr {
-        if matches!(self.resolve(lhs_ty), Ty::Vec(..)) {
-            return self.check_expr(rhs, None); // vec lhs: rhs self-types
+    /// Type-check an eager or short-circuit binary tree with heap-owned continuation frames.
+    ///
+    /// Parser-valid left-associative chains may contain 128 AST expressions. Keeping the former
+    /// recursive `check_expr(lhs)` call here made that accepted boundary exhaust the 2 MiB compiler
+    /// test stack before HIR existed. `AfterLhs` retains the source-order type hint and
+    /// scalar/vector retry point; `AfterRhs` applies the former parent logic only after both
+    /// operands have completed.
+    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        enum Frame<'e> {
+            Enter {
+                expr: &'e ast::Expr,
+                expected: Option<Ty>,
+            },
+            AfterLhs {
+                op: BinOp,
+                rhs: &'e ast::Expr,
+                expected: Option<Ty>,
+                span: Span,
+            },
+            AfterRhs {
+                op: BinOp,
+                lhs: Expr,
+                rhs: &'e ast::Expr,
+                expected: Option<Ty>,
+                span: Span,
+                diagnostic_mark: Option<usize>,
+            },
         }
-        let mark = self.diags.len();
-        let r = self.check_expr(rhs, Some(lhs_ty));
-        if matches!(self.resolve(r.ty), Ty::Vec(..)) {
-            // Sound to roll back here: the only side effect of the speculative check was the
-            // diagnostic. The hint applied `unify(rhs = Vec, lhs_ty)`, and `unify` binds a variable
-            // only to a concrete `Int`/`Float` (its `(IntVar, Int)` / `(FloatVar, Float)` arms) — never
-            // to a `Vec` (that hits the mismatch arm), so `lhs_ty` is left exactly as it was.
-            self.diags.truncate(mark);
-            return self.check_expr(rhs, None);
+
+        let lhs_expected = match op {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr => expected,
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => None,
+            BinOp::And | BinOp::Or => Some(Ty::Bool),
+        };
+        let mut frames = vec![
+            Frame::AfterLhs {
+                op,
+                rhs,
+                expected,
+                span,
+            },
+            Frame::Enter {
+                expr: lhs,
+                expected: lhs_expected,
+            },
+        ];
+        let mut values = Vec::new();
+
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Enter { expr, expected } => {
+                    let ast::ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+                        values.push(self.check_expr(expr, expected));
+                        continue;
+                    };
+                    let lhs_expected = match op {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr => expected,
+                        BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge => None,
+                        BinOp::And | BinOp::Or => Some(Ty::Bool),
+                    };
+                    frames.push(Frame::AfterLhs {
+                        op: *op,
+                        rhs,
+                        expected,
+                        span: expr.span,
+                    });
+                    frames.push(Frame::Enter {
+                        expr: lhs,
+                        expected: lhs_expected,
+                    });
+                }
+                Frame::AfterLhs {
+                    op,
+                    rhs,
+                    expected,
+                    span,
+                } => {
+                    let lhs = values.pop().expect("binary lhs value");
+                    let (rhs_expected, diagnostic_mark) = match op {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge => {
+                            if matches!(self.resolve(lhs.ty), Ty::Vec(..)) {
+                                (None, None)
+                            } else {
+                                (Some(lhs.ty), Some(self.diags.len()))
+                            }
+                        }
+                        BinOp::And | BinOp::Or => (Some(Ty::Bool), None),
+                        BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr => (Some(lhs.ty), None),
+                    };
+                    frames.push(Frame::AfterRhs {
+                        op,
+                        lhs,
+                        rhs,
+                        expected,
+                        span,
+                        diagnostic_mark,
+                    });
+                    frames.push(Frame::Enter {
+                        expr: rhs,
+                        expected: rhs_expected,
+                    });
+                }
+                Frame::AfterRhs {
+                    op,
+                    lhs,
+                    rhs,
+                    expected,
+                    span,
+                    diagnostic_mark,
+                } => {
+                    let right = values.pop().expect("binary rhs value");
+                    if let Some(mark) = diagnostic_mark
+                        && matches!(self.resolve(right.ty), Ty::Vec(..))
+                    {
+                        // A scalar lhs may broadcast against a vector rhs. The hinted first check
+                        // can only have added diagnostics: unification never binds a scalar
+                        // inference variable to a vector. Discard those diagnostics and replay the
+                        // rhs without the scalar hint, preserving the former recursive path.
+                        self.diags.truncate(mark);
+                        frames.push(Frame::AfterRhs {
+                            op,
+                            lhs,
+                            rhs,
+                            expected,
+                            span,
+                            diagnostic_mark: None,
+                        });
+                        frames.push(Frame::Enter {
+                            expr: rhs,
+                            expected: None,
+                        });
+                        continue;
+                    }
+                    values.push(self.finish_binary(op, lhs, right, expected, span));
+                }
+            }
         }
-        r
+
+        values.pop().expect("binary root value")
     }
 
-    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+    fn finish_binary(
+        &mut self,
+        op: BinOp,
+        l: Expr,
+        r: Expr,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
         let ty;
-        let (l, r);
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                l = self.check_expr(lhs, expected);
-                r = self.check_binop_rhs(l.ty, rhs);
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
                     // Vectors support all elementwise arithmetic `+` `-` `*` `/` `%` (M6). Integer
                     // `/`/`%` carry the same lane-wise divisor guard as scalars (zero lane → abort,
@@ -17996,8 +20872,6 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                l = self.check_expr(lhs, None);
-                r = self.check_binop_rhs(l.ty, rhs);
                 // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar in either
                 // order like `scores > 80` / `80 < scores`) is elementwise and yields a `mask` (M6).
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
@@ -18052,15 +20926,11 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             BinOp::And | BinOp::Or => {
-                l = self.check_expr(lhs, Some(Ty::Bool));
-                r = self.check_expr(rhs, Some(Ty::Bool));
                 ty = Ty::Bool;
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 // Bitwise / shift: integer-only, no implicit coercion. The shift amount shares the
                 // value's type (unified like arithmetic), so the result is that integer type.
-                l = self.check_expr(lhs, expected);
-                r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
                 if matches!(t, Ty::Vec(..)) {
                     // Vectors carry only elementwise `+` `-` `*` `/` `%` (and comparisons → `mask`), not
@@ -22808,7 +25678,7 @@ impl<'a, 't> Checker<'a, 't> {
         match ty {
             // A single struct → a JSON object.
             Ty::Struct(sid) => {
-                self.json_object_parts(base, sid, None, &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
+                self.json_object_parts(base, sid, None, &[], &[], &mut parts, args[0].span, &mut ok);
             }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
@@ -22817,7 +25687,7 @@ impl<'a, 't> Checker<'a, 't> {
                     if i > 0 {
                         parts.push(TemplatePart::Text(",".to_string()));
                     }
-                    self.json_object_parts(base, sid, Some(i), &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
+                    self.json_object_parts(base, sid, Some(i), &[], &[], &mut parts, args[0].span, &mut ok);
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
@@ -23184,159 +26054,233 @@ impl<'a, 't> Checker<'a, 't> {
     /// and `array<Struct>` fields (Encode) — the two field shapes whose encoding goes through the
     /// descriptor table instead of the template pieces.
     fn json_struct_fields_ok(&mut self, sid: u32, span: Span, dir: JsonDir) -> bool {
-        self.json_struct_fields_ok_rec(sid, span, dir, &mut Vec::new())
+        self.json_shape_ok(JsonShapeRoot::Struct(sid), span, dir)
     }
 
-    fn json_struct_fields_ok_rec(&mut self, sid: u32, span: Span, dir: JsonDir, stack: &mut Vec<u32>) -> bool {
-        // The struct graph is acyclic (`struct_acyclic`), so this is defense in depth against a
-        // mis-built graph looping forever, not a reachable diagnostic.
-        if stack.contains(&sid) {
-            self.diags
-                .error(format!("'{}' cannot {} a self-referential struct", dir.name(), dir.verb()), span);
-            return false;
-        }
-        stack.push(sid);
-        let fields = self.structs[sid as usize].fields.clone();
-        for f in &fields {
-            match f.ty {
-                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str => {}
-                Ty::Struct(nid) => {
-                    if !self.json_struct_fields_ok_rec(nid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `Option<T>` field is optional (missing key / JSON `null` → `None`); its payload
-                // must itself be decodeable. `Option<Struct>` recurses into the payload struct.
-                // Owned Option payloads are legal language fields but remain outside this JSON
-                // descriptor boundary. A decodeable Option payload here is scalar/str/plain-struct.
-                Ty::Option(Scalar::Int(_)) | Ty::Option(Scalar::Float(_)) | Ty::Option(Scalar::Bool) | Ty::Option(Scalar::Str) => {}
-                // The one field shape the two directions disagree on. `json_payload_tag_sub` tags an
-                // `Option<enum>` payload as kind 6 with a real `JsonUnion` sub-pointer, so the runtime
-                // union encoder renders it; the decoder has no rule for an optional union, so Decode
-                // falls through to the tail below and reports it.
-                Ty::Option(Scalar::Enum(eid)) if dir == JsonDir::Encode => {
-                    if !self.check_union_decodable(eid, span, dir) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                Ty::Option(Scalar::Struct(nid)) => {
-                    if !self.json_struct_fields_ok_rec(nid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `array<Struct>` field (REST-gateway runway Slice C): decode a JSON array of
-                // objects into an owned AoS in the field. The element struct's fields must themselves
-                // be decodeable — recurse. The `stack` cycle guard rejects a recursive `array<Node>`
-                // (its descriptor table would be infinite), so codegen's `emit_json_subtable`
-                // recursion is bounded by construction. (`array<scalar>` field decode is a later slice.)
-                Ty::DynStructArray(eid, _) => {
-                    if !self.json_struct_fields_ok_rec(eid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `array<scalar>` field (JSON completeness T1b): decode a JSON array of numbers /
-                // bools into an owned scalar buffer. `array<str>` is admitted too — its elements are
-                // zero-copy `{ptr,len}` VIEWS into the input (the same borrowed-view model as a
-                // top-level `str` field, MMv2 slice 6), so the decoded struct is already input-region-
-                // bound (via `region_of(JsonDecode) = region_of(input)`) and its `array<str>` field's
-                // `Drop` flat-frees only the owned spine while the elements borrow the input. A numeric
-                // / bool element is Copy (owns nothing either); `.clone()` copies past the input. Only
-                // `array<char>` stays deferred (char has no JSON form).
-                Ty::DynArray(Scalar::Int(_)) | Ty::DynArray(Scalar::Float(_)) | Ty::DynArray(Scalar::Bool) | Ty::DynArray(Scalar::Str) => {}
-                // A shape-directed union (`enum`) field (J1b-2b): the `Message { content: Content }`
-                // shape. The enum must be union-decodable (pairwise-distinct shape classes); an object
-                // payload's struct is validated recursively by `check_union_decodable`.
-                Ty::Enum(eid) => {
-                    if !self.check_union_decodable(eid, span, dir) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                _ => {
-                    self.diags.error(
-                        format!(
-                            "'{}' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct>/enum-union only for now)",
-                            dir.name(),
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    stack.pop();
-                    return false;
-                }
-            }
-        }
-        stack.pop();
-        true
-    }
-
-    /// Validate that sum type `enum_id` is **union-decodable** (JSON completeness J1b): every variant
-    /// carries exactly one payload, each payload maps to a JSON shape class (str/number/bool/object/array),
-    /// and the classes are **pairwise distinct** — so the value's first structural byte selects the
-    /// variant unambiguously (O(1) dispatch, no backtracking). An object (struct) payload must itself
-    /// be json-decodable (its fields recurse). Reports every offending variant and returns false.
-    /// `null` is deliberately not a class (absence belongs to `Option`). A supported
-    /// `array<Struct>` payload maps to Array; scalar-element owned arrays remain valid language
-    /// payloads but have no JSON-union descriptor arm and fail this package-specific check.
     fn check_union_decodable(&mut self, enum_id: u32, span: Span, dir: JsonDir) -> bool {
-        let Some(ed) = self.enums.get(enum_id as usize) else { return false };
-        let name = ed.name.clone();
-        let variants = ed.variants.clone();
-        if variants.is_empty() {
-            self.diags.error(format!("'{name}' has no variants to decode as a JSON union"), span);
-            return false;
+        self.json_shape_ok(JsonShapeRoot::Enum(enum_id), span, dir)
+    }
+
+    fn json_shape_ok(&mut self, root: JsonShapeRoot, span: Span, dir: JsonDir) -> bool {
+        struct StructFrame {
+            id: u32,
+            fields: Vec<hir::FieldDef>,
+            next: usize,
         }
-        let mut ok = true;
-        // Each shape class (Str/Number/Bool/Object/Array) may be claimed by at most one variant.
-        // Sized `JSON_SHAPE_CLASSES` so an Array-class payload (`union_shape_class` → 4) indexes in
-        // bounds (J2b — a `[_; 4]` would panic on the Array arm).
-        let mut class_owner: [Option<String>; JSON_SHAPE_CLASSES] = Default::default();
-        for v in &variants {
-            if v.payload.len() != 1 {
-                self.diags.error(
-                    format!("union variant '{}' of '{name}' must carry exactly one payload to map to a JSON value (a tag-only or multi-payload variant has no shape class)", v.name),
-                    span,
-                );
-                ok = false;
-                continue;
-            }
-            let sc = v.payload[0];
-            let Some(cls) = union_shape_class(sc) else {
-                self.diags.error(
-                    format!("union variant '{}' of '{name}' has payload {}, which has no JSON shape class (str / number / bool / object)", v.name, ty_name(scalar_to_ty(sc))),
-                    span,
-                );
-                ok = false;
-                continue;
-            };
-            if let Some(prev) = &class_owner[cls as usize] {
-                self.diags.error(
-                    format!("union variants '{prev}' and '{}' of '{name}' map to the same JSON shape class — a shape-directed union needs pairwise-distinct classes", v.name),
-                    span,
-                );
-                ok = false;
-                continue;
-            }
-            class_owner[cls as usize] = Some(v.name.clone());
-            // An object (struct) payload — or the ELEMENT struct of an `array<Struct>` payload (J2b)
-            // — must itself be json-decodable: recurse into its fields (the array element reuses the
-            // struct-array descriptor, so its element struct is validated exactly like a nested object).
-            let recurse_sid = match sc {
-                Scalar::Struct(sid) | Scalar::DynStructArray(sid) => Some(sid),
-                _ => None,
-            };
-            if let Some(sid) = recurse_sid
-                && !self.json_struct_fields_ok(sid, span, dir)
-            {
-                ok = false;
+
+        struct UnionFrame {
+            id: u32,
+            name: String,
+            variants: Vec<hir::EnumVariant>,
+            next: usize,
+            class_owner: [Option<String>; JSON_SHAPE_CLASSES],
+            ok: bool,
+        }
+
+        enum Work {
+            Start(JsonShapeRoot),
+            Struct(StructFrame),
+            AfterStructChild(StructFrame),
+            Union(UnionFrame),
+            AfterUnionChild(UnionFrame),
+        }
+
+        let mut work = vec![Work::Start(root)];
+        let mut values = Vec::new();
+        let mut active_structs = HashSet::new();
+        let mut active_enums = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Start(JsonShapeRoot::Struct(id)) => {
+                    if !active_structs.insert(id) {
+                        self.diags.error(
+                            format!(
+                                "'{}' cannot {} a self-referential struct",
+                                dir.name(),
+                                dir.verb()
+                            ),
+                            span,
+                        );
+                        values.push(false);
+                        continue;
+                    }
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        active_structs.remove(&id);
+                        values.push(false);
+                        continue;
+                    };
+                    work.push(Work::Struct(StructFrame {
+                        id,
+                        fields: definition.fields.clone(),
+                        next: 0,
+                    }));
+                }
+                Work::Start(JsonShapeRoot::Enum(id)) => {
+                    if !active_enums.insert(id) {
+                        self.diags.error(
+                            format!(
+                                "'{}' cannot {} a self-referential struct",
+                                dir.name(),
+                                dir.verb()
+                            ),
+                            span,
+                        );
+                        values.push(false);
+                        continue;
+                    }
+                    let Some(definition) = self.enums.get(id as usize) else {
+                        active_enums.remove(&id);
+                        values.push(false);
+                        continue;
+                    };
+                    if definition.variants.is_empty() {
+                        self.diags.error(
+                            format!(
+                                "'{}' has no variants to decode as a JSON union",
+                                definition.name
+                            ),
+                            span,
+                        );
+                        active_enums.remove(&id);
+                        values.push(false);
+                        continue;
+                    }
+                    work.push(Work::Union(UnionFrame {
+                        id,
+                        name: definition.name.clone(),
+                        variants: definition.variants.clone(),
+                        next: 0,
+                        class_owner: Default::default(),
+                        ok: true,
+                    }));
+                }
+                Work::Struct(mut frame) => {
+                    let Some(field) = frame.fields.get(frame.next).cloned() else {
+                        active_structs.remove(&frame.id);
+                        values.push(true);
+                        continue;
+                    };
+                    frame.next += 1;
+                    let child = match field.ty {
+                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str => None,
+                        Ty::Struct(id)
+                        | Ty::Option(Scalar::Struct(id))
+                        | Ty::DynStructArray(id, _) => {
+                            Some(JsonShapeRoot::Struct(id))
+                        }
+                        Ty::Option(Scalar::Enum(id)) if dir == JsonDir::Encode => {
+                            Some(JsonShapeRoot::Enum(id))
+                        }
+                        Ty::Enum(id) => Some(JsonShapeRoot::Enum(id)),
+                        Ty::Option(Scalar::Int(_))
+                        | Ty::Option(Scalar::Float(_))
+                        | Ty::Option(Scalar::Bool)
+                        | Ty::Option(Scalar::Str)
+                        | Ty::DynArray(Scalar::Int(_))
+                        | Ty::DynArray(Scalar::Float(_))
+                        | Ty::DynArray(Scalar::Bool)
+                        | Ty::DynArray(Scalar::Str) => None,
+                        _ => {
+                            self.diags.error(
+                                format!(
+                                    "'{}' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct>/enum-union only for now)",
+                                    dir.name(),
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            active_structs.remove(&frame.id);
+                            values.push(false);
+                            continue;
+                        }
+                    };
+                    if let Some(child) = child {
+                        work.push(Work::AfterStructChild(frame));
+                        work.push(Work::Start(child));
+                    } else {
+                        work.push(Work::Struct(frame));
+                    }
+                }
+                Work::AfterStructChild(frame) => {
+                    let child_ok = values.pop().expect("JSON struct child result");
+                    if child_ok {
+                        work.push(Work::Struct(frame));
+                    } else {
+                        active_structs.remove(&frame.id);
+                        values.push(false);
+                    }
+                }
+                Work::Union(mut frame) => {
+                    let Some(variant) = frame.variants.get(frame.next).cloned() else {
+                        active_enums.remove(&frame.id);
+                        values.push(frame.ok);
+                        continue;
+                    };
+                    frame.next += 1;
+                    if variant.payload.len() != 1 {
+                        self.diags.error(
+                            format!(
+                                "union variant '{}' of '{}' must carry exactly one payload to map to a JSON value (a tag-only or multi-payload variant has no shape class)",
+                                variant.name, frame.name
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    }
+                    let payload = variant.payload[0];
+                    let Some(class) = union_shape_class(payload) else {
+                        self.diags.error(
+                            format!(
+                                "union variant '{}' of '{}' has payload {}, which has no JSON shape class (str / number / bool / object)",
+                                variant.name,
+                                frame.name,
+                                ty_name(scalar_to_ty(payload))
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    };
+                    if let Some(previous) = &frame.class_owner[class as usize] {
+                        self.diags.error(
+                            format!(
+                                "union variants '{previous}' and '{}' of '{}' map to the same JSON shape class — a shape-directed union needs pairwise-distinct classes",
+                                variant.name, frame.name
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    }
+                    frame.class_owner[class as usize] = Some(variant.name);
+                    let child = match payload {
+                        Scalar::Struct(id) | Scalar::DynStructArray(id) => {
+                            Some(JsonShapeRoot::Struct(id))
+                        }
+                        _ => None,
+                    };
+                    if let Some(child) = child {
+                        work.push(Work::AfterUnionChild(frame));
+                        work.push(Work::Start(child));
+                    } else {
+                        work.push(Work::Union(frame));
+                    }
+                }
+                Work::AfterUnionChild(mut frame) => {
+                    if !values.pop().expect("JSON union child result") {
+                        frame.ok = false;
+                    }
+                    work.push(Work::Union(frame));
+                }
             }
         }
-        ok
+        debug_assert_eq!(values.len(), 1);
+        values.pop().unwrap_or(false)
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
@@ -23352,159 +26296,236 @@ impl<'a, 't> Checker<'a, 't> {
         sid: u32,
         elem: Option<u32>,
         path_prefix: &[u32],
-        visiting: &mut Vec<u32>,
+        visiting: &[u32],
         parts: &mut Vec<TemplatePart>,
         span: Span,
         ok: &mut bool,
     ) {
-        // The struct graph is acyclic (`struct_acyclic`), but sema logs-and-continues, so a cyclic
-        // struct that already errored could still reach here with a `Ty::Struct` field looping back —
-        // guard so `json.encode` diagnoses instead of recursing forever.
-        if visiting.contains(&sid) {
-            self.diags
-                .error("'json.encode' cannot encode a self-referential struct".to_string(), span);
-            *ok = false;
-            return;
+        enum Work {
+            Enter {
+                id: u32,
+                projection: Option<u32>,
+            },
+            Field {
+                field: hir::FieldDef,
+                index: u32,
+                has_option: bool,
+            },
+            AfterRequired {
+                has_option: bool,
+            },
+            Exit {
+                id: u32,
+                pop_projection: bool,
+                has_option: bool,
+            },
         }
-        visiting.push(sid);
-        // Clone the field list so the recursion (which needs `&mut self`) doesn't hold a borrow of
-        // `self.structs` across the loop — `Field` is cheap to clone (a name + a `Copy` type).
-        let fields = self.structs[sid as usize].fields.clone();
-        // An `Option`-bearing object can't use the static leading-comma layout — a `None` field is
-        // omitted at runtime, so which field is "first" is dynamic. Switch to the trailing-comma
-        // scheme: every present field emits `"name":value,` and a `PopComma` before `}` drops the
-        // last one (`{"a":1,"b":2}` / `{}`). A pure-required object keeps the original static layout,
-        // so existing `json.encode` codegen is unchanged (zero regression surface).
-        let has_option = fields.iter().any(|f| matches!(f.ty, Ty::Option(_)));
-        parts.push(TemplatePart::Text("{".to_string()));
-        for (i, f) in fields.iter().enumerate() {
-            let mut full = path_prefix.to_vec();
-            full.push(i as u32);
-            let access = |ty: Ty| Expr {
-                kind: match elem {
-                    None => ExprKind::Field { root: base, path: full.clone() },
-                    Some(e) => ExprKind::IndexField { base, index: e, path: full.clone() },
-                },
-                ty,
-                span,
-            };
-            // An optional (`Option<T>`) field: a single conditional `OptionField` piece that emits
-            // `"name":value,` only when `Some`. Only present in the trailing-comma scheme.
-            if let Ty::Option(s) = f.ty {
-                if let Scalar::Struct(pid) = s {
-                    // `Option<struct>` encode (JSON completeness T1b): a conditional nested object — when
-                    // `Some`, the payload struct is rendered by the runtime descriptor-driven encoder
-                    // (`OptionStructField`); when `None`, the field is omitted (the trailing-comma
-                    // scheme + `PopComma`). The payload struct must be encodable (its schema drives the
-                    // descriptor table) — validate it like a decode target so a bad field is a clean
-                    // sema error, not a codegen surprise.
-                    if !self.json_struct_fields_ok(pid, span, JsonDir::Encode) {
-                        *ok = false;
-                    } else {
-                        parts.push(TemplatePart::OptionStructField { access: access(f.ty), name: f.name.clone(), struct_id: pid });
+
+        let mut work = vec![Work::Enter {
+            id: sid,
+            projection: None,
+        }];
+        let mut path = path_prefix.to_vec();
+        let mut active = visiting.iter().copied().collect::<HashSet<_>>();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Enter { id, projection } => {
+                    if let Some(projection) = projection {
+                        path.push(projection);
                     }
-                    continue;
-                }
-                // Every other payload is rendered by the flat `OptionField` writer, which knows the
-                // same value shapes a *required* field does — int, float, bool, str. The struct-field
-                // declaration gate above only rejects an **owned** payload (`sc.is_move()`), so a
-                // non-Move but unrenderable one (`Option<enum>`, `Option<slice<T>>`, `Option<()>`,
-                // `Option<char>`, a `soa`/`json.doc` view) used to reach codegen with no diagnostic
-                // at all and abort there. `json.encode` names its own encodable domain instead.
-                if !json_encodable_scalar(s) {
-                    self.diags.error(
-                        format!(
-                            "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    *ok = false;
-                    continue;
-                }
-                parts.push(TemplatePart::OptionField { access: access(f.ty), name: f.name.clone() });
-                continue;
-            }
-            // A required field. The key prefix carries the leading separator in the static layout, or
-            // no separator in the trailing-comma layout (the trailing comma is pushed after the value).
-            if has_option {
-                parts.push(TemplatePart::Text(format!("\"{}\":", f.name)));
-            } else {
-                let sep = if i == 0 { "" } else { "," };
-                parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
-            }
-            // A nested struct emits its own object; every leaf reads its field value through the full
-            // path (`base.path…` or the struct-array element `base[elem].path…`).
-            if let Ty::Struct(nid) = f.ty {
-                self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
-            } else if let Ty::DynStructArray(eid, _) = f.ty {
-                // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
-                // encoder (dynamic length → a runtime loop, not a static unroll). The ELEMENT struct's
-                // schema drives that descriptor table, so validate it like a decode target — exactly
-                // as the `Option<struct>` field above does — instead of letting an unrenderable
-                // element field surface as a codegen panic.
-                if !self.json_struct_fields_ok(eid, span, JsonDir::Encode) {
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
-                }
-            } else if let Ty::DynArray(s) = f.ty {
-                // An `array<scalar>` field (T1b) emits `[e0,e1,…]` via a runtime loop (dynamic length).
-                // The element rides the same flat leaf writer as an `Option` payload, so it obeys the
-                // same domain: `array<char>` and `array<enum>` have no JSON leaf rendering and used to
-                // reach codegen's descriptor builder, which aborted the compiler on them.
-                if !json_encodable_scalar(s) {
-                    self.diags.error(
-                        format!(
-                            "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::ScalarArrayField { access: access(f.ty), elem: s });
-                }
-            } else if let Ty::Enum(eid) = f.ty {
-                // A shape-directed union (`enum`) field (J1b-2b): emit the live variant's payload bare
-                // after the `"name":` prefix already pushed above — the value-side dual of the union
-                // decode field. The enum must be union-decodable (also validated at the decode side);
-                // check here too so encode-only use can't reach codegen's `emit_json_union` on a
-                // non-union enum (which would panic on a 0-/multi-payload variant).
-                if !self.check_union_decodable(eid, span, JsonDir::Encode) {
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::UnionValue { access: access(f.ty), enum_id: eid });
-                }
-            } else {
-                match f.ty {
-                    Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
-                    t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(access(f.ty))),
-                    _ => {
+                    let pop_projection = projection.is_some();
+                    if !active.insert(id) {
                         self.diags.error(
-                            format!(
-                                "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
-                                f.name,
-                                ty_name(f.ty)
-                            ),
+                            "'json.encode' cannot encode a self-referential struct".to_string(),
                             span,
                         );
                         *ok = false;
+                        if pop_projection {
+                            path.pop();
+                        }
                         continue;
+                    }
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        active.remove(&id);
+                        *ok = false;
+                        if pop_projection {
+                            path.pop();
+                        }
+                        continue;
+                    };
+                    let fields = definition.fields.clone();
+                    let has_option =
+                        fields.iter().any(|field| matches!(field.ty, Ty::Option(_)));
+                    parts.push(TemplatePart::Text("{".to_string()));
+                    work.push(Work::Exit {
+                        id,
+                        pop_projection,
+                        has_option,
+                    });
+                    for (index, field) in fields.into_iter().enumerate().rev() {
+                        work.push(Work::Field {
+                            field,
+                            index: index as u32,
+                            has_option,
+                        });
+                    }
+                }
+                Work::Field {
+                    field,
+                    index,
+                    has_option,
+                } => {
+                    let mut full = path.clone();
+                    full.push(index);
+                    let access = |ty: Ty| Expr {
+                        kind: match elem {
+                            None => ExprKind::Field {
+                                root: base,
+                                path: full.clone(),
+                            },
+                            Some(index) => ExprKind::IndexField {
+                                base,
+                                index,
+                                path: full.clone(),
+                            },
+                        },
+                        ty,
+                        span,
+                    };
+
+                    if let Ty::Option(payload) = field.ty {
+                        if let Scalar::Struct(id) = payload {
+                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::OptionStructField {
+                                    access: access(field.ty),
+                                    name: field.name,
+                                    struct_id: id,
+                                });
+                            }
+                            continue;
+                        }
+                        if !json_encodable_scalar(payload) {
+                            self.diags.error(
+                                format!(
+                                    "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            *ok = false;
+                            continue;
+                        }
+                        parts.push(TemplatePart::OptionField {
+                            access: access(field.ty),
+                            name: field.name,
+                        });
+                        continue;
+                    }
+
+                    if has_option {
+                        parts.push(TemplatePart::Text(format!("\"{}\":", field.name)));
+                    } else {
+                        let separator = if index == 0 { "" } else { "," };
+                        parts.push(TemplatePart::Text(format!(
+                            "{separator}\"{}\":",
+                            field.name
+                        )));
+                    }
+
+                    if let Ty::Struct(id) = field.ty {
+                        work.push(Work::AfterRequired { has_option });
+                        work.push(Work::Enter {
+                            id,
+                            projection: Some(index),
+                        });
+                        continue;
+                    }
+
+                    let mut skip_trailing_comma = false;
+                    match field.ty {
+                        Ty::DynStructArray(id, _) => {
+                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::StructArrayField {
+                                    access: access(field.ty),
+                                    struct_id: id,
+                                });
+                            }
+                        }
+                        Ty::DynArray(payload) => {
+                            if !json_encodable_scalar(payload) {
+                                self.diags.error(
+                                    format!(
+                                        "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
+                                        field.name,
+                                        ty_name(field.ty)
+                                    ),
+                                    span,
+                                );
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::ScalarArrayField {
+                                    access: access(field.ty),
+                                    elem: payload,
+                                });
+                            }
+                        }
+                        Ty::Enum(id) => {
+                            if !self.check_union_decodable(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::UnionValue {
+                                    access: access(field.ty),
+                                    enum_id: id,
+                                });
+                            }
+                        }
+                        Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
+                        ty if ty.is_numeric() || ty == Ty::Bool => {
+                            parts.push(TemplatePart::Hole(access(field.ty)));
+                        }
+                        _ => {
+                            self.diags.error(
+                                format!(
+                                    "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            *ok = false;
+                            skip_trailing_comma = true;
+                        }
+                    }
+                    if has_option && !skip_trailing_comma {
+                        parts.push(TemplatePart::Text(",".to_string()));
+                    }
+                }
+                Work::AfterRequired { has_option } => {
+                    if has_option {
+                        parts.push(TemplatePart::Text(",".to_string()));
+                    }
+                }
+                Work::Exit {
+                    id,
+                    pop_projection,
+                    has_option,
+                } => {
+                    if has_option {
+                        parts.push(TemplatePart::PopComma);
+                    }
+                    parts.push(TemplatePart::Text("}".to_string()));
+                    active.remove(&id);
+                    if pop_projection {
+                        path.pop();
                     }
                 }
             }
-            if has_option {
-                parts.push(TemplatePart::Text(",".to_string()));
-            }
         }
-        if has_option {
-            parts.push(TemplatePart::PopComma);
-        }
-        parts.push(TemplatePart::Text("}".to_string()));
-        visiting.pop();
     }
 
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
@@ -27653,6 +30674,46 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn finalize_expr(&mut self, e: &mut Expr) {
+        if self.finalize_node_active {
+            return;
+        }
+
+        let nodes = hir_depth::expr_postorder_mut(e);
+        // A literal negation chain is one semantic unit: only its outermost `-` emits the unsigned
+        // or range diagnostic. Mark every direct child of such a chain for type-only finalization;
+        // transitivity marks the whole inner chain, including its literal leaf.
+        let mut neg_chain_inners = HashSet::new();
+        for &node in &nodes {
+            // SAFETY: `expr_postorder_mut` finishes all shared traversal before returning and
+            // finalization never changes the expression topology.
+            let node_ref = unsafe { &*node };
+            if let ExprKind::Unary {
+                op: UnOp::Neg,
+                expr,
+            } = &node_ref.kind
+                && peel_neg_literal(expr).is_some()
+            {
+                neg_chain_inners.insert(expr.as_ref() as *const Expr as *mut Expr);
+            }
+        }
+
+        for node in nodes {
+            // SAFETY: every pointer belongs to `e`; the child-first list contains each node once,
+            // and no finalization arm replaces an expression, block, or child vector.
+            let node = unsafe { &mut *node };
+            if neg_chain_inners.contains(&(node as *mut Expr)) {
+                node.ty = self.finalize(node.ty);
+                continue;
+            }
+            self.finalize_node_active = true;
+            self.finalize_expr_node(node);
+            self.finalize_node_active = false;
+        }
+    }
+
+    /// Finalize one expression after all of its children. Child calls remain in this exhaustive
+    /// match as a local audit of the HIR shape, but are suppressed by `finalize_node_active`.
+    fn finalize_expr_node(&mut self, e: &mut Expr) {
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
         let span = e.span;
@@ -27740,10 +30801,7 @@ impl<'a, 't> Checker<'a, 't> {
                     ));
                 }
             }
-            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
-                self.finalize_expr(lhs);
-                self.finalize_expr(rhs);
-            }
+            ExprKind::Binary { .. } | ExprKind::IntArith { .. } => {}
             ExprKind::Call { func, args, type_args } => {
                 for a in args {
                     self.finalize_expr(a);
@@ -29195,36 +32253,72 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
 /// Substitute a `Scalar::Param(i)` with the scalar form of `args[i]` (a generic enum's variant
 /// payload, or a composite payload). A non-`Param` scalar is unchanged.
 fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Scalar {
-    match s {
-        Scalar::Param(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
-            Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
-                tagged_types,
-                hir::TaggedType::Option(payload),
-            )),
-            Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
-                tagged_types,
-                hir::TaggedType::Result(ok, err),
-            )),
-            ty => ty_to_scalar(ty).unwrap_or(s),
-        },
-        Scalar::Tagged(id) => {
-            let Some(tagged) = tagged_types.get(id as usize).copied() else {
-                return s;
-            };
-            let concrete = match tagged {
-                hir::TaggedType::Option(payload) => {
-                    hir::TaggedType::Option(subst_scalar(payload, args, tagged_types))
-                }
-                hir::TaggedType::Result(ok, err) => {
-                    let ok = subst_scalar(ok, args, tagged_types);
-                    let err = subst_scalar(err, args, tagged_types);
-                    hir::TaggedType::Result(ok, err)
-                }
-            };
-            Scalar::Tagged(intern_tagged_type(tagged_types, concrete))
-        }
-        other => other,
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter(Scalar),
+        FinishOption(u32),
+        FinishResult(u32),
     }
+
+    let mut work = vec![Work::Enter(s)];
+    let mut values = Vec::new();
+    let mut visiting = HashSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Scalar::Param(index)) => {
+                let original = Scalar::Param(index);
+                let value = match args.get(index as usize).copied().unwrap_or(Ty::Error) {
+                    Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                        tagged_types,
+                        hir::TaggedType::Option(payload),
+                    )),
+                    Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                        tagged_types,
+                        hir::TaggedType::Result(ok, err),
+                    )),
+                    ty => ty_to_scalar(ty).unwrap_or(original),
+                };
+                values.push(value);
+            }
+            Work::Enter(Scalar::Tagged(id)) if visiting.insert(id) => {
+                match tagged_types.get(id as usize).copied() {
+                    Some(hir::TaggedType::Option(payload)) => {
+                        work.push(Work::FinishOption(id));
+                        work.push(Work::Enter(payload));
+                    }
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        work.push(Work::FinishResult(id));
+                        work.push(Work::Enter(err));
+                        work.push(Work::Enter(ok));
+                    }
+                    None => {
+                        visiting.remove(&id);
+                        values.push(Scalar::Tagged(id));
+                    }
+                }
+            }
+            Work::Enter(other) => values.push(other),
+            Work::FinishOption(id) => {
+                let payload = values.pop().expect("substituted option payload");
+                visiting.remove(&id);
+                values.push(Scalar::Tagged(intern_tagged_type(
+                    tagged_types,
+                    hir::TaggedType::Option(payload),
+                )));
+            }
+            Work::FinishResult(id) => {
+                let err = values.pop().expect("substituted result error");
+                let ok = values.pop().expect("substituted result success");
+                visiting.remove(&id);
+                values.push(Scalar::Tagged(intern_tagged_type(
+                    tagged_types,
+                    hir::TaggedType::Result(ok, err),
+                )));
+            }
+        }
+    }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().unwrap_or(s)
 }
 
 /// Whether a type carries a generic `Param` — bare, or nested one level in a scalar-payload
@@ -29234,88 +32328,77 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
 fn mark_nested_params(ty: Ty, nested: &mut [bool], tagged_types: &[hir::TaggedType]) {
-    fn mark_scalar(
-        scalar: Scalar,
-        nested: &mut [bool],
-        tagged_types: &[hir::TaggedType],
-        visiting: &mut HashSet<u32>,
-    ) {
+    let mut work = Vec::new();
+    match ty {
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
+            work.push(s);
+        }
+        Ty::Result(ok, err) => {
+            work.push(err);
+            work.push(ok);
+        }
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
+    }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
         match scalar {
             Scalar::Param(p) => {
                 if let Some(slot) = nested.get_mut(p as usize) {
                     *slot = true;
                 }
             }
-            Scalar::Tagged(id) if visiting.insert(id) => {
+            Scalar::Tagged(id) if visited.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
-                        hir::TaggedType::Option(payload) => {
-                            mark_scalar(payload, nested, tagged_types, visiting);
-                        }
+                        hir::TaggedType::Option(payload) => work.push(payload),
                         hir::TaggedType::Result(ok, err) => {
-                            mark_scalar(ok, nested, tagged_types, visiting);
-                            mark_scalar(err, nested, tagged_types, visiting);
+                            work.push(err);
+                            work.push(ok);
                         }
                     }
                 }
-                visiting.remove(&id);
             }
             _ => {}
         }
     }
-    let mut visiting = HashSet::new();
-    match ty {
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
-            mark_scalar(s, nested, tagged_types, &mut visiting);
-        }
-        Ty::Result(o, e) => {
-            mark_scalar(o, nested, tagged_types, &mut visiting);
-            mark_scalar(e, nested, tagged_types, &mut visiting);
-        }
-        Ty::Tagged(id) => mark_scalar(Scalar::Tagged(id), nested, tagged_types, &mut visiting),
-        _ => {}
-    }
 }
 
 fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    fn scalar_mentions(
-        scalar: Scalar,
-        tagged_types: &[hir::TaggedType],
-        visiting: &mut HashSet<u32>,
-    ) -> bool {
-        match scalar {
-            Scalar::Param(_) => true,
-            Scalar::Tagged(id) if visiting.insert(id) => {
-                let mentions = tagged_types
-                    .get(id as usize)
-                    .is_some_and(|tagged| match *tagged {
-                        hir::TaggedType::Option(payload) => {
-                            scalar_mentions(payload, tagged_types, visiting)
-                        }
-                        hir::TaggedType::Result(ok, err) => {
-                            scalar_mentions(ok, tagged_types, visiting)
-                                || scalar_mentions(err, tagged_types, visiting)
-                        }
-                    });
-                visiting.remove(&id);
-                mentions
-            }
-            _ => false,
-        }
+    if matches!(ty, Ty::Param(_)) {
+        return true;
     }
-    let mut visiting = HashSet::new();
+    let mut work = Vec::new();
     match ty {
-        Ty::Param(_) => true,
         Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
-            scalar_mentions(s, tagged_types, &mut visiting)
+            work.push(s);
         }
         Ty::Result(ok, err) => {
-            scalar_mentions(ok, tagged_types, &mut visiting)
-                || scalar_mentions(err, tagged_types, &mut visiting)
+            work.push(err);
+            work.push(ok);
         }
-        Ty::Tagged(id) => scalar_mentions(Scalar::Tagged(id), tagged_types, &mut visiting),
-        _ => false,
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
     }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
+        match scalar {
+            Scalar::Param(_) => return true,
+            Scalar::Tagged(id) if visited.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(payload),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(err);
+                            work.push(ok);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
@@ -29418,185 +32501,167 @@ fn ty_mangle_impl(
     fn_types: &[hir::FnTy],
     include_fn_origin: bool,
 ) -> String {
-    #[allow(clippy::too_many_arguments)]
-    fn key(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        structs: &[StructDef],
-        enums: &[hir::EnumDef],
-        tuples: &[hir::TupleDef],
-        fn_types: &[hir::FnTy],
-        include_fn_origin: bool,
-        tagged_visiting: &mut HashSet<u32>,
-        fn_visiting: &mut HashSet<u32>,
-    ) -> String {
-        let scalar = |s: Scalar,
-                      tagged_visiting: &mut HashSet<u32>,
-                      fn_visiting: &mut HashSet<u32>| {
-            key(
-                scalar_to_ty(s),
-                tagged_types,
-                structs,
-                enums,
-                tuples,
-                fn_types,
-                include_fn_origin,
-                tagged_visiting,
-                fn_visiting,
-            )
-        };
-        match ty {
-            Ty::Struct(id) => structs.get(id as usize).map_or_else(
-                || "S_invalid".to_string(),
-                |s| {
-                    let name = if include_fn_origin {
-                        &s.name
-                    } else {
-                        &s.source_name
-                    };
-                    format!("S{}_{}", name.len(), name)
-                },
-            ),
-            Ty::Enum(id) => enums.get(id as usize).map_or_else(
-                || "E_invalid".to_string(),
-                |e| {
-                    let name = if include_fn_origin {
-                        &e.name
-                    } else {
-                        &e.source_name
-                    };
-                    format!("E{}_{}", name.len(), name)
-                },
-            ),
-            Ty::Tagged(id) if tagged_visiting.insert(id) => {
-                let result = match tagged_types.get(id as usize) {
-                    Some(hir::TaggedType::Option(payload)) => {
-                        format!("O_{}", scalar(*payload, tagged_visiting, fn_visiting))
-                    }
-                    Some(hir::TaggedType::Result(ok, err)) => {
-                        format!(
-                            "R_{}_{}",
-                            scalar(*ok, tagged_visiting, fn_visiting),
-                            scalar(*err, tagged_visiting, fn_visiting)
-                        )
-                    }
-                    None => "T_invalid".to_string(),
-                };
+    enum Work {
+        Type(Ty),
+        Text(String),
+        ExitTagged(u32),
+        ExitFn(u32),
+    }
+
+    fn push_sequence(work: &mut Vec<Work>, sequence: Vec<Work>) {
+        work.extend(sequence.into_iter().rev());
+    }
+
+    let mut work = vec![Work::Type(ty)];
+    let mut output = String::new();
+    let mut tagged_visiting = HashSet::new();
+    let mut fn_visiting = HashSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Text(text) => output.push_str(&text),
+            Work::ExitTagged(id) => {
                 tagged_visiting.remove(&id);
-                result
             }
-            Ty::Tagged(_) => "T_cycle".to_string(),
-            Ty::Option(payload) => {
-                format!("O_{}", scalar(payload, tagged_visiting, fn_visiting))
+            Work::ExitFn(id) => {
+                fn_visiting.remove(&id);
             }
-            Ty::Result(ok, err) => {
-                format!(
-                    "R_{}_{}",
-                    scalar(ok, tagged_visiting, fn_visiting),
-                    scalar(err, tagged_visiting, fn_visiting)
-                )
-            }
-            Ty::Box(payload) => {
-                format!("B_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Array(payload, n) => {
-                format!("A{n}_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Slice(payload) => {
-                format!("V_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::DynArray(payload) => {
-                format!("D_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::Task(payload) => {
-                format!("K_{}", scalar(payload, tagged_visiting, fn_visiting))
-            }
-            Ty::StructArray(id, n) => format!(
-                "A{n}_{}",
-                key(
-                    Ty::Struct(id),
-                    tagged_types,
-                    structs,
-                    enums,
-                    tuples,
-                    fn_types,
-                    include_fn_origin,
-                    tagged_visiting,
-                    fn_visiting
-                )
-            ),
-            Ty::DynStructArray(id, _) => {
-                format!(
-                    "D_{}",
-                    key(
-                        Ty::Struct(id),
-                        tagged_types,
-                        structs,
-                        enums,
-                        tuples,
-                        fn_types,
-                        include_fn_origin,
-                        tagged_visiting,
-                        fn_visiting
-                    )
-                )
-            }
-            Ty::Soa(id) => format!(
-                "Q_{}",
-                key(
-                    Ty::Struct(id),
-                    tagged_types,
-                    structs,
-                    enums,
-                    tuples,
-                    fn_types,
-                    include_fn_origin,
-                    tagged_visiting,
-                    fn_visiting
-                )
-            ),
-            Ty::Tuple(id) => tuples.get(id as usize).map_or_else(
-                || "U_invalid".to_string(),
-                |tuple| {
-                    format!(
-                        "U{}_{}",
-                        tuple.elems.len(),
-                        tuple
-                            .elems
-                            .iter()
-                            .map(|element| {
-                                scalar(
-                                    *element,
-                                    tagged_visiting,
-                                    fn_visiting,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    )
+            Work::Type(ty) => match ty {
+                Ty::Struct(id) => output.push_str(&structs.get(id as usize).map_or_else(
+                    || "S_invalid".to_string(),
+                    |structure| {
+                        let name = if include_fn_origin {
+                            &structure.name
+                        } else {
+                            &structure.source_name
+                        };
+                        format!("S{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::Enum(id) => output.push_str(&enums.get(id as usize).map_or_else(
+                    || "E_invalid".to_string(),
+                    |enumeration| {
+                        let name = if include_fn_origin {
+                            &enumeration.name
+                        } else {
+                            &enumeration.source_name
+                        };
+                        format!("E{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::Tagged(id) if tagged_visiting.insert(id) => {
+                    let sequence = match tagged_types.get(id as usize).copied() {
+                        Some(hir::TaggedType::Option(payload)) => vec![
+                            Work::Text("O_".to_string()),
+                            Work::Type(scalar_to_ty(payload)),
+                            Work::ExitTagged(id),
+                        ],
+                        Some(hir::TaggedType::Result(ok, err)) => vec![
+                            Work::Text("R_".to_string()),
+                            Work::Type(scalar_to_ty(ok)),
+                            Work::Text("_".to_string()),
+                            Work::Type(scalar_to_ty(err)),
+                            Work::ExitTagged(id),
+                        ],
+                        None => {
+                            tagged_visiting.remove(&id);
+                            vec![Work::Text("T_invalid".to_string())]
+                        }
+                    };
+                    push_sequence(&mut work, sequence);
+                }
+                Ty::Tagged(_) => output.push_str("T_cycle"),
+                Ty::Option(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("O_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Result(ok, err) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("R_".to_string()),
+                        Work::Type(scalar_to_ty(ok)),
+                        Work::Text("_".to_string()),
+                        Work::Type(scalar_to_ty(err)),
+                    ],
+                ),
+                Ty::Box(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("B_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Array(payload, len) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text(format!("A{len}_")),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Slice(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("V_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::DynArray(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("D_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::Task(payload) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("K_".to_string()),
+                        Work::Type(scalar_to_ty(payload)),
+                    ],
+                ),
+                Ty::StructArray(id, len) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text(format!("A{len}_")),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::DynStructArray(id, _) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("D_".to_string()),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::Soa(id) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("Q_".to_string()),
+                        Work::Type(Ty::Struct(id)),
+                    ],
+                ),
+                Ty::Tuple(id) => match tuples.get(id as usize) {
+                    None => output.push_str("U_invalid"),
+                    Some(tuple) => {
+                        let mut sequence =
+                            vec![Work::Text(format!("U{}_", tuple.elems.len()))];
+                        for (index, element) in tuple.elems.iter().enumerate() {
+                            if index > 0 {
+                                sequence.push(Work::Text("_".to_string()));
+                            }
+                            sequence.push(Work::Type(scalar_to_ty(*element)));
+                        }
+                        push_sequence(&mut work, sequence);
+                    }
                 },
-            ),
-            Ty::Fn(id) if fn_visiting.insert(id) => {
-                let result = fn_types.get(id as usize).map_or_else(
-                    || "F_invalid".to_string(),
-                    |function| {
-                        let params = function
-                            .params
-                            .iter()
-                            .map(|(mode, ty)| {
-                                let mode = match mode {
-                                    ast::ParamMode::ByValue => "v",
-                                    ast::ParamMode::Out => "o",
-                                    ast::ParamMode::Borrow => "b",
-                                    ast::ParamMode::BorrowMut => "m",
-                                };
-                                format!(
-                                    "{mode}{}",
-                                    scalar(*ty, tagged_visiting, fn_visiting)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("_");
+                Ty::Fn(id) if fn_visiting.insert(id) => match fn_types.get(id as usize) {
+                    None => {
+                        fn_visiting.remove(&id);
+                        output.push_str("F_invalid");
+                    }
+                    Some(function) => {
                         let roots = |params: &[u32], captures: &[u32]| {
                             format!(
                                 "p{}_c{}",
@@ -29629,42 +32694,44 @@ fn ty_mangle_impl(
                         } else {
                             String::new()
                         };
-                        format!(
-                            "F{origin}_{params}_{}_b{borrow}_r{region}",
-                            key(
-                                function.ret,
-                                tagged_types,
-                                structs,
-                                enums,
-                                tuples,
-                                fn_types,
-                                include_fn_origin,
-                                tagged_visiting,
-                                fn_visiting
-                            )
-                        )
-                    },
-                );
-                fn_visiting.remove(&id);
-                result
-            }
-            Ty::Fn(_) => "F_cycle".to_string(),
-            other => ty_name(other),
+                        let mut sequence = vec![Work::Text(format!("F{origin}_"))];
+                        for (index, (mode, ty)) in function.params.iter().enumerate() {
+                            if index > 0 {
+                                sequence.push(Work::Text("_".to_string()));
+                            }
+                            let mode = match mode {
+                                ast::ParamMode::ByValue => "v",
+                                ast::ParamMode::Out => "o",
+                                ast::ParamMode::Borrow => "b",
+                                ast::ParamMode::BorrowMut => "m",
+                            };
+                            sequence.push(Work::Text(mode.to_string()));
+                            sequence.push(Work::Type(scalar_to_ty(*ty)));
+                        }
+                        sequence.push(Work::Text("_".to_string()));
+                        sequence.push(Work::Type(function.ret));
+                        sequence.push(Work::Text(format!(
+                            "_b{borrow}_r{region}"
+                        )));
+                        sequence.push(Work::ExitFn(id));
+                        push_sequence(&mut work, sequence);
+                    }
+                },
+                Ty::Fn(_) => output.push_str("F_cycle"),
+                other => output.push_str(&ty_name(other)),
+            },
         }
     }
-    key(
-        ty,
-        tagged_types,
-        structs,
-        enums,
-        tuples,
-        fn_types,
-        include_fn_origin,
-        &mut HashSet::new(),
-        &mut HashSet::new(),
-    )
+
+    output
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -30495,68 +33562,77 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     // struct). An owned (`string`, Move-struct, or `Option<owned>`) field makes the enclosing struct a
     // Move type with a recursive `Drop` (Slice 3 / the REST-gateway runway Slice B). Owned
     // *collections* (`array<T>` etc.) as fields are a later slice.
-    match ty {
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
         // enclosing struct to borrowed storage (`struct_has_str_rec` / `tracks_region` handle that).
-        Ty::Enum(_) => true,
+        Ty::Enum(_) => {}
         // A Move **handle** field (F1②, the pkg.web request `Ctx` owning its `http_request_ctx`). A
         // bare pointer handle (`file`, `http_request_ctx`, a reader/writer/buffer, a socket, an http
         // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
         // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
         // handle arm → the null-safe `*_free`; the DropPlan leaf makes the struct Move). The admitted
         // set matches codegen's `handle_free_fn`.
-        _ if is_move_handle(ty) => true,
+        _ if is_move_handle(ty) => {}
         // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
         // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no
         // heap (its DropPlan is `None`, so the enclosing struct stays **Copy** — a Move
         // `Ctx` would be consumed by its own accessors) and needs no drop. It region-ties the
         // enclosing struct to the request buffer: `region_of(StructLit)` folds in each field's region,
         // so a `Ctx` built from a local ctx handle cannot outlive it.
-        Ty::HttpHeaders => true,
+        Ty::HttpHeaders => {}
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
-        // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
+        // buffer (16 bytes / 8-align — `abi_type`/the type-layout engine already size it), owns no heap
         // (its DropPlan is `None`, so the enclosing struct stays non-Move) and needs no
         // drop. It region-ties the enclosing struct to the borrowed buffer: `region_of(StructLit)`
         // folds in each field value's region, so a struct holding a slice field cannot outlive the
         // buffer the slice views (the escape check enforces it). A `slice<str>` element also carries
         // `str` views, tracked via `struct_has_str_rec` below.
-        Ty::Slice(_) => true,
+        Ty::Slice(_) => {}
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
-        // `abi_type`/`ty_size_align` already size it), owns no heap (its DropPlan is `None`,
+        // `abi_type`/the type-layout engine already size it), owns no heap (its DropPlan is `None`,
         // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
-        Ty::Fn(_) => true,
+        Ty::Fn(_) => {}
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
         // rejected until array-in-Option lands, matching the direct-field rule).
-        Ty::Option(s) => is_field_ok(scalar_to_ty(s), tagged_types),
+        Ty::Option(s) => work.push(scalar_to_ty(s)),
         Ty::Result(ok, err) => {
-            is_field_ok(scalar_to_ty(ok), tagged_types)
-                && is_field_ok(scalar_to_ty(err), tagged_types)
+            work.push(scalar_to_ty(err));
+            work.push(scalar_to_ty(ok));
         }
-        Ty::Tagged(id) => tagged_types
-            .get(id as usize)
-            .is_some_and(|entry| match *entry {
+        Ty::Tagged(id) if visited_tagged.insert(id) => {
+            let Some(entry) = tagged_types.get(id as usize) else {
+                return false;
+            };
+            match *entry {
                 hir::TaggedType::Option(payload) => {
-                    is_field_ok(scalar_to_ty(payload), tagged_types)
+                    work.push(scalar_to_ty(payload));
                 }
                 hir::TaggedType::Result(ok, err) => {
-                    is_field_ok(scalar_to_ty(ok), tagged_types)
-                        && is_field_ok(scalar_to_ty(err), tagged_types)
+                    work.push(scalar_to_ty(err));
+                    work.push(scalar_to_ty(ok));
                 }
-            }),
+            }
+        }
+        Ty::Tagged(_) => return false,
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
         // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
         // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
         // (pass 0b-2), where the struct table is populated; here we admit the array shape.
-        Ty::DynArray(_) | Ty::DynStructArray(..) => true,
-        _ => false,
+        Ty::DynArray(_) | Ty::DynStructArray(..) => {}
+        _ => return false,
+        }
     }
+    true
 }
 
 fn collect_inline_struct_ids(
@@ -30564,83 +33640,66 @@ fn collect_inline_struct_ids(
     tagged_types: &[hir::TaggedType],
     output: &mut Vec<u32>,
 ) {
-    fn visit(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        active: &mut Vec<u32>,
-        output: &mut Vec<u32>,
-    ) {
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
         match ty {
             Ty::Struct(id) => {
                 if !output.contains(&id) {
                     output.push(id);
                 }
             }
-            Ty::Option(payload) => {
-                visit(scalar_to_ty(payload), tagged_types, active, output)
-            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
             Ty::Result(ok, err) => {
-                visit(scalar_to_ty(ok), tagged_types, active, output);
-                visit(scalar_to_ty(err), tagged_types, active, output);
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
             }
-            Ty::Tagged(id) if !active.contains(&id) => {
-                let Some(entry) = tagged_types.get(id as usize) else {
-                    return;
-                };
-                active.push(id);
-                match *entry {
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(entry) = tagged_types.get(id as usize) {
+                    match *entry {
                     hir::TaggedType::Option(payload) => {
-                        visit(scalar_to_ty(payload), tagged_types, active, output)
+                            work.push(scalar_to_ty(payload));
                     }
                     hir::TaggedType::Result(ok, err) => {
-                        visit(scalar_to_ty(ok), tagged_types, active, output);
-                        visit(scalar_to_ty(err), tagged_types, active, output);
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
                     }
                 }
-                active.pop();
             }
             _ => {}
         }
     }
-    visit(ty, tagged_types, &mut Vec::new(), output);
 }
 
 fn ty_contains_inline_enum(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    fn visit(
-        ty: Ty,
-        tagged_types: &[hir::TaggedType],
-        active: &mut Vec<u32>,
-    ) -> bool {
+    let mut work = vec![ty];
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
         match ty {
-            Ty::Enum(_) => true,
-            Ty::Option(payload) => {
-                visit(scalar_to_ty(payload), tagged_types, active)
-            }
+            Ty::Enum(_) => return true,
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
             Ty::Result(ok, err) => {
-                visit(scalar_to_ty(ok), tagged_types, active)
-                    || visit(scalar_to_ty(err), tagged_types, active)
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
             }
-            Ty::Tagged(id) if !active.contains(&id) => {
-                let Some(entry) = tagged_types.get(id as usize) else {
-                    return false;
-                };
-                active.push(id);
-                let found = match *entry {
-                    hir::TaggedType::Option(payload) => {
-                        visit(scalar_to_ty(payload), tagged_types, active)
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(entry) = tagged_types.get(id as usize) {
+                    match *entry {
+                        hir::TaggedType::Option(payload) => {
+                            work.push(scalar_to_ty(payload));
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
                     }
-                    hir::TaggedType::Result(ok, err) => {
-                        visit(scalar_to_ty(ok), tagged_types, active)
-                            || visit(scalar_to_ty(err), tagged_types, active)
-                    }
-                };
-                active.pop();
-                found
+                }
             }
-            _ => false,
+            _ => {}
         }
     }
-    visit(ty, tagged_types, &mut Vec::new())
+    false
 }
 
 /// Whether struct `id`'s complete inline layout graph is acyclic. Structs, Options, Results, and
@@ -30651,7 +33710,7 @@ fn struct_acyclic(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
+    visiting: &[u32],
 ) -> bool {
     type_graph_acyclic(
         Ty::Struct(id),
@@ -30659,8 +33718,6 @@ fn struct_acyclic(
         enums,
         tagged_types,
         visiting,
-        &mut Vec::new(),
-        &mut Vec::new(),
     )
 }
 
@@ -30675,9 +33732,7 @@ fn enum_acyclic(
         structs,
         enums,
         tagged_types,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &mut Vec::new(),
+        &[],
     )
 }
 
@@ -30686,127 +33741,107 @@ fn type_graph_acyclic(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    struct_path: &mut Vec<u32>,
-    enum_path: &mut Vec<u32>,
-    tagged_path: &mut Vec<u32>,
+    initial_struct_path: &[u32],
 ) -> bool {
-    match ty {
-        Ty::Struct(id) => {
-            if struct_path.contains(&id) {
-                return false;
-            }
-            let Some(def) = structs.get(id as usize) else { return true };
-            struct_path.push(id);
-            let ok = def
-                .fields
-                .iter()
-                .all(|field| {
-                    type_graph_acyclic(
-                        field.ty,
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                });
-            struct_path.pop();
-            ok
-        }
-        Ty::Enum(id) => {
-            if enum_path.contains(&id) {
-                return false;
-            }
-            let Some(def) = enums.get(id as usize) else { return true };
-            enum_path.push(id);
-            let ok = def.variants.iter().all(|variant| {
-                variant.payload.iter().all(|payload| {
-                    type_graph_acyclic(
-                        scalar_to_ty(*payload),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                })
-            });
-            enum_path.pop();
-            ok
-        }
-        Ty::Option(payload) => type_graph_acyclic(
-            scalar_to_ty(payload),
-            structs,
-            enums,
-            tagged_types,
-            struct_path,
-            enum_path,
-            tagged_path,
-        ),
-        Ty::Result(ok, err) => {
-            type_graph_acyclic(
-                scalar_to_ty(ok),
-                structs,
-                enums,
-                tagged_types,
-                struct_path,
-                enum_path,
-                tagged_path,
-            ) && type_graph_acyclic(
-                scalar_to_ty(err),
-                structs,
-                enums,
-                tagged_types,
-                struct_path,
-                enum_path,
-                tagged_path,
-            )
-        }
-        Ty::Tagged(id) => {
-            if tagged_path.contains(&id) {
-                return false;
-            }
-            let Some(entry) = tagged_types.get(id as usize) else {
-                return false;
-            };
-            tagged_path.push(id);
-            let ok = match *entry {
-                hir::TaggedType::Option(payload) => type_graph_acyclic(
-                    scalar_to_ty(payload),
-                    structs,
-                    enums,
-                    tagged_types,
-                    struct_path,
-                    enum_path,
-                    tagged_path,
-                ),
-                hir::TaggedType::Result(ok, err) => {
-                    type_graph_acyclic(
-                        scalar_to_ty(ok),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    ) && type_graph_acyclic(
-                        scalar_to_ty(err),
-                        structs,
-                        enums,
-                        tagged_types,
-                        struct_path,
-                        enum_path,
-                        tagged_path,
-                    )
-                }
-            };
-            tagged_path.pop();
-            ok
-        }
-        _ => true,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum Node {
+        Struct(u32),
+        Enum(u32),
+        Tagged(u32),
     }
+
+    enum Work {
+        Enter(Ty),
+        Exit(Node),
+    }
+
+    let mut active: std::collections::HashSet<Node> = initial_struct_path
+        .iter()
+        .copied()
+        .map(Node::Struct)
+        .collect();
+    let mut complete = std::collections::HashSet::new();
+    let mut work = vec![Work::Enter(ty)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(Ty::Struct(id)) => {
+                let node = Node::Struct(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(definition) = structs.get(id as usize) else {
+                    active.remove(&node);
+                    continue;
+                };
+                work.push(Work::Exit(node));
+                for field in definition.fields.iter().rev() {
+                    work.push(Work::Enter(field.ty));
+                }
+            }
+            Work::Enter(Ty::Enum(id)) => {
+                let node = Node::Enum(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(definition) = enums.get(id as usize) else {
+                    active.remove(&node);
+                    continue;
+                };
+                work.push(Work::Exit(node));
+                for payload in definition
+                    .variants
+                    .iter()
+                    .rev()
+                    .flat_map(|variant| variant.payload.iter().rev())
+                {
+                    work.push(Work::Enter(scalar_to_ty(*payload)));
+                }
+            }
+            Work::Enter(Ty::Option(payload)) => {
+                work.push(Work::Enter(scalar_to_ty(payload)));
+            }
+            Work::Enter(Ty::Result(ok, err)) => {
+                work.push(Work::Enter(scalar_to_ty(err)));
+                work.push(Work::Enter(scalar_to_ty(ok)));
+            }
+            Work::Enter(Ty::Tagged(id)) => {
+                let node = Node::Tagged(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                if !active.insert(node) {
+                    return false;
+                }
+                let Some(entry) = tagged_types.get(id as usize) else {
+                    return false;
+                };
+                work.push(Work::Exit(node));
+                match *entry {
+                    hir::TaggedType::Option(payload) => {
+                        work.push(Work::Enter(scalar_to_ty(payload)));
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        work.push(Work::Enter(scalar_to_ty(err)));
+                        work.push(Work::Enter(scalar_to_ty(ok)));
+                    }
+                }
+            }
+            Work::Enter(_) => {}
+            Work::Exit(node) => {
+                if !active.remove(&node) {
+                    return false;
+                }
+                complete.insert(node);
+            }
+        }
+    }
+    true
 }
 
 /// Whether a scalar is a valid sum-type variant payload. Direct structs and sums may be Move: the
@@ -31149,6 +34184,9 @@ fn main() -> i32 = 0
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
@@ -31863,6 +34901,205 @@ fn main() -> i32 = 0
                 .map(|function| function.effect.get())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn effect_scan_prunes_transitively_diverging_template_holes() {
+        let (mut program, diagnostics) = check(
+            "\
+fn id(value: i64) -> i64 = value
+fn impure() -> i64 {
+  print(1)
+  return 1
+}
+fn wrapper() -> i64 {
+  template \"{id(1)}{impure()}\"
+  print(2)
+  return 0
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::Template(parts),
+            ..
+        }) = &mut wrapper.body.stmts[0]
+        else {
+            panic!("wrapper template statement");
+        };
+        let first_hole = parts
+            .iter_mut()
+            .find_map(|part| match part {
+                TemplatePart::Hole(expression) => Some(expression),
+                _ => None,
+            })
+            .expect("first template hole");
+        let ExprKind::Call { args, .. } = &mut first_hole.kind else {
+            panic!("first template hole call");
+        };
+        args[0] = Expr {
+            kind: ExprKind::Loop {
+                body: Block {
+                    stmts: Vec::new(),
+                    value: None,
+                },
+                diverges: true,
+                body_locals: 0..0,
+            },
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span: args[0].span,
+        };
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new()).get("wrapper"),
+            Some(&FnEffect::Pure),
+            "the nested diverging first hole must suppress the later impure hole and statement"
+        );
+    }
+
+    #[test]
+    fn effect_scan_prunes_transitively_diverging_stage_captures() {
+        let (mut program, diagnostics) = check(
+            "\
+fn id(value: i64) -> i64 = value
+fn impure(value: i64) -> i64 {
+  print(value)
+  return value
+}
+fn wrapper() -> i64 {
+  first := 1
+  second := 2
+  [1].map(fn value { impure(value + first + second) }).sum()
+  print(3)
+  return 0
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let wrapper = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "wrapper")
+            .expect("wrapper function");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::ArraySum { stages, .. },
+            ..
+        }) = &mut wrapper.body.stmts[2]
+        else {
+            panic!("wrapper pipeline statement");
+        };
+        let StageKind::Map { captures, .. } = &mut stages[0].kind else {
+            panic!("wrapper map stage");
+        };
+        assert_eq!(captures.len(), 2, "the lambda must capture both locals");
+        let capture_span = captures[0].span;
+        captures[0] = Expr {
+            kind: ExprKind::Call {
+                func: "id".to_string(),
+                args: vec![Expr {
+                    kind: ExprKind::Loop {
+                        body: Block {
+                            stmts: Vec::new(),
+                            value: None,
+                        },
+                        diverges: true,
+                        body_locals: 0..0,
+                    },
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span: capture_span,
+                }],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span: capture_span,
+        };
+        assert_eq!(
+            fn_effects(&program, &std::collections::HashMap::new()).get("wrapper"),
+            Some(&FnEffect::Pure),
+            "the first diverging capture must suppress later captures, callback action, and statements"
+        );
+    }
+
+    #[test]
+    fn process_termination_is_known_non_fallthrough_at_joins() {
+        let (program, diagnostics) = check(
+            "\
+import std.process
+fn abort_branch(flag: bool) -> i64 {
+  value := \"abort\".clone()
+  if flag {
+    consumed := value
+    process.abort()
+  }
+  return value.len()
+}
+fn exit_branch(flag: bool) -> i64 {
+  value := \"exit\".clone()
+  if flag {
+    consumed := value
+    process.exit(1)
+  }
+  return value.len()
+}
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "a move on a terminating branch must not poison its join: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        for name in ["abort_branch", "exit_branch"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} function"));
+            let Stmt::Expr(Expr {
+                kind: ExprKind::If { then, .. },
+                ..
+            }) = &function.body.stmts[1]
+            else {
+                panic!("{name} if statement");
+            };
+            let termination = then
+                .value
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} termination value"));
+            assert!(
+                hir_expr_diverges(termination),
+                "{name} termination must be non-fallthrough"
+            );
+        }
     }
 
     #[test]
@@ -33692,38 +36929,87 @@ fn main() -> i32 = 0
             panic!("root plan must be a struct");
         };
         assert!(
-            std::sync::Arc::ptr_eq(&fields[0].1, &fields[1].1),
+            DropPlanRef::ptr_eq(&fields[0].1, &fields[1].1),
             "repeated nominal children must share one memoized DropPlan node"
         );
     }
 
     #[test]
     fn drop_plan_handles_a_deep_linear_nominal_chain() {
-        let mut structs = vec![StructDef {
-            name: "S0".to_string(),
-            source_name: "S0".to_string(),
-            fields: vec![FieldDef {
-                name: "copy".to_string(),
-                ty: Ty::Bool,
-            }],
-            align: None,
-            c_repr: false,
-        }];
-        for depth in 1..512 {
-            structs.push(StructDef {
+        std::thread::Builder::new()
+            .name("deep-drop-plan-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 65_536;
+                let mut structs = vec![StructDef {
+                    name: "S0".to_string(),
+                    source_name: "S0".to_string(),
+                    fields: vec![FieldDef {
+                        name: "copy".to_string(),
+                        ty: Ty::Bool,
+                    }],
+                    align: None,
+                    c_repr: false,
+                }];
+                for depth in 1..DEPTH {
+                    structs.push(StructDef {
+                        name: format!("S{depth}"),
+                        source_name: format!("S{depth}"),
+                        fields: vec![FieldDef {
+                            name: "next".to_string(),
+                            ty: Ty::Struct((depth - 1) as u32),
+                        }],
+                        align: None,
+                        c_repr: false,
+                    });
+                }
+                let plan = drop_plan(
+                    Ty::Struct((DEPTH - 1) as u32),
+                    &structs,
+                    &[],
+                    &[],
+                );
+                assert!(
+                    plan.is_valid(),
+                    "a deep finite DropPlan must remain valid without recursive inspection"
+                );
+                assert!(
+                    !plan.needs_drop(),
+                    "ID-indexed visitation must classify a deep Copy chain without path scans"
+                );
+                drop(plan);
+            })
+            .expect("spawn deep DropPlan owner")
+            .join()
+            .expect("deep DropPlan owner");
+    }
+
+    #[test]
+    fn inline_type_graph_acyclicity_is_stack_bounded() {
+        let mut structs = (0..4_096)
+            .map(|depth| StructDef {
                 name: format!("S{depth}"),
                 source_name: format!("S{depth}"),
                 fields: vec![FieldDef {
                     name: "next".to_string(),
-                    ty: Ty::Struct((depth - 1) as u32),
+                    ty: if depth == 4_095 {
+                        Ty::Bool
+                    } else {
+                        Ty::Struct(depth + 1)
+                    },
                 }],
                 align: None,
                 c_repr: false,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
         assert!(
-            !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
-            "ID-indexed visitation must classify a deep Copy chain without path scans"
+            struct_acyclic(0, &structs, &[], &[], &[]),
+            "a finite deep inline graph must not consume the process stack"
+        );
+        structs[4_095].fields[0].ty = Ty::Struct(0);
+        assert!(
+            !struct_acyclic(0, &structs, &[], &[], &[]),
+            "a deep inline cycle must still reject"
         );
     }
 
@@ -33911,5 +37197,191 @@ fn main() -> i32 = 0
             ),
             "source tuple identity recursively erases nested callback origins"
         );
+    }
+
+    #[test]
+    fn deep_type_consumer_closure_matrix() {
+        const DEPTH: usize = 4096;
+        let mut structs = (0..DEPTH)
+            .map(|id| StructDef {
+                name: format!("Deep{id}"),
+                source_name: format!("Deep{id}"),
+                fields: vec![hir::FieldDef {
+                    name: "next".to_string(),
+                    ty: if id + 1 == DEPTH {
+                        Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))
+                    } else {
+                        Ty::Struct((id + 1) as u32)
+                    },
+                }],
+                align: None,
+                c_repr: false,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+        assert!(ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (16, 8));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::String;
+        assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+        assert!(!ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
+        assert!(struct_is_move(0, &structs, &[], &[]));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Str;
+        let paths = borrow_leaf_paths_for_type(Ty::Struct(0), &structs, &[], &[], &[]);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), DEPTH);
+        structs[0].fields.push(hir::FieldDef {
+            name: "malformed_later".to_string(),
+            ty: Ty::Struct(DEPTH as u32 + 9),
+        });
+        assert!(struct_contains_str(0, &structs, &[]));
+        assert_eq!(
+            borrow_leaf_paths_for_type(Ty::Struct(0), &structs, &[], &[], &[]),
+            paths,
+            "a malformed later sibling must not reorder or erase the valid borrow leaf"
+        );
+        structs[0].fields.pop();
+
+        let tagged = (0..DEPTH)
+            .map(|id| hir::TaggedType::Option(if id + 1 == DEPTH {
+                Scalar::Int(IntTy { bits: 64, signed: true })
+            } else {
+                Scalar::Tagged((id + 1) as u32)
+            }))
+            .collect::<Vec<_>>();
+        assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[]);
+        assert!(tagged_mangle.len() > DEPTH * 2);
+        assert!(is_field_ok(Ty::Tagged(0), &tagged));
+        let mut tagged_struct = tagged.clone();
+        tagged_struct[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Struct(42));
+        let mut inline_structs = Vec::new();
+        collect_inline_struct_ids(
+            Ty::Tagged(0),
+            &tagged_struct,
+            &mut inline_structs,
+        );
+        assert_eq!(inline_structs, vec![42]);
+        tagged_struct[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Enum(9));
+        assert!(ty_contains_inline_enum(
+            Ty::Tagged(0),
+            &tagged_struct
+        ));
+
+        let fn_types = (0..DEPTH)
+            .map(|id| hir::FnTy {
+                params: Vec::new(),
+                ret: if id + 1 == DEPTH {
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })
+                } else {
+                    Ty::Fn((id + 1) as u32)
+                },
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                effect: std::cell::Cell::new(FnEffect::Unknown),
+            })
+            .collect::<Vec<_>>();
+        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types);
+        assert!(fn_mangle.len() > DEPTH * 3);
+        assert_ne!(
+            fn_mangle,
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types),
+            "concrete function origins remain part of the internal mangle"
+        );
+
+        let mut tagged_params = tagged.clone();
+        tagged_params[DEPTH - 1] =
+            hir::TaggedType::Option(Scalar::Param(0));
+        let mut nested = [false];
+        mark_nested_params(Ty::Tagged(0), &mut nested, &tagged_params);
+        assert!(nested[0]);
+        assert!(ty_mentions_param(Ty::Tagged(0), &tagged_params));
+        let mut substituted_tagged = tagged_params;
+        let substituted = subst_scalar(
+            Scalar::Tagged(0),
+            &[Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            })],
+            &mut substituted_tagged,
+        );
+        assert!(!ty_mentions_param(
+            scalar_to_ty(substituted),
+            &substituted_tagged
+        ));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Fn(7);
+        let tables = EffectTypeTables {
+            structs: &structs,
+            enums: &[],
+            tuples: &[],
+            tagged_types: &[],
+        };
+        let effect_paths = fn_effect_leaf_paths(Ty::Struct(0), tables, false);
+        assert_eq!(effect_paths.len(), 1);
+        assert_eq!(effect_paths[0].0.len(), DEPTH);
+        assert_eq!(effect_paths[0].1, 7);
+        for definition in &mut structs {
+            definition.source_name.push_str("$source");
+        }
+        assert_eq!(
+            fn_effect_leaf_paths(
+                Ty::Struct(0),
+                EffectTypeTables {
+                    structs: &structs,
+                    enums: &[],
+                    tuples: &[],
+                    tagged_types: &[],
+                },
+                true,
+            ),
+            effect_paths
+        );
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Struct(0);
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+        assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Struct(DEPTH as u32 + 7);
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+
+        std::thread::Builder::new()
+            .name("deep-json-descriptor-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut source = String::from("import core.json\n");
+                for id in 0..DEPTH {
+                    if id + 1 == DEPTH {
+                        source.push_str(&format!("JsonDeep{id} {{ value: str }}\n"));
+                    } else {
+                        source.push_str(&format!(
+                            "JsonDeep{id} {{ next: JsonDeep{} }}\n",
+                            id + 1
+                        ));
+                    }
+                }
+                source.push_str(
+                    "fn decode(data: str) -> Result<(), Error> {\n  value: JsonDeep0 := json.decode(data)?\n  return Ok(())\n}\nfn encode(value: JsonDeep0) -> i64 {\n  text := json.encode(value)\n  return text.len()\n}\nfn main() -> i32 = 0\n",
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !diagnostics.has_errors(),
+                    "deep JSON descriptor graph must check: {messages:?}"
+                );
+            })
+            .expect("spawn deep JSON descriptor owner")
+            .join()
+            .expect("deep JSON descriptor owner");
     }
 }

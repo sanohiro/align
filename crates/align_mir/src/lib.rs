@@ -1512,7 +1512,14 @@ pub fn lower_program(program: &hir::Program) -> Program {
 /// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
 /// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), false)
+    if !hir_program_is_valid(program) {
+        return empty_program();
+    }
+    lower_program_unchecked(
+        program,
+        Some(Rc::new(SourceLines::from_map(sm))),
+        false,
+    )
 }
 
 /// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
@@ -1534,17 +1541,29 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// now compiles each unit in isolation and needs both the debug locations (for remark attribution)
 /// and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), true)
+    if !hir_program_is_valid(program) {
+        return empty_program();
+    }
+    lower_program_unchecked(
+        program,
+        Some(Rc::new(SourceLines::from_map(sm))),
+        true,
+    )
 }
 
 // Inlined into the two thin entry points above so a normal build gains no extra call frame at the
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
-    if !validate_hir::global_type_metadata_is_valid(program) {
+    if !hir_program_is_valid(program) {
         return empty_program();
     }
     lower_program_unchecked(program, lines, per_unit)
+}
+
+fn hir_program_is_valid(program: &hir::Program) -> bool {
+    align_sema::checked_hir_body_depth_is_valid(program)
+        && validate_hir::global_type_metadata_is_valid(program)
 }
 
 fn empty_program() -> Program {
@@ -2499,6 +2518,11 @@ struct BuilderCtx {
     /// Sema function-type facts used to make function-value and indirect-call signatures explicit
     /// in MIR. Kept behind the existing box to preserve recursive lowering stack headroom.
     fn_types: Rc<[hir::FnTy]>,
+    /// Results produced by the active eager-expression worklist, keyed by stable HIR address.
+    /// Recursive child requests consume these operands without re-entering `lower_expr`.
+    eager_expr_results: std::collections::HashMap<usize, Operand>,
+    /// Whether an outer `lower_expr` invocation currently owns `eager_expr_results`.
+    eager_expr_active: bool,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -2802,6 +2826,8 @@ fn lower_fn(
             slot_borrow_owners: std::collections::HashMap::new(),
             dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
             fn_types: Rc::clone(fn_types),
+            eager_expr_results: std::collections::HashMap::new(),
+            eager_expr_active: false,
         }),
     };
     let entry = b.new_block();
@@ -3779,7 +3805,703 @@ fn terminated_operand() -> Operand {
     Operand::Const(Const::Unit)
 }
 
-fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+/// Lower an eager unary spine without one native [`lower_expr`] frame per HIR record.
+///
+/// The leaf is evaluated once before results are rebuilt from the inside out, preserving the
+/// recursive lowering order while keeping the accepted checked-HIR boundary stack-safe.
+#[inline(never)]
+fn lower_unary_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    let mut frames = Vec::new();
+    let mut leaf = root;
+    while let hir::ExprKind::Unary { op, expr } = &leaf.kind {
+        frames.push((*op, leaf.ty));
+        leaf = expr;
+    }
+
+    let mut operand = lower_expr(b, leaf);
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    while let Some((op, ty)) = frames.pop() {
+        let value = b.fresh_value(ty);
+        b.push(Stmt::Let(value, Rvalue::Un(op, operand)));
+        operand = Operand::Value(value);
+    }
+    operand
+}
+
+struct TemplateFrame<'a> {
+    expr: &'a hir::Expr,
+    parts: &'a [hir::TemplatePart],
+    next: usize,
+    pieces: Vec<TemplatePiece>,
+    pending: Option<&'a hir::TemplatePart>,
+    owner: Option<Slot>,
+}
+
+fn template_frame<'a>(b: &mut Builder, expr: &'a hir::Expr) -> TemplateFrame<'a> {
+    let hir::ExprKind::Template(parts) = &expr.kind else {
+        unreachable!("a template frame starts at a Template expression")
+    };
+    // Register before holes: a `?` inside one may emit an early cleanup edge.
+    let owner =
+        owns_hidden_string(expr, !b.arenas.is_empty()).then(|| b.new_synthetic_owner(Ty::String));
+    TemplateFrame {
+        expr,
+        parts,
+        next: 0,
+        pieces: Vec::new(),
+        pending: None,
+        owner,
+    }
+}
+
+fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
+    match part {
+        hir::TemplatePart::Hole(hole) => {
+            // The piece is picked by sema's single display classification. An owned `string` is
+            // already a borrowed `str` here (`StrBorrow`), so it uses the one string path.
+            match align_sema::print_kind(hole.ty) {
+                Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(operand),
+                Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(operand),
+                Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(operand),
+                Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(operand),
+                // An erroring program never reaches MIR; the only `None` is the poison sentinel.
+                Some(align_sema::PrintKind::Int) | None => TemplatePiece::IntHole(operand),
+            }
+        }
+        hir::TemplatePart::JsonStr(_) => TemplatePiece::JsonStrHole(operand),
+        hir::TemplatePart::OptionField { name, .. } => TemplatePiece::OptionField {
+            opt: operand,
+            name: name.clone(),
+        },
+        hir::TemplatePart::OptionStructField {
+            name, struct_id, ..
+        } => TemplatePiece::OptionStructField {
+            opt: operand,
+            name: name.clone(),
+            struct_id: *struct_id,
+        },
+        hir::TemplatePart::StructArrayField { struct_id, .. } => {
+            TemplatePiece::StructArrayField {
+                array: operand,
+                struct_id: *struct_id,
+            }
+        }
+        hir::TemplatePart::ScalarArrayField { elem, .. } => TemplatePiece::ScalarArrayField {
+            array: operand,
+            elem: *elem,
+        },
+        hir::TemplatePart::UnionValue { enum_id, .. } => TemplatePiece::UnionValue {
+            value: operand,
+            enum_id: *enum_id,
+        },
+        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {
+            unreachable!("a static template part has no operand")
+        }
+    }
+}
+
+fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
+    match part {
+        hir::TemplatePart::Hole(expr)
+        | hir::TemplatePart::JsonStr(expr)
+        | hir::TemplatePart::OptionField { access: expr, .. }
+        | hir::TemplatePart::OptionStructField { access: expr, .. }
+        | hir::TemplatePart::StructArrayField { access: expr, .. }
+        | hir::TemplatePart::ScalarArrayField { access: expr, .. }
+        | hir::TemplatePart::UnionValue { access: expr, .. } => Some(expr),
+        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => None,
+    }
+}
+
+/// Lower nested templates with explicit frames while preserving part evaluation and owner order.
+#[inline(never)]
+fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    enum Action<'a> {
+        Finish,
+        Text(&'a str),
+        PopComma,
+        Child(&'a hir::TemplatePart, &'a hir::Expr),
+    }
+
+    let mut frames = vec![template_frame(b, root)];
+    let mut completed = None;
+    loop {
+        if let Some(operand) = completed.take() {
+            let Some(parent) = frames.last_mut() else {
+                return operand;
+            };
+            let part = parent
+                .pending
+                .take()
+                .expect("a nested template result has a parent part");
+            parent.pieces.push(template_piece(part, operand));
+            continue;
+        }
+
+        let action = {
+            let frame = frames.last_mut().expect("the root frame returns directly");
+            if frame.next == frame.parts.len() {
+                Action::Finish
+            } else {
+                let part = &frame.parts[frame.next];
+                frame.next += 1;
+                match part {
+                    hir::TemplatePart::Text(text) => Action::Text(text),
+                    hir::TemplatePart::PopComma => Action::PopComma,
+                    _ => Action::Child(
+                        part,
+                        template_part_expr(part).expect("an operand part has one expression"),
+                    ),
+                }
+            }
+        };
+
+        match action {
+            Action::Finish => {
+                let frame = frames.pop().expect("one template frame is active");
+                let arena = b.arenas.last().map(|handle| Operand::Value(*handle));
+                let result = b.fresh_value(frame.expr.ty);
+                b.push(Stmt::Let(
+                    result,
+                    Rvalue::Template(frame.pieces, arena),
+                ));
+                if let Some(owner) = frame.owner {
+                    b.push(Stmt::Store(owner, Operand::Value(result)));
+                    b.set_drop_flag(owner, true);
+                    b.attach_borrow_owners(result, [owner]);
+                }
+                completed = Some(Operand::Value(result));
+            }
+            Action::Text(text) => frames
+                .last_mut()
+                .expect("a part belongs to an active frame")
+                .pieces
+                .push(TemplatePiece::Static(text.to_string())),
+            Action::PopComma => frames
+                .last_mut()
+                .expect("a part belongs to an active frame")
+                .pieces
+                .push(TemplatePiece::PopComma),
+            Action::Child(part, child) => {
+                if matches!(child.kind, hir::ExprKind::Template(_)) {
+                    frames
+                        .last_mut()
+                        .expect("a nested template has a parent frame")
+                        .pending = Some(part);
+                    frames.push(template_frame(b, child));
+                } else {
+                    let operand = lower_expr(b, child);
+                    if !lowering_continues(b) {
+                        return terminated_operand();
+                    }
+                    frames
+                        .last_mut()
+                        .expect("a part belongs to an active frame")
+                        .pieces
+                        .push(template_piece(part, operand));
+                }
+            }
+        }
+    }
+}
+
+/// Lower transparent block tails and Copy/Unit expression-statement spines without native
+/// `lower_expr -> lower_block -> lower_stmt` recursion.
+#[inline(never)]
+fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    #[derive(Clone, Copy)]
+    enum Post {
+        Tail,
+        ExprStmt,
+    }
+
+    let mut posts = Vec::new();
+    let mut current = root;
+    while let hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) =
+        &current.kind
+    {
+        if block.stmts.is_empty()
+            && let Some(value) = block.value.as_deref()
+        {
+            b.set_span(value.span);
+            posts.push(Post::Tail);
+            current = value;
+            continue;
+        }
+        if block.value.is_none()
+            && let [hir::Stmt::Expr(expr)] = block.stmts.as_slice()
+            && !needs_drop_flag(
+                expr.ty,
+                &b.structs,
+                &b.tuples,
+                &b.enums,
+                &b.tagged_types,
+            )
+        {
+            b.set_span(expr.span);
+            posts.push(Post::ExprStmt);
+            current = expr;
+            continue;
+        }
+        break;
+    }
+
+    if posts.is_empty() {
+        let block = match &root.kind {
+            hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block,
+            _ => unreachable!("a plain block spine starts at Block or Unsafe"),
+        };
+        return lower_block(b, block).unwrap_or(Operand::Const(Const::Unit));
+    }
+
+    let mut operand = lower_expr(b, current);
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    while let Some(post) = posts.pop() {
+        match post {
+            Post::Tail => {}
+            Post::ExprStmt => {
+                drop_borrow_owners(b, &operand);
+                operand = Operand::Const(Const::Unit);
+            }
+        }
+    }
+    operand
+}
+
+struct WildcardMatchFrame<'a> {
+    body: &'a hir::Expr,
+    ty: Ty,
+    result_slot: Option<Slot>,
+    result_flag: Option<Slot>,
+    result_temp_flag: Option<Slot>,
+    join: BlockId,
+}
+
+fn wildcard_match_parts<'a>(
+    b: &Builder,
+    expr: &'a hir::Expr,
+) -> Option<(&'a hir::Expr, &'a hir::Expr)> {
+    let hir::ExprKind::Match { scrutinee, arms } = &expr.kind else {
+        return None;
+    };
+    let [arm] = arms.as_slice() else {
+        return None;
+    };
+    if !arm.variants.is_empty()
+        || !arm.bindings.is_empty()
+        || !matches!(scrutinee.ty, Ty::Enum(_) | Ty::Option(_) | Ty::Result(..))
+        || needs_drop_flag(
+            scrutinee.ty,
+            &b.structs,
+            &b.tuples,
+            &b.enums,
+            &b.tagged_types,
+        )
+    {
+        return None;
+    }
+    Some((scrutinee, &arm.body))
+}
+
+/// Lower single-wildcard match spines with explicit join frames.
+#[inline(never)]
+fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
+    let mut frames = Vec::new();
+    let mut current = root;
+    let mut started = false;
+    let mut terminated_while_descending = false;
+    while let Some((scrutinee, body)) = wildcard_match_parts(b, current) {
+        started = true;
+        let (result_slot, result_flag, result_temp_flag) =
+            control_result_slots(b, current.ty);
+        let _scrutinee = lower_expr_for_borrow(b, scrutinee);
+        if !lowering_continues(b) {
+            terminated_while_descending = true;
+            break;
+        }
+        let join = b.new_block();
+        frames.push(WildcardMatchFrame {
+            body,
+            ty: current.ty,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join,
+        });
+        current = body;
+    }
+
+    if !started {
+        let hir::ExprKind::Match { scrutinee, arms } = &root.kind else {
+            unreachable!("a wildcard match spine starts at Match")
+        };
+        return lower_match(b, scrutinee, arms, root.ty, false);
+    }
+
+    let mut operand = if terminated_while_descending {
+        terminated_operand()
+    } else {
+        lower_expr(b, current)
+    };
+    while let Some(frame) = frames.pop() {
+        if lowering_continues(b) {
+            store_control_result(
+                b,
+                frame.result_slot,
+                frame.result_flag,
+                frame.result_temp_flag,
+                frame.body,
+                operand,
+                false,
+            );
+            b.terminate(Term::Goto(frame.join));
+        }
+        b.cur = frame.join;
+        operand = if lowering_continues(b) {
+            load_control_result(
+                b,
+                frame.ty,
+                frame.result_slot,
+                frame.result_flag,
+                frame.result_temp_flag,
+            )
+        } else {
+            terminated_operand()
+        };
+    }
+    operand
+}
+
+/// Expressions whose parent-specific child protocol must run outside the giant eager dispatcher.
+/// This includes structured control/scopes and multi-child ownership boundaries such as calls.
+fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
+    matches!(
+        &e.kind,
+        hir::ExprKind::Binary { op: BinOp::And | BinOp::Or, .. }
+        | hir::ExprKind::Unary { .. }
+        | hir::ExprKind::Call { .. }
+        | hir::ExprKind::CallFnValue { .. }
+        | hir::ExprKind::ResultMapErr { .. }
+        | hir::ExprKind::If { .. }
+        | hir::ExprKind::Match { .. }
+        | hir::ExprKind::ElseUnwrap { .. }
+        | hir::ExprKind::Loop { .. }
+        | hir::ExprKind::Block(_)
+        | hir::ExprKind::Unsafe(_)
+        | hir::ExprKind::Arena(_)
+        | hir::ExprKind::TaskGroup(_)
+        | hir::ExprKind::Template(_)
+        | hir::ExprKind::FileCreateRw { .. }
+        | hir::ExprKind::FileOpenRw { .. }
+        | hir::ExprKind::FilePread { .. }
+        | hir::ExprKind::FilePwrite { .. }
+        | hir::ExprKind::FileLen { .. }
+        | hir::ExprKind::ReaderBuffered { .. }
+        | hir::ExprKind::ReaderReadLine { .. }
+        | hir::ExprKind::BytesAsStr { .. }
+        | hir::ExprKind::ArrayBuilderNew { .. }
+        | hir::ExprKind::ArrayBuilderPush { .. }
+        | hir::ExprKind::ArrayBuilderAppend { .. }
+        | hir::ExprKind::ArrayBuilderBuild(_)
+        | hir::ExprKind::ProcessCommand { .. }
+        | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandEnv { .. }
+        | hir::ExprKind::CommandEnvClear { .. }
+        | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::RunOutputCode { .. }
+        | hir::ExprKind::RunOutputStdout { .. }
+        | hir::ExprKind::RunOutputStderr { .. }
+        | hir::ExprKind::PathJoin { .. }
+        | hir::ExprKind::PathComponent { .. }
+        | hir::ExprKind::PathNormalize { .. }
+        | hir::ExprKind::RegexCompile { .. }
+        | hir::ExprKind::RegexIsMatch { .. }
+        | hir::ExprKind::RegexFind { .. }
+        | hir::ExprKind::RegexFindAll { .. }
+        | hir::ExprKind::RegexSplit { .. }
+        | hir::ExprKind::RegexReplace { .. }
+        | hir::ExprKind::RegexCaptures { .. }
+        | hir::ExprKind::RegexGroupCount { .. }
+        | hir::ExprKind::RegexGroupIndex { .. }
+        | hir::ExprKind::CapturesGroup { .. }
+        | hir::ExprKind::HttpRequest { .. }
+        | hir::ExprKind::HttpHeader { .. }
+        | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpRequestTimeout { .. }
+        | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpParse { .. }
+        | hir::ExprKind::HttpRespStatus { .. }
+        | hir::ExprKind::HttpRespHeader { .. }
+        | hir::ExprKind::HttpRespBody { .. }
+        | hir::ExprKind::HttpClient
+        | hir::ExprKind::HttpClientGet { .. }
+        | hir::ExprKind::HttpClientPost { .. }
+        | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpGetMany { .. }
+        | hir::ExprKind::HttpServe { .. }
+        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpCtxMethod { .. }
+        | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeaders { .. }
+        | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpCtxBody { .. }
+        | hir::ExprKind::HttpResponseBuilder { .. }
+        | hir::ExprKind::HttpRbHeader { .. }
+        | hir::ExprKind::HttpRbBody { .. }
+        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamReject { .. }
+        | hir::ExprKind::HttpStreamSend { .. }
+        | hir::ExprKind::HttpStreamFinish { .. }
+    )
+}
+
+/// Strict eager parents perform no parent action between their source-ordered children. They can
+/// therefore share a heterogeneous worklist without disturbing the required-child ownership and
+/// termination protocol used by parent-specific or structurally optimized operations.
+fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or),
+        hir::ExprKind::IntArith { .. }
+        | hir::ExprKind::MathOp { .. }
+        | hir::ExprKind::RawLoad { .. }
+        | hir::ExprKind::RawStore { .. }
+        | hir::ExprKind::RawOffset { .. }
+        | hir::ExprKind::Cast(_)
+        | hir::ExprKind::TaskGet(_)
+        | hir::ExprKind::OptionSome(_)
+        | hir::ExprKind::ResultOk(_)
+        | hir::ExprKind::ResultErr(_)
+        | hir::ExprKind::Try(_)
+        | hir::ExprKind::RawAlloc(_)
+        | hir::ExprKind::RawFree(_)
+        | hir::ExprKind::HeapNew(_)
+        | hir::ExprKind::BoxGet(_)
+        | hir::ExprKind::BoxClone(_)
+        | hir::ExprKind::StrClone(_)
+        | hir::ExprKind::StrTrim { .. }
+        | hir::ExprKind::StrBorrow(_)
+        | hir::ExprKind::StrBytes { .. }
+        | hir::ExprKind::BuilderToString(_) => true,
+        _ => false,
+    }
+}
+
+/// Dispatch parent-specific roots without retaining the giant eager-expression match frame.
+/// Nested control is bounded by the checked-HIR ceiling, while calls preserve their inter-child
+/// ownership protocol. Retaining the eager dispatcher on each level would multiply its debug-build
+/// frame by that depth and overflow the 2 MiB owner stack.
+#[inline(never)]
+fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::Binary { op, lhs, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
+            lower_short_circuit(b, *op, lhs, rhs)
+        }
+        hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
+        hir::ExprKind::Call { .. } => lower_direct_call(b, e),
+        hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
+        hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
+        hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => {
+            lower_else_unwrap(b, opt, fallback, e.ty, false)
+        }
+        hir::ExprKind::Loop { .. } => lower_loop(b, e),
+        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
+        hir::ExprKind::Arena(block) => lower_arena_block(b, block),
+        hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
+        hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::FileCreateRw { .. }
+        | hir::ExprKind::FileOpenRw { .. }
+        | hir::ExprKind::FilePread { .. }
+        | hir::ExprKind::FilePwrite { .. }
+        | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
+        hir::ExprKind::ReaderBuffered { .. }
+        | hir::ExprKind::ReaderReadLine { .. }
+        | hir::ExprKind::BytesAsStr { .. } => lower_reader_line_expr(b, e),
+        hir::ExprKind::ArrayBuilderNew { .. }
+        | hir::ExprKind::ArrayBuilderPush { .. }
+        | hir::ExprKind::ArrayBuilderAppend { .. }
+        | hir::ExprKind::ArrayBuilderBuild(_) => lower_array_builder_expr(b, e),
+        hir::ExprKind::ProcessCommand { .. }
+        | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandEnv { .. }
+        | hir::ExprKind::CommandEnvClear { .. }
+        | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::RunOutputCode { .. }
+        | hir::ExprKind::RunOutputStdout { .. }
+        | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
+        hir::ExprKind::PathJoin { .. }
+        | hir::ExprKind::PathComponent { .. }
+        | hir::ExprKind::PathNormalize { .. } => lower_path_expr(b, e),
+        hir::ExprKind::RegexCompile { .. }
+        | hir::ExprKind::RegexIsMatch { .. }
+        | hir::ExprKind::RegexFind { .. }
+        | hir::ExprKind::RegexFindAll { .. }
+        | hir::ExprKind::RegexSplit { .. }
+        | hir::ExprKind::RegexReplace { .. }
+        | hir::ExprKind::RegexCaptures { .. }
+        | hir::ExprKind::RegexGroupCount { .. }
+        | hir::ExprKind::RegexGroupIndex { .. }
+        | hir::ExprKind::CapturesGroup { .. } => lower_regex_expr(b, e),
+        hir::ExprKind::HttpRequest { .. }
+        | hir::ExprKind::HttpHeader { .. }
+        | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpRequestTimeout { .. }
+        | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpParse { .. }
+        | hir::ExprKind::HttpRespStatus { .. }
+        | hir::ExprKind::HttpRespHeader { .. }
+        | hir::ExprKind::HttpRespBody { .. }
+        | hir::ExprKind::HttpClient
+        | hir::ExprKind::HttpClientGet { .. }
+        | hir::ExprKind::HttpClientPost { .. }
+        | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpGetMany { .. }
+        | hir::ExprKind::HttpServe { .. }
+        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpCtxMethod { .. }
+        | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeaders { .. }
+        | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpCtxBody { .. }
+        | hir::ExprKind::HttpResponseBuilder { .. }
+        | hir::ExprKind::HttpRbHeader { .. }
+        | hir::ExprKind::HttpRbBody { .. }
+        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamReject { .. }
+        | hir::ExprKind::HttpStreamSend { .. }
+        | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
+        _ => unreachable!("out-of-line dispatcher received an eager expression"),
+    }
+}
+
+#[inline(never)]
+fn lower_arena_block(b: &mut Builder, block: &hir::Block) -> Operand {
+    let handle = b.fresh_value(Ty::ArenaHandle);
+    b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+    b.arenas.push(handle);
+    let tail = lower_block(b, block);
+    b.arenas.pop();
+    if !lowering_continues(b) {
+        terminated_operand()
+    } else {
+        b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+        tail.unwrap_or(Operand::Const(Const::Unit))
+    }
+}
+
+#[inline(never)]
+fn lower_task_group_block(b: &mut Builder, block: &hir::Block) -> Operand {
+    let handle = b.fresh_value(Ty::ArenaHandle);
+    b.push(Stmt::Let(handle, Rvalue::TgBegin));
+    b.task_groups.push(handle);
+    let tail = lower_block(b, block);
+    b.task_groups.pop();
+    if !lowering_continues(b) {
+        terminated_operand()
+    } else {
+        b.push(Stmt::TgWait(Operand::Value(handle)));
+        b.push(Stmt::TgEnd(Operand::Value(handle)));
+        tail.unwrap_or(Operand::Const(Const::Unit))
+    }
+}
+
+/// Lower one expression with explicit child-first work items for every eager HIR edge.
+///
+/// Structured control remains in its dedicated lowering helpers because its children occupy
+/// distinct MIR blocks. Those helpers re-enter this function for each selected child; eager chains
+/// below those boundaries still use this worklist rather than native recursion.
+fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    let key = root as *const hir::Expr as usize;
+    if b.ctx.eager_expr_active
+        && let Some(result) = b.ctx.eager_expr_results.get(&key)
+    {
+        return result.clone();
+    }
+
+    let owns_results = !b.ctx.eager_expr_active;
+    if owns_results {
+        b.ctx.eager_expr_active = true;
+        debug_assert!(b.ctx.eager_expr_results.is_empty());
+    }
+
+    enum Work<'a> {
+        Enter(&'a hir::Expr),
+        Exit(&'a hir::Expr),
+    }
+
+    let mut work = vec![Work::Enter(root)];
+    let mut terminated = false;
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(expression) => {
+                let expression_key = expression as *const hir::Expr as usize;
+                if b.ctx.eager_expr_results.contains_key(&expression_key) {
+                    continue;
+                }
+                if expression_uses_out_of_line_dispatch(expression) {
+                    let result = lower_out_of_line_expr(b, expression);
+                    b.ctx.eager_expr_results.insert(expression_key, result);
+                    if !lowering_continues(b) {
+                        terminated = true;
+                        break;
+                    }
+                    continue;
+                }
+                if !expression_uses_eager_worklist(expression) {
+                    let result = lower_expr_recursive(b, expression);
+                    b.ctx.eager_expr_results.insert(expression_key, result);
+                    if !lowering_continues(b) {
+                        terminated = true;
+                        break;
+                    }
+                    continue;
+                }
+                work.push(Work::Exit(expression));
+                let children = align_sema::direct_expr_children(expression);
+                work.extend(children.into_iter().rev().map(Work::Enter));
+            }
+            Work::Exit(expression) => {
+                let result = lower_expr_recursive(b, expression);
+                b.ctx
+                    .eager_expr_results
+                    .insert(expression as *const hir::Expr as usize, result);
+                if !lowering_continues(b) {
+                    terminated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let result = if terminated {
+        terminated_operand()
+    } else {
+        b.ctx
+            .eager_expr_results
+            .get(&key)
+            .cloned()
+            .expect("the eager worklist lowers its root")
+    };
+    if owns_results {
+        b.ctx.eager_expr_results.clear();
+        b.ctx.eager_expr_active = false;
+    }
+    result
+}
+
+fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
     'lower_expr: {
         // Keep every required-child failure in this giant recursive dispatcher on one common exit.
         // Separate `return Const::Unit` expansions make debug LLVM reserve one return temporary per
@@ -3824,129 +4546,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 elem,
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
-            hir::ExprKind::Template(parts) => {
-                // Outside an explicit arena, retain the produced bytes in a hidden owned string.
-                // Its view inherits this owner through scalar/view consumers and loop/function
-                // cleanup. Register before holes: a `?` inside one may emit an early cleanup edge.
-                // The condition is sema's (`owns_hidden_string`), shared so `MoveCheck`'s borrow
-                // liveness ends a template view's generation at exactly the loop edge where this
-                // owner is freed.
-                let owner = owns_hidden_string(e, !b.arenas.is_empty())
-                    .then(|| b.new_synthetic_owner(Ty::String));
-                let mut pieces = Vec::new();
-                for p in parts {
-                    match p {
-                        hir::TemplatePart::Text(s) => {
-                            pieces.push(TemplatePiece::Static(s.clone()));
-                        }
-                        hir::TemplatePart::Hole(h) => {
-                            let ty = h.ty;
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, h),
-                                Operand::Const(Const::Unit)
-                            );
-                            // The piece is picked by sema's SINGLE display classification
-                            // (`print_kind`), never by a local catch-all: a printable type sema
-                            // accepts but this match forgot used to fall into `IntHole` and hand
-                            // codegen a `{ptr,len}` aggregate where it demanded an integer. An
-                            // owned `string` is already a borrowed `str` here (sema's
-                            // `StrBorrow`), so it renders through the one string path.
-                            pieces.push(match align_sema::print_kind(ty) {
-                                Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(op),
-                                Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(op),
-                                Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(op),
-                                Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(op),
-                                // `Int`, plus the poisoned `Ty::Error` hole — unprintable holes
-                                // are a sema error, and an erroring program never reaches MIR, so
-                                // the only `None` here is the error sentinel, which codegen renders
-                                // as an int.
-                                Some(align_sema::PrintKind::Int) | None => {
-                                    TemplatePiece::IntHole(op)
-                                }
-                            });
-                        }
-                        hir::TemplatePart::JsonStr(h) => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, h),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::JsonStrHole(op));
-                        }
-                        hir::TemplatePart::OptionField { access, name } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::OptionField {
-                                opt: op,
-                                name: name.clone(),
-                            });
-                        }
-                        hir::TemplatePart::OptionStructField {
-                            access,
-                            name,
-                            struct_id,
-                        } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::OptionStructField {
-                                opt: op,
-                                name: name.clone(),
-                                struct_id: *struct_id,
-                            });
-                        }
-                        hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
-                        hir::TemplatePart::StructArrayField { access, struct_id } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::StructArrayField {
-                                array: op,
-                                struct_id: *struct_id,
-                            });
-                        }
-                        hir::TemplatePart::ScalarArrayField { access, elem } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::ScalarArrayField {
-                                array: op,
-                                elem: *elem,
-                            });
-                        }
-                        hir::TemplatePart::UnionValue { access, enum_id } => {
-                            lower_required_binding!(
-                                b,
-                                op = lower_expr(b, access),
-                                Operand::Const(Const::Unit)
-                            );
-                            pieces.push(TemplatePiece::UnionValue {
-                                value: op,
-                                enum_id: *enum_id,
-                            });
-                        }
-                    }
-                }
-                let arena = b.arenas.last().map(|h| Operand::Value(*h));
-                let r = b.fresh_value(e.ty);
-                b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
-                if let Some(owner) = owner {
-                    b.push(Stmt::Store(owner, Operand::Value(r)));
-                    b.set_drop_flag(owner, true);
-                    b.attach_borrow_owners(r, [owner]);
-                }
-                Operand::Value(r)
-            }
+            hir::ExprKind::Template(_) => lower_template_spine(b, e),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode(b, *struct_id, input, e.ty)
             }
@@ -4762,12 +5362,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::Load(*id)));
                 Operand::Value(v)
             }
-            hir::ExprKind::Unary { op, expr } => {
-                lower_required_binding!(b, a = lower_expr(b, expr), Operand::Const(Const::Unit));
-                let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::Un(*op, a)));
-                Operand::Value(v)
-            }
+            hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
             hir::ExprKind::Cast(inner) => {
                 let from = inner.ty;
                 let operand = lower_expr(b, inner);
@@ -4905,9 +5500,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 finish_consumed_aggregate(b, payload, owners);
                 Operand::Value(v)
             }
-            hir::ExprKind::Match { scrutinee, arms } => {
-                lower_match(b, scrutinee, arms, e.ty, false)
-            }
+            hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
             hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
             hir::ExprKind::Field { root, path } => {
                 let v = b.fresh_value(e.ty);
@@ -4974,12 +5567,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            hir::ExprKind::Block(blk) => lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit)),
+            hir::ExprKind::Block(_) => lower_plain_block_spine(b, e),
             // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
             // inner block; the enforcement + impurity were handled in sema.
-            hir::ExprKind::Unsafe(blk) => {
-                lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit))
-            }
+            hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
             // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
             hir::ExprKind::RawAlloc(size) => {
                 lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
@@ -11417,6 +12008,43 @@ fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) ->
     Operand::Value(r)
 }
 
+/// The three `std.path` operations stay outside the giant recursive expression dispatcher. Their
+/// string/`str` results can form producer-valid chains with `str.borrow`, so retaining the giant
+/// dispatcher frame at each path operation would exceed the 2 MiB owner stack at the accepted HIR
+/// depth boundary.
+#[inline(never)]
+fn lower_path_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::PathJoin { a, b: pb } => {
+            let ao = lower_required!(b, lower_expr(b, a), Operand::Const(Const::Unit));
+            let bo = lower_required!(b, lower_expr(b, pb), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathJoin { a: ao, b: bo }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::PathComponent { kind, path } => {
+            let po = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            inherit_borrow_owners(b, v, [&po]);
+            b.push(Stmt::Let(
+                v,
+                Rvalue::PathComponent {
+                    kind: *kind,
+                    path: po,
+                },
+            ));
+            Operand::Value(v)
+        }
+        hir::ExprKind::PathNormalize { path } => {
+            let po = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
+            Operand::Value(v)
+        }
+        _ => unreachable!("lower_path_expr on a non-path operation"),
+    }
+}
+
 /// The three A7 line-read ops off `lower_expr`'s hot path (the #296 expr-depth lesson): `.buffered()`
 /// consumes+re-emits the reader; `.read_line()` folds the runtime i64 into `Result<i64, Error>`
 /// (the `reader.read` sign convention); `.as_str()` delegates to [`lower_bytes_as_str`].
@@ -13459,6 +14087,8 @@ mod tests {
                 slot_borrow_owners: Default::default(),
                 dbg: None,
                 fn_types: Rc::from(Vec::<hir::FnTy>::new()),
+                eager_expr_results: std::collections::HashMap::new(),
+                eager_expr_active: false,
             }),
         };
         let entry = builder.new_block();

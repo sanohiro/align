@@ -22,11 +22,12 @@ pub mod thinlto_spike;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
+mod drop_codegen;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{
-    ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
+    DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
@@ -802,17 +803,15 @@ fn build_module<'c>(
     // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
     // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
     // unchanged.
+    let mut type_layouts = align_sema::TypeLayoutCache::new(
+        &program.structs,
+        &program.enums,
+        &program.tagged_types,
+    );
     let field_perm: Vec<Vec<u32>> = program
         .structs
         .iter()
-        .map(|s| {
-            logical_to_physical(
-                s,
-                &program.structs,
-                &program.enums,
-                &program.tagged_types,
-            )
-        })
+        .map(|s| logical_to_physical(s, &mut type_layouts))
         .collect();
     let mut completed_struct_types = HashSet::new();
     for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
@@ -4216,8 +4215,8 @@ fn scalar_type<'c>(
         // its representation IS the `http_request_ctx` pointer, so it must lower to `ptr`. Missing
         // this arm is silent: the `_ =>` below falls through to `int_type`'s own `_ => i32`, which
         // truncates a pointer to 4 bytes — the exact bug that already happened once for `Ty::Fn`.
-        // Derived from `is_move_handle`, not re-listed: sema's `ty_size_align` answers 8 bytes off
-        // that same predicate, and a hand-copied list here would let a future handle type land in
+        // Derived from `is_move_handle`, not re-listed: sema's type-layout engine answers 8 bytes
+        // off that same predicate, and a hand-copied list here would let a future handle type land in
         // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
         // table happens to have a row.
         Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
@@ -4568,85 +4567,14 @@ fn task_tramp_key(ty: Ty) -> String {
     }
 }
 
-/// The natural ABI alignment (in bytes) of a struct field, used only to *order* fields for padding
-/// elimination — the actual byte offsets are always read back from the built LLVM struct type via
-/// `offset_of_element`, so a slightly-off estimate can never miscompile, only leave padding. Scalars
-/// use their width; a nested aggregate takes the max of its members; pointer-like views (`str`,
-/// `slice`, `string`, `box`, `soa`, dynamic arrays, …) are pointer-aligned (8).
-///
-/// The *valid* struct-field domain (`is_field_ok` in `align_sema`) is
-/// `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`; on that domain this **must** return the
-/// same alignment as `align_sema::ty_size_align` (the ordering must agree, or the sema huge-struct-copy
-/// lint's size would diverge from the real layout). It does. The `Unit` (→ 4, vs sema's 1) and `Array`
-/// (→ `scalar_bytes.min(8)`, vs sema's 8) arms below are for types `is_field_ok` **rejects**, so they
-/// never reach field ordering — kept only so the function is total. Scalars top out at 64-bit, so no
-/// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
-/// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
-/// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
+/// The natural ABI alignment (in bytes) of a struct field, used only to order fields for padding
+/// elimination. Sema owns the single iterative layout traversal so deep nominal/tagged graphs cannot
+/// overflow either compiler layer and field ordering cannot drift from the huge-copy lint's layout.
 fn field_abi_align(
     ty: Ty,
-    structs: &[StructDef],
-    enums: &[EnumDef],
-    tagged_types: &[hir::TaggedType],
+    layouts: &mut align_sema::TypeLayoutCache<'_>,
 ) -> u64 {
-    match ty {
-        Ty::Int(it) => (it.bits / 8).max(1) as u64,
-        Ty::Float(ft) => (ft.bits / 8) as u64,
-        Ty::Bool => 1,
-        Ty::Char => 4,
-        Ty::Unit => 4,
-        Ty::Struct(id) | Ty::StructArray(id, _) => structs[id as usize]
-            .fields
-            .iter()
-            .map(|f| field_abi_align(f.ty, structs, enums, tagged_types))
-            .max()
-            .unwrap_or(1),
-        // A sum type lowers to `{ i32 tag, <payloads flattened> }` (`enum_types`), so its ABI
-        // alignment is the max of the i32 tag (4) and every payload scalar's alignment (J1b: an enum
-        // is a valid struct field). Must match sema's `enum_size_align`.
-        Ty::Enum(id) => enums.get(id as usize).map_or(4, |e| {
-            e.variants
-                .iter()
-                .flat_map(|v| v.payload.iter())
-                .map(|&s| field_abi_align(scalar_to_ty(s), structs, enums, tagged_types))
-                .fold(4, u64::max)
-        }),
-        Ty::Option(payload) => {
-            field_abi_align(scalar_to_ty(payload), structs, enums, tagged_types)
-        }
-        Ty::Result(ok, err) => field_abi_align(
-            scalar_to_ty(ok),
-            structs,
-            enums,
-            tagged_types,
-        )
-        .max(field_abi_align(
-            scalar_to_ty(err),
-            structs,
-            enums,
-            tagged_types,
-        )),
-        Ty::Tagged(id) => match tagged_types.get(id as usize) {
-            Some(hir::TaggedType::Option(payload)) => {
-                field_abi_align(scalar_to_ty(*payload), structs, enums, tagged_types)
-            }
-            Some(hir::TaggedType::Result(ok, err)) => field_abi_align(
-                scalar_to_ty(*ok),
-                structs,
-                enums,
-                tagged_types,
-            )
-            .max(field_abi_align(
-                scalar_to_ty(*err),
-                structs,
-                enums,
-                tagged_types,
-            )),
-            None => 1,
-        },
-        Ty::Array(s, _) => scalar_bytes(s).clamp(1, 8),
-        _ => 8,
-    }
+    layouts.layout(ty).1
 }
 
 /// The logical→physical field-index map for a struct. A non-`layout(C)` struct is laid out in
@@ -4656,9 +4584,7 @@ fn field_abi_align(
 /// vector `m` satisfies `m[logical] = physical`; invert with [`physical_order`] to emit the body.
 fn logical_to_physical(
     s: &StructDef,
-    structs: &[StructDef],
-    enums: &[EnumDef],
-    tagged_types: &[hir::TaggedType],
+    layouts: &mut align_sema::TypeLayoutCache<'_>,
 ) -> Vec<u32> {
     let n = s.fields.len();
     if s.c_repr {
@@ -4667,12 +4593,7 @@ fn logical_to_physical(
     // Physical order = logical indices sorted by descending alignment (stable → decl order on ties).
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| {
-        std::cmp::Reverse(field_abi_align(
-            s.fields[i as usize].ty,
-            structs,
-            enums,
-            tagged_types,
-        ))
+        std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, layouts))
     });
     // Invert: `map[logical] = physical`.
     let mut map = vec![0u32; n];
@@ -11262,7 +11183,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_struct_gep(st, base, pi, "dropnest")
                         .map_err(|e| self.err(e))?;
-                    self.drop_struct_fields(fp, nid)?;
+                    self.drop_ty_at(fp, Ty::Struct(nid))?;
                 }
                 // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
                 // struct Move through the recursive DropPlan. Tag-switch and free the live variant's
@@ -11274,20 +11195,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_struct_gep(st, base, pi, "dropenumfld")
                         .map_err(|e| self.err(e))?;
-                    self.drop_enum(fp, eid)?;
+                    self.drop_ty_at(fp, Ty::Enum(eid))?;
                 }
                 // An owned `array<Move-struct>` field (J3b) — the `Chat { messages: array<Message> }`
                 // shape, where each element owns a buffer (a `string`/owned-array field, or a Move-enum
                 // field like `Message`'s `content`). Deep-free each element then the AoS (`free(null)` is
                 // a no-op for an empty array) via the shared helper.
-                Ty::DynStructArray(eid, _)
+                ty @ Ty::DynStructArray(eid, _)
                     if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
                 {
                     let fp = self
                         .builder
                         .build_struct_gep(st, base, pi, "dropdeeparr")
                         .map_err(|e| self.err(e))?;
-                    self.deep_free_struct_array(fp, eid)?;
+                    self.drop_ty_at(fp, ty)?;
                 }
                 // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
                 // free its single heap buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an
@@ -11322,7 +11243,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let ep = unsafe {
                             self.builder.build_in_bounds_gep(arr_ty, fp, &[zero, idx], "dropnestel").map_err(|e| self.err(e))?
                         };
-                        self.drop_struct_fields(ep, eid)?;
+                        self.drop_ty_at(ep, Ty::Struct(eid))?;
                     }
                 }
                 // A Move **handle** field (F1②): a bare pointer handle — `http_request_ctx`, `file`,
@@ -11357,185 +11278,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         base: inkwell::values::PointerValue<'c>,
         ty: Ty,
     ) -> Result<(), CodegenError> {
-        match ty {
-            Ty::Option(payload) => self.drop_option_at(base, payload),
-            Ty::Result(ok, err) => self.drop_result_at(base, ok, err),
-            Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
-                Some(hir::TaggedType::Option(payload)) => self.drop_option_at(base, *payload),
-                Some(hir::TaggedType::Result(ok, err)) => self.drop_result_at(base, *ok, *err),
-                None => Err(self.err(format!("nested tagged type id {id} is missing"))),
-            },
-            Ty::Struct(id) => self.drop_struct_fields(base, id),
-            Ty::Enum(id) => self.drop_enum(base, id),
-            Ty::DynStructArray(id, _)
-                if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
-            {
-                self.deep_free_struct_array(base, id)
-            }
-            Ty::DynArray(Scalar::String) => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "dropstrarr")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "dropstrarrptr").map_err(|e| self.err(e))?;
-                let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            Ty::DynResponseArray => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "droprsparr")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "droprsparrptr").map_err(|e| self.err(e))?;
-                let len = self.builder.build_extract_value(agg, 1, "droprsparrlen").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            ty if let Some(free_fn) = handle_free_fn(ty) => {
-                let ptr = self
-                    .builder
-                    .build_load(self.ctx.ptr_type(AddressSpace::default()), base, "drophandlev")
-                    .map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs[free_fn], &[ptr.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            Ty::String
-            | Ty::DynArray(_)
-            | Ty::DynStructArray(..)
-            | Ty::DynSliceArray(_) => {
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), base, "dropslicev")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "dropsliceptr").map_err(|e| self.err(e))?;
-                self.builder
-                    .build_call(self.funcs["free"], &[ptr.into()], "")
-                    .map_err(|e| self.err(e))?;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Drop an `Option<T>` by testing the tag before reading or recursively dropping its payload.
-    fn drop_option_at(
-        &self,
-        base: inkwell::values::PointerValue<'c>,
-        payload: Scalar,
-    ) -> Result<(), CodegenError> {
-        let option_ty = option_struct_type(
-            self.ctx,
-            payload,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let tag_ptr = self
-            .builder
-            .build_struct_gep(option_ty, base, 0, "dropopttagp")
-            .map_err(|e| self.err(e))?;
-        let tag = self
-            .builder
-            .build_load(self.ctx.i8_type(), tag_ptr, "dropopttag")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        let some = self.ctx.append_basic_block(self.func, "drop.opt.some");
-        let cont = self.ctx.append_basic_block(self.func, "drop.opt.cont");
-        let is_some = self
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                tag,
-                self.ctx.i8_type().const_int(1, false),
-                "dropoptissome",
-            )
-            .map_err(|e| self.err(e))?;
-        self.builder
-            .build_conditional_branch(is_some, some, cont)
-            .map_err(|e| self.err(e))?;
-        self.builder.position_at_end(some);
-        let payload_ptr = self
-            .builder
-            .build_struct_gep(option_ty, base, 1, "dropoptpayload")
-            .map_err(|e| self.err(e))?;
-        self.drop_ty_at(payload_ptr, scalar_to_ty(payload))?;
-        self.builder
-            .build_unconditional_branch(cont)
-            .map_err(|e| self.err(e))?;
-        self.builder.position_at_end(cont);
-        Ok(())
-    }
-
-    /// Drop a `Result<T,E>` by selecting exactly the active Ok/Err payload.
-    fn drop_result_at(
-        &self,
-        base: inkwell::values::PointerValue<'c>,
-        ok: Scalar,
-        err: Scalar,
-    ) -> Result<(), CodegenError> {
-        let result_ty = result_struct_type(
-            self.ctx,
-            ok,
-            err,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let tag_ptr = self
-            .builder
-            .build_struct_gep(result_ty, base, 0, "droprestagp")
-            .map_err(|e| self.err(e))?;
-        let tag = self
-            .builder
-            .build_load(self.ctx.i8_type(), tag_ptr, "droprestag")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        let cont = self.ctx.append_basic_block(self.func, "drop.result.cont");
-        let ok_plan = drop_plan(scalar_to_ty(ok), self.structs, self.enums, self.tagged_defs);
-        let err_plan = drop_plan(
-            scalar_to_ty(err),
-            self.structs,
-            self.enums,
-            self.tagged_defs,
-        );
-        let ok_bb = ok_plan
-            .needs_drop()
-            .then(|| self.ctx.append_basic_block(self.func, "drop.result.ok"));
-        let err_bb = err_plan
-            .needs_drop()
-            .then(|| self.ctx.append_basic_block(self.func, "drop.result.err"));
-        let mut cases = Vec::with_capacity(2);
-        if let Some(bb) = ok_bb {
-            cases.push((self.ctx.i8_type().const_zero(), bb));
-        }
-        if let Some(bb) = err_bb {
-            cases.push((self.ctx.i8_type().const_int(1, false), bb));
-        }
-        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
-        if let Some(bb) = ok_bb {
-            self.builder.position_at_end(bb);
-            let payload = self.builder.build_struct_gep(result_ty, base, 1, "dropresok").map_err(|e| self.err(e))?;
-            self.drop_ty_at(payload, scalar_to_ty(ok))?;
-            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
-        }
-        if let Some(bb) = err_bb {
-            self.builder.position_at_end(bb);
-            let payload = self.builder.build_struct_gep(result_ty, base, 2, "droprese").map_err(|e| self.err(e))?;
-            self.drop_ty_at(payload, scalar_to_ty(err))?;
-            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
-        }
-        self.builder.position_at_end(cont);
-        Ok(())
+        self.emit_drop_at_iterative(base, ty)
     }
 
     /// Deep-free an owned `array<Move-struct>` (J3b) whose `{ptr,len}` aggregate lives at `slice_ptr`:
@@ -13450,6 +13193,168 @@ mod tests {
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
+    fn unary_hir_at_body_depth(depth: usize) -> hir::Program {
+        assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(0, "fn main() -> i32 = 0\n", &mut diagnostics);
+        let file = parse_file(tokens, &mut diagnostics);
+        let mut program = check_file(&file, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+
+        let function = &mut program.fns[0];
+        let span = function.span;
+        let mut expression = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: function.ret,
+            span,
+        };
+        for _ in 2..depth {
+            expression = hir::Expr {
+                kind: hir::ExprKind::Unary {
+                    op: align_ast::UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: function.ret,
+                span,
+            };
+        }
+        function.body = hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        };
+        program
+    }
+
+    fn mixed_hir_at_body_depth(depth: usize) -> hir::Program {
+        assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+        let mut program = unary_hir_at_body_depth(2);
+        let function = &mut program.fns[0];
+        let span = function.span;
+        let mut expression = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: Ty::Int(align_sema::IntTy {
+                bits: 32,
+                signed: true,
+            }),
+            span,
+        };
+        for expression_depth in 2..depth {
+            let ty = expression.ty;
+            expression = match expression_depth % 3 {
+                0 => hir::Expr {
+                    kind: hir::ExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(expression),
+                        rhs: Box::new(hir::Expr {
+                            kind: hir::ExprKind::Int(1),
+                            ty,
+                            span,
+                        }),
+                    },
+                    ty,
+                    span,
+                },
+                1 => hir::Expr {
+                    kind: hir::ExprKind::Unary {
+                        op: align_ast::UnOp::Neg,
+                        expr: Box::new(expression),
+                    },
+                    ty,
+                    span,
+                },
+                _ => {
+                    let ty = match ty {
+                        Ty::Int(align_sema::IntTy { bits: 32, .. }) => {
+                            Ty::Int(align_sema::IntTy {
+                                bits: 64,
+                                signed: true,
+                            })
+                        }
+                        _ => Ty::Int(align_sema::IntTy {
+                            bits: 32,
+                            signed: true,
+                        }),
+                    };
+                    hir::Expr {
+                        kind: hir::ExprKind::Cast(Box::new(expression)),
+                        ty,
+                        span,
+                    }
+                }
+            };
+        }
+        function.ret = expression.ty;
+        function.body = hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        };
+        program
+    }
+
+    #[test]
+    fn checked_hir_depth_closure_matrix() {
+        std::thread::Builder::new()
+            .name("checked-hir-depth-codegen-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for make_hir in [
+                    unary_hir_at_body_depth as fn(usize) -> hir::Program,
+                    mixed_hir_at_body_depth,
+                ] {
+                    for depth in [
+                        align_sema::MAX_CHECKED_HIR_DEPTH - 1,
+                        align_sema::MAX_CHECKED_HIR_DEPTH,
+                    ] {
+                        let hir = make_hir(depth);
+                        assert!(
+                            align_sema::checked_hir_body_depth_is_valid(&hir),
+                            "valid checked-HIR depth {depth} was rejected"
+                        );
+                        let mir = lower_program(&hir);
+                        assert!(!mir.fns.is_empty(), "valid depth {depth} did not reach MIR");
+                        for optimized in [false, true] {
+                            let llvm = emit_llvm_ir(
+                                &mir,
+                                &BuildTarget::Baseline,
+                                optimized,
+                                &[],
+                                None,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("depth {depth}, optimized={optimized}: {error}")
+                            });
+                            assert!(
+                                llvm.contains("define") && llvm.contains("@main("),
+                                "depth {depth}, optimized={optimized}: main was not emitted"
+                            );
+                        }
+                    }
+                }
+
+                let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
+                let hir = unary_hir_at_body_depth(depth);
+                assert!(
+                    !align_sema::checked_hir_body_depth_is_valid(&hir),
+                    "over-bound checked-HIR depth {depth} was accepted"
+                );
+                let mir = lower_program(&hir);
+                assert!(
+                    mir.fns.is_empty()
+                        && mir.externs.is_empty()
+                        && mir.imported_fns.is_empty()
+                        && mir.link_libs.is_empty()
+                        && mir.structs.is_empty()
+                        && mir.enums.is_empty()
+                        && mir.tagged_types.is_empty()
+                        && mir.tuples.is_empty(),
+                    "an over-bound body published partial MIR"
+                );
+            })
+            .expect("spawn checked-HIR depth codegen owner")
+            .join()
+            .expect("checked-HIR depth codegen owner");
+    }
+
     // -- Build profiles reach the backend (Codex audit item 3) ------------------------------------
 
     #[test]
@@ -15143,11 +15048,11 @@ mod tests {
         assert!(function_body(&soa, "main").contains("@align_rt_alloc_size_fail"), "SoA alignment bump overflow must fail:\n{soa}");
     }
 
-    /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /
-    /// `struct_size_align`, which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
+    /// Layout parity: the sema `(size, align)` computation (the shared iterative type-layout engine,
+    /// which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
     /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
-    /// `logical_to_physical`). This pins the two independent hand-written layout computations
-    /// (`field_abi_align` here vs `ty_size_align` in sema) against LLVM ground truth, so any future
+    /// `logical_to_physical`). This pins `field_abi_align` and sema layout against LLVM ground truth,
+    /// so any future
     /// drift — or a new wider-aligned field type added to `is_field_ok` without updating both — fails
     /// loudly. Covers every valid struct-field type, mixed widths that force a reorder, `str`/`string`
     /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-aligned
@@ -15163,7 +15068,7 @@ mod tests {
         fn f(bits: u8) -> Ty {
             Ty::Float(FloatTy { bits })
         }
-        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (ty_size_align ↔
+        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (sema layout ↔
         // option_struct_type) across scalar / str / nested-struct payloads and reorder cases.
         fn opt(ty: Ty) -> Ty {
             Ty::Option(align_sema::ty_to_scalar(ty).expect("option payload is a scalar"))
@@ -15235,7 +15140,7 @@ mod tests {
             sdef("ArrStruct", false, &[i(64, true), Ty::DynStructArray(2, Layout::Aos)]), // { i64, {ptr,len} }
             sdef("ArrScalar", false, &[Ty::Bool, Ty::DynArray(align_sema::Scalar::Int(IntTy { bits: 64, signed: true }))]),
             // Sum-type (`enum`) fields (JSON completeness J1b): an enum lowers to `{ i32 tag, payloads
-            // flattened }`, so its field alignment/size must agree between sema (`enum_size_align`) and
+            // flattened }`, so its field alignment/size must agree between sema's layout engine and
             // LLVM. `EScalar`/`EStr`/`EObj` (enum ids 0/1/2 below) cover scalar-only (align 4),
             // `str`-view (align 8), and object (struct payload) shapes, plus a reorder (`SEnum1`).
             sdef("SEnumScalar", false, &[Ty::Enum(0)]),                  // { i32, i32, i8 } → (12, 4)
@@ -15249,7 +15154,7 @@ mod tests {
             // `Ty::Fn` closure field and a `slice<T>` view field really are 16 bytes. Mixed with an
             // i8 so the reorder path is exercised too.
             sdef("HandleField", false, &[i(8, true), Ty::HttpRequestCtx]),   // { ptr, i8 } → (16, 8)
-            // A SECOND Move handle, because `ty_size_align` answers the whole family through
+            // A SECOND Move handle, because sema layout answers the whole family through
             // `is_move_handle` and `scalar_type` lowers all of them to `ptr`: one row per arm would
             // pin only the arm it names, and this table is hand-written — nothing else notices a
             // family member drifting.
@@ -15385,9 +15290,9 @@ mod tests {
             };
             tagged_type.set_body(&fields, false);
         }
+        let mut layouts = align_sema::TypeLayoutCache::new(&structs, &enums, &tagged_defs);
         for (s, st) in structs.iter().zip(&struct_types) {
-            let perm =
-                logical_to_physical(s, &structs, &enums, &tagged_defs);
+            let perm = logical_to_physical(s, &mut layouts);
             set_struct_body(
                 &ctx,
                 *st,
@@ -15415,6 +15320,79 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    #[test]
+    fn deep_type_consumer_closure_matrix() {
+        const DEPTH: usize = 4096;
+        std::thread::Builder::new()
+            .name("deep-type-codegen-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let structs = (0..DEPTH)
+                    .map(|id| StructDef {
+                        name: format!("Deep{id}"),
+                        source_name: format!("Deep{id}"),
+                        fields: vec![align_sema::hir::FieldDef {
+                            name: "next".to_string(),
+                            ty: if id + 1 == DEPTH {
+                                i64_ty
+                            } else {
+                                Ty::Struct((id + 1) as u32)
+                            },
+                        }],
+                        align: None,
+                        c_repr: false,
+                    })
+                    .collect::<Vec<_>>();
+                let mut probe_layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
+                assert_eq!(field_abi_align(Ty::Struct(0), &mut probe_layouts), 8);
+
+                let ctx = Context::create();
+                let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+                    .expect("target machine");
+                let target_data = tm.get_target_data();
+                let struct_types = structs
+                    .iter()
+                    .map(|structure| ctx.opaque_struct_type(&structure.name))
+                    .collect::<Vec<_>>();
+                let mut layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
+                for (structure, llvm_ty) in structs.iter().zip(&struct_types) {
+                    let permutation = logical_to_physical(structure, &mut layouts);
+                    set_struct_body(
+                        &ctx,
+                        *llvm_ty,
+                        structure,
+                        &permutation,
+                        &struct_types,
+                        &[],
+                        &[],
+                        &target_data,
+                    );
+                }
+                assert_eq!(target_data.get_abi_alignment(&struct_types[0]), 8);
+                assert_eq!(target_data.get_abi_size(&struct_types[0]), 8);
+
+                let mut owned = structs;
+                owned[DEPTH - 1].fields[0].ty = Ty::String;
+                let llvm = codegen_program(
+                    vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                    vec![],
+                    vec![Ty::Struct(0)],
+                    owned,
+                    vec![],
+                    vec![],
+                )
+                .expect("deep recursive Drop emission must use compiler-owned frames");
+                assert!(
+                    function_body(&llvm, "main").contains("@align_rt_free"),
+                    "the deepest owned leaf must still be dropped"
+                );
+            })
+            .expect("spawn deep type codegen owner")
+            .join()
+            .expect("deep type codegen owner");
     }
 
     #[test]

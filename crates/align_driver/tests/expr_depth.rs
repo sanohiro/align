@@ -98,10 +98,10 @@ fn within_limit_chain_compiles_and_runs() {
     if !backend_available() {
         return;
     }
-    // End-to-end: a 40-term chain (safe for the full codegen pipeline on the test thread) must
-    // build and return the correct value — the truncation pass leaves in-limit trees untouched.
-    let chain = std::iter::repeat_n("1", 40).collect::<Vec<_>>().join("+");
+    // End-to-end: a 120-term chain below the parser ceiling must build and return the correct value
+    // on the ordinary 2 MiB test stack.
+    let chain = std::iter::repeat_n("1", 120).collect::<Vec<_>>().join("+");
     let src = format!("fn main() -> i32 {{\n  return {chain}\n}}\n");
     let out = build_and_run("within-limit-run", &src);
-    assert_eq!(out.status.code(), Some(40));
+    assert_eq!(out.status.code(), Some(120));
 }
