@@ -1443,6 +1443,46 @@ pub fn ty_may_borrow(
     false
 }
 
+/// Whether a struct transitively contains a zero-copy `str` view.
+///
+/// This is intentionally narrower than [`ty_may_borrow`]: it classifies decoded struct/SoA
+/// storage whose string columns borrow an input buffer. Header-mediated struct and enum edges use
+/// one explicit worklist, so every finite validated graph is independent of the process stack.
+fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    let mut work = vec![Ty::Struct(id)];
+    let mut visited_structs = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Str | Ty::Option(Scalar::Str) | Ty::Slice(Scalar::Str) => return true,
+            Ty::Struct(id)
+            | Ty::Option(Scalar::Struct(id))
+            | Ty::Slice(Scalar::Struct(id))
+                if visited_structs.insert(id) =>
+            {
+                if let Some(definition) = structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(definition) = enums.get(id as usize) {
+                    for variant in definition.variants.iter().rev() {
+                        for payload in variant.payload.iter().rev() {
+                            match *payload {
+                                Scalar::Str => return true,
+                                Scalar::Struct(id) => work.push(Ty::Struct(id)),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
 /// `None` mode = `wrapping_*` (the default wrapping arithmetic — lowered to a plain `Binary`);
 /// `Some(_)` = `saturating_*` / `checked_*`. Returns `None` for any other method name.
@@ -9414,57 +9454,7 @@ impl<'a> EscapeCheck<'a> {
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
     /// a primitive-only one is free to escape the arena (`s[i]` gather returns a Copy POD value).
     fn struct_has_str(&self, id: u32) -> bool {
-        self.struct_has_str_rec(id, &mut Vec::new())
-    }
-
-    /// Whether struct `id` holds a `str` field at any nesting depth — a decoded nested struct's `str`
-    /// fields are zero-copy views into the JSON input, so a struct that (transitively) contains one is
-    /// region-tied to that input and cannot outlive it (`region_of`). Cycle-safe (`stack`) even though
-    /// the struct graph is acyclic (`struct_acyclic`), so a mis-built graph can't loop forever.
-    fn struct_has_str_rec(&self, id: u32, stack: &mut Vec<u32>) -> bool {
-        if stack.contains(&id) {
-            return false;
-        }
-        stack.push(id);
-        let mut found = false;
-        for f in &self.structs[id as usize].fields {
-            let has = match f.ty {
-                Ty::Str => true,
-                Ty::Struct(nid) => self.struct_has_str_rec(nid, stack),
-                // An `Option<str>` field holds a `str` view when `Some`; an `Option<Struct>` field can
-                // hold a str-bearing struct — both make the enclosing struct input-region-tied.
-                Ty::Option(Scalar::Str) => true,
-                Ty::Option(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
-                // A `slice<str>` field holds `str` views into a backing buffer, so the enclosing
-                // struct is region-tied exactly like a direct `str` field (F1③, the pkg.web param
-                // slots). A `slice<struct>` recurses into a str-bearing element struct; other slice
-                // elements (`slice<i64>`) carry no `str` view (their backing-buffer region-tie is
-                // handled by the `region_of(StructLit)` field fold, not here — this predicate is
-                // specifically about `str` views).
-                Ty::Slice(Scalar::Str) => true,
-                Ty::Slice(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
-                // A sum-type (`enum`) field holds a `str` view when its live variant carries one — a
-                // `Content.Text(view)` field makes the enclosing struct input-region-tied, exactly like
-                // a direct `str` field (J1b). Recurse into a `str`-bearing struct payload too; a
-                // scalar-only enum contributes no region (stays `Static`, freely returnable).
-                Ty::Enum(eid) => self.enums.get(eid as usize).is_some_and(|e| {
-                    e.variants.iter().any(|v| {
-                        v.payload.iter().any(|&s| match s {
-                            Scalar::Str => true,
-                            Scalar::Struct(nid) => self.struct_has_str_rec(nid, stack),
-                            _ => false,
-                        })
-                    })
-                }),
-                _ => false,
-            };
-            if has {
-                found = true;
-                break;
-            }
-        }
-        stack.pop();
-        found
+        struct_contains_str(id, self.structs, self.enums)
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
@@ -33643,6 +33633,14 @@ fn main() -> i32 = 0
         assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
         assert!(!ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
         assert!(struct_is_move(0, &structs, &[], &[]));
+
+        structs[DEPTH - 1].fields[0].ty = Ty::Str;
+        structs[0].fields.push(hir::FieldDef {
+            name: "malformed_later".to_string(),
+            ty: Ty::Struct(DEPTH as u32 + 9),
+        });
+        assert!(struct_contains_str(0, &structs, &[]));
+        structs[0].fields.pop();
 
         let tagged = (0..DEPTH)
             .map(|id| hir::TaggedType::Option(if id + 1 == DEPTH {
