@@ -3729,7 +3729,7 @@ pub fn check_program_with_interface_facts(
                     &structs,
                     &enums,
                     &tagged_types,
-                    &mut vec![i as u32],
+                    &[i as u32],
                 ) {
                     diags.error(
                         format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
@@ -3857,7 +3857,7 @@ pub fn check_program_with_interface_facts(
             &structs,
             &enums,
             &tagged_types,
-            &mut Vec::new(),
+            &[],
         ) {
             let span = decl.2.fields.iter().find(|sf| sf.name.name == enum_field.name).map_or(decl.2.span, |sf| sf.span);
             diags.error(
@@ -6153,8 +6153,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 scalar_to_ty(error),
                 result,
-                &mut vec![FnEffectProjection::ResultErr],
-                &mut Vec::new(),
+                &[FnEffectProjection::ResultErr],
             );
         }
     }
@@ -6218,8 +6217,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 *param,
                 capture,
-                &mut Vec::new(),
-                &mut Vec::new(),
+                &[],
             );
         }
     }
@@ -6400,8 +6398,7 @@ impl EffectScan<'_> {
                         self.join_concrete_effects(
                             ty,
                             init,
-                            &mut vec![FnEffectProjection::TupleElement(index as u32)],
-                            &mut Vec::new(),
+                            &[FnEffectProjection::TupleElement(index as u32)],
                         );
                     }
                 }
@@ -6486,8 +6483,7 @@ impl EffectScan<'_> {
                     self.join_concrete_effects(
                         loop_ty,
                         value,
-                        &mut Vec::new(),
-                        &mut Vec::new(),
+                        &[],
                     );
                 }
             }
@@ -6529,8 +6525,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 ty,
                 scrutinee,
-                &mut vec![projection],
-                &mut Vec::new(),
+                &[projection],
             );
         }
     }
@@ -7135,8 +7130,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             self.return_ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -7229,8 +7223,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -7247,8 +7240,7 @@ impl EffectScan<'_> {
             self.join_concrete_effects(
                 field.ty,
                 incoming,
-                &mut vec![FnEffectProjection::StructField(index as u32)],
-                &mut vec![Ty::Struct(id)],
+                &[FnEffectProjection::StructField(index as u32)],
             );
         }
     }
@@ -7299,8 +7291,7 @@ impl EffectScan<'_> {
         self.join_concrete_effects(
             *ty,
             incoming,
-            &mut Vec::new(),
-            &mut Vec::new(),
+            &[],
         );
     }
 
@@ -7308,8 +7299,7 @@ impl EffectScan<'_> {
         &self,
         ty: Ty,
         incoming: &Expr,
-        path: &mut Vec<FnEffectProjection>,
-        _visiting: &mut Vec<Ty>,
+        path: &[FnEffectProjection],
     ) {
         let tables = EffectTypeTables {
             structs: self.structs,
@@ -7321,7 +7311,7 @@ impl EffectScan<'_> {
             let Some(function) = self.fn_types.get(id as usize) else {
                 continue;
             };
-            let mut full_path = path.clone();
+            let mut full_path = path.to_vec();
             full_path.extend(suffix);
             if let Some(incoming) = self.projected_fn_effect(incoming, &full_path) {
                 function.effect.set(function.effect.get().join(incoming));
@@ -7459,8 +7449,7 @@ impl EffectScan<'_> {
                         self.join_concrete_effects(
                             *param,
                             arg,
-                            &mut Vec::new(),
-                            &mut Vec::new(),
+                            &[],
                         );
                     }
                 }
@@ -7521,8 +7510,7 @@ impl EffectScan<'_> {
                             self.join_concrete_effects(
                                 scalar_to_ty(*param),
                                 arg,
-                                &mut Vec::new(),
-                                &mut Vec::new(),
+                                &[],
                             );
                         }
                     }
@@ -15043,7 +15031,7 @@ impl<'a> MoveCheck<'a> {
                 consuming: bool,
                 incoming: Option<(MovedSet, BorrowState)>,
                 then_result:
-                    Option<(bool, MovedSet, BorrowState, BorrowFact)>,
+                    Box<Option<(bool, MovedSet, BorrowState, BorrowFact)>>,
             },
             MatchAfterScrutinee {
                 scrutinee: &'e Expr,
@@ -15061,8 +15049,8 @@ impl<'a> MoveCheck<'a> {
                 direct: bool,
                 incoming_borrows: BorrowState,
                 consuming_control: bool,
-                prepared: Option<MoveMatchPrepared>,
-                join: MoveMatchJoin,
+                prepared: Option<Box<MoveMatchPrepared>>,
+                join: Box<MoveMatchJoin>,
             },
             BlockLet {
                 local: LocalId,
@@ -15657,7 +15645,7 @@ impl<'a> MoveCheck<'a> {
                                     incoming_borrows,
                                     consuming_control,
                                     prepared: None,
-                                    join: MoveMatchJoin::default(),
+                                    join: Box::default(),
                                 },
                             )
                         }
@@ -15788,7 +15776,7 @@ impl<'a> MoveCheck<'a> {
                                     els,
                                     consuming: current_consuming,
                                     incoming: None,
-                                    then_result: None,
+                                    then_result: Box::default(),
                                 },
                             )
                         }
@@ -16060,7 +16048,7 @@ impl<'a> MoveCheck<'a> {
                             &arms[*selected],
                             moved,
                         );
-                        *prepared = Some(match_state);
+                        *prepared = Some(Box::new(match_state));
                     }
                     Post::BlockPairAfterValue {
                         index,
@@ -16133,10 +16121,12 @@ impl<'a> MoveCheck<'a> {
                             *consuming,
                             false,
                         );
-                        let then_fact = then_falls
-                            .then(|| self.block_value_fact(then))
-                            .unwrap_or_default();
-                        *then_result = Some((
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        **then_result = Some((
                             then_falls,
                             then_moved,
                             self.borrows.clone(),
@@ -16348,7 +16338,7 @@ impl<'a> MoveCheck<'a> {
                         }
                         falls_through = self.finish_match_join(
                             &prepared,
-                            join,
+                            *join,
                             moved,
                         );
                     }
@@ -16370,9 +16360,11 @@ impl<'a> MoveCheck<'a> {
                             consuming,
                             false,
                         );
-                        let then_fact = then_falls
-                            .then(|| self.block_value_fact(then))
-                            .unwrap_or_default();
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
                         let then_borrows = self.borrows.clone();
                         let mut else_moved = incoming_moved.clone();
                         self.borrows = incoming_borrows.clone();
@@ -16382,9 +16374,11 @@ impl<'a> MoveCheck<'a> {
                             consuming,
                             false,
                         );
-                        let else_fact = else_falls
-                            .then(|| self.block_value_fact(els))
-                            .unwrap_or_default();
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
                         let else_borrows = self.borrows.clone();
                         falls_through = self.finish_if_move_join(
                             wrapper.span,
@@ -16416,9 +16410,11 @@ impl<'a> MoveCheck<'a> {
                         let then_falls = falls_through;
                         let then_moved = moved.clone();
                         let then_borrows = self.borrows.clone();
-                        let then_fact = then_falls
-                            .then(|| self.block_value_fact(then))
-                            .unwrap_or_default();
+                        let then_fact = if then_falls {
+                            self.block_value_fact(then)
+                        } else {
+                            BorrowFact::default()
+                        };
                         let mut else_moved = incoming_moved.clone();
                         self.borrows = incoming_borrows.clone();
                         let else_falls = self.block(
@@ -16427,9 +16423,11 @@ impl<'a> MoveCheck<'a> {
                             consuming,
                             false,
                         );
-                        let else_fact = else_falls
-                            .then(|| self.block_value_fact(els))
-                            .unwrap_or_default();
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
                         let else_borrows = self.borrows.clone();
                         falls_through = self.finish_if_move_join(
                             wrapper.span,
@@ -16462,14 +16460,16 @@ impl<'a> MoveCheck<'a> {
                             then_borrows,
                             then_fact,
                         )),
-                    ) = (incoming, then_result)
+                    ) = (incoming, *then_result)
                     {
                         let else_falls = falls_through;
                         let else_moved = moved.clone();
                         let else_borrows = self.borrows.clone();
-                        let else_fact = else_falls
-                            .then(|| self.block_value_fact(els))
-                            .unwrap_or_default();
+                        let else_fact = if else_falls {
+                            self.block_value_fact(els)
+                        } else {
+                            BorrowFact::default()
+                        };
                         falls_through = self.finish_if_move_join(
                             wrapper.span,
                             moved,
@@ -25561,7 +25561,7 @@ impl<'a, 't> Checker<'a, 't> {
         match ty {
             // A single struct → a JSON object.
             Ty::Struct(sid) => {
-                self.json_object_parts(base, sid, None, &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
+                self.json_object_parts(base, sid, None, &[], &[], &mut parts, args[0].span, &mut ok);
             }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
@@ -25570,7 +25570,7 @@ impl<'a, 't> Checker<'a, 't> {
                     if i > 0 {
                         parts.push(TemplatePart::Text(",".to_string()));
                     }
-                    self.json_object_parts(base, sid, Some(i), &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
+                    self.json_object_parts(base, sid, Some(i), &[], &[], &mut parts, args[0].span, &mut ok);
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
@@ -26179,7 +26179,7 @@ impl<'a, 't> Checker<'a, 't> {
         sid: u32,
         elem: Option<u32>,
         path_prefix: &[u32],
-        visiting: &mut Vec<u32>,
+        visiting: &[u32],
         parts: &mut Vec<TemplatePart>,
         span: Span,
         ok: &mut bool,
@@ -33593,7 +33593,7 @@ fn struct_acyclic(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    visiting: &mut Vec<u32>,
+    visiting: &[u32],
 ) -> bool {
     type_graph_acyclic(
         Ty::Struct(id),
@@ -33615,7 +33615,7 @@ fn enum_acyclic(
         structs,
         enums,
         tagged_types,
-        &mut Vec::new(),
+        &[],
     )
 }
 
@@ -33624,7 +33624,7 @@ fn type_graph_acyclic(
     structs: &[StructDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-    initial_struct_path: &mut Vec<u32>,
+    initial_struct_path: &[u32],
 ) -> bool {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Node {
@@ -36672,12 +36672,12 @@ fn main() -> i32 = 0
             })
             .collect::<Vec<_>>();
         assert!(
-            struct_acyclic(0, &structs, &[], &[], &mut Vec::new()),
+            struct_acyclic(0, &structs, &[], &[], &[]),
             "a finite deep inline graph must not consume the process stack"
         );
         structs[4_095].fields[0].ty = Ty::Struct(0);
         assert!(
-            !struct_acyclic(0, &structs, &[], &[], &mut Vec::new()),
+            !struct_acyclic(0, &structs, &[], &[], &[]),
             "a deep inline cycle must still reject"
         );
     }

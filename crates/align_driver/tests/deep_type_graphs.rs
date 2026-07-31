@@ -9,7 +9,7 @@ fn deep_types(module: Option<&str>, depth: usize) -> String {
         source.push_str(&format!("module {module}\n"));
     }
     for index in 0..depth {
-        let visibility = module.is_some().then_some("pub ").unwrap_or("");
+        let visibility = if module.is_some() { "pub " } else { "" };
         if index + 1 == depth {
             source.push_str(&format!(
                 "{visibility}Deep{index} {{ value: string }}\n"

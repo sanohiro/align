@@ -3995,11 +3995,9 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 
     let mut posts = Vec::new();
     let mut current = root;
-    loop {
-        let block = match &current.kind {
-            hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block,
-            _ => break,
-        };
+    while let hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) =
+        &current.kind
+    {
         if block.stmts.is_empty()
             && let Some(value) = block.value.as_deref()
         {
@@ -4092,10 +4090,7 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     let mut current = root;
     let mut started = false;
     let mut terminated_while_descending = false;
-    loop {
-        let Some((scrutinee, body)) = wildcard_match_parts(b, current) else {
-            break;
-        };
+    while let Some((scrutinee, body)) = wildcard_match_parts(b, current) {
         started = true;
         let (result_slot, result_flag, result_temp_flag) =
             control_result_slots(b, current.ty);

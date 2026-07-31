@@ -167,7 +167,7 @@ impl<'a> TypeLayoutCache<'a> {
                     c_repr,
                     over_align,
                 } => {
-                    let start = built.len().checked_sub(fields).unwrap_or(0);
+                    let start = built.len().saturating_sub(fields);
                     let mut layouts = built.drain(start..).collect::<Vec<_>>();
                     if !c_repr {
                         layouts.sort_by_key(|&(_, align)| std::cmp::Reverse(align.max(1)));
@@ -186,7 +186,7 @@ impl<'a> TypeLayoutCache<'a> {
                     built.push(layout);
                 }
                 Work::ExitEnum { id, payloads } => {
-                    let start = built.len().checked_sub(payloads).unwrap_or(0);
+                    let start = built.len().saturating_sub(payloads);
                     let layouts = built.drain(start..).collect::<Vec<_>>();
                     let mut size = 4u64;
                     let mut align = 4u64;
