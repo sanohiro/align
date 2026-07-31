@@ -404,7 +404,11 @@ match/loop gaps can otherwise admit `TaskGet` from an uninitialized result slot.
 post-review closure assigns stable tokens per syntax site, computes each loop header from entry and
 reachable fallthrough to a fixed point before joining breaks, and preserves an established
 completion across a later unhandled no-task Wait. This prevents an earlier iteration's unresolved
-or failed Wait from disappearing while keeping initialized slots readable. Am-v requires a
+or failed Wait from disappearing while keeping initialized slots readable. The next independent
+pass found the same distinction missing in join remapping: a TaskProof now survives an unresolved
+Wait only when that predecessor already completed its current generation; otherwise coverage
+clears the proof. The TaskGet discriminator and straight-line/branch/loop owner rows carry the same
+rule. Am-v requires a
 bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
 those five producer paths currently accept equal-typed temporaries and immutable buffers even
 though the runtime writes through them. Am-u rejects extern declarations as first-class function
