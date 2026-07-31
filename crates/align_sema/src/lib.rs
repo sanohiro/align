@@ -923,6 +923,12 @@ enum JsonDir {
     Encode,
 }
 
+#[derive(Clone, Copy)]
+enum JsonShapeRoot {
+    Struct(u32),
+    Enum(u32),
+}
+
 impl JsonDir {
     /// The builtin's name, for a diagnostic.
     fn name(self) -> &'static str {
@@ -22782,159 +22788,233 @@ impl<'a, 't> Checker<'a, 't> {
     /// and `array<Struct>` fields (Encode) — the two field shapes whose encoding goes through the
     /// descriptor table instead of the template pieces.
     fn json_struct_fields_ok(&mut self, sid: u32, span: Span, dir: JsonDir) -> bool {
-        self.json_struct_fields_ok_rec(sid, span, dir, &mut Vec::new())
+        self.json_shape_ok(JsonShapeRoot::Struct(sid), span, dir)
     }
 
-    fn json_struct_fields_ok_rec(&mut self, sid: u32, span: Span, dir: JsonDir, stack: &mut Vec<u32>) -> bool {
-        // The struct graph is acyclic (`struct_acyclic`), so this is defense in depth against a
-        // mis-built graph looping forever, not a reachable diagnostic.
-        if stack.contains(&sid) {
-            self.diags
-                .error(format!("'{}' cannot {} a self-referential struct", dir.name(), dir.verb()), span);
-            return false;
-        }
-        stack.push(sid);
-        let fields = self.structs[sid as usize].fields.clone();
-        for f in &fields {
-            match f.ty {
-                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str => {}
-                Ty::Struct(nid) => {
-                    if !self.json_struct_fields_ok_rec(nid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `Option<T>` field is optional (missing key / JSON `null` → `None`); its payload
-                // must itself be decodeable. `Option<Struct>` recurses into the payload struct.
-                // Owned Option payloads are legal language fields but remain outside this JSON
-                // descriptor boundary. A decodeable Option payload here is scalar/str/plain-struct.
-                Ty::Option(Scalar::Int(_)) | Ty::Option(Scalar::Float(_)) | Ty::Option(Scalar::Bool) | Ty::Option(Scalar::Str) => {}
-                // The one field shape the two directions disagree on. `json_payload_tag_sub` tags an
-                // `Option<enum>` payload as kind 6 with a real `JsonUnion` sub-pointer, so the runtime
-                // union encoder renders it; the decoder has no rule for an optional union, so Decode
-                // falls through to the tail below and reports it.
-                Ty::Option(Scalar::Enum(eid)) if dir == JsonDir::Encode => {
-                    if !self.check_union_decodable(eid, span, dir) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                Ty::Option(Scalar::Struct(nid)) => {
-                    if !self.json_struct_fields_ok_rec(nid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `array<Struct>` field (REST-gateway runway Slice C): decode a JSON array of
-                // objects into an owned AoS in the field. The element struct's fields must themselves
-                // be decodeable — recurse. The `stack` cycle guard rejects a recursive `array<Node>`
-                // (its descriptor table would be infinite), so codegen's `emit_json_subtable`
-                // recursion is bounded by construction. (`array<scalar>` field decode is a later slice.)
-                Ty::DynStructArray(eid, _) => {
-                    if !self.json_struct_fields_ok_rec(eid, span, dir, stack) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                // An `array<scalar>` field (JSON completeness T1b): decode a JSON array of numbers /
-                // bools into an owned scalar buffer. `array<str>` is admitted too — its elements are
-                // zero-copy `{ptr,len}` VIEWS into the input (the same borrowed-view model as a
-                // top-level `str` field, MMv2 slice 6), so the decoded struct is already input-region-
-                // bound (via `region_of(JsonDecode) = region_of(input)`) and its `array<str>` field's
-                // `Drop` flat-frees only the owned spine while the elements borrow the input. A numeric
-                // / bool element is Copy (owns nothing either); `.clone()` copies past the input. Only
-                // `array<char>` stays deferred (char has no JSON form).
-                Ty::DynArray(Scalar::Int(_)) | Ty::DynArray(Scalar::Float(_)) | Ty::DynArray(Scalar::Bool) | Ty::DynArray(Scalar::Str) => {}
-                // A shape-directed union (`enum`) field (J1b-2b): the `Message { content: Content }`
-                // shape. The enum must be union-decodable (pairwise-distinct shape classes); an object
-                // payload's struct is validated recursively by `check_union_decodable`.
-                Ty::Enum(eid) => {
-                    if !self.check_union_decodable(eid, span, dir) {
-                        stack.pop();
-                        return false;
-                    }
-                }
-                _ => {
-                    self.diags.error(
-                        format!(
-                            "'{}' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct>/enum-union only for now)",
-                            dir.name(),
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    stack.pop();
-                    return false;
-                }
-            }
-        }
-        stack.pop();
-        true
-    }
-
-    /// Validate that sum type `enum_id` is **union-decodable** (JSON completeness J1b): every variant
-    /// carries exactly one payload, each payload maps to a JSON shape class (str/number/bool/object/array),
-    /// and the classes are **pairwise distinct** — so the value's first structural byte selects the
-    /// variant unambiguously (O(1) dispatch, no backtracking). An object (struct) payload must itself
-    /// be json-decodable (its fields recurse). Reports every offending variant and returns false.
-    /// `null` is deliberately not a class (absence belongs to `Option`). A supported
-    /// `array<Struct>` payload maps to Array; scalar-element owned arrays remain valid language
-    /// payloads but have no JSON-union descriptor arm and fail this package-specific check.
     fn check_union_decodable(&mut self, enum_id: u32, span: Span, dir: JsonDir) -> bool {
-        let Some(ed) = self.enums.get(enum_id as usize) else { return false };
-        let name = ed.name.clone();
-        let variants = ed.variants.clone();
-        if variants.is_empty() {
-            self.diags.error(format!("'{name}' has no variants to decode as a JSON union"), span);
-            return false;
+        self.json_shape_ok(JsonShapeRoot::Enum(enum_id), span, dir)
+    }
+
+    fn json_shape_ok(&mut self, root: JsonShapeRoot, span: Span, dir: JsonDir) -> bool {
+        struct StructFrame {
+            id: u32,
+            fields: Vec<hir::FieldDef>,
+            next: usize,
         }
-        let mut ok = true;
-        // Each shape class (Str/Number/Bool/Object/Array) may be claimed by at most one variant.
-        // Sized `JSON_SHAPE_CLASSES` so an Array-class payload (`union_shape_class` → 4) indexes in
-        // bounds (J2b — a `[_; 4]` would panic on the Array arm).
-        let mut class_owner: [Option<String>; JSON_SHAPE_CLASSES] = Default::default();
-        for v in &variants {
-            if v.payload.len() != 1 {
-                self.diags.error(
-                    format!("union variant '{}' of '{name}' must carry exactly one payload to map to a JSON value (a tag-only or multi-payload variant has no shape class)", v.name),
-                    span,
-                );
-                ok = false;
-                continue;
-            }
-            let sc = v.payload[0];
-            let Some(cls) = union_shape_class(sc) else {
-                self.diags.error(
-                    format!("union variant '{}' of '{name}' has payload {}, which has no JSON shape class (str / number / bool / object)", v.name, ty_name(scalar_to_ty(sc))),
-                    span,
-                );
-                ok = false;
-                continue;
-            };
-            if let Some(prev) = &class_owner[cls as usize] {
-                self.diags.error(
-                    format!("union variants '{prev}' and '{}' of '{name}' map to the same JSON shape class — a shape-directed union needs pairwise-distinct classes", v.name),
-                    span,
-                );
-                ok = false;
-                continue;
-            }
-            class_owner[cls as usize] = Some(v.name.clone());
-            // An object (struct) payload — or the ELEMENT struct of an `array<Struct>` payload (J2b)
-            // — must itself be json-decodable: recurse into its fields (the array element reuses the
-            // struct-array descriptor, so its element struct is validated exactly like a nested object).
-            let recurse_sid = match sc {
-                Scalar::Struct(sid) | Scalar::DynStructArray(sid) => Some(sid),
-                _ => None,
-            };
-            if let Some(sid) = recurse_sid
-                && !self.json_struct_fields_ok(sid, span, dir)
-            {
-                ok = false;
+
+        struct UnionFrame {
+            id: u32,
+            name: String,
+            variants: Vec<hir::EnumVariant>,
+            next: usize,
+            class_owner: [Option<String>; JSON_SHAPE_CLASSES],
+            ok: bool,
+        }
+
+        enum Work {
+            Start(JsonShapeRoot),
+            Struct(StructFrame),
+            AfterStructChild(StructFrame),
+            Union(UnionFrame),
+            AfterUnionChild(UnionFrame),
+        }
+
+        let mut work = vec![Work::Start(root)];
+        let mut values = Vec::new();
+        let mut active_structs = HashSet::new();
+        let mut active_enums = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Start(JsonShapeRoot::Struct(id)) => {
+                    if !active_structs.insert(id) {
+                        self.diags.error(
+                            format!(
+                                "'{}' cannot {} a self-referential struct",
+                                dir.name(),
+                                dir.verb()
+                            ),
+                            span,
+                        );
+                        values.push(false);
+                        continue;
+                    }
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        active_structs.remove(&id);
+                        values.push(false);
+                        continue;
+                    };
+                    work.push(Work::Struct(StructFrame {
+                        id,
+                        fields: definition.fields.clone(),
+                        next: 0,
+                    }));
+                }
+                Work::Start(JsonShapeRoot::Enum(id)) => {
+                    if !active_enums.insert(id) {
+                        self.diags.error(
+                            format!(
+                                "'{}' cannot {} a self-referential struct",
+                                dir.name(),
+                                dir.verb()
+                            ),
+                            span,
+                        );
+                        values.push(false);
+                        continue;
+                    }
+                    let Some(definition) = self.enums.get(id as usize) else {
+                        active_enums.remove(&id);
+                        values.push(false);
+                        continue;
+                    };
+                    if definition.variants.is_empty() {
+                        self.diags.error(
+                            format!(
+                                "'{}' has no variants to decode as a JSON union",
+                                definition.name
+                            ),
+                            span,
+                        );
+                        active_enums.remove(&id);
+                        values.push(false);
+                        continue;
+                    }
+                    work.push(Work::Union(UnionFrame {
+                        id,
+                        name: definition.name.clone(),
+                        variants: definition.variants.clone(),
+                        next: 0,
+                        class_owner: Default::default(),
+                        ok: true,
+                    }));
+                }
+                Work::Struct(mut frame) => {
+                    let Some(field) = frame.fields.get(frame.next).cloned() else {
+                        active_structs.remove(&frame.id);
+                        values.push(true);
+                        continue;
+                    };
+                    frame.next += 1;
+                    let child = match field.ty {
+                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str => None,
+                        Ty::Struct(id)
+                        | Ty::Option(Scalar::Struct(id))
+                        | Ty::DynStructArray(id, _) => {
+                            Some(JsonShapeRoot::Struct(id))
+                        }
+                        Ty::Option(Scalar::Enum(id)) if dir == JsonDir::Encode => {
+                            Some(JsonShapeRoot::Enum(id))
+                        }
+                        Ty::Enum(id) => Some(JsonShapeRoot::Enum(id)),
+                        Ty::Option(Scalar::Int(_))
+                        | Ty::Option(Scalar::Float(_))
+                        | Ty::Option(Scalar::Bool)
+                        | Ty::Option(Scalar::Str)
+                        | Ty::DynArray(Scalar::Int(_))
+                        | Ty::DynArray(Scalar::Float(_))
+                        | Ty::DynArray(Scalar::Bool)
+                        | Ty::DynArray(Scalar::Str) => None,
+                        _ => {
+                            self.diags.error(
+                                format!(
+                                    "'{}' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct>/enum-union only for now)",
+                                    dir.name(),
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            active_structs.remove(&frame.id);
+                            values.push(false);
+                            continue;
+                        }
+                    };
+                    if let Some(child) = child {
+                        work.push(Work::AfterStructChild(frame));
+                        work.push(Work::Start(child));
+                    } else {
+                        work.push(Work::Struct(frame));
+                    }
+                }
+                Work::AfterStructChild(frame) => {
+                    let child_ok = values.pop().expect("JSON struct child result");
+                    if child_ok {
+                        work.push(Work::Struct(frame));
+                    } else {
+                        active_structs.remove(&frame.id);
+                        values.push(false);
+                    }
+                }
+                Work::Union(mut frame) => {
+                    let Some(variant) = frame.variants.get(frame.next).cloned() else {
+                        active_enums.remove(&frame.id);
+                        values.push(frame.ok);
+                        continue;
+                    };
+                    frame.next += 1;
+                    if variant.payload.len() != 1 {
+                        self.diags.error(
+                            format!(
+                                "union variant '{}' of '{}' must carry exactly one payload to map to a JSON value (a tag-only or multi-payload variant has no shape class)",
+                                variant.name, frame.name
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    }
+                    let payload = variant.payload[0];
+                    let Some(class) = union_shape_class(payload) else {
+                        self.diags.error(
+                            format!(
+                                "union variant '{}' of '{}' has payload {}, which has no JSON shape class (str / number / bool / object)",
+                                variant.name,
+                                frame.name,
+                                ty_name(scalar_to_ty(payload))
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    };
+                    if let Some(previous) = &frame.class_owner[class as usize] {
+                        self.diags.error(
+                            format!(
+                                "union variants '{previous}' and '{}' of '{}' map to the same JSON shape class — a shape-directed union needs pairwise-distinct classes",
+                                variant.name, frame.name
+                            ),
+                            span,
+                        );
+                        frame.ok = false;
+                        work.push(Work::Union(frame));
+                        continue;
+                    }
+                    frame.class_owner[class as usize] = Some(variant.name);
+                    let child = match payload {
+                        Scalar::Struct(id) | Scalar::DynStructArray(id) => {
+                            Some(JsonShapeRoot::Struct(id))
+                        }
+                        _ => None,
+                    };
+                    if let Some(child) = child {
+                        work.push(Work::AfterUnionChild(frame));
+                        work.push(Work::Start(child));
+                    } else {
+                        work.push(Work::Union(frame));
+                    }
+                }
+                Work::AfterUnionChild(mut frame) => {
+                    if !values.pop().expect("JSON union child result") {
+                        frame.ok = false;
+                    }
+                    work.push(Work::Union(frame));
+                }
             }
         }
-        ok
+        debug_assert_eq!(values.len(), 1);
+        values.pop().unwrap_or(false)
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
@@ -22955,154 +23035,231 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
         ok: &mut bool,
     ) {
-        // The struct graph is acyclic (`struct_acyclic`), but sema logs-and-continues, so a cyclic
-        // struct that already errored could still reach here with a `Ty::Struct` field looping back —
-        // guard so `json.encode` diagnoses instead of recursing forever.
-        if visiting.contains(&sid) {
-            self.diags
-                .error("'json.encode' cannot encode a self-referential struct".to_string(), span);
-            *ok = false;
-            return;
+        enum Work {
+            Enter {
+                id: u32,
+                projection: Option<u32>,
+            },
+            Field {
+                field: hir::FieldDef,
+                index: u32,
+                has_option: bool,
+            },
+            AfterRequired {
+                has_option: bool,
+            },
+            Exit {
+                id: u32,
+                pop_projection: bool,
+                has_option: bool,
+            },
         }
-        visiting.push(sid);
-        // Clone the field list so the recursion (which needs `&mut self`) doesn't hold a borrow of
-        // `self.structs` across the loop — `Field` is cheap to clone (a name + a `Copy` type).
-        let fields = self.structs[sid as usize].fields.clone();
-        // An `Option`-bearing object can't use the static leading-comma layout — a `None` field is
-        // omitted at runtime, so which field is "first" is dynamic. Switch to the trailing-comma
-        // scheme: every present field emits `"name":value,` and a `PopComma` before `}` drops the
-        // last one (`{"a":1,"b":2}` / `{}`). A pure-required object keeps the original static layout,
-        // so existing `json.encode` codegen is unchanged (zero regression surface).
-        let has_option = fields.iter().any(|f| matches!(f.ty, Ty::Option(_)));
-        parts.push(TemplatePart::Text("{".to_string()));
-        for (i, f) in fields.iter().enumerate() {
-            let mut full = path_prefix.to_vec();
-            full.push(i as u32);
-            let access = |ty: Ty| Expr {
-                kind: match elem {
-                    None => ExprKind::Field { root: base, path: full.clone() },
-                    Some(e) => ExprKind::IndexField { base, index: e, path: full.clone() },
-                },
-                ty,
-                span,
-            };
-            // An optional (`Option<T>`) field: a single conditional `OptionField` piece that emits
-            // `"name":value,` only when `Some`. Only present in the trailing-comma scheme.
-            if let Ty::Option(s) = f.ty {
-                if let Scalar::Struct(pid) = s {
-                    // `Option<struct>` encode (JSON completeness T1b): a conditional nested object — when
-                    // `Some`, the payload struct is rendered by the runtime descriptor-driven encoder
-                    // (`OptionStructField`); when `None`, the field is omitted (the trailing-comma
-                    // scheme + `PopComma`). The payload struct must be encodable (its schema drives the
-                    // descriptor table) — validate it like a decode target so a bad field is a clean
-                    // sema error, not a codegen surprise.
-                    if !self.json_struct_fields_ok(pid, span, JsonDir::Encode) {
-                        *ok = false;
-                    } else {
-                        parts.push(TemplatePart::OptionStructField { access: access(f.ty), name: f.name.clone(), struct_id: pid });
+
+        let mut work = vec![Work::Enter {
+            id: sid,
+            projection: None,
+        }];
+        let mut path = path_prefix.to_vec();
+        let mut active = visiting.iter().copied().collect::<HashSet<_>>();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Enter { id, projection } => {
+                    if let Some(projection) = projection {
+                        path.push(projection);
                     }
-                    continue;
-                }
-                // Every other payload is rendered by the flat `OptionField` writer, which knows the
-                // same value shapes a *required* field does — int, float, bool, str. The struct-field
-                // declaration gate above only rejects an **owned** payload (`sc.is_move()`), so a
-                // non-Move but unrenderable one (`Option<enum>`, `Option<slice<T>>`, `Option<()>`,
-                // `Option<char>`, a `soa`/`json.doc` view) used to reach codegen with no diagnostic
-                // at all and abort there. `json.encode` names its own encodable domain instead.
-                if !json_encodable_scalar(s) {
-                    self.diags.error(
-                        format!(
-                            "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    *ok = false;
-                    continue;
-                }
-                parts.push(TemplatePart::OptionField { access: access(f.ty), name: f.name.clone() });
-                continue;
-            }
-            // A required field. The key prefix carries the leading separator in the static layout, or
-            // no separator in the trailing-comma layout (the trailing comma is pushed after the value).
-            if has_option {
-                parts.push(TemplatePart::Text(format!("\"{}\":", f.name)));
-            } else {
-                let sep = if i == 0 { "" } else { "," };
-                parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
-            }
-            // A nested struct emits its own object; every leaf reads its field value through the full
-            // path (`base.path…` or the struct-array element `base[elem].path…`).
-            if let Ty::Struct(nid) = f.ty {
-                self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
-            } else if let Ty::DynStructArray(eid, _) = f.ty {
-                // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
-                // encoder (dynamic length → a runtime loop, not a static unroll). The ELEMENT struct's
-                // schema drives that descriptor table, so validate it like a decode target — exactly
-                // as the `Option<struct>` field above does — instead of letting an unrenderable
-                // element field surface as a codegen panic.
-                if !self.json_struct_fields_ok(eid, span, JsonDir::Encode) {
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
-                }
-            } else if let Ty::DynArray(s) = f.ty {
-                // An `array<scalar>` field (T1b) emits `[e0,e1,…]` via a runtime loop (dynamic length).
-                // The element rides the same flat leaf writer as an `Option` payload, so it obeys the
-                // same domain: `array<char>` and `array<enum>` have no JSON leaf rendering and used to
-                // reach codegen's descriptor builder, which aborted the compiler on them.
-                if !json_encodable_scalar(s) {
-                    self.diags.error(
-                        format!(
-                            "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
-                            f.name,
-                            ty_name(f.ty)
-                        ),
-                        span,
-                    );
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::ScalarArrayField { access: access(f.ty), elem: s });
-                }
-            } else if let Ty::Enum(eid) = f.ty {
-                // A shape-directed union (`enum`) field (J1b-2b): emit the live variant's payload bare
-                // after the `"name":` prefix already pushed above — the value-side dual of the union
-                // decode field. The enum must be union-decodable (also validated at the decode side);
-                // check here too so encode-only use can't reach codegen's `emit_json_union` on a
-                // non-union enum (which would panic on a 0-/multi-payload variant).
-                if !self.check_union_decodable(eid, span, JsonDir::Encode) {
-                    *ok = false;
-                } else {
-                    parts.push(TemplatePart::UnionValue { access: access(f.ty), enum_id: eid });
-                }
-            } else {
-                match f.ty {
-                    Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
-                    t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(access(f.ty))),
-                    _ => {
+                    let pop_projection = projection.is_some();
+                    if !active.insert(id) {
                         self.diags.error(
-                            format!(
-                                "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
-                                f.name,
-                                ty_name(f.ty)
-                            ),
+                            "'json.encode' cannot encode a self-referential struct".to_string(),
                             span,
                         );
                         *ok = false;
+                        if pop_projection {
+                            path.pop();
+                        }
                         continue;
+                    }
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        active.remove(&id);
+                        *ok = false;
+                        if pop_projection {
+                            path.pop();
+                        }
+                        continue;
+                    };
+                    let fields = definition.fields.clone();
+                    let has_option =
+                        fields.iter().any(|field| matches!(field.ty, Ty::Option(_)));
+                    parts.push(TemplatePart::Text("{".to_string()));
+                    work.push(Work::Exit {
+                        id,
+                        pop_projection,
+                        has_option,
+                    });
+                    for (index, field) in fields.into_iter().enumerate().rev() {
+                        work.push(Work::Field {
+                            field,
+                            index: index as u32,
+                            has_option,
+                        });
+                    }
+                }
+                Work::Field {
+                    field,
+                    index,
+                    has_option,
+                } => {
+                    let mut full = path.clone();
+                    full.push(index);
+                    let access = |ty: Ty| Expr {
+                        kind: match elem {
+                            None => ExprKind::Field {
+                                root: base,
+                                path: full.clone(),
+                            },
+                            Some(index) => ExprKind::IndexField {
+                                base,
+                                index,
+                                path: full.clone(),
+                            },
+                        },
+                        ty,
+                        span,
+                    };
+
+                    if let Ty::Option(payload) = field.ty {
+                        if let Scalar::Struct(id) = payload {
+                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::OptionStructField {
+                                    access: access(field.ty),
+                                    name: field.name,
+                                    struct_id: id,
+                                });
+                            }
+                            continue;
+                        }
+                        if !json_encodable_scalar(payload) {
+                            self.diags.error(
+                                format!(
+                                    "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            *ok = false;
+                            continue;
+                        }
+                        parts.push(TemplatePart::OptionField {
+                            access: access(field.ty),
+                            name: field.name,
+                        });
+                        continue;
+                    }
+
+                    if has_option {
+                        parts.push(TemplatePart::Text(format!("\"{}\":", field.name)));
+                    } else {
+                        let separator = if index == 0 { "" } else { "," };
+                        parts.push(TemplatePart::Text(format!(
+                            "{separator}\"{}\":",
+                            field.name
+                        )));
+                    }
+
+                    if let Ty::Struct(id) = field.ty {
+                        work.push(Work::AfterRequired { has_option });
+                        work.push(Work::Enter {
+                            id,
+                            projection: Some(index),
+                        });
+                        continue;
+                    }
+
+                    let mut skip_trailing_comma = false;
+                    match field.ty {
+                        Ty::DynStructArray(id, _) => {
+                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::StructArrayField {
+                                    access: access(field.ty),
+                                    struct_id: id,
+                                });
+                            }
+                        }
+                        Ty::DynArray(payload) => {
+                            if !json_encodable_scalar(payload) {
+                                self.diags.error(
+                                    format!(
+                                        "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
+                                        field.name,
+                                        ty_name(field.ty)
+                                    ),
+                                    span,
+                                );
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::ScalarArrayField {
+                                    access: access(field.ty),
+                                    elem: payload,
+                                });
+                            }
+                        }
+                        Ty::Enum(id) => {
+                            if !self.check_union_decodable(id, span, JsonDir::Encode) {
+                                *ok = false;
+                            } else {
+                                parts.push(TemplatePart::UnionValue {
+                                    access: access(field.ty),
+                                    enum_id: id,
+                                });
+                            }
+                        }
+                        Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
+                        ty if ty.is_numeric() || ty == Ty::Bool => {
+                            parts.push(TemplatePart::Hole(access(field.ty)));
+                        }
+                        _ => {
+                            self.diags.error(
+                                format!(
+                                    "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
+                                    field.name,
+                                    ty_name(field.ty)
+                                ),
+                                span,
+                            );
+                            *ok = false;
+                            skip_trailing_comma = true;
+                        }
+                    }
+                    if has_option && !skip_trailing_comma {
+                        parts.push(TemplatePart::Text(",".to_string()));
+                    }
+                }
+                Work::AfterRequired { has_option } => {
+                    if has_option {
+                        parts.push(TemplatePart::Text(",".to_string()));
+                    }
+                }
+                Work::Exit {
+                    id,
+                    pop_projection,
+                    has_option,
+                } => {
+                    if has_option {
+                        parts.push(TemplatePart::PopComma);
+                    }
+                    parts.push(TemplatePart::Text("}".to_string()));
+                    active.remove(&id);
+                    if pop_projection {
+                        path.pop();
                     }
                 }
             }
-            if has_option {
-                parts.push(TemplatePart::Text(",".to_string()));
-            }
         }
-        if has_option {
-            parts.push(TemplatePart::PopComma);
-        }
-        parts.push(TemplatePart::Text("}".to_string()));
-        visiting.pop();
     }
 
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
@@ -33711,5 +33868,37 @@ fn main() -> i32 = 0
 
         structs[DEPTH - 1].fields[0].ty = Ty::Struct(DEPTH as u32 + 7);
         assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+
+        std::thread::Builder::new()
+            .name("deep-json-descriptor-owner".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut source = String::from("import core.json\n");
+                for id in 0..DEPTH {
+                    if id + 1 == DEPTH {
+                        source.push_str(&format!("JsonDeep{id} {{ value: str }}\n"));
+                    } else {
+                        source.push_str(&format!(
+                            "JsonDeep{id} {{ next: JsonDeep{} }}\n",
+                            id + 1
+                        ));
+                    }
+                }
+                source.push_str(
+                    "fn decode(data: str) -> Result<(), Error> {\n  value: JsonDeep0 := json.decode(data)?\n  return Ok(())\n}\nfn encode(value: JsonDeep0) -> i64 {\n  text := json.encode(value)\n  return text.len()\n}\nfn main() -> i32 = 0\n",
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !diagnostics.has_errors(),
+                    "deep JSON descriptor graph must check: {messages:?}"
+                );
+            })
+            .expect("spawn deep JSON descriptor owner")
+            .join()
+            .expect("deep JSON descriptor owner");
     }
 }
