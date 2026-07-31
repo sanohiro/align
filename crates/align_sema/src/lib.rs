@@ -15008,6 +15008,27 @@ impl<'a> MoveCheck<'a> {
                 snapshots_source: bool,
                 snapshot: Option<Option<usize>>,
             },
+            IfAfterCondition {
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+            },
+            IfAfterThen {
+                condition: &'e Expr,
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
+            },
+            IfAfterElse {
+                condition: &'e Expr,
+                then: &'e Block,
+                els: &'e Block,
+                consuming: bool,
+                incoming: Option<(MovedSet, BorrowState)>,
+                then_result:
+                    Option<(bool, MovedSet, BorrowState, BorrowFact)>,
+            },
             JoinIncoming {
                 moved: MovedSet,
                 borrows: BorrowState,
@@ -15137,39 +15158,69 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::If { cond, then, els }
-                        if self.expr_is_move_neutral(cond)
-                            && !hir_expr_diverges(cond) =>
+                        if then.stmts.is_empty()
+                            && els.stmts.is_empty()
+                            && then.value.is_some()
+                            && els.value.is_some() =>
                     {
-                        let child = if self
-                            .move_neutral_block_value(els)
-                            .is_some()
+                        let then_value = then
+                            .value
+                            .as_deref()
+                            .expect("guarded then value");
+                        let else_value = els
+                            .value
+                            .as_deref()
+                            .expect("guarded else value");
+                        let condition_size =
+                            hir_depth::expr_postorder(cond).len();
+                        let then_size =
+                            hir_depth::expr_postorder(then_value).len();
+                        let else_size =
+                            hir_depth::expr_postorder(else_value).len();
+                        if condition_size >= then_size
+                            && condition_size >= else_size
                         {
-                            then.stmts
-                                .is_empty()
-                                .then_some(then.value.as_deref())
-                                .flatten()
-                        } else if self
-                            .move_neutral_block_value(then)
-                            .is_some()
-                        {
-                            els.stmts
-                                .is_empty()
-                                .then_some(els.value.as_deref())
-                                .flatten()
+                            (
+                                cond.as_ref(),
+                                false,
+                                false,
+                                false,
+                                Post::IfAfterCondition {
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                },
+                            )
+                        } else if then_size >= else_size {
+                            (
+                                then_value,
+                                false,
+                                current_consuming,
+                                false,
+                                Post::IfAfterThen {
+                                    condition: cond,
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                    incoming: None,
+                                },
+                            )
                         } else {
-                            None
-                        };
-                        let Some(child) = child else { break };
-                        (
-                            child,
-                            false,
-                            current_consuming,
-                            false,
-                            Post::JoinIncoming {
-                                moved: moved.clone(),
-                                borrows: self.borrows.clone(),
-                            },
-                        )
+                            (
+                                else_value,
+                                false,
+                                current_consuming,
+                                false,
+                                Post::IfAfterElse {
+                                    condition: cond,
+                                    then,
+                                    els,
+                                    consuming: current_consuming,
+                                    incoming: None,
+                                    then_result: None,
+                                },
+                            )
+                        }
                     }
                     ExprKind::Loop {
                         body,
@@ -15327,7 +15378,7 @@ impl<'a> MoveCheck<'a> {
                     | ExprKind::BytesAsStr { bytes: child } => {
                         (child.as_ref(), false, false, false, Post::None)
                     }
-                        _ => break,
+                    _ => break,
                     }
                 };
             let may_borrow = ty_may_borrow(
@@ -15345,20 +15396,78 @@ impl<'a> MoveCheck<'a> {
                 self.arena_depth += 1;
             };
             wrappers.push((current, opens_arena, post));
-            if let Some((_, _, Post::Pipeline {
-                source,
-                snapshots_source,
-                snapshot,
-            })) = wrappers.last_mut()
-            {
-                if !self.expr(source, moved, false, false) {
-                    prefix_falls_through = Some(false);
-                    break;
-                }
-                if *snapshots_source {
-                    *snapshot = Some(
-                        self.begin_pipeline_source_snapshot(source),
-                    );
+            if let Some((_, _, post)) = wrappers.last_mut() {
+                match post {
+                    Post::Pipeline {
+                        source,
+                        snapshots_source,
+                        snapshot,
+                    } => {
+                        if !self.expr(source, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        if *snapshots_source {
+                            *snapshot = Some(
+                                self.begin_pipeline_source_snapshot(
+                                    source,
+                                ),
+                            );
+                        }
+                    }
+                    Post::IfAfterThen {
+                        condition,
+                        incoming,
+                        ..
+                    } => {
+                        if !self.expr(condition, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        *incoming = Some((
+                            moved.clone(),
+                            self.borrows.clone(),
+                        ));
+                    }
+                    Post::IfAfterElse {
+                        condition,
+                        then,
+                        consuming,
+                        incoming,
+                        then_result,
+                        ..
+                    } => {
+                        if !self.expr(condition, moved, false, false) {
+                            prefix_falls_through = Some(false);
+                            break;
+                        }
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut then_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let then_falls = self.block(
+                            then,
+                            &mut then_moved,
+                            *consuming,
+                            false,
+                        );
+                        let then_fact = then_falls
+                            .then(|| self.block_value_fact(then))
+                            .unwrap_or_default();
+                        *then_result = Some((
+                            then_falls,
+                            then_moved,
+                            self.borrows.clone(),
+                            then_fact,
+                        ));
+                        *incoming = Some((
+                            incoming_moved.clone(),
+                            incoming_borrows.clone(),
+                        ));
+                        *moved = incoming_moved;
+                        self.borrows = incoming_borrows;
+                    }
+                    _ => {}
                 }
             }
             current = child;
@@ -15383,10 +15492,6 @@ impl<'a> MoveCheck<'a> {
             if opens_arena {
                 self.arena_depth -= 1;
             }
-            let child_snapshots = self
-                .value_snapshot_frames
-                .pop()
-                .expect("value snapshot frame for transparent expression");
             let key = Self::expr_key(wrapper);
             let try_result = match post {
                 Post::JoinIncoming {
@@ -15445,8 +15550,145 @@ impl<'a> MoveCheck<'a> {
                     }
                     None
                 }
+                Post::IfAfterCondition {
+                    then,
+                    els,
+                    consuming,
+                } => {
+                    if falls_through {
+                        let incoming_moved = moved.clone();
+                        let incoming_borrows = self.borrows.clone();
+                        let mut then_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let then_falls = self.block(
+                            then,
+                            &mut then_moved,
+                            consuming,
+                            false,
+                        );
+                        let then_fact = then_falls
+                            .then(|| self.block_value_fact(then))
+                            .unwrap_or_default();
+                        let then_borrows = self.borrows.clone();
+                        let mut else_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let else_falls = self.block(
+                            els,
+                            &mut else_moved,
+                            consuming,
+                            false,
+                        );
+                        let else_fact = else_falls
+                            .then(|| self.block_value_fact(els))
+                            .unwrap_or_default();
+                        let else_borrows = self.borrows.clone();
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
+                Post::IfAfterThen {
+                    then,
+                    els,
+                    consuming,
+                    incoming,
+                    ..
+                } => {
+                    if let Some((incoming_moved, incoming_borrows)) =
+                        incoming
+                    {
+                        let then_falls = falls_through;
+                        let then_moved = moved.clone();
+                        let then_borrows = self.borrows.clone();
+                        let then_fact = then_falls
+                            .then(|| self.block_value_fact(then))
+                            .unwrap_or_default();
+                        let mut else_moved = incoming_moved.clone();
+                        self.borrows = incoming_borrows.clone();
+                        let else_falls = self.block(
+                            els,
+                            &mut else_moved,
+                            consuming,
+                            false,
+                        );
+                        let else_fact = else_falls
+                            .then(|| self.block_value_fact(els))
+                            .unwrap_or_default();
+                        let else_borrows = self.borrows.clone();
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
+                Post::IfAfterElse {
+                    els,
+                    incoming,
+                    then_result,
+                    ..
+                } => {
+                    if let (
+                        Some((incoming_moved, incoming_borrows)),
+                        Some((
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                        )),
+                    ) = (incoming, then_result)
+                    {
+                        let else_falls = falls_through;
+                        let else_moved = moved.clone();
+                        let else_borrows = self.borrows.clone();
+                        let else_fact = else_falls
+                            .then(|| self.block_value_fact(els))
+                            .unwrap_or_default();
+                        falls_through = self.finish_if_move_join(
+                            wrapper.span,
+                            moved,
+                            incoming_moved,
+                            incoming_borrows,
+                            then_falls,
+                            then_moved,
+                            then_borrows,
+                            then_fact,
+                            else_falls,
+                            else_moved,
+                            else_borrows,
+                            else_fact,
+                        );
+                    }
+                    None
+                }
                 Post::None => None,
             };
+            let child_snapshots = self
+                .value_snapshot_frames
+                .pop()
+                .expect("value snapshot frame for transparent expression");
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
             } else {
@@ -15489,16 +15731,48 @@ impl<'a> MoveCheck<'a> {
         Some(falls_through)
     }
 
-    fn move_neutral_block_value<'b>(
-        &self,
-        block: &'b Block,
-    ) -> Option<&'b Expr> {
-        if !block.stmts.is_empty() {
-            return None;
+    #[allow(clippy::too_many_arguments)]
+    fn finish_if_move_join(
+        &mut self,
+        span: Span,
+        moved: &mut MovedSet,
+        incoming_moved: MovedSet,
+        incoming_borrows: BorrowState,
+        then_falls: bool,
+        then_moved: MovedSet,
+        then_borrows: BorrowState,
+        then_fact: BorrowFact,
+        else_falls: bool,
+        else_moved: MovedSet,
+        else_borrows: BorrowState,
+        else_fact: BorrowFact,
+    ) -> bool {
+        let value_fact = match (then_falls, else_falls) {
+            (true, true) => then_fact.join(&else_fact),
+            (true, false) => then_fact,
+            (false, true) => else_fact,
+            (false, false) => BorrowFact::default(),
+        };
+        if value_fact.is_empty() {
+            self.control_value_facts.remove(&span);
+        } else {
+            self.control_value_facts.insert(span, value_fact);
         }
-        let value = block.value.as_deref()?;
-        (self.expr_is_move_neutral(value) && !hir_expr_diverges(value))
-            .then_some(value)
+        *moved = match (then_falls, else_falls) {
+            (true, true) => &then_moved | &else_moved,
+            (true, false) => then_moved,
+            (false, true) => else_moved,
+            (false, false) => incoming_moved,
+        };
+        self.borrows = match (then_falls, else_falls) {
+            (true, true) => {
+                BorrowState::join(&then_borrows, &else_borrows)
+            }
+            (true, false) => then_borrows,
+            (false, true) => else_borrows,
+            (false, false) => incoming_borrows,
+        };
+        then_falls || else_falls
     }
 
     fn transparent_pipeline_child(

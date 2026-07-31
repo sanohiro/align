@@ -997,6 +997,8 @@ mod tests {
         ShortCircuit,
         ElseUnwrap,
         If,
+        IfElse,
+        IfCondition,
         LoopBreak,
         LoopRepeat,
         ReduceInit,
@@ -1329,7 +1331,9 @@ mod tests {
             | MoveControlShape::ReduceInit
             | MoveControlShape::ScanInit
             | MoveControlShape::MapIntoDst => 1,
-            MoveControlShape::If => 2,
+            MoveControlShape::If
+            | MoveControlShape::IfElse
+            | MoveControlShape::IfCondition => 2,
             MoveControlShape::LoopBreak
             | MoveControlShape::LoopRepeat => 3,
         };
@@ -1374,6 +1378,40 @@ mod tests {
                     then: Block {
                         stmts: Vec::new(),
                         value: Some(Box::new(expression)),
+                    },
+                    els: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(leaf())),
+                    },
+                },
+                MoveControlShape::IfElse => ExprKind::If {
+                    cond: Box::new(Expr {
+                        kind: ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    }),
+                    then: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(Expr {
+                            kind: ExprKind::StrBorrow(Box::new(Expr {
+                                kind: ExprKind::Local(0),
+                                ty: Ty::String,
+                                span,
+                            })),
+                            ty: Ty::Str,
+                            span,
+                        })),
+                    },
+                    els: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(expression)),
+                    },
+                },
+                MoveControlShape::IfCondition => ExprKind::If {
+                    cond: Box::new(expression),
+                    then: Block {
+                        stmts: Vec::new(),
+                        value: Some(Box::new(leaf())),
                     },
                     els: Block {
                         stmts: Vec::new(),
@@ -1439,6 +1477,8 @@ mod tests {
                     MoveControlShape::ShortCircuit => Ty::Bool,
                     MoveControlShape::ElseUnwrap
                     | MoveControlShape::If
+                    | MoveControlShape::IfElse
+                    | MoveControlShape::IfCondition
                     | MoveControlShape::LoopBreak
                     | MoveControlShape::LoopRepeat
                     | MoveControlShape::ReduceInit
@@ -1562,6 +1602,12 @@ mod tests {
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::If,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::IfElse,
+                    ),
+                    move_control_program_at_boundary(
+                        MoveControlShape::IfCondition,
                     ),
                     move_control_program_at_boundary(
                         MoveControlShape::LoopBreak,
