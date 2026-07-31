@@ -8746,59 +8746,87 @@ impl<'a> EscapeCheck<'a> {
     /// aggregate region/cleanup bit cannot hide mixed heap and arena members; bound locals use the
     /// path-sensitive ownership fact joined in [`EscapeState`].
     fn call_transfer_contains_arena_owned(&mut self, e: &Expr, depth: u32) -> bool {
-        if !needs_drop_flag(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) || matches!(e.ty, Ty::DynSliceArray(_))
-        {
-            return false;
-        }
-        match &e.kind {
-            ExprKind::Local(local) => !self.state.individual.get(local).copied().unwrap_or_else(|| {
-                !matches!(self.region_of(e, depth), Region::Arena(_))
-            }),
-            ExprKind::Tuple { elems, .. } => elems
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::OptionSome(inner)
-            | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner)
-            | ExprKind::TaskGet(inner) => self.call_transfer_contains_arena_owned(inner, depth),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth + 1)),
-            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
-                block
-                    .value
-                    .as_ref()
-                    .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth))
-            }),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.call_transfer_contains_arena_owned(&arm.body, depth)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.call_transfer_contains_arena_owned(opt, depth)
-                    || self.call_transfer_contains_arena_owned(fallback, depth)
+        let mut work = vec![(e, depth)];
+        while let Some((expression, depth)) = work.pop() {
+            if !needs_drop_flag(
+                expression.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) || matches!(expression.ty, Ty::DynSliceArray(_))
+            {
+                continue;
             }
-            // A function result cannot borrow arena-owned storage across its own return boundary.
-            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => false,
-            _ => !self.drop_is_individual(e, depth),
+            match &expression.kind {
+                ExprKind::Local(local) => {
+                    let individual = self
+                        .state
+                        .individual
+                        .get(local)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            !matches!(
+                                self.region_of(expression, depth),
+                                Region::Arena(_)
+                            )
+                        });
+                    if !individual {
+                        return true;
+                    }
+                }
+                ExprKind::Tuple { elems, .. }
+                | ExprKind::ArrayLit { elems, .. } => {
+                    work.extend(elems.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::EnumValue { payload, .. } => {
+                    work.extend(payload.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::StructLit { fields, .. } => {
+                    work.extend(fields.iter().rev().map(|value| (value, depth)));
+                }
+                ExprKind::OptionSome(inner)
+                | ExprKind::ResultOk(inner)
+                | ExprKind::ResultErr(inner)
+                | ExprKind::Try(inner)
+                | ExprKind::TaskGet(inner) => work.push((inner, depth)),
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
+                }
+                ExprKind::If { then, els, .. } => {
+                    for block in [els, then] {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push((value, depth));
+                        }
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                ExprKind::ElseUnwrap { opt, fallback } => {
+                    work.push((fallback, depth));
+                    work.push((opt, depth));
+                }
+                // A function result cannot borrow arena-owned storage across its own return boundary.
+                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => {}
+                _ if !self.drop_is_individual(expression, depth) => {
+                    return true;
+                }
+                _ => {}
+            }
         }
+        false
     }
 
     /// Check the implicit Err return edge of `?` for a borrowed payload. This is independent of
@@ -8808,38 +8836,46 @@ impl<'a> EscapeCheck<'a> {
     /// Fresh constructors preserve variant precision. A bound or control-flow Result uses its
     /// conservative joined region because L1a has no per-variant borrow-provenance bit.
     fn check_try_error_borrow_escape(&mut self, result: &Expr, depth: u32) {
-        let Ty::Result(_, err) = result.ty else {
-            return;
-        };
-        if !self.region_bearing(scalar_to_ty(err)) {
-            return;
-        }
-        match &result.kind {
-            ExprKind::ResultOk(_) => {}
-            ExprKind::ResultErr(error) => self.check_return_escape(error, depth),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
-                if let Some(value) = &block.value {
-                    self.check_try_error_borrow_escape(value, depth);
-                }
+        let mut work = vec![(result, depth)];
+        while let Some((result, depth)) = work.pop() {
+            let Ty::Result(_, err) = result.ty else {
+                continue;
+            };
+            if !self.region_bearing(scalar_to_ty(err)) {
+                continue;
             }
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
-                if let Some(value) = &block.value {
-                    self.check_try_error_borrow_escape(value, depth + 1);
+            match &result.kind {
+                ExprKind::ResultOk(_) => {}
+                ExprKind::ResultErr(error) => {
+                    self.check_return_escape(error, depth);
                 }
-            }
-            ExprKind::If { then, els, .. } => {
-                for block in [then, els] {
-                    if let Some(value) = &block.value {
-                        self.check_try_error_borrow_escape(value, depth);
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
                     }
                 }
-            }
-            ExprKind::Match { arms, .. } => {
-                for arm in arms {
-                    self.check_try_error_borrow_escape(&arm.body, depth);
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
                 }
+                ExprKind::If { then, els, .. } => {
+                    if let Some(value) = els.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                    if let Some(value) = then.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                _ => self.check_return_escape(result, depth),
             }
-            _ => self.check_return_escape(result, depth),
         }
     }
 
@@ -8847,46 +8883,63 @@ impl<'a> EscapeCheck<'a> {
     /// precision for fresh constructors; a bound/control-flow Result uses the conservative joined
     /// ownership bit because L1a has only one cleanup-provenance bit for the aggregate.
     fn try_error_contains_arena_owned(&mut self, result: &Expr, depth: u32) -> bool {
-        let Ty::Result(_, err) = result.ty else {
-            return false;
-        };
-        if !needs_drop_flag(
-            scalar_to_ty(err),
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            return false;
-        }
-        match &result.kind {
-            ExprKind::ResultOk(_) => false,
-            ExprKind::ResultErr(error) => {
-                self.call_transfer_contains_arena_owned(error, depth)
+        let mut work = vec![(result, depth)];
+        while let Some((result, depth)) = work.pop() {
+            let Ty::Result(_, err) = result.ty else {
+                continue;
+            };
+            if !needs_drop_flag(
+                scalar_to_ty(err),
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
+                continue;
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth + 1)),
-            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
-                block
-                    .value
-                    .as_ref()
-                    .is_some_and(|value| self.try_error_contains_arena_owned(value, depth))
-            }),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.try_error_contains_arena_owned(&arm.body, depth)),
-            // A callee cannot return arena-owned storage across its own function boundary.
-            ExprKind::Call { .. }
-            | ExprKind::CallFnValue { .. }
-            | ExprKind::ResultMapErr { .. } => false,
-            _ => self.call_transfer_contains_arena_owned(result, depth),
+            match &result.kind {
+                ExprKind::ResultOk(_) => {}
+                ExprKind::ResultErr(error) => {
+                    if self.call_transfer_contains_arena_owned(error, depth) {
+                        return true;
+                    }
+                }
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push((value, depth + 1));
+                    }
+                }
+                ExprKind::If { then, els, .. } => {
+                    if let Some(value) = els.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                    if let Some(value) = then.value.as_deref() {
+                        work.push((value, depth));
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(
+                        arms.iter()
+                            .rev()
+                            .map(|arm| (&arm.body, depth)),
+                    );
+                }
+                // A callee cannot return arena-owned storage across its own function boundary.
+                ExprKind::Call { .. }
+                | ExprKind::CallFnValue { .. }
+                | ExprKind::ResultMapErr { .. } => {}
+                _ if self.call_transfer_contains_arena_owned(result, depth) => {
+                    return true;
+                }
+                _ => {}
+            }
         }
+        false
     }
 
     /// A resource-owning slot has one runtime cleanup bit, so every directly owned member of one
@@ -9001,34 +9054,52 @@ impl<'a> EscapeCheck<'a> {
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(&self, ty: Ty) -> bool {
-        match ty {
-            Ty::Tagged(id) => {
-                self.tracks_region(expand_tagged_ty(Ty::Tagged(id), self.tagged_types))
+        let mut work = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(ty) = work.pop() {
+            if !seen.insert(ty) {
+                continue;
             }
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
+            match ty {
+            Ty::Tagged(id) => work.push(expand_tagged_ty(
+                Ty::Tagged(id),
+                self.tagged_types,
+            )),
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => return true,
             // An owned `array<response>` is escape-checked in the same lane as every owned collection.
             // It borrows nothing, so its `region_of` is explicitly `Static` — the check passes and
             // the array is freely returnable (like `array<string>` from `fs.read_dir`); tracking keeps
             // it from silently skipping the escape pass if a future producer gives it a region.
-            Ty::DynResponseArray => true,
+            Ty::DynResponseArray => return true,
             // A `dict_encoded` value's `dict`/`source` slices borrow the source AoS, so it is
             // region-tracked — it must not outlive the array it encodes.
-            Ty::DictEncoded(..) => true,
+            Ty::DictEncoded(..) => return true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
-            Ty::Soa(_) => true,
+            Ty::Soa(_) => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
             // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
-            Ty::HttpHeaders => true,
+            Ty::HttpHeaders => return true,
             // A `json.doc` view borrows the arena tape + the JSON input (min of the two), so it is
             // region-tracked — it (and any str/sub-doc read of it) must not outlive either (J4).
-            Ty::JsonDoc => true,
+            Ty::JsonDoc => return true,
             // A `json.scanner<Row>` view borrows the JSON input it streams over, so it is
             // region-tracked — it must not outlive that input (J5).
-            Ty::JsonScanner(_) => true,
+            Ty::JsonScanner(_) => return true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
-            Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
+            Ty::Tuple(id) => {
+                if let Some(definition) = self.tuples.get(id as usize) {
+                    work.extend(
+                        definition
+                            .elems
+                            .iter()
+                            .rev()
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
             // A *fixed* `array<T>` (a stack value) is region-tracked iff its element is — an
             // `array<str>` holds `str` views (so an array of arena strs is arena-regioned and must
             // not escape), while an `array<i64>` is plain Copy data (Static, freely returnable).
@@ -9036,22 +9107,34 @@ impl<'a> EscapeCheck<'a> {
             // separately by the local-backed-slice check). A fixed `array<Struct>` (AoS) always
             // tracks, like `Struct` itself — a struct may hold a region-tracked `str` field, so an
             // element / element-field read must inherit the array's region.
-            Ty::Array(s, _) | Ty::Slice(s) => self.tracks_region(scalar_to_ty(s)),
-            Ty::StructArray(..) => true,
+            Ty::Array(s, _) | Ty::Slice(s) => work.push(scalar_to_ty(s)),
+            Ty::StructArray(..) => return true,
             // An `Option`/`Result` is region-tracked iff its payload is. A `Struct` payload (e.g. a
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
-            Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
-            Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
+            Ty::Option(s) => work.push(scalar_to_ty(s)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
             // A sum type is region-tracked iff any variant payload is (J1: a `str`-view or
             // `str`-bearing-struct payload makes the enum a borrow — `Content.Text(view)` must not
             // outlive the view; scalar-only enums stay Copy / `Static`, freely returnable).
-            Ty::Enum(id) => self
-                .enums
-                .get(id as usize)
-                .is_some_and(|e| e.variants.iter().any(|v| v.payload.iter().any(|s| self.tracks_region(scalar_to_ty(*s))))),
+            Ty::Enum(id) => {
+                if let Some(definition) = self.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter())
+                            .rev()
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
             // `Task<R>` (④b) is a box in the task_group region — region-tracked like `box<T>`, so
             // a task handle cannot escape its `task_group` scope.
-            Ty::Task(_) => true,
+            Ty::Task(_) => return true,
             // A `reader`/`writer` is region-tracked *because* it can be a **borrow**: `c.reader()` /
             // `c.writer()` on a `tcp_conn` hand back a reader/writer over the conn's fd
             // (`owns_fd: false`), region-bound to `c` (see `region_of` — `ConnReader`/`ConnWriter`),
@@ -9069,7 +9152,7 @@ impl<'a> EscapeCheck<'a> {
             // summaries, independently of the intraprocedural region-flow CFG. This arm only makes
             // the escape check *consult* the region either way. (A `tcp_conn` itself is always
             // owned, never a borrow, so it is deliberately NOT here.)
-            Ty::Reader | Ty::Writer | Ty::Fn(_) => true,
+            Ty::Reader | Ty::Writer | Ty::Fn(_) => return true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
             Ty::Int(_)
@@ -9112,8 +9195,10 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Command
             | Ty::RunOutput
             | Ty::Error
-            | Ty::Unit => false,
+            | Ty::Unit => {}
+            }
         }
+        false
     }
 
     /// Whether a value of `ty` must be escape-checked against its inferred [`Region`]: it is
@@ -9133,111 +9218,199 @@ impl<'a> EscapeCheck<'a> {
     /// Whether an owned expression's storage is individually released rather than arena-bulk
     /// released. This is allocation provenance, deliberately separate from borrow/escape Region.
     fn drop_is_individual(&mut self, e: &Expr, depth: u32) -> bool {
-        let individual = if matches!(e.ty, Ty::DynSliceArray(_)) {
-            true
-        } else {
-            match &e.kind {
-                // A callee cannot return arena-owned storage across its function boundary, even when
-                // `region_of(Call)` is shortened by an arena-borrowing argument.
-                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
-                ExprKind::OptionSome(inner)
-                | ExprKind::ResultOk(inner)
-                | ExprKind::ResultErr(inner)
-                | ExprKind::Try(inner)
-                | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
-                // `map_err` passes the Ok payload through and a callee-produced Move error is always
-                // free-standing. The source therefore determines whether every owning runtime variant
-                // is individual; MIR carries the selected variant's exact bit.
-                ExprKind::ResultMapErr { result, .. } => self.drop_is_individual(result, depth),
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                    .value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth)),
-                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                    .value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
-                // A value-carrying branch is statically individual only when every continuing arm is.
-                // Each arm is still recorded separately below, so MIR can select its exact constant or
-                // a moved local's runtime flag alongside the selected value.
-                ExprKind::If { then, els, .. } => {
-                    let then_individual = then
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_is_individual(value, depth));
-                    let else_individual = els
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_is_individual(value, depth));
-                    then_individual && else_individual
-                }
-                ExprKind::Match { arms, .. } => arms
-                    .iter()
-                    .all(|arm| self.drop_is_individual(&arm.body, depth)),
-                ExprKind::ElseUnwrap { opt, fallback } => {
-                    self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
-                }
-                // One aggregate slot has one cleanup bit. Determine it only from directly owned
-                // members: borrowed members may shorten Region but do not affect allocation mode. The
-                // separate mixed-mode diagnostic rejects the case where this conjunction would lose
-                // a free-standing member.
-                ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::EnumValue { payload, .. } => payload
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::StructLit { fields, .. } => fields
-                    .iter()
-                    .filter(|part| {
-                        needs_drop_flag(
-                            part.ty,
-                            self.structs,
-                            self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                    })
-                    .all(|part| self.drop_is_individual(part, depth)),
-                ExprKind::ArrayParMap { source, stages, .. }
-                    if par_map_parallelizable(
-                        source.ty,
-                        stages,
-                        self.structs,
-                        self.enums,
-                        self.tagged_types,
-                    ) && par_map_result_is_plain_primitive(e.ty) =>
-                {
-                    true
-                }
-                _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            All(Vec<(&'e Expr, u32)>, usize),
+            Record(&'e Expr),
+        }
+        fn push_all<'e>(
+            work: &mut Vec<Work<'e>>,
+            values: &mut Vec<bool>,
+            children: Vec<(&'e Expr, u32)>,
+        ) {
+            if children.is_empty() {
+                values.push(true);
+            } else {
+                work.push(Work::All(children, 0));
             }
-        };
-        // The same syntax node can be replayed at more than one CFG state. Retain the conservative
-        // conjunction; runtime local moves do not consume this static entry.
-        self.drop_individual_exprs
-            .entry(e.span)
-            .and_modify(|known| *known &= individual)
-            .or_insert(individual);
-        individual
+        }
+
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    work.push(Work::Record(expression));
+                    if matches!(expression.ty, Ty::DynSliceArray(_)) {
+                        values.push(true);
+                        continue;
+                    }
+                    match &expression.kind {
+                        // A callee cannot return arena-owned storage across its function boundary,
+                        // even when `region_of(Call)` is shortened by an arena-borrowing argument.
+                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::OptionSome(inner)
+                        | ExprKind::ResultOk(inner)
+                        | ExprKind::ResultErr(inner)
+                        | ExprKind::Try(inner)
+                        | ExprKind::TaskGet(inner) => {
+                            work.push(Work::Eval(inner, depth));
+                        }
+                        // `map_err` passes the Ok payload through and a callee-produced Move error is
+                        // always free-standing. The source therefore determines whether every owning
+                        // runtime variant is individual; MIR carries the selected variant's exact bit.
+                        ExprKind::ResultMapErr { result, .. } => {
+                            work.push(Work::Eval(result, depth));
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                block
+                                    .value
+                                    .as_deref()
+                                    .map(|value| vec![(value, depth)])
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                block
+                                    .value
+                                    .as_deref()
+                                    .map(|value| vec![(value, depth + 1)])
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        // A value-carrying branch is statically individual only when every continuing
+                        // arm is. Short-circuit in source order exactly as the recursive evaluator did.
+                        ExprKind::If { then, els, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                [then, els]
+                                    .into_iter()
+                                    .filter_map(|block| {
+                                        block.value.as_deref().map(|value| (value, depth))
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::Match { arms, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                arms.iter().map(|arm| (&arm.body, depth)).collect(),
+                            );
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                vec![(opt, depth), (fallback, depth)],
+                            );
+                        }
+                        // One aggregate slot has one cleanup bit. Determine it only from directly
+                        // owned members: borrowed members may shorten Region but do not affect
+                        // allocation mode.
+                        ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                elems
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::EnumValue { payload, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                payload
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::StructLit { fields, .. } => {
+                            push_all(
+                                &mut work,
+                                &mut values,
+                                fields
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                            );
+                        }
+                        ExprKind::ArrayParMap { source, stages, .. }
+                            if par_map_parallelizable(
+                                source.ty,
+                                stages,
+                                self.structs,
+                                self.enums,
+                                self.tagged_types,
+                            ) && par_map_result_is_plain_primitive(expression.ty) =>
+                        {
+                            values.push(true);
+                        }
+                        _ => values.push(!matches!(
+                            self.region_of(expression, depth),
+                            Region::Arena(_)
+                        )),
+                    }
+                }
+                Work::All(children, index) => {
+                    if index > 0 && !values.pop().expect("ownership child result") {
+                        values.push(false);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::All(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(true);
+                    }
+                }
+                Work::Record(expression) => {
+                    let individual = *values.last().expect("ownership expression result");
+                    // The same syntax node can be replayed at more than one CFG state. Retain the
+                    // conservative conjunction; runtime local moves do not consume this static entry.
+                    self.drop_individual_exprs
+                        .entry(expression.span)
+                        .and_modify(|known| *known &= individual)
+                        .or_insert(individual);
+                }
+            }
+        }
+        values.pop().expect("ownership result")
     }
 
     /// Whether an owned expression may be individually allocated on any reaching path. Paired
@@ -9245,94 +9418,171 @@ impl<'a> EscapeCheck<'a> {
     /// `(true,true)` is definitely individual, `(false,false)` definitely arena, and
     /// `(false,true)` path-dependent. Mutating an aggregate requires a definite mode.
     fn drop_may_be_individual(&mut self, e: &Expr, depth: u32) -> bool {
-        if matches!(e.ty, Ty::DynSliceArray(_)) {
-            return true;
+        enum Work<'a> {
+            Eval(&'a Expr, u32),
+            All(Vec<(&'a Expr, u32)>, usize),
+            Any(Vec<(&'a Expr, u32)>, usize),
         }
-        match &e.kind {
-            ExprKind::Local(local) => self
-                .state
-                .individual_may
-                .get(local)
-                .copied()
-                .unwrap_or_else(|| !matches!(self.region_of(e, depth), Region::Arena(_))),
-            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
-            ExprKind::OptionSome(inner)
-            | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner)
-            | ExprKind::TaskGet(inner) => self.drop_may_be_individual(inner, depth),
-            ExprKind::ResultMapErr { result, .. } => {
-                self.drop_may_be_individual(result, depth)
-                    || matches!(e.ty, Ty::Result(_, err) if needs_drop_flag(
-                        scalar_to_ty(err),
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    ))
+
+        let mut work = vec![Work::Eval(e, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    if matches!(expression.ty, Ty::DynSliceArray(_)) {
+                        values.push(true);
+                        continue;
+                    }
+                    match &expression.kind {
+                        ExprKind::Local(local) => values.push(
+                            self.state
+                                .individual_may
+                                .get(local)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    !matches!(
+                                        self.region_of(expression, depth),
+                                        Region::Arena(_)
+                                    )
+                                }),
+                        ),
+                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::OptionSome(inner)
+                        | ExprKind::ResultOk(inner)
+                        | ExprKind::ResultErr(inner)
+                        | ExprKind::Try(inner)
+                        | ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
+                        ExprKind::ResultMapErr { result, .. } => {
+                            if matches!(
+                                expression.ty,
+                                Ty::Result(_, err) if needs_drop_flag(
+                                    scalar_to_ty(err),
+                                    self.structs,
+                                    self.tuples,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                            ) {
+                                values.push(true);
+                            } else {
+                                work.push(Work::Eval(result, depth));
+                            }
+                        }
+                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                            if let Some(value) = block.value.as_deref() {
+                                work.push(Work::Eval(value, depth));
+                            } else {
+                                values.push(true);
+                            }
+                        }
+                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                            if let Some(value) = block.value.as_deref() {
+                                work.push(Work::Eval(value, depth + 1));
+                            } else {
+                                values.push(true);
+                            }
+                        }
+                        ExprKind::If { then, els, .. } => {
+                            let children = [then, els]
+                                .into_iter()
+                                .filter_map(|block| {
+                                    block.value.as_deref().map(|value| (value, depth))
+                                })
+                                .collect();
+                            work.push(Work::Any(children, 0));
+                        }
+                        ExprKind::Match { arms, .. } => {
+                            work.push(Work::Any(
+                                arms.iter().map(|arm| (&arm.body, depth)).collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            work.push(Work::Any(vec![(opt, depth), (fallback, depth)], 0));
+                        }
+                        ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                            work.push(Work::All(
+                                elems
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::EnumValue { payload, .. } => {
+                            work.push(Work::All(
+                                payload
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        ExprKind::StructLit { fields, .. } => {
+                            work.push(Work::All(
+                                fields
+                                    .iter()
+                                    .filter(|part| {
+                                        needs_drop_flag(
+                                            part.ty,
+                                            self.structs,
+                                            self.tuples,
+                                            self.enums,
+                                            self.tagged_types,
+                                        )
+                                    })
+                                    .map(|part| (part, depth))
+                                    .collect(),
+                                0,
+                            ));
+                        }
+                        _ => values.push(!matches!(
+                            self.region_of(expression, depth),
+                            Region::Arena(_)
+                        )),
+                    }
+                }
+                Work::All(children, index) => {
+                    if index > 0 && !values.pop().expect("ownership child result") {
+                        values.push(false);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::All(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(true);
+                    }
+                }
+                Work::Any(children, index) => {
+                    if index > 0 && values.pop().expect("ownership child result") {
+                        values.push(true);
+                    } else if let Some(&(child, depth)) = children.get(index) {
+                        work.push(Work::Any(children, index + 1));
+                        work.push(Work::Eval(child, depth));
+                    } else {
+                        values.push(false);
+                    }
+                }
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_may_be_individual(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_may_be_individual(value, depth + 1)),
-            ExprKind::If { then, els, .. } => {
-                then.value
-                    .as_ref()
-                    .is_none_or(|value| self.drop_may_be_individual(value, depth))
-                    || els
-                        .value
-                        .as_ref()
-                        .is_none_or(|value| self.drop_may_be_individual(value, depth))
-            }
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|arm| self.drop_may_be_individual(&arm.body, depth)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.drop_may_be_individual(opt, depth)
-                    || self.drop_may_be_individual(fallback, depth)
-            }
-            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .filter(|part| {
-                    needs_drop_flag(
-                        part.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    )
-                })
-                .all(|part| self.drop_may_be_individual(part, depth)),
-            _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
         }
+        values.pop().expect("ownership result")
     }
 
     /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
