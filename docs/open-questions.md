@@ -13,6 +13,45 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Non-Unit functions never fall through or return without a value (SETTLED 2026-07-31)
+
+**Decision:** Unit functions alone may use bare `return` or reach an empty block tail. Every
+reachable path of a non-Unit function produces the declared type through a tail expression or
+`return value`; a proven non-fallthrough path needs no value. The current checker accidentally
+accepts a bare return and reachable absent tail in a non-Unit body, allowing MIR/LLVM `ret void`
+under a value-returning signature. Am-f is the pending producer correction.
+
+Record: `draft.md` Function, `docs/language-spec.md`, `docs/design-notes.md`,
+`docs/impl/07-roadmap.md`, `docs/impl/17-library-boundary-prerequisites.md`
+
+### Extern call permission never escapes lexical `unsafe` (SETTLED 2026-07-31)
+
+**Decision:** an extern can be invoked directly or by a non-escaping pipeline, reducer, or sort
+callback only when the invocation expression is lexically inside `unsafe`. An extern declaration
+cannot become a first-class function value. The current `Fn` value has no unsafe-call permission in
+its type, so allowing it would let foreign execution escape the visible unsafe boundary. A future
+explicit unsafe-callable type may reopen that surface; am-u closes the current producer bypass
+without adding such a type.
+
+Record: `draft.md` Foreign functions, `docs/language-spec.md`,
+`docs/design-notes.md`, `docs/impl/07-roadmap.md`,
+`docs/impl/17-library-boundary-prerequisites.md`
+
+### Entry `main` has one closed C-compatible signature family (SETTLED 2026-07-31)
+
+**Decision:** a no-argument `main` returns only Unit, exact signed `i32`, or
+`Result<Unit, builtin Error>`; `main(args: array<str>)` returns exactly that Result. Exact i32 is
+the external C entry directly. Unit and Result use an internal Align body plus the generated
+i32-returning C wrapper. Every other parameter/return shape is a source error. The old checker
+accidentally accepted bool, float, integer widths other than i32, and aggregate returns, while the
+backend emitted those Align ABIs directly under external `main`; C startup requires an i32 entry
+and no language semantics existed for those values. The am-e prerequisite closes the producer
+before malformed-HIR header validation. This preserves the three specified forms and deliberately
+rejects only the undefined-ABI corner.
+
+Record: `draft.md` Error handling, `docs/language-spec.md`, `docs/design-notes.md`,
+`docs/impl/07-roadmap.md`, `docs/impl/17-library-boundary-prerequisites.md`
+
 ### `Error.Timeout` — a 5th builtin `Error` category (SHIPPED 2026-07-24, std.process Slice 5)
 **Decision: a run/transport deadline is a distinct `Error` variant, not an errno-mapped `Code`.** The
 builtin `Error` sum type gains a payload-less `Timeout` variant between `Denied` and `Code`:
@@ -275,7 +314,9 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 
 > **Current status:** first-class closures ①–③ and `task_group` ④a–④c are shipped, including real
 > threads, scoped capture environments, `spawn`/`wait()`/`get()`, and fallible `wait()?`. The plan
-> below is retained as the implementation record. Only function values that escape every enclosing
+> below is retained as the implementation record. The exact stored-Result/control-flow
+> successful-Wait proof described below is pending the am-w correction after its 2026-07-31 audit.
+> Only function values that escape every enclosing
 > region (return / struct field / array element) remain deferred pending a heap-owned environment
 > and Drop model with a real consumer.
 **Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety comes from by-value capture (no shared mutable state). Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
@@ -295,14 +336,14 @@ Decomposition: **④a** scope + the task region + `spawn` (fresh region env per 
   **Reference pointer (concurrent arena, Future, recorded 2026-07-04, external design-note review
   adoption):** Mimalloc free-list sharding as prior art if/when this region's bump allocator needs to
   serve concurrent `spawn`/`alloc` calls across the ④b-2 real threads without a single global lock.
-- **Owned `R` (`string`/`array<T>`)** is the subtle case: the slot holds the owned `{ptr,len}`. `get()` (consuming for a Move `R`, per ④a) moves it out — afterward the caller owns the buffer, while the slot itself stays in the region until the whole region is reclaimed at scope end. An **un-`get()`'d** owned-`R` task must still free its buffer before the region drops: codegen emits a conditional drop of each owned-`R` task at scope end, gated by a **drop flag cleared by `get()`** (the existing drop-flag-via-null pattern, applied to the slot). (Alternative under consideration: make `get()` mandatory for an owned-`R` task — a must-consume rule — so the buffer always moves out and no in-region drop is needed; decide in ④b-1.) Copy `R` needs none of this (the region free reclaims everything).
+- **Future owned `R` (`string`/`array<T>`)** is not part of the current primitive-result producer. If admitted, the slot would hold the owned `{ptr,len}` and `get()` would consume a Move `R`: afterward the caller would own the buffer, while the slot itself stayed in the region until scope end. An **un-`get()`'d** owned-`R` task would still need to free its buffer before the region drops, likely via a conditional per-task drop gated by a flag cleared by `get()`; making `get()` mandatory is the alternative. This ownership decision belongs to that future producer slice. Current Copy `R` needs none of it.
 
 **④c-2 plan — the `wait()?` error boundary (the last task_group slice).** A task may **fail**: its closure returns `Result<R, Error>`. `wait()?` joins all, and if any task failed, propagates the `Err` from the lowest spawn index out of the enclosing function (deterministic across parallel completion order; documented). After `wait()?`, `get()` yields the `Ok` `R`. Implementation, in order:
-- **Prerequisite — `Result`-returning spawn closures.** A `Result`-returning lambda cannot be a `Ty::Fn` value today (`FnTy.ret` is scalar-only). Since a spawned lambda is *consumed by `spawn`* (never a free first-class value), `check_spawn` should **lift the literal lambda directly** (via `lift_lambda`, whose result type may legitimately be `Ty::Result(ok, ErrCode)`) instead of routing through a `Ty::Fn` value — and the `Spawn` node carries the lifted name + captures + the `Ok` scalar + a `fallible` flag, like `Closure` does. **Infer the lambda's `Err` type from the enclosing function's return type** (no annotation needed): `wait()?` propagates the task error out of the enclosing function, so the task's `Err` must match the enclosing function's `Err` — pass that as the lambda's expected return (`Result<_, EnclosingErr>`), so `spawn(fn { fallible()? ; Ok(x) })` type-checks without a written return type.
-- **`get()` requires a *successful* `wait()`.** For a fallible group, a bare `wait()` whose `Result` is ignored does **not** make `get()` safe — an `Err` task never stored its slot, so the slot is uninitialized. So the ④c-1 wait-state flag is set only by `wait()?` (or otherwise handling the `Result` such that control is on the success path) for a fallible group; a bare `wait()` does not enable `get()` there. (For an infallible group `wait()` returns `()` and enables `get()` as in ④c-1.) Thus `get()` is reachable only when `wait()` is guaranteed to have *succeeded*.
+- **Prerequisite — `Result`-returning spawn closures.** A `Result`-returning lambda cannot be a `Ty::Fn` value today (`FnTy.ret` is scalar-only). Since a spawned lambda is *consumed by `spawn`* (never a free first-class value), `check_spawn` **lifts the literal lambda directly** (via `lift_lambda`, whose result type may legitimately be `Ty::Result(ok, builtin Error)`) instead of routing through a `Ty::Fn` value — and the `Spawn` node carries the lifted name + captures + the `Ok` scalar + a `fallible` flag, like `Closure` does. The task's Err type is the exact builtin `Error` used by the enclosing fallible function, so `spawn(fn { fallible()? ; Ok(x) })` type-checks without a written return type.
+- **`get()` requires a *successful* `wait()`.** For a fallible group, a bare `wait()` whose `Result` is ignored does **not** make `get()` safe — an `Err` task never stored its slot, so the slot is uninitialized. Each Wait Result carries its exact compiler-only group/proof-epoch/Wait-id/covered-generation fact through bare locals, copy/reassignment, block tail, `map_err`, and value-producing control. `?`, exhaustive Result `match`, or Result `else` resolves that exact id on its Ok continuation, including inside a nested group. Every earlier Wait for the same drained generation must also be proved Ok: a second empty `wait()?` cannot hide an unresolved or failed first Wait. Err advances the proof epoch and invalidates every Task/Wait proof it covered. Every Spawn advances the current task generation and stales earlier Wait proofs; with an unresolved Wait it also invalidates covered Tasks, while after successful completion the next successful Wait reauthorizes old and new handles. A later no-task Wait cannot revoke completion already established for that generation, even when its Result is left unhandled. Loop headers join entry and reachable body fallthrough to a fixed point using stable syntax-site tokens before accepted breaks form the exit, so an earlier iteration's unresolved or failed Wait cannot disappear. Calls, returns, closure captures, imported values, and aggregate reconstruction do not transport the proof; passing a Copy Result leaves the caller's original local intact but gives the callee/return no proof. A Task is a Move handle with a separate compiler-only originating-group/born-generation proof, transferred through local moves/reassignment and value-producing control but not opaque boundaries. `get()` checks that exact still-active generation range: an inner Wait cannot authorize an outer Task, while an already-successful outer generation remains readable inside a nested group. Group exit clears every proof naming the exited group, including one attached to its Result block value, and preserves proofs for still-active outer groups; handling the cleared inner Result outside cannot authorize an outer Task. For an infallible group `wait()` returns `()` and enables `get()` immediately. Current Task results are primitive Copy values, so `get()` preserves the handle and may repeat; owned Task results remain a future slice.
 - **Per-`task_group` `fallible` flag** (a stack like `wait_state`): set when a `Result`-returning task is spawned. `wait()`'s type is `Result<(), Error>` when the group is fallible, else `()` (so infallible groups stay `()` — no spurious `Result`).
-- **Error reporting via the worker's return value (no shared state).** The per-`R` trampoline returns an `i32` error code (`0` = ok): infallible → store `R`, return `0`; fallible → match the `Result`, on `Ok(v)` store `v` and return `0`, on `Err(e)` return `e`. `align_rt_tg_wait` (already `thread::scope`) collects each worker's returned code via `ScopedJoinHandle::join` and returns the lowest-index nonzero — no shared error cell, no extra aliasing.
-- **`wait()?`**: codegen builds `Result<(), Error>` from `tg_wait`'s code (`Ok(())` if `0`, else `Err(code)`); `?` propagates as usual. `get()` (already `wait`-gated by ④c-1) then reads the `Ok` slot.
+- **Full-Error reporting via private task slots.** Each fallible task gets a private `err_slot`. The per-`R` trampoline stores `R` and returns 0 on Ok, or stores the complete builtin `Error` and returns 1 on Err. `align_rt_tg_wait` joins all workers and returns null on success or the lowest-spawn-index errored slot pointer. The slots are disjoint region allocations, so no shared mutable error cell is introduced.
+- **`wait()?`**: codegen builds `Result<(), Error>` from the pointer-returning `tg_wait` result (`Ok(())` for null, otherwise copy the full Error from that slot); `?` propagates as usual. `get()` (already `wait`-gated by ④c-1) then reads the Ok slot.
 
 **Closure-captured arena-view escape — FIXED (2026-07-10, PR #406).** The gap the A1 adversarial
 review recorded here (a lambda capturing an arena-backed view escaped the arena unchecked →
@@ -4048,10 +4089,12 @@ D8 pkg-layering rule (both are import-edge checks in `load_units`/sema), ③ spe
 §17 (the two rules) + §18.3 (replace the placeholder with this model), `language-spec.md` digest,
 `design-notes.md` rationale. Everything else already works or is deferred above.
 
-### FFI (foreign function interface) — v1 COMPLETE (keystone for the library strategy)
+### FFI (foreign function interface) — v1 SHIPPED; call-permission correction pending am-u
 Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
 
-**First slice SHIPPED (2026-07-01):** `extern "C"` bodyless declarations + `unsafe`-gated direct calls; FFI-safe scalars (int/float) + `raw` + `()` return; libc/libm resolve with no extra `-l`. See the `unsafe`/`raw` Settled entry above for the full record.
+**First slice SHIPPED (2026-07-01):** `extern "C"` bodyless declarations + `unsafe`-gated direct
+calls; FFI-safe scalars (int/float) + `raw` + `()` return; libc/libm resolve with no extra `-l`.
+See the `unsafe`/`raw` Settled entry above for the full record.
 
 **`layout(C)` struct ABI — slice 1 SHIPPED (2026-07-01):** a `layout(C)` attribute (composes with `align(N)`) pins a struct to a stable, C-compatible flat layout (decl order, natural alignment, no reordering — Align's default, which the marker *locks* and opts into FFI). Only a `layout(C)` struct may be moved through a `raw` pointer — `raw.store`/`raw.load` widened to accept a struct value (no new IR variant; the existing `Scalar::Struct` flows through `RawLoad`/`RawStore`, codegen does an unaligned aggregate load/store). Fields must be int/float. This is the **pointer-based** FFI pattern (hand C a buffer, read/write structs in it).
 
@@ -4059,7 +4102,17 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 
 **External library linking — SHIPPED (2026-07-01):** an `extern "C" link("name")` clause names a library to link (`-lname`); sema validates + dedupes into `hir`/`mir::Program.link_libs`, and the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay auto-linked). The name is charset-validated (`[A-Za-z0-9._+-]`) and passed as a single `-l<name>` argv (no flag/shell injection). `ast::ExternBlock.link`.
 
-**FFI v1 — COMPLETE (2026-07-01).** The shipped surface: `extern "C"` decls + `unsafe`-gated calls; scalar/`raw`/`()` signatures; `layout(C)` struct-by-pointer (`raw.load`/`store`); `str`/`slice`/`bytes` views (data-pointer + separate length); `link("name")` external libraries. That is a coherent, tested v1 — the `std`/`pkg` C-engine wrapper strategy (zstd/sqlite/…) can be built on it (own the memory wrappers, borrow the engines, pass buffers by pointer+len).
+**FFI v1 — SHIPPED (2026-07-01).** The shipped intended surface: `extern "C"` declarations +
+`unsafe`-gated direct calls; scalar/`raw`/`()` signatures; `layout(C)` struct-by-pointer
+(`raw.load`/`store`); `str`/`slice`/`bytes` views (data-pointer + separate length); `link("name")`
+external libraries. That is the C-engine wrapper foundation (own the memory wrappers, borrow the
+engines, pass buffers by pointer+len).
+
+**Call-permission correction pending am-u (2026-07-31):** audit found that higher-order callback
+resolution and extern function-value formation bypass the direct-call `unsafe` gate. The Settled
+target above permits direct and non-escaping pipeline/reducer/sort callback invocation only at a
+lexically `unsafe` expression and rejects extern function values. It is not shipped until am-u
+merges.
 
 **Measured optimization follow-up (2026-07-14; updated 2026-07-27).** The direct call and view ABI
 are already at the useful floor; retain two measured additions rather than inventing a second FFI
