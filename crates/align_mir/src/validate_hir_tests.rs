@@ -164,6 +164,16 @@ fn str_trim_expr_depth(depth: usize) -> hir::Expr {
     expr
 }
 
+fn individual_expr_span(
+    next_offset: &mut u32,
+    ownership: &mut std::collections::HashMap<align_span::Span, bool>,
+) -> align_span::Span {
+    let span = align_span::Span::new(0, *next_offset, *next_offset + 1);
+    *next_offset += 1;
+    ownership.insert(span, true);
+    span
+}
+
 fn with_return(ty: Ty) -> hir::Program {
     let mut program = baseline_program();
     program.imported_fns.push(ImportedFn {
@@ -226,7 +236,9 @@ enum MirOwner {
     Scoped,
     Loop,
     Stage,
-    Structural,
+    BlockStatement,
+    WildcardMatch,
+    If,
 }
 
 fn rvalues(program: &Program) -> impl Iterator<Item = &Rvalue> {
@@ -241,14 +253,60 @@ fn rvalues(program: &Program) -> impl Iterator<Item = &Rvalue> {
         })
 }
 
-fn is_result_ty(program: &Program, ty: Ty) -> bool {
+fn result_payload_tys(program: &Program, ty: Ty) -> Option<(Ty, Ty)> {
     match ty {
-        Ty::Result(..) => true,
-        Ty::Tagged(id) => matches!(
-            program.tagged_types.get(id as usize),
-            Some(TaggedType::Result(..))
-        ),
-        _ => false,
+        Ty::Result(ok, err) => Some((align_sema::scalar_to_ty(ok), align_sema::scalar_to_ty(err))),
+        Ty::Tagged(id) => match program.tagged_types.get(id as usize) {
+            Some(TaggedType::Result(ok, err)) => Some((
+                align_sema::scalar_to_ty(*ok),
+                align_sema::scalar_to_ty(*err),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn assert_builtin_error_ty(label: &str, program: &Program, ty: Ty) {
+    let Ty::Enum(id) = ty else {
+        panic!("{label}: Result error payload is not the builtin Error enum: {ty:?}");
+    };
+    let error = program
+        .enums
+        .get(id as usize)
+        .unwrap_or_else(|| panic!("{label}: builtin Error enum id {id} is out of range"));
+    assert_eq!(error.name, "Error", "{label}: wrong builtin Error name");
+    assert_eq!(
+        error.source_name, "Error",
+        "{label}: wrong builtin Error source name"
+    );
+    let expected = ["NotFound", "Invalid", "Denied", "Timeout", "Code"];
+    assert_eq!(
+        error.variants.len(),
+        expected.len(),
+        "{label}: wrong builtin Error variant count"
+    );
+    for (index, (variant, expected_name)) in error.variants.iter().zip(expected).enumerate() {
+        assert_eq!(
+            variant.name, expected_name,
+            "{label}: wrong builtin Error variant at index {index}"
+        );
+        assert_eq!(
+            variant.field_base, 1,
+            "{label}: wrong builtin Error field base at index {index}"
+        );
+        if index == 4 {
+            assert_eq!(
+                variant.payload,
+                vec![scalar_int(32)],
+                "{label}: Error.Code must carry exact i32"
+            );
+        } else {
+            assert!(
+                variant.payload.is_empty(),
+                "{label}: non-Code Error variant carries a payload"
+            );
+        }
     }
 }
 
@@ -261,17 +319,64 @@ fn assert_result_rvalue_contract(label: &str, program: &Program) {
                 };
                 let value_ty = function.value_tys[*value as usize];
                 match rvalue {
-                    Rvalue::ResultOk(_) | Rvalue::ResultErr(_) => assert!(
-                        is_result_ty(program, value_ty),
-                        "{label}: Result construction has non-Result MIR type {value_ty:?}"
-                    ),
-                    Rvalue::ResultIsOk(result)
-                    | Rvalue::ResultUnwrapOk(result)
-                    | Rvalue::ResultUnwrapErr(result) => {
+                    Rvalue::ResultOk(ok) => {
+                        let (ok_ty, _) = result_payload_tys(program, value_ty).unwrap_or_else(|| {
+                            panic!(
+                                "{label}: ResultOk construction has non-Result MIR type {value_ty:?}"
+                            )
+                        });
+                        assert_eq!(
+                            function.operand_ty(ok),
+                            ok_ty,
+                            "{label}: ResultOk operand disagrees with its Result payload"
+                        );
+                    }
+                    Rvalue::ResultErr(err) => {
+                        let (_, err_ty) = result_payload_tys(program, value_ty).unwrap_or_else(|| {
+                            panic!(
+                                "{label}: ResultErr construction has non-Result MIR type {value_ty:?}"
+                            )
+                        });
+                        assert_eq!(
+                            function.operand_ty(err),
+                            err_ty,
+                            "{label}: ResultErr operand disagrees with its Result payload"
+                        );
+                    }
+                    Rvalue::ResultIsOk(result) => {
+                        assert_eq!(
+                            value_ty,
+                            Ty::Bool,
+                            "{label}: ResultIsOk destination is not bool"
+                        );
                         let operand_ty = function.operand_ty(result);
                         assert!(
-                            is_result_ty(program, operand_ty),
-                            "{label}: Result inspection received non-Result MIR operand {operand_ty:?}"
+                            result_payload_tys(program, operand_ty).is_some(),
+                            "{label}: ResultIsOk received non-Result MIR operand {operand_ty:?}"
+                        );
+                    }
+                    Rvalue::ResultUnwrapOk(result) => {
+                        let operand_ty = function.operand_ty(result);
+                        let (ok_ty, _) = result_payload_tys(program, operand_ty).unwrap_or_else(|| {
+                            panic!(
+                                "{label}: ResultUnwrapOk received non-Result MIR operand {operand_ty:?}"
+                            )
+                        });
+                        assert_eq!(
+                            value_ty, ok_ty,
+                            "{label}: ResultUnwrapOk destination disagrees with its Result payload"
+                        );
+                    }
+                    Rvalue::ResultUnwrapErr(result) => {
+                        let operand_ty = function.operand_ty(result);
+                        let (_, err_ty) = result_payload_tys(program, operand_ty).unwrap_or_else(|| {
+                            panic!(
+                                "{label}: ResultUnwrapErr received non-Result MIR operand {operand_ty:?}"
+                            )
+                        });
+                        assert_eq!(
+                            value_ty, err_ty,
+                            "{label}: ResultUnwrapErr destination disagrees with its Result payload"
                         );
                     }
                     _ => {}
@@ -293,6 +398,25 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
             count(|rv| matches!(rv, Rvalue::ResultUnwrapOk(..))),
         )
     };
+    let branch_count = program
+        .fns
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .filter(|block| matches!(block.term, Term::Branch(..)))
+        .count();
+    let goto_count = program
+        .fns
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .filter(|block| matches!(block.term, Term::Goto(..)))
+        .count();
+    let option_test_count = count(|rv| matches!(rv, Rvalue::OptionIsSome(..)));
+    let has_call = |expected: &str| {
+        values
+            .iter()
+            .copied()
+            .any(|rv| matches!(rv, Rvalue::Call(name, _) if name == expected))
+    };
     let owned = match owner {
         MirOwner::Unary => has(|rv| matches!(rv, Rvalue::Un(..))),
         MirOwner::MixedEager => {
@@ -310,24 +434,38 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
         MirOwner::Reader => has(|rv| matches!(rv, Rvalue::ReaderBuffered(..))),
         MirOwner::BytesStrTry => {
             let (conversions, result_tests, result_unwraps) = bytes_str_counts();
-            conversions > 0 && result_tests > 0 && result_unwraps > 0
+            let mut exact_builtin_result = false;
+            for function in &program.fns {
+                for block in &function.blocks {
+                    for stmt in &block.stmts {
+                        let Stmt::Let(value, Rvalue::ResultOk(ok)) = stmt else {
+                            continue;
+                        };
+                        let value_ty = function.value_tys[*value as usize];
+                        let Some((ok_ty, err_ty)) = result_payload_tys(program, value_ty) else {
+                            continue;
+                        };
+                        if ok_ty != Ty::Str || function.operand_ty(ok) != Ty::Str {
+                            continue;
+                        }
+                        assert_builtin_error_ty(label, program, err_ty);
+                        exact_builtin_result = true;
+                    }
+                }
+            }
+            conversions > 0 && result_tests > 0 && result_unwraps > 0 && exact_builtin_result
         }
         MirOwner::Regex => has(|rv| matches!(rv, Rvalue::RegexReplace { .. })),
-        MirOwner::Template => has(|rv| matches!(rv, Rvalue::Template(..))),
+        MirOwner::Template => {
+            has(|rv| matches!(rv, Rvalue::Template(..)))
+                && has(|rv| matches!(rv, Rvalue::StrClone(..)))
+        }
         MirOwner::File => has(|rv| matches!(rv, Rvalue::FileCreateRw { .. })),
         MirOwner::ArrayBuilder => has(|rv| matches!(rv, Rvalue::ArrayBuilderPush { .. })),
         MirOwner::Command => has(|rv| matches!(rv, Rvalue::Command { .. })),
         MirOwner::Http => has(|rv| matches!(rv, Rvalue::HttpRequest { .. })),
         MirOwner::Match => has(|rv| matches!(rv, Rvalue::OptionIsSome(..))),
-        MirOwner::Conditional => {
-            has(|rv| matches!(rv, Rvalue::OptionIsSome(..)))
-                && program.fns.iter().any(|function| {
-                    function
-                        .blocks
-                        .iter()
-                        .any(|block| matches!(block.term, Term::Branch(..)))
-                })
-        }
+        MirOwner::Conditional => option_test_count > 0 && branch_count > option_test_count,
         MirOwner::Scoped => {
             has(|rv| matches!(rv, Rvalue::ArenaBegin)) && has(|rv| matches!(rv, Rvalue::TgBegin))
         }
@@ -338,10 +476,14 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
                 .any(|block| matches!(block.term, Term::Goto(_)))
         }),
         MirOwner::Stage => has(|rv| matches!(rv, Rvalue::Call(name, _) if name == "dep$stage_id")),
-        // Block/statement wrappers can be semantically transparent and therefore emit no MIR
-        // instruction of their own. Their exact record depth is owned by the HIR preflight above;
-        // successful function construction proves the structural lowering path completed.
-        MirOwner::Structural => !program.fns.is_empty(),
+        // Transparent blocks and expression statements emit no instruction of their own, so their
+        // fixture ends in a producer-valid imported sentinel. Reaching that call proves the whole
+        // structural spine was traversed rather than merely publishing an empty function.
+        MirOwner::BlockStatement => has_call("dep$block_stmt_sentinel"),
+        // A wildcard-only match has no tag test. Its sentinel proves the selected arm was lowered,
+        // and the join edge proves the wildcard-match spine completed its parent action.
+        MirOwner::WildcardMatch => has_call("dep$wildcard_sentinel") && goto_count > 0,
+        MirOwner::If => branch_count > 0,
     };
     if !owned {
         let (conversions, result_tests, result_unwraps) = bytes_str_counts();
@@ -353,11 +495,64 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner) {
     }
 }
 
+fn assert_hir_owner_contract(label: &str, program: &hir::Program, owner: MirOwner) {
+    let function = program
+        .fns
+        .first()
+        .unwrap_or_else(|| panic!("{label}: depth fixture has no function"));
+    match owner {
+        MirOwner::Path | MirOwner::Regex => {
+            assert_eq!(
+                function.ret,
+                Ty::String,
+                "{label}: borrowed owned temporary escaped as the function result"
+            );
+            assert!(
+                function.drop_individual_exprs.len() > 1
+                    && function
+                        .drop_individual_exprs
+                        .values()
+                        .all(|individual| *individual),
+                "{label}: owned string temporaries lack sema-equivalent individual ownership"
+            );
+        }
+        MirOwner::Template => {
+            assert_eq!(
+                function.ret,
+                Ty::String,
+                "{label}: hidden template string view escaped as the function result"
+            );
+            assert!(
+                !function.drop_individual_exprs.is_empty()
+                    && function
+                        .drop_individual_exprs
+                        .values()
+                        .all(|individual| *individual),
+                "{label}: cloned template result lacks individual ownership"
+            );
+        }
+        _ => {}
+    }
+    if matches!(owner, MirOwner::Regex | MirOwner::ArrayBuilder) {
+        assert_eq!(
+            function.drop_locals, function.drop_individual_locals,
+            "{label}: Move parameters do not have individual Drop ownership"
+        );
+        assert!(
+            !function.drop_locals.is_empty(),
+            "{label}: Move parameter is missing Drop metadata"
+        );
+    }
+}
+
 fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOwner>) {
     assert!(
         validate_hir::global_type_metadata_is_valid(program),
         "{label}: validator rejected valid metadata"
     );
+    if let Some(owner) = owner {
+        assert_hir_owner_contract(label, program, owner);
+    }
     let source_map = SourceMap::new();
     for lowered in [
         lower_program(program),
@@ -538,60 +733,89 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
 }
 
 fn with_path_string_body_depth(depth: usize) -> hir::Program {
-    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    assert!(
+        depth >= 8,
+        "the root Block, path cycle, and owned endpoint need depth eight"
+    );
     let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let inner_depth = target_expr_depth - 1;
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let mut expr = hir::Expr {
         kind: hir::ExprKind::Str("x".to_string()),
         ty: Ty::Str,
         span,
     };
-    for expression_depth in 2..depth {
-        expr = if expr.ty == Ty::String {
-            hir::Expr {
-                kind: hir::ExprKind::StrBorrow(Box::new(expr)),
-                ty: Ty::Str,
-                span,
-            }
-        } else {
-            match expression_depth % 4 {
-                0 | 2 => hir::Expr {
-                    kind: hir::ExprKind::PathComponent {
-                        kind: hir::PathComponentKind::Base,
-                        path: Box::new(expr),
-                    },
-                    ty: Ty::Str,
-                    span,
-                },
-                1 => hir::Expr {
-                    kind: hir::ExprKind::PathNormalize {
-                        path: Box::new(expr),
-                    },
-                    ty: Ty::String,
-                    span,
-                },
-                _ => hir::Expr {
-                    kind: hir::ExprKind::PathJoin {
-                        a: Box::new(expr),
-                        b: Box::new(hir::Expr {
-                            kind: hir::ExprKind::Str("y".to_string()),
-                            ty: Ty::Str,
-                            span,
-                        }),
-                    },
-                    ty: Ty::String,
-                    span,
-                },
-            }
+    let cycle_count = (inner_depth - 1) / 5;
+    for _ in 0..(inner_depth - 1) % 5 {
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrTrim {
+                kind: hir::StrTrimKind::Both,
+                recv: Box::new(expr),
+            },
+            ty: Ty::Str,
+            span,
         };
     }
-    let ret = expr.ty;
+    for _ in 0..cycle_count {
+        expr = hir::Expr {
+            kind: hir::ExprKind::PathComponent {
+                kind: hir::PathComponentKind::Base,
+                path: Box::new(expr),
+            },
+            ty: Ty::Str,
+            span,
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::PathJoin {
+                a: Box::new(expr),
+                b: Box::new(hir::Expr {
+                    kind: hir::ExprKind::Str("y".to_string()),
+                    ty: Ty::Str,
+                    span,
+                }),
+            },
+            ty: Ty::String,
+            span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrBorrow(Box::new(expr)),
+            ty: Ty::Str,
+            span,
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::PathNormalize {
+                path: Box::new(expr),
+            },
+            ty: Ty::String,
+            span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrBorrow(Box::new(expr)),
+            ty: Ty::Str,
+            span,
+        };
+    }
+    expr = hir::Expr {
+        kind: hir::ExprKind::PathJoin {
+            a: Box::new(expr),
+            b: Box::new(hir::Expr {
+                kind: hir::ExprKind::Str("z".to_string()),
+                ty: Ty::Str,
+                span,
+            }),
+        },
+        ty: Ty::String,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+    };
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_path_string".to_string(),
         lifted_capture_count: None,
         params: Vec::new(),
         param_modes: Vec::new(),
-        ret,
+        ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
@@ -602,7 +826,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
@@ -729,49 +953,80 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
 }
 
 fn with_regex_string_body_depth(depth: usize) -> hir::Program {
-    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    assert!(
+        depth >= 5,
+        "the root Block, regex cycle, and owned endpoint need depth five"
+    );
     let span = align_span::Span::new(0, 0, 0);
+    let target_expr_depth = depth - 1;
+    let inner_depth = target_expr_depth - 1;
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
     let mut expr = hir::Expr {
         kind: hir::ExprKind::Str("x".to_string()),
         ty: Ty::Str,
         span,
     };
-    for _ in 2..depth {
-        expr = if expr.ty == Ty::String {
-            hir::Expr {
-                kind: hir::ExprKind::StrBorrow(Box::new(expr)),
-                ty: Ty::Str,
-                span,
-            }
-        } else {
-            hir::Expr {
-                kind: hir::ExprKind::RegexReplace {
-                    regex: Box::new(hir::Expr {
-                        kind: hir::ExprKind::Local(0),
-                        ty: Ty::Regex,
-                        span,
-                    }),
-                    text: Box::new(expr),
-                    repl: Box::new(hir::Expr {
-                        kind: hir::ExprKind::Str("y".to_string()),
-                        ty: Ty::Str,
-                        span,
-                    }),
-                    all: false,
-                },
-                ty: Ty::String,
-                span,
-            }
+    for _ in 0..(inner_depth - 1) % 2 {
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrTrim {
+                kind: hir::StrTrimKind::Both,
+                recv: Box::new(expr),
+            },
+            ty: Ty::Str,
+            span,
         };
     }
-    let ret = expr.ty;
+    for _ in 0..(inner_depth - 1) / 2 {
+        expr = hir::Expr {
+            kind: hir::ExprKind::RegexReplace {
+                regex: Box::new(hir::Expr {
+                    kind: hir::ExprKind::Local(0),
+                    ty: Ty::Regex,
+                    span,
+                }),
+                text: Box::new(expr),
+                repl: Box::new(hir::Expr {
+                    kind: hir::ExprKind::Str("y".to_string()),
+                    ty: Ty::Str,
+                    span,
+                }),
+                all: false,
+            },
+            ty: Ty::String,
+            span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+        };
+        expr = hir::Expr {
+            kind: hir::ExprKind::StrBorrow(Box::new(expr)),
+            ty: Ty::Str,
+            span,
+        };
+    }
+    expr = hir::Expr {
+        kind: hir::ExprKind::RegexReplace {
+            regex: Box::new(hir::Expr {
+                kind: hir::ExprKind::Local(0),
+                ty: Ty::Regex,
+                span,
+            }),
+            text: Box::new(expr),
+            repl: Box::new(hir::Expr {
+                kind: hir::ExprKind::Str("z".to_string()),
+                ty: Ty::Str,
+                span,
+            }),
+            all: false,
+        },
+        ty: Ty::String,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+    };
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_regex_string".to_string(),
         lifted_capture_count: None,
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
-        ret,
+        ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: vec![hir::Local {
@@ -789,23 +1044,27 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: vec![0],
         drop_individual_locals: vec![0],
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
 }
 
 fn with_template_body_depth(depth: usize) -> hir::Program {
-    assert!(depth >= 2, "the root Block and leaf Expr need depth two");
+    assert!(
+        depth >= 4,
+        "the root Block, template view, and owned clone need depth four"
+    );
     let span = align_span::Span::new(0, 0, 0);
     let target_expr_depth = depth - 1;
+    let inner_depth = target_expr_depth - 1;
     let mut expr = hir::Expr {
         kind: hir::ExprKind::Str("x".to_string()),
         ty: Ty::Str,
         span,
     };
     let mut expr_depth = 1;
-    if target_expr_depth.is_multiple_of(2) {
+    if inner_depth.is_multiple_of(2) {
         expr = hir::Expr {
             kind: hir::ExprKind::StrTrim {
                 kind: hir::StrTrimKind::Both,
@@ -816,7 +1075,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         };
         expr_depth += 1;
     }
-    while expr_depth < target_expr_depth {
+    while expr_depth < inner_depth {
         expr = hir::Expr {
             kind: hir::ExprKind::Template(vec![hir::TemplatePart::Hole(expr)]),
             ty: Ty::Str,
@@ -824,13 +1083,20 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         };
         expr_depth += 2;
     }
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    let mut next_offset = 1;
+    expr = hir::Expr {
+        kind: hir::ExprKind::StrClone(Box::new(expr)),
+        ty: Ty::String,
+        span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
+    };
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_template".to_string(),
         lifted_capture_count: None,
         params: Vec::new(),
         param_modes: Vec::new(),
-        ret: Ty::Str,
+        ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
@@ -841,7 +1107,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
         exportable: false,
     });
     program
@@ -1035,7 +1301,11 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         stmt_layers -= 1;
     }
     let mut expr = hir::Expr {
-        kind: hir::ExprKind::Unit,
+        kind: hir::ExprKind::Call {
+            func: "dep$block_stmt_sentinel".to_string(),
+            args: Vec::new(),
+            type_args: Vec::new(),
+        },
         ty: Ty::Unit,
         span,
     };
@@ -1063,6 +1333,9 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         expr_depth += 2;
     }
     let mut program = baseline_program();
+    program
+        .imported_fns
+        .push(imported_fn("dep$block_stmt_sentinel", Vec::new(), Ty::Unit));
     program.fns.push(hir::Fn {
         name: "deep_block_stmt".to_string(),
         lifted_capture_count: None,
@@ -1091,7 +1364,11 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
     let target_expr_depth = depth - 1;
     let option_unit = Ty::Option(Scalar::Unit);
     let mut expr = hir::Expr {
-        kind: hir::ExprKind::Unit,
+        kind: hir::ExprKind::Call {
+            func: "dep$wildcard_sentinel".to_string(),
+            args: Vec::new(),
+            type_args: Vec::new(),
+        },
         ty: Ty::Unit,
         span,
     };
@@ -1125,6 +1402,9 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         expr_depth += 2;
     }
     let mut program = baseline_program();
+    program
+        .imported_fns
+        .push(imported_fn("dep$wildcard_sentinel", Vec::new(), Ty::Unit));
     program.fns.push(hir::Fn {
         name: "deep_match_arm".to_string(),
         lifted_capture_count: None,
@@ -1666,17 +1946,17 @@ fn depth_fixtures() -> Vec<DepthFixture> {
         DepthFixture {
             name: "block/statement",
             make: with_block_stmt_body_depth,
-            owner: MirOwner::Structural,
+            owner: MirOwner::BlockStatement,
         },
         DepthFixture {
             name: "wildcard match",
             make: with_match_arm_body_depth,
-            owner: MirOwner::Structural,
+            owner: MirOwner::WildcardMatch,
         },
         DepthFixture {
             name: "if",
             make: with_if_branch_body_depth,
-            owner: MirOwner::Structural,
+            owner: MirOwner::If,
         },
         DepthFixture {
             name: "binary match",

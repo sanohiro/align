@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-31. `main` includes the shipped wave through #678. Draft PR #679 is the
+_Last updated: 2026-08-01. `main` includes the shipped wave through #678. Draft PR #679 is the
 active L2b-a2-am-d checked-HIR/type-DAG stack-safety implementation.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
@@ -429,12 +429,16 @@ spines, immediate parent-owned continuations for multi-child ownership boundarie
 out-of-line structured-control and specialized-operation frames bounded by the fixed 259 ceiling.
 The outer dispatcher reaches the existing file, reader, array-builder, process-command, path,
 regex, and HTTP helpers without retaining the giant recursive frame; strict string wrappers stay
-on the eager worklist. Operation-specific MIR assertions cover mixed eager/call,
-string/path/regex, self-buffering reader, a producer-valid `Result<str, Error>`
-`StrBytes`/`BytesAsStr`/`Try` cycle, file create, array-builder push, process-command construction,
-HTTP request construction, block/template, `if`, binary/wildcard `match`, `else`, short-circuit,
-loop, and arena/task-group boundary owners on the 2 MiB test stack. Result construction and
-inspection instructions are also checked against their MIR value types. Reachability replay propagates strict-child divergence
+on the eager worklist. Operation-specific MIR assertions cover mixed eager/call, string trim,
+producer-valid path/regex chains whose individually owned temporary strings end in an owned return,
+self-buffering reader, a producer-valid `Result<str, Error>` `StrBytes`/`BytesAsStr`/`Try` cycle,
+template spines cloned from their hidden views into an owned return, file create, array-builder push,
+process-command construction, HTTP request construction, block/statement sentinel reachability,
+proportional `if` and binary/wildcard `match` CFG evidence, independently counted `else` and
+short-circuit branches, loop, and arena/task-group boundary owners on the 2 MiB test stack. Result
+construction and inspection instructions are checked against the exact Ok/Error payload and bool or
+unwrap destination type, and the bytes/string owner checks the exact builtin Error declaration.
+Reachability replay propagates strict-child divergence
 through transparent stage/template records before visiting later siblings and preserves the
 non-fallthrough status of `process.exit`/`process.abort`. The final raw/optimized
 LLVM owner uses the same accepted record boundary, and the deep owned-leaf codegen owner emits the
