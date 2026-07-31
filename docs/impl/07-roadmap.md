@@ -141,16 +141,17 @@ every item below has since completed as recorded in the per-milestone sections, 
    suffice — sound, not a linear approximation). **④c-2 DONE** — the `wait()?` error boundary. A
    task closure may return `Result<R, Error>` (so `check_spawn` lifts the literal lambda directly
    rather than via a scalar-ret `Ty::Fn` value); a per-group `fallible` flag types `wait()` as
-   `Result<(), Error>` (else `()`); the per-`(R, fallible)` trampoline returns an `i32` error code
-   (storing the `Ok` payload / returning the `Err` code), `tg_wait` collects the workers' codes and
-   returns the lowest-index nonzero, `wait()` builds a `Result` from it, and `wait()?` propagates. For a
+   `Result<(), Error>` (else `()`); each fallible task owns a private full-`Error` err slot, and its
+   trampoline stores the `Ok` payload or the `Err` value and returns only a 0/1 status.
+   Pointer-returning `tg_wait` returns null on success or the lowest-spawn-index errored slot,
+   `wait()` builds the full `Result` from it, and `wait()?` propagates. For a
    fallible group only a *successful* `wait()?` enables `get()` (a bare `wait()` does not). **The
    first-class-closures → `task_group` arc (slices ①–④c) is COMPLETE**: closures as values /
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
    sound `get`-before-`wait`, and a `wait()?` error boundary.
    **Successful-Wait flow correction pending am-w (2026-07-31):** the settled proof follows an
    exact group/generation/Wait id through bare Result locals, copy/reassignment, `map_err`, and value-producing
-   control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and is
+   control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and
    requires every earlier Wait for that drained generation to resolve Ok. A later empty Wait cannot
    hide an unresolved or failed first Wait; Err invalidates every Wait/Task proof it covered.
    Every Spawn advances the current generation and stales old Wait proofs; with an unresolved Wait

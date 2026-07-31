@@ -225,7 +225,7 @@ trusting the stored bits:
 10. Re-run the producer's per-`task_group` successful-wait dominance fact.
     A group starts with no completed task generation. Each group has one
     compiler-only preorder `group: usize`, monotonically increasing
-    `current_generation` and `proof_epoch`, `completed_through`,
+    `current_generation` and `proof_epoch`, optional `completed_generation`,
     `valid_from`, and a sparse ordered set of unresolved fallible-wait ids.
     These are indices or counters in function-analysis-owned vectors and have
     no HIR/interface/wire form. Every `Spawn` increments
@@ -236,7 +236,7 @@ trusting the stored bits:
     O(1); otherwise old TaskProofs remain eligible and the next successful Wait
     can reauthorize old and new handles.
     An infallible group has no unresolved set and its `Wait` sets
-    `completed_through = current_generation`.
+    `completed_generation = Some(current_generation)`.
     Each fallible `Wait` registers one fresh ordered wait id before producing
     `WaitProof { group: usize, proof_epoch: usize, wait: usize,
     covers_through: usize }`, where `covers_through` is the current task
@@ -244,10 +244,11 @@ trusting the stored bits:
     that Result alone does not establish completion. Handling its `Ok` edge
     resolves that exact id idempotently; it establishes completion only when
     every earlier Wait registered in that proof epoch is also proved `Ok` and
-    no later Spawn changed the epoch. It then advances `completed_through`
-    through the proof's covered generation. Handling its `Err` edge poisons
+    no later Spawn changed the epoch. It then sets
+    `completed_generation = Some(covers_through)`. Handling its `Err` edge poisons
     every task covered by that Wait: it advances `proof_epoch`, clears the
-    unresolved set, and sets `valid_from` past `covers_through`, invalidating
+    unresolved set, sets `completed_generation = None`, and sets `valid_from`
+    past `covers_through`, invalidating
     every affected TaskProof and WaitProof in O(1).
     Therefore a second empty Wait cannot reauthorize task slots while an
     earlier drained Wait Result is unresolved or failed. The proof propagates
@@ -288,20 +289,31 @@ trusting the stored bits:
     edge and poisons it on the `Err` fallback; if that fallback terminates,
     only the successful continuation remains.
     `If`, ordinary `Match`/`ElseUnwrap` facts, and all other control joins start
-    alternatives from their incoming ambient fact and AND the reachable
-    fallthrough alternatives. Local proof maps join by exact
-    group/proof-epoch/wait/coverage intersection. A join of distinct group
-    states allocates fresh generation/epoch counters, conservatively intersects
-    `valid_from`/`completed_through`, and retains a Task proof only when every
-    reachable predecessor carries that exact logical handle and authorizes its
-    born generation; unresolved Wait proofs never remap across such a join.
+    alternatives from their incoming group state. For each active group
+    independently, if every reachable
+    predecessor has byte-identical group counters, completion, unresolved set,
+    and local proof records, retain them verbatim. Otherwise allocate one fresh
+    `join_generation` and `join_proof_epoch`, clear the joined unresolved set
+    and every WaitProof, set `valid_from = join_generation`, and set
+    `completed_generation = Some(join_generation)` iff every predecessor had
+    `completed_generation == Some(current_generation)`; otherwise set it to
+    None. For each Task-valued local/result independently, retain a joined
+    `TaskProof { group, born_generation: join_generation }` iff every reachable
+    predecessor carries a TaskProof for that same active group, its
+    `born_generation >= valid_from`, and no unresolved Wait on that predecessor
+    covers its born generation. The predecessor handles may differ: a
+    value-producing branch may select either Task. Failure of any predicate
+    clears only that Task proof. This exact remap accepts a completed
+    Spawn+Wait/no-Spawn asymmetric join, rejects `get()` after an incomplete
+    asymmetric join until a later Wait completes the join generation, and
+    prevents a drained unresolved Wait from being hidden by the join.
     A loop records the ambient fact and every result/local proof independently
     on each reachable accepted `Break`; an exit retains only facts present on
     every reachable break. A body-only state never escapes by traversal order.
     A terminating alternative contributes no post-join edge.
     `TaskGet` requires its operand's TaskProof group to remain active and that
-    `valid_from <= born_generation <= completed_through` and
-    `completed_through == current_generation`. It does not consult
+    `born_generation >= valid_from` and
+    `completed_generation == Some(current_generation)`. It does not consult
     merely the innermost group: an inner Wait can never authorize an outer
     Task. An outer Task may be read inside a nested group only if its born generation
     is still valid and the group's current generation has completed a successful
@@ -420,7 +432,7 @@ The result formula in every row is followed by the universal
 | `Match` | `env[arms.len]`: non-empty. `child[scrutinee,arms in order]`; `post[scrutinee is one sum type: user Enum(id), Option(T), or Result(T,E); each MatchArm uses that exact sum table; no tag repeats across arms, at most one wildcard occurs at its preserved source position, and coverage is exhaustive by all tags or that wildcard; all fallthrough arm bodies have one result type, while divergent arms are context-polymorphic; scrutinee evaluated once; branch ownership joins exactly]`. |
 | `ResultMapErr` | `env[]`; `child[result,f]`; `post[result.ty == Result(ok,err); f.ty == Fn(id) with one ByValue err parameter and return err2; FT summary/effect apply; result Result(ok,err2); Ok ownership passes unchanged and Err ownership transfers through f]`. |
 | `Spawn` | `env[fallible]`; `child[closure with SPAWN(fallible,ok)]`; `post[inside task_group; ok is one primitive Int/Float/Bool/Char/Unit scalar; closure.ty == Fn(id) with zero explicit parameters and stored return ok; Pure/Impure allowed by current task rule; the exact lifted target returns ok when false or Result(ok,builtin Error) when true; result Task(ok); closure/environment transfers to task storage]`. |
-| `TaskGet` | `env[]`; `child[task]`; `post[task.ty == Task(T) for current primitive Copy T; task has recomputed `TaskProof { group, born_generation }`; that group remains active, `valid_from <= born_generation <= completed_through`, and `completed_through == current_generation` on this exact path, with no unresolved or failed earlier Wait covering it; an inner group's Wait cannot discharge it; failed-check diagnostic uses that group's fallibility; result T is copied without consuming the Move task handle, TaskProof remains available, and repeated get is valid; owned task results are not producer-reachable]`. |
+| `TaskGet` | `env[]`; `child[task]`; `post[task.ty == Task(T) for current primitive Copy T; task has recomputed `TaskProof { group, born_generation }`; that group remains active, `born_generation >= valid_from`, and `completed_generation == Some(current_generation)` on this exact path, with no unresolved or failed earlier Wait covering it; an inner group's Wait cannot discharge it; failed-check diagnostic uses that group's fallibility; result T is copied without consuming the Move task handle, TaskProof remains available, and repeated get is valid; owned task results are not producer-reachable]`. |
 | `Wait` | `env[]`; `child[]`; `post[inside task_group; result Unit for infallible group or Result(Unit,builtin Error) for a fallible group exactly as producer records; joins registered tasks once]`. |
 | `Call` | `env[func,type_args]`: non-empty NUL-free func resolves one `SIG`; an extern target requires current lexical `unsafe_depth > 0`. Empty type_args require a non-Monomorph target. Non-empty type_args are concrete graph-valid types; encoding them with the single producer/validator-owned `mangle_mono_suffix(type_args)` (the current `mangle_mono("", type_args)` bytes) yields a non-empty `$...` suffix, func must equal a non-empty base plus that exact suffix, and the stored target must have `FnOrigin::Monomorph`. HIR stores neither the discarded generic template nor its bounds, so this row makes no uncheckable template/bound claim. `child[args in order]`; `post[arity/modes/types and disabled modes match the concrete SIG; Move/Out behavior and return provenance are exact; result SIG.ret; a source spelling equal to a RuntimeKey still resolves ProgramCall]`. |
 | `If` | `env[]`; `child[cond,then,els]`; `post[cond Bool; all fallthrough branches have one result type; missing-source else is represented by empty Unit block; divergent branch is context-polymorphic; state/ownership joins only fallthrough predecessors]`. |

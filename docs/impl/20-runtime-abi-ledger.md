@@ -27,12 +27,14 @@ Rust state only and adds no unmangled native export.
 The compiler-visible native registry is always exactly the 286 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend one unconditional 294-identity reserved-name set used only for
-external collision rejection and runtime-export verification. They never gain
-a `RuntimeKey`, callable/declaration policy, or compatible-extern reuse. Thus
-runtime feature selection changes neither accepted callable input nor MIR,
-interface, artifact, or cache identity. Registry membership is never inferred
-from symbol spelling.
+records extend only the verification-time maximum runtime-export table to 294.
+They never gain a `RuntimeKey`, callable/declaration policy, collision
+reservation, or compatible-extern reuse. Their spellings remain ordinary
+program/extern/export identities in a normal build. Probe-feature runtime
+builds are test/benchmark fixtures and never link user artifacts. Thus runtime
+feature selection changes neither accepted callable input nor MIR, interface,
+artifact, or cache identity. Registry membership is never inferred from symbol
+spelling.
 
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 
@@ -182,11 +184,11 @@ attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
 that row. The five base unkeyed records use the same ABI shape without a key;
 only the two wrapper records have an Align module declaration policy. The
 eight probe rows have
-`verification_presence = AllocCount | ParMapProbe`, but are reserved-only:
-their exact signatures are checked against the corresponding runtime build,
-their names always participate in collision rejection, and no compatible
-extern may reuse them. The compiler uses the fixed base table before LLVM
-construction and receives no runtime-feature input.
+`verification_presence = AllocCount | ParMapProbe`: their exact signatures are
+checked against the corresponding runtime fixture, but their names do not
+participate in compiler collision validation and no compatible-extern reuse
+path is synthesized for them. The compiler uses the fixed base table before
+LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
@@ -202,8 +204,8 @@ Tests compare:
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol;
 - compatible extern reuse against only the fixed 286-row base registry's
-  complete LLVM type and curated declaration attributes, plus rejection of
-  every extern/export claimant for each of the eight reserved probe names;
+  complete LLVM type and curated declaration attributes, plus ordinary
+  extern/export positives using each probe spelling in a normal runtime build;
 - one mutation of return type, every parameter ordinal, each attribute class,
   symbol, and key; and
 - trivial whole/per-unit emitted IR against a checked-in declaration golden

@@ -348,11 +348,16 @@ generated-identity, corrected source/header origin facts, and the dependent PR o
 The pre-PR author consistency pass and adversarial preflight were clean. Post-open review of PR
 #678 reopened the am-w closure matrix: a failed drained Wait could be hidden by a later empty
 successful Wait, and seven adjacent ledger contradictions also required one coherent follow-up.
-The coherent follow-up is authored and mechanically verified; the design PR still needs a fresh
-clean review, its repository gate, and merge before implementation begins.
-The reviewed order is am-e exact entry ABI, am-f non-Unit return completeness, am-w
+The first revised-HEAD review then found five closure details: depth preflight had to precede every
+body pass, differing control states needed an exact Task-proof remap, task-error mirrors retained
+the obsolete i32-code ABI, two extern cross-class collision rows were absent, and optional probe
+names were over-reserved. The second coherent follow-up is authored and mechanically verified; the
+design PR still needs a fresh clean review, its repository gate, and merge before implementation
+begins.
+The reviewed order is am-d checked-HIR body/type-DAG stack safety, am-e exact entry ABI,
+am-f non-Unit return completeness, am-w
 outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
-extern invocation, am-d checked-HIR body/type-DAG stack safety, am-p placement, am-n nominal/link, am-h
+extern invocation, am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. The twenty-three/twenty-seven
@@ -492,9 +497,10 @@ private generated helpers; inventories the 277 existing runtime lookup keys, all
 variants, and every helper discriminator. The revised native ledger promotes the four previously
 codegen-selected AEAD symbols to typed keys, for 281 keyed records. Five always-built unkeyed
 runtime records make the fixed compiler registry 286 entries. Four `alloc-count` and four distinct
-`par-map-probe` exports extend an unconditional 294-name collision-reservation set but are never
-callable or compatible-extern targets; runtime feature selection is verification-only and changes
-no compiler input or cache identity. `task-group-probe` adds no unmangled export. Exact LLVM
+`par-map-probe` exports extend only the verification-time maximum export table to 294; their names
+remain ordinary program/extern/export spellings, and probe-feature runtime fixtures never link user
+artifacts. Runtime feature selection changes no compiler input, source acceptance, or cache
+identity. `task-group-probe` adds no unmangled export. Exact LLVM
 types/attributes and verification presence policy live in
 `docs/impl/20-runtime-abi-ledger.md`. The draft
 also records every placement predicate and gives every body discriminator an envelope/child/type/
@@ -519,7 +525,7 @@ SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
 L2b-a1/a2-s/a2-ac/a2-am-g-t. The am-r ledger proposes
-a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-d/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+a2-am-d/a2-am-e/a2-am-f/a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
