@@ -16,6 +16,7 @@ use align_span::Span;
 pub mod hir;
 pub use hir::*;
 mod hir_depth;
+mod task_wait;
 pub use hir_depth::{
     MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
 };
@@ -19148,6 +19149,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Finalize all inferred types to concrete (or default i64).
         let mut body = body;
         self.finalize_block(&mut body);
+        task_wait::validate(&body, self.tagged_types, self.diags);
         // The broad "unnecessary heap" lint: a whole-function scan for a box local that is only ever
         // read back with `.get()` and never escapes (the narrow inline `heap.new(x).get()` slice lives
         // in `finalize_expr`). A warning, not an error — it never blocks a build.
@@ -23524,6 +23526,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.check_return_completeness(&checked, ret, body.span);
         let mut body_fin = checked;
         self.finalize_block(&mut body_fin);
+        task_wait::validate(&body_fin, self.tagged_types, self.diags);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
         // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
         // captured), so the scan is self-contained and never double-reports the enclosing function.
@@ -30051,19 +30054,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `task.get()` — read a spawned task's result (`task_group`, slice ④). The result is
             // only computed after `wait()` joins, so `get()` before `wait()` reads an uncomputed
             // slot — rejected (the result is guaranteed ready only if a `wait()` dominates here).
-            Ty::Task(s) => {
-                if !self.wait_state.last().copied().unwrap_or(false) {
-                    let msg = if self.task_group_fallible.last().copied().unwrap_or(false) {
-                        // A fallible group: a bare `wait()` ignores the error; only `wait()?` makes
-                        // the results safe to read.
-                        "cannot call '.get()' before a successful 'wait()?' — this task_group is fallible, so use 'wait()?' to join (its error propagates) before reading results"
-                    } else {
-                        "cannot call '.get()' before 'wait()' — a task's result is ready only after the group is joined"
-                    };
-                    self.diags.error(msg.to_string(), span);
-                }
-                Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span }
-            }
+            Ty::Task(s) => Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span },
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags

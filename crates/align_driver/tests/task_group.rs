@@ -1,8 +1,6 @@
 //! `task_group` structured concurrency (slice ④a — walking skeleton). `spawn(fn { … })` returns
 //! a `Task<R>`; `wait()` joins; `t.get()` reads the result. ④a runs tasks eagerly/sequentially
 //! (correct results; real threads arrive in ④b). `spawn`/`wait` are valid only inside the scope.
-
-
 mod common;
 use common::*;
 
@@ -203,6 +201,37 @@ fn wait_in_one_branch_rejected() {
 }
 
 #[test]
+fn second_spawn_does_not_reauthorize_first_task() {
+    // A new generation still needs its own join; spawning again cannot make the first handle ready.
+    assert!(check_errs(
+        "tg-second-spawn-before-wait",
+        "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { 1 })\n    spawn(fn { 2 })\n    print(a.get())\n    wait()\n  }\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn task_handle_through_branch_and_loop_join() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    mut t := spawn(fn { 1 })\n    if true { t = spawn(fn { 2 }) } else { t = spawn(fn { 3 }) }\n    loop {\n      t = spawn(fn { 4 })\n      break\n    }\n    wait()\n    print(t.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-proof-value-control", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n");
+}
+
+#[test]
+fn branch_spawn_join_can_be_waited_after_join() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  c := true\n  task_group {\n    mut t := spawn(fn { 1 })\n    if c { t = spawn(fn { 2 }) } else { t = spawn(fn { 3 }) }\n    wait()\n    print(t.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-join-remap-wait", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
 fn lambda_wait_does_not_leak_to_enclosing() {
     // A `wait()` inside a lambda body must not set the enclosing task_group's wait-state at compile
     // time (the lambda is a separate function body); the enclosing `get()` is still rejected.
@@ -324,9 +353,15 @@ fn spawn_accepts_captures_that_outlive_group() {
     let outer_arena = "fn main() -> Result<(), Error> {\n  arena {\n    n := 7\n    v := template \"hello {n}\"\n    task_group {\n      spawn(fn { print(v) })\n      wait()\n    }\n  }\n  return Ok(())\n}\n";
     let frame_and_static = "fn main() -> Result<(), Error> {\n  owned := \"frame\".clone()\n  view: str := owned\n  literal := \"static\"\n  task_group {\n    spawn(fn { print(view) })\n    spawn(fn { print(literal) })\n    wait()\n  }\n  return Ok(())\n}\n";
 
-    for (name, src) in [("outer-arena", outer_arena), ("frame-static", frame_and_static)] {
+    for (name, src) in [
+        ("outer-arena", outer_arena),
+        ("frame-static", frame_and_static),
+    ] {
         let diagnostics = check_diagnostics(&format!("tg-valid-capture-{name}"), src);
-        assert!(diagnostics.is_empty(), "{name} capture should be accepted:\n{diagnostics}");
+        assert!(
+            diagnostics.is_empty(),
+            "{name} capture should be accepted:\n{diagnostics}"
+        );
     }
 }
 

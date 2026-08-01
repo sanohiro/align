@@ -499,7 +499,16 @@ or failed Wait from disappearing while keeping initialized slots readable. The n
 pass found the same distinction missing in join remapping: a TaskProof now survives an unresolved
 Wait only when that predecessor already completed its current generation; otherwise coverage
 clears the proof. The TaskGet discriminator and straight-line/branch/loop owner rows carry the same
-rule. Am-v requires a
+rule. Checkpoint `7247fc6` now contains the first compiling vertical implementation and has passed
+`cargo check -p align_sema --lib` plus the existing 188 sema unit tests. The am-w implementation is intentionally one vertical: splitting group state, proof
+transport, joins, or TaskGet diagnostics would leave an intermediate compiler that can authorize
+an uninitialized task slot or reject a valid outer proof. If the implementation exceeds the
+500-line target, the split-proof exception is justified by this single safety invariant; the
+formation, control, ownership, and whole/per-unit rows must land together. Am-v requires a
+The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
+with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
+the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
+tests; this is an environment/toolchain execution blocker, not a compiler test failure.
 bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
 those five producer paths currently accept equal-typed temporaries and immutable buffers even
 though the runtime writes through them. Am-u rejects extern declarations as first-class function
