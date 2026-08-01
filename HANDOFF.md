@@ -355,17 +355,31 @@ validity, and run focused owner tests before one monitored full PR gate. When a 
 if the next checkpoint still cannot be mergeable by two hours, split at the next independently
 correct placement family and record the boundary here.
 
-The am-p checkpoint is intentionally paused before PR creation. The required broad host
-preflight (`.git/align-preflight-review-5a7588d.log`) reached its 900-second bound without a
-verdict; a narrow host continuation (`.git/align-preflight-host-continuation-5a7588d.log`) was
-stopped at 8m09s after continued sema inspection, also without a verdict. The independent
-adversarial review completed CLEAN and withdrew an initial nested-`Fn` concern after confirming
-that `Ty::Fn` is not produced by `ty_to_scalar` and is a direct enum-payload-only extension.
-Do not treat either host transcript as CLEAN and do not open or attest a PR from this SHA yet.
-On resume, obtain one bounded host verdict for the unchanged final SHA, run `scripts/pre-pr.sh`
-with that log and the already-passing `align_mir` owner checks, then push/open the draft PR and
+The am-p checkpoint remains before PR creation. The required broad host preflight at
+`90a30fa` reached its 900-second bound without a verdict, and the fresh independent adversarial
+review found six valid closure issues: nested `array<string>` field placement was over-rejected,
+generic `ResponseBuilder` producer validation disagreed between sema and am-p, body-only handle
+types were admitted in declaration headers, an abstract `box<Param>` could pass the placement
+predicate, shared tagged DAGs lacked completed-node memoization, and the owner negatives did not
+prove graph-valid placement rejection. The owning ledger and closure matrix were updated first;
+the working tree now closes each issue with producer-aligned predicates, graph-valid owner twins,
+and a memoized shared-DAG test. Existing deep body fixtures now use a source-nameable declaration
+return while retaining their body-produced command/HTTP owner expression.
+
+The old host and independent transcripts are not attestations for the corrected tree. Focused
+direct owner binaries pass: all 40 `align_mir` tests and all 191 `align_sema` tests. Rebuilds and
+test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some Cargo-spawned
+Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript rather than
+restarting the broad gate. On resume, commit the correction, obtain a fresh bounded host or
+independent clean review on the new SHA, run `scripts/pre-pr.sh`, then push/open the draft PR and
 complete the normal post-open review cycle. The next implementation slice remains am-n nominal/link
 only after am-p is merged.
+
+The corrected am-p change is above the repository's 1,000-line split threshold (currently about
+1,041 changed lines against `main`). It cannot be split safely: validator activation, the producer
+contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
+ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
+or leave the reviewed producer/validator matrix without its required owner evidence.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

@@ -202,7 +202,6 @@ impl<'a> PlacementValidator<'a> {
                 // `array<Struct>` has its own `DynStructArray` producer; a plain scalar array
                 // with a struct element is a malformed HIR spelling of that type.
                 !matches!(element, Scalar::Struct(_))
-                    && !matches!(element, Scalar::String)
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::DynStructArray(id, Layout::Aos) => self.dynamic_struct_array_ok(id),
@@ -222,14 +221,19 @@ impl<'a> PlacementValidator<'a> {
 
         let mut work = vec![Work::Enter(initial)];
         let mut active_tagged = HashSet::new();
+        let mut completed_tagged = HashSet::new();
         while let Some(item) = work.pop() {
             match item {
                 Work::ExitTagged(id) => {
                     if !active_tagged.remove(&id) {
                         return false;
                     }
+                    completed_tagged.insert(id);
                 }
                 Work::Enter(Scalar::Tagged(id)) => {
+                    if completed_tagged.contains(&id) {
+                        continue;
+                    }
                     if !active_tagged.insert(id) {
                         return false;
                     }
@@ -294,14 +298,19 @@ impl<'a> PlacementValidator<'a> {
 
         let mut work = vec![Work::Enter(initial)];
         let mut active_tagged = HashSet::new();
+        let mut completed_tagged = HashSet::new();
         while let Some(item) = work.pop() {
             match item {
                 Work::ExitTagged(id) => {
                     if !active_tagged.remove(&id) {
                         return false;
                     }
+                    completed_tagged.insert(id);
                 }
                 Work::Enter(Scalar::Tagged(id)) => {
+                    if completed_tagged.contains(&id) {
+                        continue;
+                    }
                     if !active_tagged.insert(id) {
                         return false;
                     }
@@ -430,7 +439,10 @@ impl<'a> PlacementValidator<'a> {
                     && self.scalar_ok(err, ScalarPlacement::Payload { allow_param })
             }
             Ty::Tagged(id) => self.tagged_payload_ok(id, ScalarPlacement::Payload { allow_param }),
-            Ty::Box(payload) => self.box_payload_ok(payload, allow_param),
+            // `scalar_arg` always resolves a box payload with `allow_param=false`, even while
+            // validating an abstract generic template. A `box<Param>` HIR node is therefore
+            // graph-valid but never producer-valid.
+            Ty::Box(payload) => self.box_payload_ok(payload),
             Ty::Vec(element, lanes) | Ty::Mask(element, lanes) => {
                 matches!(lanes, 2 | 4 | 8 | 16)
                     && matches!(element, Scalar::Int(_) | Scalar::Float(_))
@@ -457,21 +469,23 @@ impl<'a> PlacementValidator<'a> {
             | Ty::Buffer
             | Ty::Regex
             | Ty::Captures
-            | Ty::CliParsed
             | Ty::TcpConn
             | Ty::TcpListener
             | Ty::UdpSocket
             | Ty::Child
             | Ty::File
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream => true,
+            // These handles are body-produced only. They are valid local/expression types but have
+            // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
+            Ty::CliParsed
             | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::HttpClient
             | Ty::HttpServer
-            | Ty::HttpRequestCtx
-            | Ty::ResponseBuilder
-            | Ty::HttpStream
             | Ty::Command
-            | Ty::RunOutput => true,
+            | Ty::RunOutput => false,
             Ty::CliCommand => false,
             _ if align_sema::is_move_handle(ty) => true,
             Ty::Rng | Ty::HttpHeaders | Ty::JsonDoc => true,
@@ -499,8 +513,8 @@ impl<'a> PlacementValidator<'a> {
             && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_)))
     }
 
-    fn box_payload_ok(&self, payload: Scalar, allow_param: bool) -> bool {
-        if !self.scalar_ok(payload, ScalarPlacement::Payload { allow_param }) {
+    fn box_payload_ok(&self, payload: Scalar) -> bool {
+        if !self.scalar_ok(payload, ScalarPlacement::Payload { allow_param: false }) {
             return false;
         }
         match payload {

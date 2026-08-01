@@ -34152,6 +34152,9 @@ fn enum_payload_ok(
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
+        // `response_builder` is a payload-scalar in generic templates as well as a direct
+        // concrete sum payload. Keep generic monomorphization aligned with Pass 0c and am-p.
+        Scalar::ResponseBuilder => true,
         // An owned `array<T>` payload (J2) — the enum becomes Move (tag-switched drop). The element
         // must be non-owned so the drop is one flat free: `array<string>` (a per-element deep free) is
         // deferred, `array<Move-struct>` likewise.
@@ -34410,6 +34413,18 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn generic_enum_response_builder_monomorph_is_producer_valid() {
+        let (_, diagnostics) = check(
+            "Envelope<T> { Item(T) }\nfn use(value: Envelope<response_builder>) -> () = ()\nfn main() -> i32 = 0\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "generic response_builder sum monomorph must use the payload producer predicate: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]

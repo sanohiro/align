@@ -218,6 +218,18 @@ fn assert_rejected(label: &str, program: &hir::Program) {
     }
 }
 
+fn assert_placement_rejected(label: &str, program: &hir::Program) {
+    assert!(
+        validate_hir::global_type_metadata_is_valid(program),
+        "{label}: placement fixture is not graph-valid"
+    );
+    assert!(
+        !validate_hir::type_placement_metadata_is_valid(program),
+        "{label}: placement validator accepted graph-valid malformed metadata"
+    );
+    assert_rejected(label, program);
+}
+
 fn assert_graph_accepted(label: &str, program: &hir::Program) {
     assert!(
         validate_hir::global_type_metadata_is_valid(program),
@@ -1360,7 +1372,10 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         lifted_capture_count: None,
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
-        ret: Ty::Command,
+        // `command` is a body-produced builder, not a source-nameable header type. Keep the
+        // deep producer in the body while giving this synthetic function a valid declaration
+        // return type; am-b owns the later body/result relation.
+        ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: vec![hir::Local {
@@ -1410,7 +1425,10 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         lifted_capture_count: None,
         params: Vec::new(),
         param_modes: Vec::new(),
-        ret: Ty::HttpRequest,
+        // `http_request` is a body-produced builder, not a source-nameable header type. Keep the
+        // deep producer in the body while giving this synthetic function a valid declaration
+        // return type; am-b owns the later body/result relation.
+        ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
@@ -2337,20 +2355,20 @@ fn malformed_hir_global_type_metadata_fails_closed() {
 fn malformed_hir_type_placement_fails_closed() {
     let mut field_box = baseline_program();
     field_box.structs[0].fields[0].ty = Ty::Box(scalar_int(64));
-    assert_rejected("box in struct field", &field_box);
+    assert_placement_rejected("box in struct field", &field_box);
 
     let mut field_owned_array = baseline_program();
     field_owned_array.structs[0].fields[0].ty = Ty::DynArray(Scalar::String);
-    assert_rejected("deep-free array in struct field", &field_owned_array);
+    assert_placement_rejected("deep-free array in struct field", &field_owned_array);
 
     let mut field_soa_array = baseline_program();
     field_soa_array.structs[0].fields[0].ty = Ty::DynStructArray(0, Layout::Soa);
-    assert_rejected("future SoA dynamic struct field", &field_soa_array);
+    assert_placement_rejected("future SoA dynamic struct field", &field_soa_array);
 
     let mut c_field = baseline_program();
     c_field.structs[0].c_repr = true;
     c_field.structs[0].fields[0].ty = Ty::Bool;
-    assert_rejected("non-FFI field in layout(C) struct", &c_field);
+    assert_placement_rejected("non-FFI field in layout(C) struct", &c_field);
 
     let mut aligned_field = baseline_program();
     aligned_field.structs.push(StructDef {
@@ -2364,36 +2382,36 @@ fn malformed_hir_type_placement_fails_closed() {
         c_repr: false,
     });
     aligned_field.structs[0].fields[0].ty = Ty::Struct(1);
-    assert_rejected("over-aligned inline field", &aligned_field);
+    assert_placement_rejected("over-aligned inline field", &aligned_field);
 
     let mut enum_buffer = baseline_program();
     enum_buffer.enums[0].variants[1].payload = vec![Scalar::Buffer];
-    assert_rejected("buffer enum payload", &enum_buffer);
+    assert_placement_rejected("buffer enum payload", &enum_buffer);
 
     let mut enum_soa = baseline_program();
     enum_soa.enums[0].variants[1].payload = vec![Scalar::Soa(0)];
-    assert_rejected("SoA enum payload", &enum_soa);
+    assert_placement_rejected("SoA enum payload", &enum_soa);
 
     let mut tuple_fn = baseline_program();
     tuple_fn.tuples[0].elems = vec![Scalar::Fn(0)];
-    assert_rejected("function tuple element", &tuple_fn);
+    assert_placement_rejected("function tuple element", &tuple_fn);
 
     let mut tuple_slice = baseline_program();
     tuple_slice.tuples[0].elems = vec![Scalar::Slice(PrimScalar::Str)];
-    assert_rejected("slice tuple element", &tuple_slice);
+    assert_placement_rejected("slice tuple element", &tuple_slice);
 
     let mut tagged_fn = baseline_program();
     tagged_fn.tagged_types[0] = TaggedType::Option(Scalar::Fn(0));
-    assert_rejected("function Option payload", &tagged_fn);
+    assert_placement_rejected("function Option payload", &tagged_fn);
 
     let mut fn_param = baseline_program();
     fn_param.fn_types[0].params = vec![(align_ast::ParamMode::ByValue, Scalar::Fn(0))];
-    assert_rejected("function-valued FnTy parameter", &fn_param);
+    assert_placement_rejected("function-valued FnTy parameter", &fn_param);
 
     let mut imported_box = with_return(Ty::Box(scalar_int(64)));
-    assert_rejected("box imported parameter return", &imported_box);
+    assert_placement_rejected("box imported parameter return", &imported_box);
     imported_box.imported_fns[0].ret = Ty::Fn(0);
-    assert_rejected("function imported return", &imported_box);
+    assert_placement_rejected("function imported return", &imported_box);
 
     let mut extern_bool = baseline_program();
     extern_bool.externs.push(hir::ExternFn {
@@ -2404,7 +2422,7 @@ fn malformed_hir_type_placement_fails_closed() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
     });
-    assert_rejected("bool extern parameter", &extern_bool);
+    assert_placement_rejected("bool extern parameter", &extern_bool);
 
     let mut extern_view_return = baseline_program();
     extern_view_return.externs.push(hir::ExternFn {
@@ -2415,7 +2433,34 @@ fn malformed_hir_type_placement_fails_closed() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
     });
-    assert_rejected("view extern return", &extern_view_return);
+    assert_placement_rejected("view extern return", &extern_view_return);
+}
+
+#[test]
+fn body_only_header_types_fail_placement_closed() {
+    for (label, ty) in [
+        ("cli parsed", Ty::CliParsed),
+        ("http request", Ty::HttpRequest),
+        ("http response", Ty::HttpResponse),
+        ("http client", Ty::HttpClient),
+        ("http server", Ty::HttpServer),
+        ("command", Ty::Command),
+        ("run output", Ty::RunOutput),
+    ] {
+        let mut program = baseline_program();
+        program.fn_types[0].ret = ty;
+        program
+            .imported_fns
+            .push(imported_fn("dep$body_only_header", Vec::new(), ty));
+        assert_placement_rejected(label, &program);
+    }
+}
+
+#[test]
+fn abstract_box_param_fails_placement_closed() {
+    let mut program = baseline_program();
+    program.fn_types[0].ret = Ty::Box(Scalar::Param(0));
+    assert_placement_rejected("abstract box parameter", &program);
 }
 
 #[test]
@@ -2437,8 +2482,12 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
             name: "owned".to_string(),
             ty: Ty::File,
         },
+        FieldDef {
+            name: "nested_owned_array".to_string(),
+            ty: Ty::Option(Scalar::DynArray(PrimScalar::String)),
+        },
     ];
-    program.enums[0].variants[1].payload = vec![Scalar::Fn(0)];
+    program.enums[0].variants[1].payload = vec![Scalar::Fn(0), Scalar::ResponseBuilder];
     program.tagged_types[0] = TaggedType::Result(Scalar::File, Scalar::String);
     program.tuples[0].elems = vec![Scalar::String, Scalar::DynArray(PrimScalar::Str)];
     program.fn_types[0].params = vec![
@@ -2516,7 +2565,38 @@ fn deep_hir_type_dag_placement_is_stack_bounded() {
             assert_accepted("deep valid placement", &program);
 
             program.structs[DEPTH - 1].fields[0].ty = Ty::Box(scalar_int(64));
-            assert_rejected("deep later placement failure", &program);
+            assert_placement_rejected("deep later placement failure", &program);
+
+            // A shared binary DAG makes an un-memoized walker revisit 2^n paths; 256 is already
+            // far beyond what an exponential implementation can finish, while keeping the
+            // four-entrypoint owner test quick once completed tagged nodes are memoized.
+            const TAG_DEPTH: usize = 256;
+            let mut tagged_dag = baseline_program();
+            tagged_dag.tagged_types = (0..TAG_DEPTH)
+                .map(|id| {
+                    if id == 0 {
+                        TaggedType::Option(scalar_int(64))
+                    } else {
+                        TaggedType::Result(
+                            Scalar::Tagged((id - 1) as u32),
+                            Scalar::Tagged((id - 1) as u32),
+                        )
+                    }
+                })
+                .collect();
+            tagged_dag.imported_fns.push(imported_fn(
+                "dep$tagged_dag",
+                Vec::new(),
+                Ty::Tagged((TAG_DEPTH - 1) as u32),
+            ));
+            assert!(
+                validate_hir::global_type_metadata_is_valid(&tagged_dag),
+                "shared tagged placement DAG: global graph validator rejected valid metadata"
+            );
+            assert!(
+                validate_hir::type_placement_metadata_is_valid(&tagged_dag),
+                "shared tagged placement DAG: placement validator rejected valid metadata"
+            );
         })
         .expect("spawn deep placement validator")
         .join()
