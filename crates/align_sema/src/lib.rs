@@ -18250,8 +18250,9 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, salt, moved, false, false);
                 move_expr!(self, params, moved, false, false);
             }
-            // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
-            // borrows. Recurse to catch moves in element subexpressions.
+            // Tuple elements may be Copy or Move. Recurse through each element so owned values are
+            // consumed at construction and tuple-index provenance remains visible to the move and
+            // borrow analyses.
             ExprKind::Tuple { elems, .. } => {
                 for element in elems {
                     move_expr!(self, element, moved, true, true);
@@ -33267,8 +33268,9 @@ fn resolve_type(
             return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
         }
         ast::Type::Tuple { elems, span: _ } => {
-            // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
-            // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
+            // Tuple elements use the supported scalar forms: primitive scalars, `str` views, and
+            // owned `string`/array values. A tuple containing a Move element carries the recursive
+            // Drop/region behavior of those elements and remains restricted to temporary results.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
                 let ety = resolve_type(e, cx, type_params, diags);
@@ -34155,9 +34157,10 @@ fn enum_payload_ok(
         // `response_builder` is a payload-scalar in generic templates as well as a direct
         // concrete sum payload. Keep generic monomorphization aligned with Pass 0c and am-p.
         Scalar::ResponseBuilder => true,
-        // An owned `array<T>` payload (J2) — the enum becomes Move (tag-switched drop). The element
-        // must be non-owned so the drop is one flat free: `array<string>` (a per-element deep free) is
-        // deferred, `array<Move-struct>` likewise.
+        // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
+        // scalar-element arrays are admitted; bare `array<string>` is excluded because its
+        // per-element string Drop is not part of this enum payload contract. Struct arrays are
+        // admitted only when their element struct is non-Move.
         Scalar::DynArray(PrimScalar::String) => false,
         Scalar::DynArray(_) => true,
         Scalar::DynStructArray(id) => structs

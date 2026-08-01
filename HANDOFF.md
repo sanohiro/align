@@ -389,8 +389,10 @@ element through the existing recursive pointer-based destructor and adds a codeg
 ledger/type-doc coverage. The subsequent full independent preflight reported one P1 claiming that
 `Option/Result<array<T>>` fields were rejected; exact source inspection and the named positive MIR
 fixture show this is a false positive—the direct-only `array<string>` guard does not apply inside
-the payload. The adjudication is recorded in `.git/align-independent-61e482c-pre.log`. It still
-needs the full pre-PR gate and the final post-open review on the resulting SHA.
+the payload. The adjudication is recorded in `.git/align-independent-61e482c-pre.log`. The final
+pre-PR gate passed on `71951e1`; its host-native post-open review reached the 900-second bound
+after inspecting the validator, tuple Drop, and sema through `resolve_type`/`box`, so the transcript
+is preserved and the remaining sema contract slice is being continued narrowly.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
 rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
