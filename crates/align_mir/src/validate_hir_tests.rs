@@ -2361,6 +2361,13 @@ fn malformed_hir_type_placement_fails_closed() {
     field_owned_array.structs[0].fields[0].ty = Ty::DynArray(Scalar::String);
     assert_placement_rejected("deep-free array in struct field", &field_owned_array);
 
+    for (label, ty) in [
+        ("file slice element", Ty::Slice(Scalar::File)),
+        ("file array element", Ty::DynArray(Scalar::File)),
+    ] {
+        assert_placement_rejected(label, &with_return(ty));
+    }
+
     let mut field_soa_array = baseline_program();
     field_soa_array.structs[0].fields[0].ty = Ty::DynStructArray(0, Layout::Soa);
     assert_placement_rejected("future SoA dynamic struct field", &field_soa_array);

@@ -373,7 +373,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpStream
             | Scalar::ResponseBuilder
             | Scalar::RunOutput => !matches!(mode, ScalarPlacement::Collection),
-            Scalar::File => true,
+            Scalar::File => !matches!(mode, ScalarPlacement::Collection),
             Scalar::Bool
             | Scalar::Char
             | Scalar::Unit
