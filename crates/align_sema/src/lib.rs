@@ -30543,10 +30543,12 @@ impl<'a, 't> Checker<'a, 't> {
             // Unit HIR type instead of being coerced to the match result. The first non-diverging,
             // non-error arm fixes an otherwise unconstrained result type.
             let arm_expected = if scrutinee_diverges { None } else { result_ty };
+            let body_errors_before = self.diags.error_count();
             self.reject_bare_array_value(&arm.body, arm_expected, "a `match` arm value");
             let body = self.check_completion_expr(&arm.body, arm_expected);
+            let body_is_clean = self.diags.error_count() == body_errors_before;
             let body_diverges = hir_expr_diverges(&body);
-            if !scrutinee_diverges && result_ty.is_none() && body_diverges {
+            if !scrutinee_diverges && result_ty.is_none() && body_diverges && body_is_clean {
                 unconstrained_diverging_arms.push(checked.len());
             }
             if !scrutinee_diverges && result_ty.is_none() && body.ty != Ty::Error && !body_diverges {
@@ -30585,14 +30587,17 @@ impl<'a, 't> Checker<'a, 't> {
         // an absent `else` is a path that did not wait). Soundly tracks `get`-before-`wait`.
         let in_tg = !self.wait_state.is_empty();
         let w_before = self.wait_state.last().copied().unwrap_or(false);
+        let then_errors_before = self.diags.error_count();
         let then_b = self.check_block(
             then,
             if ast_block_diverges(then) { None } else { branch_expected },
         );
+        let then_is_clean = self.diags.error_count() == then_errors_before;
         let w_then = self.wait_state.last().copied().unwrap_or(false);
         if in_tg {
             *self.wait_state.last_mut().unwrap() = w_before;
         }
+        let else_errors_before = self.diags.error_count();
         let els_b = match els {
             Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(
                 b,
@@ -30606,6 +30611,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             None => Block { stmts: Vec::new(), value: None },
         };
+        let else_is_clean = self.diags.error_count() == else_errors_before;
         if in_tg {
             let w_els = if els.is_some() { self.wait_state.last().copied().unwrap_or(false) } else { w_before };
             *self.wait_state.last_mut().unwrap() = w_then && w_els;
@@ -30636,10 +30642,10 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ty, expected, span);
         }
         if expected.is_none() && !condition_diverges {
-            if then_diverges {
+            if then_diverges && then_is_clean {
                 self.reconcile_diverging_completion_block(&then_b, ty);
             }
-            if else_diverges {
+            if else_diverges && else_is_clean {
                 self.reconcile_diverging_completion_block(&els_b, ty);
             }
         }
@@ -37087,6 +37093,25 @@ fn exit_branch(flag: bool) -> i64 {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(errors, ["type mismatch: () vs i64"], "{name}");
+        }
+
+        for (name, source) in [
+            (
+                "match-malformed-eager-child",
+                "import std.process\nChoice { A, B }\nfn sink(value: ()) {}\nfn f(value: Choice) -> i64 { out := match value { A => sink(process.exit({ missing\n1\n})) B => 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "if-malformed-eager-child",
+                "import std.process\nfn sink(value: ()) {}\nfn f(flag: bool) -> i64 { out := if flag { sink(process.exit({ missing\n1\n})) } else { 2 as i64 }\nreturn out\n}\nfn main() -> i32 = 0\n",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == align_diag::Severity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(errors, ["undefined name: 'missing'"], "{name}");
         }
 
         let (_, diagnostics) = check(
