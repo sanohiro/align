@@ -5,9 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #686. L2b-a2-am-w
-task-wait dominance and am-v native output-buffer mutability are complete; am-u lexical extern
-invocation is next.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #686; the current final
+implementation PR carries the am-u lexical extern invocation correction. After that merge, the
+next slice is am-p placement validation.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -103,6 +103,7 @@ facts must live in this repository.
 #675  eager MIR continuation closure
 #685  path-complete task-wait dominance
 #686  native output-buffer local/mutability validation
+current PR  lexical extern invocation permission and non-escaping extern-call closure (am-u)
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -328,6 +329,18 @@ create fresh identities for the same loop or branch join. Finally, every owner f
 be legal under the language's own Move/arena rules before it can test compiler-only proof
 transport.
 
+### Current am-u delivery retrospective
+
+The am-u implementation interval exceeded the two-hour checkpoint target because the callback and
+lambda lexical-depth matrix had to be expanded after independent review, while macOS test startup
+and compilation runs intermittently produced no harness output. The implementation was narrowed to
+one sema producer gate plus the existing resolver consumers; direct execution of the built owner
+binary was used to distinguish a completed test from a stalled Cargo wrapper. The durable rule is
+to preserve the stalled transcript, inspect the actual child process, and continue with the smallest
+complete owner target instead of restarting a broad suite. The matrix now includes exact one-error
+precedence, rejected-HIR absence, branch/loop/early-exit lambda depth, and qualified whole/per-unit
+parity.
+
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
 direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
@@ -480,7 +493,7 @@ before HIR publication/MIR lowering while preserving typed and proven non-fallth
 focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/optimized IR,
 execution, and cold/hot object-cache parity. The reviewed order is am-w
 outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
-am-u lexical extern invocation, am-p placement, am-n nominal/link, am-h
+am-u lexical extern invocation (current PR), then am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
@@ -685,13 +698,13 @@ SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
 L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, a2-am-e, and a2-am-f. #679 completes
-am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; after #686, am-u is the next implementation slice. The required milestone order
+#678; after the current am-u PR, am-p is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and

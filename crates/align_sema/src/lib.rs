@@ -18363,6 +18363,10 @@ struct Checker<'a, 't> {
     scan_terminal: bool,
     /// Nesting depth of `unsafe {}` blocks (0 = in safe code). `raw.*` ops are valid only inside one.
     unsafe_depth: u32,
+    /// Whether the current function body encountered a forbidden extern boundary. This compiler-only
+    /// sentinel lets a lifted lambda suppress its rejected function HIR without parsing diagnostic
+    /// text; the flag is reset at each lambda boundary and propagated only as a rejection signal.
+    extern_boundary_error: bool,
     /// Nesting depth of `task_group {}` blocks (0 = not in one). `spawn`/`wait` are valid only
     /// inside a `task_group` scope (slice ④).
     task_group_depth: u32,
@@ -18522,6 +18526,7 @@ impl<'a, 't> Checker<'a, 't> {
             arena_depth: 0,
             scan_terminal: false,
             unsafe_depth: 0,
+            extern_boundary_error: false,
             task_group_depth: 0,
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
@@ -19004,6 +19009,10 @@ impl<'a, 't> Checker<'a, 't> {
         // modules (two modules may each have `fn run` with a lambda).
         let mangled = self.resolve_local_fn(&f.name.name).unwrap_or_else(|| f.name.name.clone());
         self.cur_fn = mangled.clone();
+        // The permission sentinel is function-local compiler state. A rejected extern in an
+        // earlier top-level body must not become the saved enclosing state for this function's
+        // otherwise independent lambdas.
+        self.extern_boundary_error = false;
         let sig = &self.sigs[&mangled];
         let mut ret = sig.ret;
         let mut param_tys = sig.params.clone();
@@ -20201,6 +20210,14 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("undefined function: '{display}'"), span);
             return err();
         };
+        if sig.is_extern {
+            self.extern_boundary_error = true;
+            self.diags.error(
+                format!("extern function '{display}' cannot be used as a function value; call it directly inside unsafe"),
+                span,
+            );
+            return err();
+        }
         let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
         let ret_ok = fn_value_ret_ok(sig.ret);
         let sig_ret = sig.ret;
@@ -21497,28 +21514,43 @@ impl<'a, 't> Checker<'a, 't> {
             }
         // A user function: a bare call resolves in the caller's own module (`module$fn` mangled
         // name); cross-module calls are written `mod.fn(...)` (handled in `check_method_call`).
+        let display = name.clone();
         let Some(name) = self.resolve_local_fn(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
-        self.check_named_call(name, args, expected, span)
+        self.check_named_call(name, display, args, expected, span)
+    }
+
+    /// Reject an extern invocation outside the lexical `unsafe` block that owns the expression.
+    /// The permission is compiler-only: it never becomes a type/effect bit or runtime value.
+    fn reject_extern_without_unsafe(&mut self, is_extern: bool, display: &str, span: Span) -> bool {
+        if is_extern && self.unsafe_depth == 0 {
+            self.extern_boundary_error = true;
+            self.diags.error(
+                format!("calling extern function '{display}' requires an unsafe {{ }} block"),
+                span,
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// The shared tail of a direct call once its target is a resolved (mangled) function name:
     /// signature lookup, generic-call dispatch, the `out` no-alias check, argument checking, and the
     /// `Call` node. Reused by a bare call (`check_call`) and a cross-module `mod.fn(...)` call.
-    fn check_named_call(&mut self, name: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_named_call(&mut self, name: String, display: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
         // A foreign (`extern "C"`) call can violate every safe-core invariant, so it is confined to
-        // an `unsafe {}` block — exactly like a `raw.*` op (draft.md §15).
-        if sig.is_extern && self.unsafe_depth == 0 {
-            self.diags.error(
-                format!("calling the extern function '{name}' requires an `unsafe {{ }}` block (foreign code is outside the safe core)"),
-                span,
-            );
+        // an `unsafe {}` block — exactly like a `raw.*` op (draft.md §15). Reject before generic,
+        // arity, or argument checking so a forbidden call produces one deterministic diagnostic and
+        // cannot enter HIR as a `Call` node.
+        if self.reject_extern_without_unsafe(sig.is_extern, &display, span) {
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
         let (param_tys, ret, param_modes) =
             (sig.params.clone(), sig.ret, sig.param_modes.clone());
@@ -22407,7 +22439,10 @@ impl<'a, 't> Checker<'a, 't> {
         if !leftmost_is_local
             && let Some(modpath) = flatten_module_path(recv) {
                 match self.resolve_qualified_fn(&modpath, method, span) {
-                    Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
+                    Ok(Some(mangled)) => {
+                        let display = format!("{modpath}.{method}");
+                        return self.check_named_call(mangled, display, args, expected, span);
+                    }
                     Ok(None) => {}
                     Err(()) => return err,
                 }
@@ -23416,7 +23451,10 @@ impl<'a, 't> Checker<'a, 't> {
                         .error(format!("undefined function: '{}'", named.display_name()), named.span);
                     return None;
                 };
-                let (params, ret) = (sig.params.clone(), sig.ret);
+                let (is_extern, params, ret) = (sig.is_extern, sig.params.clone(), sig.ret);
+                if self.reject_extern_without_unsafe(is_extern, &named.display_name(), named.span) {
+                    return None;
+                }
                 if params.len() != 1
                     || !self.source_ty_matches(params[0], elem)
                 {
@@ -23435,7 +23473,8 @@ impl<'a, 't> Checker<'a, 't> {
             }
             StageFn::Lambda { params, body, span } => {
                 let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
-                self.lift_lambda(params, body, &[elem], expected_ret, *span)
+                let lifted = self.lift_lambda(params, body, &[elem], expected_ret, *span)?;
+                (lifted.1 != Ty::Error).then_some(lifted)
             }
         }
     }
@@ -23488,6 +23527,11 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_ret = self.ret_hint;
         let saved_arena = self.arena_depth;
+        // A lambda body is a separate function: an enclosing `unsafe {}` does not lexically
+        // contain the lifted function body. Extern permission must be re-established by an unsafe
+        // block inside the lambda itself.
+        let saved_unsafe_depth = self.unsafe_depth;
+        let saved_extern_boundary_error = self.extern_boundary_error;
         // A lambda body is a separate function: it is not lexically inside the enclosing
         // `task_group`, so reset the task-group / `wait`-state tracking (else a `wait()` inside the
         // lambda would set the enclosing group's flag at compile time and bypass the check).
@@ -23502,6 +23546,8 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.arena_depth = 0;
+        self.unsafe_depth = 0;
+        self.extern_boundary_error = false;
         self.task_group_depth = 0;
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
@@ -23528,6 +23574,10 @@ impl<'a, 't> Checker<'a, 't> {
         // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
         // captured), so the scan is self-contained and never double-reports the enclosing function.
         UnnecessaryHeapScan::run(&body_fin, self.diags);
+        // A forbidden extern boundary inside this separately lifted function is a producer error,
+        // not a recoverable callback type. Keep the exact diagnostic but do not publish the lifted
+        // function (or let an outer terminal infer from its recovery return type).
+        let extern_boundary_error = self.extern_boundary_error;
 
         // Collect captures: each becomes a trailing parameter of the lifted function, and the
         // enclosing local is passed at the call site. Slice ③ supports copy-value captures only.
@@ -23580,6 +23630,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_parent = saved_float_parent;
         self.ret_hint = saved_ret;
         self.arena_depth = saved_arena;
+        self.unsafe_depth = saved_unsafe_depth;
+        self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
         self.task_group_depth = saved_tg_depth;
         self.wait_state = saved_wait_state;
         self.task_group_fallible = saved_tg_fallible;
@@ -23587,6 +23639,12 @@ impl<'a, 't> Checker<'a, 't> {
         self.slice_bases = saved_bases;
         self.buffered_readers = saved_buffered_readers;
         self.capture = saved_capture;
+        if extern_boundary_error {
+            // The outer lifted function was appended after any nested lambdas, so popping here
+            // removes exactly this rejected function while preserving nested recovery artifacts.
+            self.lifted.pop();
+            return None;
+        }
         // A lambda must not return a function value: the returned closure's environment is
         // frame-local to *this* lifted function and would dangle once it returns (the same rule as
         // a top-level fn — checked here too so a stage/value lambda can't slip a closure out).
@@ -23608,7 +23666,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// types are known after `check_pipeline`/the initial value).
     fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty, Vec<Expr>)> {
         if let ast::ExprKind::Lambda { params, body } = &arg.kind {
-            return self.lift_lambda(params, body, expected_params, expected_ret, arg.span);
+            let lifted = self.lift_lambda(params, body, expected_params, expected_ret, arg.span)?;
+            return (lifted.1 != Ty::Error).then_some(lifted);
         }
         let Some(named) = self.pipeline_fn_name(arg) else {
             self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
@@ -23620,7 +23679,10 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("undefined function: '{}'", named.display_name()), named.span);
             return None;
         };
-        let (params, ret) = (sig.params.clone(), sig.ret);
+        let (is_extern, params, ret) = (sig.is_extern, sig.params.clone(), sig.ret);
+        if self.reject_extern_without_unsafe(is_extern, &named.display_name(), named.span) {
+            return None;
+        }
         // Resolve the expected types first: an unresolved inference variable (e.g. an inline
         // literal's element type) must not false-positive against the concrete signature.
         let expected_resolved: Vec<Ty> = expected_params.iter().map(|&t| self.resolve(t)).collect();
@@ -34348,6 +34410,140 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn extern_invocation_permission_matrix() {
+        const PERMISSION: &str = "calling extern function 'foreign' requires an unsafe { } block";
+        const FN_VALUE: &str = "extern function 'foreign' cannot be used as a function value; call it directly inside unsafe";
+
+        let (program, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn bad() -> i64 { return foreign() }\nfn main() -> i32 = 0\n",
+        );
+        let errors = diagnostics
+            .iter()
+            .filter(|d| d.severity == align_diag::Severity::Error)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(), [PERMISSION]);
+        let bad = program.fns.iter().find(|f| f.name == "bad").expect("bad function");
+        assert!(matches!(
+            bad.body.stmts.first(),
+            Some(Stmt::Return(Some(Expr { kind: ExprKind::Bool(false), ty: Ty::Error, .. })))
+        ), "a forbidden direct call must not enter HIR as Call: {:?}", bad.body.stmts);
+
+        let (_, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn good() -> i64 { unsafe { return foreign(1) } }\nfn main() -> i32 = 0\n",
+        );
+        assert!(!diagnostics.has_errors(), "a direct extern call in unsafe must check: {:?}", diagnostics.iter().collect::<Vec<_>>());
+
+        let (_, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn bad() -> i32 { f := foreign\nreturn 0 }\nfn main() -> i32 = 0\n",
+        );
+        let messages = diagnostics
+            .iter()
+            .filter(|d| d.severity == align_diag::Severity::Error)
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, [FN_VALUE], "extern declarations cannot form FnValue: {messages:?}");
+
+        let callback_sources = [
+            ("fn bad() -> i32 { [1, 2].map(foreign).sum()\nreturn 0 }", "foreign"),
+            ("fn bad() -> i32 { [1, 2].where(predicate).sum()\nreturn 0 }", "predicate"),
+            ("fn bad() -> i32 { [1, 2].reduce(0, fold)\nreturn 0 }", "fold"),
+            ("fn bad() -> i32 { [1, 2].partition(predicate)\nreturn 0 }", "predicate"),
+            ("fn bad() -> i32 { [1, 2].any(predicate)\nreturn 0 }", "predicate"),
+            ("fn bad() -> i32 { [1, 2].all(predicate)\nreturn 0 }", "predicate"),
+            ("fn bad() -> i32 { [1, 2].par_map(foreign).sum()\nreturn 0 }", "foreign"),
+            ("fn bad() -> i32 { [1, 2].scan(0, fold)\nreturn 0 }", "fold"),
+            ("fn bad() -> i32 { [1, 2].sort_by_key(foreign)\nreturn 0 }", "foreign"),
+        ];
+        for (body, name) in callback_sources {
+            let source = format!(
+                "extern \"C\" fn foreign(x: i64) -> i64\nextern \"C\" fn predicate(x: i64) -> i32\nextern \"C\" fn fold(a: i64, b: i64) -> i64\n{body}\nfn main() -> i32 = 0\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .filter(|d| d.severity == align_diag::Severity::Error)
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(messages, vec![format!("calling extern function '{name}' requires an unsafe {{ }} block")], "callback must be gated before shape checking: {body}: {messages:?}");
+        }
+
+        let (program, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn bad() -> i32 { [1, 2].map(foreign).sum()\nreturn 0 }\nfn main() -> i32 = 0\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.severity == align_diag::Severity::Error)
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            [PERMISSION],
+            "a rejected named callback must not cascade into terminal diagnostics"
+        );
+        let bad = program.fns.iter().find(|f| f.name == "bad").expect("bad callback function");
+        assert!(matches!(
+            bad.body.stmts.first(),
+            Some(Stmt::Expr(Expr { kind: ExprKind::Bool(false), ty: Ty::Error, .. }))
+        ), "a rejected callback pipeline must not enter HIR as an Array* node: {:?}", bad.body.stmts);
+
+        let permitted_callbacks = [
+            "[1, 2].map(foreign).sum()",
+            "[1, 2].where(predicate).sum()",
+            "[1, 2].reduce(0, fold)",
+            "[1, 2].partition(predicate)",
+            "[1, 2].any(predicate)",
+            "[1, 2].all(predicate)",
+            "[1, 2].par_map(foreign).sum()",
+            "[1, 2].scan(0, fold)",
+            "[1, 2].sort_by_key(foreign)",
+        ];
+        for body in permitted_callbacks {
+            let source = format!(
+                "extern \"C\" fn foreign(x: i64) -> i64\nextern \"C\" fn predicate(x: i64) -> i32\nextern \"C\" fn fold(a: i64, b: i64) -> i64\nfn good() -> i32 {{ unsafe {{ {body} }}\nreturn 0 }}\nfn main() -> i32 = 0\n"
+            );
+            let (_, diagnostics) = check(&source);
+            assert!(
+                !diagnostics.iter().any(|d| d.message == PERMISSION),
+                "owning callback expression in unsafe must pass the permission gate: {body}: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+
+        let (_, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn bad() -> i64 { unsafe { return [1].map(fn x { if x > 0 { foreign(x) } else { x } }).sum() } }\nfn main() -> i32 = 0\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.severity == align_diag::Severity::Error)
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            [PERMISSION],
+            "a lifted lambda has its own lexical unsafe depth"
+        );
+
+        for body in [
+            "loop { break foreign(x) }",
+            "return foreign(x)",
+        ] {
+            let source = format!(
+                "extern \"C\" fn foreign(x: i64) -> i64\nfn bad() -> i64 {{ unsafe {{ return [1].map(fn x {{ {body} }}).count() }} }}\nfn main() -> i32 = 0\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .filter(|d| d.severity == align_diag::Severity::Error)
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(messages, [PERMISSION], "lambda control-flow boundary must reset unsafe depth: {body}: {messages:?}");
+        }
+
+        let (_, diagnostics) = check(
+            "extern \"C\" fn foreign(x: i64) -> i64\nfn good() -> i64 { return [1].map(fn x { unsafe { foreign(x) } }).sum() }\nfn main() -> i32 = 0\n",
+        );
+        assert!(!diagnostics.has_errors(), "an unsafe block inside the lambda permits its extern call: {:?}", diagnostics.iter().collect::<Vec<_>>());
     }
 
     #[test]
