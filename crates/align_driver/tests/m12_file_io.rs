@@ -54,7 +54,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   f.pwrite(\"Hello, \", 0)?
   f.pwrite(\"World!\", 7)?
   f.pwrite(\"Z\", 20)?
-  buf := buffer(6)
+  mut buf := buffer(6)
   n := f.pread(buf, 7)?
   io.stdout.write(buf.bytes())?
   return Ok(())
@@ -257,6 +257,6 @@ fn file_constructors_require_std_fs_import() {
     // With the import, a bound file's methods type-check (regression: the gates don't over-reach).
     assert!(!check_errs(
         "m12-file-bound-ok",
-        "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  f := fs.create_rw(args[1])?\n  f.pwrite(\"hi\", 0)?\n  buf := buffer(2)\n  n := f.pread(buf, 0)?\n  print(f.len()?)\n  return Ok(())\n}\n",
+        "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  f := fs.create_rw(args[1])?\n  f.pwrite(\"hi\", 0)?\n  mut buf := buffer(2)\n  n := f.pread(buf, 0)?\n  print(f.len()?)\n  return Ok(())\n}\n",
     ), "a bound file's pwrite/pread/len must stay allowed");
 }

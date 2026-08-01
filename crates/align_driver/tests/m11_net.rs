@@ -174,7 +174,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   w := conn.writer()
   w.write(\"ping\\n\")?
   r := conn.reader()
-  b := buffer(64)
+  mut b := buffer(64)
   n := r.read(b)?
   print(n)
   io.stdout.write(b.bytes())?
@@ -362,13 +362,13 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   conn1 := l.accept()?
   r1 := conn1.reader()
   w1 := conn1.writer()
-  b1 := buffer(64)
+  mut b1 := buffer(64)
   n1 := r1.read(b1)?
   w1.write(b1.bytes())?
   conn2 := l.accept()?
   r2 := conn2.reader()
   w2 := conn2.writer()
-  b2 := buffer(64)
+  mut b2 := buffer(64)
   n2 := r2.read(b2)?
   w2.write(b2.bytes())?
   return Ok(())
@@ -531,7 +531,7 @@ fn make(p: str) -> Result<reader, Error> {
 }
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := make(args[1])?
-  buf := buffer(4)
+  mut buf := buffer(4)
   n := r.read(buf)?
   print(n)
   return Ok(())
@@ -546,14 +546,12 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     );
 }
 
-/// Adversarial-review F1: the conservative counterpart to the test above. `open_it`'s own reader is
-/// an unrelated fixed-path `fs.open` — it borrows nothing from `tag` — but `region_of(Call)` has no
-/// per-fn "does this borrow arg i" fact, so it folds in *every* argument's region regardless. Passing
-/// a `Frame`-region argument (a `string` local auto-borrowed to `str`, MMv2 slice 7b) taints the call
-/// result, so returning it out of `steal` (past the frame) is conservatively rejected — sound (never
-/// miscompiles), just imprecise. (Documented on `tracks_region`'s `Reader | Writer` arm.)
+/// Adversarial-review F1: a direct constructor's named return summary is `None`, so an unrelated
+/// frame-region argument does not taint the returned owned reader. This is the precise counterpart
+/// to the static-argument constructor test above: only a callee that explicitly returns a view of an
+/// argument contributes that argument's region to the call result.
 #[test]
-fn reader_through_call_with_frame_arg_conservatively_rejected() {
+fn reader_through_call_with_frame_arg_direct_constructor_is_precise() {
     let src = "\
 import std.fs
 fn open_it(tag: str) -> Result<reader, Error> {
@@ -571,8 +569,8 @@ pub fn main() -> Result<(), Error> {
 }
 ";
     assert!(
-        check_errs("m11net-reader-call-frame-arg", src),
-        "a reader returned through a user call with a Frame-region argument must be conservatively rejected"
+        !check_errs("m11net-reader-call-frame-arg", src),
+        "an unrelated frame-region argument must not taint a direct owned-reader constructor"
     );
 }
 
@@ -613,7 +611,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   c.flag_i64(\"peer\", 0)
   p := c.parse(args)?
   u := udp.bind(\"127.0.0.1\", p.get_i64(\"port\"))?
-  b := buffer(64)
+  mut b := buffer(64)
   n := u.recv_from(b)?
   u.send_to(b.bytes(), \"127.0.0.1\", p.get_i64(\"peer\"))?
   return Ok(())

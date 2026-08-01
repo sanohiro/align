@@ -52,17 +52,18 @@ fn file_copy_byte_exact_through_read_write_loop() {
     let prog = "\
 import std.fs
 import std.io
-fn copy_all(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
-  n := r.read(buf)?
-  if n == 0 { return Ok(()) }
-  w.write(buf.bytes())?
-  return copy_all(r, w, buf)
+fn copy_all(r: reader, w: writer) -> Result<(), Error> {
+  mut buf := buffer(4)
+  loop {
+    n := r.read(buf)?
+    if n == 0 { break Ok(()) }
+    w.write(buf.bytes())?
+  }
 }
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
   w := fs.create(args[2])?
-  buf := buffer(4)
-  copy_all(r, w, buf)?
+  copy_all(r, w)?
   return Ok(())
 }
 ";
@@ -88,7 +89,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
   w := fs.create(args[2])?
-  buf := buffer(65536)
+  mut buf := buffer(65536)
   n := r.read(buf)?
   print(n)
   w.write(buf.bytes())?
@@ -114,7 +115,7 @@ import std.fs
 import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
-  buf := buffer(16)
+  mut buf := buffer(16)
   n := r.read(buf)?
   print(n)
   return Ok(())
@@ -209,7 +210,7 @@ fn stdin_reader_reads_from_fd_zero() {
 import std.io
 pub fn main() -> Result<(), Error> {
   r := io.stdin
-  buf := buffer(64)
+  mut buf := buffer(64)
   n := r.read(buf)?
   print(n)
   return Ok(())
@@ -262,7 +263,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   match fs.open(args[1]) {
     Ok(r) => {
-      buf := buffer(4)
+      mut buf := buffer(4)
       n := r.read(buf)?
       print(n)
       return Ok(())
@@ -292,7 +293,7 @@ fn reusing_a_moved_reader_is_rejected() {
 import std.fs
 import std.io
 fn count(r: reader) -> Result<i64, Error> {
-  buf := buffer(8)
+  mut buf := buffer(8)
   return r.read(buf)
 }
 pub fn main(args: array<str>) -> Result<(), Error> {
@@ -438,7 +439,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   n := arena {
     r := fs.open(args[1])?
-    buf := buffer(3)
+    mut buf := buffer(3)
     r.read(buf)?
   }
   print(n)
@@ -546,7 +547,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   w := fs.create(args[2])?
   n := io.copy(r, w)?
   print(n)
-  buf := buffer(8)
+  mut buf := buffer(8)
   m := r.read(buf)?
   print(m)
   w.write(\"!\")?
@@ -696,7 +697,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   w.flush()?
   print(n)
   sin := io.stdin
-  b := buffer(4)
+  mut b := buffer(4)
   k := sin.read(b)?
   return Ok(())
 }

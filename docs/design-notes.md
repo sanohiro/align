@@ -786,6 +786,9 @@ Consequences already in the design:
 - cost is visible (no hidden alloc / copy / async / thread)
 - memory layout is a first-class, explicit choice (type- and scope-driven, never whole-program inferred)
 - I/O is sink-first, buffered, region-scoped (mmap views, writev, io.copy)
+- native operations that fill a `buffer` take only a bare `mut` local: the mutation and stable
+  address are visible, while temporaries and immutable aliases fail before any syscall or entropy
+  operation is formed
 - the std library encodes performance rails, not only convenience APIs
 - diagnostics explain resource mistakes in plain terms (the perf-rail lints)
 ```

@@ -83,7 +83,7 @@ fn http_client_requests_the_full_tls_set() {
 fn ct_equal_and_random_touch_no_library() {
     // `crypto.ct_equal` is a constant-time byte compare and `crypto.random` is OS getrandom — neither
     // links libcrypto. This guards against over-linking the whole `std.crypto` surface.
-    let src = "import std.crypto\nfn main() -> Result<(), Error> {\n  b := buffer(16)\n  crypto.random(b)\n  print(b.len() as i64)\n  return Ok(())\n}\n";
+    let src = "import std.crypto\nfn main() -> Result<(), Error> {\n  mut b := buffer(16)\n  crypto.random(b)\n  print(b.len() as i64)\n  return Ok(())\n}\n";
     assert_eq!(gated_link_libs("cap-rand", src), Vec::<String>::new());
 }
 

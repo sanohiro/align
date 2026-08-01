@@ -50,7 +50,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(8)
+  mut buf := buffer(8)
   w := io.stdout
   mut acc: array_builder<string> := array_builder()
   loop {
@@ -92,7 +92,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(64)
+  mut buf := buffer(64)
   w := io.stdout
   n := r.read_line(buf)?
   line := buf.bytes().as_str()?
@@ -133,7 +133,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(64)
+  mut buf := buffer(64)
   n := r.read_line(buf)?
   print(n)
   w := fs.create(args[2])?
@@ -179,7 +179,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(16)
+  mut buf := buffer(16)
   n := r.read_line(buf)?
   line := buf.bytes().as_str()?
   print(line.len())
@@ -206,7 +206,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(8)
+  mut buf := buffer(8)
   mut count := 0
   loop {
     n := r.read_line(buf)?
@@ -237,7 +237,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(8)
+  mut buf := buffer(8)
   n := r.read_line(buf)?
   print(buf.len())
   print(n)
@@ -266,7 +266,7 @@ Rec { n: i64 }
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(8)
+  mut buf := buffer(8)
   mut total := 0
   loop {
     k := r.read_line(buf)?
@@ -294,7 +294,7 @@ import std.fs
 import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
-  buf := buffer(8)
+  mut buf := buffer(8)
   n := r.read_line(buf)?
   print(n)
   return Ok(())
@@ -322,7 +322,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  buf := buffer(8)
+  mut buf := buffer(8)
   n := r.read_line(buf)?
   line := buf.bytes().as_str()?
   print(line.len())
@@ -364,17 +364,18 @@ fn unbuffered_read_path_unchanged() {
     let prog = "\
 import std.fs
 import std.io
-fn drain(r: reader, buf: buffer, w: writer) -> Result<(), Error> {
-  n := r.read(buf)?
-  if n == 0 { return Ok(()) }
-  w.write(buf.bytes())?
-  return drain(r, buf, w)
+fn drain(r: reader, w: writer) -> Result<(), Error> {
+  mut buf := buffer(4)
+  loop {
+    n := r.read(buf)?
+    if n == 0 { break Ok(()) }
+    w.write(buf.bytes())?
+  }
 }
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
-  buf := buffer(4)
   w := io.stdout
-  drain(r, buf, w)?
+  drain(r, w)?
   return Ok(())
 }
 ";

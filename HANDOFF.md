@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #683. L2b-a2-am-f
-return completeness is complete; am-w task-wait dominance is next.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #685. L2b-a2-am-w
+task-wait dominance is complete; am-v native output-buffer mutability is next.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -100,6 +100,7 @@ facts must live in this repository.
 #673  named/direct/imported parameter-root inference
 #674  product return-provenance refinement
 #675  eager MIR continuation closure
+#685  path-complete task-wait dominance
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -300,6 +301,30 @@ a runtime value. Delayed constraints retain the same diagnostic guard as immedia
 Required verification was slow but progressing: the final locked all-target Clippy took
 11m56s, and several test binaries had their known long startup delay. Those timings do not
 justify weakening the gate.
+
+### PR #685 delivery retrospective
+
+PR #685 was squash-merged as `257c704`. Its earliest-commit-to-merge proxy was 5h17m;
+the public PR was open for 4h18m. The implementation changed 4 files by +1,042/-18,
+including the complete compiler-only task-wait proof checker and its owner tests. The
+vertical remained intentionally atomic because splitting proof state, control joins, or
+TaskGet diagnostics could authorize an uninitialized task result or reject an outer proof.
+
+The avoidable delay was review execution and checkpoint churn, not the final compiler fix.
+The first host review spent its bound reading the large repository context and repeatedly
+hit macOS `xcodebuild` cache errors. A later host pass found a real P1: join tokens were
+keyed by incoming generation/epoch, so loop headers could allocate a new token on every
+state change and miss the required fixed point. The fix made join generation/epoch tokens
+stable by syntax site, then replaced an invalid owner fixture that tried to move a Task
+directly out of a conditional expression with a legal branch/loop reassignment twin.
+
+Durable rules: a review that has no verdict is never a clean result; inspect process state,
+log growth, and the last completed action, then stop at the hard bound and rerun against a
+small explicit complete patch. For control-flow token interning, keys that define a join
+identity are syntax-site-only; incoming state may key Spawn/Wait/Err events but must not
+create fresh identities for the same loop or branch join. Finally, every owner fixture must
+be legal under the language's own Move/arena rules before it can test compiler-only proof
+transport.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

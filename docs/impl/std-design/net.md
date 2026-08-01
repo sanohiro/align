@@ -31,7 +31,7 @@ l.accept() -> Result<tcp_conn, Error>
 // UDP
 udp.bind(host: str, port: i64) -> Result<udp_socket, Error>
 u.send_to(data: bytes, host: str, port: i64) -> Result<i64, Error>
-u.recv_from(buf: mut buffer) -> Result<datagram, Error>   // fills caller buffer, returns {n, peer}
+u.recv_from(buf: mut buffer) -> Result<i64, Error>        // fills caller buffer, returns byte count (v1)
 // DNS
 dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
 ```

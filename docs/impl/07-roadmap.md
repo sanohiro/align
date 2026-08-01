@@ -1959,7 +1959,7 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
     (the #297 arm; a view of a buffer's bytes stays pinned to the buffer). This is the one
     bytes→text path; a bespoke line-view op on `buffer` was REJECTED (a second bytes→str
     path, and a text op leaking into the deliberately-binary container).
-  - Canonical loop: `loop { n := r.read_line(buf)?; if n == 0 { break };
+  - Canonical loop: bind `mut buf := buffer(cap)` first, then `loop { n := r.read_line(buf)?; if n == 0 { break };
     line := buf.bytes().as_str()?; rec := json.decode(line)?; …array_builder… }`.
   - Documented edges: exactly one `\r?\n` is stripped; a lone `\r` (old-Mac) is not a
     terminator; a BOM is never stripped (no hidden transformation — json fails line 1;

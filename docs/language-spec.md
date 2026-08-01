@@ -729,6 +729,10 @@ directly, and programmer errors abort. A failing syscall in a `Result`-returning
 through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`, `EINVAL`→`Invalid`,
 else `Code(errno)`). (`draft.md` §18.2, M9.)
 
+All native buffer-fill operations require the argument to be a bare local declared with `mut`;
+temporaries and immutable locals are rejected before the operation is formed. The same rule applies
+to `read_line`, positional `pread`, UDP `recv_from`, and `crypto.random`.
+
 `std.encoding`: `base64`/`base64url`/`hex`/`percent` (RFC 3986 URI components — everything outside
 the unreserved set becomes `%XX`) / `form` (`application/x-www-form-urlencoded` — the same rule but
 space is `+`; encode one key or value at a time, the `=`/`&` joining them are structure) encode+decode,
