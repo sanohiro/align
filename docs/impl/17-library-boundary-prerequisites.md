@@ -1512,7 +1512,7 @@ not accept source syntax whose complete safety contract belongs to a later miles
 | L2b-a2-am-f | Implemented: make function completion exact before a non-Unit body reaches HIR/MIR | Bare return and reachable absent tail are valid only for Unit; every non-Unit path returns a typed value or is proven non-fallthrough | completed bare/value return, tail/absent tail, every-control-family, whole/per-unit MIR/LLVM verifier matrix |
 | L2b-a2-am-w | Make successful task-wait dominance path-complete before malformed-HIR validation consumes it | Reject a `TaskGet` unless its exact active group proves the Task's born generation valid and the current generation completed, with every earlier drained fallible Wait resolved Ok; carry Wait proofs and Move Task origin proofs through exact transparent local/control flow without a type or runtime ABI change | straight-line/reset, infallible/fallible, stored/copied/reassigned/map_err Result, Task move/reassignment/control origin, if/match/else, loop-break, early-exit, stale Wait alias after Spawn, unresolved/failed first Wait plus empty second Wait, inner-Wait/outer-Task isolation, outer proof handled inside inner group, exited-inner proof clearing, repeated primitive get, whole/per-unit task result matrix |
 | L2b-a2-am-v | Require each native output `Buffer` to be a bound `mut` local before the runtime can write through it | Reject temporary and immutable output buffers at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom; every other native handle and accepted buffer use is unchanged | five-site local/mut/type/diagnostic-order matrix, accepted runtime/allocation twins, whole/per-unit parity |
-| L2b-a2-am-u | Make foreign invocation permission lexical and non-escaping | Reject extern function-value formation; direct extern calls and named extern pipeline/reducer/sort callbacks require their invocation expression inside `unsafe`; safe user/imported callable behavior and native RuntimeKey calls are unchanged | direct/callback/FnValue/unsafe-depth matrix, resolver diagnostic order, whole/per-unit extern ABI parity |
+| L2b-a2-am-u | Make foreign invocation permission lexical and non-escaping (shipped 2026-08-01) | Reject extern function-value formation; direct extern calls and named extern pipeline/reducer/sort callbacks require their invocation expression inside `unsafe`; safe user/imported callable behavior and native RuntimeKey calls are unchanged | direct/callback/FnValue/unsafe-depth matrix, resolver diagnostic order, whole/per-unit extern ABI parity |
 | L2b-a2-am-p | Validate every body-independent type placement against its exact sema producer predicate | No source acceptance change; placement-invalid handcrafted HIR becomes canonical-empty | producer/placement Cartesian matrix and valid graph-but-invalid-position twins |
 | L2b-a2-am-n | Validate nominal/source identities, complete structural equality, enum/table ordinals, alignment, and link libraries | No source, ABI, or artifact change on valid input | exact-byte/NUL/collision/shape/base/alignment/library matrix |
 | L2b-a2-am-h | Validate extern/import/stored/main/local body-independent declarations and headers, and retain normalized imported-effect facts in checked HIR | Header-invalid handcrafted HIR becomes canonical-empty; source/interface behavior is unchanged | mode/signature/summary/imported-effect/main/local/drop-set structural matrix |
@@ -2461,8 +2461,9 @@ does not add a new source construct.
 
 #### Am-u implementation closure matrix
 
-This matrix is authoritative before the extern-call producer correction begins. `unsafe` remains a
-lexical invocation permission; am-u does not add an unsafe-callable function type.
+This matrix is authoritative for the shipped extern-call producer correction (2026-08-01).
+`unsafe` remains a lexical invocation permission; am-u does not add an unsafe-callable function
+type.
 
 | Cell | Required am-u closure | Exact owner evidence |
 |---|---|---|

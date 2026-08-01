@@ -61,6 +61,20 @@ fn extern_call_outside_unsafe_is_rejected() {
 }
 
 #[test]
+fn extern_call_permission_diagnostic_precedes_arity_errors() {
+    let src = "extern \"C\" fn abs(x: i32) -> i32\nfn main() -> i32 {\n  return abs()\n}\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "ffi-permission-order", src);
+    let errors = checked
+        .diags
+        .iter()
+        .filter(|diag| diag.severity == align_diag::Severity::Error)
+        .map(|diag| diag.message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(errors, ["calling extern function 'abs' requires an unsafe { } block"]);
+}
+
+#[test]
 fn extern_call_inside_unsafe_is_accepted() {
     assert!(ok("extern \"C\" fn abs(x: i32) -> i32\nfn main() -> i32 {\n  unsafe {\n    return abs(-7)\n  }\n}\n"));
 }

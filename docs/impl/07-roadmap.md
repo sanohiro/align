@@ -1237,11 +1237,10 @@ and the hot/cold field-split suggestion (needs heuristic design).
   auto-linked). `ast::ExternBlock.link`, parser `parse_link_clause`. (`tests/ffi_link.rs`,
   `examples/ffi_link.align`.)
   **FFI v1 shipped** extern declarations, unsafe-gated direct calls, scalar+`raw`+`()` signatures,
-  `layout(C)` struct-by-pointer, `str`/`slice`/`bytes` views, and `link("name")`. A 2026-07-31 audit
-  found that higher-order resolvers and function-value formation bypass the intended lexical
-  permission. The settled target is direct and non-escaping pipeline/reducer/sort callback
-  invocation only while lexically inside `unsafe`, with no extern function values; am-u is the
-  pending producer correction. **By-value struct passing shipped
+  `layout(C)` struct-by-pointer, `str`/`slice`/`bytes` views, and `link("name")`. Am-u (2026-08-01)
+  closes the audited higher-order resolver and function-value bypass: direct and non-escaping
+  pipeline/reducer/sort callback invocation is permitted only while its owning expression is
+  lexically inside `unsafe`, and extern function values are rejected. **By-value struct passing shipped
   beyond v1** (#329, 2026-07-03): a `layout(C)` struct ≤ 16 bytes passes/returns in registers on
   **x86-64 SysV only**, emitting clang's exact coercion and verified against a compiled-C-helper
   round-trip harness; codegen refuses (rather than guesses) on any non-SysV target, a >16-byte

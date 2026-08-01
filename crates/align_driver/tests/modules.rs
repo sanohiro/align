@@ -35,6 +35,35 @@ fn calling_without_importing_is_rejected() {
 }
 
 #[test]
+fn qualified_extern_permission_and_fn_value_diagnostics_use_source_name() {
+    let geom = "module geom\nextern \"C\" fn foreign(x: i64) -> i64\n";
+    let main = "module main\nimport geom\nfn main() -> i32 {\n  geom.foreign(1)\n  f := geom.foreign\n  [1, 2].map(geom.foreign).sum()\n  return 0\n}\n";
+    let diagnostics = check_multi_diagnostics(
+        "mod-qualified-extern-permission",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains("calling extern function 'geom.foreign' requires an unsafe { } block"),
+        "qualified direct call must retain its source spelling: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("extern function 'geom.foreign' cannot be used as a function value; call it directly inside unsafe"),
+        "qualified extern FnValue must retain its source spelling: {diagnostics}"
+    );
+    assert!(
+        diagnostics.matches("calling extern function 'geom.foreign' requires an unsafe { } block").count() >= 2,
+        "qualified direct and callback calls must use the same source spelling: {diagnostics}"
+    );
+    let parity = diff_check_multi(
+        "mod-qualified-extern-permission-parity",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert!(parity.whole_errors && parity.per_unit_errors, "both whole and per-unit checking must reject the same extern forms");
+}
+
+#[test]
 fn missing_module_file_is_rejected() {
     let main = "module main\nimport geom\nfn main() -> i32 = 0\n";
     assert!(check_multi_errs("mod-missing", &[("main.align", main)], "main.align"));

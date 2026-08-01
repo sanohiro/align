@@ -4098,7 +4098,7 @@ D8 pkg-layering rule (both are import-edge checks in `load_units`/sema), ③ spe
 §17 (the two rules) + §18.3 (replace the placeholder with this model), `language-spec.md` digest,
 `design-notes.md` rationale. Everything else already works or is deferred above.
 
-### FFI (foreign function interface) — v1 SHIPPED; call-permission correction pending am-u
+### FFI (foreign function interface) — v1 SHIPPED; lexical call permission shipped am-u
 Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
 
 **First slice SHIPPED (2026-07-01):** `extern "C"` bodyless declarations + `unsafe`-gated direct
@@ -4117,11 +4117,13 @@ See the `unsafe`/`raw` Settled entry above for the full record.
 external libraries. That is the C-engine wrapper foundation (own the memory wrappers, borrow the
 engines, pass buffers by pointer+len).
 
-**Call-permission correction pending am-u (2026-07-31):** audit found that higher-order callback
-resolution and extern function-value formation bypass the direct-call `unsafe` gate. The Settled
-target above permits direct and non-escaping pipeline/reducer/sort callback invocation only at a
-lexically `unsafe` expression and rejects extern function values. It is not shipped until am-u
-merges.
+**Call-permission correction SHIPPED (2026-08-01, am-u):** the audit's higher-order callback
+resolution and extern function-value formation bypass is closed. Direct and non-escaping
+pipeline/reducer/sort callback invocation now requires the owning expression to be lexically inside
+`unsafe`; extern declarations cannot become function values. The compiler-only permission never
+enters a function type, interface field, or runtime value. The owner is
+`align_sema::tests::extern_invocation_permission_matrix` plus the direct/qualified whole/per-unit
+driver coverage.
 
 **Measured optimization follow-up (2026-07-14; updated 2026-07-27).** The direct call and view ABI
 are already at the useful floor; retain two measured additions rather than inventing a second FFI
