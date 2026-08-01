@@ -499,7 +499,8 @@ or failed Wait from disappearing while keeping initialized slots readable. The n
 pass found the same distinction missing in join remapping: a TaskProof now survives an unresolved
 Wait only when that predecessor already completed its current generation; otherwise coverage
 clears the proof. The TaskGet discriminator and straight-line/branch/loop owner rows carry the same
-rule. The am-w implementation is intentionally one vertical: splitting group state, proof
+rule. Checkpoint `7247fc6` now contains the first compiling vertical implementation and has passed
+`cargo check -p align_sema --lib` plus the existing 188 sema unit tests. The am-w implementation is intentionally one vertical: splitting group state, proof
 transport, joins, or TaskGet diagnostics would leave an intermediate compiler that can authorize
 an uninitialized task slot or reject a valid outer proof. If the implementation exceeds the
 500-line target, the split-proof exception is justified by this single safety invariant; the
