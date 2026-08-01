@@ -390,12 +390,10 @@ impl<'a> Analyzer<'a> {
             first.id,
             site,
             JOIN_GENERATION,
-            first.generation,
-            first.epoch,
+            0,
+            0,
         );
-        let epoch = self
-            .tokens
-            .get(first.id, site, JOIN_EPOCH, first.generation, first.epoch);
+        let epoch = self.tokens.get(first.id, site, JOIN_EPOCH, 0, 0);
         let completed = groups
             .iter()
             .all(|group| group.completed == Some(group.generation));

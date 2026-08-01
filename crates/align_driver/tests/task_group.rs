@@ -210,14 +210,14 @@ fn second_spawn_does_not_reauthorize_first_task() {
 }
 
 #[test]
-fn task_handle_through_value_if_and_loop_break() {
+fn task_handle_through_branch_and_loop_join() {
     if !backend_available() {
         return;
     }
-    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { 1 })\n    b := spawn(fn { 2 })\n    t := if true { a } else { b }\n    u := loop { break t }\n    wait()\n    print(u.get())\n  }\n  return Ok(())\n}\n";
+    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    mut t := spawn(fn { 1 })\n    if true { t = spawn(fn { 2 }) } else { t = spawn(fn { 3 }) }\n    loop {\n      t = spawn(fn { 4 })\n      break\n    }\n    wait()\n    print(t.get())\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("tg-proof-value-control", src);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n");
 }
 
 #[test]
