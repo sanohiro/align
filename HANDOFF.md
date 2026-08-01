@@ -386,8 +386,11 @@ the follow-up passed focused MIR/sema/Clippy checks. The fresh preflight on that
 valid P1: tuple placement admits deep-owned `array<string>` and `array<Move-struct>` elements while
 the tuple Drop path freed only each outer buffer. The current follow-up routes every owned tuple
 element through the existing recursive pointer-based destructor and adds a codegen owner test plus
-ledger/type-doc coverage. It still needs focused codegen verification, the full pre-PR gate, and a
-fresh review on its new SHA.
+ledger/type-doc coverage. The subsequent full independent preflight reported one P1 claiming that
+`Option/Result<array<T>>` fields were rejected; exact source inspection and the named positive MIR
+fixture show this is a false positive—the direct-only `array<string>` guard does not apply inside
+the payload. The adjudication is recorded in `.git/align-independent-61e482c-pre.log`. It still
+needs the full pre-PR gate and the final post-open review on the resulting SHA.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
 rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
