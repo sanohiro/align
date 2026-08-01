@@ -30,6 +30,8 @@ struct TokenKey {
     group: Span,
     site: Span,
     kind: u8,
+    incoming_generation: Token,
+    incoming_epoch: Token,
 }
 
 #[derive(Default)]
@@ -39,13 +41,27 @@ struct Tokens {
 }
 
 impl Tokens {
-    fn get(&mut self, group: Span, site: Span, kind: u8) -> Token {
-        if let Some(token) = self.values.get(&TokenKey { group, site, kind }) {
+    fn get(
+        &mut self,
+        group: Span,
+        site: Span,
+        kind: u8,
+        incoming_generation: Token,
+        incoming_epoch: Token,
+    ) -> Token {
+        let key = TokenKey {
+            group,
+            site,
+            kind,
+            incoming_generation,
+            incoming_epoch,
+        };
+        if let Some(token) = self.values.get(&key) {
             return *token;
         }
         let token = self.next.saturating_add(1).max(1);
         self.next = token;
-        self.values.insert(TokenKey { group, site, kind }, token);
+        self.values.insert(key, token);
         token
     }
 }
@@ -80,6 +96,7 @@ struct WaitProof {
     group: Span,
     epoch: Token,
     wait: Token,
+    covers_through: Token,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +149,7 @@ struct Analyzer<'a> {
     tagged_types: &'a [TaggedType],
     diags: &'a mut Diagnostics,
     tokens: Tokens,
-    loop_breaks: Vec<Vec<State>>,
+    loop_breaks: Vec<Vec<(State, Option<Proof>)>>,
     reported_gets: HashSet<Span>,
 }
 
@@ -161,8 +178,8 @@ impl<'a> Analyzer<'a> {
     }
 
     fn new_group(&mut self, id: Span) -> Group {
-        let generation = self.tokens.get(id, id, INITIAL_GENERATION);
-        let epoch = self.tokens.get(id, id, INITIAL_EPOCH);
+        let generation = self.tokens.get(id, id, INITIAL_GENERATION, 0, 0);
+        let epoch = self.tokens.get(id, id, INITIAL_EPOCH, 0, 0);
         let mut valid_generations = BTreeSet::new();
         valid_generations.insert(generation);
         Group {
@@ -185,9 +202,25 @@ impl<'a> Analyzer<'a> {
             && group.completed == Some(group.generation)
     }
 
+    fn task_merge_eligible(&self, state: &State, proof: TaskProof) -> bool {
+        let Some(group) = self.group(state, proof.group) else {
+            return false;
+        };
+        group.valid_generations.contains(&proof.generation)
+            && (group.completed == Some(group.generation)
+                || !group.waits.values().any(|wait| {
+                    wait.status == WaitStatus::Pending
+                        && wait.covered_generations.contains(&proof.generation)
+                }))
+    }
+
     fn wait_current(&self, state: &State, proof: WaitProof) -> bool {
         self.group(state, proof.group).is_some_and(|group| {
-            group.epoch == proof.epoch && group.waits.contains_key(&proof.wait)
+            group.epoch == proof.epoch
+                && group
+                    .waits
+                    .get(&proof.wait)
+                    .is_some_and(|record| record.covers_through == proof.covers_through)
         })
     }
 
@@ -199,8 +232,20 @@ impl<'a> Analyzer<'a> {
                 .values()
                 .any(|wait| wait.status == WaitStatus::Pending)
         });
-        let generation = self.tokens.get(id, site, SPAWN_GENERATION);
-        let epoch = self.tokens.get(id, site, SPAWN_EPOCH);
+        let (incoming_generation, incoming_epoch) = self
+            .group(state, id)
+            .map(|group| (group.generation, group.epoch))
+            .unwrap_or((0, 0));
+        let generation = self.tokens.get(
+            id,
+            site,
+            SPAWN_GENERATION,
+            incoming_generation,
+            incoming_epoch,
+        );
+        let epoch = self
+            .tokens
+            .get(id, site, SPAWN_EPOCH, incoming_generation, incoming_epoch);
         let group = self.group_mut(state, id)?;
         if pending {
             group.valid_generations.clear();
@@ -231,7 +276,7 @@ impl<'a> Analyzer<'a> {
             self.group_mut(state, id)?.completed = Some(generation);
             return None;
         }
-        let wait = self.tokens.get(id, site, WAIT_TOKEN);
+        let wait = self.tokens.get(id, site, WAIT_TOKEN, generation, epoch);
         if let Some(group) = self.group_mut(state, id) {
             if !group.waits.contains_key(&wait) {
                 group.wait_order.push(wait);
@@ -249,6 +294,7 @@ impl<'a> Analyzer<'a> {
             group: id,
             epoch,
             wait,
+            covers_through: generation,
         }))
     }
 
@@ -262,6 +308,9 @@ impl<'a> Analyzer<'a> {
         let Some(record) = group.waits.get_mut(&proof.wait) else {
             return;
         };
+        if record.covers_through != proof.covers_through {
+            return;
+        }
         record.status = WaitStatus::Ok;
         let mut completed = group.completed;
         for wait in group.wait_order.iter().copied() {
@@ -289,10 +338,19 @@ impl<'a> Analyzer<'a> {
         let Some(record) = snapshot.waits.get(&proof.wait) else {
             return;
         };
+        if record.covers_through != proof.covers_through {
+            return;
+        }
         if record.status == WaitStatus::Ok {
             return;
         }
-        let epoch = self.tokens.get(proof.group, site, ERR_EPOCH);
+        let epoch = self.tokens.get(
+            proof.group,
+            site,
+            ERR_EPOCH,
+            snapshot.generation,
+            proof.epoch,
+        );
         let Some(group) = self.group_mut(state, proof.group) else {
             return;
         };
@@ -307,8 +365,8 @@ impl<'a> Analyzer<'a> {
 
     fn join_group(&mut self, site: Span, groups: &[Group]) -> (Group, bool) {
         let Some(first) = groups.first() else {
-            let generation = self.tokens.get(site, site, JOIN_GENERATION);
-            let epoch = self.tokens.get(site, site, JOIN_EPOCH);
+            let generation = self.tokens.get(site, site, JOIN_GENERATION, 0, 0);
+            let epoch = self.tokens.get(site, site, JOIN_EPOCH, 0, 0);
             let mut valid_generations = BTreeSet::new();
             valid_generations.insert(generation);
             return (
@@ -328,8 +386,16 @@ impl<'a> Analyzer<'a> {
         if groups.iter().all(|group| group == first) {
             return (first.clone(), false);
         }
-        let generation = self.tokens.get(first.id, site, JOIN_GENERATION);
-        let epoch = self.tokens.get(first.id, site, JOIN_EPOCH);
+        let generation = self.tokens.get(
+            first.id,
+            site,
+            JOIN_GENERATION,
+            first.generation,
+            first.epoch,
+        );
+        let epoch = self
+            .tokens
+            .get(first.id, site, JOIN_EPOCH, first.generation, first.epoch);
         let completed = groups
             .iter()
             .all(|group| group.completed == Some(group.generation));
@@ -398,7 +464,7 @@ impl<'a> Analyzer<'a> {
                 || !states
                     .iter()
                     .zip(&proofs)
-                    .all(|(state, candidate)| self.task_ready(state, *candidate))
+                    .all(|(state, candidate)| self.task_merge_eligible(state, *candidate))
             {
                 continue;
             }
@@ -458,7 +524,7 @@ impl<'a> Analyzer<'a> {
                     && live
                         .iter()
                         .zip(&proofs)
-                        .all(|((state, _), candidate)| self.task_ready(state, *candidate));
+                        .all(|((state, _), candidate)| self.task_merge_eligible(state, *candidate));
                 if eligible {
                     let Some(group) = merged.groups.iter().find(|group| group.id == proof.group)
                     else {
@@ -586,15 +652,17 @@ impl<'a> Analyzer<'a> {
             }
             Stmt::Break { value, accepted } => {
                 let mut next = state;
+                let mut proof = None;
                 if let Some(value) = value {
                     let flow = self.expr(value, next, report);
                     let Some(after) = flow.state else {
                         return Flow::dead();
                     };
                     next = after;
+                    proof = flow.proof;
                 }
                 if let (true, Some(breaks)) = (*accepted, self.loop_breaks.last_mut()) {
-                    breaks.push(next);
+                    breaks.push((next, proof));
                 }
                 Flow::dead()
             }
@@ -675,6 +743,10 @@ impl<'a> Analyzer<'a> {
                 let mut nested = state;
                 nested.groups.push(self.new_group(expr.span));
                 let flow = self.block(block, nested, report);
+                let proof = flow.proof.filter(|proof| match proof {
+                    Proof::Wait(wait) => wait.group != expr.span,
+                    Proof::Task(task) => task.group != expr.span,
+                });
                 flow.map_state(|mut state| {
                     state.waits.retain(|_, proof| proof.group != expr.span);
                     state.tasks.retain(|_, proof| proof.group != expr.span);
@@ -685,6 +757,7 @@ impl<'a> Analyzer<'a> {
                     }
                     state
                 })
+                .map_proof(proof)
             }
             ExprKind::Binary {
                 op: BinOp::And | BinOp::Or,
@@ -735,7 +808,7 @@ impl<'a> Analyzer<'a> {
             self.resolve_ok(&mut success, proof);
             self.resolve_err(&mut failure, proof, site);
         }
-        let fallback_flow = self.expr(fallback, failure, report).clear_proof();
+        let fallback_flow = self.expr(fallback, failure, report);
         self.merge_flows(site, vec![Flow::live(success, None), fallback_flow])
     }
 
@@ -752,8 +825,8 @@ impl<'a> Analyzer<'a> {
         let Some(state) = condition.state else {
             return Flow::dead();
         };
-        let then_flow = self.block(then, state.clone(), report).clear_proof();
-        let else_flow = self.block(els, state, report).clear_proof();
+        let then_flow = self.block(then, state.clone(), report);
+        let else_flow = self.block(els, state, report);
         self.merge_flows(site, vec![then_flow, else_flow])
     }
 
@@ -801,7 +874,7 @@ impl<'a> Analyzer<'a> {
                     self.resolve_err(&mut arm_state, proof, site);
                 }
             }
-            flows.push(self.expr(&arm.body, arm_state, report).clear_proof());
+            flows.push(self.expr(&arm.body, arm_state, report));
         }
         if flows.is_empty() {
             Flow::live(base, None)
@@ -839,14 +912,14 @@ impl<'a> Analyzer<'a> {
         if diverges || breaks.is_empty() {
             return Flow::dead();
         }
-        for state in &mut breaks {
-            clear_locals(state, body_locals);
-        }
-        Flow::live(
-            self.merge_states(site, &breaks)
-                .unwrap_or_else(|| entry.clone()),
-            None,
-        )
+        let break_flows = breaks
+            .drain(..)
+            .map(|(mut state, proof)| {
+                clear_locals(&mut state, body_locals);
+                Flow::live(state, proof)
+            })
+            .collect();
+        self.merge_flows(site, break_flows)
     }
 
     fn run_loop_body(
@@ -854,7 +927,7 @@ impl<'a> Analyzer<'a> {
         body: &Block,
         state: State,
         report: bool,
-    ) -> (Option<State>, Vec<State>) {
+    ) -> (Option<State>, Vec<(State, Option<Proof>)>) {
         self.loop_breaks.push(Vec::new());
         let flow = self.block(body, state, report);
         let breaks = self.loop_breaks.pop().unwrap_or_default();
