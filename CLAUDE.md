@@ -339,6 +339,14 @@ formatting churn, or elapsed agent activity.
   `every`/`exact` acceptance phrase and every named build path into an explicit
   owner-test closure checklist. Enumerate the Cartesian cells and mutate malformed
   records one field at a time; representative samples do not close an exact contract.
+- Before coding a control-flow/type-inference slice, cross discriminator reachability,
+  alternative completion kind, expected-type availability, source-order permutations,
+  and clean versus already-invalid subtrees in the owner matrix. Distinguish runtime joins
+  from structural type reconciliation: only fallthrough alternatives contribute to a join;
+  discriminator-unreachable alternatives receive no enclosing expectation but remain
+  structurally checked; reachable eager-diverging typed wrappers receive any required late
+  reconciliation without contributing a runtime value. Preserve the same diagnostic guard
+  for immediate and delayed constraints.
 - Keep the existing two-hour PR-ready limit. If the checkpoint cannot be made
   mergeable by then, reduce it to the next smaller correct vertical slice and
   record the reason in `HANDOFF.md`.

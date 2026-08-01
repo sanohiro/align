@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #682. The current branch
-completes L2b-a2-am-f return completeness; am-w task-wait dominance is next.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #683. L2b-a2-am-f
+return completeness is complete; am-w task-wait dominance is next.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -273,6 +273,34 @@ completed cleanly but put its verdict marker inline; its preserved result was no
 instead of rerunning the full review. No extra rule is needed for that formatting-only
 tool failure because the existing bounded-review continuation rule already applies.
 
+### PR #683 delivery retrospective
+
+PR #683 was squash-merged as `c304512`. The predecessor-merge-to-merge proxy was
+3h48m14s; the public PR was open for 53m30s. The independently mergeable am-f vertical
+changed 12 files by +884/-89 and closed source completion, HIR publication, MIR/LLVM
+termination, whole/per-unit code generation, execution, and object-cache parity together.
+It stayed below the 1,000-line split-proof threshold.
+
+The avoidable delay was an incomplete control-flow/type-inference Cartesian matrix. The
+initial implementation treated completion mainly as a body-tail property, while the exact
+contract also depended on whether a discriminator falls through, whether each alternative
+produces a value or completes directly, whether its expected type is already known or inferred
+later, arm source order, and whether a subtree already emitted an error. The broad owner gate
+first exposed an eager-termination compatibility gap; post-open review then found unreachable
+alternatives receiving an outer expectation and mixed branches typing differently by source
+order. The coherent fix delayed only the necessary branch reconciliation, and the focused
+closure found and removed one resulting diagnostic cascade on malformed children.
+
+The durable rule is now in `CLAUDE.md`: before coding a control-flow/type-inference slice,
+cross reachability, completion kind, expected-type availability, source-order permutations,
+and subtree validity in the owner matrix. Runtime joins use only fallthrough alternatives;
+discriminator-unreachable alternatives are structurally checked without an enclosing expectation;
+reachable eager-diverging typed wrappers receive required late reconciliation without contributing
+a runtime value. Delayed constraints retain the same diagnostic guard as immediate ones.
+Required verification was slow but progressing: the final locked all-target Clippy took
+11m56s, and several test binaries had their known long startup delay. Those timings do not
+justify weakening the gate.
+
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
 direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
@@ -420,7 +448,7 @@ completed in #678. PR #679 completes am-d with exact producer-valid depth owners
 stack-safe checked-HIR/type-DAG consumers. PR #681 completes am-e by restricting
 the entry producer to Unit, signed i32, or exact `Result<(), Error>`, preserving exact whole/per-unit
 and ThinLTO C entry behavior, and rejecting malformed MIR entry ABI before LLVM construction.
-The current branch completes am-f by rejecting bare non-Unit returns and reachable fallthrough
+PR #683 completes am-f by rejecting bare non-Unit returns and reachable fallthrough
 before HIR publication/MIR lowering while preserving typed and proven non-fallthrough paths. Its
 focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/optimized IR,
 execution, and cold/hot object-cache parity. The remaining reviewed order is am-w
@@ -620,7 +648,7 @@ SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
 L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, a2-am-e, and a2-am-f. #679 completes
-am-d, #681 completes am-e, and the current branch completes am-f; the remaining sequence is a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
