@@ -382,14 +382,19 @@ found one valid P1: `inline_structs_unaligned` did not traverse enum payloads, s
 `align(N)` struct embedded in an enum could pass placement although enum storage is inline and the
 LLVM type cannot carry the custom member alignment. The current follow-up adds enum/DAG traversal,
 checks direct enum payloads, adds graph-valid enum-field/payload negatives, and updates the ledger;
-it still needs focused verification, the full pre-PR gate, and a fresh review on its new SHA.
+the follow-up passed focused MIR/sema/Clippy checks. The fresh preflight on that SHA then found one
+valid P1: tuple placement admits deep-owned `array<string>` and `array<Move-struct>` elements while
+the tuple Drop path freed only each outer buffer. The current follow-up routes every owned tuple
+element through the existing recursive pointer-based destructor and adds a codegen owner test plus
+ledger/type-doc coverage. It still needs focused codegen verification, the full pre-PR gate, and a
+fresh review on its new SHA.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
 rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
 after am-p is merged.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
-1,155 changed lines against `main`). It cannot be split safely: validator activation, the producer
+1,212 changed lines against `main`). It cannot be split safely: validator activation, the producer
 contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.

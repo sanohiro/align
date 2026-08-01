@@ -7423,27 +7423,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // inspected, and that payload uses the same destructor as a standalone value.
                         self.drop_ty_at(self.slots[slot], ty)?;
                     } else if let Ty::Tuple(tid) = ty {
-                        // A Move tuple: free each owned element's buffer pointer (null-safe — a
-                        // moved-out tuple was zeroed, and Copy elements are skipped).
+                        // A Move tuple: recursively drop each owned element through its in-memory
+                        // field pointer. This matters for deep `array<string>` and
+                        // `array<Move-struct>` elements: freeing only the outer `{ptr,len}` buffer
+                        // would leak each element's owned storage. A moved-out field is zeroed, so
+                        // the same pointer-based destructor remains null-safe.
                         let aty = self.tuple_types[tid as usize];
-                        let agg = self
-                            .builder
-                            .build_load(aty, self.slots[slot], "droptup")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
                         for (i, s) in self.tuples[tid as usize].elems.iter().enumerate() {
                             if !s.is_move() {
                                 continue;
                             }
-                            let elem = self
+                            let elem_ptr = self
                                 .builder
-                                .build_extract_value(agg, i as u32, "droptupel")
-                                .map_err(|e| self.err(e))?
-                                .into_struct_value();
-                            let ptr = self.builder.build_extract_value(elem, 0, "droptupptr").map_err(|e| self.err(e))?;
-                            self.builder
-                                .build_call(self.funcs["free"], &[ptr.into()], "")
+                                .build_struct_gep(aty, self.slots[slot], i as u32, "droptupel")
                                 .map_err(|e| self.err(e))?;
+                            self.drop_ty_at(elem_ptr, scalar_to_ty(*s))?;
                         }
                     } else if let Ty::Struct(sid) = ty {
                         // A Move struct: recursively free each owned field's buffer, in declared order,
@@ -14154,6 +14148,47 @@ mod tests {
         assert!(
             ir.contains("dropoptissome"),
             "Ty::Tagged Drop must dispatch through the expanded Option plan:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn tuple_drop_uses_recursive_element_destructor() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                ret: i32_ty,
+                slots: vec![Ty::Tuple(0)],
+                slot_align: vec![None],
+                value_tys: vec![],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                    stmt_lines: vec![(0, 0); 2],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![TupleDef {
+                elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
+            }],
+        };
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect("a tuple with an owned string array must lower");
+        assert!(
+            ir.contains("call void @align_rt_free_string_array"),
+            "tuple Drop must use the deep string-array destructor:\n{ir}"
         );
     }
 
