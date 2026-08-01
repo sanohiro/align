@@ -389,7 +389,7 @@ rather than restarting the broad gate. The next implementation slice remains am-
 after am-p is merged.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
-1,143 changed lines against `main`). It cannot be split safely: validator activation, the producer
+1,155 changed lines against `main`). It cannot be split safely: validator activation, the producer
 contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.
