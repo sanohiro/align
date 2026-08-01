@@ -5,9 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #686; the current final
-implementation PR carries the am-u lexical extern invocation correction. After that merge, the
-next slice is am-p placement validation.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #688; PR #688 merged the
+am-u lexical extern invocation correction. The next resumable slice is am-p placement validation.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -103,7 +102,7 @@ facts must live in this repository.
 #675  eager MIR continuation closure
 #685  path-complete task-wait dominance
 #686  native output-buffer local/mutability validation
-current PR  lexical extern invocation permission and non-escaping extern-call closure (am-u)
+#688  lexical extern invocation permission and non-escaping extern-call closure (am-u)
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -329,7 +328,7 @@ create fresh identities for the same loop or branch join. Finally, every owner f
 be legal under the language's own Move/arena rules before it can test compiler-only proof
 transport.
 
-### Current am-u delivery retrospective
+### PR #688 delivery retrospective
 
 The am-u implementation interval exceeded the two-hour checkpoint target because the callback and
 lambda lexical-depth matrix had to be expanded after independent review, while macOS test startup
@@ -493,7 +492,7 @@ before HIR publication/MIR lowering while preserving typed and proven non-fallth
 focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/optimized IR,
 execution, and cold/hot object-cache parity. The reviewed order is am-w
 outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
-am-u lexical extern invocation (current PR), then am-p placement, am-n nominal/link, am-h
+#688 completes am-u lexical extern invocation, then am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
@@ -704,7 +703,7 @@ return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; after the current am-u PR, am-p is the next implementation slice. The required milestone order
+#678; after #688, am-p is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
