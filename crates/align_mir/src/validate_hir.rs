@@ -85,7 +85,7 @@ impl<'a> PlacementValidator<'a> {
                     } else {
                         self.concrete_enum_payload_ok(payload)
                     };
-                    if !valid {
+                    if !valid || !self.inline_structs_unaligned(align_sema::scalar_to_ty(payload)) {
                         return false;
                     }
                 }
@@ -559,10 +559,13 @@ impl<'a> PlacementValidator<'a> {
         enum Work {
             Enter(Ty),
             ExitTagged(u32),
+            ExitEnum(u32),
         }
         let mut work = vec![Work::Enter(ty)];
         let mut active_tagged = HashSet::new();
         let mut completed_tagged = HashSet::new();
+        let mut active_enums = HashSet::new();
+        let mut completed_enums = HashSet::new();
         while let Some(item) = work.pop() {
             match item {
                 Work::ExitTagged(id) => {
@@ -570,6 +573,12 @@ impl<'a> PlacementValidator<'a> {
                         return false;
                     }
                     completed_tagged.insert(id);
+                }
+                Work::ExitEnum(id) => {
+                    if !active_enums.remove(&id) {
+                        return false;
+                    }
+                    completed_enums.insert(id);
                 }
                 Work::Enter(ty) => match ty {
                     Ty::Struct(id) => {
@@ -588,6 +597,23 @@ impl<'a> PlacementValidator<'a> {
                     Ty::Result(ok, err) => {
                         work.push(Work::Enter(align_sema::scalar_to_ty(err)));
                         work.push(Work::Enter(align_sema::scalar_to_ty(ok)));
+                    }
+                    Ty::Enum(id) => {
+                        if completed_enums.contains(&id) {
+                            continue;
+                        }
+                        if !active_enums.insert(id) {
+                            return false;
+                        }
+                        let Some(definition) = self.program.enums.get(id as usize) else {
+                            return false;
+                        };
+                        work.push(Work::ExitEnum(id));
+                        for variant in &definition.variants {
+                            for &payload in &variant.payload {
+                                work.push(Work::Enter(align_sema::scalar_to_ty(payload)));
+                            }
+                        }
                     }
                     Ty::Tagged(id) => {
                         if completed_tagged.contains(&id) {

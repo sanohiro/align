@@ -2379,6 +2379,41 @@ fn malformed_hir_type_placement_fails_closed() {
     field_soa_array.structs[0].fields[0].ty = Ty::DynStructArray(0, Layout::Soa);
     assert_placement_rejected("future SoA dynamic struct field", &field_soa_array);
 
+    let mut enum_aligned_field = baseline_program();
+    enum_aligned_field.structs.push(StructDef {
+        name: "AlignedPayload".to_string(),
+        source_name: "AlignedPayload".to_string(),
+        fields: vec![FieldDef {
+            name: "value".to_string(),
+            ty: int(64),
+        }],
+        align: Some(32),
+        c_repr: false,
+    });
+    enum_aligned_field.enums[0].variants[1].payload = vec![Scalar::Struct(1)];
+    enum_aligned_field.structs[0].fields[0].ty = Ty::Enum(0);
+    assert_placement_rejected(
+        "over-aligned struct nested in an enum field",
+        &enum_aligned_field,
+    );
+
+    let mut enum_aligned_payload = baseline_program();
+    enum_aligned_payload.structs.push(StructDef {
+        name: "AlignedPayload".to_string(),
+        source_name: "AlignedPayload".to_string(),
+        fields: vec![FieldDef {
+            name: "value".to_string(),
+            ty: int(64),
+        }],
+        align: Some(32),
+        c_repr: false,
+    });
+    enum_aligned_payload.enums[0].variants[1].payload = vec![Scalar::Struct(1)];
+    assert_placement_rejected(
+        "over-aligned struct in an enum payload",
+        &enum_aligned_payload,
+    );
+
     let mut c_field = baseline_program();
     c_field.structs[0].c_repr = true;
     c_field.structs[0].fields[0].ty = Ty::Bool;
