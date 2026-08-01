@@ -505,6 +505,8 @@ transport, joins, or TaskGet diagnostics would leave an intermediate compiler th
 an uninitialized task slot or reject a valid outer proof. If the implementation exceeds the
 500-line target, the split-proof exception is justified by this single safety invariant; the
 formation, control, ownership, and whole/per-unit rows must land together. Am-v requires a
+The driver owner suite and `scripts/test-pr.sh` remain blocked locally until LLVM 22 is installed;
+the observed failure is `llvm-config-22: No such file or directory`, not a Rust test failure.
 bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
 those five producer paths currently accept equal-typed temporaries and immutable buffers even
 though the runtime writes through them. Am-u rejects extern declarations as first-class function
