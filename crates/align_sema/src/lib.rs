@@ -595,9 +595,10 @@ pub enum Ty {
     JsonScanner(u32),
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
-    /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
-    /// are primitive scalars (Copy, `Static`) — a tuple is Copy and never dropped/region-tied
-    /// yet; owned/`str` elements are a later, additive slice.
+    /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. Elements are
+    /// primitive scalars, `str` views, or owned `string`/`array<T>` values. A tuple is Copy unless
+    /// one element is Move; Move tuples use recursive Drop and are restricted to temporary,
+    /// returned, or destructured positions in the current surface.
     Tuple(u32),
     /// A first-class function value type (`fn(params) -> ret`), indexed into `Program.fn_types`.
     /// A function pointer — Copy, `Static`, no environment (non-capturing functions, slice ①).
