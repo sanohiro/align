@@ -830,8 +830,9 @@ fn build_module<'c>(
         );
     }
 
-    // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements are primitive
-    // scalars (PR1), so the struct-type table is not consulted here.
+    // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements use the scalar
+    // forms admitted by sema: primitive scalars, `str`, owned `string`/arrays, and dynamic struct
+    // arrays. `scalar_type` receives the nominal tables because struct-array elements need them.
     let tuple_types: Vec<StructType<'c>> = program
         .tuples
         .iter()
@@ -14189,6 +14190,56 @@ mod tests {
         assert!(
             ir.contains("call void @align_rt_free_string_array"),
             "tuple Drop must use the deep string-array destructor:\n{ir}"
+        );
+
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                param_modes: vec![],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                ret: i32_ty,
+                slots: vec![Ty::Tuple(0)],
+                slot_align: vec![None],
+                value_tys: vec![],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                    stmt_lines: vec![(0, 0); 2],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![StructDef {
+                name: "MoveElem".to_string(),
+                source_name: "MoveElem".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "text".to_string(),
+                    ty: Ty::String,
+                }],
+                align: None,
+                c_repr: false,
+            }],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![TupleDef {
+                elems: vec![Scalar::DynStructArray(0)],
+            }],
+        };
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect("a tuple with an owned Move-struct array must lower");
+        assert!(
+            ir.contains("dropdeep.head") && ir.contains("dropdeep.ep"),
+            "tuple Drop must iterate and recursively drop array<Move-struct> elements:\n{ir}"
+        );
+        assert!(
+            ir.matches("call void @align_rt_free").count() >= 2,
+            "tuple Drop must free both each owned element field and the outer array buffer:\n{ir}"
         );
     }
 

@@ -392,7 +392,13 @@ fixture show this is a false positive—the direct-only `array<string>` guard do
 the payload. The adjudication is recorded in `.git/align-independent-61e482c-pre.log`. The final
 pre-PR gate passed on `71951e1`; its host-native post-open review reached the 900-second bound
 after inspecting the validator, tuple Drop, and sema through `resolve_type`/`box`, so the transcript
-is preserved and the remaining sema contract slice is being continued narrowly.
+is preserved. The narrow continuation fixed stale tuple-contract comments in `hir.rs` and the
+LLVM tuple-layout setup, then a fresh independent preflight on `4664039` found two P2 closure gaps:
+the `array<Move-struct>` tuple Drop path lacked a dedicated owner assertion, and those comments
+still described primitive-only tuples. The follow-up adds both comments and a codegen test that
+asserts element iteration plus both recursive element and outer-buffer frees; the focused owner
+test passes. The current tree still needs a fresh pre-PR gate and post-open reviews bound to its
+new SHA.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
 rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only

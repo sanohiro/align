@@ -185,9 +185,9 @@ pub struct MatchArm {
 
 #[derive(Clone, Debug)]
 pub struct TupleDef {
-    /// Element types in positional order (`t.0`, `t.1`, …). PR1 cut: primitive scalars only
-    /// (int/float/bool/char) — all Copy / `Static`, so a tuple needs no drop or region tracking
-    /// yet; owned (`string`/`array<T>`) and `str` elements are a later, additive slice.
+    /// Element types in positional order (`t.0`, `t.1`, …). The supported forms are primitive
+    /// scalars, `str`, owned `string`/`array<T>`, and owned dynamic struct arrays. A tuple with a
+    /// Move element is temporary-only and its Drop dispatches recursively through that element.
     pub elems: Vec<crate::Scalar>,
 }
 
