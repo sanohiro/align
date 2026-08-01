@@ -357,7 +357,7 @@ impl<'a> Analyzer<'a> {
         }
         let mut merged = first.clone();
         let mut changed = vec![false; first.groups.len()];
-        for index in 0..first.groups.len() {
+        for (index, changed_entry) in changed.iter_mut().enumerate() {
             let groups: Vec<Group> = states
                 .iter()
                 .filter_map(|state| state.groups.get(index).cloned())
@@ -367,12 +367,12 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .any(|group| group.id != first.groups[index].id)
             {
-                changed[index] = true;
+                *changed_entry = true;
                 continue;
             }
             let (group, differs) = self.join_group(site, &groups);
             merged.groups[index] = group;
-            changed[index] = differs;
+            *changed_entry = differs;
         }
 
         merged.waits.clear();
@@ -593,10 +593,8 @@ impl<'a> Analyzer<'a> {
                     };
                     next = after;
                 }
-                if *accepted {
-                    if let Some(breaks) = self.loop_breaks.last_mut() {
-                        breaks.push(next);
-                    }
+                if let (true, Some(breaks)) = (*accepted, self.loop_breaks.last_mut()) {
+                    breaks.push(next);
                 }
                 Flow::dead()
             }
