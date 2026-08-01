@@ -3728,13 +3728,14 @@ pub fn check_program_with_interface_facts(
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, tcx!(module, imports_by_module.get(*module).unwrap_or(&no_imports)), &[], diags);
-            // A field is a primitive scalar (int/float/bool/char), `str`, or a nested struct (the
-            // nested-struct shape is checked structurally here; that it is scalar-only + acyclic is
-            // validated in pass 0b-2, once all struct fields are populated). Slice/option/box/Move
-            // fields are still rejected.
+            // A field may be a primitive scalar, `str`, an owned value, a nested inline type, a
+            // view/handle, an option/result payload, or an owned array. Nested inline structure is
+            // checked structurally here; its acyclicity and alignment are validated in pass 0b-2,
+            // once all struct fields are populated. The field-specific array restrictions are
+            // applied below after the complete struct table exists.
             if !is_field_ok(ty, &tagged_types) {
                 diags.error(
-                    format!("struct fields must be a primitive scalar, str, or a plain struct for now, got {}", ty_name(ty)),
+                    format!("struct field type is not supported here, got {}", ty_name(ty)),
                     f.span,
                 );
             }
@@ -3770,12 +3771,11 @@ pub fn check_program_with_interface_facts(
         for (fi, f) in s.fields.iter().enumerate() {
             let fty = structs[i].fields[fi].ty;
             // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
-            // struct's `Drop` (`drop_struct_fields`). Its **element** must be non-owned in v1 so that
-            // buffer is a single flat free: a scalar / `str` view / plain-data (non-Move) struct.
-            // `array<string>` needs a per-element deep free (a later slice), so reject it here — it
-            // needs no enum table. `array<Move-struct>` is rejected **after** pass 0c (the element may be
-            // Move only because of a not-yet-resolved enum field — `Chat { messages: array<Message> }`
-            // where `Message` owns a Move-enum field, J3), where `struct_is_move` is enum-accurate.
+            // struct's `Drop` (`drop_struct_fields`). Plain scalar, `str`-view, and Move-struct
+            // elements are supported; the recursive array Drop path handles owned struct fields.
+            // Bare `array<string>` still needs a per-element deep free in this declaration path,
+            // so reject it here. `array<Move-struct>` is checked after pass 0c, where
+            // `struct_is_move` is enum-accurate.
             if let Ty::DynArray(Scalar::String) = fty {
                 diags.error(
                     "an `array<string>` field is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
@@ -33822,15 +33822,14 @@ fn http_headers_placement_error(what: &str) -> String {
     )
 }
 
-/// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
-/// `string`, or a nested struct.
+/// Whether a resolved type has a field representation. Detailed restrictions for inline layout,
+/// direct `array<string>`, and recursive ownership are applied after all definitions exist.
 fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, a **nested struct**
-    // (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass), or an
-    // **`Option<T>`** whose payload is itself a valid field type (scalar / `str` / `string` / nested
-    // struct). An owned (`string`, Move-struct, or `Option<owned>`) field makes the enclosing struct a
-    // Move type with a recursive `Drop` (Slice 3 / the REST-gateway runway Slice B). Owned
-    // *collections* (`array<T>` etc.) as fields are a later slice.
+    // A struct field is a primitive scalar, `str` (a borrow), an owned value, an inline struct or
+    // enum, a view/handle, an **`Option<T>`/`Result<T, E>`** whose payload is itself a valid field
+    // shape, or an owned array. An owned (`string`, Move-struct, handle, option payload, or array)
+    // field makes the enclosing struct a Move type with a recursive `Drop`; the complete inline
+    // graph and the direct `array<string>` exception are checked by later passes.
     let mut work = vec![ty];
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
@@ -33871,8 +33870,8 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
         Ty::Fn(_) => {}
-        // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
-        // rejected until array-in-Option lands, matching the direct-field rule).
+        // The payload is a `Scalar`; converting it back to `Ty` lets the same field-shape walker
+        // admit producer-valid nested forms such as `Option<array<T>>`.
         Ty::Option(s) => work.push(scalar_to_ty(s)),
         Ty::Result(ok, err) => {
             work.push(scalar_to_ty(err));
@@ -33894,9 +33893,9 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         }
         Ty::Tagged(_) => return false,
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
-        // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
-        // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
-        // (pass 0b-2), where the struct table is populated; here we admit the array shape.
+        // `choices: array<Choice>` shape. The complete struct table and the direct
+        // `array<string>` exception are enforced at declaration (pass 0b-2); here we admit the
+        // array shape, including the recursively droppable `array<Move-struct>` form.
         Ty::DynArray(_) | Ty::DynStructArray(..) => {}
         _ => return false,
         }
