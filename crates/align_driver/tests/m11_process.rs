@@ -22,10 +22,9 @@ fn exit_sets_the_process_exit_code() {
     if !backend_available() {
         return;
     }
-    // `process.exit(3)` is a statement; the trailing `0` is dead (never runs) but makes `main`'s
-    // return type `i32` (there is no `Never` type yet, so `exit` is typed `()` and cannot be the
-    // tail value of a non-unit fn).
-    let src = "import std.process\npub fn main() -> i32 {\n  process.exit(3)\n  0\n}\n";
+    // `exit` remains Unit-typed, but its direct completion expression completes this non-Unit body
+    // without a synthetic dead tail.
+    let src = "import std.process\npub fn main() -> i32 {\n  process.exit(3)\n}\n";
     let out = build_and_run("proc-exit-code", src);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.stdout.is_empty(), "no output expected");
@@ -40,7 +39,7 @@ fn exit_flushes_pending_buffered_writer_output() {
     if !backend_available() {
         return;
     }
-    let src = "import std.io\nimport std.process\npub fn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"flushed on exit\\n\")?\n  process.exit(0)\n  Ok(())\n}\n";
+    let src = "import std.io\nimport std.process\npub fn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"flushed on exit\\n\")?\n  process.exit(0)\n}\n";
     let out = build_and_run("proc-exit-flush", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
@@ -57,7 +56,7 @@ fn abort_skips_cleanup_and_loses_buffered_output() {
     if !backend_available() {
         return;
     }
-    let src = "import std.io\nimport std.process\npub fn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"NOT flushed\\n\")?\n  process.abort()\n  Ok(())\n}\n";
+    let src = "import std.io\nimport std.process\npub fn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"NOT flushed\\n\")?\n  process.abort()\n}\n";
     let out = build_and_run("proc-abort-noflush", src);
     assert_eq!(out.status.code(), Some(1), "abort exits non-zero via _exit(1)");
     assert!(
@@ -78,7 +77,7 @@ fn exit_inside_arena_runs_the_pending_arena_end() {
     // Exit from INSIDE the arena block: the pending arena end must be emitted by the exit
     // cleanup itself — the block's normal close is never reached (the exit terminates it).
     // Prints 42, then exits 0.
-    let src = "import std.process\npub fn main() -> i32 {\n  arena {\n    b := heap.new(42)\n    print(b.get())\n    process.exit(0)\n  }\n  0\n}\n";
+    let src = "import std.process\npub fn main() -> i32 {\n  arena {\n    b := heap.new(42)\n    print(b.get())\n    process.exit(0)\n  }\n}\n";
     let out = build_and_run("proc-exit-arena", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
@@ -91,7 +90,7 @@ fn exit_code_is_truncated_to_the_low_byte() {
     if !backend_available() {
         return;
     }
-    let src = "import std.process\npub fn main() -> i32 {\n  process.exit(256)\n  0\n}\n";
+    let src = "import std.process\npub fn main() -> i32 {\n  process.exit(256)\n}\n";
     let out = build_and_run("proc-exit-trunc", src);
     assert_eq!(out.status.code(), Some(0), "256 & 0xff == 0");
 }
@@ -135,16 +134,16 @@ fn missing_import_diagnostic_names_the_capability() {
 /// a `par_map` closure that calls one is rejected by the Pure requirement.
 #[test]
 fn exit_in_par_map_is_rejected() {
-    // `kill` calls `process.exit` → impure → `par_map(kill)` rejected. (The trailing `x` gives the
-    // impure helper its `i64` return.)
-    let src = "import std.process\nfn kill(x: i64) -> i64 {\n  process.exit(x)\n  x\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(kill)\n  print(ys.sum())\n  return Ok(())\n}\n";
+    // `kill` calls `process.exit` → impure → `par_map(kill)` rejected. Its non-Unit body needs no
+    // synthetic tail because the process operation is non-fallthrough.
+    let src = "import std.process\nfn kill(x: i64) -> i64 {\n  process.exit(x)\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(kill)\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("proc-exit-parmap", src));
 }
 
 /// Likewise `process.abort()` inside a `par_map` closure is rejected (impure).
 #[test]
 fn abort_in_par_map_is_rejected() {
-    let src = "import std.process\nfn boom(x: i64) -> i64 {\n  process.abort()\n  x\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(boom)\n  print(ys.sum())\n  return Ok(())\n}\n";
+    let src = "import std.process\nfn boom(x: i64) -> i64 {\n  process.abort()\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(boom)\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("proc-abort-parmap", src));
 }
 

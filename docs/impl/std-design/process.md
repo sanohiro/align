@@ -85,12 +85,13 @@ should `kill()` first (or use a future explicit `detach()` API — recorded, not
   its flush would hook.
 - **Exit-code truncation.** `i64 -> i32`, observed as the low 8 bits on a Unix `wait`
   (`WEXITSTATUS`): `exit(256)` → `0`, `exit(-1)` → `255`. Documented, matches `exit(3)`.
-- **Divergence typing (v1 limitation).** There is no `Never` type, so `exit`/`abort` are typed `()`.
-  They diverge in MIR (cleanup + call + `Unreachable`), and code after them is dead — not emitted
-  (`lower_block` stops at `is_terminated`), parity with code-after-`return`, no ICE. But because the
-  type system does not model the divergence, `process.exit` cannot be the **tail value** of a
-  non-unit-returning function — use it as a statement (e.g. `process.exit(3)` then a trailing `0`).
-  A proper diverging/`Never` type is the ideal, deferred.
+- **Divergence typing (v1 limitation).** There is no `Never` type, so `exit`/`abort` retain a `()`
+  surface result. They diverge in checked control flow and MIR (cleanup + call + `Unreachable`), and code
+  after them is dead — not emitted (`lower_block` stops at `is_terminated`), parity with
+  code-after-`return`, no ICE. The am-f return-completeness check therefore accepts either operation
+  as a direct completion expression or non-fallthrough statement path completing a non-Unit
+  function. This invents no trailing value and is not a general `Never` coercion through eager
+  parents; a first-class diverging/`Never` type remains deferred.
 - **v1 multi-frame gap (recorded honestly).** Only the CURRENT function's cleanup runs. A full
   multi-frame stack unwind — running *every* caller's Drops on the way out — is the documented ideal,
   deferred. For a program whose owned resources all live in the frame that calls `exit` (or in an

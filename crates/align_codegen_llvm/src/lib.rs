@@ -15617,6 +15617,69 @@ mod tests {
     }
 
     #[test]
+    fn function_return_completeness_matrix() {
+        let program = mir(
+            "import std.process\nChoice { A, B }\nfn tail() -> i64 = 11\nfn explicit() -> i64 { return 12 }\nfn branch(flag: bool) -> i64 { if flag { return 13 } else { return 14 } }\nfn selected(value: Choice) -> i64 { result := match value { A => { return 15 } B => 16 }\nreturn result\n}\nfn loop_value() -> i64 = loop { break 17 }\nfn endless() -> i64 { loop {} }\nfn exits() -> i64 { process.exit(18)\n}\nfn aborts() -> i64 { process.abort()\n}\nfn unwrapped(value: Option<i64>) -> i64 { x := value else { return 20 }\nreturn x\n}\nfn tried(value: Result<i64, Error>) -> Result<i64, Error> { x := value?\nreturn Ok(x)\n}\nfn arena_return() -> i64 { arena { return 21 } }\nfn unsafe_return() -> i64 { unsafe { return 22 } }\nfn group_return() -> i64 { task_group { return 23 } }\nfn moved() -> string = \"owned\".clone()\nfn dead_tail() -> i64 { return 24\nprint(25)\n}\nfn main() -> i32 = 0\n",
+        );
+        let names = [
+            "tail",
+            "explicit",
+            "branch",
+            "selected",
+            "loop_value",
+            "endless",
+            "exits",
+            "aborts",
+            "unwrapped",
+            "tried",
+            "arena_return",
+            "unsafe_return",
+            "group_return",
+            "moved",
+            "dead_tail",
+        ]
+        .map(str::to_string);
+        for optimized in [false, true] {
+            let llvm = emit_llvm_ir(
+                &program,
+                &BuildTarget::Baseline,
+                optimized,
+                &names,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("optimized={optimized}: {error}"));
+            for name in &names {
+                let definition = llvm
+                    .lines()
+                    .find(|line| {
+                        line.starts_with("define ") && line.contains(&format!("@{name}("))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("optimized={optimized}: missing @{name}:\n{llvm}")
+                    });
+                assert!(
+                    !definition.split_whitespace().any(|word| word == "void"),
+                    "optimized={optimized}: @{name} must keep a value-returning signature: {definition}"
+                );
+                assert!(
+                    !function_body(&llvm, name).contains("ret void"),
+                    "optimized={optimized}: @{name} must not emit ret void:\n{}",
+                    function_body(&llvm, name)
+                );
+            }
+            if !optimized {
+                for name in ["endless", "exits", "aborts"] {
+                    assert!(
+                        function_body(&llvm, name).contains("unreachable"),
+                        "raw @{name} must retain the MIR non-fallthrough terminator:\n{}",
+                        function_body(&llvm, name)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn align_functions_are_marked_nounwind() {
         // Align functions never unwind, so codegen marks them `nounwind` (drops exception edges /
         // unwind tables, enables more inlining). Every Align-defined function carries it...

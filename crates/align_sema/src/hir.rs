@@ -1079,8 +1079,9 @@ pub enum ExprKind {
     /// (`docs/impl/std-design/process.md`): the default hard-exit is the *safe* one — no silently
     /// lost buffered output. Impure; diverges. **v1 gap:** only the current frame's cleanup runs —
     /// full multi-frame stack unwind is the documented ideal, deferred. There is no `Never` type
-    /// yet, so the `ty` is [`crate::Ty::Unit`]; `process.exit` therefore cannot sit in the tail
-    /// position of a non-unit-returning function (use it as a statement).
+    /// yet, so the `ty` is [`crate::Ty::Unit`]. As a direct completion expression or non-fallthrough
+    /// statement it can complete a non-Unit body; it is not a general `Never` coercion through an
+    /// eager parent.
     ProcessExit { code: Box<Expr> },
     /// `process.abort()` — the named-dangerous escape hatch: immediate `_exit`, running NO cleanup
     /// (no Drops / flushes / atexit). The asymmetric counterpart to `process.exit`. Impure; diverges.

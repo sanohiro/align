@@ -17,9 +17,9 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 **Decision:** Unit functions alone may use bare `return` or reach an empty block tail. Every
 reachable path of a non-Unit function produces the declared type through a tail expression or
-`return value`; a proven non-fallthrough path needs no value. The current checker accidentally
-accepts a bare return and reachable absent tail in a non-Unit body, allowing MIR/LLVM `ret void`
-under a value-returning signature. Am-f is the pending producer correction.
+`return value`; a proven non-fallthrough path needs no value. Am-f implements the producer check:
+bare return and reachable absent tail now fail before HIR publication/MIR lowering, so LLVM cannot
+receive `ret void` under a value-returning signature.
 
 Record: `draft.md` Function, `docs/language-spec.md`, `docs/design-notes.md`,
 `docs/impl/07-roadmap.md`, `docs/impl/17-library-boundary-prerequisites.md`
@@ -2571,9 +2571,10 @@ ends — the exact emission a top-level `return` uses, THEN calls libc `exit(cod
 is not a second, Drop-skipping shutdown mechanism; it reuses `emit_exit_cleanup`. The immediate
 hard-exit that skips all cleanup is the separately-named `process.abort()` (`_exit(1)`, no Drops/
 flushes) — the default is the *safe* one (no silently lost buffered output), the dangerous one is
-named. There is no `Never` type yet, so both are typed `()` (they diverge in MIR — cleanup + runtime
-call + `Unreachable` — but the type system does not model the divergence, so `exit`/`abort` cannot be
-the tail value of a non-unit-returning function; use them as statements). **v1 gap (recorded in
+named. There is no `Never` type yet, so both keep a `()` surface result. Checked control flow and MIR
+nevertheless record their divergence (cleanup + runtime call + `Unreachable`), and am-f admits either
+as a direct completion expression or non-fallthrough statement path completing a non-Unit function.
+This invents no trailing value and is not a general `Never` coercion through eager parents. **v1 gap (recorded in
 `process.md`):** only the *current* frame's cleanup runs — a full multi-frame stack unwind running
 every caller's Drops is the documented ideal, deferred. (Was Open, target M11; the two candidates —
 run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as `exit`, the second as
