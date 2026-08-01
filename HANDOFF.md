@@ -370,20 +370,20 @@ routes the deep shared-DAG fixture through a struct field. Existing deep body fi
 source-nameable declaration return while retaining their body-produced command/HTTP owner expression.
 
 The old host and independent transcripts are not attestations for the corrected tree. A later
-independent post-open pass raised a possible `array<file>` collection gap; direct inspection of
-`collection_scalar_arg` and `ty_to_scalar` showed that sema intentionally admits that producer
-shape, and the ledger already records it, so that finding was a false positive and the attempted
-am-p narrowing was reverted. The same pass found that the ledger incorrectly called graph-valid
+independent post-open pass found that the ledger incorrectly called graph-valid
 `Ty::DynArray(Scalar::DynArray(_))` producer-valid even though `scalar_to_prim` rejects nested owned
-arrays. The current correction rejects that graph-valid non-producer shape, adds its owner negative,
-and updates the ledger. Its focused test passes; it still needs the full pre-PR gate and a fresh
-post-open review on the resulting SHA. Rebuilds and test execution on this macOS host may need
-`DYLD_SHARED_REGION=private` because some Cargo-spawned Rust binaries pause in `_dyld_start`; inspect
-the child and preserve the transcript rather than restarting the broad gate. The next implementation
-slice remains am-n nominal/link only after am-p is merged.
+arrays; the correction rejects that shape and adds its owner negative. The final independent pass
+also confirmed a real ownership gap: sema admitted `array<file>`/`slice<file>` declaration types,
+but the generic dynamic-array Drop path frees only the buffer and leaks each File handle. The
+current correction closes that producer/validator/codegen boundary by rejecting File collection
+elements in sema and am-p, updating the ledger, and adding sema plus MIR negatives. It still needs
+the full pre-PR gate and a fresh post-open review on the resulting SHA. Rebuilds and test execution
+on this macOS host may need `DYLD_SHARED_REGION=private` because some Cargo-spawned Rust binaries
+pause in `_dyld_start`; inspect the child and preserve the transcript rather than restarting the
+broad gate. The next implementation slice remains am-n nominal/link only after am-p is merged.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
-1,050 changed lines against `main`). It cannot be split safely: validator activation, the producer
+1,068 changed lines against `main`). It cannot be split safely: validator activation, the producer
 contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.

@@ -1786,9 +1786,10 @@ The following producer sets are exact:
   `Option`/`Result` interned as `Tagged`. `Param` is legal only in an abstract template.
 - `collection-scalar` is `scalar_arg(..., allow_param=false)` plus `Fn`: `ty-scalar` minus
   `Buffer`, `Reader`, `Writer`, `Regex`, `Captures`, `CliParsed`, `TcpConn`, `TcpListener`,
-  `UdpSocket`, `Child`, `HttpResponse`, `HttpServer`, `HttpRequestCtx`, `HttpStream`,
-  `ResponseBuilder`, and `RunOutput`, then plus `Fn`. `File` remains accepted because that is the
-  current producer predicate; am-p does not silently narrow it.
+  `UdpSocket`, `Child`, `File`, `HttpResponse`, `HttpServer`, `HttpRequestCtx`, `HttpStream`,
+  `ResponseBuilder`, and `RunOutput`, then plus `Fn`. Owned I/O handles are never collection
+  elements because element reads copy the handle without a move-out and the generic array Drop path
+  cannot release one handle per element.
   The resolver rejects a nested owned `array<array<T>>`: `ty_to_scalar` requires the inner owned
   array element to be primitive, so `Ty::DynArray(Scalar::DynArray(…))` is graph-valid HIR but not
   producer-valid. Am-p rejects that shape before MIR, while preserving the separate body-level
@@ -1805,7 +1806,7 @@ The following producer sets are exact:
 | tuple element | Exactly integer, float, bool, char, `Str`, `String`, `DynArray`, or `DynStructArray`; order is significant and duplicate tuple element lists are one interned identity. | one positive per kind and all other graph-valid scalar/composite negatives |
 | `Option`/`Result` payload | `scalar_arg(..., allow_param=true)`: `payload-scalar`, with nested `Option`/`Result` interned as `Tagged`; abstract `Param` is template-only. | every payload kind, nested tagged values, and excluded buffer/builder/header/composite twins |
 | box type argument | `scalar_arg(..., allow_param=false)`, then reject `Struct`, `Enum`, every `Scalar::is_move`, and `Str`. The admitted type-formation remainder is integer, float, bool, char, unit, primitive `Slice`, SoA, JSON document, and a concrete non-Move `Tagged` value. This is deliberately broader than value construction: `heap.new` additionally rejects `Slice`, whose borrowed view cannot be stored as an owned box payload. | one type-formation positive for every admitted remainder including `Slice`/SoA/JSON/tagged; `heap.new(Slice)` body negative; struct/enum/owned/`Str`/parameter negatives |
-| slice/dynamic-array type argument | `collection-scalar`. A dynamic struct array instead records its exact struct id and rejects an over-aligned element. `File` is admitted here by the current type producer even though no array-literal producer admits it. SoA separately requires a non-empty struct containing only integer, float, bool, char, or `Str` fields. `ArrayBuilder` accepts only integer, float, bool, char, or `String`. | one positive per type-argument family including `File` and `Fn`; every explicitly excluded handle/nested/over-aligned/SoA-field/builder negative |
+| slice/dynamic-array type argument | `collection-scalar`. A dynamic struct array instead records its exact struct id and rejects an over-aligned element. Every owned I/O handle, including `File`, is rejected because the generic array Drop path cannot release one handle per element. SoA separately requires a non-empty struct containing only integer, float, bool, char, or `Str` fields. `ArrayBuilder` accepts only integer, float, bool, char, or `String`. | one positive per type-argument family including `Fn`; every explicitly excluded handle/File/nested/over-aligned/SoA-field/builder negative |
 | fixed-array literal element | Body-owned, not am-p-owned. A fixed struct array admits an over-aligned struct and records the padded/aligned slot contract. A scalar literal rejects every owned handle including `File`, every slice-bearing non-struct, and a Move enum; all elements have one checked type, `ArrayLit.elem` matches it, and the length fits the stored type. | over-aligned fixed-struct positive; `File` type-formation-positive/literal-negative twin; handle/slice/Move-enum/type/length/pooled-state matrix in am-b2 |
 | vector and mask element | Integer or float with exactly 2, 4, 8, or 16 lanes. | every width/lane endpoint and bool/char/aggregate negatives |
 | annotated `FnTy` type positions | Each parameter is `ty-scalar`. The return is any graph-valid non-`Error` type currently produced by `resolve_type`; the body/call validator separately requires each actual callable origin to satisfy `fn-scalar` parameters and a `fn-scalar`/`Result` return. Mode cardinality/class and summaries belong only to am-h. Imported effect transport belongs to am-h; body-correlated effect cells and parallel eligibility belong only to am-b4. | slice- and buffer-parameter annotation positives, actual fn-value slice negative, Result-return handler, and one type-position mutation per branch |
@@ -1828,7 +1829,7 @@ sema producer.
 
 | Cell | Required closure | Exact owner evidence |
 |---|---|---|
-| recursive field placement | Reject only a direct `array<string>` field and graph-valid nested owned-array shapes; preserve the producer-valid `Option`/`Result`/`Tagged` nesting. | `valid_hir_type_placement_preflight_is_mir_identity`, direct-vs-nested `array<string>` twins, graph-valid nested-array negative |
+| recursive field placement | Reject only a direct `array<string>` field, graph-valid nested owned-array shapes, and File collection elements; preserve the producer-valid `Option`/`Result`/`Tagged` nesting. | `valid_hir_type_placement_preflight_is_mir_identity`, direct-vs-nested `array<string>` twins, graph-valid nested-array and File-collection negatives |
 | generic sum producer | `enum_payload_ok` and the placement predicate both admit `ResponseBuilder` after generic substitution; concrete `Fn` remains direct-only. | `generic_enum_response_builder_monomorph_is_producer_valid`, concrete/generic builder and `Fn` twins |
 | header type formation | Header returns/parameters use the exact `resolve_type` nameable set; body-only `CliParsed`, HTTP request/response/client/server, command, and run-output types reject. | `body_only_header_types_fail_placement_closed`, source/imported/FnTy header twins |
 | abstract box | `box` payload formation never admits `Param`, including an unreachable abstract `FnTy` node. | `abstract_box_param_fails_placement_closed` |

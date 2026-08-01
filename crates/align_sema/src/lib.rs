@@ -33050,7 +33050,7 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -35933,6 +35933,12 @@ fn exit_branch(flag: bool) -> i64 {
         // element resolves to a struct via the slice arm and loads through `SliceIndex`).
         let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
         assert!(!slstruct.has_errors(), "indexing a slice<Struct> for a whole struct should check");
+
+        for ty in ["array<file>", "slice<file>"] {
+            let source = format!("fn take(xs: {ty}) -> i64 = xs.len()\nfn main() -> i32 = 0\n");
+            let (_handle, diagnostics) = check(&source);
+            assert!(diagnostics.has_errors(), "{ty} type position must reject an owned file handle element");
+        }
     }
 
     #[test]
