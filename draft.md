@@ -334,6 +334,7 @@ never yields, and like a `match` whose arms all diverge it satisfies any expecte
 
 ```align
 mut total := 0
+mut buf := buffer(4096)
 n_read := loop {
   n := r.read(buf)?
   if n == 0 { break total }
@@ -2465,6 +2466,11 @@ f.pwrite(data: bytes, off: i64)   -> Result<i64, Error>   // writes ALL of data 
 f.len()                           -> Result<i64, Error>   // live fstat (not cached)
 ```
 
+Every native operation that fills a `buffer` (`read`, `read_line`, `pread`, `recv_from`, and
+`crypto.random`) requires a bare source local declared with `mut`. Bind a temporary first; passing
+an immutable local or an expression directly is rejected before the operation is formed. This keeps
+the mutation, address stability, and ownership boundary explicit.
+
 `file` is the offset-addressed block read+write handle (`fs.create_rw` / `fs.open_rw`, below). Every
 access carries an explicit `off` — there is **no cursor and no `seek`** (a settable cursor is hidden
 mutable state), and there is **no read-only constructor** (pure random reads stay `reader` or the
@@ -2503,8 +2509,9 @@ call), so `b.len()` is the body length and the return is the bytes consumed incl
 = EOF, an empty line returns `1` with body length `0`, a final unterminated line returns its bare
 length). **Growth asymmetry:** unlike `r.read`, which caps at the buffer's capacity, `read_line`
 **grows** `b` as needed — a line has no caller-chosen bound — up to a 64 MiB line cap (`Error.Invalid`
-beyond it, so a terminator-free/binary input can't grow the buffer without bound). The canonical loop is
-`loop { n := r.read_line(buf)?; if n == 0 { break }; line := buf.bytes().as_str()?; … }`. **Warning:** the
+beyond it, so a terminator-free/binary input can't grow the buffer without bound). The canonical loop
+starts with `mut buf := buffer(4096)` and is `loop { n := r.read_line(buf)?; if n == 0 { break };
+line := buf.bytes().as_str()?; … }`. The output must be that bare `mut` local. **Warning:** the
 per-iteration line view (`buf.bytes()` / its `as_str`) must **not** be hoisted across iterations — the
 next `read_line` overwrites `buf`, so a view kept from a previous line reads stale/overwritten bytes
 (a borrow-liveness gap not yet caught by the compiler; `.clone()` a line you need to keep).

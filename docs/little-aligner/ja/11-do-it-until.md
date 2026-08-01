@@ -19,7 +19,8 @@
 **A3.** この言語が持つ、たったひとつのループ構文の出番です。
 
 ```align
-fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
+fn pump(r: reader, w: writer) -> Result<(), Error> {
+    mut buf := buffer(4096)
     loop {
         n := r.read(buf)?
         if n == 0 { break Ok(()) }
@@ -43,6 +44,7 @@ fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
 **A5.**
 
 ```align
+mut buf := buffer(4096)
 mut total := 0
 sum := loop {
     n := r.read(buf)?

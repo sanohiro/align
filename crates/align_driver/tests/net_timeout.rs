@@ -44,7 +44,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   conn := tcp.connect(\"127.0.0.1\", p.get_i64(\"port\"))?
   conn.read_timeout_ns(200000000)
   r := conn.reader()
-  b := buffer(64)
+  mut b := buffer(64)
   code := match r.read(b) {
     Ok(n) => 0,
     Err(e) => match e {
@@ -102,7 +102,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   w := conn.writer()
   w.write(\"ping\\n\")?
   r := conn.reader()
-  b := buffer(64)
+  mut b := buffer(64)
   n := r.read(b)?
   print(n)
   io.stdout.write(b.bytes())?

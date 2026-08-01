@@ -126,7 +126,7 @@ import std.fs
 import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   r := fs.open(args[1])?
-  buf := buffer(64)
+  mut buf := buffer(64)
   n := r.read(buf)?
   fs.write_file(args[2], buf.bytes())?
   return Ok(())

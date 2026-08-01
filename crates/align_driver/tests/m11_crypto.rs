@@ -130,7 +130,7 @@ fn random_fills_and_two_fills_differ() {
 import std.crypto
 import std.encoding
 pub fn main() -> Result<(), Error> {
-  b := buffer(32)
+  mut b := buffer(32)
   crypto.random(b)
   print(b.len())
   h1 := encoding.hex_encode(b.bytes())
@@ -156,7 +156,7 @@ fn random_large_fill_not_all_zero() {
 import std.crypto
 import std.encoding
 pub fn main() -> Result<(), Error> {
-  b := buffer(4096)
+  mut b := buffer(4096)
   crypto.random(b)
   print(b.len())
   print(encoding.hex_encode(b.bytes()))
@@ -180,7 +180,7 @@ fn random_impure_rejected_by_par_map() {
     let src = "\
 import std.crypto
 fn f(x: i64) -> i64 {
-  b := buffer(8)
+  mut b := buffer(8)
   crypto.random(b)
   return x + b.len()
 }
@@ -210,7 +210,7 @@ pub fn main() -> Result<(), Error> {
     assert!(check_errs("m11cr-noimport", src), "crypto.* without `import std.crypto` must error");
     let diags = check_diagnostics(
         "m11cr-diag",
-        "pub fn main() -> Result<(), Error> {\n  b := buffer(8)\n  crypto.random(b)\n  return Ok(())\n}\n",
+        "pub fn main() -> Result<(), Error> {\n  mut b := buffer(8)\n  crypto.random(b)\n  return Ok(())\n}\n",
     );
     assert!(diags.contains("import std.crypto"), "diagnostic should name the capability: {diags}");
 }
@@ -344,13 +344,13 @@ fn sha256_large_input_deterministic() {
     let prog = "\
 import std.crypto
 pub fn main() -> Result<(), Error> {
-  b := buffer(1048576)
+  mut b := buffer(1048576)
   crypto.random(b)
   print(b.len())                          // the input is 1 MiB
   d1 := crypto.sha256(b.bytes())
   d2 := crypto.sha256(b.bytes())
   print(crypto.constant_time_equal(d1[0..d1.len()], d2[0..d2.len()]))  // same input → same digest
-  c := buffer(1048576)
+  mut c := buffer(1048576)
   crypto.random(c)
   e := crypto.sha256(c.bytes())
   print(crypto.constant_time_equal(d1[0..d1.len()], e[0..e.len()]))    // different input → differ
@@ -697,9 +697,9 @@ fn aead_round_trips_both_ciphers() {
     let prog = "\
 import std.crypto
 pub fn main() -> Result<(), Error> {
-  k := buffer(32)
+  mut k := buffer(32)
   crypto.random(k)
-  n := buffer(12)
+  mut n := buffer(12)
   crypto.random(n)
   // Empty plaintext → 16-byte tag-only output; opens back to empty.
   s0 := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"\", \"aad\")?
@@ -711,7 +711,7 @@ pub fn main() -> Result<(), Error> {
   o1 := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), s1.bytes(), \"\")?
   print(crypto.constant_time_equal(o1.bytes(), \"hello world\"))
   // Large ~1 MiB plaintext round-trips (aes).
-  big := buffer(1048576)
+  mut big := buffer(1048576)
   crypto.random(big)
   s2 := crypto.aes_gcm_seal(k.bytes(), n.bytes(), big.bytes(), \"meta\")?
   print(s2.len())
@@ -745,12 +745,12 @@ fn aead_open_failures_are_invalid_and_yield_nothing() {
             "\
 import std.crypto
 pub fn main() -> Result<(), Error> {{
-  k := buffer(32)
+  mut k := buffer(32)
   crypto.random(k)
-  n := buffer(12)
+  mut n := buffer(12)
   crypto.random(n)
   sealed := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"top secret\", \"ctx\")?
-  wrong := buffer(32)
+  mut wrong := buffer(32)
   crypto.random(wrong)
   pt := {open_expr}?
   print(pt.len())
@@ -792,9 +792,9 @@ fn aead_cross_cipher_confusion_is_invalid() {
     let prog = "\
 import std.crypto
 pub fn main() -> Result<(), Error> {
-  k := buffer(32)
+  mut k := buffer(32)
   crypto.random(k)
-  n := buffer(12)
+  mut n := buffer(12)
   crypto.random(n)
   sealed := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"secret\", \"aad\")?
   pt := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), sealed.bytes(), \"aad\")?
@@ -820,9 +820,9 @@ fn aead_wrong_key_or_nonce_length_is_invalid() {
             "\
 import std.crypto
 pub fn main() -> Result<(), Error> {{
-  k := buffer(64)
+  mut k := buffer(64)
   crypto.random(k)
-  input := buffer(64)
+  mut input := buffer(64)
   crypto.random(input)
   r := crypto.{op}(k.bytes()[0..{key_slice}], k.bytes()[0..{nonce_slice}], input.bytes(), \"aad\")?
   print(r.len())
@@ -861,9 +861,9 @@ fn aead_impure_rejected_by_par_map() {
     let seal_src = "\
 import std.crypto
 fn f(x: i64) -> i64 {
-  k := buffer(32)
+  mut k := buffer(32)
   crypto.random(k)
-  n := buffer(12)
+  mut n := buffer(12)
   crypto.random(n)
   r := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"pt\", \"\")
   return x + match r { Ok(b) => b.len(), Err(_) => 0 }
@@ -881,9 +881,9 @@ pub fn main() -> i32 {
     let open_src = "\
 import std.crypto
 fn f(x: i64) -> i64 {
-  k := buffer(32)
+  mut k := buffer(32)
   crypto.random(k)
-  n := buffer(12)
+  mut n := buffer(12)
   crypto.random(n)
   r := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), \"0123456789abcdef\", \"\")
   return x + match r { Ok(b) => b.len(), Err(_) => 0 }

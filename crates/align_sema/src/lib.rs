@@ -9294,16 +9294,13 @@ impl<'a> EscapeCheck<'a> {
             // An *owned* reader/writer constructed **directly** by a builtin (`io.stdin`/`fs.open`/
             // `io.stdout`/`fs.create`) has region `Static` (its `region_of` producer — `ReaderOpen` /
             // `WriterCreate` — is classified `Static`), so it stays freely returnable.
-            // But a reader/writer threaded through a **user** function call is not so lucky:
-            // `region_of(Call)` conservatively folds in *every* argument's region (it has no per-fn
-            // "does this actually borrow arg i" fact), so calling that user fn with a Frame/Arena-
-            // region argument taints the whole result — even when the callee's own reader is an
-            // unrelated direct `fs.open`. Returning that call's result past the tainted region is
-            // then rejected, even though nothing is actually borrowed. This is sound (never
-            // miscompiles) but imprecise; the precise fix needs interprocedural return-borrow
-            // summaries, independently of the intraprocedural region-flow CFG. This arm only makes
-            // the escape check *consult* the region either way. (A `tcp_conn` itself is always
-            // owned, never a borrow, so it is deliberately NOT here.)
+            // A reader/writer threaded through a **user** function call consults the inferred
+            // named return-region summary: a callee that returns a view of parameter i contributes
+            // only argument i, a direct owned constructor publishes `None`, and an unavailable
+            // summary conservatively folds every argument. This keeps unrelated frame/arena
+            // arguments from tainting a direct `fs.open` result while still failing closed for an
+            // unknown borrowing boundary. (A `tcp_conn` itself is always owned, never a borrow,
+            // so it is deliberately NOT here.)
             Ty::Reader | Ty::Writer | Ty::Fn(_) => return true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
@@ -27233,6 +27230,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error(format!("'.recv_from()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
                 return err;
             }
+            if !self.require_mut_buffer_local(&args[0], ".recv_from()") {
+                return err;
+            }
             return Expr {
                 kind: ExprKind::UdpRecvFrom { sock: Box::new(recv_expr), buffer: Box::new(buffer) },
                 ty: i64_result,
@@ -27968,8 +27968,8 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
         }
-        // `random(out)` — fill a `buffer` (mirrors `reader.read`'s mut-buffer argument: any expr of
-        // type `buffer`, filled in place, not consumed).
+        // `random(out)` — fill a `buffer` (mirrors `reader.read`'s mut-buffer argument: only a bare
+        // mutable local, filled in place, not consumed).
         if args.len() != 1 {
             self.diags
                 .error(format!("'crypto.random' expects 1 argument (a mut buffer), got {}", args.len()), span);
@@ -27982,6 +27982,9 @@ impl<'a, 't> Checker<'a, 't> {
         if out.ty != Ty::Buffer {
             self.diags
                 .error(format!("'crypto.random' fills a buffer, got {}", ty_name(out.ty)), args[0].span);
+            return err;
+        }
+        if !self.require_mut_buffer_local(&args[0], "crypto.random") {
             return err;
         }
         Expr { kind: ExprKind::CryptoRandom { out: Box::new(out) }, ty: Ty::Unit, span }
@@ -29522,6 +29525,27 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Require a native output buffer to be a bare mutable local. The operation-specific type and
+    /// arity checks run first so this helper never masks an earlier child/type diagnostic.
+    fn require_mut_buffer_local(&mut self, arg: &ast::Expr, operation: &str) -> bool {
+        let Some((id, _)) = self.place_local(arg) else {
+            self.diags.error(
+                format!("'{operation}' needs a mut buffer local (bind it first, then pass that local)"),
+                arg.span,
+            );
+            return false;
+        };
+        if !self.locals[id as usize].is_mut {
+            let name = self.locals[id as usize].name.clone();
+            self.diags.error(
+                format!("cannot fill immutable buffer '{name}' in '{operation}' (declare with mut)"),
+                arg.span,
+            );
+            return false;
+        }
+        true
+    }
+
     /// `r.read(b: mut buffer)` on a `reader` ([`Ty::Reader`]), the receiver already evaluated. Fills
     /// `b` up to its capacity (overwriting its length), yielding `Result<i64, Error>` (bytes read;
     /// `0` = EOF). Borrows both reader and buffer (neither consumed).
@@ -29553,6 +29577,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if buffer.ty != Ty::Buffer {
             self.diags.error(format!("'.read()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+            return err;
+        }
+        if !self.require_mut_buffer_local(&args[0], ".read()") {
             return err;
         }
         Expr {
@@ -29600,6 +29627,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if buffer.ty != Ty::Buffer {
             self.diags.error(format!("'.read_line()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+            return err;
+        }
+        if !self.require_mut_buffer_local(&args[0], ".read_line()") {
             return err;
         }
         Expr {
@@ -29673,6 +29703,9 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
                 if !self.require_i64_arg(offset.ty, off_arg.span, "'.pread()' offset") {
+                    return err;
+                }
+                if !self.require_mut_buffer_local(buf_arg, ".pread()") {
                     return err;
                 }
                 Expr {
@@ -34530,6 +34563,105 @@ fn main() -> i32 = 0
                 "a malformed product write must retain old and incoming roots"
             );
         }
+    }
+
+    #[test]
+    fn native_output_buffers_require_mut_locals_at_all_five_sites() {
+        let cases = [
+            (
+                ".read()",
+                "import std.fs\nfn main() -> Result<(), Error> {\n  r := fs.open(\"input\")?\n",
+                "r.read(ARG)?",
+            ),
+            (
+                ".read_line()",
+                "import std.fs\nfn main() -> Result<(), Error> {\n  r := fs.open(\"input\")?\n  br := r.buffered()\n",
+                "br.read_line(ARG)?",
+            ),
+            (
+                ".pread()",
+                "import std.fs\nfn main() -> Result<(), Error> {\n  f := fs.open_rw(\"input\")?\n",
+                "f.pread(ARG, 0)?",
+            ),
+            (
+                ".recv_from()",
+                "import std.net\nfn main() -> Result<(), Error> {\n  u := udp.bind(\"127.0.0.1\", 1)?\n",
+                "u.recv_from(ARG)?",
+            ),
+            (
+                "crypto.random",
+                "import std.crypto\nfn main() -> Result<(), Error> {\n",
+                "crypto.random(ARG)\n",
+            ),
+        ];
+        for (operation, prefix, call) in cases {
+            let source = format!(
+                "{prefix}  mut b := buffer(4)\n  {}\n  return Ok(())\n}}\n",
+                call.replace("ARG", "\"not a buffer\"")
+            );
+            let (_, diagnostics) = check(&source);
+            assert!(
+                diagnostics.has_errors(),
+                "{operation} with a wrong buffer type must fail"
+            );
+            assert!(
+                !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.message.contains("needs a mut buffer local")
+                        || diagnostic.message.contains("cannot fill immutable buffer")
+                }),
+                "{operation} must preserve the earlier wrong-type diagnostic: {:?}",
+                diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+            );
+
+            for (label, arg, expected) in [
+                (
+                    "non-local",
+                    "buffer(4)",
+                    format!("'{operation}' needs a mut buffer local (bind it first, then pass that local)"),
+                ),
+                (
+                    "immutable",
+                    "b",
+                    format!("cannot fill immutable buffer 'b' in '{operation}' (declare with mut)"),
+                ),
+            ] {
+                let source = format!(
+                    "{prefix}  b := buffer(4)\n  {}\n  return Ok(())\n}}\n",
+                    call.replace("ARG", arg)
+                );
+                let (_, diagnostics) = check(&source);
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.message == expected),
+                    "{operation} {label} must report {expected:?}; got {:?}",
+                    diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+                );
+            }
+
+            let source = format!(
+                "{prefix}  mut b := buffer(4)\n  {}\n  return Ok(())\n}}\n",
+                call.replace("ARG", "b")
+            );
+            let (_, diagnostics) = check(&source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{operation} with a mut local must check: {:?}",
+                diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+            );
+        }
+
+        let (_, diagnostics) = check(
+            "import std.fs\nfn main() -> Result<(), Error> {\n  f := fs.open_rw(\"input\")?\n  b := buffer(4)\n  f.pread(b, \"bad offset\")?\n  return Ok(())\n}\n",
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.message.contains("'.pread()' offset must be i64")),
+            "pread must retain the later offset diagnostic before the mutability gate: {:?}",
+            diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.message.contains("cannot fill immutable buffer")),
+            "pread must not mask the invalid offset with the mutability diagnostic: {:?}",
+            diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

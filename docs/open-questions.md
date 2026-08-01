@@ -363,6 +363,14 @@ must preserve.
   - **Binary parsing arrived (2026-07-10, align-LLM runway A2, branch `runway-a2-binary-codec`).** The consumer settled the byte-level op shape as **typed binary decode/encode** rather than the originally-listed raw `.push(b)` / `buf[i]` ops: reads `bytes.<scalar>_<le|be>(off)` and writes `buffer.put_<scalar>_<le|be>(v)` (the endian-explicit typed pair — see the Open → "align-LLM runway" A2 record for the full design), plus `buffer.append(bytes)` for a raw blob. `put_u8` **supersedes** the settled `.push(b)` (a typed single-byte append), and `.append(slice<u8>)` shipped as specified. Still deferred (no A2 consumer): `buf[i]` random-access read/write and `freeze → array<u8>` / `.to_string()` — a growable-then-freeze output is the `loop` / growable-`array<T>` story, not binary parsing.
 Record: `draft.md` §12/§18.2, `impl/07-roadmap.md` M9 Slice 1, `crates/align_driver/tests/m9_io.rs`.
 
+### Native buffer fills — design SETTLED + BUILT 2026-08-01
+**Decision: native operations that fill a `buffer` require an explicit mutable local.**
+`reader.read`, `reader.read_line`, `file.pread`, `udp_socket.recv_from`, and `crypto.random` accept
+only a bare `buffer` local declared with `mut`. Passing a temporary, expression, or immutable local
+is a semantic error before the operation is formed; this keeps the in-place mutation and stable
+address visible and uniform across I/O, networking, and entropy surfaces.
+Record: `draft.md` §18.2, `docs/impl/17-library-boundary-prerequisites.md` Am-v, `crates/align_sema/src/lib.rs`.
+
 ### `str` I/O UTF-8 validation — SETTLED + BUILT (2026-07-04)
 **Decision: every I/O boundary that produces a `str`/`string` validates its bytes as UTF-8; invalid content fails rather than yielding a malformed `str`.** `draft.md` §7/§12 make "a `str` is always valid UTF-8" a load-bearing invariant (it lets `str` APIs — `chars`, slicing, `find`, display — assume well-formedness), but the M9 std.fs / core.json surfaces produced `str` values directly from raw file/mmap/JSON bytes **without checking**, so a binary file → a malformed `str` → broken invariant (external report, 2026-07-03).
 - **Fixed at every `str`-returning entry point:** `fs.read_file` (both the fast `read_exact` path and the copy fallback), `fs.read_file_view` (both the mmap path — validated before the view is registered on the arena, `munmap` on failure — and the arena-copy fallback), and `json.decode` (validate the **whole input once** at the head; a decoded `str` field is a zero-copy substring view into that input, so one pass covers every field — the same one-shot check simdjson does). Invalid → `Error.Invalid` for the `fs.*` errno-mapped surfaces; a decode error for `json.decode` (whose error channel is `Error.Code`).

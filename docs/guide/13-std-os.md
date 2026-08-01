@@ -68,7 +68,8 @@ The streaming tier, for data bigger than memory. Its control shape is the `loop`
 ```align
 import std.fs
 
-fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
+fn pump(r: reader, w: writer) -> Result<(), Error> {
+    mut buf := buffer(4096)
     loop {
         n := r.read(buf)?           // fill buf to capacity; 0 = EOF
         if n == 0 { break Ok(()) }  // break carries the loop's value out
@@ -79,8 +80,7 @@ fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
 pub fn main(args: array<str>) -> Result<(), Error> {
     r := fs.open(args[1])?          // reader — owns the fd, closes on drop
     w := fs.create(args[2])?        // writer
-    buf := buffer(4096)             // reused across the whole loop
-    pump(r, w, buf)?
+    pump(r, w)?
     return Ok(())
 }
 ```

@@ -339,7 +339,7 @@ import std.io
 pub fn main(args: array<str>) -> Result<(), Error> {
   base := fs.open(args[1])?
   r := base.buffered()
-  line := buffer(1024)
+  mut line := buffer(1024)
   consumed := r.read_line(line)?
   w := fs.create(args[2])?
   copied := io.copy(r, w)?
