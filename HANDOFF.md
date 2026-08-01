@@ -471,8 +471,8 @@ change only; the interface already carries the same effect fact.
 The closing review also found five semantic producer holes that must land before header/body
 validation. Am-e restricts no-arg `main` to Unit, exact i32, or
 `Result<Unit,builtin Error>`: other returns were accepted by sema but emitted an invalid external
-C `main` ABI. Am-f rejects bare return and reachable absent tails in non-Unit functions; before the
-current branch both reached MIR/LLVM as `ret void` under a value-returning signature. Am-w replaces task
+C `main` ABI. Am-f rejects bare return and reachable absent tails in non-Unit functions; before #683
+both reached MIR/LLVM as `ret void` under a value-returning signature. Am-w replaces task
 wait-state traversal order with generation- and Wait-id-sensitive successful-wait
 dominance across `if`, direct `match wait()`, direct `wait() else`, every reachable loop break,
 early exits, nested groups, Spawn reset, infallible Wait, and direct fallible `wait()?`; its
