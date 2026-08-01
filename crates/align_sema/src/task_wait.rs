@@ -177,19 +177,12 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn has_pending_covering(group: &Group, generation: Token) -> bool {
-        group.waits.values().any(|wait| {
-            wait.status == WaitStatus::Pending && wait.covered_generations.contains(&generation)
-        })
-    }
-
     fn task_ready(&self, state: &State, proof: TaskProof) -> bool {
         let Some(group) = self.group(state, proof.group) else {
             return false;
         };
         group.valid_generations.contains(&proof.generation)
-            && (group.completed == Some(group.generation)
-                || !Self::has_pending_covering(group, proof.generation))
+            && group.completed == Some(group.generation)
     }
 
     fn wait_current(&self, state: &State, proof: WaitProof) -> bool {

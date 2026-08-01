@@ -1,8 +1,6 @@
 //! `task_group` structured concurrency (slice ④a — walking skeleton). `spawn(fn { … })` returns
 //! a `Task<R>`; `wait()` joins; `t.get()` reads the result. ④a runs tasks eagerly/sequentially
 //! (correct results; real threads arrive in ④b). `spawn`/`wait` are valid only inside the scope.
-
-
 mod common;
 use common::*;
 
@@ -199,6 +197,15 @@ fn wait_in_one_branch_rejected() {
     assert!(check_errs(
         "tg-dom-bad",
         "fn main() -> Result<(), Error> {\n  c := true\n  task_group {\n    a := spawn(fn { 5 })\n    if c { wait() }\n    print(a.get())\n  }\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn second_spawn_does_not_reauthorize_first_task() {
+    // A new generation still needs its own join; spawning again cannot make the first handle ready.
+    assert!(check_errs(
+        "tg-second-spawn-before-wait",
+        "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { 1 })\n    spawn(fn { 2 })\n    print(a.get())\n    wait()\n  }\n  return Ok(())\n}\n"
     ));
 }
 
