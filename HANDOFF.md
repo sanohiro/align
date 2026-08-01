@@ -355,6 +355,18 @@ validity, and run focused owner tests before one monitored full PR gate. When a 
 if the next checkpoint still cannot be mergeable by two hours, split at the next independently
 correct placement family and record the boundary here.
 
+The am-p checkpoint is intentionally paused before PR creation. The required broad host
+preflight (`.git/align-preflight-review-5a7588d.log`) reached its 900-second bound without a
+verdict; a narrow host continuation (`.git/align-preflight-host-continuation-5a7588d.log`) was
+stopped at 8m09s after continued sema inspection, also without a verdict. The independent
+adversarial review completed CLEAN and withdrew an initial nested-`Fn` concern after confirming
+that `Ty::Fn` is not produced by `ty_to_scalar` and is a direct enum-payload-only extension.
+Do not treat either host transcript as CLEAN and do not open or attest a PR from this SHA yet.
+On resume, obtain one bounded host verdict for the unchanged final SHA, run `scripts/pre-pr.sh`
+with that log and the already-passing `align_mir` owner checks, then push/open the draft PR and
+complete the normal post-open review cycle. The next implementation slice remains am-n nominal/link
+only after am-p is merged.
+
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
 direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
