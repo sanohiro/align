@@ -1789,10 +1789,10 @@ The following producer sets are exact:
   `UdpSocket`, `Child`, `HttpResponse`, `HttpServer`, `HttpRequestCtx`, `HttpStream`,
   `ResponseBuilder`, and `RunOutput`, then plus `Fn`. `File` remains accepted because that is the
   current producer predicate; am-p does not silently narrow it.
-  The current resolver may carry a nested `array<array<T>>` as `Ty::DynArray(Scalar::DynArray(…))`;
-  that graph-valid shape remains producer-valid here and is rejected only by the body consumer
-  that would copy an owned element (for example indexing). Am-p preserves that existing producer
-  shape rather than silently narrowing source acceptance.
+  The resolver rejects a nested owned `array<array<T>>`: `ty_to_scalar` requires the inner owned
+  array element to be primitive, so `Ty::DynArray(Scalar::DynArray(…))` is graph-valid HIR but not
+  producer-valid. Am-p rejects that shape before MIR, while preserving the separate body-level
+  indexing rejection for any other Move element that the producer admits.
 - `fn-scalar` is `ty-scalar` without `Slice`. A first-class callable return is `fn-scalar` or
   `Result`; an annotated `FnTy` parameter uses `ty-scalar`, preserving the currently accepted
   slice annotation, while an actual named/lifted function value uses `fn-scalar`.
@@ -1828,7 +1828,7 @@ sema producer.
 
 | Cell | Required closure | Exact owner evidence |
 |---|---|---|
-| recursive field placement | Reject only a direct `array<string>` field; preserve the producer-valid `Option`/`Result`/`Tagged` nesting and nested dynamic-array shape. | `valid_hir_type_placement_preflight_is_mir_identity`, direct-vs-nested `array<string>` twins |
+| recursive field placement | Reject only a direct `array<string>` field and graph-valid nested owned-array shapes; preserve the producer-valid `Option`/`Result`/`Tagged` nesting. | `valid_hir_type_placement_preflight_is_mir_identity`, direct-vs-nested `array<string>` twins, graph-valid nested-array negative |
 | generic sum producer | `enum_payload_ok` and the placement predicate both admit `ResponseBuilder` after generic substitution; concrete `Fn` remains direct-only. | `generic_enum_response_builder_monomorph_is_producer_valid`, concrete/generic builder and `Fn` twins |
 | header type formation | Header returns/parameters use the exact `resolve_type` nameable set; body-only `CliParsed`, HTTP request/response/client/server, command, and run-output types reject. | `body_only_header_types_fail_placement_closed`, source/imported/FnTy header twins |
 | abstract box | `box` payload formation never admits `Param`, including an unreachable abstract `FnTy` node. | `abstract_box_param_fails_placement_closed` |

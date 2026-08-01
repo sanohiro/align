@@ -5,9 +5,10 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #688; PR #688 merged the
+_Last updated: 2026-08-02. `main` includes the shipped wave through #688; PR #688 merged the
 am-u lexical extern invocation correction. The am-p placement-validation checkpoint is implemented
-on `feat/am-p-type-placement`; after it merges, the next resumable slice is am-n nominal/link.
+on `feat/am-p-type-placement` and is open as PR #690; after it merges, the next resumable slice is
+am-n nominal/link.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -368,17 +369,21 @@ struct alignment traversal had not shared the completed-node memo; the follow-up
 routes the deep shared-DAG fixture through a struct field. Existing deep body fixtures now use a
 source-nameable declaration return while retaining their body-produced command/HTTP owner expression.
 
-The old host and independent transcripts are not attestations for the corrected tree. Focused
-direct owner binaries pass: all 40 `align_mir` tests and all 191 `align_sema` tests. Rebuilds and
-test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some Cargo-spawned
-Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript rather than
-restarting the broad gate. On resume, commit the correction, obtain a fresh bounded host or
-independent clean review on the new SHA, run `scripts/pre-pr.sh`, then push the follow-up and
-complete the normal post-open review cycle. The next implementation slice remains am-n nominal/link
-only after am-p is merged.
+The old host and independent transcripts are not attestations for the corrected tree. A later
+independent post-open pass raised a possible `array<file>` collection gap; direct inspection of
+`collection_scalar_arg` and `ty_to_scalar` showed that sema intentionally admits that producer
+shape, and the ledger already records it, so that finding was a false positive and the attempted
+am-p narrowing was reverted. The same pass found that the ledger incorrectly called graph-valid
+`Ty::DynArray(Scalar::DynArray(_))` producer-valid even though `scalar_to_prim` rejects nested owned
+arrays. The current correction rejects that graph-valid non-producer shape, adds its owner negative,
+and updates the ledger. Its focused test passes; it still needs the full pre-PR gate and a fresh
+post-open review on the resulting SHA. Rebuilds and test execution on this macOS host may need
+`DYLD_SHARED_REGION=private` because some Cargo-spawned Rust binaries pause in `_dyld_start`; inspect
+the child and preserve the transcript rather than restarting the broad gate. The next implementation
+slice remains am-n nominal/link only after am-p is merged.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
-1,041 changed lines against `main`). It cannot be split safely: validator activation, the producer
+1,050 changed lines against `main`). It cannot be split safely: validator activation, the producer
 contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.

@@ -353,7 +353,10 @@ impl<'a> PlacementValidator<'a> {
             }
             Scalar::DynStructArray(id) => self.dynamic_struct_array_ok(id),
             Scalar::Soa(id) => self.soa_ok(id),
-            Scalar::DynArray(element) | Scalar::Slice(element) => valid_prim(element),
+            Scalar::DynArray(element) => {
+                !matches!(mode, ScalarPlacement::Collection) && valid_prim(element)
+            }
+            Scalar::Slice(element) => valid_prim(element),
             Scalar::Buffer => !matches!(
                 mode,
                 ScalarPlacement::Payload { .. } | ScalarPlacement::Collection
@@ -373,7 +376,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpStream
             | Scalar::ResponseBuilder
             | Scalar::RunOutput => !matches!(mode, ScalarPlacement::Collection),
-            Scalar::File => !matches!(mode, ScalarPlacement::Collection),
+            Scalar::File => true,
             Scalar::Bool
             | Scalar::Char
             | Scalar::Unit
