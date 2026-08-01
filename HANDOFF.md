@@ -6,7 +6,8 @@ per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
 _Last updated: 2026-08-01. `main` includes the shipped wave through #688; PR #688 merged the
-am-u lexical extern invocation correction. The next resumable slice is am-p placement validation.
+am-u lexical extern invocation correction. The am-p placement-validation checkpoint is implemented
+on `feat/am-p-type-placement`; after it merges, the next resumable slice is am-n nominal/link.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -339,6 +340,20 @@ to preserve the stalled transcript, inspect the actual child process, and contin
 complete owner target instead of restarting a broad suite. The matrix now includes exact one-error
 precedence, rejected-HIR absence, branch/loop/early-exit lambda depth, and qualified whole/per-unit
 parity.
+
+### am-p delivery checkpoint (2026-08-01)
+
+The am-p checkpoint exceeded the two-hour implementation target because its body-independent
+placement matrix spans fields, payloads, tuples, tagged values, function headers, imported headers,
+and extern boundaries, while the existing sema predicates had to be compared exactly (including
+nested-array and generic `ResponseBuilder` behavior). The ordinary PR gate also spent several
+minutes in macOS `_dyld_start` before each integration binary produced output, although it kept
+progressing and finished clean. The durable rule is to freeze each producer predicate from the
+owning sema function before writing the validator, keep graph validity separate from placement
+validity, and run focused owner tests before one monitored full PR gate. When a binary sits in
+`_dyld_start`, inspect the child and preserve the transcript rather than restarting the broad gate;
+if the next checkpoint still cannot be mergeable by two hours, split at the next independently
+correct placement family and record the boundary here.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
