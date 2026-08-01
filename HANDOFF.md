@@ -5,8 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #685. L2b-a2-am-w
-task-wait dominance is complete; am-v native output-buffer mutability is next.
+_Last updated: 2026-08-01. `main` includes the shipped wave through #686. L2b-a2-am-w
+task-wait dominance and am-v native output-buffer mutability are complete; am-u lexical extern
+invocation is next.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -101,6 +102,7 @@ facts must live in this repository.
 #674  product return-provenance refinement
 #675  eager MIR continuation closure
 #685  path-complete task-wait dominance
+#686  native output-buffer local/mutability validation
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -476,9 +478,9 @@ and ThinLTO C entry behavior, and rejecting malformed MIR entry ABI before LLVM 
 PR #683 completes am-f by rejecting bare non-Unit returns and reachable fallthrough
 before HIR publication/MIR lowering while preserving typed and proven non-fallthrough paths. Its
 focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/optimized IR,
-execution, and cold/hot object-cache parity. The remaining reviewed order is am-w
-outcome-sensitive task-wait dominance, am-v native output-buffer local/mutability, am-u lexical
-extern invocation, am-p placement, am-n nominal/link, am-h
+execution, and cold/hot object-cache parity. The reviewed order is am-w
+outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
+am-u lexical extern invocation, am-p placement, am-n nominal/link, am-h
 declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
 am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
@@ -529,15 +531,16 @@ rule. Checkpoint `7247fc6` now contains the first compiling vertical implementat
 transport, joins, or TaskGet diagnostics would leave an intermediate compiler that can authorize
 an uninitialized task slot or reject a valid outer proof. If the implementation exceeds the
 500-line target, the split-proof exception is justified by this single safety invariant; the
-formation, control, ownership, and whole/per-unit rows must land together. Am-v requires a
+formation, control, ownership, and whole/per-unit rows must land together. Am-v (#686) required a
+bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
+those five producer paths now reject equal-typed temporaries and immutable buffers even though the
+runtime writes through them.
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
-tests; this is an environment/toolchain execution blocker, not a compiler test failure.
-bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
-those five producer paths currently accept equal-typed temporaries and immutable buffers even
-though the runtime writes through them. Am-u rejects extern declarations as first-class function
-values and requires direct or non-escaping named pipeline/reducer/sort invocation to be lexically
+tests; this is an environment/toolchain execution blocker, not a compiler test failure. Am-u rejects
+extern declarations as first-class function values and requires direct or non-escaping named
+pipeline/reducer/sort invocation to be lexically
 inside `unsafe`; current HIR function values cannot carry visible unsafe-call permission. These are
 independently correct producer fixes, not malformed-HIR heuristics.
 The same review found a separate stack-safety closure. The constructor/parser audit fixes 259 as a
@@ -682,13 +685,13 @@ SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
 L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, a2-am-e, and a2-am-f. #679 completes
-am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-w/a2-am-v/a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-u/a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; after am-f, am-w is the next implementation slice. The required milestone order
+#678; after #686, am-u is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
