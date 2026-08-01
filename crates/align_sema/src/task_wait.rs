@@ -804,12 +804,17 @@ impl<'a> Analyzer<'a> {
         };
         let opt_ty = expand_tagged_ty(opt.ty, self.tagged_types);
         let (mut success, mut failure) = (opt_state.clone(), opt_state);
+        let mut success_proof = opt_flow.proof;
         if let (Ty::Result(..), Some(Proof::Wait(proof))) = (opt_ty, opt_flow.proof) {
             self.resolve_ok(&mut success, proof);
             self.resolve_err(&mut failure, proof, site);
+            success_proof = None;
         }
         let fallback_flow = self.expr(fallback, failure, report);
-        self.merge_flows(site, vec![Flow::live(success, None), fallback_flow])
+        self.merge_flows(
+            site,
+            vec![Flow::live(success, success_proof), fallback_flow],
+        )
     }
 
     fn if_expr(
