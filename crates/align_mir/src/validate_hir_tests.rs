@@ -2584,6 +2584,9 @@ fn deep_hir_type_dag_placement_is_stack_bounded() {
                     }
                 })
                 .collect();
+            // Reach the same shared DAG through an inline struct field so the alignment walker
+            // cannot silently remain exponential while the payload walker is memoized.
+            tagged_dag.structs[0].fields[0].ty = Ty::Tagged((TAG_DEPTH - 1) as u32);
             tagged_dag.imported_fns.push(imported_fn(
                 "dep$tagged_dag",
                 Vec::new(),

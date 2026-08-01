@@ -559,12 +559,14 @@ impl<'a> PlacementValidator<'a> {
         }
         let mut work = vec![Work::Enter(ty)];
         let mut active_tagged = HashSet::new();
+        let mut completed_tagged = HashSet::new();
         while let Some(item) = work.pop() {
             match item {
                 Work::ExitTagged(id) => {
                     if !active_tagged.remove(&id) {
                         return false;
                     }
+                    completed_tagged.insert(id);
                 }
                 Work::Enter(ty) => match ty {
                     Ty::Struct(id) => {
@@ -585,6 +587,9 @@ impl<'a> PlacementValidator<'a> {
                         work.push(Work::Enter(align_sema::scalar_to_ty(ok)));
                     }
                     Ty::Tagged(id) => {
+                        if completed_tagged.contains(&id) {
+                            continue;
+                        }
                         if !active_tagged.insert(id) {
                             return false;
                         }

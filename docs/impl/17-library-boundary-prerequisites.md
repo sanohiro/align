@@ -1832,7 +1832,7 @@ sema producer.
 | generic sum producer | `enum_payload_ok` and the placement predicate both admit `ResponseBuilder` after generic substitution; concrete `Fn` remains direct-only. | `generic_enum_response_builder_monomorph_is_producer_valid`, concrete/generic builder and `Fn` twins |
 | header type formation | Header returns/parameters use the exact `resolve_type` nameable set; body-only `CliParsed`, HTTP request/response/client/server, command, and run-output types reject. | `body_only_header_types_fail_placement_closed`, source/imported/FnTy header twins |
 | abstract box | `box` payload formation never admits `Param`, including an unreachable abstract `FnTy` node. | `abstract_box_param_fails_placement_closed` |
-| shared tagged DAG | Tagged validation memoizes completed nodes per placement mode, rejects active cycles, and remains linear per reachable edge rather than exponentially revisiting shared subgraphs. | `deep_hir_type_dag_placement_is_stack_bounded`, shared tagged-DAG owner |
+| shared tagged DAG | Tagged validation memoizes completed nodes per placement mode, including the inline-struct alignment walk, rejects active cycles, and remains linear per reachable edge rather than exponentially revisiting shared subgraphs. | `deep_hir_type_dag_placement_is_stack_bounded` reaches the DAG through an imported header and an inline struct field; shared tagged-DAG owner |
 | owner isolation | Graph-valid placement negatives reject through all four lowering entrypoints without publishing partial MIR; graph-invalid fixtures remain owned by am-g-t. | graph-valid placement-negative matrix plus existing malformed global matrix |
 
 #### Nominal, link, and callable identity ledger
