@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
+use align_span::Span;
 
 /// Validate the program-global HIR type domain before MIR construction.
 pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
@@ -25,6 +26,414 @@ pub(crate) fn type_placement_metadata_is_valid(program: &hir::Program) -> bool {
 /// nominal records that claim one source identity really describe the same id-free definition.
 pub(crate) fn nominal_link_metadata_is_valid(program: &hir::Program) -> bool {
     NominalLinkValidator::new(program).validate()
+}
+
+/// Validate body-independent declaration and header records before MIR copies HIR.
+///
+/// This pass intentionally does not inspect function bodies or `drop_individual_exprs`. Body
+/// ownership/effect replay belongs to am-b4; the fields validated here are the producer-owned
+/// declaration, signature, origin, local-header, and structural drop-set facts that do not require
+/// expression semantics.
+pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bool {
+    DeclarationValidator::new(program).validate()
+}
+
+struct DeclarationValidator<'a> {
+    program: &'a hir::Program,
+    placement: PlacementValidator<'a>,
+}
+
+impl<'a> DeclarationValidator<'a> {
+    fn new(program: &'a hir::Program) -> Self {
+        Self {
+            program,
+            placement: PlacementValidator::new(program),
+        }
+    }
+
+    fn validate(&self) -> bool {
+        self.externs_valid()
+            && self.imported_functions_valid()
+            && self.function_types_valid()
+            && self.stored_functions_valid()
+    }
+
+    fn externs_valid(&self) -> bool {
+        let mut names = HashSet::new();
+        for function in &self.program.externs {
+            if function.name == "main"
+                || !valid_declaration_name(&function.name)
+                || !names.insert(function.name.as_str())
+                || function.params.len() != function.param_modes.len()
+                || !function
+                    .param_modes
+                    .iter()
+                    .all(|mode| *mode == align_ast::ParamMode::ByValue)
+                || !function
+                    .params
+                    .iter()
+                    .all(|&ty| self.placement.ffi_parameter_ok(ty))
+                || !self.placement.ffi_return_ok(function.ret)
+                || !summary_is_none(&function.return_borrow, &function.return_region)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn imported_functions_valid(&self) -> bool {
+        let mut names = HashSet::new();
+        for function in &self.program.imported_fns {
+            if function.name == "main"
+                || !valid_declaration_name(&function.name)
+                || !names.insert(function.name.as_str())
+                || !self.source_signature_valid(
+                    &function.params,
+                    &function.param_modes,
+                    function.ret,
+                    &function.return_borrow,
+                    &function.return_region,
+                )
+            {
+                return false;
+            }
+            // `FnEffect` is a closed Rust enum. The producer has already normalized an absent
+            // external-map entry to `Impure`; no body effect is inferred at this boundary.
+            match function.effect {
+                align_sema::FnEffect::Pure
+                | align_sema::FnEffect::Impure
+                | align_sema::FnEffect::Unknown => {}
+            }
+        }
+        true
+    }
+
+    fn function_types_valid(&self) -> bool {
+        for (id, function) in self.program.fn_types.iter().enumerate() {
+            let Ok(id) = u32::try_from(id) else {
+                return false;
+            };
+            let allow_param = self.placement.is_abstract(Node::Fn(id));
+            if function.params.iter().any(|(mode, scalar)| {
+                !mode_is_valid(*mode, align_sema::scalar_to_ty(*scalar), true)
+                    || !self.placement.scalar_ok(
+                        *scalar,
+                        ScalarPlacement::FnParameter { allow_param },
+                    )
+            }) || !self.placement.resolve_type_ok(function.ret, allow_param)
+                || !summary_valid(
+                    self.program,
+                    &function.return_borrow,
+                    &function.return_region,
+                    &function
+                        .params
+                        .iter()
+                        .map(|(_, scalar)| align_sema::scalar_to_ty(*scalar))
+                        .collect::<Vec<_>>(),
+                )
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn stored_functions_valid(&self) -> bool {
+        let mut names = HashSet::new();
+        for function in &self.program.fns {
+            if !valid_declaration_name(&function.name)
+                || !names.insert(function.name.as_str())
+                || !valid_span(function.span)
+                || !self.parameter_vector_valid(function)
+                || !self.function_signature_valid(function)
+                || !self.origin_valid(function)
+                || !self.locals_valid(function)
+                || !self.drop_sets_valid(function)
+                || !self.main_valid(function)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn origin_valid(&self, function: &hir::Fn) -> bool {
+        match function.origin {
+            hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => true,
+            hir::FnOrigin::Lifted { capture_count } => {
+                usize::try_from(capture_count).is_ok_and(|count| count <= function.params.len())
+                    && function
+                        .param_modes
+                        .iter()
+                        .all(|mode| *mode == align_ast::ParamMode::ByValue)
+                    && summary_is_none(
+                        &function.return_borrow,
+                        &function.return_region,
+                    )
+            }
+        }
+    }
+
+    fn parameter_vector_valid(&self, function: &hir::Fn) -> bool {
+        if function.params.len() != function.param_modes.len() {
+            return false;
+        }
+        let mut seen = HashSet::new();
+        for (&local_id, &mode) in function.params.iter().zip(&function.param_modes) {
+            if !seen.insert(local_id)
+                || !mode_is_valid(
+                    mode,
+                    function
+                        .locals
+                        .get(local_id as usize)
+                        .map(|local| local.ty)
+                        .unwrap_or(Ty::Error),
+                    true,
+                )
+            {
+                return false;
+            }
+            let Some(local) = function.locals.get(local_id as usize) else {
+                return false;
+            };
+            if local.id != local_id {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn locals_valid(&self, function: &hir::Fn) -> bool {
+        let parameter_ids: HashSet<hir::LocalId> = function.params.iter().copied().collect();
+        let lifted = matches!(function.origin, hir::FnOrigin::Lifted { .. });
+        let mut names = HashSet::new();
+        for (index, local) in function.locals.iter().enumerate() {
+            let Ok(index) = u32::try_from(index) else {
+                return false;
+            };
+            if local.id != index
+                || !valid_local_name(&local.name)
+                || !names.insert(local.name.as_str())
+                || local.align.is_some_and(|align| {
+                    !align.is_power_of_two() || align > (1u32 << 29)
+                })
+            {
+                return false;
+            }
+            let is_signature_parameter = parameter_ids.contains(&local.id);
+            if is_signature_parameter {
+                if !valid_member_name(&local.name)
+                    || local.is_param == lifted
+                    || local.align.is_some()
+                {
+                    return false;
+                }
+            } else if local.is_param {
+                return false;
+            }
+            if local.align.is_some()
+                && (local.is_param
+                    || !matches!(local.ty, Ty::Array(Scalar::Int(_) | Scalar::Float(_), _)))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn function_signature_valid(&self, function: &hir::Fn) -> bool {
+        let parameter_types: Vec<Ty> = function
+            .params
+            .iter()
+            .filter_map(|&id| function.locals.get(id as usize).map(|local| local.ty))
+            .collect();
+        parameter_types.len() == function.params.len()
+            && parameter_types
+                .iter()
+                .all(|&ty| self.placement.source_function_type_ok(ty, true, false))
+            && self
+                .placement
+                .source_function_type_ok(function.ret, false, true)
+            && summary_valid(
+                self.program,
+                &function.return_borrow,
+                &function.return_region,
+                &parameter_types,
+            )
+    }
+
+    fn drop_sets_valid(&self, function: &hir::Fn) -> bool {
+        let valid_set = |ids: &[hir::LocalId]| {
+            ids.windows(2).all(|pair| pair[0] < pair[1])
+                && ids.iter().all(|&id| (id as usize) < function.locals.len())
+        };
+        valid_set(&function.drop_locals)
+            && valid_set(&function.drop_individual_locals)
+            && function
+                .drop_individual_locals
+                .iter()
+                .all(|id| function.drop_locals.binary_search(id).is_ok())
+    }
+
+    fn main_valid(&self, function: &hir::Fn) -> bool {
+        if function.name != "main" {
+            return true;
+        }
+        if !matches!(
+            function.origin,
+            hir::FnOrigin::Source { is_entry: true, .. }
+        ) {
+            return false;
+        }
+        let exact_i32 = Ty::Int(align_sema::IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let error_id = self.builtin_error_id();
+        let result = error_id.map(|id| Ty::Result(Scalar::Unit, Scalar::Enum(id)));
+        let return_ok = function.ret == Ty::Unit
+            || function.ret == exact_i32
+            || result == Some(function.ret);
+        let no_args = function.params.is_empty();
+        let argv = function.params.len() == 1
+            && function.param_modes == [align_ast::ParamMode::ByValue]
+            && function
+                .locals
+                .get(function.params[0] as usize)
+                .is_some_and(|local| local.ty == Ty::DynArray(Scalar::Str));
+        return_ok && (no_args || (argv && result == Some(function.ret)))
+    }
+
+    fn builtin_error_id(&self) -> Option<u32> {
+        let mut found = None;
+        for (id, definition) in self.program.enums.iter().enumerate() {
+            if definition.name == "Error"
+                && definition.source_name == "Error"
+                && builtin_error_shape(definition)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(u32::try_from(id).ok()?);
+            }
+        }
+        found
+    }
+
+    fn source_signature_valid(
+        &self,
+        params: &[Ty],
+        modes: &[align_ast::ParamMode],
+        ret: Ty,
+        borrow: &hir::ReturnBorrowSummary,
+        region: &hir::ReturnRegionSummary,
+    ) -> bool {
+        params.len() == modes.len()
+            && modes
+                .iter()
+                .zip(params)
+                .all(|(&mode, &ty)| {
+                    mode_is_valid(mode, ty, true)
+                        && self.placement.source_function_type_ok(ty, true, false)
+                })
+            && self.placement.source_function_type_ok(ret, false, true)
+            && summary_valid(self.program, borrow, region, params)
+    }
+}
+
+fn valid_declaration_name(name: &str) -> bool {
+    !name.is_empty() && !name.as_bytes().contains(&0)
+}
+
+fn valid_local_name(name: &str) -> bool {
+    valid_declaration_name(name)
+}
+
+fn valid_span(span: Span) -> bool {
+    span.lo <= span.hi
+}
+
+fn mode_is_valid(mode: align_ast::ParamMode, ty: Ty, allow_out: bool) -> bool {
+    match mode {
+        align_ast::ParamMode::ByValue => true,
+        align_ast::ParamMode::Out => allow_out && matches!(ty, Ty::Slice(_)),
+        align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => false,
+    }
+}
+
+fn summary_is_none(
+    borrow: &hir::ReturnBorrowSummary,
+    region: &hir::ReturnRegionSummary,
+) -> bool {
+    matches!(borrow, hir::ReturnBorrowSummary::None)
+        && matches!(region, hir::ReturnRegionSummary::None)
+}
+
+fn summary_valid(
+    program: &hir::Program,
+    borrow: &hir::ReturnBorrowSummary,
+    region: &hir::ReturnRegionSummary,
+    params: &[Ty],
+) -> bool {
+    match (borrow, region) {
+        (hir::ReturnBorrowSummary::None, hir::ReturnRegionSummary::None) => true,
+        (
+            hir::ReturnBorrowSummary::Roots {
+                params: borrow_params,
+                captures: borrow_captures,
+            },
+            hir::ReturnRegionSummary::Roots {
+                params: region_params,
+                captures: region_captures,
+            },
+        ) => {
+            !borrow_params.is_empty()
+                && borrow_params == region_params
+                && borrow_captures.is_empty()
+                && region_captures.is_empty()
+                && borrow_params.windows(2).all(|pair| pair[0] < pair[1])
+                && borrow_params.iter().all(|&id| {
+                    params
+                        .get(id as usize)
+                        .is_some_and(|&ty| {
+                            align_sema::ty_may_borrow(
+                                ty,
+                                &program.structs,
+                                &program.tuples,
+                                &program.enums,
+                                &program.tagged_types,
+                            )
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn builtin_error_shape(definition: &hir::EnumDef) -> bool {
+    if definition.variants.len() != 5 {
+        return false;
+    }
+    let names = ["NotFound", "Invalid", "Denied", "Timeout", "Code"];
+    definition
+        .variants
+        .iter()
+        .zip(names)
+        .all(|(variant, name)| {
+            variant.name == name
+                && variant.field_base == 1
+                && match name {
+                    "Code" => {
+                        variant.payload.as_slice()
+                            == [Scalar::Int(align_sema::IntTy {
+                                bits: 32,
+                                signed: true,
+                            })]
+                    }
+                    _ => variant.payload.is_empty(),
+                }
+        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

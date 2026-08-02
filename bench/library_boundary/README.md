@@ -29,6 +29,9 @@ a 256-function, high-CFG fixture with three expression-valued branches per funct
 - `mir-nominal-link-validation`: whole-program MIR-lowering milliseconds per iteration for nominal
   structs/enums, repeated id-free source-shape twins, and one linked library, isolating the
   nominal/source-identity, enum-base, alignment, and link-name preflight.
+- `mir-header-validation`: paired valid and malformed whole-program MIR-lowering milliseconds per
+  iteration for a large function-header/signature fixture, isolating declaration/header validation
+  and its canonical-empty failure path.
 - `mir-continuation-lowering`: L2b-a2-ac whole-program MIR-lowering milliseconds per iteration and
   the fixture's total basic-block count, tracking the O(1) required-child continuation protocol.
 

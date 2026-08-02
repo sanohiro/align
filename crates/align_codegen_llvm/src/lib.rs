@@ -5022,7 +5022,7 @@ fn declare_fn<'c>(
 fn declare_imported_fn<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
-    imp: &align_sema::hir::ImportedFn,
+    imp: &align_mir::ImportedFn,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
     tagged_types: &[StructType<'c>],
