@@ -3805,7 +3805,27 @@ fn body_tail_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
 }
 
 fn body_native_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
-    if matches!(&ret, Ty::Result(..)) {
+    if let Ty::Result(Scalar::Buffer, error) = &ret {
+        let function_ret = Ty::Result(Scalar::Unit, *error);
+        body_test_named_function(
+            name,
+            hir::Block {
+                stmts: vec![hir::Stmt::Expr(body_test_expr(
+                    hir::ExprKind::Try(Box::new(expression)),
+                    Ty::Buffer,
+                ))],
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                        hir::ExprKind::Unit,
+                        Ty::Unit,
+                    ))),
+                    function_ret,
+                ))),
+            },
+            Vec::new(),
+            function_ret,
+        )
+    } else if matches!(&ret, Ty::Result(..)) {
         body_tail_case(name, expression, ret)
     } else {
         body_unit_case(name, expression)
