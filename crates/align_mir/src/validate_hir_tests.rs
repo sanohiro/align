@@ -6337,6 +6337,51 @@ fn hir_body_validator_pipeline_array_views() {
     ));
     assert!(body_core_metadata_is_valid(&program));
 
+    for (name, source_ty, element) in [
+        (
+            "array_view_fixed_move_string",
+            Ty::Array(Scalar::String, 2),
+            Scalar::String,
+        ),
+        (
+            "array_view_dynamic_move_string",
+            Ty::DynArray(Scalar::String),
+            Scalar::String,
+        ),
+        (
+            "array_view_fixed_move_struct",
+            Ty::StructArray(0, 2),
+            Scalar::Struct(0),
+        ),
+        (
+            "array_view_dynamic_move_struct",
+            Ty::DynStructArray(0, Layout::Aos),
+            Scalar::Struct(0),
+        ),
+    ] {
+        let view = body_test_expr(
+            hir::ExprKind::ArrayToSlice(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                source_ty,
+            ))),
+            Ty::Slice(element),
+        );
+        let mut reject = program.clone();
+        reject.fns.push(body_test_parameter_function(
+            name,
+            source_ty,
+            hir::Block {
+                stmts: vec![hir::Stmt::Expr(view)],
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+            },
+            Ty::Unit,
+        ));
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: array-to-slice must reject Move-element arrays"
+        );
+    }
+
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "array_view_index");
     let hir::ExprKind::Index { index, .. } = &mut expression.kind else {

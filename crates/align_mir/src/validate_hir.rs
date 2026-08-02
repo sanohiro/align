@@ -6590,6 +6590,9 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(source)?;
                 let result = match flow.ty {
                     Ty::Array(scalar, _) => {
+                        if !self.scalar_copy_ok(scalar) {
+                            return None;
+                        }
                         if !matches!(
                             source.kind,
                             hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
@@ -6599,6 +6602,9 @@ impl<'a> BodyValidator<'a> {
                         Ty::Slice(scalar)
                     }
                     Ty::StructArray(id, _) => {
+                        if !self.scalar_copy_ok(Scalar::Struct(id)) {
+                            return None;
+                        }
                         if !matches!(
                             source.kind,
                             hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
@@ -6607,8 +6613,12 @@ impl<'a> BodyValidator<'a> {
                         }
                         Ty::Slice(Scalar::Struct(id))
                     }
-                    Ty::DynArray(scalar) => Ty::Slice(scalar),
-                    Ty::DynStructArray(id, Layout::Aos) => Ty::Slice(Scalar::Struct(id)),
+                    Ty::DynArray(scalar) if self.scalar_copy_ok(scalar) => Ty::Slice(scalar),
+                    Ty::DynStructArray(id, Layout::Aos)
+                        if self.scalar_copy_ok(Scalar::Struct(id)) =>
+                    {
+                        Ty::Slice(Scalar::Struct(id))
+                    }
                     _ => return None,
                 };
                 let (falls, breaks) = strict_flow(&[flow]);
