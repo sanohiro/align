@@ -320,6 +320,26 @@ automation must not launch
 `cargo test --workspace` or `scripts/test-full.sh` for an ordinary PR unless
 the change scope explicitly requires that expanded verification.
 
+### Review operation guardrails
+
+- Run one review for an exact `HEAD`/base pair. Do not launch a duplicate review
+  for the same pair while the first is still running.
+- A timeout, invocation bound, missing machine-readable verdict, or killed
+  process means **INCOMPLETE**, never CLEAN. Preserve the log, elapsed time,
+  last completed area, and process state.
+- Inspect the process and new log output at least once per minute. Stop orphaned,
+  duplicate, stalled, or scope-drifting review processes after recording their
+  state; do not leave helper processes running after the parent review stops.
+- Continue only with the unreviewed, contradictory, or changed slice. A review
+  continuation is separate from rerunning owner tests, pre-PR attestation, or
+  CI; do not repeat those gates unless the tree or their required inputs changed.
+- A broad review rerun requires a high-risk trigger: a P1, public-contract or
+  strategy change, ownership/cleanup/FFI/ABI/IR change, three or more compiler
+  layers, more than 250 hand-written changed lines, or an explicit user request.
+- On macOS, a review process at CPU 0 in `_dyld_start` with repeated Xcode cache
+  or `xcodebuild` errors is a host stall. Stop it as INCOMPLETE, retain its
+  useful static findings, and use CI or an isolated target for verification.
+
 Do not open and immediately merge a code PR.
 
 Do not rerun the same broad review or broad test gate on an unchanged tree.
