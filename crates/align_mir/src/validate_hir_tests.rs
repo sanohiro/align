@@ -3804,6 +3804,14 @@ fn body_tail_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
     )
 }
 
+fn body_native_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
+    if matches!(&ret, Ty::Result(..)) {
+        body_tail_case(name, expression, ret)
+    } else {
+        body_unit_case(name, expression)
+    }
+}
+
 fn body_statement_expression_mut<'a>(
     program: &'a mut hir::Program,
     name: &str,
@@ -7224,7 +7232,7 @@ fn hir_body_validator_native() {
 
     macro_rules! add {
         ($name:expr, $expression:expr, $locals:expr, $ret:expr) => {
-            program.fns.push(body_tail_case($name, $expression, $ret));
+            program.fns.push(body_native_case($name, $expression, $ret));
             let locals: Vec<hir::Local> = $locals;
             if !locals.is_empty() {
                 let function = program.fns.last_mut().expect("native function just added");
@@ -9056,36 +9064,29 @@ fn hir_body_validator_generated_callables() {
     monomorph.origin = hir::FnOrigin::Monomorph;
     program.fns.push(monomorph);
 
-    program.fns.push(body_tail_case(
+    program.fns.push(body_unit_case(
         "generated_fn_value_source",
         body_test_expr(
             hir::ExprKind::FnValue("generated_source".to_string()),
             Ty::Fn(0),
         ),
-        Ty::Fn(0),
     ));
-    program.fns.push(body_tail_case(
+    program.fns.push(body_unit_case(
         "generated_fn_value_imported",
         body_test_expr(
             hir::ExprKind::FnValue("dep$generated".to_string()),
             Ty::Fn(imported_fid),
         ),
-        Ty::Fn(imported_fid),
     ));
-    program.fns.push(body_test_named_function(
+    program.fns.push(body_unit_case(
         "generated_closure",
-        hir::Block {
-            stmts: Vec::new(),
-            value: Some(Box::new(body_test_expr(
-                hir::ExprKind::Closure {
-                    lifted: "generated_lifted".to_string(),
-                    captures: vec![native_i64()],
-                },
-                Ty::Fn(closure_fid),
-            ))),
-        },
-        Vec::new(),
-        Ty::Fn(closure_fid),
+        body_test_expr(
+            hir::ExprKind::Closure {
+                lifted: "generated_lifted".to_string(),
+                captures: vec![native_i64()],
+            },
+            Ty::Fn(closure_fid),
+        ),
     ));
     program.fns.push(body_tail_case(
         "generated_call_fn_value",
@@ -9236,7 +9237,7 @@ fn hir_body_validator_generated_callables() {
     assert!(body_core_metadata_is_valid(&program));
 
     let mut reject = program.clone();
-    reject.fns.push(body_tail_case(
+    reject.fns.push(body_unit_case(
         "generated_extern_fn_value_rejected",
         body_test_expr(
             hir::ExprKind::Unsafe(hir::Block {
@@ -9248,7 +9249,6 @@ fn hir_body_validator_generated_callables() {
             }),
             Ty::Fn(extern_fid),
         ),
-        Ty::Fn(extern_fid),
     ));
     assert!(!body_core_metadata_is_valid(&reject));
 
@@ -9268,7 +9268,7 @@ fn hir_body_validator_generated_callables() {
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let expression = body_value_expression_mut(&mut reject, "generated_closure");
+    let expression = body_statement_expression_mut(&mut reject, "generated_closure");
     let hir::ExprKind::Closure { lifted, .. } = &mut expression.kind else {
         panic!("generated closure fixture lost its closure")
     };
