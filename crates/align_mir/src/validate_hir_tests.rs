@@ -3673,6 +3673,36 @@ fn body_test_parameter_function(name: &str, ty: Ty, body: hir::Block, ret: Ty) -
     function
 }
 
+fn body_test_function_with_params(
+    name: &str,
+    locals: Vec<hir::Local>,
+    params: Vec<hir::LocalId>,
+    body: hir::Block,
+    ret: Ty,
+) -> hir::Fn {
+    let mut function = body_test_named_function(name, body, locals, ret);
+    function.param_modes = vec![align_ast::ParamMode::ByValue; params.len()];
+    function.params = params;
+    function
+}
+
+fn body_test_local(
+    id: u32,
+    name: &str,
+    ty: Ty,
+    is_mut: bool,
+    is_param: bool,
+) -> hir::Local {
+    hir::Local {
+        id,
+        name: name.to_string(),
+        ty,
+        is_mut,
+        is_param,
+        align: None,
+    }
+}
+
 fn body_unit_case(name: &str, expression: hir::Expr) -> hir::Fn {
     body_test_named_function(
         name,
@@ -3706,6 +3736,21 @@ fn body_statement_expression_mut<'a>(
         panic!("statement fixture {name} is not an expression")
     };
     expression
+}
+
+fn body_value_expression_mut<'a>(
+    program: &'a mut hir::Program,
+    name: &str,
+) -> &'a mut hir::Expr {
+    program
+        .fns
+        .iter_mut()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("missing value fixture {name}"))
+        .body
+        .value
+        .as_deref_mut()
+        .unwrap_or_else(|| panic!("value fixture {name} has no value"))
 }
 
 fn body_first_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Stmt {
@@ -5472,25 +5517,1007 @@ fn hir_body_validator_storage_vector_array_control_flow() {
 }
 
 #[test]
-fn hir_body_validator_storage_vector_array_deferred_b2b() {
+fn hir_body_validator_pipeline_stage_records() {
     let integer = int(64);
+    let scalar = scalar_int(64);
+    let dyn_int = Ty::DynArray(scalar);
+    let dyn_str = Ty::DynArray(Scalar::Str);
+    let dyn_flags = Ty::DynStructArray(1, Layout::Aos);
     let mut program = baseline_program();
-    program.fns.push(body_tail_case(
-        "deferred_array_sum",
+    program.structs.push(StructDef {
+        name: "Flags".to_string(),
+        source_name: "Flags".to_string(),
+        fields: vec![
+            FieldDef {
+                name: "active".to_string(),
+                ty: Ty::Bool,
+            },
+            FieldDef {
+                name: "value".to_string(),
+                ty: integer,
+            },
+        ],
+        align: None,
+        c_repr: false,
+    });
+    program.imported_fns.extend([
+        imported_fn("dep$captured_map", vec![integer, integer], integer),
+        imported_fn("dep$predicate", vec![integer], Ty::Bool),
+    ]);
+
+    let source_int = body_test_expr(hir::ExprKind::Local(0), dyn_int);
+    program.fns.push(body_test_parameter_function(
+        "pipeline_stage_scalar",
+        dyn_int,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArraySum {
+                    source: Box::new(source_int),
+                    stages: vec![
+                        hir::Stage {
+                            kind: hir::StageKind::Map {
+                                func: "dep$captured_map".to_string(),
+                                captures: vec![body_test_expr(
+                                    hir::ExprKind::Int(2),
+                                    integer,
+                                )],
+                            },
+                            out_ty: integer,
+                        },
+                        hir::Stage {
+                            kind: hir::StageKind::Where {
+                                func: "dep$predicate".to_string(),
+                                captures: Vec::new(),
+                            },
+                            out_ty: integer,
+                        },
+                    ],
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+
+    program.fns.push(body_test_parameter_function(
+        "pipeline_stage_string",
+        dyn_str,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArrayCount {
+                    source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_str)),
+                    stages: vec![hir::Stage {
+                        kind: hir::StageKind::WhereStrContains {
+                            needle: body_test_expr(
+                                hir::ExprKind::Str("needle".to_string()),
+                                Ty::Str,
+                            ),
+                        },
+                        out_ty: Ty::Str,
+                    }],
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+
+    program.fns.push(body_test_parameter_function(
+        "pipeline_stage_fields",
+        dyn_flags,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArraySum {
+                    source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_flags)),
+                    stages: vec![
+                        hir::Stage {
+                            kind: hir::StageKind::WhereField { field: 0 },
+                            out_ty: Ty::Struct(1),
+                        },
+                        hir::Stage {
+                            kind: hir::StageKind::Project { field: 1 },
+                            out_ty: integer,
+                        },
+                    ],
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_stage_scalar");
+    let hir::ExprKind::ArraySum { stages, .. } = &mut expression.kind else {
+        panic!("scalar pipeline fixture lost its terminal")
+    };
+    stages[0].out_ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_stage_scalar");
+    let hir::ExprKind::ArraySum { stages, .. } = &mut expression.kind else {
+        panic!("scalar pipeline fixture lost its terminal")
+    };
+    stages[0].kind = hir::StageKind::Map {
+        func: "".to_string(),
+        captures: Vec::new(),
+    };
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_stage_fields");
+    let hir::ExprKind::ArraySum { stages, .. } = &mut expression.kind else {
+        panic!("field pipeline fixture lost its terminal")
+    };
+    stages[0].kind = hir::StageKind::WhereField { field: 1 };
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_stage_string");
+    let hir::ExprKind::ArrayCount { stages, .. } = &mut expression.kind else {
+        panic!("string pipeline fixture lost its terminal")
+    };
+    stages[0].kind = hir::StageKind::WhereStrContains {
+        needle: body_test_expr(hir::ExprKind::Int(1), integer),
+    };
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_validator_pipeline_terminals() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let dyn_int = Ty::DynArray(scalar);
+    let mut program = baseline_program();
+    program.imported_fns.extend([
+        imported_fn("dep$terminal_pred", vec![integer], Ty::Bool),
+        imported_fn("dep$terminal_fold", vec![integer, integer], integer),
+        imported_fn("dep$terminal_key", vec![integer], integer),
+        imported_fn("dep$terminal_map", vec![integer], integer),
+    ]);
+    program.tuples.push(TupleDef {
+        elems: vec![Scalar::DynArray(PrimScalar::Int(align_sema::IntTy {
+            bits: 64,
+            signed: true,
+        })); 2],
+    });
+    let partition_tuple = Ty::Tuple(1);
+    let local_source = || body_test_expr(hir::ExprKind::Local(0), dyn_int);
+    let add_pipeline = |program: &mut hir::Program,
+                        name: &str,
+                        expression: hir::Expr,
+                        ret: Ty| {
+        program.fns.push(body_test_parameter_function(
+            name,
+            dyn_int,
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(expression)),
+            },
+            ret,
+        ));
+    };
+    add_pipeline(
+        &mut program,
+        "pipeline_sum",
         body_test_expr(
             hir::ExprKind::ArraySum {
-                source: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+            },
+            integer,
+        ),
+        integer,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_count",
+        body_test_expr(
+            hir::ExprKind::ArrayCount {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+            },
+            integer,
+        ),
+        integer,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_any",
+        body_test_expr(
+            hir::ExprKind::ArrayAnyAll {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                func: "dep$terminal_pred".to_string(),
+                captures: Vec::new(),
+                all: false,
+            },
+            Ty::Bool,
+        ),
+        Ty::Bool,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_minmax",
+        body_test_expr(
+            hir::ExprKind::ArrayMinMax {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                is_max: true,
+            },
+            integer,
+        ),
+        integer,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_reduce",
+        body_test_expr(
+            hir::ExprKind::ArrayReduce {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                func: "dep$terminal_fold".to_string(),
+                captures: Vec::new(),
+                init: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+            },
+            integer,
+        ),
+        integer,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_scan",
+        body_test_expr(
+            hir::ExprKind::ArrayScan {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                func: "dep$terminal_fold".to_string(),
+                captures: Vec::new(),
+                init: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                elem: integer,
+            },
+            Ty::DynArray(scalar),
+        ),
+        Ty::DynArray(scalar),
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_sort",
+        body_test_expr(
+            hir::ExprKind::ArraySort {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                elem: integer,
+            },
+            dyn_int,
+        ),
+        dyn_int,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_sort_by",
+        body_test_expr(
+            hir::ExprKind::ArraySortBy {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                key_func: "dep$terminal_key".to_string(),
+                captures: Vec::new(),
+                key_ty: integer,
+                elem: integer,
+            },
+            dyn_int,
+        ),
+        dyn_int,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_to_array",
+        body_test_expr(
+            hir::ExprKind::ArrayToArray {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                elem: integer,
+            },
+            dyn_int,
+        ),
+        dyn_int,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_partition",
+        body_test_expr(
+            hir::ExprKind::ArrayPartition {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                func: "dep$terminal_pred".to_string(),
+                captures: Vec::new(),
+                elem: integer,
+            },
+            partition_tuple,
+        ),
+        partition_tuple,
+    );
+    add_pipeline(
+        &mut program,
+        "pipeline_par_map",
+        body_test_expr(
+            hir::ExprKind::ArrayParMap {
+                source: Box::new(local_source()),
+                stages: Vec::new(),
+                func: "dep$terminal_map".to_string(),
+                captures: Vec::new(),
+                elem: integer,
+            },
+            dyn_int,
+        ),
+        dyn_int,
+    );
+
+    let array = |value: i128| {
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: vec![
+                    body_test_expr(hir::ExprKind::Int(value), integer),
+                    body_test_expr(hir::ExprKind::Int(value + 1), integer),
+                ],
+                elem: integer,
+                pooled: false,
+            },
+            Ty::Array(scalar, 2),
+        )
+    };
+    program.fns.push(body_tail_case(
+        "pipeline_dot",
+        body_test_expr(
+            hir::ExprKind::ArrayDot {
+                a: Box::new(array(1)),
+                b: Box::new(array(3)),
+                elem: integer,
+            },
+            integer,
+        ),
+        integer,
+    ));
+    let bool_array = body_test_expr(
+        hir::ExprKind::ArrayLit {
+            elems: vec![
+                body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                body_test_expr(hir::ExprKind::Bool(false), Ty::Bool),
+            ],
+            elem: Ty::Bool,
+            pooled: false,
+        },
+        Ty::Array(Scalar::Bool, 2),
+    );
+    program.fns.push(body_tail_case(
+        "pipeline_zip_count",
+        body_test_expr(
+            hir::ExprKind::ArrayCount {
+                source: Box::new(body_test_expr(
+                    hir::ExprKind::ArrayZip {
+                        sources: vec![array(1), bool_array],
+                        tuple_id: 0,
+                    },
+                    Ty::Tuple(0),
+                )),
                 stages: Vec::new(),
             },
             integer,
         ),
         integer,
     ));
-    assert!(!body_core_metadata_is_valid(&program));
+
+    let map_into_source = body_test_expr(hir::ExprKind::Local(0), dyn_int);
+    program.fns.push(body_test_function_with_params(
+        "pipeline_map_into",
+        vec![
+            body_test_local(0, "source", dyn_int, false, true),
+            body_test_local(1, "destination", Ty::Slice(scalar), true, false),
+        ],
+        vec![0],
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArrayMapInto {
+                    source: Box::new(map_into_source),
+                    stages: vec![hir::Stage {
+                        kind: hir::StageKind::Map {
+                            func: "dep$terminal_map".to_string(),
+                            captures: Vec::new(),
+                        },
+                        out_ty: integer,
+                    }],
+                    dst: Box::new(body_test_expr(
+                        hir::ExprKind::Local(1),
+                        Ty::Slice(scalar),
+                    )),
+                    elem: integer,
+                },
+                Ty::Unit,
+            ))),
+        },
+        Ty::Unit,
+    ));
+
+    program.fns.push(body_test_parameter_function(
+        "pipeline_to_soa",
+        Ty::DynStructArray(0, Layout::Aos),
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Arena(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::ArrayToSoa {
+                            source: Box::new(body_test_expr(
+                                hir::ExprKind::Local(0),
+                                Ty::DynStructArray(0, Layout::Aos),
+                            )),
+                            struct_id: 0,
+                        },
+                        Ty::Soa(0),
+                    ))),
+                }),
+                Ty::Soa(0),
+            ))),
+        },
+        Ty::Soa(0),
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_any");
+    let hir::ExprKind::ArrayAnyAll { func, .. } = &mut expression.kind else {
+        panic!("any pipeline fixture lost its terminal")
+    };
+    *func = "".to_string();
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_reduce");
+    let hir::ExprKind::ArrayReduce { init, .. } = &mut expression.kind else {
+        panic!("reduce pipeline fixture lost its terminal")
+    };
+    init.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_sort_by");
+    let hir::ExprKind::ArraySortBy { key_ty, .. } = &mut expression.kind else {
+        panic!("sort-by pipeline fixture lost its terminal")
+    };
+    *key_ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "pipeline_map_into")
+        .expect("map-into fixture")
+        .locals[1]
+        .is_mut = false;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_to_soa");
+    let hir::ExprKind::Arena(block) = &mut expression.kind else {
+        panic!("to-soa fixture lost its arena")
+    };
+    let value = block.value.as_deref_mut().expect("to-soa value");
+    let hir::ExprKind::ArrayToSoa { source, .. } = &mut value.kind else {
+        panic!("to-soa fixture lost its transpose")
+    };
+    source.kind = hir::ExprKind::Local(0);
+    source.ty = Ty::Soa(0);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "pipeline_to_soa");
+    let hir::ExprKind::Arena(block) = &mut expression.kind else {
+        panic!("to-soa fixture lost its arena")
+    };
+    let value = block.value.as_deref_mut().expect("to-soa value");
+    let hir::ExprKind::ArrayToSoa { source, .. } = &mut value.kind else {
+        panic!("to-soa fixture lost its transpose")
+    };
+    **source = body_test_expr(
+        hir::ExprKind::If {
+            cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+            then: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    Ty::DynStructArray(0, Layout::Aos),
+                ))),
+            },
+            els: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    Ty::DynStructArray(0, Layout::Aos),
+                ))),
+            },
+        },
+        Ty::DynStructArray(0, Layout::Aos),
+    );
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut impure = program.clone();
+    impure
+        .imported_fns
+        .iter_mut()
+        .find(|function| function.name == "dep$terminal_map")
+        .expect("par-map callable")
+        .effect = FnEffect::Impure;
+    assert!(body_core_metadata_is_valid(&impure));
+
+    let mut scanner = baseline_program();
+    let scanner_ty = Ty::JsonScanner(0);
+    scanner.fns.push(body_test_parameter_function(
+        "pipeline_scanner_rejected",
+        scanner_ty,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArrayCount {
+                    source: Box::new(body_test_expr(
+                        hir::ExprKind::Local(0),
+                        scanner_ty,
+                    )),
+                    stages: Vec::new(),
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+    assert!(!body_core_metadata_is_valid(&scanner));
 }
 
 #[test]
-fn hir_body_validator_storage_vector_array_deferred_facts_are_not_consumed() {
+fn hir_body_validator_pipeline_array_views() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let dyn_int = Ty::DynArray(scalar);
+    let dyn_record = Ty::DynStructArray(0, Layout::Aos);
+    let mut program = baseline_program();
+    let add = |program: &mut hir::Program,
+               name: &str,
+               expression: hir::Expr,
+               ret: Ty,
+               source_ty: Ty| {
+        program.fns.push(body_test_parameter_function(
+            name,
+            source_ty,
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(expression)),
+            },
+            ret,
+        ));
+    };
+    add(
+        &mut program,
+        "array_view_to_slice",
+        body_test_expr(
+            hir::ExprKind::ArrayToSlice(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                dyn_int,
+            ))),
+            Ty::Slice(scalar),
+        ),
+        Ty::Slice(scalar),
+        dyn_int,
+    );
+    add(
+        &mut program,
+        "array_view_fixed_to_slice",
+        body_test_expr(
+            hir::ExprKind::ArrayToSlice(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                Ty::Array(scalar, 2),
+            ))),
+            Ty::Slice(scalar),
+        ),
+        Ty::Slice(scalar),
+        Ty::Array(scalar, 2),
+    );
+    add(
+        &mut program,
+        "array_view_slice_len",
+        body_test_expr(
+            hir::ExprKind::Len(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                Ty::Slice(scalar),
+            ))),
+            integer,
+        ),
+        integer,
+        Ty::Slice(scalar),
+    );
+    add(
+        &mut program,
+        "array_view_soa_len",
+        body_test_expr(
+            hir::ExprKind::Len(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                Ty::Soa(0),
+            ))),
+            integer,
+        ),
+        integer,
+        Ty::Soa(0),
+    );
+    add(
+        &mut program,
+        "array_view_len",
+        body_test_expr(
+            hir::ExprKind::Len(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                dyn_int,
+            ))),
+            integer,
+        ),
+        integer,
+        dyn_int,
+    );
+    add(
+        &mut program,
+        "array_view_index",
+        body_test_expr(
+            hir::ExprKind::Index {
+                recv: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
+                index: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+            },
+            integer,
+        ),
+        integer,
+        dyn_int,
+    );
+    add(
+        &mut program,
+        "array_view_range",
+        body_test_expr(
+            hir::ExprKind::SliceRange {
+                recv: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
+                start: Some(Box::new(body_test_expr(hir::ExprKind::Int(0), integer))),
+                end: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
+            },
+            Ty::Slice(scalar),
+        ),
+        Ty::Slice(scalar),
+        dyn_int,
+    );
+    add(
+        &mut program,
+        "array_view_elem_field",
+        body_test_expr(
+            hir::ExprKind::ElemField {
+                recv: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_record)),
+                index: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                path: vec![1],
+                struct_id: 0,
+            },
+            integer,
+        ),
+        integer,
+        dyn_record,
+    );
+    add(
+        &mut program,
+        "array_view_chunks",
+        body_test_expr(
+            hir::ExprKind::ArrayChunks {
+                source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
+                n: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                elem: integer,
+            },
+            Ty::DynSliceArray(PrimScalar::Int(align_sema::IntTy {
+                bits: 64,
+                signed: true,
+            })),
+        ),
+        Ty::DynSliceArray(PrimScalar::Int(align_sema::IntTy {
+            bits: 64,
+            signed: true,
+        })),
+        dyn_int,
+    );
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "array_view_index");
+    let hir::ExprKind::Index { index, .. } = &mut expression.kind else {
+        panic!("index fixture lost its node")
+    };
+    index.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "array_view_range");
+    let hir::ExprKind::SliceRange { end, .. } = &mut expression.kind else {
+        panic!("range fixture lost its node")
+    };
+    end.as_deref_mut().expect("range end").ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "array_view_elem_field");
+    let hir::ExprKind::ElemField { path, .. } = &mut expression.kind else {
+        panic!("element-field fixture lost its node")
+    };
+    *path = vec![9];
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "array_view_chunks");
+    let hir::ExprKind::ArrayChunks { n, .. } = &mut expression.kind else {
+        panic!("chunks fixture lost its node")
+    };
+    n.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_validator_pipeline_control_flow() {
+    let integer = int(64);
+    let dyn_int = Ty::DynArray(scalar_int(64));
+    let mut program = baseline_program();
+    program.imported_fns.push(imported_fn(
+        "dep$control_map",
+        vec![integer, integer],
+        integer,
+    ));
+    let source = body_test_expr(
+        hir::ExprKind::If {
+            cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+            then: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    dyn_int,
+                ))),
+            },
+            els: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    dyn_int,
+                ))),
+            },
+        },
+        dyn_int,
+    );
+    program.fns.push(body_test_parameter_function(
+        "pipeline_if_source",
+        dyn_int,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArrayCount {
+                    source: Box::new(source),
+                    stages: Vec::new(),
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+
+    let malformed_capture = body_test_expr(
+        hir::ExprKind::Int(0),
+        Ty::Int(IntTy {
+            bits: 0,
+            signed: true,
+        }),
+    );
+    let diverging_source = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: Vec::new(),
+                value: None,
+            },
+            diverges: true,
+            body_locals: 0..0,
+        },
+        dyn_int,
+    );
+    let mut reject = baseline_program();
+    reject.imported_fns.push(imported_fn(
+        "dep$control_map",
+        vec![integer, integer],
+        integer,
+    ));
+    reject.fns.push(body_test_parameter_function(
+        "pipeline_retained_child",
+        dyn_int,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArraySum {
+                    source: Box::new(diverging_source),
+                    stages: vec![hir::Stage {
+                        kind: hir::StageKind::Map {
+                            func: "dep$control_map".to_string(),
+                            captures: vec![malformed_capture],
+                        },
+                        out_ty: integer,
+                    }],
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn deep_hir_body_pipeline_type_dag_is_stack_bounded() {
+    let program = with_stage_body_depth(align_sema::MAX_CHECKED_HIR_DEPTH);
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || assert!(body_core_metadata_is_valid(&program)))
+        .expect("spawn deep pipeline body validator");
+    handle.join().expect("join deep pipeline body validator");
+}
+
+#[test]
+fn hir_body_validator_pipeline_deferred_b2b2() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let string = body_test_expr(hir::ExprKind::Str("x".to_string()), Ty::Str);
+    let number = body_test_expr(hir::ExprKind::Int(1), integer);
+    let unit = body_test_expr(hir::ExprKind::Unit, Ty::Unit);
+    let template_parts = vec![
+        hir::TemplatePart::Text("x".to_string()),
+        hir::TemplatePart::Hole(number.clone()),
+        hir::TemplatePart::JsonStr(string.clone()),
+        hir::TemplatePart::OptionField {
+            access: unit.clone(),
+            name: "x".to_string(),
+        },
+        hir::TemplatePart::OptionStructField {
+            access: unit.clone(),
+            name: "record".to_string(),
+            struct_id: 0,
+        },
+        hir::TemplatePart::PopComma,
+        hir::TemplatePart::StructArrayField {
+            access: unit.clone(),
+            struct_id: 0,
+        },
+        hir::TemplatePart::ScalarArrayField {
+            access: unit.clone(),
+            elem: scalar,
+        },
+        hir::TemplatePart::UnionValue {
+            access: unit.clone(),
+            enum_id: 0,
+        },
+    ];
+    let mut cases = vec![hir::ExprKind::Template(template_parts)];
+    cases.extend([
+        hir::ExprKind::JsonDecode {
+            struct_id: 0,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDecodeArray {
+            elem: integer,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDecodeScalar {
+            scalar: integer,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDecodeStructArray {
+            struct_id: 0,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDecodeSoa {
+            struct_id: 0,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDecodeUnion {
+            enum_id: 0,
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDoc {
+            input: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDocKind {
+            doc: Box::new(unit.clone()),
+        },
+        hir::ExprKind::JsonDocGet {
+            doc: Box::new(unit.clone()),
+            key: Box::new(string.clone()),
+        },
+        hir::ExprKind::JsonDocAt {
+            doc: Box::new(unit.clone()),
+            index: Box::new(number.clone()),
+        },
+        hir::ExprKind::JsonDocAsStr {
+            doc: Box::new(unit.clone()),
+        },
+        hir::ExprKind::JsonDocAsScalar {
+            doc: Box::new(unit.clone()),
+            scalar: integer,
+        },
+        hir::ExprKind::JsonDocLen {
+            doc: Box::new(unit.clone()),
+        },
+        hir::ExprKind::JsonDocKey {
+            doc: Box::new(unit.clone()),
+            index: Box::new(number.clone()),
+        },
+        hir::ExprKind::JsonDocElems {
+            doc: Box::new(unit.clone()),
+        },
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(string.clone()),
+        },
+    ]);
+    for source in [
+        hir::GroupSource::SoaI64,
+        hir::GroupSource::SoaStr,
+        hir::GroupSource::AosStr,
+        hir::GroupSource::Encoded,
+    ] {
+        for value_field in [None, Some(1)] {
+            for op in [
+                hir::GroupOp::Sum,
+                hir::GroupOp::Min,
+                hir::GroupOp::Max,
+                hir::GroupOp::Count,
+            ] {
+                cases.push(hir::ExprKind::ArrayGroupAgg {
+                    base: 0,
+                    struct_id: 0,
+                    key_field: 0,
+                    value_field,
+                    op,
+                    source,
+                });
+                cases.push(hir::ExprKind::ArrayGroupAggMulti {
+                    base: 0,
+                    struct_id: 0,
+                    key_field: 0,
+                    aggs: vec![hir::GroupAgg1 { op, value_field }],
+                    source,
+                });
+            }
+        }
+    }
+    cases.push(hir::ExprKind::ArrayDictEncode {
+        base: 0,
+        struct_id: 0,
+        key_field: 0,
+    });
+
+    for (index, kind) in cases.into_iter().enumerate() {
+        let mut program = baseline_program();
+        program.fns.push(body_tail_case(
+            &format!("deferred_b2b2_{index}"),
+            body_test_expr(kind, Ty::Unit),
+            Ty::Unit,
+        ));
+        assert!(
+            !body_core_metadata_is_valid(&program),
+            "deferred b2b2 discriminator {index} was accepted"
+        );
+    }
+}
+
+#[test]
+fn hir_body_validator_pipeline_deferred_facts_are_not_consumed() {
     let integer = int(64);
     let scalar = scalar_int(64);
     let mut program = baseline_program();

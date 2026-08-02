@@ -519,11 +519,13 @@ The result formula in every row is followed by the universal
 
 ## Expression ledger: am-b2
 
-The am-b2 implementation is delivered in two contiguous dormant-validator slices. Am-b2a owns
-`ExprKind::ArrayLit` through `ExprKind::VecLit`; am-b2b owns `ExprKind::ArraySum` through
-`ExprKind::ArrayDictEncode` plus all nested `StageKind`, `TemplatePart`, `GroupSource`, `GroupAgg1`,
-and `GroupOp` records. Neither slice activates public HIR validation; am-b4 owns the assembled
-activation and body-derived ownership/effect correlation.
+The am-b2 implementation is delivered in contiguous dormant-validator slices. Am-b2a owns
+`ExprKind::ArrayLit` through `ExprKind::VecLit`; am-b2b1 owns `ExprKind::ArraySum` through
+`ExprKind::ElemField` plus all `StageKind`; am-b2b2 owns `ExprKind::Template` through
+`ExprKind::ArrayDictEncode` plus all nested `TemplatePart`, `GroupSource`, `GroupAgg1`, and
+`GroupOp` records. Neither slice activates public HIR validation; am-b4 owns the assembled
+activation and body-derived ownership/effect correlation. The b2b1 checkpoint leaves b2b2
+records fail-closed.
 
 For this range, `ERR(T)` means `Result(payload(T), Scalar::Enum(error_enum_id))`
 using the already validated builtin Error definition. `PIPE(source,stages)`
@@ -566,7 +568,7 @@ means:
 | `ArrayToSoa` | `env[struct_id]`: in-range nonempty SoA-admissible flat struct and the expression is lexically inside an active arena. `child[source]`; `post[source fixed/dynamic StructArray(struct_id); result Soa(struct_id); source borrowed; result storage belongs to that exact active arena]`. |
 | `ArrayMapInto` | `env[stages,elem]`: elem is admitted Copy scalar and every stage is length-preserving (`Map`/`Project`, no filter). `child[source,stage children,dst]`; `post[PIPE final element elem; dst writable Slice(elem), exact equal-length runtime contract and semantic no-alias proof; result Unit; dst mutated, no allocation]`. |
 | `ArrayPartition` | `env[stages,func,elem,captures.len]`: predicate resolves. `child[source,stage children,captures]`; `post[PIPE final element elem; predicate params elem,captures→Bool; result is exact interned tuple (DynArray(elem),DynArray(elem)); two owned allocations]`. |
-| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and complete reachable effect is Pure. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
+| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and its structural signature is exact; the `complete reachable effect == Pure` requirement is an am-b4 producer fact, not consumed by the dormant am-b2b1 body slice. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
 | `ArrayChunks` | `env[elem]`: primitive Copy scalar. `child[source,n]`; `post[source fixed/dynamic array or Slice(elem), n i64; result DynSliceArray(prim(elem)); owned header array whose elements view source; source remains live]`. |
 | `ArrayToSlice` | `env[]`; `child[array]`; `post[array is fixed Array(s,n), fixed StructArray(id,n), DynArray(s), or AoS DynStructArray(id); fixed sources are Local or ArrayLit, element identity is exact, and result is matching Slice(s/Struct(id)); view borrows array storage, no allocation]`. |
 | `Len` | `env[]`; `child[recv]`; `post[recv is exactly Str, String, Slice(_), DynArray(_), DynStructArray(_,_), DynSliceArray(_), DynResponseArray, or Soa(_); result i64; recv borrowed. Fixed-array lengths are Int literals and never Len records]`. |

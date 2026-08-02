@@ -8,8 +8,10 @@ per-PR journal is preserved in
 _Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`). The next implementation slice is am-b2a storage/vector/array body validation;
-there is no resumable feature branch for the completed am-b1 work.
+(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The next
+implementation slice is am-b2b1 pipeline and array-view body validation; b2b2 then owns
+templates, JSON, and group/dictionary records. There is no resumable feature branch for the
+completed am-b2a work.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -107,6 +109,7 @@ facts must live in this repository.
 #686  native output-buffer local/mutability validation
 #688  lexical extern invocation permission and non-escaping extern-call closure (am-u)
 #694  dormant am-b1 body-core validator and owner matrix
+#695  dormant am-b2a storage/vector/array validator and owner matrix
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -493,9 +496,35 @@ successful compile and benchmark evidence rather than treated as a test pass.
 
 PR #694 completes the dormant am-b1 body-core validator: statements, ordinary expressions,
 calls, aggregates, tagged values, and structured control are checked through an explicit
-child-first worklist without public activation. Its owner tests and closure matrix are merged;
-am-b2a is the next implementation slice for storage/vector/array body records; am-b2b then adds
-pipeline/template/JSON/group records, followed by am-b3, am-b4, and am-c typed callable namespaces.
+child-first worklist without public activation. PR #695 adds the dormant am-b2a
+storage/vector/array records. The next slice is am-b2b1 for pipeline and array-view records;
+am-b2b2 then adds templates, JSON, groups, and dictionary records, followed by am-b3, am-b4,
+and am-c typed callable namespaces.
+
+### am-b2b1 working checkpoint (2026-08-02)
+
+The current `feat/am-b2b-pipeline-validator` branch extends the same dormant body worklist through
+pipeline stages, fused terminals, array views/chunks, and `ArrayToSoa`; b2b2 records remain
+fail-closed. The closure matrix is in `docs/impl/17-library-boundary-prerequisites.md`, and the
+ledger split is in `docs/impl/19-hir-validation-ledger.md`. Owner tests are
+`hir_body_validator_pipeline_stage_records`, `hir_body_validator_pipeline_terminals`,
+`hir_body_validator_pipeline_array_views`, `hir_body_validator_pipeline_control_flow`,
+`hir_body_validator_pipeline_deferred_b2b2`,
+`hir_body_validator_pipeline_deferred_facts_are_not_consumed`, and
+`deep_hir_body_pipeline_type_dag_is_stack_bounded`.
+
+The test target compiled with `cargo check -p align_mir --tests --locked`, and focused Clippy passed
+with `cargo clippy -p align_mir --all-targets --locked -- -D warnings`. The focused runtime test
+invocation compiled but the macOS ARM test process paused in `_dyld_start` at 0% CPU for about one
+minute and was stopped; it is recorded in `.git/align-am-b2b1-test-2026-08-02.log` and is not a
+test pass or a CLEAN verdict. Do not rerun the same broad invocation solely because it stopped;
+continue with the static checks and one bounded final review after the source/test diff is stable.
+The current `crates/` delta is about 2,057 hand-written lines, above the ordinary 500-line target
+and the 1,000-line split threshold. This checkpoint keeps it atomic because the range shares one
+`derive_expression` dispatch, one child-ordering helper, and one source/stage/terminal type
+thread; splitting those into temporary validator paths would leave an incomplete contract or a
+second implementation path. The closure matrix and owner tests cover the whole closed range, and
+no second broad review should be started merely because the diff is large.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

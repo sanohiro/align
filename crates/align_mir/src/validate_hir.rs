@@ -2774,6 +2774,36 @@ impl<'a> BodyValidator<'a> {
                         .ok()
                         .is_some_and(valid_vector_lanes)
             }
+            hir::ExprKind::ArraySum { stages, .. }
+            | hir::ExprKind::ArrayCount { stages, .. }
+            | hir::ExprKind::ArrayMinMax { stages, .. }
+            | hir::ExprKind::ArrayReduce { stages, .. }
+            | hir::ExprKind::ArrayScan { stages, .. }
+            | hir::ExprKind::ArraySort { stages, .. }
+            | hir::ExprKind::ArraySortBy { stages, .. }
+            | hir::ExprKind::ArrayToArray { stages, .. }
+            | hir::ExprKind::ArrayMapInto { stages, .. }
+            | hir::ExprKind::ArrayPartition { stages, .. }
+            | hir::ExprKind::ArrayParMap { stages, .. } => {
+                self.pipeline_stages_envelope_ok(stages)
+            }
+            hir::ExprKind::ArrayAnyAll { stages, func, .. } => {
+                valid_declaration_name(func) && self.pipeline_stages_envelope_ok(stages)
+            }
+            hir::ExprKind::ArrayDot { elem, .. } => self.body_ty_ok(*elem),
+            hir::ExprKind::ArrayToSoa { struct_id, .. } => {
+                self.program.structs.get(*struct_id as usize).is_some()
+            }
+            hir::ExprKind::ArrayChunks { elem, .. } => self.body_ty_ok(*elem),
+            hir::ExprKind::ArrayToSlice(_)
+            | hir::ExprKind::Len(_)
+            | hir::ExprKind::Index { .. }
+            | hir::ExprKind::SliceRange { .. } => true,
+            hir::ExprKind::ElemField {
+                path, struct_id, ..
+            } => {
+                !path.is_empty() && self.program.structs.get(*struct_id as usize).is_some()
+            }
             hir::ExprKind::FnValue(name) => valid_declaration_name(name),
             hir::ExprKind::Closure { lifted, .. } => valid_declaration_name(lifted),
             hir::ExprKind::EnumValue {
@@ -3155,6 +3185,100 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(index, context.clone());
                 push_expr!(dst, context.clone());
             }
+            hir::ExprKind::ArraySum { source, stages }
+            | hir::ExprKind::ArrayCount { source, stages }
+            | hir::ExprKind::ArrayMinMax { source, stages, .. }
+            | hir::ExprKind::ArraySort { source, stages, .. }
+            | hir::ExprKind::ArrayToArray { source, stages, .. }
+            | hir::ExprKind::ArrayParMap { source, stages, .. }
+            | hir::ExprKind::ArrayPartition { source, stages, .. } => {
+                self.push_pipeline_children(source, stages, &[], context, work);
+            }
+            hir::ExprKind::ArrayAnyAll {
+                source,
+                stages,
+                captures,
+                ..
+            } => {
+                self.push_pipeline_children(source, stages, captures, context, work);
+            }
+            hir::ExprKind::ArrayReduce {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            }
+            | hir::ExprKind::ArrayScan {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            } => {
+                self.push_pipeline_children_with_tail(
+                    source,
+                    stages,
+                    &[init.as_ref()],
+                    captures,
+                    context,
+                    work,
+                );
+            }
+            hir::ExprKind::ArraySortBy {
+                source,
+                stages,
+                captures,
+                ..
+            } => {
+                self.push_pipeline_children(source, stages, captures, context, work);
+            }
+            hir::ExprKind::ArrayMapInto {
+                source,
+                stages,
+                dst,
+                ..
+            } => {
+                self.push_pipeline_children_with_tail(
+                    source,
+                    stages,
+                    &[dst.as_ref()],
+                    &[],
+                    context,
+                    work,
+                );
+            }
+            hir::ExprKind::ArrayToSoa { source, .. } => {
+                push_expr!(source, context.clone());
+            }
+            hir::ExprKind::ArrayDot { a, b, .. } => {
+                push_expr!(b, context.clone());
+                push_expr!(a, context.clone());
+            }
+            hir::ExprKind::ArrayChunks { source, n, .. } => {
+                push_expr!(n, context.clone());
+                push_expr!(source, context.clone());
+            }
+            hir::ExprKind::ArrayToSlice(source) | hir::ExprKind::Len(source) => {
+                push_expr!(source, context.clone());
+            }
+            hir::ExprKind::Index { recv, index } => {
+                push_expr!(index, context.clone());
+                push_expr!(recv, context.clone());
+            }
+            hir::ExprKind::SliceRange { recv, start, end } => {
+                if let Some(end) = end {
+                    push_expr!(end, context.clone());
+                }
+                if let Some(start) = start {
+                    push_expr!(start, context.clone());
+                }
+                push_expr!(recv, context.clone());
+            }
+            hir::ExprKind::ElemField { recv, index, .. } => {
+                push_expr!(index, context.clone());
+                push_expr!(recv, context.clone());
+            }
             hir::ExprKind::Unit
             | hir::ExprKind::Int(_)
             | hir::ExprKind::Float(_)
@@ -3171,6 +3295,63 @@ impl<'a> BodyValidator<'a> {
             => {}
             _ => {}
         }
+    }
+
+    fn push_pipeline_children(
+        &self,
+        source: &'a hir::Expr,
+        stages: &'a [hir::Stage],
+        terminal_captures: &'a [hir::Expr],
+        context: &BodyContext,
+        work: &mut Vec<BodyWork<'a>>,
+    ) {
+        self.push_pipeline_children_with_tail(
+            source,
+            stages,
+            &[],
+            terminal_captures,
+            context,
+            work,
+        );
+    }
+
+    fn push_pipeline_children_with_tail(
+        &self,
+        source: &'a hir::Expr,
+        stages: &'a [hir::Stage],
+        terminal_args: &[&'a hir::Expr],
+        terminal_captures: &'a [hir::Expr],
+        context: &BodyContext,
+        work: &mut Vec<BodyWork<'a>>,
+    ) {
+        macro_rules! push_expr {
+            ($child:expr) => {{
+                let mut child_context = context.clone();
+                child_context.pooled_initializer = None;
+                work.push(BodyWork::EnterExpr($child, child_context));
+            }};
+        }
+        // The worklist is LIFO. Push terminal captures first, then stage children in reverse, and
+        // source last so the observed order is source → stages → terminal operands/captures.
+        for capture in terminal_captures.iter().rev() {
+            push_expr!(capture);
+        }
+        for argument in terminal_args.iter().rev() {
+            push_expr!(*argument);
+        }
+        for stage in stages.iter().rev() {
+            match &stage.kind {
+                hir::StageKind::Map { captures, .. }
+                | hir::StageKind::Where { captures, .. } => {
+                    for capture in captures.iter().rev() {
+                        push_expr!(capture);
+                    }
+                }
+                hir::StageKind::WhereStrContains { needle } => push_expr!(needle),
+                hir::StageKind::WhereField { .. } | hir::StageKind::Project { .. } => {}
+            }
+        }
+        push_expr!(source);
     }
 
     fn finish_expression(&mut self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -3962,8 +4143,855 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(builder)?;
                 (flow.ty == Ty::Builder).then_some((Ty::String, flow.falls, flow.breaks))
             }
+            _ => self.derive_pipeline_expression(expression, context),
+        }
+    }
+
+    fn pipeline_stages_envelope_ok(&self, stages: &[hir::Stage]) -> bool {
+        stages.iter().all(|stage| {
+            self.body_ty_ok(stage.out_ty)
+                && match &stage.kind {
+                    hir::StageKind::Map { func, .. }
+                    | hir::StageKind::Where { func, .. } => valid_declaration_name(func),
+                    hir::StageKind::WhereField { .. }
+                    | hir::StageKind::WhereStrContains { .. }
+                    | hir::StageKind::Project { .. } => true,
+                }
+        })
+    }
+
+    fn pipeline_source_element(
+        &self,
+        source: &hir::Expr,
+        source_ty: Ty,
+    ) -> Option<Ty> {
+        match source_ty {
+            Ty::Array(scalar, _)
+            | Ty::Slice(scalar)
+            | Ty::DynArray(scalar) => Some(align_sema::scalar_to_ty(scalar)),
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => {
+                Some(Ty::Struct(id))
+            }
+            Ty::DynSliceArray(primitive) => {
+                Some(Ty::Slice(align_sema::prim_to_scalar(primitive)))
+            }
+            Ty::Tuple(id) if matches!(source.kind, hir::ExprKind::ArrayZip { .. }) => {
+                self.program.tuples.get(id as usize).and_then(|tuple| {
+                    tuple
+                        .elems
+                        .iter()
+                        .all(|scalar| self.scalar_copy_ok(*scalar))
+                        .then_some(source_ty)
+                })
+            }
+            Ty::Tuple(_) => None,
+            // A scanner is owned by the later JSON slice. Keeping it out here also prevents the
+            // array reducers from taking the Result<T, Error> scanner ABI by accident.
+            Ty::JsonScanner(_)
+            | Ty::DynStructArray(_, Layout::Soa)
+            | Ty::DynResponseArray
+            | Ty::Unit
+            | Ty::Str
+            | Ty::String
+            | Ty::Struct(_)
+            | Ty::Vec(_, _)
+            | Ty::Mask(_, _)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Float(_)
+            | Ty::Int(_)
+            | Ty::Raw
+            | Ty::Option(_)
+            | Ty::Result(_, _)
+            | Ty::Tagged(_)
+            | Ty::Box(_)
+            | Ty::Fn(_)
+            | Ty::Enum(_)
+            | Ty::Task(_)
+            | Ty::ArenaHandle
+            | Ty::Builder
+            | Ty::ArrayBuilder(_)
+            | Ty::JsonDoc
+            | Ty::DictEncoded(_, _)
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::HttpHeaders
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::FloatVar(_)
+            | Ty::StrFinder
+            | Ty::Error => None,
+        }
+    }
+
+    fn pipeline_callable_ok(
+        &self,
+        func: &str,
+        captures: &[hir::Expr],
+        capture_flows: &[BodyFlow],
+        input: Ty,
+        output: Ty,
+        context: &BodyContext,
+    ) -> bool {
+        let Some(signature) = self.resolve_signature(func) else {
+            return false;
+        };
+        if signature.is_extern && context.unsafe_depth == 0 {
+            return false;
+        }
+        if signature.modes.len() != signature.params.len()
+            || signature.modes.iter().any(|mode| *mode != align_ast::ParamMode::ByValue)
+            || capture_flows.len() != captures.len()
+            || capture_flows.iter().zip(captures).any(|(flow, capture)| {
+                flow.ty != capture.ty || !self.ty_copy_ok(flow.ty, context)
+            })
+            || !self.ty_copy_ok(input, context)
+            || !self.ty_copy_ok(output, context)
+        {
+            return false;
+        }
+        let mut expected = Vec::with_capacity(1 + captures.len());
+        expected.push(input);
+        expected.extend(capture_flows.iter().map(|flow| flow.ty));
+        if signature.params != expected || signature.ret != output {
+            return false;
+        }
+        match signature.origin {
+            Some(hir::FnOrigin::Lifted { capture_count }) => {
+                usize::try_from(capture_count).ok() == Some(captures.len())
+            }
+            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+        }
+    }
+
+    fn pipeline_prefix(
+        &self,
+        source: &hir::Expr,
+        stages: &[hir::Stage],
+        context: &BodyContext,
+    ) -> Option<(Ty, Vec<BodyFlow>)> {
+        let source_flow = self.expr_flow(source)?;
+        let source_ty = source_flow.ty;
+        let current_source = self.pipeline_source_element(source, source_ty)?;
+        let needs_var = matches!(
+            source_ty,
+            Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..) | Ty::Soa(_)
+        );
+        if needs_var
+            && !matches!(
+                source.kind,
+                hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+            )
+        {
+            return None;
+        }
+        let slot_backed = matches!(
+            source_ty,
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Soa(_)
+        );
+        let mut current = current_source;
+        let mut mapped = false;
+        let mut flows = vec![source_flow];
+        for stage in stages {
+            let stage_flows = match &stage.kind {
+                hir::StageKind::Map { captures, .. }
+                | hir::StageKind::Where { captures, .. } => self.expr_flows(captures)?,
+                hir::StageKind::WhereStrContains { needle } => {
+                    vec![self.expr_flow(needle)?]
+                }
+                hir::StageKind::WhereField { .. } | hir::StageKind::Project { .. } => Vec::new(),
+            };
+            flows.extend(stage_flows.iter().cloned());
+            current = self.pipeline_stage_output(
+                source_ty,
+                current,
+                slot_backed,
+                &mut mapped,
+                stage,
+                &stage_flows,
+                context,
+            )?;
+        }
+        Some((current, flows))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_stage_output(
+        &self,
+        source_ty: Ty,
+        current: Ty,
+        slot_backed: bool,
+        mapped: &mut bool,
+        stage: &hir::Stage,
+        capture_flows: &[BodyFlow],
+        context: &BodyContext,
+    ) -> Option<Ty> {
+        match &stage.kind {
+            hir::StageKind::Map { func, captures } => {
+                if matches!(source_ty, Ty::Soa(_)) && matches!(current, Ty::Struct(_)) {
+                    return None;
+                }
+                if !self.pipeline_callable_ok(
+                    func,
+                    captures,
+                    capture_flows,
+                    current,
+                    stage.out_ty,
+                    context,
+                ) {
+                    return None;
+                }
+                *mapped = true;
+                Some(stage.out_ty)
+            }
+            hir::StageKind::Where { func, captures } => {
+                if matches!(source_ty, Ty::Soa(_)) && matches!(current, Ty::Struct(_)) {
+                    return None;
+                }
+                if stage.out_ty != current
+                    || !self.pipeline_callable_ok(
+                        func,
+                        captures,
+                        capture_flows,
+                        current,
+                        Ty::Bool,
+                        context,
+                    )
+                {
+                    return None;
+                }
+                Some(current)
+            }
+            hir::StageKind::WhereField { field } => {
+                let Ty::Struct(id) = current else { return None };
+                if *mapped || !slot_backed || stage.out_ty != current {
+                    return None;
+                }
+                let field_ty = self
+                    .program
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(*field as usize)?
+                    .ty;
+                (field_ty == Ty::Bool).then_some(current)
+            }
+            hir::StageKind::WhereStrContains { needle } => {
+                if current != Ty::Str || stage.out_ty != Ty::Str || capture_flows.len() != 1 {
+                    return None;
+                }
+                (capture_flows[0].ty == needle.ty && needle.ty == Ty::Str).then_some(current)
+            }
+            hir::StageKind::Project { field } => {
+                let Ty::Struct(id) = current else { return None };
+                if *mapped || !slot_backed {
+                    return None;
+                }
+                let field_ty = self
+                    .program
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(*field as usize)?
+                    .ty;
+                (stage.out_ty == field_ty).then_some(field_ty)
+            }
+        }
+    }
+
+    fn derive_pipeline_expression(
+        &self,
+        expression: &hir::Expr,
+        context: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let kind = &expression.kind;
+        match kind {
+            hir::ExprKind::ArraySum { source, stages } => {
+                let (elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                if !numeric_body_ty(elem) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((elem, falls, breaks))
+            }
+            hir::ExprKind::ArrayCount { source, stages } => {
+                let (_, flows) = self.pipeline_prefix(source, stages, context)?;
+                let (falls, breaks) = strict_flow(&flows);
+                Some((i64_ty(), falls, breaks))
+            }
+            hir::ExprKind::ArrayAnyAll {
+                source,
+                stages,
+                func,
+                captures,
+                ..
+            } => {
+                let (elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if !self.ty_copy_ok(elem, context)
+                    || align_sema::ty_to_scalar(elem).is_none()
+                {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_callable_ok(
+                    func,
+                    captures,
+                    &capture_flows,
+                    elem,
+                    Ty::Bool,
+                    context,
+                ) {
+                    return None;
+                }
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Bool, falls, breaks))
+            }
+            hir::ExprKind::ArrayMinMax { source, stages, .. } => {
+                let (elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                if !numeric_body_ty(elem) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((elem, falls, breaks))
+            }
+            hir::ExprKind::ArrayReduce {
+                source,
+                stages,
+                func,
+                captures,
+                init,
+            } => {
+                let (elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let init_flow = self.expr_flow(init)?;
+                if !self.ty_copy_ok(elem, context) || !self.ty_copy_ok(init_flow.ty, context) {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_reducer_callable_ok(
+                    func,
+                    captures,
+                    &capture_flows,
+                    init_flow.ty,
+                    elem,
+                    init_flow.ty,
+                    context,
+                ) {
+                    return None;
+                }
+                flows.push(init_flow);
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((init.ty, falls, breaks))
+            }
+            hir::ExprKind::ArrayScan {
+                source,
+                stages,
+                func,
+                captures,
+                init,
+                elem: output_elem,
+            } => {
+                let (input_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let init_flow = self.expr_flow(init)?;
+                let output_scalar = align_sema::ty_to_scalar(*output_elem)
+                    .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some());
+                if init_flow.ty != *output_elem
+                    || !self.ty_copy_ok(input_elem, context)
+                    || !self.ty_copy_ok(*output_elem, context)
+                    || output_scalar.is_none()
+                {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_reducer_callable_ok(
+                    func,
+                    captures,
+                    &capture_flows,
+                    *output_elem,
+                    input_elem,
+                    *output_elem,
+                    context,
+                ) {
+                    return None;
+                }
+                flows.push(init_flow);
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((
+                    Ty::DynArray(output_scalar?),
+                    falls,
+                    breaks,
+                ))
+            }
+            hir::ExprKind::ArrayDot { a, b, elem } => {
+                let left = self.expr_flow(a)?;
+                let right = self.expr_flow(b)?;
+                let (left_scalar, left_len) = fixed_array_shape(a, left.ty)?;
+                let (right_scalar, right_len) = fixed_array_shape(b, right.ty)?;
+                if left_scalar != right_scalar
+                    || left_len != right_len
+                    || align_sema::scalar_to_ty(left_scalar) != *elem
+                    || !numeric_body_ty(*elem)
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[left, right]);
+                Some((*elem, falls, breaks))
+            }
+            hir::ExprKind::ArraySort { source, stages, elem } => {
+                let (final_elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                if final_elem != *elem
+                    || !numeric_body_ty(final_elem)
+                    || !self.scalar_copy_ok(scalar)
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::DynArray(scalar), falls, breaks))
+            }
+            hir::ExprKind::ArraySortBy {
+                source,
+                stages,
+                key_func,
+                captures,
+                key_ty,
+                elem,
+            } => {
+                let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                if final_elem != *elem
+                    || align_sema::scalar_to_prim(scalar).is_none()
+                    || !self.scalar_copy_ok(scalar)
+                    || !orderable_body_ty(*key_ty)
+                {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_callable_ok(
+                    key_func,
+                    captures,
+                    &capture_flows,
+                    final_elem,
+                    *key_ty,
+                    context,
+                ) {
+                    return None;
+                }
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::DynArray(scalar), falls, breaks))
+            }
+            hir::ExprKind::ArrayToArray { source, stages, elem } => {
+                let (final_elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                if final_elem != *elem || !self.ty_copy_ok(final_elem, context) {
+                    return None;
+                }
+                let result = self.array_to_array_result(final_elem)?;
+                let (falls, breaks) = strict_flow(&flows);
+                Some((result, falls, breaks))
+            }
+            hir::ExprKind::ArrayToSoa { source, struct_id } => {
+                if context.arena_depth == 0 {
+                    return None;
+                }
+                let source_flow = self.expr_flow(source)?;
+                if !matches!(
+                    source.kind,
+                    hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                ) {
+                    return None;
+                }
+                let source_struct_id = match source_flow.ty {
+                    Ty::StructArray(id, _)
+                    | Ty::DynStructArray(id, Layout::Aos) => Some(id),
+                    _ => None,
+                };
+                if source_struct_id != Some(*struct_id) {
+                    return None;
+                }
+                if !self.soa_struct_ok(*struct_id) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[source_flow]);
+                Some((Ty::Soa(*struct_id), falls, breaks))
+            }
+            hir::ExprKind::ArrayMapInto {
+                source,
+                stages,
+                dst,
+                elem,
+            } => {
+                let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let dst_flow = self.expr_flow(dst)?;
+                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                let Ty::Slice(dst_scalar) = dst_flow.ty else { return None };
+                if final_elem != *elem
+                    || scalar != dst_scalar
+                    || !self.scalar_copy_ok(scalar)
+                    || !stages.iter().all(|stage| {
+                        matches!(
+                            stage.kind,
+                            hir::StageKind::Map { .. } | hir::StageKind::Project { .. }
+                        )
+                    })
+                    || !self.out_arg_is_writable(context, std::slice::from_ref(dst), 0)
+                {
+                    return None;
+                }
+                flows.push(dst_flow);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Unit, falls, breaks))
+            }
+            hir::ExprKind::ArrayPartition {
+                source,
+                stages,
+                func,
+                captures,
+                elem,
+            } => {
+                let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                let primitive = align_sema::scalar_to_prim(scalar)?;
+                if final_elem != *elem || !self.scalar_copy_ok(scalar) {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_callable_ok(
+                    func,
+                    captures,
+                    &capture_flows,
+                    final_elem,
+                    Ty::Bool,
+                    context,
+                ) {
+                    return None;
+                }
+                let tuple = match expression.ty {
+                    Ty::Tuple(id) => self.program.tuples.get(id as usize)?,
+                    _ => return None,
+                };
+                let expected = [Scalar::DynArray(primitive), Scalar::DynArray(primitive)];
+                if tuple.elems.as_slice() != expected.as_slice() {
+                    return None;
+                }
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((expression.ty, falls, breaks))
+            }
+            hir::ExprKind::ArrayParMap {
+                source,
+                stages,
+                func,
+                captures,
+                elem,
+            } => {
+                let (input_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                let output_scalar = align_sema::ty_to_scalar(*elem)?;
+                if !matches!(
+                    output_scalar,
+                    Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
+                ) || !self.scalar_copy_ok(output_scalar)
+                {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_callable_ok(
+                    func,
+                    captures,
+                    &capture_flows,
+                    input_elem,
+                    *elem,
+                    context,
+                ) {
+                    return None;
+                }
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::DynArray(output_scalar), falls, breaks))
+            }
+            hir::ExprKind::ArrayChunks { source, n, elem } => {
+                let source_flow = self.expr_flow(source)?;
+                let n_flow = self.expr_flow(n)?;
+                if n_flow.ty != i64_ty() {
+                    return None;
+                }
+                let source_scalar = match source_flow.ty {
+                    Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => scalar,
+                    _ => return None,
+                };
+                let primitive = align_sema::scalar_to_prim(source_scalar)?;
+                if !self.scalar_copy_ok(source_scalar)
+                    || *elem != align_sema::scalar_to_ty(align_sema::prim_to_scalar(primitive))
+                    || (matches!(source_flow.ty, Ty::Array(..))
+                        && !matches!(
+                            source.kind,
+                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                        ))
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[source_flow, n_flow]);
+                Some((Ty::DynSliceArray(primitive), falls, breaks))
+            }
+            hir::ExprKind::ArrayToSlice(source) => {
+                let flow = self.expr_flow(source)?;
+                let result = match flow.ty {
+                    Ty::Array(scalar, _) => {
+                        if !matches!(
+                            source.kind,
+                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                        ) {
+                            return None;
+                        }
+                        Ty::Slice(scalar)
+                    }
+                    Ty::StructArray(id, _) => {
+                        if !matches!(
+                            source.kind,
+                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                        ) {
+                            return None;
+                        }
+                        Ty::Slice(Scalar::Struct(id))
+                    }
+                    Ty::DynArray(scalar) => Ty::Slice(scalar),
+                    Ty::DynStructArray(id, Layout::Aos) => Ty::Slice(Scalar::Struct(id)),
+                    _ => return None,
+                };
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((result, falls, breaks))
+            }
+            hir::ExprKind::Len(source) => {
+                let flow = self.expr_flow(source)?;
+                if !matches!(
+                    flow.ty,
+                    Ty::Str
+                        | Ty::String
+                        | Ty::Slice(_)
+                        | Ty::DynArray(_)
+                        | Ty::DynStructArray(_, _)
+                        | Ty::DynSliceArray(_)
+                        | Ty::DynResponseArray
+                        | Ty::Soa(_)
+                ) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((i64_ty(), falls, breaks))
+            }
+            hir::ExprKind::Index { recv, index } => {
+                let receiver = self.expr_flow(recv)?;
+                let index_flow = self.expr_flow(index)?;
+                if index_flow.ty != i64_ty() {
+                    return None;
+                }
+                let result = match receiver.ty {
+                    Ty::Vec(scalar, lanes) => {
+                        let hir::ExprKind::Int(lane) = &index.kind else { return None };
+                        if *lane < 0 || (*lane as u128) >= lanes as u128 {
+                            return None;
+                        }
+                        align_sema::scalar_to_ty(scalar)
+                    }
+                    Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
+                        align_sema::scalar_to_ty(scalar)
+                    }
+                    Ty::DynSliceArray(primitive) => {
+                        Ty::Slice(align_sema::prim_to_scalar(primitive))
+                    }
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => {
+                        Ty::Struct(id)
+                    }
+                    _ => return None,
+                };
+                if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
+                    && !matches!(
+                        recv.kind,
+                        hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                    )
+                {
+                    return None;
+                }
+                if !self.ty_copy_ok(result, context) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[receiver, index_flow]);
+                Some((result, falls, breaks))
+            }
+            hir::ExprKind::SliceRange { recv, start, end } => {
+                let receiver = self.expr_flow(recv)?;
+                let start_flow = match start.as_deref() {
+                    Some(expr) => Some(self.expr_flow(expr)?),
+                    None => None,
+                };
+                let end_flow = match end.as_deref() {
+                    Some(expr) => Some(self.expr_flow(expr)?),
+                    None => None,
+                };
+                if start_flow.as_ref().is_some_and(|flow| flow.ty != i64_ty())
+                    || end_flow.as_ref().is_some_and(|flow| flow.ty != i64_ty())
+                {
+                    return None;
+                }
+                let result = match receiver.ty {
+                    Ty::Str | Ty::String => Ty::Str,
+                    Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
+                        if !self.scalar_copy_ok(scalar) {
+                            return None;
+                        }
+                        if matches!(receiver.ty, Ty::Array(..))
+                            && !matches!(
+                                recv.kind,
+                                hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                            )
+                        {
+                            return None;
+                        }
+                        Ty::Slice(scalar)
+                    }
+                    _ => return None,
+                };
+                let mut flows = vec![receiver];
+                if let Some(flow) = start_flow {
+                    flows.push(flow);
+                }
+                if let Some(flow) = end_flow {
+                    flows.push(flow);
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((result, falls, breaks))
+            }
+            hir::ExprKind::ElemField {
+                recv,
+                index,
+                path,
+                struct_id,
+            } => {
+                let receiver = self.expr_flow(recv)?;
+                let index_flow = self.expr_flow(index)?;
+                if index_flow.ty != i64_ty() || path.is_empty() {
+                    return None;
+                }
+                let receiver_id = match receiver.ty {
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => id,
+                    _ => return None,
+                };
+                if receiver_id != *struct_id
+                    || (matches!(receiver.ty, Ty::StructArray(..))
+                        && !matches!(
+                            recv.kind,
+                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                        ))
+                {
+                    return None;
+                }
+                let leaf = self.field_path_ty(Some(Ty::Struct(*struct_id)), path)?;
+                if !self.ty_copy_ok(leaf, context) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[receiver, index_flow]);
+                Some((leaf, falls, breaks))
+            }
             _ => None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_reducer_callable_ok(
+        &self,
+        func: &str,
+        captures: &[hir::Expr],
+        capture_flows: &[BodyFlow],
+        first: Ty,
+        second: Ty,
+        output: Ty,
+        context: &BodyContext,
+    ) -> bool {
+        let Some(signature) = self.resolve_signature(func) else {
+            return false;
+        };
+        if signature.is_extern && context.unsafe_depth == 0 {
+            return false;
+        }
+        if signature.modes.len() != signature.params.len()
+            || signature.modes.iter().any(|mode| *mode != align_ast::ParamMode::ByValue)
+            || capture_flows.len() != captures.len()
+            || capture_flows.iter().any(|flow| !self.ty_copy_ok(flow.ty, context))
+            || !self.ty_copy_ok(first, context)
+            || !self.ty_copy_ok(second, context)
+            || !self.ty_copy_ok(output, context)
+            || signature.ret != output
+        {
+            return false;
+        }
+        let mut expected = vec![first, second];
+        expected.extend(capture_flows.iter().map(|flow| flow.ty));
+        if signature.params != expected {
+            return false;
+        }
+        match signature.origin {
+            Some(hir::FnOrigin::Lifted { capture_count }) => {
+                usize::try_from(capture_count).ok() == Some(captures.len())
+            }
+            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+        }
+    }
+
+    fn array_to_array_result(&self, elem: Ty) -> Option<Ty> {
+        match elem {
+            Ty::Struct(id) => {
+                if self.program.structs.get(id as usize)?.align.is_some()
+                    || !self.scalar_copy_ok(Scalar::Struct(id))
+                {
+                    return None;
+                }
+                Some(Ty::DynStructArray(id, Layout::Aos))
+            }
+            other => {
+                let scalar = align_sema::ty_to_scalar(other)?;
+                self.body_ty_ok(Ty::DynArray(scalar)).then_some(Ty::DynArray(scalar))
+            }
+        }
+    }
+
+    fn soa_struct_ok(&self, id: u32) -> bool {
+        self.program
+            .structs
+            .get(id as usize)
+            .is_some_and(|definition| {
+                !definition.fields.is_empty()
+                    && definition.fields.iter().all(|field| {
+                        matches!(
+                            field.ty,
+                            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
+                        )
+                    })
+            })
     }
 
     fn finish_block(&mut self, block: &hir::Block, _: &BodyContext) -> bool {
@@ -4650,6 +5678,27 @@ fn strict_flow(flows: &[BodyFlow]) -> (bool, Vec<Ty>) {
         }
     }
     (falls, breaks)
+}
+
+fn numeric_body_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_))
+}
+
+fn orderable_body_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Char | Ty::Str)
+}
+
+fn fixed_array_shape(expression: &hir::Expr, ty: Ty) -> Option<(Scalar, u32)> {
+    if !matches!(
+        expression.kind,
+        hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+    ) {
+        return None;
+    }
+    match ty {
+        Ty::Array(scalar, length) => Some((scalar, length)),
+        _ => None,
+    }
 }
 
 fn primitive_task_scalar(scalar: Scalar) -> bool {
