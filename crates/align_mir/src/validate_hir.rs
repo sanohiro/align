@@ -38,11 +38,11 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
     DeclarationValidator::new(program).validate()
 }
 
-/// Validate the dormant am-b1 portion of stored HIR bodies.
+/// Validate the dormant am-b1 through am-b3 portion of stored HIR bodies.
 ///
-/// This helper is deliberately not part of [`hir_program_is_valid`].  am-b1 owns the structural
-/// and type envelope of the first body range; am-b4 owns the single public activation and the
-/// replay of ownership, Drop, effects, and wait proofs.
+/// This helper is deliberately not part of [`hir_program_is_valid`].  Am-b1 through am-b3 own the
+/// structural and type envelope of their body ranges; am-b4 owns the single public activation and
+/// the replay of ownership, Drop, effects, and wait proofs.
 #[allow(dead_code)]
 pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
     global_type_metadata_is_valid(program)
@@ -2887,6 +2887,141 @@ impl<'a> BodyValidator<'a> {
                 struct_id,
                 key_field,
             } => self.dictionary_envelope_ok(context, *base, *struct_id, *key_field),
+            hir::ExprKind::FsReadFile { .. }
+            | hir::ExprKind::ReaderStdin
+            | hir::ExprKind::ReaderOpen { .. }
+            | hir::ExprKind::WriterStd { .. }
+            | hir::ExprKind::WriterCreate { .. }
+            | hir::ExprKind::ReaderRead { .. }
+            | hir::ExprKind::ReaderBuffered { .. }
+            | hir::ExprKind::ReaderReadLine { .. }
+            | hir::ExprKind::BytesAsStr { .. }
+            | hir::ExprKind::WriterWrite { .. }
+            | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::IoCopy { .. }
+            | hir::ExprKind::FileCreateRw { .. }
+            | hir::ExprKind::FileOpenRw { .. }
+            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePwrite { .. }
+            | hir::ExprKind::FileLen { .. }
+            | hir::ExprKind::BufferNew { .. }
+            | hir::ExprKind::BufferBytes { .. }
+            | hir::ExprKind::StrBytes { .. }
+            | hir::ExprKind::BufferLen { .. }
+            | hir::ExprKind::BytesRead { .. }
+            | hir::ExprKind::BufferPut { .. }
+            | hir::ExprKind::BufferAppend { .. }
+            | hir::ExprKind::ArrayBuilderNew { .. }
+            | hir::ExprKind::ArrayBuilderPush { .. }
+            | hir::ExprKind::ArrayBuilderAppend { .. }
+            | hir::ExprKind::ArrayBuilderBuild(..)
+            | hir::ExprKind::FsWriteFile { .. }
+            | hir::ExprKind::FsExists { .. }
+            | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsReadDir { .. }
+            | hir::ExprKind::DnsResolve { .. }
+            | hir::ExprKind::TcpConnect { .. }
+            | hir::ExprKind::ConnReader { .. }
+            | hir::ExprKind::ConnWriter { .. }
+            | hir::ExprKind::TcpReadTimeout { .. }
+            | hir::ExprKind::TcpWriteTimeout { .. }
+            | hir::ExprKind::TcpListen { .. }
+            | hir::ExprKind::TcpAccept { .. }
+            | hir::ExprKind::UdpBind { .. }
+            | hir::ExprKind::UdpSendTo { .. }
+            | hir::ExprKind::UdpRecvFrom { .. }
+            | hir::ExprKind::FsReadFileView { .. }
+            | hir::ExprKind::FsReadBytesView { .. }
+            | hir::ExprKind::PathJoin { .. }
+            | hir::ExprKind::PathComponent { .. }
+            | hir::ExprKind::PathNormalize { .. }
+            | hir::ExprKind::EnvGet { .. }
+            | hir::ExprKind::EnvSet { .. }
+            | hir::ExprKind::TimeNow
+            | hir::ExprKind::TimeInstant
+            | hir::ExprKind::ProcessCpuCount
+            | hir::ExprKind::TimeSleep { .. }
+            | hir::ExprKind::ProcessExit { .. }
+            | hir::ExprKind::ProcessAbort
+            | hir::ExprKind::ProcessSpawn { .. }
+            | hir::ExprKind::ChildWait { .. }
+            | hir::ExprKind::ChildKill { .. }
+            | hir::ExprKind::ProcessExec { .. }
+            | hir::ExprKind::ProcessCommand { .. }
+            | hir::ExprKind::CommandCwd { .. }
+            | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandEnv { .. }
+            | hir::ExprKind::CommandEnvClear { .. }
+            | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::RunOutputCode { .. }
+            | hir::ExprKind::RunOutputStdout { .. }
+            | hir::ExprKind::RunOutputStderr { .. }
+            | hir::ExprKind::EncodingEncode { .. }
+            | hir::ExprKind::EncodingDecode { .. }
+            | hir::ExprKind::Utf8Valid { .. }
+            | hir::ExprKind::Compress { .. }
+            | hir::ExprKind::Decompress { .. }
+            | hir::ExprKind::RandSeed
+            | hir::ExprKind::RandSeedWith { .. }
+            | hir::ExprKind::RandNext { .. }
+            | hir::ExprKind::RandRange { .. }
+            | hir::ExprKind::RandShuffle { .. }
+            | hir::ExprKind::RandSample { .. }
+            | hir::ExprKind::RegexCompile { .. }
+            | hir::ExprKind::RegexIsMatch { .. }
+            | hir::ExprKind::RegexFind { .. }
+            | hir::ExprKind::RegexFindAll { .. }
+            | hir::ExprKind::RegexSplit { .. }
+            | hir::ExprKind::RegexReplace { .. }
+            | hir::ExprKind::RegexCaptures { .. }
+            | hir::ExprKind::RegexGroupCount { .. }
+            | hir::ExprKind::RegexGroupIndex { .. }
+            | hir::ExprKind::CapturesGroup { .. }
+            | hir::ExprKind::CliCommand { .. }
+            | hir::ExprKind::CliFlag { .. }
+            | hir::ExprKind::CliParse { .. }
+            | hir::ExprKind::CliGetBool { .. }
+            | hir::ExprKind::CliGetI64 { .. }
+            | hir::ExprKind::CliGetStr { .. }
+            | hir::ExprKind::CliUsage { .. }
+            | hir::ExprKind::HttpRequest { .. }
+            | hir::ExprKind::HttpHeader { .. }
+            | hir::ExprKind::HttpBody { .. }
+            | hir::ExprKind::HttpRequestTimeout { .. }
+            | hir::ExprKind::HttpParse { .. }
+            | hir::ExprKind::HttpRespStatus { .. }
+            | hir::ExprKind::HttpRespHeader { .. }
+            | hir::ExprKind::HttpRespBody { .. }
+            | hir::ExprKind::HttpClient
+            | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpClientGet { .. }
+            | hir::ExprKind::HttpClientPost { .. }
+            | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpAccept { .. }
+            | hir::ExprKind::HttpCtxMethod { .. }
+            | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxHeaders { .. }
+            | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpCtxBody { .. }
+            | hir::ExprKind::HttpResponseBuilder { .. }
+            | hir::ExprKind::HttpRbHeader { .. }
+            | hir::ExprKind::HttpRbBody { .. }
+            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpStreamSend { .. }
+            | hir::ExprKind::HttpStreamFinish { .. }
+            | hir::ExprKind::HttpStreamReject { .. }
+            | hir::ExprKind::CryptoCtEqual { .. }
+            | hir::ExprKind::CryptoRandom { .. }
+            | hir::ExprKind::CryptoHash { .. }
+            | hir::ExprKind::CryptoHmac { .. }
+            | hir::ExprKind::CryptoHkdf { .. }
+            | hir::ExprKind::CryptoAead { .. }
+            | hir::ExprKind::CryptoArgon2 { .. } => {
+                self.native_expression_envelope_ok(expression)
+            }
             hir::ExprKind::FnValue(name) => valid_declaration_name(name),
             hir::ExprKind::Closure { lifted, .. } => valid_declaration_name(lifted),
             hir::ExprKind::EnumValue {
@@ -2952,9 +3087,543 @@ impl<'a> BodyValidator<'a> {
                     && end <= function.locals.len()
                     && self.loop_body_locals_valid(body, body_locals, context)
             }
-            _ => false,
         };
         envelope && valid_span(expression.span)
+    }
+
+    fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
+        match &expression.kind {
+            hir::ExprKind::WriterStd { fd, .. } => matches!(*fd, 1 | 2),
+            hir::ExprKind::ArrayBuilderNew { elem } => self.array_builder_elem_ok(*elem),
+            hir::ExprKind::RandShuffle { elem, .. } | hir::ExprKind::RandSample { elem, .. } => {
+                self.rng_elem_ok(*elem)
+            }
+            hir::ExprKind::CliFlag { kind, default, .. } => match kind {
+                hir::CliFlagKind::Bool => default.is_none(),
+                hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
+            },
+            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Html),
+            hir::ExprKind::BytesRead { .. } => true,
+            hir::ExprKind::BufferPut { .. }
+            | hir::ExprKind::Compress { .. }
+            | hir::ExprKind::Decompress { .. }
+            | hir::ExprKind::PathComponent { .. }
+            | hir::ExprKind::EncodingEncode { .. }
+            | hir::ExprKind::CryptoHash { .. }
+            | hir::ExprKind::CryptoAead { .. }
+            | hir::ExprKind::CryptoArgon2 { .. }
+            | hir::ExprKind::RegexFind { .. }
+            | hir::ExprKind::RegexReplace { .. }
+            | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpStreamSend { .. }
+            | hir::ExprKind::WriterWrite { .. }
+            | hir::ExprKind::FsWriteFile { .. }
+            | hir::ExprKind::ArrayBuilderPush { .. }
+            | hir::ExprKind::FsReadFile { .. }
+            | hir::ExprKind::ReaderStdin
+            | hir::ExprKind::ReaderOpen { .. }
+            | hir::ExprKind::WriterCreate { .. }
+            | hir::ExprKind::ReaderRead { .. }
+            | hir::ExprKind::ReaderBuffered { .. }
+            | hir::ExprKind::ReaderReadLine { .. }
+            | hir::ExprKind::BytesAsStr { .. }
+            | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::IoCopy { .. }
+            | hir::ExprKind::FileCreateRw { .. }
+            | hir::ExprKind::FileOpenRw { .. }
+            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePwrite { .. }
+            | hir::ExprKind::FileLen { .. }
+            | hir::ExprKind::BufferNew { .. }
+            | hir::ExprKind::BufferBytes { .. }
+            | hir::ExprKind::StrBytes { .. }
+            | hir::ExprKind::BufferLen { .. }
+            | hir::ExprKind::BufferAppend { .. }
+            | hir::ExprKind::ArrayBuilderAppend { .. }
+            | hir::ExprKind::ArrayBuilderBuild(..)
+            | hir::ExprKind::FsExists { .. }
+            | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsReadDir { .. }
+            | hir::ExprKind::DnsResolve { .. }
+            | hir::ExprKind::TcpConnect { .. }
+            | hir::ExprKind::ConnReader { .. }
+            | hir::ExprKind::ConnWriter { .. }
+            | hir::ExprKind::TcpReadTimeout { .. }
+            | hir::ExprKind::TcpWriteTimeout { .. }
+            | hir::ExprKind::TcpListen { .. }
+            | hir::ExprKind::TcpAccept { .. }
+            | hir::ExprKind::UdpBind { .. }
+            | hir::ExprKind::UdpSendTo { .. }
+            | hir::ExprKind::UdpRecvFrom { .. }
+            | hir::ExprKind::FsReadFileView { .. }
+            | hir::ExprKind::FsReadBytesView { .. }
+            | hir::ExprKind::PathJoin { .. }
+            | hir::ExprKind::PathNormalize { .. }
+            | hir::ExprKind::EnvGet { .. }
+            | hir::ExprKind::EnvSet { .. }
+            | hir::ExprKind::TimeNow
+            | hir::ExprKind::TimeInstant
+            | hir::ExprKind::ProcessCpuCount
+            | hir::ExprKind::TimeSleep { .. }
+            | hir::ExprKind::ProcessExit { .. }
+            | hir::ExprKind::ProcessAbort
+            | hir::ExprKind::ProcessSpawn { .. }
+            | hir::ExprKind::ChildWait { .. }
+            | hir::ExprKind::ChildKill { .. }
+            | hir::ExprKind::ProcessExec { .. }
+            | hir::ExprKind::ProcessCommand { .. }
+            | hir::ExprKind::CommandCwd { .. }
+            | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandEnv { .. }
+            | hir::ExprKind::CommandEnvClear { .. }
+            | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::RunOutputCode { .. }
+            | hir::ExprKind::RunOutputStdout { .. }
+            | hir::ExprKind::RunOutputStderr { .. }
+            | hir::ExprKind::Utf8Valid { .. }
+            | hir::ExprKind::RandSeed
+            | hir::ExprKind::RandSeedWith { .. }
+            | hir::ExprKind::RandNext { .. }
+            | hir::ExprKind::RandRange { .. }
+            | hir::ExprKind::RegexCompile { .. }
+            | hir::ExprKind::RegexIsMatch { .. }
+            | hir::ExprKind::RegexFindAll { .. }
+            | hir::ExprKind::RegexSplit { .. }
+            | hir::ExprKind::RegexCaptures { .. }
+            | hir::ExprKind::RegexGroupCount { .. }
+            | hir::ExprKind::RegexGroupIndex { .. }
+            | hir::ExprKind::CapturesGroup { .. }
+            | hir::ExprKind::CliCommand { .. }
+            | hir::ExprKind::CliParse { .. }
+            | hir::ExprKind::CliGetBool { .. }
+            | hir::ExprKind::CliGetI64 { .. }
+            | hir::ExprKind::CliGetStr { .. }
+            | hir::ExprKind::CliUsage { .. }
+            | hir::ExprKind::HttpRequest { .. }
+            | hir::ExprKind::HttpHeader { .. }
+            | hir::ExprKind::HttpBody { .. }
+            | hir::ExprKind::HttpRequestTimeout { .. }
+            | hir::ExprKind::HttpParse { .. }
+            | hir::ExprKind::HttpRespStatus { .. }
+            | hir::ExprKind::HttpRespHeader { .. }
+            | hir::ExprKind::HttpRespBody { .. }
+            | hir::ExprKind::HttpClient
+            | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpClientGet { .. }
+            | hir::ExprKind::HttpClientPost { .. }
+            | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpAccept { .. }
+            | hir::ExprKind::HttpCtxMethod { .. }
+            | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxHeaders { .. }
+            | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpCtxBody { .. }
+            | hir::ExprKind::HttpResponseBuilder { .. }
+            | hir::ExprKind::HttpRbHeader { .. }
+            | hir::ExprKind::HttpRbBody { .. }
+            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpStreamFinish { .. }
+            | hir::ExprKind::HttpStreamReject { .. }
+            | hir::ExprKind::CryptoCtEqual { .. }
+            | hir::ExprKind::CryptoRandom { .. }
+            | hir::ExprKind::CryptoHmac { .. }
+            | hir::ExprKind::CryptoHkdf { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn array_builder_elem_ok(&self, elem: Scalar) -> bool {
+        align_sema::scalar_to_prim(elem).is_some()
+            && (elem == Scalar::String || self.scalar_copy_ok(elem))
+    }
+
+    fn rng_elem_ok(&self, elem: Ty) -> bool {
+        align_sema::ty_to_scalar(elem)
+            .is_some_and(|scalar| align_sema::scalar_to_prim(scalar).is_some() && self.scalar_copy_ok(scalar))
+    }
+
+    fn native_children(&self, children: &[&hir::Expr]) -> Option<Vec<BodyFlow>> {
+        children.iter().map(|child| self.expr_flow(child)).collect()
+    }
+
+    fn native_outcome(&self, ty: Ty, children: &[&hir::Expr]) -> Option<(Ty, bool, Vec<Ty>)> {
+        let flows = self.native_children(children)?;
+        let (falls, breaks) = strict_flow(&flows);
+        Some((ty, falls, breaks))
+    }
+
+    fn native_result_outcome(
+        &self,
+        ok: Ty,
+        children: &[&hir::Expr],
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        self.native_outcome(self.native_result_ty(ok)?, children)
+    }
+
+    fn native_result_ty(&self, ok: Ty) -> Option<Ty> {
+        Some(Ty::Result(align_sema::ty_to_scalar(ok)?, Scalar::Enum(self.error_id()?)))
+    }
+
+    fn binary_scalar_width(&self, ty: Ty) -> Option<u8> {
+        match ty {
+            Ty::Int(integer) if matches!(integer.bits, 8 | 16 | 32 | 64) => {
+                Some(integer.bits / 8)
+            }
+            Ty::Float(float) if matches!(float.bits, 32 | 64) => Some(float.bits / 8),
+            _ => None,
+        }
+    }
+
+    fn local_handle_place(&self, context: &BodyContext, expression: &hir::Expr, ty: Ty) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        expression.ty == ty && self.local_type(context, id) == Some(ty)
+    }
+
+    fn source_mut_local(&self, context: &BodyContext, expression: &hir::Expr, ty: Ty) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        self.local_type(context, id) == Some(ty)
+            && self
+                .program
+                .fns
+                .get(context.function)
+                .and_then(|function| function.locals.get(id as usize))
+                .is_some_and(|local| local.id == id && local.is_mut)
+    }
+
+    fn writable_slice_local(&self, context: &BodyContext, expression: &hir::Expr) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        self.source_mut_local(context, expression, expression.ty)
+            && matches!(expression.ty, Ty::Slice(_))
+            && !self.readonly_slice_local(context, id)
+    }
+
+    fn readonly_slice_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
+        enum Scan<'b> {
+            Block(&'b hir::Block),
+            Stmt(&'b hir::Stmt),
+            Expr(&'b hir::Expr),
+        }
+
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let mut work = vec![Scan::Block(&function.body)];
+        let mut blocks = HashSet::new();
+        let mut statements = HashSet::new();
+        let mut expressions = HashSet::new();
+        let mut assignments = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Scan::Block(block) => {
+                    if !blocks.insert(ptr_key(block)) {
+                        continue;
+                    }
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Scan::Expr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(Scan::Stmt(statement));
+                    }
+                }
+                Scan::Stmt(statement) => {
+                    if !statements.insert(ptr_key(statement)) {
+                        continue;
+                    }
+                    match statement {
+                        hir::Stmt::Let { local, init }
+                        | hir::Stmt::Assign {
+                            local,
+                            value: init,
+                            ..
+                        } => {
+                            assignments.push((*local, init));
+                        }
+                        hir::Stmt::LetTuple { locals, init, .. } => {
+                            for local in locals.iter().flatten() {
+                                assignments.push((*local, init));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for child in statement_children(statement).into_iter().rev() {
+                        work.push(Scan::Expr(child));
+                    }
+                }
+                Scan::Expr(expression) => {
+                    if !expressions.insert(ptr_key(expression)) {
+                        continue;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(Scan::Block(block));
+                        }
+                        hir::ExprKind::If { then, els, .. } => {
+                            work.push(Scan::Block(els));
+                            work.push(Scan::Block(then));
+                            if let hir::ExprKind::If { cond, .. } = &expression.kind {
+                                work.push(Scan::Expr(cond));
+                            }
+                        }
+                        hir::ExprKind::Match { arms, .. } => {
+                            for arm in arms.iter().rev() {
+                                work.push(Scan::Expr(&arm.body));
+                            }
+                            if let hir::ExprKind::Match { scrutinee, .. } = &expression.kind {
+                                work.push(Scan::Expr(scrutinee));
+                            }
+                        }
+                        _ => {
+                            for child in align_sema::direct_expr_children(expression).into_iter().rev() {
+                                work.push(Scan::Expr(child));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut readonly = HashSet::new();
+        for (local, expression) in assignments {
+            if self.readonly_view_expression(expression, &readonly) {
+                readonly.insert(local);
+            }
+        }
+        readonly.contains(&target)
+    }
+
+    fn readonly_view_expression(
+        &self,
+        root: &hir::Expr,
+        readonly_locals: &HashSet<hir::LocalId>,
+    ) -> bool {
+        let mut work = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(expression) = work.pop() {
+            if !seen.insert(ptr_key(expression)) {
+                continue;
+            }
+            match &expression.kind {
+                hir::ExprKind::ConstArray { .. }
+                | hir::ExprKind::FsReadFileView { .. }
+                | hir::ExprKind::FsReadBytesView { .. } => return true,
+                hir::ExprKind::Local(id) => {
+                    if readonly_locals.contains(id) {
+                        return true;
+                    }
+                }
+                hir::ExprKind::StrBytes { inner } => {
+                    if matches!(inner.kind, hir::ExprKind::Str(_)) {
+                        return true;
+                    }
+                    work.push(inner);
+                }
+                hir::ExprKind::SliceRange { recv, .. }
+                | hir::ExprKind::ArrayToSlice(recv)
+                | hir::ExprKind::Try(recv) => work.push(recv),
+                hir::ExprKind::Block(block)
+                | hir::ExprKind::Arena(block)
+                | hir::ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(value);
+                    }
+                }
+                hir::ExprKind::If { then, els, .. } => {
+                    if let Some(value) = then.value.as_deref() {
+                        work.push(value);
+                    }
+                    if let Some(value) = els.value.as_deref() {
+                        work.push(value);
+                    }
+                }
+                hir::ExprKind::Match { arms, .. } => {
+                    for arm in arms {
+                        work.push(&arm.body);
+                    }
+                }
+                hir::ExprKind::ElseUnwrap { opt, fallback } => {
+                    work.push(opt);
+                    work.push(fallback);
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn reader_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        self.local_handle_place(context, expression, Ty::Reader)
+            || (expression.ty == Ty::Reader
+                && matches!(expression.kind, hir::ExprKind::ReaderStdin))
+    }
+
+    fn writer_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        self.local_handle_place(context, expression, Ty::Writer)
+            || matches!(
+                expression.kind,
+                hir::ExprKind::WriterStd {
+                    fd: 1 | 2,
+                    buffered: false,
+                }
+            ) && expression.ty == Ty::Writer
+    }
+
+    fn http_response_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        if self.local_handle_place(context, expression, Ty::HttpResponse) {
+            return true;
+        }
+        let hir::ExprKind::Index { recv, index } = &expression.kind else {
+            return false;
+        };
+        expression.ty == Ty::HttpResponse
+            && self.local_handle_place(context, recv, Ty::DynResponseArray)
+            && self.expr_flow(index).is_some_and(|flow| flow.ty == i64_ty())
+    }
+
+    fn http_request_ctx_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        if self.local_handle_place(context, expression, Ty::HttpRequestCtx) {
+            return true;
+        }
+        let hir::ExprKind::Field { root, path } = &expression.kind else {
+            return false;
+        };
+        expression.ty == Ty::HttpRequestCtx
+            && self
+                .field_path_ty(self.local_type(context, *root), path)
+                == Some(Ty::HttpRequestCtx)
+    }
+
+    fn buffered_reader_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
+        enum Scan<'b> {
+            Block(&'b hir::Block),
+            Expr(&'b hir::Expr),
+        }
+
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let mut work = vec![Scan::Block(&function.body)];
+        let mut blocks = HashSet::new();
+        let mut expressions = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Scan::Block(block) => {
+                    if !blocks.insert(ptr_key(block)) {
+                        continue;
+                    }
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Scan::Expr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        if let hir::Stmt::Let { local, init } = statement
+                            && *local == target
+                        {
+                            return self.buffered_reader_initializer(init);
+                        }
+                        for child in statement_children(statement).into_iter().rev() {
+                            work.push(Scan::Expr(child));
+                        }
+                    }
+                }
+                Scan::Expr(expression) => {
+                    if !expressions.insert(ptr_key(expression)) {
+                        continue;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(Scan::Block(block));
+                        }
+                        hir::ExprKind::If { then, els, .. } => {
+                            work.push(Scan::Block(els));
+                            work.push(Scan::Block(then));
+                        }
+                        hir::ExprKind::Match { arms, .. } => {
+                            for arm in arms.iter().rev() {
+                                work.push(Scan::Expr(&arm.body));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for child in align_sema::direct_expr_children(expression).into_iter().rev() {
+                        work.push(Scan::Expr(child));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn buffered_reader_initializer(&self, root: &hir::Expr) -> bool {
+        let mut current = root;
+        loop {
+            match &current.kind {
+                hir::ExprKind::ReaderBuffered { .. } => return true,
+                hir::ExprKind::Block(block)
+                | hir::ExprKind::Arena(block)
+                | hir::ExprKind::Unsafe(block) => {
+                    let Some(value) = block.value.as_deref() else {
+                        return false;
+                    };
+                    current = value;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn regex_match_id(&self) -> Option<u32> {
+        let mut found = None;
+        for (id, definition) in self.program.structs.iter().enumerate() {
+            let i64 = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+            let exact = definition.name == "regex_match"
+                && definition.source_name == "regex_match"
+                && definition.align.is_none()
+                && definition.fields.len() == 2
+                && definition
+                    .fields
+                    .first()
+                    .is_some_and(|field| field.name == "start" && field.ty == i64)
+                && definition
+                    .fields
+                    .get(1)
+                    .is_some_and(|field| field.name == "end" && field.ty == i64);
+            if exact {
+                if found.is_some() {
+                    return None;
+                }
+                found = u32::try_from(id).ok();
+            }
+        }
+        found
+    }
+
+    fn argon2_params_ok(&self, ty: Ty) -> bool {
+        let Ty::Struct(id) = ty else { return false };
+        let Some(definition) = self.program.structs.get(id as usize) else {
+            return false;
+        };
+        let i64 = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+        definition.name == "argon2_params"
+            && definition.source_name == "argon2_params"
+            && definition.align.is_none()
+            && definition.fields.len() == 4
+            && definition.fields.iter().zip(["m_cost", "t_cost", "parallelism", "len"])
+                .all(|(field, name)| field.name == name && field.ty == i64)
     }
 
     fn template_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
@@ -3683,6 +4352,11 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::ArrayGroupAgg { .. }
             | hir::ExprKind::ArrayGroupAggMulti { .. }
             | hir::ExprKind::ArrayDictEncode { .. } => {}
+            _ if self.native_expression_envelope_ok(expression) => {
+                for child in align_sema::direct_expr_children(expression).into_iter().rev() {
+                    push_expr!(child, context.clone());
+                }
+            }
             hir::ExprKind::Unit
             | hir::ExprKind::Int(_)
             | hir::ExprKind::Float(_)
@@ -4547,7 +5221,714 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(builder)?;
                 (flow.ty == Ty::Builder).then_some((Ty::String, flow.falls, flow.breaks))
             }
-            _ => self.derive_pipeline_expression(expression, context),
+            _ => self
+                .derive_pipeline_expression(expression, context)
+                .or_else(|| self.derive_native_expression(expression, context)),
+        }
+    }
+
+    fn derive_native_expression(
+        &self,
+        expression: &hir::Expr,
+        context: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let kind = &expression.kind;
+        let i64 = i64_ty();
+        let u8_scalar = Scalar::Int(align_sema::IntTy {
+            bits: 8,
+            signed: false,
+        });
+        let byte_view = |ty: Ty| ty == Ty::Str || ty == Ty::Slice(align_sema::Scalar::Int(
+            align_sema::IntTy {
+                bits: 8,
+                signed: false,
+            },
+        ));
+        let strict = |ty: Ty, children: &[&hir::Expr]| {
+            self.native_outcome(ty, children)
+        };
+        let result = |ok: Ty, children: &[&hir::Expr]| {
+            self.native_result_outcome(ok, children)
+        };
+        let local = |expr: &hir::Expr, ty: Ty| self.local_handle_place(context, expr, ty);
+        let mutable_local = |expr: &hir::Expr, ty: Ty| {
+            self.source_mut_local(context, expr, ty)
+        };
+        match kind {
+            hir::ExprKind::FsReadFile { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::String, &[path.as_ref()]))?
+            }
+            hir::ExprKind::ReaderStdin => (expression.ty == Ty::Reader).then_some((Ty::Reader, true, Vec::new())),
+            hir::ExprKind::ReaderOpen { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
+            }
+            hir::ExprKind::WriterStd { fd, .. } => {
+                (matches!(*fd, 1 | 2) && expression.ty == Ty::Writer)
+                    .then_some((Ty::Writer, true, Vec::new()))
+            }
+            hir::ExprKind::WriterCreate { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Writer, &[path.as_ref()]))?
+            }
+            hir::ExprKind::ReaderRead { reader, buffer } => {
+                if !self.reader_place(reader, context)
+                    || !mutable_local(buffer, Ty::Buffer)
+                    || reader.ty != Ty::Reader
+                    || buffer.ty != Ty::Buffer
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[reader, buffer])
+            }
+            hir::ExprKind::ReaderBuffered { reader } => {
+                (reader.ty == Ty::Reader && self.expr_flow(reader)?.ty == Ty::Reader)
+                    .then(|| strict(Ty::Reader, &[reader]))?
+            }
+            hir::ExprKind::ReaderReadLine { reader, buffer } => {
+                let hir::ExprKind::Local(id) = reader.kind else {
+                    return None;
+                };
+                if reader.ty != Ty::Reader
+                    || !self.buffered_reader_local(context, id)
+                    || !mutable_local(buffer, Ty::Buffer)
+                    || buffer.ty != Ty::Buffer
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[reader, buffer])
+            }
+            hir::ExprKind::BytesAsStr { bytes } => {
+                (bytes.ty == Ty::Slice(u8_scalar)).then(|| result(Ty::Str, &[bytes]))?
+            }
+            hir::ExprKind::WriterWrite { writer, arg, builder } => {
+                if !self.writer_place(writer, context) || writer.ty != Ty::Writer {
+                    return None;
+                }
+                if (*builder && arg.ty != Ty::Builder) || (!*builder && !byte_view(arg.ty)) {
+                    return None;
+                }
+                result(Ty::Unit, &[writer, arg])
+            }
+            hir::ExprKind::WriterFlush { writer } => {
+                (self.writer_place(writer, context) && writer.ty == Ty::Writer)
+                    .then(|| result(Ty::Unit, &[writer]))?
+            }
+            hir::ExprKind::IoCopy { reader, writer } => {
+                if !self.reader_place(reader, context)
+                    || !self.writer_place(writer, context)
+                    || reader.ty != Ty::Reader
+                    || writer.ty != Ty::Writer
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[reader, writer])
+            }
+            hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::File, &[path]))?
+            }
+            hir::ExprKind::FilePread { file, buffer, offset } => {
+                if !local(file, Ty::File)
+                    || !mutable_local(buffer, Ty::Buffer)
+                    || file.ty != Ty::File
+                    || buffer.ty != Ty::Buffer
+                    || offset.ty != i64
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, buffer, offset])
+            }
+            hir::ExprKind::FilePwrite { file, data, offset } => {
+                if !local(file, Ty::File)
+                    || file.ty != Ty::File
+                    || !byte_view(data.ty)
+                    || offset.ty != i64
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, data, offset])
+            }
+            hir::ExprKind::FileLen { file } => {
+                (local(file, Ty::File) && file.ty == Ty::File)
+                    .then(|| result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file]))?
+            }
+            hir::ExprKind::BufferNew { capacity } => {
+                (capacity.ty == i64).then(|| strict(Ty::Buffer, &[capacity]))?
+            }
+            hir::ExprKind::BufferBytes { buffer } => {
+                (local(buffer, Ty::Buffer) && buffer.ty == Ty::Buffer)
+                    .then(|| strict(Ty::Slice(u8_scalar), &[buffer]))?
+            }
+            hir::ExprKind::StrBytes { inner } => {
+                (inner.ty == Ty::Str).then(|| strict(Ty::Slice(u8_scalar), &[inner]))?
+            }
+            hir::ExprKind::BufferLen { buffer } => {
+                (local(buffer, Ty::Buffer) && buffer.ty == Ty::Buffer)
+                    .then(|| strict(i64, &[buffer]))?
+            }
+            hir::ExprKind::BytesRead { bytes, offset, be } => {
+                let width = self.binary_scalar_width(expression.ty)?;
+                if bytes.ty != Ty::Slice(u8_scalar)
+                    || offset.ty != i64
+                    || (width == 1 && *be)
+                {
+                    return None;
+                }
+                strict(expression.ty, &[bytes, offset])
+            }
+            hir::ExprKind::BufferPut { buffer, value, be } => {
+                let width = self.binary_scalar_width(value.ty)?;
+                if !mutable_local(buffer, Ty::Buffer)
+                    || buffer.ty != Ty::Buffer
+                    || (width == 1 && *be)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[buffer, value])
+            }
+            hir::ExprKind::BufferAppend { buffer, data } => {
+                if !mutable_local(buffer, Ty::Buffer)
+                    || buffer.ty != Ty::Buffer
+                    || !byte_view(data.ty)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[buffer, data])
+            }
+            hir::ExprKind::ArrayBuilderNew { elem } => {
+                (self.array_builder_elem_ok(*elem) && expression.ty == Ty::ArrayBuilder(*elem))
+                    .then_some((expression.ty, true, Vec::new()))
+            }
+            hir::ExprKind::ArrayBuilderPush {
+                builder,
+                value,
+                moves_value,
+            } => {
+                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
+                    return None;
+                };
+                if !self.array_builder_elem_ok(elem)
+                    || !mutable_local(builder, Ty::ArrayBuilder(elem))
+                    || value.ty != align_sema::scalar_to_ty(elem)
+                    || *moves_value != (elem == Scalar::String)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[builder, value])
+            }
+            hir::ExprKind::ArrayBuilderAppend { builder, data } => {
+                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
+                    return None;
+                };
+                if !self.array_builder_elem_ok(elem)
+                    || elem == Scalar::String
+                    || !self.scalar_copy_ok(elem)
+                    || !mutable_local(builder, Ty::ArrayBuilder(elem))
+                    || data.ty != Ty::Slice(elem)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[builder, data])
+            }
+            hir::ExprKind::ArrayBuilderBuild(builder) => {
+                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
+                    return None;
+                };
+                let primitive = align_sema::scalar_to_prim(elem)?;
+                strict(Ty::DynArray(align_sema::prim_to_scalar(primitive)), &[builder])
+            }
+            hir::ExprKind::FsWriteFile { path, data, builder } => {
+                if path.ty != Ty::Str
+                    || (*builder && data.ty != Ty::Builder)
+                    || (!*builder && !byte_view(data.ty))
+                {
+                    return None;
+                }
+                result(Ty::Unit, &[path, data])
+            }
+            hir::ExprKind::FsExists { path } => {
+                (path.ty == Ty::Str).then(|| strict(Ty::Bool, &[path]))?
+            }
+            hir::ExprKind::FsRemove { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
+            }
+            hir::ExprKind::FsReadDir { path } | hir::ExprKind::DnsResolve { host: path } => {
+                (path.ty == Ty::Str)
+                    .then(|| result(Ty::DynArray(Scalar::String), &[path]))?
+            }
+            hir::ExprKind::TcpConnect { host, port }
+            | hir::ExprKind::TcpListen { host, port }
+            | hir::ExprKind::UdpBind { host, port } => {
+                (host.ty == Ty::Str && port.ty == i64).then(|| {
+                    let ty = match kind {
+                        hir::ExprKind::TcpConnect { .. } => Ty::TcpConn,
+                        hir::ExprKind::TcpListen { .. } => Ty::TcpListener,
+                        _ => Ty::UdpSocket,
+                    };
+                    result(ty, &[host, port])
+                })?
+            }
+            hir::ExprKind::ConnReader { conn } => {
+                (local(conn, Ty::TcpConn) && conn.ty == Ty::TcpConn)
+                    .then(|| strict(Ty::Reader, &[conn]))?
+            }
+            hir::ExprKind::ConnWriter { conn } => {
+                (local(conn, Ty::TcpConn) && conn.ty == Ty::TcpConn)
+                    .then(|| strict(Ty::Writer, &[conn]))?
+            }
+            hir::ExprKind::TcpReadTimeout { conn, ns }
+            | hir::ExprKind::TcpWriteTimeout { conn, ns } => {
+                (local(conn, Ty::TcpConn) && conn.ty == Ty::TcpConn && ns.ty == i64)
+                    .then(|| strict(Ty::Unit, &[conn, ns]))?
+            }
+            hir::ExprKind::TcpAccept { listener } => {
+                (local(listener, Ty::TcpListener) && listener.ty == Ty::TcpListener)
+                    .then(|| result(Ty::TcpConn, &[listener]))?
+            }
+            hir::ExprKind::UdpSendTo {
+                sock,
+                data,
+                host,
+                port,
+            } => {
+                if !local(sock, Ty::UdpSocket)
+                    || sock.ty != Ty::UdpSocket
+                    || !byte_view(data.ty)
+                    || host.ty != Ty::Str
+                    || port.ty != i64
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[sock, data, host, port])
+            }
+            hir::ExprKind::UdpRecvFrom { sock, buffer } => {
+                if !local(sock, Ty::UdpSocket)
+                    || !mutable_local(buffer, Ty::Buffer)
+                    || sock.ty != Ty::UdpSocket
+                    || buffer.ty != Ty::Buffer
+                {
+                    return None;
+                }
+                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[sock, buffer])
+            }
+            hir::ExprKind::FsReadFileView { path } => {
+                (context.arena_depth > 0 && path.ty == Ty::Str)
+                    .then(|| result(Ty::Str, &[path]))?
+            }
+            hir::ExprKind::FsReadBytesView { path } => {
+                (context.arena_depth > 0 && path.ty == Ty::Str)
+                    .then(|| result(Ty::Slice(u8_scalar), &[path]))?
+            }
+            hir::ExprKind::PathJoin { a, b } => {
+                (a.ty == Ty::Str && b.ty == Ty::Str).then(|| strict(Ty::String, &[a, b]))?
+            }
+            hir::ExprKind::PathComponent { path, .. } => {
+                (path.ty == Ty::Str).then(|| strict(Ty::Str, &[path]))?
+            }
+            hir::ExprKind::PathNormalize { path } => {
+                (path.ty == Ty::Str).then(|| strict(Ty::String, &[path]))?
+            }
+            hir::ExprKind::EnvGet { name } => {
+                (name.ty == Ty::Str).then(|| strict(Ty::Option(Scalar::String), &[name]))?
+            }
+            hir::ExprKind::EnvSet { name, value } => {
+                (name.ty == Ty::Str && value.ty == Ty::Str)
+                    .then(|| result(Ty::Unit, &[name, value]))?
+            }
+            hir::ExprKind::TimeNow | hir::ExprKind::TimeInstant | hir::ExprKind::ProcessCpuCount => {
+                strict(i64, &[])
+            }
+            hir::ExprKind::TimeSleep { ns } => {
+                (ns.ty == i64).then(|| strict(Ty::Unit, &[ns]))?
+            }
+            hir::ExprKind::ProcessExit { code } => {
+                if code.ty != i64 {
+                    return None;
+                }
+                let flows = self.native_children(&[code])?;
+                let (_, breaks) = strict_flow(&flows);
+                Some((Ty::Unit, false, breaks))
+            }
+            hir::ExprKind::ProcessAbort => (expression.ty == Ty::Unit).then_some((Ty::Unit, false, Vec::new())),
+            hir::ExprKind::ProcessSpawn { cmd, args } => {
+                (cmd.ty == Ty::Str && is_argv_ty(args.ty)).then(|| result(Ty::Child, &[cmd, args]))?
+            }
+            hir::ExprKind::ChildWait { child } => {
+                (local(child, Ty::Child) && child.ty == Ty::Child)
+                    .then(|| result(i64, &[child]))?
+            }
+            hir::ExprKind::ChildKill { child, sig } => {
+                (local(child, Ty::Child) && child.ty == Ty::Child && sig.ty == i64)
+                    .then(|| result(Ty::Unit, &[child, sig]))?
+            }
+            hir::ExprKind::ProcessExec { cmd, args } => {
+                (cmd.ty == Ty::Str && is_argv_ty(args.ty)).then(|| result(Ty::Unit, &[cmd, args]))?
+            }
+            hir::ExprKind::ProcessCommand { cmd, args } => {
+                (cmd.ty == Ty::Str && is_argv_ty(args.ty)).then(|| strict(Ty::Command, &[cmd, args]))?
+            }
+            hir::ExprKind::CommandCwd { command, dir } => {
+                (local(command, Ty::Command) && command.ty == Ty::Command && dir.ty == Ty::Str)
+                    .then(|| strict(Ty::Unit, &[command, dir]))?
+            }
+            hir::ExprKind::CommandTimeout { command, ns } => {
+                (local(command, Ty::Command) && command.ty == Ty::Command && ns.ty == i64)
+                    .then(|| strict(Ty::Unit, &[command, ns]))?
+            }
+            hir::ExprKind::CommandEnv {
+                command,
+                name,
+                value,
+            } => {
+                (local(command, Ty::Command)
+                    && command.ty == Ty::Command
+                    && name.ty == Ty::Str
+                    && value.ty == Ty::Str)
+                    .then(|| strict(Ty::Unit, &[command, name, value]))?
+            }
+            hir::ExprKind::CommandEnvClear { command } => {
+                (local(command, Ty::Command) && command.ty == Ty::Command)
+                    .then(|| strict(Ty::Unit, &[command]))?
+            }
+            hir::ExprKind::CommandRun { command } => {
+                (local(command, Ty::Command) && command.ty == Ty::Command)
+                    .then(|| result(Ty::RunOutput, &[command]))?
+            }
+            hir::ExprKind::RunOutputCode { out } => {
+                (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
+                    .then(|| strict(i64, &[out]))?
+            }
+            hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
+                (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
+                    .then(|| strict(Ty::Str, &[out]))?
+            }
+            hir::ExprKind::EncodingEncode { data, .. } => {
+                (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
+            }
+            hir::ExprKind::EncodingDecode { input, kind } => {
+                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Html))
+                    .then(|| result(Ty::Buffer, &[input]))?
+            }
+            hir::ExprKind::Utf8Valid { data } => {
+                (data.ty == Ty::Slice(u8_scalar)).then(|| strict(Ty::Bool, &[data]))?
+            }
+            hir::ExprKind::Compress { data, level, .. } => {
+                (byte_view(data.ty) && level.ty == i64).then(|| result(Ty::Buffer, &[data, level]))?
+            }
+            hir::ExprKind::Decompress { data, .. } => {
+                (byte_view(data.ty)).then(|| result(Ty::Buffer, &[data]))?
+            }
+            hir::ExprKind::RandSeed => (expression.ty == Ty::Rng).then_some((Ty::Rng, true, Vec::new())),
+            hir::ExprKind::RandSeedWith { seed } => {
+                (seed.ty == i64).then(|| strict(Ty::Rng, &[seed]))?
+            }
+            hir::ExprKind::RandNext { rng } => {
+                (mutable_local(rng, Ty::Rng) && rng.ty == Ty::Rng)
+                    .then(|| strict(i64, &[rng]))?
+            }
+            hir::ExprKind::RandRange { rng, lo, hi } => {
+                (mutable_local(rng, Ty::Rng)
+                    && rng.ty == Ty::Rng
+                    && lo.ty == i64
+                    && hi.ty == i64)
+                    .then(|| strict(i64, &[rng, lo, hi]))?
+            }
+            hir::ExprKind::RandShuffle { rng, xs, elem } => {
+                if !mutable_local(rng, Ty::Rng)
+                    || rng.ty != Ty::Rng
+                    || !self.rng_elem_ok(*elem)
+                    || xs.ty != Ty::Slice(align_sema::ty_to_scalar(*elem)?)
+                    || !self.writable_slice_local(context, xs)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[rng, xs])
+            }
+            hir::ExprKind::RandSample { rng, xs, k, elem } => {
+                if !mutable_local(rng, Ty::Rng)
+                    || rng.ty != Ty::Rng
+                    || !self.rng_elem_ok(*elem)
+                    || xs.ty != Ty::Slice(align_sema::ty_to_scalar(*elem)?)
+                    || k.ty != i64
+                {
+                    return None;
+                }
+                strict(Ty::DynArray(align_sema::ty_to_scalar(*elem)?), &[rng, xs, k])
+            }
+            hir::ExprKind::RegexCompile { pattern } => {
+                (pattern.ty == Ty::Str).then(|| result(Ty::Regex, &[pattern]))?
+            }
+            hir::ExprKind::RegexIsMatch { regex, text } => {
+                (local(regex, Ty::Regex) && regex.ty == Ty::Regex && text.ty == Ty::Str)
+                    .then(|| strict(Ty::Bool, &[regex, text]))?
+            }
+            hir::ExprKind::RegexFind { regex, text, start } => {
+                if !local(regex, Ty::Regex) || regex.ty != Ty::Regex || text.ty != Ty::Str {
+                    return None;
+                }
+                let match_id = self.regex_match_id()?;
+                let mut children = vec![regex.as_ref(), text.as_ref()];
+                if let Some(start) = start {
+                    if start.ty != i64 {
+                        return None;
+                    }
+                    children.push(start.as_ref());
+                }
+                strict(Ty::Option(Scalar::Struct(match_id)), &children)
+            }
+            hir::ExprKind::RegexFindAll { regex, text }
+            | hir::ExprKind::RegexSplit { regex, text } => {
+                if !local(regex, Ty::Regex) || regex.ty != Ty::Regex || text.ty != Ty::Str {
+                    return None;
+                }
+                strict(
+                    Ty::DynStructArray(self.regex_match_id()?, Layout::Aos),
+                    &[regex, text],
+                )
+            }
+            hir::ExprKind::RegexReplace {
+                regex,
+                text,
+                repl,
+                ..
+            } => {
+                if !local(regex, Ty::Regex)
+                    || regex.ty != Ty::Regex
+                    || text.ty != Ty::Str
+                    || repl.ty != Ty::Str
+                {
+                    return None;
+                }
+                strict(Ty::String, &[regex, text, repl])
+            }
+            hir::ExprKind::RegexCaptures { regex, text } => {
+                if !local(regex, Ty::Regex) || regex.ty != Ty::Regex || text.ty != Ty::Str {
+                    return None;
+                }
+                strict(Ty::Option(Scalar::Captures), &[regex, text])
+            }
+            hir::ExprKind::RegexGroupCount { regex } => {
+                (local(regex, Ty::Regex) && regex.ty == Ty::Regex)
+                    .then(|| strict(i64, &[regex]))?
+            }
+            hir::ExprKind::RegexGroupIndex { regex, name } => {
+                (local(regex, Ty::Regex) && regex.ty == Ty::Regex && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true })), &[regex, name]))?
+            }
+            hir::ExprKind::CapturesGroup { caps, index } => {
+                if !local(caps, Ty::Captures) || caps.ty != Ty::Captures || index.ty != i64 {
+                    return None;
+                }
+                strict(Ty::Option(Scalar::Struct(self.regex_match_id()?)), &[caps, index])
+            }
+            hir::ExprKind::CliCommand { name } => {
+                (name.ty == Ty::Str).then(|| strict(Ty::CliCommand, &[name]))?
+            }
+            hir::ExprKind::CliFlag {
+                cmd,
+                kind,
+                name,
+                default,
+            } => {
+                if !local(cmd, Ty::CliCommand) || cmd.ty != Ty::CliCommand || name.ty != Ty::Str {
+                    return None;
+                }
+                match (kind, default) {
+                    (hir::CliFlagKind::Bool, None) => {}
+                    (hir::CliFlagKind::I64, Some(default)) if default.ty == i64 => {}
+                    (hir::CliFlagKind::Str, Some(default)) if default.ty == Ty::Str => {}
+                    _ => return None,
+                }
+                let mut children = vec![cmd.as_ref(), name.as_ref()];
+                if let Some(default) = default {
+                    children.push(default.as_ref());
+                }
+                strict(Ty::Unit, &children)
+            }
+            hir::ExprKind::CliParse { cmd, args } => {
+                (local(cmd, Ty::CliCommand) && cmd.ty == Ty::CliCommand && args.ty == Ty::DynArray(Scalar::Str))
+                    .then(|| result(Ty::CliParsed, &[cmd, args]))?
+            }
+            hir::ExprKind::CliGetBool { parsed, name } => {
+                (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Bool, &[parsed, name]))?
+            }
+            hir::ExprKind::CliGetI64 { parsed, name } => {
+                (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
+                    .then(|| strict(i64, &[parsed, name]))?
+            }
+            hir::ExprKind::CliGetStr { parsed, name } => {
+                (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Str, &[parsed, name]))?
+            }
+            hir::ExprKind::CliUsage { cmd } => {
+                (local(cmd, Ty::CliCommand) && cmd.ty == Ty::CliCommand)
+                    .then(|| strict(Ty::String, &[cmd]))?
+            }
+            hir::ExprKind::HttpRequest { method, url } => {
+                (method.ty == Ty::Str && url.ty == Ty::Str)
+                    .then(|| strict(Ty::HttpRequest, &[method, url]))?
+            }
+            hir::ExprKind::HttpHeader { req, name, value } => {
+                (local(req, Ty::HttpRequest)
+                    && req.ty == Ty::HttpRequest
+                    && name.ty == Ty::Str
+                    && value.ty == Ty::Str)
+                    .then(|| strict(Ty::Unit, &[req, name, value]))?
+            }
+            hir::ExprKind::HttpBody { req, data } => {
+                (local(req, Ty::HttpRequest)
+                    && req.ty == Ty::HttpRequest
+                    && byte_view(data.ty))
+                    .then(|| strict(Ty::Unit, &[req, data]))?
+            }
+            hir::ExprKind::HttpRequestTimeout { req, ns } => {
+                (local(req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && ns.ty == i64)
+                    .then(|| strict(Ty::Unit, &[req, ns]))?
+            }
+            hir::ExprKind::HttpParse { data } => {
+                (byte_view(data.ty)).then(|| result(Ty::HttpResponse, &[data]))?
+            }
+            hir::ExprKind::HttpRespStatus { resp } => {
+                (self.http_response_place(resp, context) && resp.ty == Ty::HttpResponse)
+                    .then(|| strict(i64, &[resp]))?
+            }
+            hir::ExprKind::HttpRespHeader { resp, name } => {
+                (self.http_response_place(resp, context) && resp.ty == Ty::HttpResponse && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Option(Scalar::Str), &[resp, name]))?
+            }
+            hir::ExprKind::HttpRespBody { resp } => {
+                (self.http_response_place(resp, context) && resp.ty == Ty::HttpResponse)
+                    .then(|| strict(Ty::Slice(u8_scalar), &[resp]))?
+            }
+            hir::ExprKind::HttpClient => (expression.ty == Ty::HttpClient).then_some((Ty::HttpClient, true, Vec::new())),
+            hir::ExprKind::HttpClientTimeout { client, ns } => {
+                (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && ns.ty == i64)
+                    .then(|| strict(Ty::Unit, &[client, ns]))?
+            }
+            hir::ExprKind::HttpClientGet { client, url } => {
+                (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && url.ty == Ty::Str)
+                    .then(|| result(Ty::HttpResponse, &[client, url]))?
+            }
+            hir::ExprKind::HttpClientPost { client, url, body } => {
+                (local(client, Ty::HttpClient)
+                    && client.ty == Ty::HttpClient
+                    && url.ty == Ty::Str
+                    && byte_view(body.ty))
+                    .then(|| result(Ty::HttpResponse, &[client, url, body]))?
+            }
+            hir::ExprKind::HttpClientRequest { client, req } => {
+                (local(client, Ty::HttpClient)
+                    && client.ty == Ty::HttpClient
+                    && req.ty == Ty::HttpRequest)
+                    .then(|| result(Ty::HttpResponse, &[client, req]))?
+            }
+            hir::ExprKind::HttpGetMany {
+                client,
+                urls,
+                max_concurrency,
+            } => {
+                (local(client, Ty::HttpClient)
+                    && client.ty == Ty::HttpClient
+                    && urls.ty == Ty::Slice(Scalar::Str)
+                    && max_concurrency.ty == i64)
+                    .then(|| result(Ty::DynResponseArray, &[client, urls, max_concurrency]))?
+            }
+            hir::ExprKind::HttpServe { host, port, .. } => {
+                (host.ty == Ty::Str && port.ty == i64)
+                    .then(|| result(Ty::HttpServer, &[host, port]))?
+            }
+            hir::ExprKind::HttpAccept { server } => {
+                (local(server, Ty::HttpServer) && server.ty == Ty::HttpServer)
+                    .then(|| result(Ty::HttpRequestCtx, &[server]))?
+            }
+            hir::ExprKind::HttpCtxMethod { ctx }
+            | hir::ExprKind::HttpCtxPath { ctx }
+            | hir::ExprKind::HttpCtxHeaders { ctx }
+            | hir::ExprKind::HttpCtxBody { ctx } => {
+                if !self.http_request_ctx_place(ctx, context) || ctx.ty != Ty::HttpRequestCtx {
+                    return None;
+                }
+                let ty = match kind {
+                    hir::ExprKind::HttpCtxMethod { .. } | hir::ExprKind::HttpCtxPath { .. } => Ty::Str,
+                    hir::ExprKind::HttpCtxHeaders { .. } => Ty::HttpHeaders,
+                    _ => Ty::Slice(u8_scalar),
+                };
+                strict(ty, &[ctx])
+            }
+            hir::ExprKind::HttpCtxHeader { headers, name } => {
+                (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Option(Scalar::Str), &[headers, name]))?
+            }
+            hir::ExprKind::HttpResponseBuilder { status } => {
+                (status.ty == i64).then(|| strict(Ty::ResponseBuilder, &[status]))?
+            }
+            hir::ExprKind::HttpRbHeader { rb, name, value } => {
+                (local(rb, Ty::ResponseBuilder)
+                    && rb.ty == Ty::ResponseBuilder
+                    && name.ty == Ty::Str
+                    && value.ty == Ty::Str)
+                    .then(|| strict(Ty::Unit, &[rb, name, value]))?
+            }
+            hir::ExprKind::HttpRbBody { rb, data } => {
+                (local(rb, Ty::ResponseBuilder)
+                    && rb.ty == Ty::ResponseBuilder
+                    && byte_view(data.ty))
+                    .then(|| strict(Ty::Unit, &[rb, data]))?
+            }
+            hir::ExprKind::HttpRespond { ctx, rb } => {
+                (self.http_request_ctx_place(ctx, context)
+                    && ctx.ty == Ty::HttpRequestCtx
+                    && rb.ty == Ty::ResponseBuilder)
+                    .then(|| result(Ty::Unit, &[ctx, rb]))?
+            }
+            hir::ExprKind::HttpRespondStream { ctx, rb } => {
+                (self.http_request_ctx_place(ctx, context)
+                    && ctx.ty == Ty::HttpRequestCtx
+                    && rb.ty == Ty::ResponseBuilder)
+                    .then(|| result(Ty::HttpStream, &[ctx, rb]))?
+            }
+            hir::ExprKind::HttpStreamSend { stream, chunk, .. } => {
+                (local(stream, Ty::HttpStream) && stream.ty == Ty::HttpStream && byte_view(chunk.ty))
+                    .then(|| result(Ty::Unit, &[stream, chunk]))?
+            }
+            hir::ExprKind::HttpStreamFinish { stream } => {
+                (local(stream, Ty::HttpStream) && stream.ty == Ty::HttpStream)
+                    .then(|| result(Ty::Unit, &[stream]))?
+            }
+            hir::ExprKind::HttpStreamReject { stream, rb } => {
+                (local(stream, Ty::HttpStream)
+                    && stream.ty == Ty::HttpStream
+                    && rb.ty == Ty::ResponseBuilder)
+                    .then(|| result(Ty::Unit, &[stream, rb]))?
+            }
+            hir::ExprKind::CryptoCtEqual { a, b } => {
+                (byte_view(a.ty) && byte_view(b.ty)).then(|| strict(Ty::Bool, &[a, b]))?
+            }
+            hir::ExprKind::CryptoRandom { out } => {
+                (mutable_local(out, Ty::Buffer) && out.ty == Ty::Buffer)
+                    .then(|| strict(Ty::Unit, &[out]))?
+            }
+            hir::ExprKind::CryptoHash { data, .. } => {
+                (byte_view(data.ty)).then(|| strict(Ty::DynArray(Scalar::Int(align_sema::IntTy { bits: 8, signed: false })), &[data]))?
+            }
+            hir::ExprKind::CryptoHmac { key, data } => {
+                (byte_view(key.ty) && byte_view(data.ty))
+                    .then(|| strict(Ty::DynArray(Scalar::Int(align_sema::IntTy { bits: 8, signed: false })), &[key, data]))?
+            }
+            hir::ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                (byte_view(salt.ty) && byte_view(ikm.ty) && byte_view(info.ty) && len.ty == i64)
+                    .then(|| result(Ty::Buffer, &[salt, ikm, info, len]))?
+            }
+            hir::ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                (byte_view(key.ty) && byte_view(nonce.ty) && byte_view(input.ty) && byte_view(aad.ty))
+                    .then(|| result(Ty::Buffer, &[key, nonce, input, aad]))?
+            }
+            hir::ExprKind::CryptoArgon2 { password, salt, params } => {
+                (byte_view(password.ty)
+                    && byte_view(salt.ty)
+                    && self.argon2_params_ok(params.ty))
+                    .then(|| result(Ty::Buffer, &[password, salt, params]))?
+            }
+            _ => None,
         }
     }
 
@@ -5209,6 +6590,9 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(source)?;
                 let result = match flow.ty {
                     Ty::Array(scalar, _) => {
+                        if !self.scalar_copy_ok(scalar) {
+                            return None;
+                        }
                         if !matches!(
                             source.kind,
                             hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
@@ -5218,6 +6602,9 @@ impl<'a> BodyValidator<'a> {
                         Ty::Slice(scalar)
                     }
                     Ty::StructArray(id, _) => {
+                        if !self.scalar_copy_ok(Scalar::Struct(id)) {
+                            return None;
+                        }
                         if !matches!(
                             source.kind,
                             hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
@@ -5226,8 +6613,12 @@ impl<'a> BodyValidator<'a> {
                         }
                         Ty::Slice(Scalar::Struct(id))
                     }
-                    Ty::DynArray(scalar) => Ty::Slice(scalar),
-                    Ty::DynStructArray(id, Layout::Aos) => Ty::Slice(Scalar::Struct(id)),
+                    Ty::DynArray(scalar) if self.scalar_copy_ok(scalar) => Ty::Slice(scalar),
+                    Ty::DynStructArray(id, Layout::Aos)
+                        if self.scalar_copy_ok(Scalar::Struct(id)) =>
+                    {
+                        Ty::Slice(Scalar::Struct(id))
+                    }
                     _ => return None,
                 };
                 let (falls, breaks) = strict_flow(&[flow]);
@@ -5274,6 +6665,12 @@ impl<'a> BodyValidator<'a> {
                     Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => {
                         Ty::Struct(id)
                     }
+                    Ty::DynResponseArray => {
+                        if !matches!(recv.kind, hir::ExprKind::Local(_)) {
+                            return None;
+                        }
+                        Ty::HttpResponse
+                    }
                     _ => return None,
                 };
                 if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
@@ -5284,7 +6681,9 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
-                if !self.ty_copy_ok(result, context) {
+                let response_element_borrow =
+                    receiver.ty == Ty::DynResponseArray && result == Ty::HttpResponse;
+                if !response_element_borrow && !self.ty_copy_ok(result, context) {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
@@ -7164,6 +8563,10 @@ fn i64_ty() -> Ty {
         bits: 64,
         signed: true,
     })
+}
+
+fn is_argv_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str))
 }
 
 fn index_element_ty(ty: Ty) -> Option<Ty> {
