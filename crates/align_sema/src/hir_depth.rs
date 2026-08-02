@@ -101,6 +101,18 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
     true
 }
 
+/// Check one function body against the common checked-HIR record ceiling before a body consumer can
+/// start its own replay. This uses the same explicit worklist as the program-level proof.
+pub(crate) fn checked_hir_block_depth_is_valid(body: &Block) -> bool {
+    walk_body_records(
+        BodyRecord::Block(body),
+        MAX_CHECKED_HIR_DEPTH,
+        None,
+        false,
+        None,
+    )
+}
+
 fn walk_body_records<'a>(
     root: BodyRecord<'a>,
     max_depth: usize,

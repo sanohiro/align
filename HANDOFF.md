@@ -757,8 +757,7 @@ or failed Wait from disappearing while keeping initialized slots readable. The n
 pass found the same distinction missing in join remapping: a TaskProof now survives an unresolved
 Wait only when that predecessor already completed its current generation; otherwise coverage
 clears the proof. The TaskGet discriminator and straight-line/branch/loop owner rows carry the same
-rule. Checkpoint `7247fc6` now contains the first compiling vertical implementation and has passed
-`cargo check -p align_sema --lib` plus the existing 188 sema unit tests. The am-w implementation is intentionally one vertical: splitting group state, proof
+rule. Checkpoint `7247fc6` contains the first compiling vertical implementation. The am-w implementation is intentionally one vertical: splitting group state, proof
 transport, joins, or TaskGet diagnostics would leave an intermediate compiler that can authorize
 an uninitialized task slot or reject a valid outer proof. If the implementation exceeds the
 500-line target, the split-proof exception is justified by this single safety invariant; the
@@ -766,6 +765,30 @@ formation, control, ownership, and whole/per-unit rows must land together. Am-v 
 bound `mut Buffer` local at ReaderRead, ReaderReadLine, FilePread, UdpRecvFrom, and CryptoRandom;
 those five producer paths now reject equal-typed temporaries and immutable buffers even though the
 runtime writes through them.
+
+The 2026-08-03 am-w continuation is the stable-identity/replay-safety correction. It replaces the
+Span-keyed recursive task-wait replay with one checked-HIR preorder `NodeId` map, explicit block/
+statement/expression/branch/loop continuation work items, a checked-HIR-derived work bound, and
+an explicit loop-header fixed point that fails closed on exhaustion. The current source diff is
+about 1,800 changed hand-written lines, above the 1,000-line split-proof threshold. It remains one
+vertical because the three changes are one safety invariant: a NodeId-only intermediate leaves
+recursive replay exposed to stack overflow, a worklist-only intermediate still aliases duplicate
+Span sites, and a fixed-point-only intermediate can replay the wrong identity/order. Splitting any
+one would require a temporary parallel proof path or would leave the accepted task-group contract
+without its owner matrix. `cargo check -p align_sema` and `cargo test -p align_sema --lib --no-run`
+pass on the current tree; the prior narrow test invocations reached the macOS `_dyld_start`
+startup stall with 0% CPU and no test output, so they remain INCOMPLETE rather than CLEAN and are
+not being rerun unchanged.
+
+The fresh bounded adversarial review then returned INCOMPLETE (never CLEAN) with no P0/P1 and
+these P2/P3 findings: the old “over 64” test did not exercise a >64 convergence; two stale owner
+names were absent from the tree; duplicate-Span evidence covered only Wait; the replay bound was
+only a stack-height check; and the matrix overstated O(1) invalidation and byte identity. The
+coherent follow-up renamed the guard owner to its actual depth-derived contract, removed the stale
+names in favor of the real driver/sema owners, added group/Spawn/Err/join/loop duplicate-Span
+coverage plus empty-body budget coverage, bounded total work by checked-HIR record count, and
+defined semantic state equality and live-entry invalidation costs. No second broad review is
+started for these non-public-contract P2/P3 fixes; the owner compile/static gates are rerun once.
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
