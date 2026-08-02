@@ -2115,6 +2115,27 @@ enum BodyWork<'a> {
     ExitArm(&'a hir::MatchArm),
 }
 
+#[derive(Clone, Copy)]
+enum BodyJsonRoot {
+    Struct(u32),
+    Enum(u32),
+}
+
+struct BodyJsonUnionFrame {
+    id: u32,
+    next: usize,
+    class_seen: [bool; align_sema::JSON_SHAPE_CLASSES],
+    ok: bool,
+}
+
+enum BodyJsonWork {
+    Start(BodyJsonRoot),
+    Struct { id: u32, next: usize },
+    AfterStruct { id: u32, next: usize },
+    Union(BodyJsonUnionFrame),
+    AfterUnion(BodyJsonUnionFrame),
+}
+
 struct BodyValidator<'a> {
     program: &'a hir::Program,
     placement: PlacementValidator<'a>,
@@ -2804,6 +2825,68 @@ impl<'a> BodyValidator<'a> {
             } => {
                 !path.is_empty() && self.program.structs.get(*struct_id as usize).is_some()
             }
+            hir::ExprKind::Template(parts) => {
+                !parts.is_empty() && self.template_parts_envelope_ok(parts)
+            }
+            hir::ExprKind::JsonDecode { struct_id, .. }
+            | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
+            | hir::ExprKind::JsonScan { struct_id, .. } => {
+                self.json_struct_descriptor_ok(*struct_id, false)
+            }
+            hir::ExprKind::JsonDecodeArray { elem, .. }
+            | hir::ExprKind::JsonDecodeScalar { scalar: elem, .. } => {
+                self.json_scalar_target_ok(*elem)
+            }
+            hir::ExprKind::JsonDecodeSoa { struct_id, .. } => {
+                self.json_soa_struct_ok(*struct_id)
+            }
+            hir::ExprKind::JsonDecodeUnion { enum_id, .. } => {
+                self.json_union_descriptor_ok(*enum_id, false)
+            }
+            hir::ExprKind::JsonDoc { .. }
+            | hir::ExprKind::JsonDocKind { .. }
+            | hir::ExprKind::JsonDocGet { .. }
+            | hir::ExprKind::JsonDocAt { .. }
+            | hir::ExprKind::JsonDocAsStr { .. }
+            | hir::ExprKind::JsonDocLen { .. }
+            | hir::ExprKind::JsonDocKey { .. }
+            | hir::ExprKind::JsonDocElems { .. } => true,
+            hir::ExprKind::JsonDocAsScalar { scalar, .. } => self.json_doc_scalar_ok(*scalar),
+            hir::ExprKind::ArrayGroupAgg {
+                base,
+                struct_id,
+                key_field,
+                value_field,
+                ..
+            } => self.group_aggregate_envelope_ok(
+                context,
+                *base,
+                *struct_id,
+                *key_field,
+                *value_field,
+            ),
+            hir::ExprKind::ArrayGroupAggMulti {
+                base,
+                struct_id,
+                key_field,
+                aggs,
+                ..
+            } => {
+                !aggs.is_empty()
+                    && self.group_aggregate_envelope_ok(
+                        context,
+                        *base,
+                        *struct_id,
+                        *key_field,
+                        None,
+                    )
+                    && aggs.iter().all(|agg| self.group_aggregate_part_envelope_ok(agg))
+            }
+            hir::ExprKind::ArrayDictEncode {
+                base,
+                struct_id,
+                key_field,
+            } => self.dictionary_envelope_ok(context, *base, *struct_id, *key_field),
             hir::ExprKind::FnValue(name) => valid_declaration_name(name),
             hir::ExprKind::Closure { lifted, .. } => valid_declaration_name(lifted),
             hir::ExprKind::EnumValue {
@@ -2872,6 +2955,289 @@ impl<'a> BodyValidator<'a> {
             _ => false,
         };
         envelope && valid_span(expression.span)
+    }
+
+    fn template_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
+        parts.iter().all(|part| match part {
+            hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_) | hir::TemplatePart::JsonStr(_) => true,
+            hir::TemplatePart::OptionField { name, .. } => valid_declaration_name(name),
+            hir::TemplatePart::OptionStructField {
+                name, struct_id, ..
+            } => {
+                valid_declaration_name(name)
+                    && self.program.structs.get(*struct_id as usize).is_some()
+                    && self.json_struct_descriptor_ok(*struct_id, true)
+            }
+            hir::TemplatePart::PopComma => true,
+            hir::TemplatePart::StructArrayField { struct_id, .. } => {
+                self.program.structs.get(*struct_id as usize).is_some()
+                    && self.json_struct_descriptor_ok(*struct_id, true)
+            }
+            hir::TemplatePart::ScalarArrayField { elem, .. } => self.json_array_element_ok(*elem),
+            hir::TemplatePart::UnionValue { enum_id, .. } => {
+                self.program.enums.get(*enum_id as usize).is_some()
+                    && self.json_union_descriptor_ok(*enum_id, true)
+            }
+        })
+    }
+
+    fn json_scalar_target_ok(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Int(integer) => valid_int(integer.bits),
+            Ty::Float(float) => valid_float(float.bits),
+            Ty::Bool => true,
+            _ => false,
+        }
+    }
+
+    fn json_doc_scalar_ok(&self, ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Int(align_sema::IntTy {
+                bits: 64,
+                signed: true,
+            }) | Ty::Float(align_sema::FloatTy { bits: 64 })
+                | Ty::Bool
+        )
+    }
+
+    fn json_array_element_ok(&self, scalar: Scalar) -> bool {
+        match scalar {
+            Scalar::Int(integer) => valid_int(integer.bits),
+            Scalar::Float(float) => valid_float(float.bits),
+            Scalar::Bool | Scalar::Str => true,
+            _ => false,
+        }
+    }
+
+    fn json_soa_struct_ok(&self, id: u32) -> bool {
+        self.program.structs.get(id as usize).is_some_and(|definition| {
+            !definition.fields.is_empty()
+                && definition.fields.iter().all(|field| match field.ty {
+                    Ty::Int(integer) => valid_int(integer.bits),
+                    Ty::Float(float) => valid_float(float.bits),
+                    Ty::Bool | Ty::Char | Ty::Str => true,
+                    _ => false,
+                })
+        })
+    }
+
+    fn json_struct_descriptor_ok(&self, id: u32, encode: bool) -> bool {
+        self.json_shape_ok(BodyJsonRoot::Struct(id), encode)
+    }
+
+    fn json_union_descriptor_ok(&self, id: u32, encode: bool) -> bool {
+        self.json_shape_ok(BodyJsonRoot::Enum(id), encode)
+    }
+
+    fn json_shape_ok(&self, root: BodyJsonRoot, encode: bool) -> bool {
+        let mut work = vec![BodyJsonWork::Start(root)];
+        let mut values = Vec::new();
+        let mut active_structs = HashSet::new();
+        let mut active_enums = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                BodyJsonWork::Start(BodyJsonRoot::Struct(id)) => {
+                    if self.program.structs.get(id as usize).is_none() {
+                        values.push(false);
+                        continue;
+                    }
+                    if !active_structs.insert(id) {
+                        values.push(false);
+                    } else {
+                        work.push(BodyJsonWork::Struct { id, next: 0 });
+                    }
+                }
+                BodyJsonWork::Start(BodyJsonRoot::Enum(id)) => {
+                    let Some(definition) = self.program.enums.get(id as usize) else {
+                        values.push(false);
+                        continue;
+                    };
+                    if definition.variants.is_empty() || !active_enums.insert(id) {
+                        values.push(false);
+                    } else {
+                        work.push(BodyJsonWork::Union(BodyJsonUnionFrame {
+                            id,
+                            next: 0,
+                            class_seen: [false; align_sema::JSON_SHAPE_CLASSES],
+                            ok: true,
+                        }));
+                    }
+                }
+                BodyJsonWork::Struct { id, next } => {
+                    let Some(field) = self
+                        .program
+                        .structs
+                        .get(id as usize)
+                        .and_then(|definition| definition.fields.get(next))
+                    else {
+                        active_structs.remove(&id);
+                        values.push(true);
+                        continue;
+                    };
+                    let child = match field.ty {
+                        Ty::Int(integer) => valid_int(integer.bits).then_some(None),
+                        Ty::Float(float) => valid_float(float.bits).then_some(None),
+                        Ty::Bool | Ty::Str => Some(None),
+                        Ty::Struct(child) => Some(Some(BodyJsonRoot::Struct(child))),
+                        Ty::Enum(child) => Some(Some(BodyJsonRoot::Enum(child))),
+                        Ty::DynStructArray(child, Layout::Aos) => {
+                            Some(Some(BodyJsonRoot::Struct(child)))
+                        }
+                        Ty::Option(payload) => match payload {
+                            Scalar::Int(integer) => valid_int(integer.bits).then_some(None),
+                            Scalar::Float(float) => valid_float(float.bits).then_some(None),
+                            Scalar::Bool | Scalar::Str => Some(None),
+                            Scalar::Struct(child) => Some(Some(BodyJsonRoot::Struct(child))),
+                            Scalar::Enum(child) if encode => {
+                                Some(Some(BodyJsonRoot::Enum(child)))
+                            }
+                            _ => None,
+                        },
+                        Ty::DynArray(element) => self.json_array_element_ok(element).then_some(None),
+                        _ => None,
+                    };
+                    let Some(child) = child else {
+                        active_structs.remove(&id);
+                        values.push(false);
+                        continue;
+                    };
+                    let next = next.saturating_add(1);
+                    if let Some(child) = child {
+                        work.push(BodyJsonWork::AfterStruct { id, next });
+                        work.push(BodyJsonWork::Start(child));
+                    } else {
+                        work.push(BodyJsonWork::Struct { id, next });
+                    }
+                }
+                BodyJsonWork::AfterStruct { id, next } => {
+                    let Some(child_ok) = values.pop() else {
+                        return false;
+                    };
+                    if child_ok {
+                        work.push(BodyJsonWork::Struct { id, next });
+                    } else {
+                        active_structs.remove(&id);
+                        values.push(false);
+                    }
+                }
+                BodyJsonWork::Union(mut frame) => {
+                    let Some(variant) = self
+                        .program
+                        .enums
+                        .get(frame.id as usize)
+                        .and_then(|definition| definition.variants.get(frame.next))
+                    else {
+                        active_enums.remove(&frame.id);
+                        values.push(frame.ok);
+                        continue;
+                    };
+                    frame.next = frame.next.saturating_add(1);
+                    let Some(&payload) = variant.payload.first() else {
+                        frame.ok = false;
+                        work.push(BodyJsonWork::Union(frame));
+                        continue;
+                    };
+                    if variant.payload.len() != 1
+                        || !match payload {
+                            Scalar::Int(integer) => valid_int(integer.bits),
+                            Scalar::Float(float) => valid_float(float.bits),
+                            Scalar::Bool | Scalar::Str => true,
+                            Scalar::Struct(id) | Scalar::DynStructArray(id) => {
+                                self.program.structs.get(id as usize).is_some()
+                            }
+                            _ => false,
+                        }
+                    {
+                        frame.ok = false;
+                        work.push(BodyJsonWork::Union(frame));
+                        continue;
+                    }
+                    let Some(class) = align_sema::union_shape_class(payload).map(usize::from)
+                    else {
+                        frame.ok = false;
+                        work.push(BodyJsonWork::Union(frame));
+                        continue;
+                    };
+                    let Some(seen) = frame.class_seen.get_mut(class) else {
+                        frame.ok = false;
+                        work.push(BodyJsonWork::Union(frame));
+                        continue;
+                    };
+                    if *seen {
+                        frame.ok = false;
+                        work.push(BodyJsonWork::Union(frame));
+                        continue;
+                    }
+                    *seen = true;
+                    let child = match payload {
+                        Scalar::Struct(id) | Scalar::DynStructArray(id) => {
+                            Some(BodyJsonRoot::Struct(id))
+                        }
+                        _ => None,
+                    };
+                    if let Some(child) = child {
+                        work.push(BodyJsonWork::AfterUnion(frame));
+                        work.push(BodyJsonWork::Start(child));
+                    } else {
+                        work.push(BodyJsonWork::Union(frame));
+                    }
+                }
+                BodyJsonWork::AfterUnion(mut frame) => {
+                    let Some(child_ok) = values.pop() else {
+                        return false;
+                    };
+                    if !child_ok {
+                        frame.ok = false;
+                    }
+                    work.push(BodyJsonWork::Union(frame));
+                }
+            }
+        }
+        match values.as_slice() {
+            [value] => *value,
+            _ => false,
+        }
+    }
+
+    fn group_aggregate_envelope_ok(
+        &self,
+        context: &BodyContext,
+        base: hir::LocalId,
+        struct_id: u32,
+        key_field: u32,
+        value_field: Option<u32>,
+    ) -> bool {
+        self.local_ok(context, base)
+            && self.program.structs.get(struct_id as usize).is_some_and(|definition| {
+                definition.fields.get(key_field as usize).is_some()
+                    && value_field.is_none_or(|field| definition.fields.get(field as usize).is_some())
+            })
+    }
+
+    fn group_aggregate_part_envelope_ok(&self, aggregate: &hir::GroupAgg1) -> bool {
+        matches!(
+            aggregate.op,
+            hir::GroupOp::Sum
+                | hir::GroupOp::Min
+                | hir::GroupOp::Max
+                | hir::GroupOp::Count
+        )
+    }
+
+    fn dictionary_envelope_ok(
+        &self,
+        context: &BodyContext,
+        base: hir::LocalId,
+        struct_id: u32,
+        key_field: u32,
+    ) -> bool {
+        self.local_ok(context, base)
+            && self
+                .program
+                .structs
+                .get(struct_id as usize)
+                .is_some_and(|definition| definition.fields.get(key_field as usize).is_some())
     }
 
     fn loop_body_locals_valid(
@@ -3279,6 +3645,44 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(index, context.clone());
                 push_expr!(recv, context.clone());
             }
+            hir::ExprKind::Template(parts) => {
+                for part in parts.iter().rev() {
+                    match part {
+                        hir::TemplatePart::Hole(expr)
+                        | hir::TemplatePart::JsonStr(expr) => {
+                            push_expr!(expr, context.clone());
+                        }
+                        hir::TemplatePart::OptionField { access, .. }
+                        | hir::TemplatePart::OptionStructField { access, .. }
+                        | hir::TemplatePart::StructArrayField { access, .. }
+                        | hir::TemplatePart::ScalarArrayField { access, .. }
+                        | hir::TemplatePart::UnionValue { access, .. } => {
+                            push_expr!(access, context.clone());
+                        }
+                        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {}
+                    }
+                }
+            }
+            hir::ExprKind::JsonDecode { input, .. }
+            | hir::ExprKind::JsonDecodeArray { input, .. }
+            | hir::ExprKind::JsonDecodeScalar { input, .. }
+            | hir::ExprKind::JsonDecodeStructArray { input, .. }
+            | hir::ExprKind::JsonDecodeSoa { input, .. }
+            | hir::ExprKind::JsonDecodeUnion { input, .. }
+            | hir::ExprKind::JsonScan { input, .. }
+            | hir::ExprKind::JsonDoc { input } => push_expr!(input, context.clone()),
+            hir::ExprKind::JsonDocKind { doc }
+            | hir::ExprKind::JsonDocAsStr { doc }
+            | hir::ExprKind::JsonDocAsScalar { doc, .. }
+            | hir::ExprKind::JsonDocLen { doc }
+            | hir::ExprKind::JsonDocElems { doc } => push_expr!(doc, context.clone()),
+            hir::ExprKind::JsonDocGet { doc, key } | hir::ExprKind::JsonDocAt { doc, index: key } | hir::ExprKind::JsonDocKey { doc, index: key } => {
+                push_expr!(key, context.clone());
+                push_expr!(doc, context.clone());
+            }
+            hir::ExprKind::ArrayGroupAgg { .. }
+            | hir::ExprKind::ArrayGroupAggMulti { .. }
+            | hir::ExprKind::ArrayDictEncode { .. } => {}
             hir::ExprKind::Unit
             | hir::ExprKind::Int(_)
             | hir::ExprKind::Float(_)
@@ -4175,6 +4579,7 @@ impl<'a> BodyValidator<'a> {
             Ty::DynSliceArray(primitive) => {
                 Some(Ty::Slice(align_sema::prim_to_scalar(primitive)))
             }
+            Ty::JsonScanner(id) => Some(Ty::Struct(id)),
             Ty::Tuple(id) if matches!(source.kind, hir::ExprKind::ArrayZip { .. }) => {
                 self.program.tuples.get(id as usize).and_then(|tuple| {
                     tuple
@@ -4187,8 +4592,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Tuple(_) => None,
             // A scanner is owned by the later JSON slice. Keeping it out here also prevents the
             // array reducers from taking the Result<T, Error> scanner ABI by accident.
-            Ty::JsonScanner(_)
-            | Ty::DynStructArray(_, Layout::Soa)
+            Ty::DynStructArray(_, Layout::Soa)
             | Ty::DynResponseArray
             | Ty::Unit
             | Ty::Str
@@ -4241,6 +4645,15 @@ impl<'a> BodyValidator<'a> {
             | Ty::FloatVar(_)
             | Ty::StrFinder
             | Ty::Error => None,
+        }
+    }
+
+    fn pipeline_terminal_result(&self, source_ty: Ty, payload: Ty) -> Option<Ty> {
+        if matches!(source_ty, Ty::JsonScanner(_)) {
+            let error = self.error_id()?;
+            Some(Ty::Result(align_sema::ty_to_scalar(payload)?, Scalar::Enum(error)))
+        } else {
+            Some(payload)
         }
     }
 
@@ -4311,6 +4724,7 @@ impl<'a> BodyValidator<'a> {
                 | Ty::StructArray(..)
                 | Ty::DynStructArray(..)
                 | Ty::Soa(_)
+                | Ty::JsonScanner(_)
         );
         let mut current = current_source;
         let mut mapped = false;
@@ -4435,12 +4849,16 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&flows);
-                Some((elem, falls, breaks))
+                Some((self.pipeline_terminal_result(source.ty, elem)?, falls, breaks))
             }
             hir::ExprKind::ArrayCount { source, stages } => {
                 let (_, flows) = self.pipeline_prefix(source, stages, context)?;
                 let (falls, breaks) = strict_flow(&flows);
-                Some((i64_ty(), falls, breaks))
+                Some((
+                    self.pipeline_terminal_result(source.ty, i64_ty())?,
+                    falls,
+                    breaks,
+                ))
             }
             hir::ExprKind::ArrayAnyAll {
                 source,
@@ -4468,7 +4886,11 @@ impl<'a> BodyValidator<'a> {
                 }
                 flows.extend(capture_flows);
                 let (falls, breaks) = strict_flow(&flows);
-                Some((Ty::Bool, falls, breaks))
+                Some((
+                    self.pipeline_terminal_result(source.ty, Ty::Bool)?,
+                    falls,
+                    breaks,
+                ))
             }
             hir::ExprKind::ArrayMinMax { source, stages, .. } => {
                 let (elem, flows) = self.pipeline_prefix(source, stages, context)?;
@@ -4476,7 +4898,7 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&flows);
-                Some((elem, falls, breaks))
+                Some((self.pipeline_terminal_result(source.ty, elem)?, falls, breaks))
             }
             hir::ExprKind::ArrayReduce {
                 source,
@@ -4505,7 +4927,11 @@ impl<'a> BodyValidator<'a> {
                 flows.push(init_flow);
                 flows.extend(capture_flows);
                 let (falls, breaks) = strict_flow(&flows);
-                Some((init.ty, falls, breaks))
+                Some((
+                    self.pipeline_terminal_result(source.ty, init.ty)?,
+                    falls,
+                    breaks,
+                ))
             }
             hir::ExprKind::ArrayScan {
                 source,
@@ -4516,6 +4942,9 @@ impl<'a> BodyValidator<'a> {
                 elem: output_elem,
             } => {
                 let (input_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let init_flow = self.expr_flow(init)?;
                 let output_scalar = align_sema::ty_to_scalar(*output_elem)
                     .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some());
@@ -4564,6 +4993,9 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::ArraySort { source, stages, elem } => {
                 let (final_elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 if final_elem != *elem
                     || !numeric_body_ty(final_elem)
@@ -4583,6 +5015,9 @@ impl<'a> BodyValidator<'a> {
                 elem,
             } => {
                 let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 if final_elem != *elem
                     || align_sema::scalar_to_prim(scalar).is_none()
@@ -4608,6 +5043,9 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::ArrayToArray { source, stages, elem } => {
                 let (final_elem, flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 if final_elem != *elem || !self.ty_copy_ok(final_elem, context) {
                     return None;
                 }
@@ -4647,6 +5085,9 @@ impl<'a> BodyValidator<'a> {
                 elem,
             } => {
                 let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let dst_flow = self.expr_flow(dst)?;
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 let Ty::Slice(dst_scalar) = dst_flow.ty else { return None };
@@ -4675,6 +5116,9 @@ impl<'a> BodyValidator<'a> {
                 elem,
             } => {
                 let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 let primitive = align_sema::scalar_to_prim(scalar)?;
                 if final_elem != *elem || !self.scalar_copy_ok(scalar) {
@@ -4711,6 +5155,9 @@ impl<'a> BodyValidator<'a> {
                 elem,
             } => {
                 let (input_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
                 let output_scalar = align_sema::ty_to_scalar(*elem)?;
                 if !matches!(
                     output_scalar,
@@ -4917,8 +5364,528 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
                 Some((leaf, falls, breaks))
             }
+            hir::ExprKind::Template(parts) => {
+                self.derive_template_expression(parts, context)
+            }
+            hir::ExprKind::JsonDecode { struct_id, input } => {
+                self.derive_json_decode_struct(*struct_id, input, context, false)
+            }
+            hir::ExprKind::JsonDecodeArray { elem, input } => {
+                self.derive_json_decode_array(*elem, input, context)
+            }
+            hir::ExprKind::JsonDecodeScalar { scalar, input } => {
+                self.derive_json_decode_scalar(*scalar, input, context)
+            }
+            hir::ExprKind::JsonDecodeStructArray { struct_id, input } => {
+                self.derive_json_decode_struct(*struct_id, input, context, true)
+            }
+            hir::ExprKind::JsonDecodeSoa { struct_id, input } => {
+                let flow = self.expr_flow(input)?;
+                if context.arena_depth == 0
+                    || flow.ty != Ty::Str
+                    || !self.json_soa_struct_ok(*struct_id)
+                {
+                    return None;
+                }
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((
+                    Ty::Result(Scalar::Soa(*struct_id), Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
+            }
+            hir::ExprKind::JsonDecodeUnion { enum_id, input } => {
+                let flow = self.expr_flow(input)?;
+                if flow.ty != Ty::Str || !self.json_union_descriptor_ok(*enum_id, false) {
+                    return None;
+                }
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((
+                    Ty::Result(Scalar::Enum(*enum_id), Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
+            }
+            hir::ExprKind::JsonDoc { input } => {
+                let flow = self.expr_flow(input)?;
+                if context.arena_depth == 0 || flow.ty != Ty::Str {
+                    return None;
+                }
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((
+                    Ty::Result(Scalar::JsonDoc, Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
+            }
+            hir::ExprKind::JsonDocKind { doc } => {
+                let flow = self.expr_flow(doc)?;
+                let kind = self.json_kind_id()?;
+                if flow.ty != Ty::JsonDoc {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::Enum(kind), falls, breaks))
+            }
+            hir::ExprKind::JsonDocGet { doc, key } => {
+                let doc_flow = self.expr_flow(doc)?;
+                let key_flow = self.expr_flow(key)?;
+                if doc_flow.ty != Ty::JsonDoc || key_flow.ty != Ty::Str {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[doc_flow, key_flow]);
+                Some((Ty::JsonDoc, falls, breaks))
+            }
+            hir::ExprKind::JsonDocAt { doc, index } => {
+                let doc_flow = self.expr_flow(doc)?;
+                let index_flow = self.expr_flow(index)?;
+                if doc_flow.ty != Ty::JsonDoc || index_flow.ty != i64_ty() {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[doc_flow, index_flow]);
+                Some((Ty::JsonDoc, falls, breaks))
+            }
+            hir::ExprKind::JsonDocAsStr { doc } => {
+                let flow = self.expr_flow(doc)?;
+                if flow.ty != Ty::JsonDoc {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::Option(Scalar::Str), falls, breaks))
+            }
+            hir::ExprKind::JsonDocAsScalar { doc, scalar } => {
+                let flow = self.expr_flow(doc)?;
+                if flow.ty != Ty::JsonDoc || !self.json_doc_scalar_ok(*scalar) {
+                    return None;
+                }
+                let payload = align_sema::ty_to_scalar(*scalar)?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::Option(payload), falls, breaks))
+            }
+            hir::ExprKind::JsonDocLen { doc } => {
+                let flow = self.expr_flow(doc)?;
+                if flow.ty != Ty::JsonDoc {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((i64_ty(), falls, breaks))
+            }
+            hir::ExprKind::JsonDocKey { doc, index } => {
+                let doc_flow = self.expr_flow(doc)?;
+                let index_flow = self.expr_flow(index)?;
+                if doc_flow.ty != Ty::JsonDoc || index_flow.ty != i64_ty() {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[doc_flow, index_flow]);
+                Some((Ty::Option(Scalar::Str), falls, breaks))
+            }
+            hir::ExprKind::JsonDocElems { doc } => {
+                let flow = self.expr_flow(doc)?;
+                if context.arena_depth == 0 || flow.ty != Ty::JsonDoc {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::Slice(Scalar::JsonDoc), falls, breaks))
+            }
+            hir::ExprKind::JsonScan { struct_id, input } => {
+                let flow = self.expr_flow(input)?;
+                if flow.ty != Ty::Str || !self.json_struct_descriptor_ok(*struct_id, false) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::JsonScanner(*struct_id), falls, breaks))
+            }
+            hir::ExprKind::ArrayGroupAgg {
+                base,
+                struct_id,
+                key_field,
+                value_field,
+                op,
+                source,
+            } => self.derive_group_aggregate(
+                context,
+                *base,
+                *struct_id,
+                *key_field,
+                *value_field,
+                *op,
+                *source,
+                expression.ty,
+            ),
+            hir::ExprKind::ArrayGroupAggMulti {
+                base,
+                struct_id,
+                key_field,
+                aggs,
+                source,
+            } => self.derive_group_aggregate_multi(
+                context,
+                *base,
+                *struct_id,
+                *key_field,
+                aggs,
+                *source,
+                expression.ty,
+            ),
+            hir::ExprKind::ArrayDictEncode {
+                base,
+                struct_id,
+                key_field,
+            } => self.derive_dictionary(
+                context,
+                *base,
+                *struct_id,
+                *key_field,
+            ),
             _ => None,
         }
+    }
+
+    fn derive_template_expression(
+        &self,
+        parts: &[hir::TemplatePart],
+        _: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let mut flows = Vec::new();
+        // `true` means that the current object has emitted at least one optional field since the
+        // last `PopComma`.  The stack makes nested descriptor-driven objects independent.
+        let mut object_has_option = Vec::new();
+        for part in parts {
+            match part {
+                hir::TemplatePart::Text(text) => match text.as_str() {
+                    "{" => object_has_option.push(false),
+                    "}" => match object_has_option.pop() {
+                        Some(false) => {}
+                        Some(true) | None => return None,
+                    },
+                    _ => {}
+                },
+                hir::TemplatePart::Hole(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    let printable = match flow.ty {
+                        Ty::Int(integer) => valid_int(integer.bits),
+                        Ty::Float(float) => valid_float(float.bits),
+                        Ty::Bool | Ty::Char | Ty::Str => true,
+                        _ => false,
+                    };
+                    if !printable {
+                        return None;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::JsonStr(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if flow.ty != Ty::Str {
+                        return None;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::OptionField { access, name } => {
+                    if !valid_declaration_name(name)
+                        || object_has_option.last().is_none()
+                        || !matches!(
+                            self.expr_flow(access)?.ty,
+                            Ty::Option(payload) if self.json_array_element_ok(payload)
+                        )
+                    {
+                        return None;
+                    }
+                    let flow = self.expr_flow(access)?;
+                    if let Some(has_option) = object_has_option.last_mut() {
+                        *has_option = true;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::OptionStructField {
+                    access,
+                    name,
+                    struct_id,
+                } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || object_has_option.last().is_none()
+                        || flow.ty != Ty::Option(Scalar::Struct(*struct_id))
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    if let Some(has_option) = object_has_option.last_mut() {
+                        *has_option = true;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::PopComma => {
+                    let has_option = object_has_option.last_mut()?;
+                    if !*has_option {
+                        return None;
+                    }
+                    *has_option = false;
+                }
+                hir::TemplatePart::StructArrayField { access, struct_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynStructArray(*struct_id, align_sema::Layout::Aos)
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::ScalarArrayField { access, elem } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynArray(*elem) || !self.json_array_element_ok(*elem) {
+                        return None;
+                    }
+                    flows.push(flow);
+                }
+                hir::TemplatePart::UnionValue { access, enum_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::Enum(*enum_id)
+                        || !self.json_union_descriptor_ok(*enum_id, true)
+                    {
+                        return None;
+                    }
+                    flows.push(flow);
+                }
+            }
+        }
+        if !object_has_option.is_empty() {
+            return None;
+        }
+        let (falls, breaks) = strict_flow(&flows);
+        Some((Ty::Str, falls, breaks))
+    }
+
+    fn derive_json_decode_struct(
+        &self,
+        struct_id: u32,
+        input: &hir::Expr,
+        _: &BodyContext,
+        array: bool,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let flow = self.expr_flow(input)?;
+        if flow.ty != Ty::Str || !self.json_struct_descriptor_ok(struct_id, false) {
+            return None;
+        }
+        let payload = if array {
+            Ty::DynStructArray(struct_id, align_sema::Layout::Aos)
+        } else {
+            Ty::Struct(struct_id)
+        };
+        let error = self.error_id()?;
+        let result = Ty::Result(align_sema::ty_to_scalar(payload)?, Scalar::Enum(error));
+        let (falls, breaks) = strict_flow(&[flow]);
+        Some((result, falls, breaks))
+    }
+
+    fn derive_json_decode_array(
+        &self,
+        elem: Ty,
+        input: &hir::Expr,
+        _: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let flow = self.expr_flow(input)?;
+        if flow.ty != Ty::Str || !self.json_scalar_target_ok(elem) {
+            return None;
+        }
+        let payload = Ty::DynArray(align_sema::ty_to_scalar(elem)?);
+        let error = self.error_id()?;
+        let (falls, breaks) = strict_flow(&[flow]);
+        Some((Ty::Result(align_sema::ty_to_scalar(payload)?, Scalar::Enum(error)), falls, breaks))
+    }
+
+    fn derive_json_decode_scalar(
+        &self,
+        scalar: Ty,
+        input: &hir::Expr,
+        _: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        let flow = self.expr_flow(input)?;
+        if flow.ty != Ty::Str || !self.json_scalar_target_ok(scalar) {
+            return None;
+        }
+        let error = self.error_id()?;
+        let (falls, breaks) = strict_flow(&[flow]);
+        Some((Ty::Result(align_sema::ty_to_scalar(scalar)?, Scalar::Enum(error)), falls, breaks))
+    }
+
+    fn json_kind_id(&self) -> Option<u32> {
+        let names = ["Object", "Array", "Str", "Number", "Bool", "Null", "Missing"];
+        let mut found = None;
+        for (id, definition) in self.program.enums.iter().enumerate() {
+            if definition.name != "json.kind"
+                || definition.source_name != "json.kind"
+                || definition.variants.len() != names.len()
+                || !definition.variants.iter().zip(names).all(|(variant, name)| {
+                    variant.name == name && variant.payload.is_empty() && variant.field_base == 1
+                })
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = u32::try_from(id).ok();
+        }
+        found
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn derive_group_aggregate(
+        &self,
+        context: &BodyContext,
+        base: hir::LocalId,
+        struct_id: u32,
+        key_field: u32,
+        value_field: Option<u32>,
+        op: hir::GroupOp,
+        source: hir::GroupSource,
+        result_ty: Ty,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !self.local_ok(context, base) {
+            return None;
+        }
+        let base_ty = self.local_type(context, base)?;
+        let definition = self.program.structs.get(struct_id as usize)?;
+        let key_ty = definition.fields.get(key_field as usize)?.ty;
+        let source_key_ty = match source {
+            hir::GroupSource::SoaI64 => {
+                if base_ty != Ty::Soa(struct_id) {
+                    return None;
+                }
+                Ty::Int(align_sema::IntTy { bits: 64, signed: true })
+            }
+            hir::GroupSource::SoaStr => {
+                if base_ty != Ty::Soa(struct_id) {
+                    return None;
+                }
+                Ty::Str
+            }
+            hir::GroupSource::AosStr => {
+                if base_ty != Ty::DynStructArray(struct_id, align_sema::Layout::Aos) {
+                    return None;
+                }
+                Ty::Str
+            }
+            hir::GroupSource::Encoded => {
+                let Ty::DictEncoded(encoded_id, encoded_field) = base_ty else {
+                    return None;
+                };
+                if encoded_id != struct_id || encoded_field != key_field {
+                    return None;
+                }
+                Ty::Str
+            }
+        };
+        if key_ty != source_key_ty {
+            return None;
+        }
+        let value_ty = match value_field {
+            Some(field) => Some(definition.fields.get(field as usize)?.ty),
+            None => None,
+        };
+        match op {
+            hir::GroupOp::Count if value_field.is_some() => return None,
+            hir::GroupOp::Count => {}
+            hir::GroupOp::Sum | hir::GroupOp::Min | hir::GroupOp::Max => {
+                if value_ty != Some(Ty::Int(align_sema::IntTy { bits: 64, signed: true })) {
+                    return None;
+                }
+            }
+        }
+        let array_i64 = align_sema::ty_to_scalar(Ty::DynArray(Scalar::Int(
+            align_sema::IntTy { bits: 64, signed: true },
+        )))?;
+        let array_key = align_sema::ty_to_scalar(Ty::DynArray(
+            align_sema::ty_to_scalar(source_key_ty)?,
+        ))?;
+        let expected = [array_key, array_i64];
+        let Ty::Tuple(tuple_id) = result_ty else {
+            return None;
+        };
+        let tuple = self.program.tuples.get(tuple_id as usize)?;
+        if tuple.elems.as_slice() != expected {
+            return None;
+        }
+        Some((result_ty, true, Vec::new()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn derive_group_aggregate_multi(
+        &self,
+        context: &BodyContext,
+        base: hir::LocalId,
+        struct_id: u32,
+        key_field: u32,
+        aggregates: &[hir::GroupAgg1],
+        source: hir::GroupSource,
+        result_ty: Ty,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !self.local_ok(context, base)
+            || source != hir::GroupSource::AosStr
+            || aggregates.is_empty()
+        {
+            return None;
+        }
+        if self.local_type(context, base)?
+            != Ty::DynStructArray(struct_id, align_sema::Layout::Aos)
+        {
+            return None;
+        }
+        let definition = self.program.structs.get(struct_id as usize)?;
+        if definition.fields.get(key_field as usize)?.ty != Ty::Str {
+            return None;
+        }
+        let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+        for aggregate in aggregates {
+            match aggregate.op {
+                hir::GroupOp::Count if aggregate.value_field.is_some() => return None,
+                hir::GroupOp::Count => {}
+                hir::GroupOp::Sum | hir::GroupOp::Min | hir::GroupOp::Max => {
+                    let field = aggregate.value_field?;
+                    if definition.fields.get(field as usize)?.ty != i64_ty {
+                        return None;
+                    }
+                }
+            }
+        }
+        let array_str = align_sema::ty_to_scalar(Ty::DynArray(Scalar::Str))?;
+        let array_i64 = align_sema::ty_to_scalar(Ty::DynArray(Scalar::Int(
+            align_sema::IntTy { bits: 64, signed: true },
+        )))?;
+        let Ty::Tuple(tuple_id) = result_ty else {
+            return None;
+        };
+        let tuple = self.program.tuples.get(tuple_id as usize)?;
+        if tuple.elems.first().copied() != Some(array_str)
+            || tuple.elems.len() != aggregates.len().saturating_add(1)
+            || tuple.elems.iter().skip(1).any(|element| *element != array_i64)
+        {
+            return None;
+        }
+        Some((result_ty, true, Vec::new()))
+    }
+
+    fn derive_dictionary(
+        &self,
+        context: &BodyContext,
+        base: hir::LocalId,
+        struct_id: u32,
+        key_field: u32,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !self.local_ok(context, base)
+            || self.local_type(context, base)?
+                != Ty::DynStructArray(struct_id, align_sema::Layout::Aos)
+        {
+            return None;
+        }
+        let definition = self.program.structs.get(struct_id as usize)?;
+        if definition.fields.get(key_field as usize)?.ty != Ty::Str {
+            return None;
+        }
+        Some((Ty::DictEncoded(struct_id, key_field), true, Vec::new()))
     }
 
     #[allow(clippy::too_many_arguments)]

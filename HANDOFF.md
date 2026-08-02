@@ -8,10 +8,10 @@ per-PR journal is preserved in
 _Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The next
-implementation slice is am-b2b1 pipeline and array-view body validation; b2b2 then owns
-templates, JSON, and group/dictionary records. There is no resumable feature branch for the
-completed am-b2a work.
+(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
+implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
+group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
+history. There is no public validator activation yet.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -525,6 +525,32 @@ and the 1,000-line split threshold. This checkpoint keeps it atomic because the 
 thread; splitting those into temporary validator paths would leave an incomplete contract or a
 second implementation path. The closure matrix and owner tests cover the whole closed range, and
 no second broad review should be started merely because the diff is large.
+
+### am-b2b2 working checkpoint (2026-08-02)
+
+The branch now implements the next dormant body range through `ArrayDictEncode`. The shared
+worklist validates exact template object/`PopComma` state, separate JSON Decode/Encode descriptor
+walks, JSON document result contracts, scanner `Result<scalar, Error>` terminals, and all four
+single-group source shapes plus the AoS-string fused multi-group shape. The authoritative closure
+matrix is in `docs/impl/17-library-boundary-prerequisites.md`; the exact rows are in
+`docs/impl/19-hir-validation-ledger.md`.
+
+Owner coverage is `hir_body_validator_pipeline_template_json_group`,
+`hir_body_validator_pipeline_template_json_group_control_flow`,
+`deep_hir_body_pipeline_b2b2_type_dag_is_stack_bounded`, and the existing
+`hir_body_validator_pipeline_deferred_b2b2` / deferred-facts owners. `cargo test -p align_mir
+--tests --no-run --locked` and `cargo clippy -p align_mir --tests --locked -- -D warnings` pass.
+The focused test binary compiled but again remained at 0% CPU during macOS dyld startup and was
+stopped; the attempt is recorded in `.git/align-am-b2b2-test-2026-08-02.log` and is not a test
+pass. Do not rerun the same host execution solely because it stopped; retain the compile/Clippy
+evidence and continue with the final static diff, commit, and one bounded review cycle.
+
+Against `origin/main`, the current range is 3,801 added and 73 removed hand-written Rust lines
+(2,070/54 in `validate_hir.rs` and 1,731/19 in its owner tests). It exceeds the ordinary 500-line
+target because this range shares one `derive_expression` dispatch, one child-ordering helper, one
+descriptor worklist, and one pipeline source/result thread; splitting it into temporary validator
+paths would leave an incomplete public discriminator contract. This exact count is recorded before
+the PR gate.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

@@ -575,15 +575,15 @@ means:
 | `Index` | `env[]`; `child[recv,index]`; `post[index i64. A Vec(s,n) receiver requires index to be an Int literal in 0..n and returns scalar_to_ty(s). Otherwise recv is Array, Slice, DynArray, DynSliceArray, StructArray, DynStructArray, or Soa; a fixed source is Local or ArrayLit; result is its exact scalar, slice, or struct element and must not be recursively Move; recv is borrowed and the bounds action is last]`. |
 | `SliceRange` | `env[start presence,end presence]`; `child[recv,start if present,end if present]`; `post[start/end i64; recv Str→Str or fixed/dynamic primitive array/Slice(s)→Slice(s); result view inherits recv owner/region; range action last]`. |
 | `ElemField` | `env[path,struct_id]`: nonempty valid path in struct_id. `child[recv,index]`; `post[index i64; recv fixed/dynamic StructArray(struct_id) or Soa(struct_id) where producer admits this path; result exact leaf; result view/Copy fact inherits recv; bounds/path action last]`. |
-| `Template` | `env[parts.len]`; `child[parts in order]`; `post[each part row below; result Str; hidden builder ownership is registered before holes and cleaned/transferred exactly; no later part after termination]`. |
-| `JsonDecode` | `env[struct_id]`: JSON-decodable struct descriptor. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); input borrowed by any Str fields; successful struct ownership exact]`. |
+| `Template` | `env[parts.len]`; `child[parts in order]`; `post[nonempty; every part is checked against its exact access type; an exact `Text("{")`/`Text("}")` stack tracks nested optional-field objects, and each `PopComma` requires an optional field since the previous pop in the current object; result Str; hidden builder ownership is registered before holes and cleaned/transferred exactly]`. Part records have no span; only the enclosing expression span participates. |
+| `JsonDecode` | `env[struct_id]`: Decode-direction JSON descriptor. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); input borrowed by any Str fields; successful struct ownership exact]`. |
 | `JsonDecodeArray` | `env[elem]`: JSON scalar-array element is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(DynArray(payload(elem))); new owned array, no input view]`. |
 | `JsonDecodeScalar` | `env[scalar]`: scalar is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(scalar); copied result]`. |
 | `JsonDecodeStructArray` | `env[struct_id]`: JSON-decodable struct-array descriptor. `child[input]`; `post[input Str; result ERR(DynStructArray(struct_id)); owned array; embedded Str views retain input provenance]`. |
-| `JsonDecodeSoa` | `env[struct_id]`: nonempty SoA-admissible primitive-only struct. `child[input]`; `post[input Str; inside arena; result ERR(Soa(struct_id)); arena storage and input provenance exact]`. |
+| `JsonDecodeSoa` | `env[struct_id]`: nonempty SoA-admissible struct whose fields are exactly Int/Float/Bool/Char/Str. `child[input]`; `post[input Str; inside arena; result ERR(Soa(struct_id)); arena storage and input provenance exact]`. |
 | `JsonDecodeUnion` | `env[enum_id]`: enum variants satisfy the unique JSON shape-class decoder contract. `child[input]`; `post[input Str; result ERR(Enum(enum_id)); Str payloads retain input provenance; active payload ownership exact]`. |
-| `JsonDoc` | `env[]`; `child[input]`; `post[input Str; inside arena; result ERR(JsonDoc); document view rooted in input and arena]`. |
-| `JsonDocKind` | `env[]`; `child[doc]`; `post[doc JsonDoc; result Enum(json_kind_id); copy]`. |
+| `JsonDoc` | `env[]`; `child[input]`; `post[input Str; inside arena; result exactly Result(Scalar::JsonDoc, builtin Error); document view rooted in input and arena]`. |
+| `JsonDocKind` | `env[]`; `child[doc]`; `post[doc JsonDoc; result exactly the unique builtin Enum(json.kind) with the seven settled tag-only variants; copy]`. |
 | `JsonDocGet` | `env[]`; `child[doc,key]`; `post[doc JsonDoc,key Str; result JsonDoc; view inherits doc provenance]`. |
 | `JsonDocAt` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result JsonDoc; view inherits doc provenance]`. |
 | `JsonDocAsStr` | `env[]`; `child[doc]`; `post[doc JsonDoc; result Option<Str>; view payload inherits doc provenance]`. |
@@ -591,10 +591,10 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id]`: scanner row struct satisfies the streaming JSON row descriptor. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input]`. |
-| `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some i64 field. `child[]`; `post[result exact interned two-array tuple: i64 keys for SoaI64; Str keys for SoaStr, AosStr, or Encoded; plus i64 aggregate; owned arrays, Str keys borrow base]`. |
+| `JsonScan` | `env[struct_id]`: scanner row struct satisfies the Decode-direction JSON descriptor. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
+| `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
-| `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is dynamic/fixed AoS StructArray(struct_id), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
+| `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
 
 ### am-b2 nested records
 
@@ -608,15 +608,15 @@ means:
 | `TemplatePart::Text` | `env[UTF-8 bytes]`; embedded NUL permitted; `child[]`; append exact bytes. |
 | `TemplatePart::Hole` | `env[]`; `child[expr]`; primitive printable Int/Float/Bool/Char/Str only; append using exact type. |
 | `TemplatePart::JsonStr` | `env[]`; `child[expr]`; expr Str; append quoted JSON-escaped bytes. |
-| `TemplatePart::OptionField` | `env[name]`: nonempty NUL-free JSON field bytes. `child[access]`; access admitted Option scalar/Str; emit key/value/comma only for Some. |
-| `TemplatePart::OptionStructField` | `env[name,struct_id]`: JSON-encodable struct. `child[access]`; access Option<Struct(struct_id)>; conditional nested object plus comma. |
-| `TemplatePart::PopComma` | `env[]; child[]`; valid only at producer-recorded optional-field object boundary; remove at most one trailing comma. |
-| `TemplatePart::StructArrayField` | `env[struct_id]`: JSON-encodable struct. `child[access]`; access DynStructArray(struct_id); borrowed encode. |
-| `TemplatePart::ScalarArrayField` | `env[elem]`: JSON scalar element Int/Float/Bool. `child[access]`; access DynArray(elem); borrowed encode. |
+| `TemplatePart::OptionField` | `env[name]`: nonempty NUL-free JSON field bytes. `child[access]`; access exactly Option<Int/Float/Bool/Str>; it must be inside an active exact-object state and marks that state as having an optional field. |
+| `TemplatePart::OptionStructField` | `env[name,struct_id]`: Encode-direction JSON struct descriptor. `child[access]`; access exactly Option<Struct(struct_id)>; it must be inside an active exact-object state and marks that state as having an optional field. |
+| `TemplatePart::PopComma` | `env[]; child[]`; no span; valid only with an active object that has an optional field since its last pop; clears exactly that object's pending-comma state. |
+| `TemplatePart::StructArrayField` | `env[struct_id]`: Encode-direction JSON struct descriptor. `child[access]`; access exactly DynStructArray(struct_id,Aos); borrowed encode. |
+| `TemplatePart::ScalarArrayField` | `env[elem]`: JSON scalar element Int/Float/Bool/Str. `child[access]`; access exactly DynArray(elem); borrowed encode. |
 | `TemplatePart::UnionValue` | `env[enum_id]`: JSON-encodable union. `child[access]`; access Enum(enum_id); borrowed active-payload encode. |
 | `GroupSource::SoaI64` | base `Soa(struct_id)`; key field i64; result keys owned i64. |
 | `GroupSource::SoaStr` | base `Soa(struct_id)`; key field Str; result key views borrow the source columns. |
-| `GroupSource::AosStr` | base fixed/dynamic `StructArray(struct_id)`; key field Str; result key views borrow base. |
+| `GroupSource::AosStr` | base dynamic AoS `DynStructArray(struct_id,Aos)`; key field Str; result key views borrow base. |
 | `GroupSource::Encoded` | base `DictEncoded(struct_id,key_field)` with exact same ids; dense i64 grouping and dictionary-backed Str result. |
 | `GroupAgg1` | `env[op,value_field]`: Count iff None; Sum/Min/Max iff Some in-range i64 field. |
 | `GroupOp::Sum` | requires one i64 value field and produces wrapping i64 sum. |
