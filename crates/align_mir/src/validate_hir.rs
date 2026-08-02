@@ -3093,7 +3093,7 @@ impl<'a> BodyValidator<'a> {
 
     fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
         match &expression.kind {
-            hir::ExprKind::WriterStd { fd, buffered } => matches!(*fd, 1 | 2) && !*buffered,
+            hir::ExprKind::WriterStd { fd, .. } => matches!(*fd, 1 | 2),
             hir::ExprKind::ArrayBuilderNew { elem } => self.array_builder_elem_ok(*elem),
             hir::ExprKind::RandShuffle { elem, .. } | hir::ExprKind::RandSample { elem, .. } => {
                 self.rng_elem_ok(*elem)
@@ -3294,6 +3294,172 @@ impl<'a> BodyValidator<'a> {
                 .get(context.function)
                 .and_then(|function| function.locals.get(id as usize))
                 .is_some_and(|local| local.id == id && local.is_mut)
+    }
+
+    fn writable_slice_local(&self, context: &BodyContext, expression: &hir::Expr) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        self.source_mut_local(context, expression, expression.ty)
+            && matches!(expression.ty, Ty::Slice(_))
+            && !self.readonly_slice_local(context, id)
+    }
+
+    fn readonly_slice_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
+        enum Scan<'b> {
+            Block(&'b hir::Block),
+            Stmt(&'b hir::Stmt),
+            Expr(&'b hir::Expr),
+        }
+
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let mut work = vec![Scan::Block(&function.body)];
+        let mut blocks = HashSet::new();
+        let mut statements = HashSet::new();
+        let mut expressions = HashSet::new();
+        let mut assignments = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Scan::Block(block) => {
+                    if !blocks.insert(ptr_key(block)) {
+                        continue;
+                    }
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Scan::Expr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(Scan::Stmt(statement));
+                    }
+                }
+                Scan::Stmt(statement) => {
+                    if !statements.insert(ptr_key(statement)) {
+                        continue;
+                    }
+                    match statement {
+                        hir::Stmt::Let { local, init }
+                        | hir::Stmt::Assign {
+                            local,
+                            value: init,
+                            ..
+                        } => {
+                            assignments.push((*local, init));
+                        }
+                        hir::Stmt::LetTuple { locals, init, .. } => {
+                            for local in locals.iter().flatten() {
+                                assignments.push((*local, init));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for child in statement_children(statement).into_iter().rev() {
+                        work.push(Scan::Expr(child));
+                    }
+                }
+                Scan::Expr(expression) => {
+                    if !expressions.insert(ptr_key(expression)) {
+                        continue;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(Scan::Block(block));
+                        }
+                        hir::ExprKind::If { then, els, .. } => {
+                            work.push(Scan::Block(els));
+                            work.push(Scan::Block(then));
+                            if let hir::ExprKind::If { cond, .. } = &expression.kind {
+                                work.push(Scan::Expr(cond));
+                            }
+                        }
+                        hir::ExprKind::Match { arms, .. } => {
+                            for arm in arms.iter().rev() {
+                                work.push(Scan::Expr(&arm.body));
+                            }
+                            if let hir::ExprKind::Match { scrutinee, .. } = &expression.kind {
+                                work.push(Scan::Expr(scrutinee));
+                            }
+                        }
+                        _ => {
+                            for child in align_sema::direct_expr_children(expression).into_iter().rev() {
+                                work.push(Scan::Expr(child));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut readonly = HashSet::new();
+        for (local, expression) in assignments {
+            if self.readonly_view_expression(expression, &readonly) {
+                readonly.insert(local);
+            }
+        }
+        readonly.contains(&target)
+    }
+
+    fn readonly_view_expression(
+        &self,
+        root: &hir::Expr,
+        readonly_locals: &HashSet<hir::LocalId>,
+    ) -> bool {
+        let mut work = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(expression) = work.pop() {
+            if !seen.insert(ptr_key(expression)) {
+                continue;
+            }
+            match &expression.kind {
+                hir::ExprKind::ConstArray { .. }
+                | hir::ExprKind::FsReadFileView { .. }
+                | hir::ExprKind::FsReadBytesView { .. } => return true,
+                hir::ExprKind::Local(id) => {
+                    if readonly_locals.contains(id) {
+                        return true;
+                    }
+                }
+                hir::ExprKind::StrBytes { inner } => {
+                    if matches!(inner.kind, hir::ExprKind::Str(_)) {
+                        return true;
+                    }
+                    work.push(inner);
+                }
+                hir::ExprKind::SliceRange { recv, .. }
+                | hir::ExprKind::ArrayToSlice(recv)
+                | hir::ExprKind::Try(recv) => work.push(recv),
+                hir::ExprKind::Block(block)
+                | hir::ExprKind::Arena(block)
+                | hir::ExprKind::Unsafe(block) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(value);
+                    }
+                }
+                hir::ExprKind::If { then, els, .. } => {
+                    if let Some(value) = then.value.as_deref() {
+                        work.push(value);
+                    }
+                    if let Some(value) = els.value.as_deref() {
+                        work.push(value);
+                    }
+                }
+                hir::ExprKind::Match { arms, .. } => {
+                    for arm in arms {
+                        work.push(&arm.body);
+                    }
+                }
+                hir::ExprKind::ElseUnwrap { opt, fallback } => {
+                    work.push(opt);
+                    work.push(fallback);
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn reader_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -5092,8 +5258,8 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::ReaderOpen { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
             }
-            hir::ExprKind::WriterStd { fd, buffered } => {
-                (matches!(*fd, 1 | 2) && !*buffered && expression.ty == Ty::Writer)
+            hir::ExprKind::WriterStd { fd, .. } => {
+                (matches!(*fd, 1 | 2) && expression.ty == Ty::Writer)
                     .then_some((Ty::Writer, true, Vec::new()))
             }
             hir::ExprKind::WriterCreate { path } => {
@@ -5466,7 +5632,7 @@ impl<'a> BodyValidator<'a> {
                     || rng.ty != Ty::Rng
                     || !self.rng_elem_ok(*elem)
                     || xs.ty != Ty::Slice(align_sema::ty_to_scalar(*elem)?)
-                    || !self.source_mut_local(context, xs, xs.ty)
+                    || !self.writable_slice_local(context, xs)
                 {
                     return None;
                 }

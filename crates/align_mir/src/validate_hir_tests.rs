@@ -7273,6 +7273,29 @@ fn hir_body_validator_native() {
         Vec::new(),
         Ty::Writer
     );
+    program.fns.push(body_test_named_function(
+        "native_writer_std_buffered_local",
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 0,
+                init: body_test_expr(
+                    hir::ExprKind::WriterStd {
+                        fd: 1,
+                        buffered: true,
+                    },
+                    Ty::Writer,
+                ),
+            }],
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::WriterFlush {
+                    writer: Box::new(native_local(0, Ty::Writer)),
+                },
+                result_unit,
+            ))),
+        },
+        vec![body_test_local(0, "writer", Ty::Writer, false, false)],
+        result_unit,
+    ));
     add!(
         "native_writer_create",
         body_test_expr(
@@ -8901,11 +8924,63 @@ fn hir_body_validator_native() {
     assert!(body_core_metadata_is_valid(&program));
 
     let mut reject = program.clone();
-    let expression = body_value_expression_mut(&mut reject, "native_writer_std");
-    let hir::ExprKind::WriterStd { buffered, .. } = &mut expression.kind else {
-        panic!("native writer fixture lost its std writer")
-    };
-    *buffered = true;
+    reject.fns.push(body_test_named_function(
+        "native_rand_shuffle_readonly_slice",
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 1,
+                init: body_test_expr(
+                    hir::ExprKind::StrBytes {
+                        inner: Box::new(native_str()),
+                    },
+                    Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                ),
+            }],
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::RandShuffle {
+                    rng: Box::new(native_local(0, Ty::Rng)),
+                    xs: Box::new(native_local(
+                        1,
+                        Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                    )),
+                    elem: Ty::Int(IntTy { bits: 8, signed: false }),
+                },
+                Ty::Unit,
+            ))),
+        },
+        vec![
+            body_test_local(0, "rng", Ty::Rng, true, false),
+            body_test_local(
+                1,
+                "xs",
+                Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                true,
+                false,
+            ),
+        ],
+        Ty::Unit,
+    ));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject.fns.push(body_tail_case(
+        "native_writer_buffered_temporary_write",
+        body_test_expr(
+            hir::ExprKind::WriterWrite {
+                writer: Box::new(body_test_expr(
+                    hir::ExprKind::WriterStd {
+                        fd: 1,
+                        buffered: true,
+                    },
+                    Ty::Writer,
+                )),
+                arg: Box::new(native_str()),
+                builder: false,
+            },
+            result_unit,
+        ),
+        result_unit,
+    ));
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut deferred = program.clone();
