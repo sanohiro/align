@@ -6192,6 +6192,17 @@ fn hir_body_validator_pipeline_array_views() {
     let dyn_int = Ty::DynArray(scalar);
     let dyn_record = Ty::DynStructArray(0, Layout::Aos);
     let mut program = baseline_program();
+    let move_struct = program.structs.len() as u32;
+    program.structs.push(StructDef {
+        name: "MoveRecord".to_string(),
+        source_name: "MoveRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "owned".to_string(),
+            ty: Ty::String,
+        }],
+        align: None,
+        c_repr: false,
+    });
     let add = |program: &mut hir::Program,
                name: &str,
                expression: hir::Expr,
@@ -6350,13 +6361,13 @@ fn hir_body_validator_pipeline_array_views() {
         ),
         (
             "array_view_fixed_move_struct",
-            Ty::StructArray(0, 2),
-            Scalar::Struct(0),
+            Ty::StructArray(move_struct, 2),
+            Scalar::Struct(move_struct),
         ),
         (
             "array_view_dynamic_move_struct",
-            Ty::DynStructArray(0, Layout::Aos),
-            Scalar::Struct(0),
+            Ty::DynStructArray(move_struct, Layout::Aos),
+            Scalar::Struct(move_struct),
         ),
     ] {
         let view = body_test_expr(
