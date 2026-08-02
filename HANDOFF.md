@@ -789,6 +789,13 @@ names in favor of the real driver/sema owners, added group/Spawn/Err/join/loop d
 coverage plus empty-body budget coverage, bounded total work by checked-HIR record count, and
 defined semantic state equality and live-entry invalidation costs. No second broad review is
 started for these non-public-contract P2/P3 fixes; the owner compile/static gates are rerun once.
+The final pre-PR adversarial pass then found one unsatisfiable owner assertion (the duplicate-span
+fixture has six Spawn sites, not eight), a loop matrix sentence that still implied more-than-64
+convergence, and Span-keyed TaskGet diagnostic deduplication. The follow-up changes the owner to
+assert all six structural Spawn sites, makes the fixed-point owner describe and exercise nested
+join convergence without claiming a measured iteration count, and keys diagnostic suppression by
+TaskGet `NodeId` while retaining its source span for the emitted location. A targeted closure
+check is required on the new HEAD; no unrelated broad review or test rerun is started.
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero

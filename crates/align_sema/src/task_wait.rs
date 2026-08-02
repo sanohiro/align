@@ -154,7 +154,7 @@ struct Analyzer<'a> {
     max_replay_steps: usize,
     tokens: Tokens,
     loop_breaks: Vec<Vec<(State, Option<Proof>)>>,
-    reported_gets: HashSet<Span>,
+    reported_gets: HashSet<NodeId>,
     replay_failed: bool,
     replay_failure_span: Option<Span>,
 }
@@ -204,6 +204,7 @@ enum ReplayWork<'b> {
         fallible: bool,
     },
     ExprAfterTaskGet {
+        site: NodeId,
         span: Span,
         report: bool,
     },
@@ -743,12 +744,19 @@ impl<'a> Analyzer<'a> {
         Flow::live(merged, proof)
     }
 
-    fn get_error(&mut self, state: &State, proof: Option<Proof>, span: Span, report: bool) {
-        if !report || self.reported_gets.contains(&span) {
+    fn get_error(
+        &mut self,
+        state: &State,
+        proof: Option<Proof>,
+        site: NodeId,
+        span: Span,
+        report: bool,
+    ) {
+        if !report || self.reported_gets.contains(&site) {
             return;
         }
         let Some(Proof::Task(task)) = proof else {
-            self.reported_gets.insert(span);
+            self.reported_gets.insert(site);
             let fallible = state.groups.last().is_some_and(|group| group.fallible);
             let message = if fallible {
                 "cannot call '.get()' before a successful 'wait()?' — this task_group is fallible, so use 'wait()?' to join (its error propagates) before reading results"
@@ -761,7 +769,7 @@ impl<'a> Analyzer<'a> {
         if self.task_ready(state, task) {
             return;
         }
-        self.reported_gets.insert(span);
+        self.reported_gets.insert(site);
         let message = self
             .group(state, task.group)
             .filter(|group| group.fallible)
@@ -1018,7 +1026,12 @@ impl<'a> Analyzer<'a> {
                         last = Flow::live(next, proof);
                     }
                     ExprKind::TaskGet(inner) => {
+                        let Some(site) = self.site(expr) else {
+                            last = Flow::dead();
+                            continue;
+                        };
                         work.push(ReplayWork::ExprAfterTaskGet {
+                            site,
                             span: expr.span,
                             report,
                         });
@@ -1193,13 +1206,13 @@ impl<'a> Analyzer<'a> {
                     let task = self.spawn(&mut state, site, fallible);
                     last = Flow::live(state, task.map(Proof::Task));
                 }
-                ReplayWork::ExprAfterTaskGet { span, report } => {
+                ReplayWork::ExprAfterTaskGet { site, span, report } => {
                     let flow = std::mem::replace(&mut last, Flow::dead());
                     let Some(state) = flow.state else {
                         last = Flow::dead();
                         continue;
                     };
-                    self.get_error(&state, flow.proof, span, report);
+                    self.get_error(&state, flow.proof, site, span, report);
                     last = Flow::live(state, None);
                 }
                 ReplayWork::ExprAfterTry => {
@@ -1896,10 +1909,7 @@ mod tests {
             .map(|key| key.site)
             .collect();
         assert_eq!(initial_groups.len(), 2, "duplicate groups must not alias");
-        assert!(
-            spawn_sites.len() >= 8,
-            "duplicate Spawn sites must not alias"
-        );
+        assert_eq!(spawn_sites.len(), 6, "duplicate Spawn sites must not alias");
         assert_eq!(err_sites.len(), 2, "duplicate Err sites must not alias");
         assert!(join_sites.len() >= 4, "duplicate join sites must not alias");
     }
@@ -1915,6 +1925,34 @@ mod tests {
         let flow = analyzer.replay(&body, State::default(), true);
         assert!(flow.state.is_none());
         assert!(analyzer.replay_failed);
+    }
+
+    #[test]
+    fn task_wait_duplicate_span_gets_report_separately() {
+        let span = Span::new(3, 7, 7);
+        let task_get = || Expr {
+            kind: ExprKind::TaskGet(Box::new(Expr {
+                kind: ExprKind::Local(0),
+                ty: Ty::Unit,
+                span,
+            })),
+            ty: Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            }),
+            span,
+        };
+        let body = Block {
+            stmts: vec![Stmt::Expr(task_get()), Stmt::Expr(task_get())],
+            value: None,
+        };
+        let mut diagnostics = Diagnostics::new();
+        validate(&body, &[], &mut diagnostics);
+        assert_eq!(
+            diagnostics.error_count(),
+            2,
+            "distinct invalid TaskGet nodes must not deduplicate by span"
+        );
     }
 
     #[test]
@@ -1959,23 +1997,8 @@ mod tests {
             crate::hir_depth::MAX_CHECKED_HIR_DEPTH * 8
         );
         let span = Span::new(0, 0, 1);
-        let loop_body = Block {
-            stmts: vec![Stmt::Break {
-                value: None,
-                accepted: true,
-            }],
-            value: None,
-        };
         let body = Block {
-            stmts: vec![Stmt::Expr(Expr {
-                kind: ExprKind::Loop {
-                    body: loop_body,
-                    body_locals: 0..0,
-                    diverges: false,
-                },
-                ty: Ty::Unit,
-                span,
-            })],
+            stmts: vec![Stmt::Expr(identity_group(span))],
             value: None,
         };
         let mut diagnostics = Diagnostics::new();
