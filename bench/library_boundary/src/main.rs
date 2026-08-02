@@ -125,6 +125,17 @@ fn mir_global_type_fixture() -> String {
     source
 }
 
+fn mir_nominal_link_fixture() -> String {
+    let mut source = String::new();
+    for index in 0..256 {
+        source.push_str(&format!("Record_{index:04} {{ value: i64 }}\n"));
+        source.push_str(&format!("Choice_{index:04} {{ Empty, Value(i64) }}\n"));
+    }
+    source.push_str("extern \"C\" link(\"m\") {\n  fn sqrt(x: f64) -> f64\n}\n");
+    source.push_str("fn main() -> i32 = 0\n");
+    source
+}
+
 fn import_validation_fixture() -> InterfaceSummary {
     let parameter = ITypeParam {
         name: "T".to_string(),
@@ -274,6 +285,47 @@ fn run_provenance() {
     println!(
         "mir-global-type-validation\t{milliseconds:.3}\tms/lower\t{}\ttypes",
         checked.hir.structs.len()
+    );
+
+    let nominal_source = mir_nominal_link_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let checked = align_driver::check(&mut source_map, "mir-nominal-link.align", &nominal_source);
+    assert!(
+        !checked.diags.has_errors(),
+        "MIR nominal/link fixture must check"
+    );
+    let mut nominal_hir = checked.hir.clone();
+    let original_structs = nominal_hir.structs.len();
+    for index in 0..original_structs {
+        let mut duplicate = nominal_hir.structs[index].clone();
+        duplicate.name = format!("bench_origin_struct_{index}");
+        nominal_hir.structs.push(duplicate);
+    }
+    let original_enums = nominal_hir.enums.len();
+    for index in 0..original_enums {
+        let mut duplicate = nominal_hir.enums[index].clone();
+        duplicate.name = format!("bench_origin_enum_{index}");
+        nominal_hir.enums.push(duplicate);
+    }
+    let nominal_definitions = nominal_hir.structs.len() + nominal_hir.enums.len();
+    let mir = align_driver::lower_to_mir(&nominal_hir);
+    assert_eq!(
+        mir.structs.len() + mir.enums.len(),
+        nominal_definitions,
+        "fixture must retain all nominal source-shape twins"
+    );
+
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let mir = align_driver::lower_to_mir(black_box(&nominal_hir));
+        black_box(mir);
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "mir-nominal-link-validation\t{milliseconds:.3}\tms/lower\t{nominal_definitions}\tdefinitions"
     );
 
     let continuation_source = mir_continuation_fixture();

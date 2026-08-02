@@ -230,6 +230,30 @@ fn assert_placement_rejected(label: &str, program: &hir::Program) {
     assert_rejected(label, program);
 }
 
+fn assert_nominal_rejected(label: &str, program: &hir::Program) {
+    assert!(
+        validate_hir::global_type_metadata_is_valid(program),
+        "{label}: nominal fixture is not graph-valid"
+    );
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(program),
+        "{label}: nominal fixture is not placement-valid"
+    );
+    assert!(
+        !validate_hir::nominal_link_metadata_is_valid(program),
+        "{label}: nominal/link validator accepted malformed metadata"
+    );
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(program),
+        lower_program_located(program, &source_map),
+        lower_program_per_unit(program),
+        lower_program_per_unit_located(program, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "{label}: an entrypoint published partial MIR");
+    }
+}
+
 fn assert_graph_accepted(label: &str, program: &hir::Program) {
     assert!(
         validate_hir::global_type_metadata_is_valid(program),
@@ -687,6 +711,10 @@ fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOw
     assert!(
         validate_hir::global_type_metadata_is_valid(program),
         "{label}: validator rejected valid metadata"
+    );
+    assert!(
+        validate_hir::nominal_link_metadata_is_valid(program),
+        "{label}: nominal/link validator rejected valid metadata"
     );
     if let Some(owner) = owner {
         assert_hir_owner_contract(label, program, owner);
@@ -2510,6 +2538,298 @@ fn abstract_box_param_fails_placement_closed() {
     let mut program = baseline_program();
     program.fn_types[0].ret = Ty::Box(Scalar::Param(0));
     assert_placement_rejected("abstract box parameter", &program);
+}
+
+#[test]
+fn malformed_hir_nominal_link_metadata_fails_closed() {
+    let mut empty_internal_name = baseline_program();
+    empty_internal_name.structs[0].name.clear();
+    assert_nominal_rejected("empty nominal name", &empty_internal_name);
+
+    let mut empty_source_name = baseline_program();
+    empty_source_name.structs[0].source_name.clear();
+    assert_nominal_rejected("empty source name", &empty_source_name);
+
+    let mut nul_internal_name = baseline_program();
+    nul_internal_name.structs[0].name = "Record\0private".to_string();
+    assert_nominal_rejected("NUL nominal name", &nul_internal_name);
+
+    let mut nul_source_name = baseline_program();
+    nul_source_name.structs[0].source_name = "Record\0source".to_string();
+    assert_nominal_rejected("NUL source name", &nul_source_name);
+
+    let mut duplicate_internal_name = baseline_program();
+    duplicate_internal_name.enums[0].name = "Record".to_string();
+    assert_nominal_rejected("duplicate internal nominal name", &duplicate_internal_name);
+
+    let mut invalid_field_name = baseline_program();
+    invalid_field_name.structs[0].fields[0].name = "bad-name".to_string();
+    assert_nominal_rejected("invalid field name", &invalid_field_name);
+
+    let mut duplicate_field_name = baseline_program();
+    duplicate_field_name.structs[0].fields[1].name = "key".to_string();
+    assert_nominal_rejected("duplicate field name", &duplicate_field_name);
+
+    let mut invalid_variant_name = baseline_program();
+    invalid_variant_name.enums[0].variants[1].name = "bad-variant".to_string();
+    assert_nominal_rejected("invalid variant name", &invalid_variant_name);
+
+    let mut duplicate_variant_name = baseline_program();
+    duplicate_variant_name.enums[0].variants[1].name = "Empty".to_string();
+    assert_nominal_rejected("duplicate variant name", &duplicate_variant_name);
+
+    for align in [Some(0), Some(3), Some(1u32 << 30)] {
+        let mut invalid_alignment = baseline_program();
+        invalid_alignment.structs[0].align = align;
+        assert_nominal_rejected("invalid nominal alignment", &invalid_alignment);
+    }
+
+    let mut invalid_enum_base = baseline_program();
+    invalid_enum_base.enums[0].variants[1].field_base = 2;
+    assert_nominal_rejected("invalid enum field base", &invalid_enum_base);
+
+    let mut duplicate_tuple = baseline_program();
+    duplicate_tuple.tuples.push(duplicate_tuple.tuples[0].clone());
+    assert_nominal_rejected("duplicate tuple element vector", &duplicate_tuple);
+
+    for link_libs in [
+        vec![String::new()],
+        vec!["-z".to_string()],
+        vec!["lib?name".to_string()],
+        vec!["z".to_string(), "z".to_string()],
+    ] {
+        let mut invalid_link = baseline_program();
+        invalid_link.link_libs = link_libs;
+        assert_nominal_rejected("invalid link library", &invalid_link);
+    }
+
+    let mut incompatible_source_shape = baseline_program();
+    incompatible_source_shape.structs.push(StructDef {
+        name: "Record$other".to_string(),
+        source_name: "Record".to_string(),
+        fields: vec![FieldDef {
+            name: "key".to_string(),
+            ty: Ty::String,
+        }],
+        align: None,
+        c_repr: false,
+    });
+    assert_nominal_rejected("incompatible repeated source shape", &incompatible_source_shape);
+
+    let mut incompatible_enum_shape = baseline_program();
+    incompatible_enum_shape.enums.push(EnumDef {
+        name: "Choice$other".to_string(),
+        source_name: "Choice".to_string(),
+        variants: vec![EnumVariant {
+            name: "Different".to_string(),
+            payload: Vec::new(),
+            field_base: 1,
+        }],
+    });
+    assert_nominal_rejected("incompatible repeated enum shape", &incompatible_enum_shape);
+
+    let mut incompatible_callable_shape = baseline_program();
+    incompatible_callable_shape.structs[0].fields = vec![FieldDef {
+        name: "handler".to_string(),
+        ty: Ty::Fn(0),
+    }];
+    incompatible_callable_shape.fn_types[0].params = vec![
+        (align_ast::ParamMode::ByValue, scalar_int(64)),
+    ];
+    incompatible_callable_shape.fn_types.push(fn_type(Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    })));
+    incompatible_callable_shape.fn_types[1].params = vec![
+        (align_ast::ParamMode::Out, scalar_int(64)),
+    ];
+    incompatible_callable_shape.fn_types[1].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: Vec::new(),
+    };
+    incompatible_callable_shape.structs.push(StructDef {
+        name: "Record$callable".to_string(),
+        source_name: "Record".to_string(),
+        fields: vec![FieldDef {
+            name: "handler".to_string(),
+            ty: Ty::Fn(1),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    assert_nominal_rejected("incompatible callable ABI shape", &incompatible_callable_shape);
+
+    let mut cross_kind_source_name = baseline_program();
+    cross_kind_source_name.enums[0].source_name = "Record".to_string();
+    assert_nominal_rejected("cross-kind source name collision", &cross_kind_source_name);
+}
+
+#[test]
+fn valid_hir_nominal_link_preflight_is_mir_identity() {
+    let mut program = baseline_program();
+    program.link_libs = vec!["z".to_string(), "foo-bar_2.1+".to_string()];
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert_accepted("valid nominal/link metadata", &program);
+
+    let mut equal_source_shape = baseline_program();
+    equal_source_shape.structs.push(StructDef {
+        name: "Record$origin1".to_string(),
+        source_name: "Record".to_string(),
+        fields: equal_source_shape.structs[0].fields.clone(),
+        align: equal_source_shape.structs[0].align,
+        c_repr: equal_source_shape.structs[0].c_repr,
+    });
+    assert!(validate_hir::nominal_link_metadata_is_valid(&equal_source_shape));
+    assert_accepted("equal source shape with private identity", &equal_source_shape);
+
+    let mut effect_origin = baseline_program();
+    effect_origin.structs[0].fields = vec![FieldDef {
+        name: "handler".to_string(),
+        ty: Ty::Fn(0),
+    }];
+    effect_origin.fn_types.push(fn_type(Ty::Unit));
+    effect_origin.fn_types[1].effect.set(FnEffect::Impure);
+    effect_origin.structs.push(StructDef {
+        name: "Record$impure".to_string(),
+        source_name: "Record".to_string(),
+        fields: vec![FieldDef {
+            name: "handler".to_string(),
+            ty: Ty::Fn(1),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    assert!(validate_hir::nominal_link_metadata_is_valid(&effect_origin));
+    assert_accepted("function effect origin excluded from source shape", &effect_origin);
+}
+
+#[test]
+fn nominal_source_shape_preserves_shared_node_correspondence() {
+    let mut program = baseline_program();
+    program.structs.extend([
+        StructDef {
+            name: "C0".to_string(),
+            source_name: "C".to_string(),
+            fields: vec![FieldDef {
+                name: "value".to_string(),
+                ty: Ty::String,
+            }],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "C1".to_string(),
+            source_name: "C".to_string(),
+            fields: vec![FieldDef {
+                name: "value".to_string(),
+                ty: Ty::String,
+            }],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "C2".to_string(),
+            source_name: "C".to_string(),
+            fields: vec![FieldDef {
+                name: "value".to_string(),
+                ty: Ty::String,
+            }],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "A0".to_string(),
+            source_name: "A".to_string(),
+            fields: vec![FieldDef {
+                name: "child".to_string(),
+                ty: Ty::Struct(1),
+            }],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "A1".to_string(),
+            source_name: "A".to_string(),
+            fields: vec![FieldDef {
+                name: "child".to_string(),
+                ty: Ty::Struct(3),
+            }],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "R0".to_string(),
+            source_name: "R".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "direct".to_string(),
+                    ty: Ty::Struct(1),
+                },
+                FieldDef {
+                    name: "nested".to_string(),
+                    ty: Ty::Struct(4),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        },
+        StructDef {
+            name: "R1".to_string(),
+            source_name: "R".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "direct".to_string(),
+                    ty: Ty::Struct(2),
+                },
+                FieldDef {
+                    name: "nested".to_string(),
+                    ty: Ty::Struct(5),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        },
+    ]);
+    assert_nominal_rejected("shared source-shape correspondence", &program);
+}
+
+#[test]
+fn deep_hir_source_shape_is_stack_bounded() {
+    std::thread::Builder::new()
+        .name("deep-source-shape".to_string())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+            let mut program = baseline_program();
+            program.structs = (0..(DEPTH * 2))
+                .map(|id| {
+                    let branch = id / DEPTH;
+                    let index = id % DEPTH;
+                    StructDef {
+                        name: format!("Deep{branch}_{index}"),
+                        source_name: format!("Deep{index}"),
+                        fields: vec![FieldDef {
+                            name: "next".to_string(),
+                            ty: if index + 1 == DEPTH {
+                                Ty::String
+                            } else {
+                                Ty::Struct((id + 1) as u32)
+                            },
+                        }],
+                        align: None,
+                        c_repr: false,
+                    }
+                })
+                .collect();
+            assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+            assert_accepted("deep equal source shape", &program);
+
+            program.structs[DEPTH * 2 - 1].fields[0].ty = Ty::Bool;
+            assert_nominal_rejected("deep later source-shape mismatch", &program);
+        })
+        .expect("spawn deep source-shape validator")
+        .join()
+        .expect("deep source-shape validator");
 }
 
 #[test]
