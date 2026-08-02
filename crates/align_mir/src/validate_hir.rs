@@ -2301,7 +2301,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
-            Ty::Task(payload) => self.body_scalar_ok(payload),
+            Ty::Task(payload) => primitive_task_scalar(payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
             Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),

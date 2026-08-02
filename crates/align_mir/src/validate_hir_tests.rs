@@ -3847,6 +3847,12 @@ fn hir_body_validator_local_type_placement_is_fail_closed() {
         .fns
         .push(function(Ty::DynStructArray(0, Layout::Aos)));
     assert!(!body_core_metadata_is_valid(&over_aligned_dynamic_struct_array));
+
+    let mut task_of_struct = baseline_program();
+    task_of_struct
+        .fns
+        .push(function(Ty::Task(Scalar::Struct(0))));
+    assert!(!body_core_metadata_is_valid(&task_of_struct));
 }
 
 #[test]
