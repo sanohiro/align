@@ -1564,6 +1564,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
 fn hir_program_is_valid(program: &hir::Program) -> bool {
     align_sema::checked_hir_body_depth_is_valid(program)
         && validate_hir::global_type_metadata_is_valid(program)
+        && validate_hir::type_placement_metadata_is_valid(program)
 }
 
 fn empty_program() -> Program {

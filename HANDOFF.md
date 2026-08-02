@@ -5,8 +5,10 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-01. `main` includes the shipped wave through #688; PR #688 merged the
-am-u lexical extern invocation correction. The next resumable slice is am-p placement validation.
+_Last updated: 2026-08-02. `main` includes the shipped wave through #688; PR #688 merged the
+am-u lexical extern invocation correction. The am-p placement-validation checkpoint is implemented
+on `feat/am-p-type-placement` and is open as PR #690; after it merges, the next resumable slice is
+am-n nominal/link.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -339,6 +341,74 @@ to preserve the stalled transcript, inspect the actual child process, and contin
 complete owner target instead of restarting a broad suite. The matrix now includes exact one-error
 precedence, rejected-HIR absence, branch/loop/early-exit lambda depth, and qualified whole/per-unit
 parity.
+
+### am-p delivery checkpoint (2026-08-01)
+
+The am-p checkpoint exceeded the two-hour implementation target because its body-independent
+placement matrix spans fields, payloads, tuples, tagged values, function headers, imported headers,
+and extern boundaries, while the existing sema predicates had to be compared exactly (including
+nested-array and generic `ResponseBuilder` behavior). The ordinary PR gate also spent several
+minutes in macOS `_dyld_start` before each integration binary produced output, although it kept
+progressing and finished clean. The durable rule is to freeze each producer predicate from the
+owning sema function before writing the validator, keep graph validity separate from placement
+validity, and run focused owner tests before one monitored full PR gate. When a binary sits in
+`_dyld_start`, inspect the child and preserve the transcript rather than restarting the broad gate;
+if the next checkpoint still cannot be mergeable by two hours, split at the next independently
+correct placement family and record the boundary here.
+
+The am-p checkpoint is open as PR #690. The required broad host preflight at
+`90a30fa` reached its 900-second bound without a verdict, and the fresh independent adversarial
+review found six valid closure issues: nested `array<string>` field placement was over-rejected,
+generic `ResponseBuilder` producer validation disagreed between sema and am-p, body-only handle
+types were admitted in declaration headers, an abstract `box<Param>` could pass the placement
+predicate, shared tagged DAGs lacked completed-node memoization, and the owner negatives did not
+prove graph-valid placement rejection. The owning ledger and closure matrix were updated first;
+the working tree now closes each issue with producer-aligned predicates, graph-valid owner twins,
+and a memoized shared-DAG test. The first post-open host continuation also found that the inline
+struct alignment traversal had not shared the completed-node memo; the follow-up adds that memo and
+routes the deep shared-DAG fixture through a struct field. Existing deep body fixtures now use a
+source-nameable declaration return while retaining their body-produced command/HTTP owner expression.
+
+The old host and independent transcripts are not attestations for the corrected tree. A later
+independent post-open pass found that the ledger incorrectly called graph-valid
+`Ty::DynArray(Scalar::DynArray(_))` producer-valid even though `scalar_to_prim` rejects nested owned
+arrays; the correction rejects that shape and adds its owner negative. The final independent pass
+also confirmed a real ownership gap: sema admitted `array<file>`/`slice<file>` declaration types,
+but the generic dynamic-array Drop path frees only the buffer and leaks each File handle. The
+current correction closes that producer/validator/codegen boundary by rejecting File collection
+elements in sema and am-p, updating the ledger, and adding sema plus MIR negatives. It still needs
+the full pre-PR gate and a fresh post-open review on the resulting SHA. That fresh preflight then
+found one valid P1: `inline_structs_unaligned` did not traverse enum payloads, so an
+`align(N)` struct embedded in an enum could pass placement although enum storage is inline and the
+LLVM type cannot carry the custom member alignment. The current follow-up adds enum/DAG traversal,
+checks direct enum payloads, adds graph-valid enum-field/payload negatives, and updates the ledger;
+the follow-up passed focused MIR/sema/Clippy checks. The fresh preflight on that SHA then found one
+valid P1: tuple placement admits deep-owned `array<string>` and `array<Move-struct>` elements while
+the tuple Drop path freed only each outer buffer. The current follow-up routes every owned tuple
+element through the existing recursive pointer-based destructor and adds a codegen owner test plus
+ledger/type-doc coverage. The subsequent full independent preflight reported one P1 claiming that
+`Option/Result<array<T>>` fields were rejected; exact source inspection and the named positive MIR
+fixture show this is a false positive—the direct-only `array<string>` guard does not apply inside
+the payload. The adjudication is recorded in `.git/align-independent-61e482c-pre.log`. The final
+pre-PR gate passed on `71951e1`; its host-native post-open review reached the 900-second bound
+after inspecting the validator, tuple Drop, and sema through `resolve_type`/`box`, so the transcript
+is preserved. The narrow continuation fixed stale tuple-contract comments in `hir.rs` and the
+LLVM tuple-layout setup, then a fresh independent preflight on `4664039` found two P2 closure gaps:
+the `array<Move-struct>` tuple Drop path lacked a dedicated owner assertion, and those comments
+still described primitive-only tuples. The follow-up adds both comments and a codegen test that
+asserts element iteration plus both recursive element and outer-buffer frees; the focused owner
+test passes. The current tree still needs a fresh pre-PR gate and post-open reviews bound to its
+new SHA.
+Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
+Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
+rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
+after am-p is merged.
+
+The corrected am-p change is above the repository's 1,000-line split threshold (currently about
+1,212 changed lines against `main`). It cannot be split safely: validator activation, the producer
+contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
+ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
+or leave the reviewed producer/validator matrix without its required owner evidence.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

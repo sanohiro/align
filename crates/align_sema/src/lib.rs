@@ -595,9 +595,10 @@ pub enum Ty {
     JsonScanner(u32),
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
-    /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
-    /// are primitive scalars (Copy, `Static`) — a tuple is Copy and never dropped/region-tied
-    /// yet; owned/`str` elements are a later, additive slice.
+    /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. Elements are
+    /// primitive scalars, `str` views, or owned `string`/`array<T>` values. A tuple is Copy unless
+    /// one element is Move; Move tuples use recursive Drop and are restricted to temporary,
+    /// returned, or destructured positions in the current surface.
     Tuple(u32),
     /// A first-class function value type (`fn(params) -> ret`), indexed into `Program.fn_types`.
     /// A function pointer — Copy, `Static`, no environment (non-capturing functions, slice ①).
@@ -3728,13 +3729,14 @@ pub fn check_program_with_interface_facts(
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, tcx!(module, imports_by_module.get(*module).unwrap_or(&no_imports)), &[], diags);
-            // A field is a primitive scalar (int/float/bool/char), `str`, or a nested struct (the
-            // nested-struct shape is checked structurally here; that it is scalar-only + acyclic is
-            // validated in pass 0b-2, once all struct fields are populated). Slice/option/box/Move
-            // fields are still rejected.
+            // A field may be a primitive scalar, `str`, an owned value, a nested inline type, a
+            // view/handle, an option/result payload, or an owned array. Nested inline structure is
+            // checked structurally here; its acyclicity and alignment are validated in pass 0b-2,
+            // once all struct fields are populated. The field-specific array restrictions are
+            // applied below after the complete struct table exists.
             if !is_field_ok(ty, &tagged_types) {
                 diags.error(
-                    format!("struct fields must be a primitive scalar, str, or a plain struct for now, got {}", ty_name(ty)),
+                    format!("struct field type is not supported here, got {}", ty_name(ty)),
                     f.span,
                 );
             }
@@ -3770,12 +3772,11 @@ pub fn check_program_with_interface_facts(
         for (fi, f) in s.fields.iter().enumerate() {
             let fty = structs[i].fields[fi].ty;
             // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
-            // struct's `Drop` (`drop_struct_fields`). Its **element** must be non-owned in v1 so that
-            // buffer is a single flat free: a scalar / `str` view / plain-data (non-Move) struct.
-            // `array<string>` needs a per-element deep free (a later slice), so reject it here — it
-            // needs no enum table. `array<Move-struct>` is rejected **after** pass 0c (the element may be
-            // Move only because of a not-yet-resolved enum field — `Chat { messages: array<Message> }`
-            // where `Message` owns a Move-enum field, J3), where `struct_is_move` is enum-accurate.
+            // struct's `Drop` (`drop_struct_fields`). Plain scalar, `str`-view, and Move-struct
+            // elements are supported; the recursive array Drop path handles owned struct fields.
+            // Bare `array<string>` still needs a per-element deep free in this declaration path,
+            // so reject it here. `array<Move-struct>` is checked after pass 0c, where
+            // `struct_is_move` is enum-accurate.
             if let Ty::DynArray(Scalar::String) = fty {
                 diags.error(
                     "an `array<string>` field is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
@@ -18249,8 +18250,9 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, salt, moved, false, false);
                 move_expr!(self, params, moved, false, false);
             }
-            // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
-            // borrows. Recurse to catch moves in element subexpressions.
+            // Tuple elements may be Copy or Move. Recurse through each element so owned values are
+            // consumed at construction and tuple-index provenance remains visible to the move and
+            // borrow analyses.
             ExprKind::Tuple { elems, .. } => {
                 for element in elems {
                     move_expr!(self, element, moved, true, true);
@@ -33050,7 +33052,7 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -33266,8 +33268,9 @@ fn resolve_type(
             return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
         }
         ast::Type::Tuple { elems, span: _ } => {
-            // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
-            // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
+            // Tuple elements use the supported scalar forms: primitive scalars, `str` views, and
+            // owned `string`/array values. A tuple containing a Move element carries the recursive
+            // Drop/region behavior of those elements and remains restricted to temporary results.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
                 let ety = resolve_type(e, cx, type_params, diags);
@@ -33822,15 +33825,14 @@ fn http_headers_placement_error(what: &str) -> String {
     )
 }
 
-/// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
-/// `string`, or a nested struct.
+/// Whether a resolved type has a field representation. Detailed restrictions for inline layout,
+/// direct `array<string>`, and recursive ownership are applied after all definitions exist.
 fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, a **nested struct**
-    // (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass), or an
-    // **`Option<T>`** whose payload is itself a valid field type (scalar / `str` / `string` / nested
-    // struct). An owned (`string`, Move-struct, or `Option<owned>`) field makes the enclosing struct a
-    // Move type with a recursive `Drop` (Slice 3 / the REST-gateway runway Slice B). Owned
-    // *collections* (`array<T>` etc.) as fields are a later slice.
+    // A struct field is a primitive scalar, `str` (a borrow), an owned value, an inline struct or
+    // enum, a view/handle, an **`Option<T>`/`Result<T, E>`** whose payload is itself a valid field
+    // shape, or an owned array. An owned (`string`, Move-struct, handle, option payload, or array)
+    // field makes the enclosing struct a Move type with a recursive `Drop`; the complete inline
+    // graph and the direct `array<string>` exception are checked by later passes.
     let mut work = vec![ty];
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
@@ -33871,8 +33873,8 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
         Ty::Fn(_) => {}
-        // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
-        // rejected until array-in-Option lands, matching the direct-field rule).
+        // The payload is a `Scalar`; converting it back to `Ty` lets the same field-shape walker
+        // admit producer-valid nested forms such as `Option<array<T>>`.
         Ty::Option(s) => work.push(scalar_to_ty(s)),
         Ty::Result(ok, err) => {
             work.push(scalar_to_ty(err));
@@ -33894,9 +33896,9 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         }
         Ty::Tagged(_) => return false,
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
-        // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
-        // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
-        // (pass 0b-2), where the struct table is populated; here we admit the array shape.
+        // `choices: array<Choice>` shape. The complete struct table and the direct
+        // `array<string>` exception are enforced at declaration (pass 0b-2); here we admit the
+        // array shape, including the recursively droppable `array<Move-struct>` form.
         Ty::DynArray(_) | Ty::DynStructArray(..) => {}
         _ => return false,
         }
@@ -34152,9 +34154,13 @@ fn enum_payload_ok(
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
-        // An owned `array<T>` payload (J2) — the enum becomes Move (tag-switched drop). The element
-        // must be non-owned so the drop is one flat free: `array<string>` (a per-element deep free) is
-        // deferred, `array<Move-struct>` likewise.
+        // `response_builder` is a payload-scalar in generic templates as well as a direct
+        // concrete sum payload. Keep generic monomorphization aligned with Pass 0c and am-p.
+        Scalar::ResponseBuilder => true,
+        // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
+        // scalar-element arrays are admitted; bare `array<string>` is excluded because its
+        // per-element string Drop is not part of this enum payload contract. Struct arrays are
+        // admitted only when their element struct is non-Move.
         Scalar::DynArray(PrimScalar::String) => false,
         Scalar::DynArray(_) => true,
         Scalar::DynStructArray(id) => structs
@@ -34410,6 +34416,18 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn generic_enum_response_builder_monomorph_is_producer_valid() {
+        let (_, diagnostics) = check(
+            "Envelope<T> { Item(T) }\nfn use(value: Envelope<response_builder>) -> () = ()\nfn main() -> i32 = 0\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "generic response_builder sum monomorph must use the payload producer predicate: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -35918,6 +35936,12 @@ fn exit_branch(flag: bool) -> i64 {
         // element resolves to a struct via the slice arm and loads through `SliceIndex`).
         let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
         assert!(!slstruct.has_errors(), "indexing a slice<Struct> for a whole struct should check");
+
+        for ty in ["array<file>", "slice<file>"] {
+            let source = format!("fn take(xs: {ty}) -> i64 = xs.len()\nfn main() -> i32 = 0\n");
+            let (_handle, diagnostics) = check(&source);
+            assert!(diagnostics.has_errors(), "{ty} type position must reject an owned file handle element");
+        }
     }
 
     #[test]
