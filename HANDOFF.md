@@ -6,9 +6,10 @@ per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
 _Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
-placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), and am-h
-declarations/headers PR #692 (`f7ebcb4`). The next implementation slice is am-b1 body validation;
-there is no resumable feature branch for the completed am-h work.
+placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
+declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
+(`b4b2d19`). The next implementation slice is am-b2a storage/vector/array body validation;
+there is no resumable feature branch for the completed am-b1 work.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -105,6 +106,7 @@ facts must live in this repository.
 #685  path-complete task-wait dominance
 #686  native output-buffer local/mutability validation
 #688  lexical extern invocation permission and non-escaping extern-call closure (am-u)
+#694  dormant am-b1 body-core validator and owner matrix
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -489,8 +491,11 @@ The revised header owner test compiled but its macOS test binary again paused in
 (CPU 0, no output after sampling) and was stopped; this host limitation is recorded with the
 successful compile and benchmark evidence rather than treated as a test pass.
 
-The next implementation slice is am-b1 body validation, followed by am-b2, am-b3, am-b4, and
-am-c typed callable namespaces.
+PR #694 completes the dormant am-b1 body-core validator: statements, ordinary expressions,
+calls, aggregates, tagged values, and structured control are checked through an explicit
+child-first worklist without public activation. Its owner tests and closure matrix are merged;
+am-b2a is the next implementation slice for storage/vector/array body records; am-b2b then adds
+pipeline/template/JSON/group records, followed by am-b3, am-b4, and am-c typed callable namespaces.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and

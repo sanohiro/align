@@ -3697,6 +3697,17 @@ fn body_tail_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
     )
 }
 
+fn body_statement_expression_mut<'a>(
+    program: &'a mut hir::Program,
+    name: &str,
+) -> &'a mut hir::Expr {
+    let statement = body_first_statement_mut(program, name);
+    let hir::Stmt::Expr(expression) = statement else {
+        panic!("statement fixture {name} is not an expression")
+    };
+    expression
+}
+
 fn body_first_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Stmt {
     program
         .fns
@@ -5070,6 +5081,486 @@ fn hir_body_validator_expression_inventory() {
     };
     expression.ty = Ty::Int(IntTy { bits: 32, signed: true });
     assert!(!body_core_metadata_is_valid(&malformed));
+}
+
+#[test]
+fn hir_body_validator_storage_vector_array() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let vector = |start: i128| {
+        body_test_expr(
+            hir::ExprKind::VecLit {
+                elems: (0..4)
+                    .map(|offset| body_test_expr(hir::ExprKind::Int(start + offset), integer))
+                    .collect(),
+                elem: scalar,
+            },
+            Ty::Vec(scalar, 4),
+        )
+    };
+    let mask = || {
+        body_test_expr(
+            hir::ExprKind::Binary {
+                op: align_ast::BinOp::Eq,
+                lhs: Box::new(vector(0)),
+                rhs: Box::new(vector(1)),
+            },
+            Ty::Mask(scalar, 4),
+        )
+    };
+    let record = |value: i128| {
+        body_test_expr(
+            hir::ExprKind::StructLit {
+                struct_id: 0,
+                fields: vec![
+                    body_test_expr(hir::ExprKind::Str("key".to_string()), Ty::Str),
+                    body_test_expr(hir::ExprKind::Int(value), integer),
+                ],
+            },
+            Ty::Struct(0),
+        )
+    };
+    let array_i64 = |values: &[i128]| {
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: values
+                    .iter()
+                    .map(|value| body_test_expr(hir::ExprKind::Int(*value), integer))
+                    .collect(),
+                elem: integer,
+                pooled: false,
+            },
+            Ty::Array(scalar, values.len() as u32),
+        )
+    };
+    let mut program = baseline_program();
+    program.fns.extend([
+        body_unit_case("array_literal_case", array_i64(&[1, 2])),
+        body_unit_case(
+            "struct_array_literal_case",
+            body_test_expr(
+                hir::ExprKind::ArrayLit {
+                    elems: vec![record(1), record(2)],
+                    elem: Ty::Struct(0),
+                    pooled: false,
+                },
+                Ty::StructArray(0, 2),
+            ),
+        ),
+        body_unit_case(
+            "const_array_case",
+            body_test_expr(
+                hir::ExprKind::ConstArray {
+                    elems: vec![
+                        body_test_expr(hir::ExprKind::Int(1), integer),
+                        body_test_expr(hir::ExprKind::Int(2), integer),
+                    ],
+                    elem: scalar,
+                    len: 2,
+                },
+                Ty::Slice(scalar),
+            ),
+        ),
+        body_unit_case(
+            "array_zip_case",
+            body_test_expr(
+                hir::ExprKind::ArrayZip {
+                    sources: vec![array_i64(&[1, 2]), body_test_expr(
+                        hir::ExprKind::ArrayLit {
+                            elems: vec![
+                                body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                                body_test_expr(hir::ExprKind::Bool(false), Ty::Bool),
+                            ],
+                            elem: Ty::Bool,
+                            pooled: false,
+                        },
+                        Ty::Array(Scalar::Bool, 2),
+                    )],
+                    tuple_id: 0,
+                },
+                Ty::Tuple(0),
+            ),
+        ),
+        body_unit_case(
+            "select_case",
+            body_test_expr(
+                hir::ExprKind::Select {
+                    mask: Box::new(mask()),
+                    a: Box::new(vector(2)),
+                    b: Box::new(vector(3)),
+                },
+                Ty::Vec(scalar, 4),
+            ),
+        ),
+        body_tail_case(
+            "vec_sum_where_case",
+            body_test_expr(
+                hir::ExprKind::VecSumWhere {
+                    vec: Box::new(vector(2)),
+                    mask: Box::new(mask()),
+                },
+                integer,
+            ),
+            integer,
+        ),
+        body_tail_case(
+            "vec_dot_case",
+            body_test_expr(
+                hir::ExprKind::VecDot {
+                    a: Box::new(vector(2)),
+                    b: Box::new(vector(3)),
+                },
+                integer,
+            ),
+            integer,
+        ),
+        body_tail_case(
+            "vec_min_case",
+            body_test_expr(
+                hir::ExprKind::VecMinMax {
+                    vec: Box::new(vector(2)),
+                    max: false,
+                },
+                integer,
+            ),
+            integer,
+        ),
+        body_tail_case(
+            "vec_sum_case",
+            body_test_expr(
+                hir::ExprKind::VecSum {
+                    vec: Box::new(vector(2)),
+                },
+                integer,
+            ),
+            integer,
+        ),
+        body_test_parameter_function(
+            "vec_load_case",
+            Ty::Slice(scalar),
+            hir::Block {
+                stmts: vec![hir::Stmt::Expr(body_test_expr(
+                    hir::ExprKind::VecLoad {
+                        src: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Slice(scalar))),
+                        index: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                        elem: scalar,
+                        n: 4,
+                    },
+                    Ty::Vec(scalar, 4),
+                ))],
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Unit,
+                    Ty::Unit,
+                ))),
+            },
+            Ty::Unit,
+        ),
+        body_test_named_function(
+            "vec_store_case",
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::VecStore {
+                        dst: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Slice(scalar))),
+                        index: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                        value: Box::new(vector(2)),
+                        elem: scalar,
+                        n: 4,
+                    },
+                    Ty::Unit,
+                ))),
+            },
+            vec![hir::Local {
+                id: 0,
+                name: "dst".to_string(),
+                ty: Ty::Slice(scalar),
+                is_mut: true,
+                is_param: false,
+                align: None,
+            }],
+            Ty::Unit,
+        ),
+        body_unit_case("vec_literal_case", vector(2)),
+    ]);
+    let pooled_elements = (0..32)
+        .map(|value| body_test_expr(hir::ExprKind::Int(value), integer))
+        .collect::<Vec<_>>();
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 0,
+                init: body_test_expr(
+                    hir::ExprKind::ArrayLit {
+                        elems: pooled_elements,
+                        elem: integer,
+                        pooled: true,
+                    },
+                    Ty::Array(scalar, 32),
+                ),
+            }],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "table".to_string(),
+            ty: Ty::Array(scalar, 32),
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        Ty::Unit,
+    ));
+
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "array_literal_case").kind {
+        hir::ExprKind::ArrayLit { elem, .. } => *elem = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(&mut reject, "array_literal_case");
+    match &mut expression.kind {
+        hir::ExprKind::ArrayLit { elem, .. } => *elem = Ty::Slice(scalar),
+        _ => unreachable!(),
+    }
+    expression.ty = Ty::Array(Scalar::Slice(PrimScalar::Int(IntTy { bits: 64, signed: true })), 2);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "const_array_case").kind {
+        hir::ExprKind::ConstArray { len, .. } => *len = 3,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "array_zip_case").kind {
+        hir::ExprKind::ArrayZip { tuple_id, .. } => *tuple_id = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "select_case").kind {
+        hir::ExprKind::Select { mask, .. } => mask.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "vec_load_case").kind {
+        hir::ExprKind::VecLoad { elem, .. } => *elem = Scalar::Float(FloatTy { bits: 64 }),
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "vec_store_case")
+        .expect("vec-store fixture")
+        .locals[0]
+        .is_mut = false;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match &mut body_statement_expression_mut(&mut reject, "vec_literal_case").kind {
+        hir::ExprKind::VecLit { elems, .. } => {
+            elems.pop();
+        }
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "body_test")
+        .expect("pooled fixture")
+        .locals[0]
+        .is_mut = true;
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_validator_storage_vector_array_control_flow() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let array = |value: i128| {
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: vec![body_test_expr(hir::ExprKind::Int(value), integer)],
+                elem: integer,
+                pooled: false,
+            },
+            Ty::Array(scalar, 1),
+        )
+    };
+    let mut valid = baseline_program();
+    valid.fns.push(body_unit_case(
+        "storage_branch_join",
+        body_test_expr(
+            hir::ExprKind::If {
+                cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                then: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(array(1))),
+                },
+                els: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(array(2))),
+                },
+            },
+            Ty::Array(scalar, 1),
+        ),
+    ));
+    valid.fns.push(body_unit_case(
+        "storage_loop_join",
+        body_test_expr(
+            hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Break {
+                        value: Some(array(3)),
+                        accepted: true,
+                    }],
+                    value: None,
+                },
+                diverges: false,
+                body_locals: 0..0,
+            },
+            Ty::Array(scalar, 1),
+        ),
+    ));
+    assert!(body_core_metadata_is_valid(&valid));
+
+    let diverging = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: Vec::new(),
+                value: None,
+            },
+            diverges: true,
+            body_locals: 0..0,
+        },
+        integer,
+    );
+    let malformed_retained = body_test_expr(
+        hir::ExprKind::Int(0),
+        Ty::Int(IntTy {
+            bits: 0,
+            signed: true,
+        }),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case(
+        "storage_control_flow",
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: vec![diverging, malformed_retained],
+                elem: integer,
+                pooled: false,
+            },
+            Ty::Array(scalar, 2),
+        ),
+    ));
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_storage_vector_array_deferred_b2b() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_tail_case(
+        "deferred_array_sum",
+        body_test_expr(
+            hir::ExprKind::ArraySum {
+                source: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                stages: Vec::new(),
+            },
+            integer,
+        ),
+        integer,
+    ));
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_storage_vector_array_deferred_facts_are_not_consumed() {
+    let integer = int(64);
+    let scalar = scalar_int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case(
+        "storage_deferred_facts",
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: vec![
+                    body_test_expr(hir::ExprKind::Int(1), integer),
+                    body_test_expr(hir::ExprKind::Int(2), integer),
+                ],
+                elem: integer,
+                pooled: false,
+            },
+            Ty::Array(scalar, 2),
+        ),
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+    program.fns[0].drop_locals = vec![0, 0, 1];
+    program.fns[0].drop_individual_locals = vec![0];
+    program.fns[0]
+        .drop_individual_exprs
+        .insert(align_span::Span::new(0, 4, 5), true);
+    assert!(body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn deep_hir_body_storage_type_dag_is_stack_bounded() {
+    let integer = int(64);
+    const TYPE_DEPTH: usize = 4_096;
+    let mut program = baseline_program();
+    program.structs = (0..TYPE_DEPTH)
+        .map(|id| StructDef {
+            name: format!("StorageNode{id}"),
+            source_name: format!("StorageNode{id}"),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: if id + 1 == TYPE_DEPTH {
+                    integer
+                } else {
+                    Ty::Struct((id + 1) as u32)
+                },
+            }],
+            align: None,
+            c_repr: false,
+        })
+        .collect();
+    program.fns.push(body_tail_case(
+        "storage_type_depth",
+        body_test_expr(
+            hir::ExprKind::VecLit {
+                elems: vec![
+                    body_test_expr(hir::ExprKind::Int(1), integer),
+                    body_test_expr(hir::ExprKind::Int(2), integer),
+                ],
+                elem: scalar_int(64),
+            },
+            Ty::Vec(scalar_int(64), 2),
+        ),
+        Ty::Vec(scalar_int(64), 2),
+    ));
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            assert!(body_core_metadata_is_valid(&program));
+            program.structs[TYPE_DEPTH - 1].fields[0].ty = Ty::Struct(TYPE_DEPTH as u32);
+            assert!(!body_core_metadata_is_valid(&program));
+        })
+        .expect("spawn deep storage body validator");
+    handle.join().expect("join deep storage body validator");
 }
 
 #[test]
