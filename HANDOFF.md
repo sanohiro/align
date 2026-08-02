@@ -5,10 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-02. `main` includes the shipped wave through #688; PR #688 merged the
-am-u lexical extern invocation correction. The am-p placement-validation checkpoint is implemented
-on `feat/am-p-type-placement` and is open as PR #690; after it merges, the next resumable slice is
-am-n nominal/link.
+_Last updated: 2026-08-02. `main` includes the shipped wave through #688 and the merged am-p
+placement-validation PR #690 (`39f9c7d`). The current resumable branch is
+`feat/am-n-nominal-link`, implementing the next am-n nominal/link slice.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -356,7 +355,7 @@ validity, and run focused owner tests before one monitored full PR gate. When a 
 if the next checkpoint still cannot be mergeable by two hours, split at the next independently
 correct placement family and record the boundary here.
 
-The am-p checkpoint is open as PR #690. The required broad host preflight at
+The am-p checkpoint was merged as PR #690. The required broad host preflight at
 `90a30fa` reached its 900-second bound without a verdict, and the fresh independent adversarial
 review found six valid closure issues: nested `array<string>` field placement was over-rejected,
 generic `ResponseBuilder` producer validation disagreed between sema and am-p, body-only handle
@@ -397,18 +396,49 @@ LLVM tuple-layout setup, then a fresh independent preflight on `4664039` found t
 the `array<Move-struct>` tuple Drop path lacked a dedicated owner assertion, and those comments
 still described primitive-only tuples. The follow-up adds both comments and a codegen test that
 asserts element iteration plus both recursive element and outer-buffer frees; the focused owner
-test passes. The current tree still needs a fresh pre-PR gate and post-open reviews bound to its
-new SHA.
+test passed before merge. Those pre-merge review records remain historical evidence; the landed
+am-p surface is now the base for am-n.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
 rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
-after am-p is merged.
+and is now active on `feat/am-n-nominal-link`.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
 1,212 changed lines against `main`). It cannot be split safely: validator activation, the producer
 contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, and the owning
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.
+
+### am-n implementation checkpoint (2026-08-02)
+
+The am-n implementation is active on `feat/am-n-nominal-link`. MIR now validates struct/enum
+identity text, combined internal-name collisions, ASCII member names, repeated source-name
+structural equality, tuple interning uniqueness, alignment, enum field bases, and link-library
+names before all four HIR-to-MIR entrypoints copy HIR. Source-shape comparison uses an explicit
+worklist plus bidirectional node correspondence, so header-mediated recursion and deep equal-shape
+DAGs are stack-bounded and preserve sharing. The owner matrix is in
+`validate_hir_tests.rs`: malformed metadata is graph/placement-valid but reaches canonical-empty
+MIR through every entrypoint; equal source-shape and function-effect-origin twins are accepted;
+the 4,096-node deep twin, later mismatch, and a shared-node correspondence conflict are covered.
+The first independent preflight reached its 15-minute bound while inspecting the source-shape
+memoization and downstream ABI consumers without returning a verdict; it was stopped with that
+last useful checkpoint preserved. The author follow-up then added the shared-correspondence
+regression and changed cache hits to restart once without memoization when the current comparison
+has sibling or ancestor mappings, retaining the linear deep-duplicate path. A fresh independent
+preflight after that fix returned `CLEAN` after inspecting the complete six-file diff, all current
+type/scalar variants, malformed-HIR paths, all four entrypoints, and the downstream ABI consumers.
+
+The focused source-shape owners and the full `align_mir` library suite pass after the cache
+follow-up (44/44); `cargo build --workspace --locked` and locked all-target Clippy also pass.
+`align_driver` per-unit codegen passed 9/9 before the cache follow-up, but its latest rerun reached
+the test binary and then paused in macOS `_dyld_start`; `scripts/test-pr.sh` hit the same dyld
+startup blocker in its first test binary and was stopped after sampling confirmed the stall. The
+required benchmark row is implemented, but this host cannot run the release harness because
+`llvm-config-22` is absent. The current diff is about 940 changed lines:
+the validator, four-entrypoint owner matrix, shared-graph regression, and benchmark are one atomic
+am-n boundary, so splitting it would leave an activated identity gate without its complete owner
+evidence. The author self-review is complete; remaining work is the final pre-PR stamp, then one
+bounded post-open review cycle for the am-n SHA.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
@@ -773,7 +803,7 @@ return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; after #688, am-p is the next implementation slice. The required milestone order
+#678; #690 now lands am-p, and am-n is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and

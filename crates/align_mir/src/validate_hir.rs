@@ -18,6 +18,544 @@ pub(crate) fn type_placement_metadata_is_valid(program: &hir::Program) -> bool {
     PlacementValidator::new(program).validate()
 }
 
+/// Validate nominal identities, complete source shapes, enum ordinals, and linker library names.
+///
+/// This is intentionally separate from the graph and placement validators.  The graph validator
+/// answers whether references are well formed, while this pass answers whether two producer-side
+/// nominal records that claim one source identity really describe the same id-free definition.
+pub(crate) fn nominal_link_metadata_is_valid(program: &hir::Program) -> bool {
+    NominalLinkValidator::new(program).validate()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NominalKind {
+    Struct,
+    Enum,
+}
+
+struct NominalLinkValidator<'a> {
+    program: &'a hir::Program,
+    internal_names: HashSet<&'a str>,
+    source_names: HashMap<&'a str, (NominalKind, u32)>,
+    checked_source_shapes: HashSet<(Node, Node)>,
+}
+
+impl<'a> NominalLinkValidator<'a> {
+    fn new(program: &'a hir::Program) -> Self {
+        Self {
+            program,
+            internal_names: HashSet::new(),
+            source_names: HashMap::new(),
+            checked_source_shapes: HashSet::new(),
+        }
+    }
+
+    fn validate(mut self) -> bool {
+        self.structs_valid()
+            && self.enums_valid()
+            && self.tuples_valid()
+            && self.link_libs_valid()
+    }
+
+    fn structs_valid(&mut self) -> bool {
+        for (id, definition) in self.program.structs.iter().enumerate() {
+            let Ok(id) = u32::try_from(id) else {
+                return false;
+            };
+            if !valid_nominal_text(&definition.name)
+                || !valid_nominal_text(&definition.source_name)
+                || !self.internal_names.insert(definition.name.as_str())
+                || !valid_alignment(definition.align)
+                || !members_valid(definition.fields.iter().map(|field| field.name.as_str()))
+            {
+                return false;
+            }
+            if !self.register_source_name(
+                definition.source_name.as_str(),
+                NominalKind::Struct,
+                id,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn enums_valid(&mut self) -> bool {
+        for (id, definition) in self.program.enums.iter().enumerate() {
+            let Ok(id) = u32::try_from(id) else {
+                return false;
+            };
+            if !valid_nominal_text(&definition.name)
+                || !valid_nominal_text(&definition.source_name)
+                || !self.internal_names.insert(definition.name.as_str())
+                || !members_valid(definition.variants.iter().map(|variant| variant.name.as_str()))
+            {
+                return false;
+            }
+            let mut expected_base = 1u32;
+            for variant in &definition.variants {
+                if variant.field_base != expected_base
+                    || variant.payload.len() > u32::MAX as usize
+                {
+                    return false;
+                }
+                let Some(next_base) = expected_base.checked_add(variant.payload.len() as u32)
+                else {
+                    return false;
+                };
+                expected_base = next_base;
+            }
+            if !self.register_source_name(
+                definition.source_name.as_str(),
+                NominalKind::Enum,
+                id,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn register_source_name(&mut self, source_name: &'a str, kind: NominalKind, id: u32) -> bool {
+        let Some(&(existing_kind, existing_id)) = self.source_names.get(source_name) else {
+            self.source_names.insert(source_name, (kind, id));
+            return true;
+        };
+        existing_kind == kind
+            && source_shape_equal(
+                self.program,
+                nominal_node(kind, existing_id),
+                nominal_node(kind, id),
+                &mut self.checked_source_shapes,
+            )
+    }
+
+    fn tuples_valid(&self) -> bool {
+        let mut seen = HashSet::new();
+        self.program
+            .tuples
+            .iter()
+            .all(|tuple| seen.insert(tuple.elems.clone()))
+    }
+
+    fn link_libs_valid(&self) -> bool {
+        let mut seen = HashSet::new();
+        self.program.link_libs.iter().all(|library| {
+            !library.is_empty()
+                && !library.as_bytes().starts_with(b"-")
+                && library.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                })
+                && seen.insert(library.as_str())
+        })
+    }
+}
+
+fn valid_nominal_text(text: &str) -> bool {
+    !text.is_empty() && !text.as_bytes().contains(&0)
+}
+
+fn valid_member_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn members_valid<'b>(names: impl IntoIterator<Item = &'b str>) -> bool {
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .all(|name| valid_member_name(name) && seen.insert(name))
+}
+
+fn valid_alignment(align: Option<u32>) -> bool {
+    align.is_none_or(|value| value.is_power_of_two() && value <= (1u32 << 29))
+}
+
+fn nominal_node(kind: NominalKind, id: u32) -> Node {
+    match kind {
+        NominalKind::Struct => Node::Struct(id),
+        NominalKind::Enum => Node::Enum(id),
+    }
+}
+
+struct SourceShapeComparator<'a> {
+    program: &'a hir::Program,
+    known_shapes: &'a HashSet<(Node, Node)>,
+    root: (Node, Node),
+    cache_enabled: bool,
+    pending: VecDeque<(Node, Node)>,
+    seen: HashSet<(Node, Node)>,
+    left_to_right: HashMap<Node, Node>,
+    right_to_left: HashMap<Node, Node>,
+}
+
+fn source_shape_equal(
+    program: &hir::Program,
+    left: Node,
+    right: Node,
+    known_shapes: &mut HashSet<(Node, Node)>,
+) -> bool {
+    let mut comparator = SourceShapeComparator {
+        program,
+        known_shapes: &*known_shapes,
+        root: (left, right),
+        cache_enabled: true,
+        pending: VecDeque::from([(left, right)]),
+        seen: HashSet::new(),
+        left_to_right: HashMap::new(),
+        right_to_left: HashMap::new(),
+    };
+    let valid = comparator.run();
+    let seen = comparator.seen.clone();
+    drop(comparator);
+    if valid {
+        known_shapes.extend(seen);
+    }
+    valid
+}
+
+impl<'a> SourceShapeComparator<'a> {
+    fn run(&mut self) -> bool {
+        loop {
+            let mut restart_without_cache = false;
+            while let Some((left, right)) = self.pending.pop_front() {
+                if !self.map_pair(left, right) {
+                    return false;
+                }
+
+                // A cached pair is safe to skip only when it is the entire fresh comparison. If
+                // another pair has already been mapped, or another pending sibling exists, the
+                // cached pair may contain a shared node whose correspondence must be checked in
+                // this context. Restart once without cache in that case; this keeps the common
+                // deep-duplicate chain linear while preserving graph sharing for branching DAGs.
+                if self.cache_enabled
+                    && self.known_shapes.contains(&(left, right))
+                {
+                    if !self.seen.is_empty() || !self.pending.is_empty() {
+                        restart_without_cache = true;
+                        break;
+                    }
+                    self.seen.insert((left, right));
+                    continue;
+                }
+
+                if !self.seen.insert((left, right)) {
+                    continue;
+                }
+                if !self.nodes_equal(left, right) {
+                    return false;
+                }
+            }
+            if !restart_without_cache {
+                return true;
+            }
+
+            self.cache_enabled = false;
+            self.pending.clear();
+            self.pending.push_back(self.root);
+            self.seen.clear();
+            self.left_to_right.clear();
+            self.right_to_left.clear();
+        }
+    }
+
+    fn map_pair(&mut self, left: Node, right: Node) -> bool {
+        if self.left_to_right.get(&left).is_some_and(|mapped| *mapped != right)
+            || self.right_to_left.get(&right).is_some_and(|mapped| *mapped != left)
+        {
+            return false;
+        }
+        self.left_to_right.insert(left, right);
+        self.right_to_left.insert(right, left);
+        true
+    }
+
+    fn nodes_equal(&mut self, left: Node, right: Node) -> bool {
+        match (left, right) {
+            (Node::Struct(left_id), Node::Struct(right_id)) => {
+                let Some(left_def) = self.program.structs.get(left_id as usize) else {
+                    return false;
+                };
+                let Some(right_def) = self.program.structs.get(right_id as usize) else {
+                    return false;
+                };
+                if left_def.source_name != right_def.source_name
+                    || left_def.align != right_def.align
+                    || left_def.c_repr != right_def.c_repr
+                    || left_def.fields.len() != right_def.fields.len()
+                {
+                    return false;
+                }
+                for (left_field, right_field) in left_def.fields.iter().zip(&right_def.fields) {
+                    if left_field.name != right_field.name
+                        || !self.types_equal(left_field.ty, right_field.ty)
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            (Node::Enum(left_id), Node::Enum(right_id)) => {
+                let Some(left_def) = self.program.enums.get(left_id as usize) else {
+                    return false;
+                };
+                let Some(right_def) = self.program.enums.get(right_id as usize) else {
+                    return false;
+                };
+                if left_def.source_name != right_def.source_name
+                    || left_def.variants.len() != right_def.variants.len()
+                {
+                    return false;
+                }
+                for (left_variant, right_variant) in
+                    left_def.variants.iter().zip(&right_def.variants)
+                {
+                    if left_variant.name != right_variant.name
+                        || left_variant.field_base != right_variant.field_base
+                        || left_variant.payload.len() != right_variant.payload.len()
+                        || !left_variant
+                            .payload
+                            .iter()
+                            .zip(&right_variant.payload)
+                            .all(|(&left, &right)| self.scalars_equal(left, right))
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            (Node::Tuple(left_id), Node::Tuple(right_id)) => {
+                let Some(left_def) = self.program.tuples.get(left_id as usize) else {
+                    return false;
+                };
+                let Some(right_def) = self.program.tuples.get(right_id as usize) else {
+                    return false;
+                };
+                left_def.elems.len() == right_def.elems.len()
+                    && left_def
+                        .elems
+                        .iter()
+                        .zip(&right_def.elems)
+                        .all(|(&left, &right)| self.scalars_equal(left, right))
+            }
+            (Node::Tagged(left_id), Node::Tagged(right_id)) => {
+                let Some(left_entry) = self.program.tagged_types.get(left_id as usize) else {
+                    return false;
+                };
+                let Some(right_entry) = self.program.tagged_types.get(right_id as usize) else {
+                    return false;
+                };
+                match (*left_entry, *right_entry) {
+                    (hir::TaggedType::Option(left), hir::TaggedType::Option(right)) => {
+                        self.scalars_equal(left, right)
+                    }
+                    (
+                        hir::TaggedType::Result(left_ok, left_err),
+                        hir::TaggedType::Result(right_ok, right_err),
+                    ) => self.scalars_equal(left_ok, right_ok) && self.scalars_equal(left_err, right_err),
+                    _ => false,
+                }
+            }
+            (Node::Fn(left_id), Node::Fn(right_id)) => {
+                let Some(left_fn) = self.program.fn_types.get(left_id as usize) else {
+                    return false;
+                };
+                let Some(right_fn) = self.program.fn_types.get(right_id as usize) else {
+                    return false;
+                };
+                if left_fn.params.len() != right_fn.params.len()
+                    || left_fn.return_borrow != right_fn.return_borrow
+                    || left_fn.return_region != right_fn.return_region
+                {
+                    return false;
+                }
+                for ((left_mode, left_scalar), (right_mode, right_scalar)) in
+                    left_fn.params.iter().zip(&right_fn.params)
+                {
+                    if left_mode != right_mode || !self.scalars_equal(*left_scalar, *right_scalar) {
+                        return false;
+                    }
+                }
+                self.types_equal(left_fn.ret, right_fn.ret)
+            }
+            _ => false,
+        }
+    }
+
+    fn queue(&mut self, left: Node, right: Node) {
+        self.pending.push_back((left, right));
+    }
+
+    fn scalars_equal(&mut self, left: Scalar, right: Scalar) -> bool {
+        match (left, right) {
+            (Scalar::Int(left), Scalar::Int(right)) => left == right,
+            (Scalar::Float(left), Scalar::Float(right)) => left == right,
+            (Scalar::Struct(left), Scalar::Struct(right)) => {
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Scalar::DynStructArray(left), Scalar::DynStructArray(right))
+            | (Scalar::Soa(left), Scalar::Soa(right)) => {
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Scalar::Enum(left), Scalar::Enum(right)) => {
+                self.queue(Node::Enum(left), Node::Enum(right));
+                true
+            }
+            (Scalar::Tagged(left), Scalar::Tagged(right)) => {
+                self.queue(Node::Tagged(left), Node::Tagged(right));
+                true
+            }
+            (Scalar::Fn(left), Scalar::Fn(right)) => {
+                self.queue(Node::Fn(left), Node::Fn(right));
+                true
+            }
+            (Scalar::DynArray(left), Scalar::DynArray(right))
+            | (Scalar::Slice(left), Scalar::Slice(right)) => left == right,
+            (Scalar::Param(left), Scalar::Param(right)) => left == right,
+            (Scalar::Bool, Scalar::Bool)
+            | (Scalar::Char, Scalar::Char)
+            | (Scalar::Unit, Scalar::Unit)
+            | (Scalar::String, Scalar::String)
+            | (Scalar::DynResponseArray, Scalar::DynResponseArray)
+            | (Scalar::Str, Scalar::Str)
+            | (Scalar::JsonDoc, Scalar::JsonDoc)
+            | (Scalar::Reader, Scalar::Reader)
+            | (Scalar::Writer, Scalar::Writer)
+            | (Scalar::Buffer, Scalar::Buffer)
+            | (Scalar::Regex, Scalar::Regex)
+            | (Scalar::Captures, Scalar::Captures)
+            | (Scalar::CliParsed, Scalar::CliParsed)
+            | (Scalar::TcpConn, Scalar::TcpConn)
+            | (Scalar::TcpListener, Scalar::TcpListener)
+            | (Scalar::UdpSocket, Scalar::UdpSocket)
+            | (Scalar::Child, Scalar::Child)
+            | (Scalar::File, Scalar::File)
+            | (Scalar::HttpResponse, Scalar::HttpResponse)
+            | (Scalar::HttpServer, Scalar::HttpServer)
+            | (Scalar::HttpRequestCtx, Scalar::HttpRequestCtx)
+            | (Scalar::ResponseBuilder, Scalar::ResponseBuilder)
+            | (Scalar::HttpStream, Scalar::HttpStream)
+            | (Scalar::RunOutput, Scalar::RunOutput) => true,
+            _ => false,
+        }
+    }
+
+    fn types_equal(&mut self, left: Ty, right: Ty) -> bool {
+        match (left, right) {
+            (Ty::Int(left), Ty::Int(right)) => left == right,
+            (Ty::Float(left), Ty::Float(right)) => left == right,
+            (Ty::Param(left), Ty::Param(right))
+            | (Ty::IntVar(left), Ty::IntVar(right))
+            | (Ty::FloatVar(left), Ty::FloatVar(right)) => left == right,
+            (Ty::Option(left), Ty::Option(right)) => self.scalars_equal(left, right),
+            (Ty::Result(left_ok, left_err), Ty::Result(right_ok, right_err)) => {
+                self.scalars_equal(left_ok, right_ok) && self.scalars_equal(left_err, right_err)
+            }
+            (Ty::Tagged(left), Ty::Tagged(right)) => {
+                self.queue(Node::Tagged(left), Node::Tagged(right));
+                true
+            }
+            (Ty::Box(left), Ty::Box(right)) => self.scalars_equal(left, right),
+            (Ty::Array(left, left_len), Ty::Array(right, right_len)) => {
+                left_len == right_len && self.scalars_equal(left, right)
+            }
+            (Ty::Vec(left, left_lanes), Ty::Vec(right, right_lanes))
+            | (Ty::Mask(left, left_lanes), Ty::Mask(right, right_lanes)) => {
+                left_lanes == right_lanes && self.scalars_equal(left, right)
+            }
+            (Ty::StructArray(left, left_len), Ty::StructArray(right, right_len)) => {
+                if left_len != right_len {
+                    return false;
+                }
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Ty::DynStructArray(left, left_layout), Ty::DynStructArray(right, right_layout)) => {
+                if left_layout != right_layout {
+                    return false;
+                }
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Ty::Slice(left), Ty::Slice(right)) => self.scalars_equal(left, right),
+            (Ty::Soa(left), Ty::Soa(right)) | (Ty::JsonScanner(left), Ty::JsonScanner(right)) => {
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Ty::DynSliceArray(left), Ty::DynSliceArray(right)) => left == right,
+            (Ty::DynArray(left), Ty::DynArray(right)) => self.scalars_equal(left, right),
+            (Ty::ArrayBuilder(left), Ty::ArrayBuilder(right)) => self.scalars_equal(left, right),
+            (Ty::Task(left), Ty::Task(right)) => self.scalars_equal(left, right),
+            (Ty::DictEncoded(left, left_field), Ty::DictEncoded(right, right_field)) => {
+                if left_field != right_field {
+                    return false;
+                }
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Ty::Struct(left), Ty::Struct(right)) => {
+                self.queue(Node::Struct(left), Node::Struct(right));
+                true
+            }
+            (Ty::Tuple(left), Ty::Tuple(right)) => {
+                self.queue(Node::Tuple(left), Node::Tuple(right));
+                true
+            }
+            (Ty::Fn(left), Ty::Fn(right)) => {
+                self.queue(Node::Fn(left), Node::Fn(right));
+                true
+            }
+            (Ty::Enum(left), Ty::Enum(right)) => {
+                self.queue(Node::Enum(left), Node::Enum(right));
+                true
+            }
+            (Ty::Bool, Ty::Bool)
+            | (Ty::Char, Ty::Char)
+            | (Ty::DynResponseArray, Ty::DynResponseArray)
+            | (Ty::Str, Ty::Str)
+            | (Ty::String, Ty::String)
+            | (Ty::ArenaHandle, Ty::ArenaHandle)
+            | (Ty::Raw, Ty::Raw)
+            | (Ty::Builder, Ty::Builder)
+            | (Ty::Writer, Ty::Writer)
+            | (Ty::Reader, Ty::Reader)
+            | (Ty::Buffer, Ty::Buffer)
+            | (Ty::StrFinder, Ty::StrFinder)
+            | (Ty::File, Ty::File)
+            | (Ty::Rng, Ty::Rng)
+            | (Ty::Regex, Ty::Regex)
+            | (Ty::Captures, Ty::Captures)
+            | (Ty::CliCommand, Ty::CliCommand)
+            | (Ty::CliParsed, Ty::CliParsed)
+            | (Ty::TcpConn, Ty::TcpConn)
+            | (Ty::TcpListener, Ty::TcpListener)
+            | (Ty::UdpSocket, Ty::UdpSocket)
+            | (Ty::Child, Ty::Child)
+            | (Ty::Command, Ty::Command)
+            | (Ty::RunOutput, Ty::RunOutput)
+            | (Ty::HttpRequest, Ty::HttpRequest)
+            | (Ty::HttpResponse, Ty::HttpResponse)
+            | (Ty::HttpClient, Ty::HttpClient)
+            | (Ty::HttpServer, Ty::HttpServer)
+            | (Ty::HttpRequestCtx, Ty::HttpRequestCtx)
+            | (Ty::ResponseBuilder, Ty::ResponseBuilder)
+            | (Ty::HttpStream, Ty::HttpStream)
+            | (Ty::HttpHeaders, Ty::HttpHeaders)
+            | (Ty::JsonDoc, Ty::JsonDoc)
+            | (Ty::Unit, Ty::Unit)
+            | (Ty::Error, Ty::Error) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ScalarPlacement {
     /// `scalar_arg(..., allow_param=...)`: Option/Result payloads and tagged entries.
