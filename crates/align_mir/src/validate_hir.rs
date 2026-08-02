@@ -3594,10 +3594,14 @@ impl<'a> BodyValidator<'a> {
                 && definition.source_name == "regex_match"
                 && definition.align.is_none()
                 && definition.fields.len() == 2
-                && definition.fields[0].name == "start"
-                && definition.fields[0].ty == i64
-                && definition.fields[1].name == "end"
-                && definition.fields[1].ty == i64;
+                && definition
+                    .fields
+                    .first()
+                    .is_some_and(|field| field.name == "start" && field.ty == i64)
+                && definition
+                    .fields
+                    .get(1)
+                    .is_some_and(|field| field.name == "end" && field.ty == i64);
             if exact {
                 if found.is_some() {
                     return None;
