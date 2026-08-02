@@ -8949,7 +8949,19 @@ fn hir_body_validator_native() {
         result_buffer
     );
 
-    assert!(body_core_metadata_is_valid(&program));
+    assert!(
+        validate_hir::global_type_metadata_is_valid(&program),
+        "native global metadata"
+    );
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(&program),
+        "native type placement metadata"
+    );
+    assert!(
+        validate_hir::nominal_link_metadata_is_valid(&program),
+        "native nominal metadata"
+    );
+    assert!(body_core_metadata_is_valid(&program), "native body metadata");
 
     let mut reject = program.clone();
     reject.fns.push(body_test_named_function(
