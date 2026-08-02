@@ -2078,6 +2078,11 @@ struct BodyContext {
     task_group_fallible: Vec<bool>,
     loop_targets: Vec<Ty>,
     spawn: Option<SpawnContext>,
+    /// A pooled array literal is valid only as the direct initializer of the named immutable
+    /// local.  The producer records no separate parent pointer in HIR, so the worklist carries
+    /// this one narrow lexical fact while entering a `let` initializer and clears it for every
+    /// retained child.
+    pooled_initializer: Option<hir::LocalId>,
 }
 
 #[derive(Clone, Debug)]
@@ -2146,6 +2151,7 @@ impl<'a> BodyValidator<'a> {
                 task_group_fallible: Vec::new(),
                 loop_targets: Vec::new(),
                 spawn: None,
+                pooled_initializer: None,
             };
             if !self.walk_block(&function.body, context.clone()) {
                 return false;
@@ -2189,9 +2195,14 @@ impl<'a> BodyValidator<'a> {
                         return false;
                     }
                     work.push(BodyWork::ExitStmt(statement, context.clone()));
+                    let mut child_context = context.clone();
+                    child_context.pooled_initializer = match statement {
+                        hir::Stmt::Let { local, .. } => Some(*local),
+                        _ => None,
+                    };
                     let mut children = statement_children(statement);
                     while let Some(child) = children.pop() {
-                        work.push(BodyWork::EnterExpr(child, context.clone()));
+                        work.push(BodyWork::EnterExpr(child, child_context.clone()));
                     }
                 }
                 BodyWork::ExitStmt(statement, context) => {
@@ -2376,6 +2387,105 @@ impl<'a> BodyValidator<'a> {
             | Scalar::RunOutput => true,
             Scalar::Param(_) => false,
         }
+    }
+
+    fn array_literal_element_ok(&self, ty: Ty) -> bool {
+        if !self.body_ty_ok(ty) {
+            return false;
+        }
+        match ty {
+            Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
+            Ty::Slice(_) => false,
+            Ty::Enum(id) => {
+                self.program.enums.get(id as usize).is_some()
+                    && !align_sema::enum_is_move(
+                        id,
+                        &self.program.structs,
+                        &self.program.enums,
+                        &self.program.tagged_types,
+                    )
+            }
+            other if self.array_literal_contains_slice(other) => false,
+            other => align_sema::ty_to_scalar(other).is_some_and(|scalar| {
+                !matches!(scalar, Scalar::Struct(_))
+                    && !scalar.is_move()
+                    && self.scalar_copy_ok(scalar)
+            }),
+        }
+    }
+
+    fn array_literal_contains_slice(&self, ty: Ty) -> bool {
+        let mut work = vec![ty];
+        let mut tagged = HashSet::new();
+        let mut tuples = HashSet::new();
+        let mut structs = HashSet::new();
+        while let Some(ty) = work.pop() {
+            match ty {
+                Ty::Slice(_) => return true,
+                Ty::Option(payload) => work.push(align_sema::scalar_to_ty(payload)),
+                Ty::Result(ok, err) => {
+                    work.push(align_sema::scalar_to_ty(err));
+                    work.push(align_sema::scalar_to_ty(ok));
+                }
+                Ty::Tagged(id) if tagged.insert(id) => {
+                    let Some(entry) = self.program.tagged_types.get(id as usize) else {
+                        return true;
+                    };
+                    match *entry {
+                        hir::TaggedType::Option(payload) => {
+                            work.push(align_sema::scalar_to_ty(payload));
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(align_sema::scalar_to_ty(err));
+                            work.push(align_sema::scalar_to_ty(ok));
+                        }
+                    }
+                }
+                Ty::Tuple(id) if tuples.insert(id) => {
+                    let Some(tuple) = self.program.tuples.get(id as usize) else {
+                        return true;
+                    };
+                    work.extend(tuple.elems.iter().rev().copied().map(align_sema::scalar_to_ty));
+                }
+                Ty::Struct(id) if structs.insert(id) => {
+                    let Some(definition) = self.program.structs.get(id as usize) else {
+                        return true;
+                    };
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn pooled_array_literal_ok(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        let Some(local_id) = context.pooled_initializer else {
+            return false;
+        };
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let Some(local) = function.locals.get(local_id as usize) else {
+            return false;
+        };
+        let hir::ExprKind::ArrayLit { elems, elem, .. } = &expression.kind else {
+            return false;
+        };
+        let Ty::Array(scalar, length) = local.ty else {
+            return false;
+        };
+        !local.is_mut
+            && !local.is_param
+            && local.align.is_none()
+            && length >= BODY_CONST_POOL_MIN_ELEMS
+            && matches!(
+                scalar,
+                Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
+            )
+            && *elem == align_sema::scalar_to_ty(scalar)
+            && expression.ty == local.ty
+            && elems.iter().all(pooled_scalar_literal_ok)
     }
 
     fn primitive_store_ty_ok(&self, ty: Ty) -> bool {
@@ -2629,6 +2739,41 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderNew { .. }
             | hir::ExprKind::BuilderWrite { .. }
             | hir::ExprKind::BuilderToString(_) => true,
+            hir::ExprKind::ArrayLit {
+                elems,
+                elem,
+                pooled,
+            } => {
+                !elems.is_empty()
+                    && u32::try_from(elems.len()).is_ok()
+                    && self.body_ty_ok(*elem)
+                    && (!*pooled || self.pooled_array_literal_ok(expression, context))
+            }
+            hir::ExprKind::ConstArray { elems, elem, len } => {
+                u32::try_from(elems.len()).ok() == Some(*len)
+                    && const_array_scalar_ok(*elem)
+            }
+            hir::ExprKind::ArrayZip { sources, tuple_id } => sources.len() >= 2
+                && self
+                    .program
+                    .tuples
+                    .get(*tuple_id as usize)
+                    .is_some_and(|tuple| tuple.elems.len() == sources.len()),
+            hir::ExprKind::Select { .. }
+            | hir::ExprKind::VecSumWhere { .. }
+            | hir::ExprKind::VecDot { .. }
+            | hir::ExprKind::VecMinMax { .. }
+            | hir::ExprKind::VecSum { .. } => true,
+            hir::ExprKind::VecLoad { elem, n, .. }
+            | hir::ExprKind::VecStore { elem, n, .. } => {
+                valid_vector_scalar(*elem) && valid_vector_lanes(*n)
+            }
+            hir::ExprKind::VecLit { elems, elem } => {
+                valid_vector_scalar(*elem)
+                    && u32::try_from(elems.len())
+                        .ok()
+                        .is_some_and(valid_vector_lanes)
+            }
             hir::ExprKind::FnValue(name) => valid_declaration_name(name),
             hir::ExprKind::Closure { lifted, .. } => valid_declaration_name(lifted),
             hir::ExprKind::EnumValue {
@@ -2772,6 +2917,7 @@ impl<'a> BodyValidator<'a> {
             task_group_fallible: Vec::new(),
             loop_targets: Vec::new(),
             spawn: None,
+            pooled_initializer: None,
         };
         let mut work = vec![BodyWork::EnterBlock(root, context)];
         while let Some(item) = work.pop() {
@@ -2819,7 +2965,9 @@ impl<'a> BodyValidator<'a> {
     ) {
         macro_rules! push_expr {
             ($child:expr, $child_context:expr) => {{
-                work.push(BodyWork::EnterExpr($child, $child_context));
+                let mut child_context = $child_context;
+                child_context.pooled_initializer = None;
+                work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
         match &expression.kind {
@@ -2874,11 +3022,14 @@ impl<'a> BodyValidator<'a> {
                 child
                     .task_group_fallible
                     .push(self.task_group_is_fallible(block));
+                child.pooled_initializer = None;
                 work.push(BodyWork::EnterBlock(block, child));
             }
             hir::ExprKind::Match { scrutinee, arms } => {
                 for arm in arms.iter().rev() {
-                    work.push(BodyWork::EnterArm(arm, scrutinee, context.clone()));
+                    let mut arm_context = context.clone();
+                    arm_context.pooled_initializer = None;
+                    work.push(BodyWork::EnterArm(arm, scrutinee, arm_context));
                 }
                 push_expr!(scrutinee, context.clone());
             }
@@ -2903,8 +3054,12 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::If { cond, then, els } => {
-                work.push(BodyWork::EnterBlock(els, context.clone()));
-                work.push(BodyWork::EnterBlock(then, context.clone()));
+                let mut else_context = context.clone();
+                else_context.pooled_initializer = None;
+                work.push(BodyWork::EnterBlock(els, else_context));
+                let mut then_context = context.clone();
+                then_context.pooled_initializer = None;
+                work.push(BodyWork::EnterBlock(then, then_context));
                 push_expr!(cond, context.clone());
             }
             hir::ExprKind::TupleIndex { recv, .. } => push_expr!(recv, context.clone()),
@@ -2912,6 +3067,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Arena(block)
             | hir::ExprKind::Unsafe(block) => {
                 let mut child = context.clone();
+                child.pooled_initializer = None;
                 if matches!(&expression.kind, hir::ExprKind::Arena(_)) {
                     child.arena_depth = child.arena_depth.saturating_add(1);
                 }
@@ -2922,6 +3078,7 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::Loop { body, .. } => {
                 let mut child = context.clone();
+                child.pooled_initializer = None;
                 child.loop_targets.push(expression.ty);
                 work.push(BodyWork::EnterBlock(body, child));
             }
@@ -2955,6 +3112,48 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::BuilderWrite { builder, arg, .. } => {
                 push_expr!(arg, context.clone());
                 push_expr!(builder, context.clone());
+            }
+            hir::ExprKind::ArrayLit { elems, .. }
+            | hir::ExprKind::ConstArray { elems, .. }
+            | hir::ExprKind::VecLit { elems, .. } => {
+                for element in elems.iter().rev() {
+                    push_expr!(element, context.clone());
+                }
+            }
+            hir::ExprKind::ArrayZip { sources, .. } => {
+                for source in sources.iter().rev() {
+                    push_expr!(source, context.clone());
+                }
+            }
+            hir::ExprKind::Select { mask, a, b } => {
+                push_expr!(b, context.clone());
+                push_expr!(a, context.clone());
+                push_expr!(mask, context.clone());
+            }
+            hir::ExprKind::VecSumWhere { vec, mask } => {
+                push_expr!(mask, context.clone());
+                push_expr!(vec, context.clone());
+            }
+            hir::ExprKind::VecDot { a, b } => {
+                push_expr!(b, context.clone());
+                push_expr!(a, context.clone());
+            }
+            hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec } => {
+                push_expr!(vec, context.clone());
+            }
+            hir::ExprKind::VecLoad { src, index, .. } => {
+                push_expr!(index, context.clone());
+                push_expr!(src, context.clone());
+            }
+            hir::ExprKind::VecStore {
+                dst,
+                index,
+                value,
+                ..
+            } => {
+                push_expr!(value, context.clone());
+                push_expr!(index, context.clone());
+                push_expr!(dst, context.clone());
             }
             hir::ExprKind::Unit
             | hir::ExprKind::Int(_)
@@ -3363,6 +3562,185 @@ impl<'a> BodyValidator<'a> {
                 }
                 let (falls, breaks) = strict_flow(&flows);
                 Some((Ty::Tuple(*tuple_id), falls, breaks))
+            }
+            hir::ExprKind::ArrayLit {
+                elems,
+                elem,
+                pooled: _,
+            } => {
+                let flows = self.expr_flows(elems)?;
+                let length = u32::try_from(elems.len()).ok()?;
+                if elems.is_empty()
+                    || flows.iter().any(|flow| flow.ty != *elem)
+                    || !self.array_literal_element_ok(*elem)
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                match *elem {
+                    Ty::Struct(id) => Some((Ty::StructArray(id, length), falls, breaks)),
+                    element_ty => {
+                        let scalar = align_sema::ty_to_scalar(element_ty)?;
+                        if matches!(scalar, Scalar::Struct(_)) {
+                            return None;
+                        }
+                        Some((Ty::Array(scalar, length), falls, breaks))
+                    }
+                }
+            }
+            hir::ExprKind::ConstArray { elems, elem, len } => {
+                if !const_array_scalar_ok(*elem)
+                    || u32::try_from(elems.len()).ok() != Some(*len)
+                {
+                    return None;
+                }
+                let expected = align_sema::scalar_to_ty(*elem);
+                let flows = self.expr_flows(elems)?;
+                if elems.iter().zip(&flows).any(|(child, flow)| {
+                    flow.ty != expected
+                        || !matches!(
+                            child.kind,
+                            hir::ExprKind::Int(_)
+                                | hir::ExprKind::Float(_)
+                                | hir::ExprKind::Bool(_)
+                                | hir::ExprKind::Char(_)
+                                | hir::ExprKind::Str(_)
+                        )
+                }) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Slice(*elem), falls, breaks))
+            }
+            hir::ExprKind::ArrayZip { sources, tuple_id } => {
+                let tuple = self.program.tuples.get(*tuple_id as usize)?;
+                if sources.len() < 2 || tuple.elems.len() != sources.len() {
+                    return None;
+                }
+                let flows = self.expr_flows(sources)?;
+                let mut fixed_len = None;
+                for ((source, flow), expected) in sources.iter().zip(&flows).zip(&tuple.elems) {
+                    if !matches!(
+                        source.kind,
+                        hir::ExprKind::Local(_)
+                            | hir::ExprKind::ArrayLit { .. }
+                            | hir::ExprKind::SliceRange { .. }
+                    ) {
+                        return None;
+                    }
+                    let (scalar, length) = match flow.ty {
+                        Ty::Array(scalar, length) => (scalar, Some(length)),
+                        Ty::DynArray(scalar) | Ty::Slice(scalar) => (scalar, None),
+                        _ => return None,
+                    };
+                    if !array_zip_scalar_ok(scalar)
+                        || scalar != *expected
+                        || !self.scalar_copy_ok(scalar)
+                    {
+                        return None;
+                    }
+                    if let Some(length) = length {
+                        if fixed_len.is_some_and(|known| known != length) {
+                            return None;
+                        }
+                        fixed_len = Some(length);
+                    }
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Tuple(*tuple_id), falls, breaks))
+            }
+            hir::ExprKind::Select { mask, a, b } => {
+                let mask = self.expr_flow(mask)?;
+                let a = self.expr_flow(a)?;
+                let b = self.expr_flow(b)?;
+                let (scalar, lanes) = vector_numeric(a.ty)?;
+                if mask.ty != Ty::Mask(scalar, lanes) || b.ty != Ty::Vec(scalar, lanes) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[mask, a, b]);
+                Some((Ty::Vec(scalar, lanes), falls, breaks))
+            }
+            hir::ExprKind::VecSumWhere { vec, mask } => {
+                let vector = self.expr_flow(vec)?;
+                let mask = self.expr_flow(mask)?;
+                let (scalar, lanes) = vector_numeric(vector.ty)?;
+                if mask.ty != Ty::Mask(scalar, lanes) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[vector, mask]);
+                Some((align_sema::scalar_to_ty(scalar), falls, breaks))
+            }
+            hir::ExprKind::VecDot { a, b } => {
+                let a = self.expr_flow(a)?;
+                let b = self.expr_flow(b)?;
+                let (scalar, lanes) = vector_numeric(a.ty)?;
+                if b.ty != Ty::Vec(scalar, lanes) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[a, b]);
+                Some((align_sema::scalar_to_ty(scalar), falls, breaks))
+            }
+            hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec } => {
+                let vector = self.expr_flow(vec)?;
+                let (scalar, _) = vector_numeric(vector.ty)?;
+                Some((
+                    align_sema::scalar_to_ty(scalar),
+                    vector.falls,
+                    vector.breaks,
+                ))
+            }
+            hir::ExprKind::VecLoad {
+                src,
+                index,
+                elem,
+                n,
+            } => {
+                if !valid_vector_scalar(*elem) || !valid_vector_lanes(*n) {
+                    return None;
+                }
+                let src = self.expr_flow(src)?;
+                let index = self.expr_flow(index)?;
+                if src.ty != Ty::Slice(*elem) || index.ty != i64_ty() {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[src, index]);
+                Some((Ty::Vec(*elem, *n), falls, breaks))
+            }
+            hir::ExprKind::VecStore {
+                dst,
+                index,
+                value,
+                elem,
+                n,
+            } => {
+                if !valid_vector_scalar(*elem) || !valid_vector_lanes(*n) {
+                    return None;
+                }
+                let dst_flow = self.expr_flow(dst)?;
+                let index_flow = self.expr_flow(index)?;
+                let value_flow = self.expr_flow(value)?;
+                if dst_flow.ty != Ty::Slice(*elem)
+                    || index_flow.ty != i64_ty()
+                    || value_flow.ty != Ty::Vec(*elem, *n)
+                    || !self.out_arg_is_writable(context, std::slice::from_ref(dst), 0)
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[dst_flow, index_flow, value_flow]);
+                Some((Ty::Unit, falls, breaks))
+            }
+            hir::ExprKind::VecLit { elems, elem } => {
+                let lanes = u32::try_from(elems.len()).ok()?;
+                if !valid_vector_scalar(*elem) || !valid_vector_lanes(lanes) {
+                    return None;
+                }
+                let expected = align_sema::scalar_to_ty(*elem);
+                let flows = self.expr_flows(elems)?;
+                if flows.iter().any(|flow| flow.ty != expected) {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Vec(*elem, lanes), falls, breaks))
             }
             hir::ExprKind::TupleIndex { recv, index } => {
                 let flow = self.expr_flow(recv)?;
@@ -4330,10 +4708,50 @@ fn scalar_numeric(ty: Ty) -> bool {
         || matches!(ty, Ty::Float(float) if valid_float(float.bits))
 }
 
+fn valid_vector_lanes(lanes: u32) -> bool {
+    matches!(lanes, 2 | 4 | 8 | 16)
+}
+
+const BODY_CONST_POOL_MIN_ELEMS: u32 = 32;
+
+fn valid_vector_scalar(scalar: Scalar) -> bool {
+    matches!(scalar, Scalar::Int(integer) if valid_int(integer.bits))
+        || matches!(scalar, Scalar::Float(float) if valid_float(float.bits))
+}
+
+fn const_array_scalar_ok(scalar: Scalar) -> bool {
+    matches!(scalar, Scalar::Int(integer) if valid_int(integer.bits))
+        || matches!(scalar, Scalar::Float(float) if valid_float(float.bits))
+        || matches!(scalar, Scalar::Bool | Scalar::Char | Scalar::Str)
+}
+
+fn array_zip_scalar_ok(scalar: Scalar) -> bool {
+    matches!(scalar, Scalar::Int(integer) if valid_int(integer.bits))
+        || matches!(scalar, Scalar::Float(float) if valid_float(float.bits))
+        || matches!(scalar, Scalar::Bool | Scalar::Char)
+}
+
+fn pooled_scalar_literal_ok(expression: &hir::Expr) -> bool {
+    match &expression.kind {
+        hir::ExprKind::Int(_)
+        | hir::ExprKind::Float(_)
+        | hir::ExprKind::Bool(_)
+        | hir::ExprKind::Char(_) => true,
+        hir::ExprKind::Unary {
+            op: align_ast::UnOp::Neg,
+            expr,
+        } => matches!(
+            &expr.kind,
+            hir::ExprKind::Int(_) | hir::ExprKind::Float(_)
+        ),
+        _ => false,
+    }
+}
+
 fn vector_numeric(ty: Ty) -> Option<(Scalar, u32)> {
     match ty {
         Ty::Vec(scalar @ (Scalar::Int(_) | Scalar::Float(_)), lanes)
-            if matches!(lanes, 2 | 4 | 8 | 16) => Some((scalar, lanes)),
+            if valid_vector_scalar(scalar) && valid_vector_lanes(lanes) => Some((scalar, lanes)),
         _ => None,
     }
 }

@@ -519,6 +519,12 @@ The result formula in every row is followed by the universal
 
 ## Expression ledger: am-b2
 
+The am-b2 implementation is delivered in two contiguous dormant-validator slices. Am-b2a owns
+`ExprKind::ArrayLit` through `ExprKind::VecLit`; am-b2b owns `ExprKind::ArraySum` through
+`ExprKind::ArrayDictEncode` plus all nested `StageKind`, `TemplatePart`, `GroupSource`, `GroupAgg1`,
+and `GroupOp` records. Neither slice activates public HIR validation; am-b4 owns the assembled
+activation and body-derived ownership/effect correlation.
+
 For this range, `ERR(T)` means `Result(payload(T), Scalar::Enum(error_enum_id))`
 using the already validated builtin Error definition. `PIPE(source,stages)`
 means:
