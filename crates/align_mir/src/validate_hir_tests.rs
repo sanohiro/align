@@ -760,6 +760,66 @@ fn push_builtin_error(program: &mut hir::Program) -> u32 {
     id
 }
 
+fn push_builtin_regex_match(program: &mut hir::Program) -> u32 {
+    let id = program.structs.len() as u32;
+    let i64_ty = int(64);
+    program.structs.push(StructDef {
+        name: "regex_match".to_string(),
+        source_name: "regex_match".to_string(),
+        fields: vec![
+            FieldDef {
+                name: "start".to_string(),
+                ty: i64_ty,
+            },
+            FieldDef {
+                name: "end".to_string(),
+                ty: i64_ty,
+            },
+        ],
+        align: None,
+        c_repr: false,
+    });
+    id
+}
+
+fn push_builtin_argon2_params(program: &mut hir::Program) -> u32 {
+    let id = program.structs.len() as u32;
+    let i64_ty = int(64);
+    program.structs.push(StructDef {
+        name: "argon2_params".to_string(),
+        source_name: "argon2_params".to_string(),
+        fields: ["m_cost", "t_cost", "parallelism", "len"]
+            .into_iter()
+            .map(|name| FieldDef {
+                name: name.to_string(),
+                ty: i64_ty,
+            })
+            .collect(),
+        align: None,
+        c_repr: false,
+    });
+    id
+}
+
+fn native_local(id: u32, ty: Ty) -> hir::Expr {
+    body_test_expr(hir::ExprKind::Local(id), ty)
+}
+
+fn native_str() -> hir::Expr {
+    body_test_expr(hir::ExprKind::Str("value".to_string()), Ty::Str)
+}
+
+fn native_i64() -> hir::Expr {
+    body_test_expr(hir::ExprKind::Int(1), int(64))
+}
+
+fn native_result(ok: Ty, error: u32) -> Ty {
+    Ty::Result(
+        align_sema::ty_to_scalar(ok).expect("native result payload is scalar"),
+        Scalar::Enum(error),
+    )
+}
+
 fn push_builtin_json_kind(program: &mut hir::Program) -> u32 {
     let id = program.enums.len() as u32;
     program.enums.push(EnumDef {
@@ -7144,6 +7204,2303 @@ fn hir_body_validator_pipeline_template_json_group_control_flow() {
         result_doc,
     ));
     assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_validator_native() {
+    let mut program = baseline_program();
+    let error = push_builtin_error(&mut program);
+    let regex_match = push_builtin_regex_match(&mut program);
+    let argon2_params = push_builtin_argon2_params(&mut program);
+    let i64_ty = int(64);
+    let i32_ty = int(32);
+    let u8_scalar = Scalar::Int(IntTy { bits: 8, signed: false });
+    let bytes = Ty::Slice(u8_scalar);
+    let result_i64 = native_result(i64_ty, error);
+    let result_unit = native_result(Ty::Unit, error);
+    let result_buffer = native_result(Ty::Buffer, error);
+    let result_response = native_result(Ty::HttpResponse, error);
+    let result_u8_array = Ty::DynArray(u8_scalar);
+
+    macro_rules! add {
+        ($name:expr, $expression:expr, $locals:expr, $ret:expr) => {
+            program.fns.push(body_tail_case($name, $expression, $ret));
+            let locals: Vec<hir::Local> = $locals;
+            if !locals.is_empty() {
+                let function = program.fns.last_mut().expect("native function just added");
+                function.locals = locals;
+            }
+        };
+    }
+
+    add!(
+        "native_fs_read_file",
+        body_test_expr(
+            hir::ExprKind::FsReadFile {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::String, error),
+        ),
+        Vec::new(),
+        native_result(Ty::String, error)
+    );
+    add!(
+        "native_reader_stdin",
+        body_test_expr(hir::ExprKind::ReaderStdin, Ty::Reader),
+        Vec::new(),
+        Ty::Reader
+    );
+    add!(
+        "native_reader_open",
+        body_test_expr(
+            hir::ExprKind::ReaderOpen {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::Reader, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Reader, error)
+    );
+    add!(
+        "native_writer_std",
+        body_test_expr(
+            hir::ExprKind::WriterStd {
+                fd: 1,
+                buffered: false,
+            },
+            Ty::Writer,
+        ),
+        Vec::new(),
+        Ty::Writer
+    );
+    add!(
+        "native_writer_create",
+        body_test_expr(
+            hir::ExprKind::WriterCreate {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::Writer, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Writer, error)
+    );
+    add!(
+        "native_reader_read",
+        body_test_expr(
+            hir::ExprKind::ReaderRead {
+                reader: Box::new(body_test_expr(hir::ExprKind::ReaderStdin, Ty::Reader)),
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+            },
+            result_i64,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, true, false)],
+        result_i64
+    );
+    add!(
+        "native_reader_buffered",
+        body_test_expr(
+            hir::ExprKind::ReaderBuffered {
+                reader: Box::new(body_test_expr(hir::ExprKind::ReaderStdin, Ty::Reader)),
+            },
+            Ty::Reader,
+        ),
+        Vec::new(),
+        Ty::Reader
+    );
+    program.fns.push(body_test_named_function(
+        "native_reader_read_line",
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 2,
+                init: body_test_expr(
+                    hir::ExprKind::ReaderBuffered {
+                        reader: Box::new(native_local(0, Ty::Reader)),
+                    },
+                    Ty::Reader,
+                ),
+            }],
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ReaderReadLine {
+                    reader: Box::new(native_local(2, Ty::Reader)),
+                    buffer: Box::new(native_local(1, Ty::Buffer)),
+                },
+                result_i64,
+            ))),
+        },
+        vec![
+            body_test_local(0, "reader", Ty::Reader, false, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+            body_test_local(2, "buffered", Ty::Reader, false, false),
+        ],
+        result_i64,
+    ));
+    add!(
+        "native_bytes_as_str",
+        body_test_expr(
+            hir::ExprKind::BytesAsStr {
+                bytes: Box::new(native_local(0, bytes)),
+            },
+            native_result(Ty::Str, error),
+        ),
+        vec![body_test_local(0, "bytes", bytes, false, false)],
+        native_result(Ty::Str, error)
+    );
+    add!(
+        "native_writer_write",
+        body_test_expr(
+            hir::ExprKind::WriterWrite {
+                writer: Box::new(body_test_expr(
+                    hir::ExprKind::WriterStd {
+                        fd: 1,
+                        buffered: false,
+                    },
+                    Ty::Writer,
+                )),
+                arg: Box::new(native_str()),
+                builder: false,
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    add!(
+        "native_writer_flush",
+        body_test_expr(
+            hir::ExprKind::WriterFlush {
+                writer: Box::new(body_test_expr(
+                    hir::ExprKind::WriterStd {
+                        fd: 2,
+                        buffered: false,
+                    },
+                    Ty::Writer,
+                )),
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    add!(
+        "native_io_copy",
+        body_test_expr(
+            hir::ExprKind::IoCopy {
+                reader: Box::new(body_test_expr(hir::ExprKind::ReaderStdin, Ty::Reader)),
+                writer: Box::new(body_test_expr(
+                    hir::ExprKind::WriterStd {
+                        fd: 1,
+                        buffered: false,
+                    },
+                    Ty::Writer,
+                )),
+            },
+            result_i64,
+        ),
+        Vec::new(),
+        result_i64
+    );
+    add!(
+        "native_file_create_rw",
+        body_test_expr(
+            hir::ExprKind::FileCreateRw {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::File, error),
+        ),
+        Vec::new(),
+        native_result(Ty::File, error)
+    );
+    add!(
+        "native_file_open_rw",
+        body_test_expr(
+            hir::ExprKind::FileOpenRw {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::File, error),
+        ),
+        Vec::new(),
+        native_result(Ty::File, error)
+    );
+    add!(
+        "native_file_pread",
+        body_test_expr(
+            hir::ExprKind::FilePread {
+                file: Box::new(native_local(0, Ty::File)),
+                buffer: Box::new(native_local(1, Ty::Buffer)),
+                offset: Box::new(native_i64()),
+            },
+            result_i64,
+        ),
+        vec![
+            body_test_local(0, "file", Ty::File, false, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+        ],
+        result_i64
+    );
+    add!(
+        "native_file_pwrite",
+        body_test_expr(
+            hir::ExprKind::FilePwrite {
+                file: Box::new(native_local(0, Ty::File)),
+                data: Box::new(native_str()),
+                offset: Box::new(native_i64()),
+            },
+            result_i64,
+        ),
+        vec![body_test_local(0, "file", Ty::File, false, false)],
+        result_i64
+    );
+    add!(
+        "native_file_len",
+        body_test_expr(
+            hir::ExprKind::FileLen {
+                file: Box::new(native_local(0, Ty::File)),
+            },
+            result_i64,
+        ),
+        vec![body_test_local(0, "file", Ty::File, false, false)],
+        result_i64
+    );
+    add!(
+        "native_buffer_new",
+        body_test_expr(
+            hir::ExprKind::BufferNew {
+                capacity: Box::new(native_i64()),
+            },
+            Ty::Buffer,
+        ),
+        Vec::new(),
+        Ty::Buffer
+    );
+    add!(
+        "native_buffer_bytes",
+        body_test_expr(
+            hir::ExprKind::BufferBytes {
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+            },
+            bytes,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, false, false)],
+        bytes
+    );
+    add!(
+        "native_str_bytes",
+        body_test_expr(
+            hir::ExprKind::StrBytes {
+                inner: Box::new(native_str()),
+            },
+            bytes,
+        ),
+        Vec::new(),
+        bytes
+    );
+    add!(
+        "native_buffer_len",
+        body_test_expr(
+            hir::ExprKind::BufferLen {
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_bytes_read",
+        body_test_expr(
+            hir::ExprKind::BytesRead {
+                bytes: Box::new(native_local(0, bytes)),
+                offset: Box::new(native_i64()),
+                be: true,
+            },
+            i32_ty,
+        ),
+        vec![body_test_local(0, "bytes", bytes, false, false)],
+        i32_ty
+    );
+    add!(
+        "native_buffer_put",
+        body_test_expr(
+            hir::ExprKind::BufferPut {
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+                value: Box::new(body_test_expr(hir::ExprKind::Int(1), i32_ty)),
+                be: true,
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, true, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_buffer_append",
+        body_test_expr(
+            hir::ExprKind::BufferAppend {
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+                data: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, true, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_array_builder_new",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderNew {
+                elem: Scalar::String,
+            },
+            Ty::ArrayBuilder(Scalar::String),
+        ),
+        Vec::new(),
+        Ty::ArrayBuilder(Scalar::String)
+    );
+    add!(
+        "native_array_builder_push",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderPush {
+                builder: Box::new(native_local(0, Ty::ArrayBuilder(Scalar::String))),
+                value: Box::new(body_test_expr(
+                    hir::ExprKind::StrClone(Box::new(native_str())),
+                    Ty::String,
+                )),
+                moves_value: true,
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(
+            0,
+            "builder",
+            Ty::ArrayBuilder(Scalar::String),
+            true,
+            false,
+        )],
+        Ty::Unit
+    );
+    add!(
+        "native_array_builder_append",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderAppend {
+                builder: Box::new(native_local(0, Ty::ArrayBuilder(scalar_int(64)))),
+                data: Box::new(native_local(1, Ty::Slice(scalar_int(64)))),
+            },
+            Ty::Unit,
+        ),
+        vec![
+            body_test_local(0, "builder", Ty::ArrayBuilder(scalar_int(64)), true, false),
+            body_test_local(1, "data", Ty::Slice(scalar_int(64)), false, false),
+        ],
+        Ty::Unit
+    );
+    add!(
+        "native_array_builder_build",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(
+                0,
+                Ty::ArrayBuilder(scalar_int(64)),
+            ))),
+            Ty::DynArray(scalar_int(64)),
+        ),
+        vec![body_test_local(
+            0,
+            "builder",
+            Ty::ArrayBuilder(scalar_int(64)),
+            false,
+            false,
+        )],
+        Ty::DynArray(scalar_int(64))
+    );
+    add!(
+        "native_fs_write_file",
+        body_test_expr(
+            hir::ExprKind::FsWriteFile {
+                path: Box::new(native_str()),
+                data: Box::new(native_str()),
+                builder: false,
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    add!(
+        "native_fs_exists",
+        body_test_expr(
+            hir::ExprKind::FsExists {
+                path: Box::new(native_str()),
+            },
+            Ty::Bool,
+        ),
+        Vec::new(),
+        Ty::Bool
+    );
+    add!(
+        "native_fs_remove",
+        body_test_expr(
+            hir::ExprKind::FsRemove {
+                path: Box::new(native_str()),
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    add!(
+        "native_fs_read_dir",
+        body_test_expr(
+            hir::ExprKind::FsReadDir {
+                path: Box::new(native_str()),
+            },
+            native_result(Ty::DynArray(Scalar::String), error),
+        ),
+        Vec::new(),
+        native_result(Ty::DynArray(Scalar::String), error)
+    );
+    add!(
+        "native_dns_resolve",
+        body_test_expr(
+            hir::ExprKind::DnsResolve {
+                host: Box::new(native_str()),
+            },
+            native_result(Ty::DynArray(Scalar::String), error),
+        ),
+        Vec::new(),
+        native_result(Ty::DynArray(Scalar::String), error)
+    );
+    add!(
+        "native_tcp_connect",
+        body_test_expr(
+            hir::ExprKind::TcpConnect {
+                host: Box::new(native_str()),
+                port: Box::new(native_i64()),
+            },
+            native_result(Ty::TcpConn, error),
+        ),
+        Vec::new(),
+        native_result(Ty::TcpConn, error)
+    );
+    add!(
+        "native_conn_reader",
+        body_test_expr(
+            hir::ExprKind::ConnReader {
+                conn: Box::new(native_local(0, Ty::TcpConn)),
+            },
+            Ty::Reader,
+        ),
+        vec![body_test_local(0, "conn", Ty::TcpConn, false, false)],
+        Ty::Reader
+    );
+    add!(
+        "native_conn_writer",
+        body_test_expr(
+            hir::ExprKind::ConnWriter {
+                conn: Box::new(native_local(0, Ty::TcpConn)),
+            },
+            Ty::Writer,
+        ),
+        vec![body_test_local(0, "conn", Ty::TcpConn, false, false)],
+        Ty::Writer
+    );
+    add!(
+        "native_tcp_read_timeout",
+        body_test_expr(
+            hir::ExprKind::TcpReadTimeout {
+                conn: Box::new(native_local(0, Ty::TcpConn)),
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "conn", Ty::TcpConn, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_tcp_write_timeout",
+        body_test_expr(
+            hir::ExprKind::TcpWriteTimeout {
+                conn: Box::new(native_local(0, Ty::TcpConn)),
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "conn", Ty::TcpConn, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_tcp_listen",
+        body_test_expr(
+            hir::ExprKind::TcpListen {
+                host: Box::new(native_str()),
+                port: Box::new(native_i64()),
+            },
+            native_result(Ty::TcpListener, error),
+        ),
+        Vec::new(),
+        native_result(Ty::TcpListener, error)
+    );
+    add!(
+        "native_tcp_accept",
+        body_test_expr(
+            hir::ExprKind::TcpAccept {
+                listener: Box::new(native_local(0, Ty::TcpListener)),
+            },
+            native_result(Ty::TcpConn, error),
+        ),
+        vec![body_test_local(0, "listener", Ty::TcpListener, false, false)],
+        native_result(Ty::TcpConn, error)
+    );
+    add!(
+        "native_udp_bind",
+        body_test_expr(
+            hir::ExprKind::UdpBind {
+                host: Box::new(native_str()),
+                port: Box::new(native_i64()),
+            },
+            native_result(Ty::UdpSocket, error),
+        ),
+        Vec::new(),
+        native_result(Ty::UdpSocket, error)
+    );
+    add!(
+        "native_udp_send_to",
+        body_test_expr(
+            hir::ExprKind::UdpSendTo {
+                sock: Box::new(native_local(0, Ty::UdpSocket)),
+                data: Box::new(native_str()),
+                host: Box::new(native_str()),
+                port: Box::new(native_i64()),
+            },
+            result_i64,
+        ),
+        vec![body_test_local(0, "socket", Ty::UdpSocket, false, false)],
+        result_i64
+    );
+    add!(
+        "native_udp_recv_from",
+        body_test_expr(
+            hir::ExprKind::UdpRecvFrom {
+                sock: Box::new(native_local(0, Ty::UdpSocket)),
+                buffer: Box::new(native_local(1, Ty::Buffer)),
+            },
+            result_i64,
+        ),
+        vec![
+            body_test_local(0, "socket", Ty::UdpSocket, false, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+        ],
+        result_i64
+    );
+    let view_result = native_result(Ty::Str, error);
+    add!(
+        "native_file_read_view",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::FsReadFileView {
+                        path: Box::new(native_str()),
+                    },
+                    view_result,
+                ))),
+            }),
+            view_result,
+        ),
+        Vec::new(),
+        view_result
+    );
+    add!(
+        "native_file_read_bytes_view",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::FsReadBytesView {
+                        path: Box::new(native_str()),
+                    },
+                    native_result(bytes, error),
+                ))),
+            }),
+            native_result(bytes, error),
+        ),
+        Vec::new(),
+        native_result(bytes, error)
+    );
+    add!(
+        "native_path_join",
+        body_test_expr(
+            hir::ExprKind::PathJoin {
+                a: Box::new(native_str()),
+                b: Box::new(native_str()),
+            },
+            Ty::String,
+        ),
+        Vec::new(),
+        Ty::String
+    );
+    add!(
+        "native_path_component",
+        body_test_expr(
+            hir::ExprKind::PathComponent {
+                kind: hir::PathComponentKind::Base,
+                path: Box::new(native_str()),
+            },
+            Ty::Str,
+        ),
+        Vec::new(),
+        Ty::Str
+    );
+    add!(
+        "native_path_normalize",
+        body_test_expr(
+            hir::ExprKind::PathNormalize {
+                path: Box::new(native_str()),
+            },
+            Ty::String,
+        ),
+        Vec::new(),
+        Ty::String
+    );
+    add!(
+        "native_env_get",
+        body_test_expr(
+            hir::ExprKind::EnvGet {
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::String),
+        ),
+        Vec::new(),
+        Ty::Option(Scalar::String)
+    );
+    add!(
+        "native_env_set",
+        body_test_expr(
+            hir::ExprKind::EnvSet {
+                name: Box::new(native_str()),
+                value: Box::new(native_str()),
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    for (name, kind, ret) in [
+        ("native_time_now", hir::ExprKind::TimeNow, i64_ty),
+        ("native_time_instant", hir::ExprKind::TimeInstant, i64_ty),
+        ("native_process_cpu_count", hir::ExprKind::ProcessCpuCount, i64_ty),
+    ] {
+        add!(name, body_test_expr(kind, ret), Vec::new(), ret);
+    }
+    add!(
+        "native_time_sleep",
+        body_test_expr(
+            hir::ExprKind::TimeSleep {
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        Vec::new(),
+        Ty::Unit
+    );
+    add!(
+        "native_process_spawn",
+        body_test_expr(
+            hir::ExprKind::ProcessSpawn {
+                cmd: Box::new(native_str()),
+                args: Box::new(native_local(0, Ty::DynArray(Scalar::Str))),
+            },
+            native_result(Ty::Child, error),
+        ),
+        vec![body_test_local(0, "args", Ty::DynArray(Scalar::Str), false, false)],
+        native_result(Ty::Child, error)
+    );
+    add!(
+        "native_child_wait",
+        body_test_expr(
+            hir::ExprKind::ChildWait {
+                child: Box::new(native_local(0, Ty::Child)),
+            },
+            result_i64,
+        ),
+        vec![body_test_local(0, "child", Ty::Child, false, false)],
+        result_i64
+    );
+    add!(
+        "native_child_kill",
+        body_test_expr(
+            hir::ExprKind::ChildKill {
+                child: Box::new(native_local(0, Ty::Child)),
+                sig: Box::new(native_i64()),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "child", Ty::Child, false, false)],
+        result_unit
+    );
+    add!(
+        "native_process_exec",
+        body_test_expr(
+            hir::ExprKind::ProcessExec {
+                cmd: Box::new(native_str()),
+                args: Box::new(native_local(0, Ty::Slice(Scalar::Str))),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "args", Ty::Slice(Scalar::Str), false, false)],
+        result_unit
+    );
+    add!(
+        "native_process_command",
+        body_test_expr(
+            hir::ExprKind::ProcessCommand {
+                cmd: Box::new(native_str()),
+                args: Box::new(native_local(0, Ty::DynArray(Scalar::Str))),
+            },
+            Ty::Command,
+        ),
+        vec![body_test_local(0, "args", Ty::DynArray(Scalar::Str), false, false)],
+        Ty::Command
+    );
+    add!(
+        "native_command_cwd",
+        body_test_expr(
+            hir::ExprKind::CommandCwd {
+                command: Box::new(native_local(0, Ty::Command)),
+                dir: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_command_timeout",
+        body_test_expr(
+            hir::ExprKind::CommandTimeout {
+                command: Box::new(native_local(0, Ty::Command)),
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_command_env",
+        body_test_expr(
+            hir::ExprKind::CommandEnv {
+                command: Box::new(native_local(0, Ty::Command)),
+                name: Box::new(native_str()),
+                value: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_command_env_clear",
+        body_test_expr(
+            hir::ExprKind::CommandEnvClear {
+                command: Box::new(native_local(0, Ty::Command)),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_command_run",
+        body_test_expr(
+            hir::ExprKind::CommandRun {
+                command: Box::new(native_local(0, Ty::Command)),
+            },
+            native_result(Ty::RunOutput, error),
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        native_result(Ty::RunOutput, error)
+    );
+    add!(
+        "native_run_output_code",
+        body_test_expr(
+            hir::ExprKind::RunOutputCode {
+                out: Box::new(native_local(0, Ty::RunOutput)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "out", Ty::RunOutput, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_run_output_stdout",
+        body_test_expr(
+            hir::ExprKind::RunOutputStdout {
+                out: Box::new(native_local(0, Ty::RunOutput)),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(0, "out", Ty::RunOutput, false, false)],
+        Ty::Str
+    );
+    add!(
+        "native_run_output_stderr",
+        body_test_expr(
+            hir::ExprKind::RunOutputStderr {
+                out: Box::new(native_local(0, Ty::RunOutput)),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(0, "out", Ty::RunOutput, false, false)],
+        Ty::Str
+    );
+    add!(
+        "native_encoding_encode",
+        body_test_expr(
+            hir::ExprKind::EncodingEncode {
+                kind: hir::EncodingKind::Base64,
+                data: Box::new(native_str()),
+            },
+            Ty::String,
+        ),
+        Vec::new(),
+        Ty::String
+    );
+    add!(
+        "native_encoding_decode",
+        body_test_expr(
+            hir::ExprKind::EncodingDecode {
+                kind: hir::EncodingKind::Hex,
+                input: Box::new(native_str()),
+            },
+            result_buffer,
+        ),
+        Vec::new(),
+        result_buffer
+    );
+    add!(
+        "native_utf8_valid",
+        body_test_expr(
+            hir::ExprKind::Utf8Valid {
+                data: Box::new(native_local(0, bytes)),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "bytes", bytes, false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_compress",
+        body_test_expr(
+            hir::ExprKind::Compress {
+                kind: hir::CompressKind::Gzip,
+                data: Box::new(native_str()),
+                level: Box::new(native_i64()),
+            },
+            result_buffer,
+        ),
+        Vec::new(),
+        result_buffer
+    );
+    add!(
+        "native_decompress",
+        body_test_expr(
+            hir::ExprKind::Decompress {
+                kind: hir::CompressKind::Zstd,
+                data: Box::new(native_str()),
+            },
+            result_buffer,
+        ),
+        Vec::new(),
+        result_buffer
+    );
+    add!(
+        "native_rand_seed",
+        body_test_expr(hir::ExprKind::RandSeed, Ty::Rng),
+        Vec::new(),
+        Ty::Rng
+    );
+    add!(
+        "native_rand_seed_with",
+        body_test_expr(
+            hir::ExprKind::RandSeedWith {
+                seed: Box::new(native_i64()),
+            },
+            Ty::Rng,
+        ),
+        Vec::new(),
+        Ty::Rng
+    );
+    add!(
+        "native_rand_next",
+        body_test_expr(
+            hir::ExprKind::RandNext {
+                rng: Box::new(native_local(0, Ty::Rng)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "rng", Ty::Rng, true, false)],
+        i64_ty
+    );
+    add!(
+        "native_rand_range",
+        body_test_expr(
+            hir::ExprKind::RandRange {
+                rng: Box::new(native_local(0, Ty::Rng)),
+                lo: Box::new(native_i64()),
+                hi: Box::new(native_i64()),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "rng", Ty::Rng, true, false)],
+        i64_ty
+    );
+    add!(
+        "native_rand_shuffle",
+        body_test_expr(
+            hir::ExprKind::RandShuffle {
+                rng: Box::new(native_local(0, Ty::Rng)),
+                xs: Box::new(native_local(1, Ty::Slice(scalar_int(64)))),
+                elem: i64_ty,
+            },
+            Ty::Unit,
+        ),
+        vec![
+            body_test_local(0, "rng", Ty::Rng, true, false),
+            body_test_local(1, "xs", Ty::Slice(scalar_int(64)), true, false),
+        ],
+        Ty::Unit
+    );
+    add!(
+        "native_rand_sample",
+        body_test_expr(
+            hir::ExprKind::RandSample {
+                rng: Box::new(native_local(0, Ty::Rng)),
+                xs: Box::new(native_local(1, Ty::Slice(scalar_int(64)))),
+                k: Box::new(native_i64()),
+                elem: i64_ty,
+            },
+            Ty::DynArray(scalar_int(64)),
+        ),
+        vec![
+            body_test_local(0, "rng", Ty::Rng, true, false),
+            body_test_local(1, "xs", Ty::Slice(scalar_int(64)), false, false),
+        ],
+        Ty::DynArray(scalar_int(64))
+    );
+    add!(
+        "native_regex_compile",
+        body_test_expr(
+            hir::ExprKind::RegexCompile {
+                pattern: Box::new(native_str()),
+            },
+            native_result(Ty::Regex, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Regex, error)
+    );
+    add!(
+        "native_regex_is_match",
+        body_test_expr(
+            hir::ExprKind::RegexIsMatch {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_regex_find",
+        body_test_expr(
+            hir::ExprKind::RegexFind {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+                start: Some(Box::new(native_i64())),
+            },
+            Ty::Option(Scalar::Struct(regex_match)),
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        Ty::Option(Scalar::Struct(regex_match))
+    );
+    for (name, kind) in [
+        (
+            "native_regex_find_all",
+            hir::ExprKind::RegexFindAll {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+            },
+        ),
+        (
+            "native_regex_split",
+            hir::ExprKind::RegexSplit {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+            },
+        ),
+    ] {
+        add!(
+            name,
+            body_test_expr(
+                kind,
+                Ty::DynStructArray(regex_match, Layout::Aos),
+            ),
+            vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+            Ty::DynStructArray(regex_match, Layout::Aos)
+        );
+    }
+    add!(
+        "native_regex_replace",
+        body_test_expr(
+            hir::ExprKind::RegexReplace {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+                repl: Box::new(native_str()),
+                all: true,
+            },
+            Ty::String,
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        Ty::String
+    );
+    add!(
+        "native_regex_captures",
+        body_test_expr(
+            hir::ExprKind::RegexCaptures {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                text: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Captures),
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        Ty::Option(Scalar::Captures)
+    );
+    add!(
+        "native_regex_group_count",
+        body_test_expr(
+            hir::ExprKind::RegexGroupCount {
+                regex: Box::new(native_local(0, Ty::Regex)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_regex_group_index",
+        body_test_expr(
+            hir::ExprKind::RegexGroupIndex {
+                regex: Box::new(native_local(0, Ty::Regex)),
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true })),
+        ),
+        vec![body_test_local(0, "regex", Ty::Regex, false, false)],
+        Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true }))
+    );
+    add!(
+        "native_captures_group",
+        body_test_expr(
+            hir::ExprKind::CapturesGroup {
+                caps: Box::new(native_local(0, Ty::Captures)),
+                index: Box::new(native_i64()),
+            },
+            Ty::Option(Scalar::Struct(regex_match)),
+        ),
+        vec![body_test_local(0, "caps", Ty::Captures, false, false)],
+        Ty::Option(Scalar::Struct(regex_match))
+    );
+    add!(
+        "native_cli_command",
+        body_test_expr(
+            hir::ExprKind::CliCommand {
+                name: Box::new(native_str()),
+            },
+            Ty::CliCommand,
+        ),
+        Vec::new(),
+        Ty::CliCommand
+    );
+    add!(
+        "native_cli_flag_bool",
+        body_test_expr(
+            hir::ExprKind::CliFlag {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+                kind: hir::CliFlagKind::Bool,
+                name: Box::new(native_str()),
+                default: None,
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_cli_flag_i64",
+        body_test_expr(
+            hir::ExprKind::CliFlag {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+                kind: hir::CliFlagKind::I64,
+                name: Box::new(native_str()),
+                default: Some(Box::new(native_i64())),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_cli_flag_str",
+        body_test_expr(
+            hir::ExprKind::CliFlag {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+                kind: hir::CliFlagKind::Str,
+                name: Box::new(native_str()),
+                default: Some(Box::new(native_str())),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_cli_parse",
+        body_test_expr(
+            hir::ExprKind::CliParse {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+                args: Box::new(native_local(1, Ty::DynArray(Scalar::Str))),
+            },
+            native_result(Ty::CliParsed, error),
+        ),
+        vec![
+            body_test_local(0, "cmd", Ty::CliCommand, false, false),
+            body_test_local(1, "args", Ty::DynArray(Scalar::Str), false, false),
+        ],
+        native_result(Ty::CliParsed, error)
+    );
+    add!(
+        "native_cli_get_bool",
+        body_test_expr(
+            hir::ExprKind::CliGetBool {
+                parsed: Box::new(native_local(0, Ty::CliParsed)),
+                name: Box::new(native_str()),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "parsed", Ty::CliParsed, false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_cli_get_i64",
+        body_test_expr(
+            hir::ExprKind::CliGetI64 {
+                parsed: Box::new(native_local(0, Ty::CliParsed)),
+                name: Box::new(native_str()),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "parsed", Ty::CliParsed, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_cli_get_str",
+        body_test_expr(
+            hir::ExprKind::CliGetStr {
+                parsed: Box::new(native_local(0, Ty::CliParsed)),
+                name: Box::new(native_str()),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(0, "parsed", Ty::CliParsed, false, false)],
+        Ty::Str
+    );
+    add!(
+        "native_cli_usage",
+        body_test_expr(
+            hir::ExprKind::CliUsage {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+            },
+            Ty::String,
+        ),
+        vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
+        Ty::String
+    );
+
+    add!(
+        "native_http_request",
+        body_test_expr(
+            hir::ExprKind::HttpRequest {
+                method: Box::new(native_str()),
+                url: Box::new(native_str()),
+            },
+            Ty::HttpRequest,
+        ),
+        Vec::new(),
+        Ty::HttpRequest
+    );
+    add!(
+        "native_http_header",
+        body_test_expr(
+            hir::ExprKind::HttpHeader {
+                req: Box::new(native_local(0, Ty::HttpRequest)),
+                name: Box::new(native_str()),
+                value: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "request", Ty::HttpRequest, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_body",
+        body_test_expr(
+            hir::ExprKind::HttpBody {
+                req: Box::new(native_local(0, Ty::HttpRequest)),
+                data: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "request", Ty::HttpRequest, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_request_timeout",
+        body_test_expr(
+            hir::ExprKind::HttpRequestTimeout {
+                req: Box::new(native_local(0, Ty::HttpRequest)),
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "request", Ty::HttpRequest, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_parse",
+        body_test_expr(
+            hir::ExprKind::HttpParse {
+                data: Box::new(native_str()),
+            },
+            result_response,
+        ),
+        Vec::new(),
+        result_response
+    );
+    add!(
+        "native_http_resp_status",
+        body_test_expr(
+            hir::ExprKind::HttpRespStatus {
+                resp: Box::new(native_local(0, Ty::HttpResponse)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "response", Ty::HttpResponse, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_http_resp_header",
+        body_test_expr(
+            hir::ExprKind::HttpRespHeader {
+                resp: Box::new(native_local(0, Ty::HttpResponse)),
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Str),
+        ),
+        vec![body_test_local(0, "response", Ty::HttpResponse, false, false)],
+        Ty::Option(Scalar::Str)
+    );
+    add!(
+        "native_http_resp_body",
+        body_test_expr(
+            hir::ExprKind::HttpRespBody {
+                resp: Box::new(native_local(0, Ty::HttpResponse)),
+            },
+            bytes,
+        ),
+        vec![body_test_local(0, "response", Ty::HttpResponse, false, false)],
+        bytes
+    );
+    add!(
+        "native_http_client",
+        body_test_expr(hir::ExprKind::HttpClient, Ty::HttpClient),
+        Vec::new(),
+        Ty::HttpClient
+    );
+    add!(
+        "native_http_client_timeout",
+        body_test_expr(
+            hir::ExprKind::HttpClientTimeout {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "client", Ty::HttpClient, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_client_get",
+        body_test_expr(
+            hir::ExprKind::HttpClientGet {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                url: Box::new(native_str()),
+            },
+            result_response,
+        ),
+        vec![body_test_local(0, "client", Ty::HttpClient, false, false)],
+        result_response
+    );
+    add!(
+        "native_http_client_post",
+        body_test_expr(
+            hir::ExprKind::HttpClientPost {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                url: Box::new(native_str()),
+                body: Box::new(native_str()),
+            },
+            result_response,
+        ),
+        vec![body_test_local(0, "client", Ty::HttpClient, false, false)],
+        result_response
+    );
+    add!(
+        "native_http_client_request",
+        body_test_expr(
+            hir::ExprKind::HttpClientRequest {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                req: Box::new(native_local(1, Ty::HttpRequest)),
+            },
+            result_response,
+        ),
+        vec![
+            body_test_local(0, "client", Ty::HttpClient, false, false),
+            body_test_local(1, "request", Ty::HttpRequest, false, false),
+        ],
+        result_response
+    );
+    add!(
+        "native_http_get_many",
+        body_test_expr(
+            hir::ExprKind::HttpGetMany {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                urls: Box::new(native_local(1, Ty::Slice(Scalar::Str))),
+                max_concurrency: Box::new(native_i64()),
+            },
+            native_result(Ty::DynResponseArray, error),
+        ),
+        vec![
+            body_test_local(0, "client", Ty::HttpClient, false, false),
+            body_test_local(1, "urls", Ty::Slice(Scalar::Str), false, false),
+        ],
+        native_result(Ty::DynResponseArray, error)
+    );
+    add!(
+        "native_http_serve",
+        body_test_expr(
+            hir::ExprKind::HttpServe {
+                host: Box::new(native_str()),
+                port: Box::new(native_i64()),
+                shared: true,
+            },
+            native_result(Ty::HttpServer, error),
+        ),
+        Vec::new(),
+        native_result(Ty::HttpServer, error)
+    );
+    add!(
+        "native_http_accept",
+        body_test_expr(
+            hir::ExprKind::HttpAccept {
+                server: Box::new(native_local(0, Ty::HttpServer)),
+            },
+            native_result(Ty::HttpRequestCtx, error),
+        ),
+        vec![body_test_local(0, "server", Ty::HttpServer, false, false)],
+        native_result(Ty::HttpRequestCtx, error)
+    );
+    add!(
+        "native_http_response_builder",
+        body_test_expr(
+            hir::ExprKind::HttpResponseBuilder {
+                status: Box::new(native_i64()),
+            },
+            Ty::ResponseBuilder,
+        ),
+        Vec::new(),
+        Ty::ResponseBuilder
+    );
+    add!(
+        "native_http_rb_header",
+        body_test_expr(
+            hir::ExprKind::HttpRbHeader {
+                rb: Box::new(native_local(0, Ty::ResponseBuilder)),
+                name: Box::new(native_str()),
+                value: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "builder", Ty::ResponseBuilder, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_rb_body",
+        body_test_expr(
+            hir::ExprKind::HttpRbBody {
+                rb: Box::new(native_local(0, Ty::ResponseBuilder)),
+                data: Box::new(native_str()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "builder", Ty::ResponseBuilder, false, false)],
+        Ty::Unit
+    );
+    let ctx_struct = program.structs.len() as u32;
+    program.structs.push(StructDef {
+        name: "CtxHolder".to_string(),
+        source_name: "CtxHolder".to_string(),
+        fields: vec![FieldDef {
+            name: "ctx".to_string(),
+            ty: Ty::HttpRequestCtx,
+        }],
+        align: None,
+        c_repr: false,
+    });
+    let ctx_field = || {
+        body_test_expr(
+            hir::ExprKind::Field {
+                root: 0,
+                path: vec![0],
+            },
+            Ty::HttpRequestCtx,
+        )
+    };
+    add!(
+        "native_http_ctx_method",
+        body_test_expr(
+            hir::ExprKind::HttpCtxMethod {
+                ctx: Box::new(ctx_field()),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Str
+    );
+    add!(
+        "native_http_ctx_path",
+        body_test_expr(
+            hir::ExprKind::HttpCtxPath {
+                ctx: Box::new(ctx_field()),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Str
+    );
+    add!(
+        "native_http_ctx_headers",
+        body_test_expr(
+            hir::ExprKind::HttpCtxHeaders {
+                ctx: Box::new(ctx_field()),
+            },
+            Ty::HttpHeaders,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::HttpHeaders
+    );
+    add!(
+        "native_http_ctx_header",
+        body_test_expr(
+            hir::ExprKind::HttpCtxHeader {
+                headers: Box::new(body_test_expr(
+                    hir::ExprKind::HttpCtxHeaders {
+                        ctx: Box::new(ctx_field()),
+                    },
+                    Ty::HttpHeaders,
+                )),
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Str),
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Option(Scalar::Str)
+    );
+    add!(
+        "native_http_ctx_body",
+        body_test_expr(
+            hir::ExprKind::HttpCtxBody {
+                ctx: Box::new(ctx_field()),
+            },
+            bytes,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        bytes
+    );
+    add!(
+        "native_http_respond",
+        body_test_expr(
+            hir::ExprKind::HttpRespond {
+                ctx: Box::new(ctx_field()),
+                rb: Box::new(native_local(1, Ty::ResponseBuilder)),
+            },
+            result_unit,
+        ),
+        vec![
+            body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false),
+            body_test_local(1, "builder", Ty::ResponseBuilder, false, false),
+        ],
+        result_unit
+    );
+    add!(
+        "native_http_respond_stream",
+        body_test_expr(
+            hir::ExprKind::HttpRespondStream {
+                ctx: Box::new(ctx_field()),
+                rb: Box::new(native_local(1, Ty::ResponseBuilder)),
+            },
+            native_result(Ty::HttpStream, error),
+        ),
+        vec![
+            body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false),
+            body_test_local(1, "builder", Ty::ResponseBuilder, false, false),
+        ],
+        native_result(Ty::HttpStream, error)
+    );
+    add!(
+        "native_http_stream_send",
+        body_test_expr(
+            hir::ExprKind::HttpStreamSend {
+                stream: Box::new(native_local(0, Ty::HttpStream)),
+                chunk: Box::new(native_str()),
+                event: true,
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "stream", Ty::HttpStream, false, false)],
+        result_unit
+    );
+    add!(
+        "native_http_stream_finish",
+        body_test_expr(
+            hir::ExprKind::HttpStreamFinish {
+                stream: Box::new(native_local(0, Ty::HttpStream)),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "stream", Ty::HttpStream, false, false)],
+        result_unit
+    );
+    add!(
+        "native_http_stream_reject",
+        body_test_expr(
+            hir::ExprKind::HttpStreamReject {
+                stream: Box::new(native_local(0, Ty::HttpStream)),
+                rb: Box::new(native_local(1, Ty::ResponseBuilder)),
+            },
+            result_unit,
+        ),
+        vec![
+            body_test_local(0, "stream", Ty::HttpStream, false, false),
+            body_test_local(1, "builder", Ty::ResponseBuilder, false, false),
+        ],
+        result_unit
+    );
+    add!(
+        "native_crypto_ct_equal",
+        body_test_expr(
+            hir::ExprKind::CryptoCtEqual {
+                a: Box::new(native_str()),
+                b: Box::new(native_local(0, bytes)),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "bytes", bytes, false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_crypto_random",
+        body_test_expr(
+            hir::ExprKind::CryptoRandom {
+                out: Box::new(native_local(0, Ty::Buffer)),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "out", Ty::Buffer, true, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_crypto_hash",
+        body_test_expr(
+            hir::ExprKind::CryptoHash {
+                algo: hir::HashAlgo::Sha256,
+                data: Box::new(native_str()),
+            },
+            result_u8_array,
+        ),
+        Vec::new(),
+        result_u8_array
+    );
+    add!(
+        "native_crypto_hmac",
+        body_test_expr(
+            hir::ExprKind::CryptoHmac {
+                key: Box::new(native_str()),
+                data: Box::new(native_str()),
+            },
+            result_u8_array,
+        ),
+        Vec::new(),
+        result_u8_array
+    );
+    add!(
+        "native_crypto_hkdf",
+        body_test_expr(
+            hir::ExprKind::CryptoHkdf {
+                salt: Box::new(native_str()),
+                ikm: Box::new(native_str()),
+                info: Box::new(native_str()),
+                len: Box::new(native_i64()),
+            },
+            result_buffer,
+        ),
+        Vec::new(),
+        result_buffer
+    );
+    add!(
+        "native_crypto_aead",
+        body_test_expr(
+            hir::ExprKind::CryptoAead {
+                cipher: hir::AeadCipher::Aes256Gcm,
+                dir: hir::AeadDir::Open,
+                key: Box::new(native_str()),
+                nonce: Box::new(native_str()),
+                input: Box::new(native_str()),
+                aad: Box::new(native_str()),
+            },
+            result_buffer,
+        ),
+        Vec::new(),
+        result_buffer
+    );
+    add!(
+        "native_crypto_argon2",
+        body_test_expr(
+            hir::ExprKind::CryptoArgon2 {
+                password: Box::new(native_str()),
+                salt: Box::new(native_str()),
+                params: Box::new(native_local(0, Ty::Struct(argon2_params))),
+            },
+            result_buffer,
+        ),
+        vec![body_test_local(
+            0,
+            "params",
+            Ty::Struct(argon2_params),
+            false,
+            false,
+        )],
+        result_buffer
+    );
+
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_writer_std");
+    let hir::ExprKind::WriterStd { buffered, .. } = &mut expression.kind else {
+        panic!("native writer fixture lost its std writer")
+    };
+    *buffered = true;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut deferred = program.clone();
+    let native = deferred
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_buffer_new")
+        .expect("native buffer fixture");
+    native.drop_locals = vec![u32::MAX];
+    native.drop_individual_locals = vec![u32::MAX];
+    native
+        .drop_individual_exprs
+        .insert(align_span::Span::new(999, 4, 5), true);
+    deferred.fn_types[0].effect.set(FnEffect::Impure);
+    assert!(body_core_metadata_is_valid(&deferred));
+}
+
+#[test]
+fn hir_body_validator_generated_callables() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    let error = push_builtin_error(&mut program);
+    let imported_fid = program.fn_types.len() as u32;
+    program
+        .fn_types
+        .push(body_fn_type(vec![(align_ast::ParamMode::ByValue, scalar_int(64))], integer));
+    let closure_fid = program.fn_types.len() as u32;
+    program.fn_types.push(body_fn_type(Vec::new(), integer));
+    let map_err_fid = program.fn_types.len() as u32;
+    program.fn_types.push(body_fn_type(
+        vec![(align_ast::ParamMode::ByValue, Scalar::Enum(error))],
+        Ty::Str,
+    ));
+    let extern_fid = program.fn_types.len() as u32;
+    program.fn_types.push(fn_type(integer));
+
+    program.imported_fns.push(imported_fn("dep$generated", vec![integer], integer));
+    program.externs.push(hir::ExternFn {
+        name: "c$generated".to_string(),
+        params: vec![integer],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: integer,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+    });
+    program.fns.push(body_unit_case("generated_source", body_test_expr(hir::ExprKind::Unit, Ty::Unit)));
+    let mut lifted = body_test_parameter_function(
+        "generated_lifted",
+        integer,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+        },
+        integer,
+    );
+    lifted.origin = hir::FnOrigin::Lifted { capture_count: 1 };
+    lifted.locals[0].is_param = false;
+    program.fns.push(lifted);
+    program.fns.push(body_test_parameter_function(
+        "generated_map_err",
+        Ty::Enum(error),
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Str("mapped".to_string()), Ty::Str))),
+        },
+        Ty::Str,
+    ));
+    let mut monomorph = body_tail_case(
+        "generated$pick$i64",
+        body_test_expr(hir::ExprKind::Int(1), integer),
+        integer,
+    );
+    monomorph.origin = hir::FnOrigin::Monomorph;
+    program.fns.push(monomorph);
+
+    program.fns.push(body_tail_case(
+        "generated_fn_value_source",
+        body_test_expr(
+            hir::ExprKind::FnValue("generated_source".to_string()),
+            Ty::Fn(0),
+        ),
+        Ty::Fn(0),
+    ));
+    program.fns.push(body_tail_case(
+        "generated_fn_value_imported",
+        body_test_expr(
+            hir::ExprKind::FnValue("dep$generated".to_string()),
+            Ty::Fn(imported_fid),
+        ),
+        Ty::Fn(imported_fid),
+    ));
+    program.fns.push(body_test_named_function(
+        "generated_closure",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Closure {
+                    lifted: "generated_lifted".to_string(),
+                    captures: vec![native_i64()],
+                },
+                Ty::Fn(closure_fid),
+            ))),
+        },
+        Vec::new(),
+        Ty::Fn(closure_fid),
+    ));
+    program.fns.push(body_tail_case(
+        "generated_call_fn_value",
+        body_test_expr(
+            hir::ExprKind::CallFnValue {
+                callee: Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("dep$generated".to_string()),
+                    Ty::Fn(imported_fid),
+                )),
+                args: vec![native_i64()],
+            },
+            integer,
+        ),
+        integer,
+    ));
+    let input_result = Ty::Result(scalar_int(64), Scalar::Enum(error));
+    let mapped_result = Ty::Result(scalar_int(64), Scalar::Str);
+    program.fns.push(body_tail_case(
+        "generated_map_err_call",
+        body_test_expr(
+            hir::ExprKind::ResultMapErr {
+                result: Box::new(body_test_expr(
+                    hir::ExprKind::ResultOk(Box::new(native_i64())),
+                    input_result,
+                )),
+                f: Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("generated_map_err".to_string()),
+                    Ty::Fn(map_err_fid),
+                )),
+            },
+            mapped_result,
+        ),
+        mapped_result,
+    ));
+    program.fns.push(body_tail_case(
+        "generated_direct_source_call",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "generated_source".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            Ty::Unit,
+        ),
+        Ty::Unit,
+    ));
+    program.fns.push(body_tail_case(
+        "generated_direct_imported_call",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "dep$generated".to_string(),
+                args: vec![native_i64()],
+                type_args: Vec::new(),
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "generated_direct_monomorph_call",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "generated$pick$i64".to_string(),
+                args: Vec::new(),
+                type_args: vec![integer],
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "generated_direct_extern_call",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Call {
+                        func: "c$generated".to_string(),
+                        args: vec![native_i64()],
+                        type_args: Vec::new(),
+                    },
+                    integer,
+                ))),
+            }),
+            integer,
+        ),
+        integer,
+    ));
+    let dyn_int = Ty::DynArray(scalar_int(64));
+    program.imported_fns.push(imported_fn("dep$generated_map", vec![integer], integer));
+    program.fns.push(body_test_parameter_function(
+        "generated_pipeline_imported",
+        dyn_int,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArraySum {
+                    source: Box::new(native_local(0, dyn_int)),
+                    stages: vec![hir::Stage {
+                        kind: hir::StageKind::Map {
+                            func: "dep$generated_map".to_string(),
+                            captures: Vec::new(),
+                        },
+                        out_ty: integer,
+                    }],
+                },
+                integer,
+            ))),
+        },
+        integer,
+    ));
+    program.externs.push(hir::ExternFn {
+        name: "c$generated_map".to_string(),
+        params: vec![integer],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: integer,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+    });
+    program.fns.push(body_test_parameter_function(
+        "generated_pipeline_extern",
+        dyn_int,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::ArraySum {
+                            source: Box::new(native_local(0, dyn_int)),
+                            stages: vec![hir::Stage {
+                                kind: hir::StageKind::Map {
+                                    func: "c$generated_map".to_string(),
+                                    captures: Vec::new(),
+                                },
+                                out_ty: integer,
+                            }],
+                        },
+                        integer,
+                    ))),
+                }),
+                integer,
+            ))),
+        },
+        integer,
+    ));
+
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    reject.fns.push(body_tail_case(
+        "generated_extern_fn_value_rejected",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("c$generated".to_string()),
+                    Ty::Fn(extern_fid),
+                ))),
+            }),
+            Ty::Fn(extern_fid),
+        ),
+        Ty::Fn(extern_fid),
+    ));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject.fns.push(body_tail_case(
+        "generated_extern_direct_without_unsafe",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "c$generated".to_string(),
+                args: vec![native_i64()],
+                type_args: Vec::new(),
+            },
+            integer,
+        ),
+        integer,
+    ));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "generated_closure");
+    let hir::ExprKind::Closure { lifted, .. } = &mut expression.kind else {
+        panic!("generated closure fixture lost its closure")
+    };
+    *lifted = "c$generated".to_string();
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject.fn_types[imported_fid as usize].ret = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let target = reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "generated_source")
+        .expect("generated source target");
+    target.origin = hir::FnOrigin::Monomorph;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "generated_direct_monomorph_call");
+    let hir::ExprKind::Call { type_args, .. } = &mut expression.kind else {
+        panic!("generated monomorph fixture lost its call")
+    };
+    type_args[0] = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_validator_native_control_flow() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    let error = push_builtin_error(&mut program);
+    program.externs.push(hir::ExternFn {
+        name: "c$control".to_string(),
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::Unit,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+    });
+    program.fns.push(body_tail_case(
+        "native_control_exit",
+        body_test_expr(
+            hir::ExprKind::ProcessExit {
+                code: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "native_control_abort",
+        body_test_expr(hir::ExprKind::ProcessAbort, Ty::Unit),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "native_control_branch",
+        body_test_expr(
+            hir::ExprKind::If {
+                cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                then: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::ProcessExit {
+                            code: Box::new(native_i64()),
+                        },
+                        Ty::Unit,
+                    ))),
+                },
+                els: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(native_i64())),
+                },
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "native_control_loop",
+        body_test_expr(
+            hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Expr(body_test_expr(
+                        hir::ExprKind::ProcessExit {
+                            code: Box::new(native_i64()),
+                        },
+                        Ty::Unit,
+                    ))],
+                    value: None,
+                },
+                diverges: true,
+                body_locals: 0..0,
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "native_control_arena_view",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::FsReadFileView {
+                        path: Box::new(native_str()),
+                    },
+                    Ty::Result(Scalar::Str, Scalar::Enum(error)),
+                ))),
+            }),
+            Ty::Result(Scalar::Str, Scalar::Enum(error)),
+        ),
+        Ty::Result(Scalar::Str, Scalar::Enum(error)),
+    ));
+    program.fns.push(body_tail_case(
+        "native_control_unsafe_extern",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::Call {
+                        func: "c$control".to_string(),
+                        args: Vec::new(),
+                        type_args: Vec::new(),
+                    },
+                    Ty::Unit,
+                ))),
+            }),
+            Ty::Unit,
+        ),
+        Ty::Unit,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_control_arena_view");
+    let hir::ExprKind::Arena(block) = &mut expression.kind else {
+        panic!("native arena fixture lost its arena")
+    };
+    let block = std::mem::replace(block, hir::Block {
+        stmts: Vec::new(),
+        value: None,
+    });
+    expression.kind = hir::ExprKind::Block(block);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_control_unsafe_extern");
+    let hir::ExprKind::Unsafe(block) = &mut expression.kind else {
+        panic!("native unsafe fixture lost its unsafe block")
+    };
+    let block = std::mem::replace(block, hir::Block {
+        stmts: Vec::new(),
+        value: None,
+    });
+    expression.kind = hir::ExprKind::Block(block);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_control_exit");
+    let hir::ExprKind::ProcessExit { code } = &mut expression.kind else {
+        panic!("native exit fixture lost its exit")
+    };
+    code.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    reject.fns.push(body_test_named_function(
+        "native_control_retained_malformed_child",
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Expr(body_test_expr(
+                    hir::ExprKind::ProcessExit {
+                        code: Box::new(native_i64()),
+                    },
+                    Ty::Unit,
+                )),
+                hir::Stmt::Expr(body_test_expr(hir::ExprKind::Int(1), Ty::Bool)),
+            ],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Vec::new(),
+        Ty::Unit,
+    ));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+}
+
+#[test]
+fn deep_hir_body_native_type_dag_is_stack_bounded() {
+    const DEPTH: usize = 4_096;
+    let mut program = baseline_program();
+    let base = program.structs.len() as u32;
+    program.structs.extend((0..DEPTH).map(|index| StructDef {
+        name: format!("NativeNode{index}"),
+        source_name: format!("NativeNode{index}"),
+        fields: vec![FieldDef {
+            name: if index + 1 == DEPTH {
+                "ctx".to_string()
+            } else {
+                "next".to_string()
+            },
+            ty: if index + 1 == DEPTH {
+                Ty::HttpRequestCtx
+            } else {
+                Ty::Struct(base + index as u32 + 1)
+            },
+        }],
+        align: None,
+        c_repr: false,
+    }));
+    let path = vec![0; DEPTH];
+    program.fns.push(body_test_named_function(
+        "deep_native_ctx",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::HttpCtxMethod {
+                    ctx: Box::new(body_test_expr(
+                        hir::ExprKind::Field { root: 0, path },
+                        Ty::HttpRequestCtx,
+                    )),
+                },
+                Ty::Str,
+            ))),
+        },
+        vec![body_test_local(0, "root", Ty::Struct(base), false, false)],
+        Ty::Str,
+    ));
+    let handle = std::thread::Builder::new()
+        .name("deep-native-body".to_string())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || assert!(body_core_metadata_is_valid(&program)))
+        .expect("spawn deep native validator");
+    handle.join().expect("join deep native validator");
+
+    let mut malformed = baseline_program();
+    let base = malformed.structs.len() as u32;
+    malformed.structs.extend((0..DEPTH).map(|index| StructDef {
+        name: format!("NativeMalformedNode{index}"),
+        source_name: format!("NativeMalformedNode{index}"),
+        fields: vec![FieldDef {
+            name: if index + 1 == DEPTH {
+                "ctx".to_string()
+            } else {
+                "next".to_string()
+            },
+            ty: if index + 1 == DEPTH {
+                Ty::HttpRequestCtx
+            } else {
+                Ty::Struct(base + index as u32 + 1)
+            },
+        }],
+        align: None,
+        c_repr: false,
+    }));
+    malformed.fns.push(body_test_named_function(
+        "deep_native_valid_first",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::HttpCtxMethod {
+                    ctx: Box::new(body_test_expr(
+                        hir::ExprKind::Field {
+                            root: 0,
+                            path: vec![0; DEPTH],
+                        },
+                        Ty::HttpRequestCtx,
+                    )),
+                },
+                Ty::Str,
+            ))),
+        },
+        vec![body_test_local(0, "root", Ty::Struct(base), false, false)],
+        Ty::Str,
+    ));
+    malformed.fns.push(body_test_named_function(
+        "deep_native_malformed_later",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::HttpCtxMethod {
+                    ctx: Box::new(body_test_expr(
+                        hir::ExprKind::Field {
+                            root: 0,
+                            path: {
+                                let mut path = vec![0; DEPTH];
+                                path.push(0);
+                                path
+                            },
+                        },
+                        Ty::HttpRequestCtx,
+                    )),
+                },
+                Ty::Str,
+            ))),
+        },
+        vec![body_test_local(0, "root", Ty::Struct(base), false, false)],
+        Ty::Str,
+    ));
+    let handle = std::thread::Builder::new()
+        .name("deep-native-malformed-body".to_string())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || assert!(!body_core_metadata_is_valid(&malformed)))
+        .expect("spawn deep malformed native validator");
+    handle.join().expect("join deep malformed native validator");
 }
 
 #[test]
