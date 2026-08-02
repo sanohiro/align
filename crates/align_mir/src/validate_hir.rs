@@ -2288,11 +2288,13 @@ impl<'a> BodyValidator<'a> {
                     && self.body_scalar_ok(element)
             }
             Ty::StructArray(id, len) => len > 0 && self.program.structs.get(id as usize).is_some(),
-            Ty::DynStructArray(id, Layout::Aos) => self.program.structs.get(id as usize).is_some(),
+            Ty::DynStructArray(id, Layout::Aos) => self.placement.dynamic_struct_array_ok(id),
             Ty::DynStructArray(_, Layout::Soa) => false,
             Ty::Slice(element) => self.body_scalar_ok(element),
             Ty::DynSliceArray(element) => valid_prim(element),
-            Ty::DynArray(element) => self.body_scalar_ok(element),
+            Ty::DynArray(element) => {
+                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+            }
             Ty::DynResponseArray => true,
             Ty::Soa(id) => self.soa_type_ok(id),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
@@ -2351,7 +2353,7 @@ impl<'a> BodyValidator<'a> {
             Scalar::Tagged(id) => self.program.tagged_types.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::DynArray(element) | Scalar::Slice(element) => valid_prim(element),
-            Scalar::DynStructArray(id) => self.program.structs.get(id as usize).is_some(),
+            Scalar::DynStructArray(id) => self.placement.dynamic_struct_array_ok(id),
             Scalar::Soa(id) => self.soa_type_ok(id),
             Scalar::DynResponseArray
             | Scalar::JsonDoc
@@ -2976,7 +2978,9 @@ impl<'a> BodyValidator<'a> {
         let Some((derived, falls, breaks)) = self.derive_expression(expression, context) else {
             return false;
         };
-        if !self.body_ty_ok(expression.ty) || (falls && expression.ty != derived) {
+        let stored_type_matches = expression.ty == derived
+            || context_polymorphic_expression(&expression.kind, falls);
+        if !self.body_ty_ok(expression.ty) || !stored_type_matches {
             return false;
         }
         self.exprs.insert(
@@ -3002,7 +3006,7 @@ impl<'a> BodyValidator<'a> {
                 let Ty::Int(integer) = expression.ty else {
                     return None;
                 };
-                let (min, max) = int_range(integer);
+                let (min, max) = int_range(integer)?;
                 (*value >= min && *value <= max).then_some((expression.ty, true, Vec::new()))
             }
             hir::ExprKind::Float(_) => {
@@ -4232,13 +4236,30 @@ impl<'a> BodyValidator<'a> {
     }
 }
 
-fn int_range(integer: align_sema::IntTy) -> (i128, i128) {
+fn context_polymorphic_expression(kind: &hir::ExprKind, falls: bool) -> bool {
+    !falls
+        && matches!(
+            kind,
+            hir::ExprKind::TaskGroup(_)
+                | hir::ExprKind::Match { .. }
+                | hir::ExprKind::If { .. }
+                | hir::ExprKind::Block(_)
+                | hir::ExprKind::Loop { .. }
+                | hir::ExprKind::Arena(_)
+                | hir::ExprKind::Unsafe(_)
+        )
+}
+
+fn int_range(integer: align_sema::IntTy) -> Option<(i128, i128)> {
+    if !valid_int(integer.bits) {
+        return None;
+    }
     let bits = integer.bits as u32;
-    if integer.signed {
+    Some(if integer.signed {
         (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
     } else {
         (0, (1i128 << bits) - 1)
-    }
+    })
 }
 
 fn strict_flow(flows: &[BodyFlow]) -> (bool, Vec<Ty>) {

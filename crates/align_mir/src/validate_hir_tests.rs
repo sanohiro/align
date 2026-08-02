@@ -3759,6 +3759,97 @@ fn hir_body_validator_core() {
 }
 
 #[test]
+fn hir_body_validator_rejects_divergent_eager_parent_type_mismatch() {
+    let integer = int(64);
+    let diverging = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: Vec::new(),
+                value: None,
+            },
+            diverges: true,
+            body_locals: 0..0,
+        },
+        integer,
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_tail_case(
+        "divergent_eager_parent",
+        body_test_expr(
+            hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(diverging),
+            },
+            Ty::Bool,
+        ),
+        Ty::Bool,
+    ));
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_integer_width_is_fail_closed_without_panic() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_tail_case(
+        "invalid_integer_width",
+        body_test_expr(
+            hir::ExprKind::Int(0),
+            Ty::Int(IntTy {
+                bits: 0,
+                signed: true,
+            }),
+        ),
+        integer,
+    ));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        body_core_metadata_is_valid(&program)
+    }));
+    assert!(result.is_ok(), "invalid integer width must not panic");
+    assert!(!result.expect("panic result checked"));
+}
+
+#[test]
+fn hir_body_validator_local_type_placement_is_fail_closed() {
+    let unit = Ty::Unit;
+    let local = |ty| hir::Local {
+        id: 0,
+        name: "value".to_string(),
+        ty,
+        is_mut: false,
+        is_param: false,
+        align: None,
+    };
+    let function = |ty| {
+        body_test_function(
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, unit))),
+            },
+            vec![local(ty)],
+            unit,
+        )
+    };
+
+    let mut valid = baseline_program();
+    valid.fns.push(function(Ty::DynStructArray(0, Layout::Aos)));
+    assert!(body_core_metadata_is_valid(&valid));
+
+    let mut dynamic_array_of_struct = baseline_program();
+    dynamic_array_of_struct
+        .fns
+        .push(function(Ty::DynArray(Scalar::Struct(0))));
+    assert!(!body_core_metadata_is_valid(&dynamic_array_of_struct));
+
+    let mut over_aligned_dynamic_struct_array = baseline_program();
+    over_aligned_dynamic_struct_array.structs[0].align = Some(16);
+    over_aligned_dynamic_struct_array
+        .fns
+        .push(function(Ty::DynStructArray(0, Layout::Aos)));
+    assert!(!body_core_metadata_is_valid(&over_aligned_dynamic_struct_array));
+}
+
+#[test]
 fn hir_body_validator_expression_inventory() {
     let integer = int(64);
     let float = Ty::Float(FloatTy { bits: 64 });
@@ -5435,6 +5526,25 @@ fn hir_body_type_mangle_golden_vectors() {
     for (ty, expected) in vectors {
         assert_eq!(body_ty_mangle(ty, &program), expected, "mangle for {ty:?}");
     }
+
+    let mut provenance_program = baseline_program();
+    provenance_program.fn_types[0] = FnTy {
+        params: vec![(align_ast::ParamMode::ByValue, Scalar::Str)],
+        ret: Ty::Str,
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        effect: Cell::new(FnEffect::Pure),
+    };
+    assert_eq!(
+        body_ty_mangle(Ty::Fn(0), &provenance_program),
+        "F0_vstr_str_bp0_c_rp0_c"
+    );
 }
 
 #[test]
