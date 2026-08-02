@@ -6,9 +6,9 @@ per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
 _Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
-placement-validation PR #690 (`39f9c7d`) and am-n nominal/link PR #691 (`755cb9c`). The current
-resumable branch is `feat/am-h-declarations-headers`, implementing the next am-h
-declarations/headers slice.
+placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), and am-h
+declarations/headers PR #692 (`f7ebcb4`). The next implementation slice is am-b1 body validation;
+there is no resumable feature branch for the completed am-h work.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -401,8 +401,8 @@ test passed before merge. Those pre-merge review records remain historical evide
 am-p surface is now the base for am-n.
 Rebuilds and test execution on this macOS host may need `DYLD_SHARED_REGION=private` because some
 Cargo-spawned Rust binaries pause in `_dyld_start`; inspect the child and preserve the transcript
-rather than restarting the broad gate. The next implementation slice remains am-n nominal/link only
-and is now active on `feat/am-n-nominal-link`.
+rather than restarting the broad gate. At the historical am-p checkpoint, the next implementation
+slice was am-n nominal/link on `feat/am-n-nominal-link`; am-n and am-h have since shipped.
 
 The corrected am-p change is above the repository's 1,000-line split threshold (currently about
 1,212 changed lines against `main`). It cannot be split safely: validator activation, the producer
@@ -440,12 +440,13 @@ required benchmark row is implemented, but this host cannot run the release harn
 the validator, four-entrypoint owner matrix, shared-graph regression, and benchmark are one atomic
 am-n boundary, so splitting it would leave an activated identity gate without its complete owner
 evidence. The author self-review, pre-PR stamp, CI, post-open host/independent review records,
-and final attestation all bind to the merged am-n SHA. The branch is now reset to the next am-h
-slice.
+and final attestation all bind to the merged am-n SHA. The branch advanced through the completed
+am-h slice recorded below.
 
-### am-h implementation checkpoint (2026-08-02)
+### am-h delivery checkpoint (2026-08-02)
 
-The next slice is am-h declarations and headers. It activates body-independent validation for
+PR #692 completed am-h declarations and headers and was squash-merged as `f7ebcb4`. It activates
+body-independent validation for
 externs, imported functions, stored functions, `main`, locals, parameter modes, return-borrow and
 return-region summaries, and structural drop-set records. Imported interface facts gain a
 normalized `FnEffect`: a present compatibility-map entry is copied as-is, while an absent entry
@@ -467,12 +468,12 @@ independent am-h preflight found one valid P2 in the parameter-id mutation fixtu
 now contains a valid non-parameter local so that mutation reaches the header validator. A second
 fresh review found two P2s: capture-count rollback now truncates nested lifted functions, and the
 matrix now covers duplicate declaration names, FnTy mode/summary fields, root order/range/
-borrowability, drop-set ranges, and the full main/Error ABI matrix. The final fresh review is
-required on this revised tree. A follow-up Galileo review was run against the revised worktree
-but returned no verdict after repeated bounded waits and no findings were reported; it was stopped
-as an incomplete review, not treated as CLEAN. The final review must start from the committed SHA
-and record its last completed scope if its bound is reached.
-The current am-h worktree delta is 1,445 changed hand-written lines under `crates/`, above the
+borrowability, drop-set ranges, and the full main/Error ABI matrix. The author self-review, matrix
+review, pre-PR attestation, bounded host continuation, fresh independent post-open review, and CI
+all completed on the committed PR head; no incomplete review attempt was treated as CLEAN. The
+broad host review reached its 900-second bound without a verdict and remains recorded as
+incomplete, while the final bounded continuation returned CLEAN.
+The merged am-h Rust delta is 1,445 changed hand-written lines under `crates/`, above the
 750–950 estimate and the roughly 1,000-line throughput target. The count includes the common
 validator, its all-entrypoint mutation matrix, the expanded exact header/ABI matrix, the
 producer/effect migration and every consumer, the distinct MIR imported record, and the
@@ -487,6 +488,9 @@ functions, alongside the unchanged global-type, nominal/link, continuation, and 
 The revised header owner test compiled but its macOS test binary again paused in dyld startup
 (CPU 0, no output after sampling) and was stopped; this host limitation is recorded with the
 successful compile and benchmark evidence rather than treated as a test pass.
+
+The next implementation slice is am-b1 body validation, followed by am-b2, am-b3, am-b4, and
+am-c typed callable namespaces.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
@@ -640,9 +644,9 @@ before HIR publication/MIR lowering while preserving typed and proven non-fallth
 focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/optimized IR,
 execution, and cold/hot object-cache parity. The reviewed order is am-w
 outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
-#688 completes am-u lexical extern invocation, then am-p placement, am-n nominal/link, am-h
-declarations/headers, dormant am-b1/am-b2/am-b3 plus activating am-b4 total-body validation, then
-am-c typed callable namespaces.
+#688 completes am-u lexical extern invocation, #690 am-p placement, #691 am-n nominal/link, and
+#692 am-h declarations/headers. The next sequence is am-b1, am-b2, am-b3, and am-b4 total-body
+validation, then am-c typed callable namespaces.
 Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
 twenty-three/twenty-seven counts as project truth.
 The final author pass found one additional hidden dependency before review convergence: imported
@@ -845,13 +849,13 @@ SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
 L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, a2-am-e, and a2-am-f. #679 completes
-am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-p/a2-am-n/a2-am-h/a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; #690 lands am-p, #691 lands am-n, and am-h is the next implementation slice. The required milestone order
+#678; #690 lands am-p, #691 lands am-n, and #692 lands am-h; am-b1 is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
