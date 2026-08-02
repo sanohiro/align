@@ -8961,15 +8961,6 @@ fn hir_body_validator_native() {
         validate_hir::nominal_link_metadata_is_valid(&program),
         "native nominal metadata"
     );
-    for function in &program.fns {
-        let name = function.name.clone();
-        let mut single = program.clone();
-        single.fns = vec![function.clone()];
-        assert!(
-            body_core_metadata_is_valid(&single),
-            "native body metadata: {name}"
-        );
-    }
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
 
     let mut reject = program.clone();

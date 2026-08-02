@@ -2957,6 +2957,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
             | hir::ExprKind::EncodingEncode { .. }
+            | hir::ExprKind::EncodingDecode { .. }
             | hir::ExprKind::Utf8Valid { .. }
             | hir::ExprKind::Compress { .. }
             | hir::ExprKind::Decompress { .. }
@@ -3086,7 +3087,6 @@ impl<'a> BodyValidator<'a> {
                     && end <= function.locals.len()
                     && self.loop_body_locals_valid(body, body_locals, context)
             }
-            _ => false,
         };
         envelope && valid_span(expression.span)
     }
