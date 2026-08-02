@@ -540,10 +540,17 @@ Owner coverage is `hir_body_validator_pipeline_template_json_group`,
 `deep_hir_body_pipeline_b2b2_type_dag_is_stack_bounded`, and the existing
 `hir_body_validator_pipeline_deferred_b2b2` / deferred-facts owners. `cargo test -p align_mir
 --tests --no-run --locked` and `cargo clippy -p align_mir --tests --locked -- -D warnings` pass.
-The focused test binary compiled but again remained at 0% CPU during macOS dyld startup and was
-stopped; the attempt is recorded in `.git/align-am-b2b2-test-2026-08-02.log` and is not a test
-pass. Do not rerun the same host execution solely because it stopped; retain the compile/Clippy
-evidence and continue with the final static diff, commit, and one bounded review cycle.
+The first ordinary gate reached the `align_mir` unit binary and ran 74 tests: 72 passed and two
+positive fixtures were correctly rejected by the body-independent placement gate because they
+published body-only `DynSliceArray`/`DictEncoded` types in function returns. Those fixtures now
+evaluate the records as statements and return `Unit`. The follow-up focused owner invocation then
+remained at 0% CPU in macOS dyld startup before printing a test count and was stopped; the host
+attempts are recorded in `.git/align-am-b2b2-test-2026-08-02.log` and
+`.git/align-am-b2b2-prepr-2026-08-02.log`, and are not runtime passes. Do not rerun the same host
+execution solely because it stopped; retain the compile/Clippy evidence and continue with the
+final static diff, commit, and one bounded review cycle. After the fixture corrections, the
+targeted `hir_body_validator_pipeline_template_json_group` owner ran successfully (`1 passed`);
+its `JsonValue` variant field bases are now the producer's cumulative `1,2,3,4,5` ordinals.
 
 Against `origin/main`, the current range is 3,801 added and 73 removed hand-written Rust lines
 (2,070/54 in `validate_hir.rs` and 1,731/19 in its owner tests). It exceeds the ordinary 500-line

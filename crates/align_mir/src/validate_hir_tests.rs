@@ -6132,19 +6132,20 @@ fn hir_body_validator_pipeline_array_views() {
         Ty::Slice(scalar),
         dyn_int,
     );
-    add(
-        &mut program,
-        "array_view_fixed_to_slice",
-        body_test_expr(
-            hir::ExprKind::ArrayToSlice(Box::new(body_test_expr(
-                hir::ExprKind::Local(0),
-                Ty::Array(scalar, 2),
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ArrayToSlice(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    Ty::Array(scalar, 2),
+                ))),
+                Ty::Slice(scalar),
             ))),
-            Ty::Slice(scalar),
-        ),
+        },
+        vec![body_test_local(0, "array", Ty::Array(scalar, 2), false, false)],
         Ty::Slice(scalar),
-        Ty::Array(scalar, 2),
-    );
+    ));
     add(
         &mut program,
         "array_view_slice_len",
@@ -6226,26 +6227,26 @@ fn hir_body_validator_pipeline_array_views() {
         integer,
         dyn_record,
     );
-    add(
-        &mut program,
-        "array_view_chunks",
-        body_test_expr(
-            hir::ExprKind::ArrayChunks {
-                source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
-                n: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
-                elem: integer,
-            },
-            Ty::DynSliceArray(PrimScalar::Int(align_sema::IntTy {
-                bits: 64,
-                signed: true,
-            })),
-        ),
+    let chunks = body_test_expr(
+        hir::ExprKind::ArrayChunks {
+            source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
+            n: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+            elem: integer,
+        },
         Ty::DynSliceArray(PrimScalar::Int(align_sema::IntTy {
             bits: 64,
             signed: true,
         })),
-        dyn_int,
     );
+    program.fns.push(body_test_parameter_function(
+        "array_view_chunks",
+        dyn_int,
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(chunks)],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
     assert!(body_core_metadata_is_valid(&program));
 
     let mut reject = program.clone();
@@ -6273,7 +6274,7 @@ fn hir_body_validator_pipeline_array_views() {
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let expression = body_value_expression_mut(&mut reject, "array_view_chunks");
+    let expression = body_statement_expression_mut(&mut reject, "array_view_chunks");
     let hir::ExprKind::ArrayChunks { n, .. } = &mut expression.kind else {
         panic!("chunks fixture lost its node")
     };
@@ -6553,22 +6554,22 @@ fn hir_body_validator_pipeline_template_json_group() {
             EnumVariant {
                 name: "Number".to_string(),
                 payload: vec![scalar_integer],
-                field_base: 1,
+                field_base: 2,
             },
             EnumVariant {
                 name: "Flag".to_string(),
                 payload: vec![Scalar::Bool],
-                field_base: 1,
+                field_base: 3,
             },
             EnumVariant {
                 name: "Object".to_string(),
                 payload: vec![Scalar::Struct(0)],
-                field_base: 1,
+                field_base: 4,
             },
             EnumVariant {
                 name: "Array".to_string(),
                 payload: vec![Scalar::DynStructArray(0)],
-                field_base: 1,
+                field_base: 5,
             },
         ],
     });
@@ -7026,20 +7027,22 @@ fn hir_body_validator_pipeline_template_json_group() {
         ),
         Ty::Tuple(tuple_multi_id),
     );
-    add_tail(
-        &mut program,
+    program.fns.push(body_test_named_function(
         "b2b2_dict_encode",
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::ArrayDictEncode {
+                    base: 0,
+                    struct_id: 0,
+                    key_field: 0,
+                },
+                Ty::DictEncoded(0, 0),
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
         vec![local(0, "base", Ty::DynStructArray(0, Layout::Aos))],
-        body_test_expr(
-            hir::ExprKind::ArrayDictEncode {
-                base: 0,
-                struct_id: 0,
-                key_field: 0,
-            },
-            Ty::DictEncoded(0, 0),
-        ),
-        Ty::DictEncoded(0, 0),
-    );
+        Ty::Unit,
+    ));
 
     assert!(body_core_metadata_is_valid(&program));
 
