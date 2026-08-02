@@ -1,4 +1,5 @@
 use super::*;
+use crate::validate_hir::{body_core_metadata_is_valid, body_ty_mangle};
 use align_sema::{
     FloatTy, FnEffect, IntTy, Layout, PrimScalar, Scalar, Ty,
     hir::{
@@ -657,6 +658,16 @@ fn scalar_int(bits: u8) -> Scalar {
 fn fn_type(ret: Ty) -> FnTy {
     FnTy {
         params: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        effect: Cell::new(FnEffect::Pure),
+    }
+}
+
+fn body_fn_type(params: Vec<(align_ast::ParamMode, Scalar)>, ret: Ty) -> FnTy {
+    FnTy {
+        params,
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
@@ -3603,6 +3614,1989 @@ fn deep_hir_type_dag_placement_is_stack_bounded() {
         .expect("spawn deep placement validator")
         .join()
         .expect("deep placement validator");
+}
+
+fn body_test_expr(kind: hir::ExprKind, ty: Ty) -> hir::Expr {
+    hir::Expr {
+        kind,
+        ty,
+        span: align_span::Span::new(0, 0, 0),
+    }
+}
+
+fn body_test_named_function(
+    name: &str,
+    body: hir::Block,
+    locals: Vec<hir::Local>,
+    ret: Ty,
+) -> hir::Fn {
+    hir::Fn {
+        name: name.to_string(),
+        origin: hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: false,
+        },
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals,
+        body,
+        span: align_span::Span::new(0, 0, 0),
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: std::collections::HashMap::new(),
+    }
+}
+
+fn body_test_function(body: hir::Block, locals: Vec<hir::Local>, ret: Ty) -> hir::Fn {
+    body_test_named_function("body_test", body, locals, ret)
+}
+
+fn body_test_parameter_function(name: &str, ty: Ty, body: hir::Block, ret: Ty) -> hir::Fn {
+    let mut function = body_test_named_function(
+        name,
+        body,
+        vec![hir::Local {
+            id: 0,
+            name: "arg".to_string(),
+            ty,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }],
+        ret,
+    );
+    function.params = vec![0];
+    function.param_modes = vec![align_ast::ParamMode::ByValue];
+    function
+}
+
+fn body_unit_case(name: &str, expression: hir::Expr) -> hir::Fn {
+    body_test_named_function(
+        name,
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(expression)],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Vec::new(),
+        Ty::Unit,
+    )
+}
+
+fn body_tail_case(name: &str, expression: hir::Expr, ret: Ty) -> hir::Fn {
+    body_test_named_function(
+        name,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        },
+        Vec::new(),
+        ret,
+    )
+}
+
+fn body_first_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Stmt {
+    program
+        .fns
+        .iter_mut()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("missing statement fixture {name}"))
+        .body
+        .stmts
+        .first_mut()
+        .unwrap_or_else(|| panic!("statement fixture {name} has no statement"))
+}
+
+fn body_loop_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Stmt {
+    let expression = program
+        .fns
+        .iter_mut()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("missing loop statement fixture {name}"))
+        .body
+        .value
+        .as_mut()
+        .unwrap_or_else(|| panic!("loop fixture {name} has no tail"));
+    let hir::ExprKind::Loop { body, .. } = &mut expression.kind else {
+        panic!("loop fixture {name} lost its loop")
+    };
+    body.stmts
+        .first_mut()
+        .unwrap_or_else(|| panic!("loop fixture {name} has no statement"))
+}
+
+#[test]
+fn hir_body_validator_core() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 0,
+                init: body_test_expr(hir::ExprKind::Int(3), integer),
+            }],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "x".to_string(),
+            ty: integer,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+
+    let hir::Stmt::Let { init, .. } = &mut program.fns[0].body.stmts[0] else {
+        panic!("test fixture lost its let");
+    };
+    init.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_expression_inventory() {
+    let integer = int(64);
+    let float = Ty::Float(FloatTy { bits: 64 });
+    let choice = Ty::Enum(0);
+    let result = Ty::Result(scalar_int(64), Scalar::Enum(0));
+    let task = Ty::Task(scalar_int(64));
+    let boxed = Ty::Box(scalar_int(64));
+    let mut program = baseline_program();
+    program.fn_types.extend([
+        body_fn_type(
+            vec![(align_ast::ParamMode::ByValue, scalar_int(64))],
+            integer,
+        ),
+        body_fn_type(Vec::new(), integer),
+        body_fn_type(
+            vec![(align_ast::ParamMode::ByValue, Scalar::Enum(0))],
+            choice,
+        ),
+        body_fn_type(Vec::new(), integer),
+    ]);
+    program.fns.extend([
+        body_test_named_function(
+            "fn_value_target",
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+            },
+            Vec::new(),
+            Ty::Unit,
+        ),
+        body_test_parameter_function(
+            "indirect_target",
+            integer,
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+            },
+            integer,
+        ),
+        {
+            let mut function = body_test_parameter_function(
+                "capture_target",
+                integer,
+                hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+                },
+                integer,
+            );
+            function.origin = hir::FnOrigin::Lifted { capture_count: 1 };
+            function.locals[0].is_param = false;
+            function
+        },
+        body_test_parameter_function(
+            "map_error_target",
+            choice,
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), choice))),
+            },
+            choice,
+        ),
+        {
+            let mut function = body_tail_case(
+                "spawn_target",
+                body_test_expr(hir::ExprKind::Int(1), integer),
+                integer,
+            );
+            function.origin = hir::FnOrigin::Lifted { capture_count: 0 };
+            function
+        },
+    ]);
+
+    program.fns.extend([
+        body_unit_case(
+            "float_literal_case",
+            body_test_expr(hir::ExprKind::Float(1.5), float),
+        ),
+        body_unit_case(
+            "char_literal_case",
+            body_test_expr(hir::ExprKind::Char('A' as u32), Ty::Char),
+        ),
+        body_unit_case(
+            "unary_neg_case",
+            body_test_expr(
+                hir::ExprKind::Unary {
+                    op: align_ast::UnOp::Neg,
+                    expr: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "unary_not_case",
+            body_test_expr(
+                hir::ExprKind::Unary {
+                    op: align_ast::UnOp::Not,
+                    expr: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "unary_bit_not_case",
+            body_test_expr(
+                hir::ExprKind::Unary {
+                    op: align_ast::UnOp::BitNot,
+                    expr: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "cast_case",
+            body_test_expr(
+                hir::ExprKind::Cast(Box::new(body_test_expr(
+                    hir::ExprKind::Int(1),
+                    integer,
+                ))),
+                float,
+            ),
+        ),
+        body_unit_case(
+            "binary_add_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Add,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_sub_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Sub,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_mul_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Mul,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(3), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_div_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Div,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(4), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_rem_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Rem,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(5), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_eq_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Eq,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_ne_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Ne,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_lt_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Lt,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_le_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Le,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_gt_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Gt,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_ge_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Ge,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_and_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::And,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_or_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Or,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)),
+                },
+                Ty::Bool,
+            ),
+        ),
+        body_unit_case(
+            "binary_bit_and_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::BitAnd,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_bit_or_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::BitOr,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_bit_xor_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::BitXor,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_shl_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Shl,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "binary_shr_case",
+            body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Shr,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(4), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "int_arith_saturating_case",
+            body_test_expr(
+                hir::ExprKind::IntArith {
+                    op: align_ast::BinOp::Add,
+                    mode: hir::ArithMode::Saturating,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "int_arith_checked_case",
+            body_test_expr(
+                hir::ExprKind::IntArith {
+                    op: align_ast::BinOp::Mul,
+                    mode: hir::ArithMode::Checked,
+                    lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(3), integer)),
+                },
+                Ty::Option(scalar_int(64)),
+            ),
+        ),
+        body_unit_case(
+            "math_abs_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Abs,
+                    operands: vec![body_test_expr(hir::ExprKind::Int(1), integer)],
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "math_min_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Min,
+                    operands: vec![
+                        body_test_expr(hir::ExprKind::Int(1), integer),
+                        body_test_expr(hir::ExprKind::Int(2), integer),
+                    ],
+                },
+                integer,
+            ),
+        ),
+        body_unit_case(
+            "math_max_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Max,
+                    operands: vec![
+                        body_test_expr(hir::ExprKind::Float(1.0), float),
+                        body_test_expr(hir::ExprKind::Float(2.0), float),
+                    ],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_sqrt_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Sqrt,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_floor_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Floor,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_ceil_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Ceil,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_round_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Round,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_trunc_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Trunc,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_pow_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Pow,
+                    operands: vec![
+                        body_test_expr(hir::ExprKind::Float(2.0), float),
+                        body_test_expr(hir::ExprKind::Float(3.0), float),
+                    ],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_fma_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Fma,
+                    operands: vec![
+                        body_test_expr(hir::ExprKind::Float(1.0), float),
+                        body_test_expr(hir::ExprKind::Float(2.0), float),
+                        body_test_expr(hir::ExprKind::Float(3.0), float),
+                    ],
+                },
+                float,
+            ),
+        ),
+    ]);
+
+    let fn_value = body_test_expr(
+        hir::ExprKind::FnValue("fn_value_target".to_string()),
+        Ty::Fn(0),
+    );
+    program.fns.push(body_unit_case("fn_value_case", fn_value));
+
+    let closure = body_test_expr(
+        hir::ExprKind::Closure {
+            lifted: "capture_target".to_string(),
+            captures: vec![body_test_expr(hir::ExprKind::Local(0), integer)],
+        },
+        Ty::Fn(2),
+    );
+    program.fns.push(body_test_named_function(
+        "closure_case",
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: 0,
+                    init: body_test_expr(hir::ExprKind::Int(1), integer),
+                },
+                hir::Stmt::Expr(closure),
+            ],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "capture".to_string(),
+            ty: integer,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        Ty::Unit,
+    ));
+
+    program.fns.push(body_unit_case(
+        "call_fn_value_case",
+        body_test_expr(
+            hir::ExprKind::CallFnValue {
+                callee: Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("indirect_target".to_string()),
+                    Ty::Fn(1),
+                )),
+                args: vec![body_test_expr(hir::ExprKind::Int(2), integer)],
+            },
+            integer,
+        ),
+    ));
+
+    program.fns.push(body_unit_case(
+        "task_group_wait_case",
+        body_test_expr(
+            hir::ExprKind::TaskGroup(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Wait, Ty::Unit))),
+            }),
+            Ty::Unit,
+        ),
+    ));
+
+    program.fns.push(body_unit_case(
+        "enum_value_case",
+        body_test_expr(
+            hir::ExprKind::EnumValue {
+                enum_id: 0,
+                variant: 0,
+                payload: Vec::new(),
+            },
+            choice,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "match_case",
+        body_test_expr(
+            hir::ExprKind::Match {
+                scrutinee: Box::new(body_test_expr(
+                    hir::ExprKind::EnumValue {
+                        enum_id: 0,
+                        variant: 0,
+                        payload: Vec::new(),
+                    },
+                    choice,
+                )),
+                arms: vec![hir::MatchArm {
+                    variants: Vec::new(),
+                    bindings: Vec::new(),
+                    body: body_test_expr(hir::ExprKind::Unit, Ty::Unit),
+                }],
+            },
+            Ty::Unit,
+        ),
+    ));
+
+    program.fns.push(body_tail_case(
+        "map_err_case",
+        body_test_expr(
+            hir::ExprKind::ResultMapErr {
+                result: Box::new(body_test_expr(
+                    hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                        hir::ExprKind::Int(1),
+                        integer,
+                    ))),
+                    result,
+                )),
+                f: Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("map_error_target".to_string()),
+                    Ty::Fn(3),
+                )),
+            },
+            result,
+        ),
+        result,
+    ));
+
+    let spawn_expr = || {
+        body_test_expr(
+            hir::ExprKind::Spawn {
+                closure: Box::new(body_test_expr(
+                    hir::ExprKind::FnValue("spawn_target".to_string()),
+                    Ty::Fn(4),
+                )),
+                fallible: false,
+            },
+            task,
+        )
+    };
+    program.fns.push(body_unit_case(
+        "spawn_case",
+        body_test_expr(
+            hir::ExprKind::TaskGroup(hir::Block {
+                stmts: vec![hir::Stmt::Expr(spawn_expr())],
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+            }),
+            Ty::Unit,
+        ),
+    ));
+    program.fns.push(body_test_named_function(
+        "task_get_case",
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::TaskGroup(hir::Block {
+                    stmts: vec![hir::Stmt::Let {
+                        local: 0,
+                        init: spawn_expr(),
+                    }],
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::TaskGet(Box::new(body_test_expr(
+                            hir::ExprKind::Local(0),
+                            task,
+                        ))),
+                        integer,
+                    ))),
+                }),
+                integer,
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "task".to_string(),
+            ty: task,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        Ty::Unit,
+    ));
+
+    program.fns.push(body_unit_case(
+        "call_case",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "indirect_target".to_string(),
+                args: vec![body_test_expr(hir::ExprKind::Int(3), integer)],
+                type_args: Vec::new(),
+            },
+            integer,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "if_case",
+        body_test_expr(
+            hir::ExprKind::If {
+                cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                then: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
+                },
+                els: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(hir::ExprKind::Int(2), integer))),
+                },
+            },
+            integer,
+        ),
+    ));
+    let diverging_bool = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: Vec::new(),
+                value: None,
+            },
+            diverges: true,
+            body_locals: 0..0,
+        },
+        Ty::Bool,
+    );
+    program.fns.push(body_unit_case(
+        "if_diverging_condition_case",
+        body_test_expr(
+            hir::ExprKind::If {
+                cond: Box::new(diverging_bool),
+                then: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
+                },
+                els: hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::Bool(true),
+                        Ty::Bool,
+                    ))),
+                },
+            },
+            integer,
+        ),
+    ));
+    let diverging_choice = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: Vec::new(),
+                value: None,
+            },
+            diverges: true,
+            body_locals: 0..0,
+        },
+        choice,
+    );
+    program.fns.push({
+        let mut function = body_unit_case(
+            "match_diverging_scrutinee_case",
+            body_test_expr(
+                hir::ExprKind::Match {
+                    scrutinee: Box::new(diverging_choice),
+                    arms: vec![
+                        hir::MatchArm {
+                            variants: vec![0],
+                            bindings: Vec::new(),
+                            body: body_test_expr(hir::ExprKind::Int(1), integer),
+                        },
+                        hir::MatchArm {
+                            variants: vec![1],
+                            bindings: vec![0],
+                            body: body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                        },
+                    ],
+                },
+                integer,
+            ),
+        );
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "payload".to_string(),
+            ty: integer,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }];
+        function
+    });
+    program.fns.push(body_unit_case(
+        "struct_lit_case",
+        body_test_expr(
+            hir::ExprKind::StructLit {
+                struct_id: 0,
+                fields: vec![
+                    body_test_expr(hir::ExprKind::Str("key".to_string()), Ty::Str),
+                    body_test_expr(hir::ExprKind::Int(4), integer),
+                ],
+            },
+            Ty::Struct(0),
+        ),
+    ));
+    program.fns.push(body_test_parameter_function(
+        "field_case",
+        Ty::Struct(0),
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::Field {
+                    root: 0,
+                    path: vec![1],
+                },
+                integer,
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    program.fns.push(body_test_parameter_function(
+        "soa_column_case",
+        Ty::Soa(0),
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::SoaColumn {
+                    base: 0,
+                    struct_id: 0,
+                    field: 1,
+                },
+                Ty::Slice(scalar_int(64)),
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    program.fns.push(body_unit_case(
+        "tuple_case",
+        body_test_expr(
+            hir::ExprKind::Tuple {
+                tuple_id: 0,
+                elems: vec![
+                    body_test_expr(hir::ExprKind::Int(1), integer),
+                    body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                ],
+            },
+            Ty::Tuple(0),
+        ),
+    ));
+    program.fns.push(body_test_parameter_function(
+        "tuple_index_case",
+        Ty::Tuple(0),
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::TupleIndex {
+                    recv: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Tuple(0))),
+                    index: 0,
+                },
+                integer,
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    program.fns.push(body_unit_case(
+        "index_field_case",
+        body_test_expr(
+            hir::ExprKind::IndexField {
+                base: 0,
+                index: 0,
+                path: vec![1],
+            },
+            integer,
+        ),
+    ));
+    program.fns.last_mut().expect("index field case").locals = vec![hir::Local {
+        id: 0,
+        name: "rows".to_string(),
+        ty: Ty::StructArray(0, 1),
+        is_mut: false,
+        is_param: true,
+        align: None,
+    }];
+
+    program.fns.push(body_unit_case(
+        "block_case",
+        body_test_expr(
+            hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Int(5), integer))),
+            }),
+            integer,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "option_some_case",
+        body_test_expr(
+            hir::ExprKind::OptionSome(Box::new(body_test_expr(
+                hir::ExprKind::Int(1),
+                integer,
+            ))),
+            Ty::Option(scalar_int(64)),
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "option_none_case",
+        body_test_expr(hir::ExprKind::OptionNone, Ty::Option(scalar_int(64))),
+    ));
+    program.fns.push(body_unit_case(
+        "else_unwrap_case",
+        body_test_expr(
+            hir::ExprKind::ElseUnwrap {
+                opt: Box::new(body_test_expr(
+                    hir::ExprKind::OptionSome(Box::new(body_test_expr(
+                        hir::ExprKind::Int(1),
+                        integer,
+                    ))),
+                    Ty::Option(scalar_int(64)),
+                )),
+                fallback: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+            },
+            integer,
+        ),
+    ));
+    program.fns.push(body_tail_case(
+        "result_ok_case",
+        body_test_expr(
+            hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                hir::ExprKind::Int(1),
+                integer,
+            ))),
+            result,
+        ),
+        result,
+    ));
+    program.fns.push(body_tail_case(
+        "result_err_case",
+        body_test_expr(
+            hir::ExprKind::ResultErr(Box::new(body_test_expr(
+                hir::ExprKind::EnumValue {
+                    enum_id: 0,
+                    variant: 0,
+                    payload: Vec::new(),
+                },
+                choice,
+            ))),
+            result,
+        ),
+        result,
+    ));
+    program.fns.push(body_tail_case(
+        "try_case",
+        body_test_expr(
+            hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                hir::ExprKind::Try(Box::new(body_test_expr(
+                    hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                        hir::ExprKind::Int(1),
+                        integer,
+                    ))),
+                    result,
+                ))),
+                integer,
+            ))),
+            result,
+        ),
+        result,
+    ));
+    program.fns.push(body_unit_case(
+        "loop_case",
+        body_test_expr(
+            hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Break {
+                        value: Some(body_test_expr(hir::ExprKind::Int(1), integer)),
+                        accepted: true,
+                    }],
+                    value: None,
+                },
+                diverges: false,
+                body_locals: 0..0,
+            },
+            integer,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "arena_case",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
+            }),
+            integer,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "unsafe_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
+            }),
+            integer,
+        ),
+    ));
+    let raw_local = |name: &str, expression: hir::Expr| {
+        let mut function = body_unit_case(name, expression);
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "ptr".to_string(),
+            ty: Ty::Raw,
+            is_mut: true,
+            is_param: true,
+            align: None,
+        }];
+        function
+    };
+    program.fns.push(body_unit_case(
+        "raw_alloc_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawAlloc(Box::new(body_test_expr(
+                        hir::ExprKind::Int(8),
+                        integer,
+                    ))),
+                    Ty::Raw,
+                ))),
+            }),
+            Ty::Raw,
+        ),
+    ));
+    program.fns.push(raw_local(
+        "raw_free_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawFree(Box::new(body_test_expr(
+                        hir::ExprKind::Local(0),
+                        Ty::Raw,
+                    ))),
+                    Ty::Unit,
+                ))),
+            }),
+            Ty::Unit,
+        ),
+    ));
+    program.fns.push(raw_local(
+        "raw_load_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawLoad {
+                        ptr: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Raw)),
+                        offset: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                        scalar: scalar_int(64),
+                    },
+                    integer,
+                ))),
+            }),
+            integer,
+        ),
+    ));
+    program.fns.push(raw_local(
+        "raw_store_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawStore {
+                        ptr: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Raw)),
+                        offset: Box::new(body_test_expr(hir::ExprKind::Int(0), integer)),
+                        value: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    },
+                    Ty::Unit,
+                ))),
+            }),
+            Ty::Unit,
+        ),
+    ));
+    program.fns.push(raw_local(
+        "raw_offset_case",
+        body_test_expr(
+            hir::ExprKind::Unsafe(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawOffset {
+                        ptr: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Raw)),
+                        offset: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
+                    },
+                    Ty::Raw,
+                ))),
+            }),
+            Ty::Raw,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "heap_new_case",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::HeapNew(Box::new(body_test_expr(
+                        hir::ExprKind::Int(1),
+                        integer,
+                    ))),
+                    boxed,
+                ))),
+            }),
+            boxed,
+        ),
+    ));
+    let box_local = |name: &str, expression: hir::Expr| {
+        let mut function = body_unit_case(name, expression);
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "box".to_string(),
+            ty: boxed,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }];
+        function
+    };
+    program.fns.push(box_local(
+        "box_get_case",
+        body_test_expr(
+            hir::ExprKind::BoxGet(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                boxed,
+            ))),
+            integer,
+        ),
+    ));
+    program.fns.push(box_local(
+        "box_clone_case",
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::BoxClone(Box::new(body_test_expr(
+                        hir::ExprKind::Local(0),
+                        boxed,
+                    ))),
+                    boxed,
+                ))),
+            }),
+            boxed,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "str_clone_case",
+        body_test_expr(
+            hir::ExprKind::StrClone(Box::new(body_test_expr(
+                hir::ExprKind::Str("x".to_string()),
+                Ty::Str,
+            ))),
+            Ty::String,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "str_predicate_case",
+        body_test_expr(
+            hir::ExprKind::StrPredicate {
+                kind: hir::StrPredKind::Contains,
+                haystack: Box::new(body_test_expr(
+                    hir::ExprKind::Str("a".to_string()),
+                    Ty::Str,
+                )),
+                needle: Box::new(body_test_expr(
+                    hir::ExprKind::Str("b".to_string()),
+                    Ty::Str,
+                )),
+            },
+            Ty::Bool,
+        ),
+    ));
+    program.fns.push(body_unit_case(
+        "str_trim_case",
+        body_test_expr(
+            hir::ExprKind::StrTrim {
+                kind: hir::StrTrimKind::Both,
+                recv: Box::new(body_test_expr(
+                    hir::ExprKind::Str(" x ".to_string()),
+                    Ty::Str,
+                )),
+            },
+            Ty::Str,
+        ),
+    ));
+    program.fns.push({
+        let mut function = body_unit_case(
+            "str_borrow_case",
+            body_test_expr(
+                hir::ExprKind::StrBorrow(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    Ty::String,
+                ))),
+                Ty::Str,
+            ),
+        );
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "owned".to_string(),
+            ty: Ty::String,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }];
+        function
+    });
+    program.fns.push(body_unit_case(
+        "builder_new_case",
+        body_test_expr(hir::ExprKind::BuilderNew { capacity: None }, Ty::Builder),
+    ));
+    program.fns.push({
+        let mut function = body_unit_case(
+            "builder_write_case",
+            body_test_expr(
+                hir::ExprKind::BuilderWrite {
+                    builder: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Builder)),
+                    arg: Box::new(body_test_expr(hir::ExprKind::Str("x".to_string()), Ty::Str)),
+                    kind: hir::BuilderWriteKind::Str,
+                },
+                Ty::Unit,
+            ),
+        );
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "builder".to_string(),
+            ty: Ty::Builder,
+            is_mut: true,
+            is_param: true,
+            align: None,
+        }];
+        function
+    });
+    program.fns.push({
+        let mut function = body_unit_case(
+            "builder_to_string_case",
+            body_test_expr(
+                hir::ExprKind::BuilderToString(Box::new(body_test_expr(
+                    hir::ExprKind::Local(0),
+                    Ty::Builder,
+                ))),
+                Ty::String,
+            ),
+        );
+        function.locals = vec![hir::Local {
+            id: 0,
+            name: "builder".to_string(),
+            ty: Ty::Builder,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }];
+        function
+    });
+
+    assert!(body_core_metadata_is_valid(&program));
+
+    // Keep the inventory test table-driven at the assertion boundary: every case above enters
+    // the same dormant helper, and a representative envelope mutation must fail closed.
+    let mut malformed = program.clone();
+    let case = malformed
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "str_predicate_case")
+        .expect("inventory case");
+    let hir::Stmt::Expr(expression) = &mut case.body.stmts[0] else {
+        panic!("inventory case lost its expression");
+    };
+    expression.ty = Ty::Int(IntTy { bits: 32, signed: true });
+    assert!(!body_core_metadata_is_valid(&malformed));
+}
+
+#[test]
+fn hir_body_validator_statements() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    let drop_old = Cell::new(false);
+    let drop_new = Cell::new(false);
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: 0,
+                    init: body_test_expr(hir::ExprKind::Int(1), integer),
+                },
+                hir::Stmt::Assign {
+                    local: 0,
+                    value: body_test_expr(hir::ExprKind::Int(2), integer),
+                    drop_old,
+                    drop_new,
+                },
+            ],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "x".to_string(),
+            ty: integer,
+            is_mut: true,
+            is_param: false,
+            align: None,
+        }],
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_statement_inventory() {
+    let integer = int(64);
+    let unit = Ty::Unit;
+    let span = align_span::Span::new(0, 0, 0);
+    let mut program = baseline_program();
+    let no_tail = |name: &str, statement: hir::Stmt, locals: Vec<hir::Local>, ret: Ty| {
+        body_test_named_function(
+            name,
+            hir::Block {
+                stmts: vec![statement],
+                value: None,
+            },
+            locals,
+            ret,
+        )
+    };
+    let local = |id: u32, name: &str, ty: Ty, is_mut: bool| hir::Local {
+        id,
+        name: name.to_string(),
+        ty,
+        is_mut,
+        is_param: false,
+        align: None,
+    };
+    let expr = |kind: hir::ExprKind, ty: Ty| hir::Expr { kind, ty, span };
+
+    program.fns.push(no_tail(
+        "stmt_let",
+        hir::Stmt::Let {
+            local: 0,
+            init: expr(hir::ExprKind::Int(1), integer),
+        },
+        vec![local(0, "value", integer, false)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_let_tuple",
+        hir::Stmt::LetTuple {
+            locals: vec![Some(0), None],
+            tuple_id: 0,
+            init: expr(
+                hir::ExprKind::Tuple {
+                    tuple_id: 0,
+                    elems: vec![
+                        expr(hir::ExprKind::Int(1), integer),
+                        expr(hir::ExprKind::Bool(true), Ty::Bool),
+                    ],
+                },
+                Ty::Tuple(0),
+            ),
+        },
+        vec![local(0, "first", integer, false), local(1, "second", Ty::Bool, false)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign",
+        hir::Stmt::Assign {
+            local: 0,
+            value: expr(hir::ExprKind::Int(2), integer),
+            drop_old: std::cell::Cell::new(false),
+            drop_new: std::cell::Cell::new(false),
+        },
+        vec![local(0, "value", integer, true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign_index",
+        hir::Stmt::AssignIndex {
+            base: 0,
+            index: expr(hir::ExprKind::Int(0), integer),
+            value: expr(hir::ExprKind::Int(3), integer),
+        },
+        vec![local(0, "values", Ty::Array(scalar_int(64), 3), true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign_vec_lane",
+        hir::Stmt::AssignVecLane {
+            local: 0,
+            lane: 2,
+            value: expr(hir::ExprKind::Int(4), integer),
+        },
+        vec![local(0, "lanes", Ty::Vec(scalar_int(64), 4), true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign_field",
+        hir::Stmt::AssignField {
+            root: 0,
+            path: vec![1],
+            value: expr(hir::ExprKind::Int(5), integer),
+        },
+        vec![local(0, "record", Ty::Struct(0), true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign_elem_field",
+        hir::Stmt::AssignElemField {
+            base: 0,
+            index: expr(hir::ExprKind::Int(0), integer),
+            path: vec![1],
+            struct_id: 0,
+            soa: false,
+            value: expr(hir::ExprKind::Int(6), integer),
+        },
+        vec![local(0, "records", Ty::StructArray(0, 2), true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_assign_elem",
+        hir::Stmt::AssignElem {
+            base: 0,
+            index: expr(hir::ExprKind::Int(0), integer),
+            struct_id: 0,
+            soa: true,
+            value: expr(
+                hir::ExprKind::StructLit {
+                    struct_id: 0,
+                    fields: vec![
+                        expr(hir::ExprKind::Str("key".to_string()), Ty::Str),
+                        expr(hir::ExprKind::Int(7), integer),
+                    ],
+                },
+                Ty::Struct(0),
+            ),
+        },
+        vec![local(0, "columns", Ty::Soa(0), true)],
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_return_none",
+        hir::Stmt::Return(None),
+        Vec::new(),
+        unit,
+    ));
+    program.fns.push(no_tail(
+        "stmt_return_some",
+        hir::Stmt::Return(Some(expr(hir::ExprKind::Int(8), integer))),
+        Vec::new(),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "stmt_break_value",
+        expr(
+            hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Break {
+                        value: Some(expr(hir::ExprKind::Int(9), integer)),
+                        accepted: true,
+                    }],
+                    value: None,
+                },
+                diverges: false,
+                body_locals: 0..0,
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(body_tail_case(
+        "stmt_break_rejected",
+        expr(
+            hir::ExprKind::Loop {
+                body: hir::Block {
+                    stmts: vec![hir::Stmt::Break {
+                        value: None,
+                        accepted: false,
+                    }],
+                    value: None,
+                },
+                diverges: true,
+                body_locals: 0..0,
+            },
+            integer,
+        ),
+        integer,
+    ));
+    program.fns.push(no_tail(
+        "stmt_expr",
+        hir::Stmt::Expr(expr(hir::ExprKind::Int(10), integer)),
+        Vec::new(),
+        unit,
+    ));
+
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_let") {
+        hir::Stmt::Let { local, .. } => *local = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_let") {
+        hir::Stmt::Let { init, .. } => init.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_let_tuple") {
+        hir::Stmt::LetTuple { locals, .. } => *locals = vec![Some(0)],
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_let_tuple") {
+        hir::Stmt::LetTuple { tuple_id, .. } => *tuple_id = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_let_tuple") {
+        hir::Stmt::LetTuple { init, .. } => init.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign") {
+        hir::Stmt::Assign { local, .. } => *local = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign") {
+        hir::Stmt::Assign { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_index") {
+        hir::Stmt::AssignIndex { base, .. } => *base = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_index") {
+        hir::Stmt::AssignIndex { index, .. } => index.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_index") {
+        hir::Stmt::AssignIndex { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_vec_lane") {
+        hir::Stmt::AssignVecLane { local, .. } => *local = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_vec_lane") {
+        hir::Stmt::AssignVecLane { lane, .. } => *lane = 4,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_vec_lane") {
+        hir::Stmt::AssignVecLane { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_field") {
+        hir::Stmt::AssignField { root, .. } => *root = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_field") {
+        hir::Stmt::AssignField { path, .. } => path.clear(),
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_field") {
+        hir::Stmt::AssignField { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { base, .. } => *base = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { path, .. } => path.clear(),
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { struct_id, .. } => *struct_id = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { soa, .. } => *soa = true,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { index, .. } => index.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem_field") {
+        hir::Stmt::AssignElemField { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem") {
+        hir::Stmt::AssignElem { base, .. } => *base = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem") {
+        hir::Stmt::AssignElem { struct_id, .. } => *struct_id = 99,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem") {
+        hir::Stmt::AssignElem { soa, .. } => *soa = false,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem") {
+        hir::Stmt::AssignElem { index, .. } => index.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_assign_elem") {
+        hir::Stmt::AssignElem { value, .. } => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    *body_first_statement_mut(&mut reject, "stmt_return_none") = hir::Stmt::Return(Some(expr(
+        hir::ExprKind::Int(11),
+        integer,
+    )));
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    *body_first_statement_mut(&mut reject, "stmt_return_some") = hir::Stmt::Return(None);
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_return_some") {
+        hir::Stmt::Return(Some(value)) => value.ty = Ty::Bool,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_loop_statement_mut(&mut reject, "stmt_break_value") {
+        hir::Stmt::Break { value, .. } => *value = None,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+    let mut reject = program.clone();
+    match body_loop_statement_mut(&mut reject, "stmt_break_rejected") {
+        hir::Stmt::Break { accepted, .. } => *accepted = true,
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    match body_first_statement_mut(&mut reject, "stmt_expr") {
+        hir::Stmt::Expr(expression) => {
+            *expression = expr(
+                hir::ExprKind::ResultOk(Box::new(expr(hir::ExprKind::Int(12), integer))),
+                Ty::Result(scalar_int(64), Scalar::Enum(0)),
+            )
+        }
+        _ => unreachable!(),
+    }
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
+#[test]
+fn hir_body_type_mangle_golden_vectors() {
+    let program = baseline_program();
+    let vectors = [
+        (Ty::Int(IntTy { bits: 64, signed: true }), "i64"),
+        (Ty::Struct(0), "S6_Record"),
+        (Ty::Enum(0), "E6_Choice"),
+        (Ty::Tagged(0), "O_i64"),
+        (Ty::Option(scalar_int(64)), "O_i64"),
+        (Ty::Result(scalar_int(64), Scalar::Enum(0)), "R_i64_E6_Choice"),
+        (Ty::Box(scalar_int(64)), "B_i64"),
+        (Ty::Array(scalar_int(64), 3), "A3_i64"),
+        (Ty::StructArray(0, 2), "A2_S6_Record"),
+        (Ty::Slice(Scalar::Str), "V_str"),
+        (Ty::DynArray(scalar_int(32)), "D_i32"),
+        (Ty::DynStructArray(0, Layout::Aos), "D_S6_Record"),
+        (Ty::Soa(0), "Q_S6_Record"),
+        (Ty::Tuple(0), "U2_i64_bool"),
+        (Ty::Vec(scalar_int(32), 4), "vec4_i32"),
+        (Ty::Mask(scalar_int(32), 4), "mask4_i32"),
+        (Ty::Task(scalar_int(64)), "K_i64"),
+        (Ty::Fn(0), "F0_____bn_rn"),
+    ];
+    for (ty, expected) in vectors {
+        assert_eq!(body_ty_mangle(ty, &program), expected, "mangle for {ty:?}");
+    }
+}
+
+#[test]
+fn hir_body_validator_accepts_module_monomorph_call_name() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    let mut target = body_tail_case(
+        "math$pick$i64",
+        body_test_expr(hir::ExprKind::Int(1), integer),
+        integer,
+    );
+    target.origin = hir::FnOrigin::Monomorph;
+    program.fns.push(target);
+    program.fns.push(body_tail_case(
+        "caller",
+        body_test_expr(
+            hir::ExprKind::Call {
+                func: "math$pick$i64".to_string(),
+                args: Vec::new(),
+                type_args: vec![integer],
+            },
+            integer,
+        ),
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn deep_hir_body_core_type_dag_is_stack_bounded() {
+    let integer = int(64);
+    let mut expression = body_test_expr(hir::ExprKind::Int(0), integer);
+    for _ in 0..512 {
+        expression = body_test_expr(
+            hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr: Box::new(expression),
+            },
+            integer,
+        );
+    }
+    let mut program = baseline_program();
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        },
+        Vec::new(),
+        integer,
+    ));
+
+    const TYPE_DEPTH: usize = 4_096;
+    program.structs = (0..TYPE_DEPTH)
+        .map(|id| StructDef {
+            name: format!("BodyNode{id}"),
+            source_name: format!("BodyNode{id}"),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: if id + 1 == TYPE_DEPTH {
+                    integer
+                } else {
+                    Ty::Struct((id + 1) as u32)
+                },
+            }],
+            align: None,
+            c_repr: false,
+        })
+        .collect();
+    program.fns.push(body_test_parameter_function(
+        "deep_body_type",
+        Ty::Struct(0),
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                Ty::Struct(0),
+            ))),
+        },
+        Ty::Struct(0),
+    ));
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            assert!(body_core_metadata_is_valid(&program));
+
+            program.structs[TYPE_DEPTH - 1].fields[0].ty = Ty::Struct(TYPE_DEPTH as u32);
+            assert!(!body_core_metadata_is_valid(&program));
+        })
+        .expect("spawn deep body type validator");
+    handle.join().expect("join deep body type validator");
+}
+
+#[test]
+fn hir_body_validator_loop_and_break() {
+    let mut program = with_loop_body_depth(5);
+    assert!(body_core_metadata_is_valid(&program));
+    let hir::ExprKind::Loop { body_locals, .. } = &mut program.fns[0]
+        .body
+        .value
+        .as_mut()
+        .expect("loop fixture has a value")
+        .kind
+    else {
+        panic!("loop fixture lost its loop");
+    };
+    *body_locals = 1..1;
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_deferred_facts_are_not_consumed() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: 0,
+                    init: body_test_expr(hir::ExprKind::Int(1), integer),
+                },
+                hir::Stmt::Assign {
+                    local: 0,
+                    value: body_test_expr(hir::ExprKind::Int(2), integer),
+                    drop_old: Cell::new(false),
+                    drop_new: Cell::new(false),
+                },
+            ],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Local(0), integer))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "x".to_string(),
+            ty: integer,
+            is_mut: true,
+            is_param: false,
+            align: None,
+        }],
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+    program.fns[0].drop_locals = vec![0, 0, 1];
+    program.fns[0].drop_individual_locals = vec![0];
+    program.fns[0]
+        .drop_individual_exprs
+        .insert(align_span::Span::new(0, 4, 5), true);
+    let hir::Stmt::Assign {
+        drop_old,
+        drop_new,
+        ..
+    } = &program.fns[0].body.stmts[1]
+    else {
+        panic!("test fixture lost its assignment");
+    };
+    drop_old.set(true);
+    drop_new.set(true);
+    assert!(body_core_metadata_is_valid(&program));
+
+    // `Local::is_param` is an am-h declaration/header fact, not a body-core binding source.
+    // Mutating it here must not make the dormant b1 helper silently accept or reject the body;
+    // the activated preflight will reject the malformed header separately.
+    program.fns[0].locals[0].is_param = true;
+    assert!(body_core_metadata_is_valid(&program));
 }
 
 #[test]
