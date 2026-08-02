@@ -77,6 +77,19 @@ pub type ValueId = u32;
 pub type Slot = u32;
 pub type BlockId = u32;
 
+/// A bodyless cross-unit declaration after HIR header validation. The checked-HIR `FnEffect` seed
+/// is intentionally absent: it is consumed by sema/MIR validation and is not part of the imported
+/// Align ABI, structural MIR bytes, implementation hash, or object-cache input.
+#[derive(Clone, Debug)]
+pub struct ImportedFn {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub param_modes: Vec<align_ast::ParamMode>,
+    pub ret: Ty,
+    pub return_borrow: hir::ReturnBorrowSummary,
+    pub return_region: hir::ReturnRegionSummary,
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Function>,
@@ -88,7 +101,7 @@ pub struct Program {
     /// `declare` for each so a `Rvalue::Call` keyed by the mangled `module$name` resolves at link
     /// time. **Empty in the whole-program path** (byte-identity), populated only by per-unit
     /// lowering.
-    pub imported_fns: Vec<hir::ImportedFn>,
+    pub imported_fns: Vec<ImportedFn>,
     /// External libraries to link (`-l<name>`), passed through from HIR; consumed by the driver.
     pub link_libs: Vec<String>,
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
@@ -129,7 +142,7 @@ pub struct Function {
     pub blocks: Vec<Block>,
     pub entry: BlockId,
     /// M15 S2: whether this function gets `external` linkage under separate compilation (a non-entry
-    /// `pub` user function; see [`hir::Fn::exportable`]). **Always `false` from whole-program
+    /// `pub` user function; see [`hir::FnOrigin::is_exportable`]). **Always `false` from whole-program
     /// lowering** ([`lower_program`]) so the default object is byte-identical to today; set from HIR
     /// only by per-unit lowering ([`lower_program_per_unit`]).
     pub exportable: bool,
@@ -1523,7 +1536,7 @@ pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program 
 }
 
 /// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
-/// model — a non-entry `pub` user function ([`hir::Fn::exportable`]) gets `external` linkage in the
+/// model — a non-entry `pub` user function ([`hir::FnOrigin::is_exportable`]) gets `external` linkage in the
 /// object (so a dependent unit's object resolves the cross-unit call), and the unit's imported
 /// `pub` declarations ([`hir::Program::imported_fns`]) are carried through as bodyless external
 /// declares. The whole-program [`lower_program`] forces every function `internal` and drops any
@@ -1566,6 +1579,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
         && validate_hir::global_type_metadata_is_valid(program)
         && validate_hir::type_placement_metadata_is_valid(program)
         && validate_hir::nominal_link_metadata_is_valid(program)
+        && validate_hir::declaration_header_metadata_is_valid(program)
 }
 
 fn empty_program() -> Program {
@@ -1604,7 +1618,7 @@ fn lower_program_unchecked(
             );
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
             // every function `internal` for byte-identity.
-            mf.exportable = per_unit && f.exportable;
+            mf.exportable = per_unit && f.origin.is_exportable();
             simplify_known_drop_flags(&mut mf);
             fuse_builder_writes(&mut mf);
             mf
@@ -1624,7 +1638,22 @@ fn lower_program_unchecked(
         externs: program.externs.clone(),
         // Cross-unit `pub` callee declares are a per-unit-only concern; the whole-program path has
         // every callee body in `fns`, so its declare list is empty (byte-identity).
-        imported_fns: if per_unit { program.imported_fns.clone() } else { Vec::new() },
+        imported_fns: if per_unit {
+            program
+                .imported_fns
+                .iter()
+                .map(|import| ImportedFn {
+                    name: import.name.clone(),
+                    params: import.params.clone(),
+                    param_modes: import.param_modes.clone(),
+                    ret: import.ret,
+                    return_borrow: import.return_borrow.clone(),
+                    return_region: import.return_region.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         link_libs,
         structs: program.structs.clone(),
         enums: program.enums.clone(),

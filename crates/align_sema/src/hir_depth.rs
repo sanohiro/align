@@ -1201,7 +1201,7 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep".to_string(),
-                lifted_capture_count: None,
+                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
                 params: Vec::new(),
                 param_modes: Vec::new(),
                 ret: int_ty(),
@@ -1216,7 +1216,6 @@ mod tests {
                 drop_locals: Vec::new(),
                 drop_individual_locals: Vec::new(),
                 drop_individual_exprs: Default::default(),
-                exportable: false,
             }],
             externs: Vec::new(),
             link_libs: Vec::new(),
@@ -1257,7 +1256,7 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move".to_string(),
-                lifted_capture_count: None,
+                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret: result_ty,
@@ -1279,7 +1278,6 @@ mod tests {
                 drop_locals: Vec::new(),
                 drop_individual_locals: Vec::new(),
                 drop_individual_exprs: Default::default(),
-                exportable: false,
             }],
             externs: Vec::new(),
             link_libs: Vec::new(),
@@ -1323,7 +1321,7 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_call".to_string(),
-                lifted_capture_count: None,
+                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret: Ty::String,
@@ -1345,7 +1343,6 @@ mod tests {
                 drop_locals: Vec::new(),
                 drop_individual_locals: Vec::new(),
                 drop_individual_exprs: Default::default(),
-                exportable: false,
             }],
             externs: Vec::new(),
             link_libs: Vec::new(),
@@ -1391,7 +1388,7 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_shape".to_string(),
-                lifted_capture_count: None,
+                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret,
@@ -1413,7 +1410,6 @@ mod tests {
                 drop_locals: Vec::new(),
                 drop_individual_locals: Vec::new(),
                 drop_individual_exprs: Default::default(),
-                exportable: false,
             }],
             externs: Vec::new(),
             link_libs: Vec::new(),
@@ -1833,7 +1829,7 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_control".to_string(),
-                lifted_capture_count: None,
+                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret,
@@ -1855,7 +1851,6 @@ mod tests {
                 drop_locals: Vec::new(),
                 drop_individual_locals: Vec::new(),
                 drop_individual_exprs: Default::default(),
-                exportable: false,
             }],
             externs: Vec::new(),
             link_libs: Vec::new(),

@@ -328,6 +328,39 @@ fn run_provenance() {
         "mir-nominal-link-validation\t{milliseconds:.3}\tms/lower\t{nominal_definitions}\tdefinitions"
     );
 
+    let header_source = provenance_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let checked = align_driver::check(
+        &mut source_map,
+        "mir-header.align",
+        &header_source,
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "MIR header fixture must check"
+    );
+    let valid = align_driver::lower_to_mir(&checked.hir);
+    assert!(!valid.fns.is_empty(), "header fixture must lower");
+    let mut malformed = checked.hir.clone();
+    malformed.fns[0].name.push('\0');
+    let invalid = align_driver::lower_to_mir(&malformed);
+    assert!(invalid.fns.is_empty(), "malformed header must fail closed");
+
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let valid = align_driver::lower_to_mir(black_box(&checked.hir));
+        let invalid = align_driver::lower_to_mir(black_box(&malformed));
+        black_box((valid, invalid));
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "mir-header-validation\t{milliseconds:.3}\tms/valid+malformed-lower\t{}\tfunctions",
+        checked.hir.fns.len()
+    );
+
     let continuation_source = mir_continuation_fixture();
     let mut source_map = align_span::SourceMap::new();
     let checked = align_driver::check(

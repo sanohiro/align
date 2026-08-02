@@ -538,3 +538,20 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     }
     Ok(summary)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_effect_tag_is_rejected_before_sema() {
+        let mut reader = Reader::new(&[3]);
+        assert_eq!(
+            read_effect(&mut reader),
+            Err(DecodeError::BadTag {
+                what: "effect",
+                tag: 3,
+            })
+        );
+    }
+}

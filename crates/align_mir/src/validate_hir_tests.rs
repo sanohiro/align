@@ -8,6 +8,644 @@ use align_sema::{
 };
 use std::cell::Cell;
 
+fn declaration_header_program() -> hir::Program {
+    let mut program = baseline_program();
+    let slice_i32 = Ty::Slice(scalar_int(32));
+    program.externs.push(hir::ExternFn {
+        name: "c_read".to_string(),
+        params: vec![int(64)],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: int(64),
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+    });
+    program.imported_fns.push(ImportedFn {
+        name: "dep$read".to_string(),
+        params: vec![slice_i32],
+        param_modes: vec![align_ast::ParamMode::Out],
+        ret: slice_i32,
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        effect: FnEffect::Pure,
+    });
+    let span = align_span::Span::new(0, 0, 0);
+    program.fns.push(hir::Fn {
+        name: "worker".to_string(),
+        origin: hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: true,
+        },
+        params: vec![0],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: Ty::Str,
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        locals: vec![hir::Local {
+            id: 0,
+            name: "value".to_string(),
+            ty: Ty::Str,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        }, hir::Local {
+            id: 1,
+            name: "unused".to_string(),
+            ty: Ty::Str,
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(hir::Expr {
+                kind: hir::ExprKind::Local(0),
+                ty: Ty::Str,
+                span,
+            })),
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+    });
+    program
+}
+
+fn fn_type_header_program() -> hir::Program {
+    let mut program = baseline_program();
+    program.fn_types[0] = FnTy {
+        params: vec![
+            (align_ast::ParamMode::ByValue, Scalar::Str),
+            (align_ast::ParamMode::ByValue, Scalar::Str),
+        ],
+        ret: Ty::Str,
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0, 1],
+            captures: Vec::new(),
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0, 1],
+            captures: Vec::new(),
+        },
+        effect: Cell::new(FnEffect::Pure),
+    };
+    program
+}
+
+fn summary_header_program() -> hir::Program {
+    let mut program = declaration_header_program();
+    program.fns[0].params = vec![0, 1];
+    program.fns[0].param_modes = vec![
+        align_ast::ParamMode::ByValue,
+        align_ast::ParamMode::ByValue,
+    ];
+    program.fns[0].locals[1].ty = Ty::Str;
+    program.fns[0].locals[1].is_param = true;
+    program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0, 1],
+        captures: Vec::new(),
+    };
+    program.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0, 1],
+        captures: Vec::new(),
+    };
+    program
+}
+
+fn main_header_program(params: Vec<Ty>, param_modes: Vec<align_ast::ParamMode>, ret: Ty) -> hir::Program {
+    let mut program = baseline_program();
+    push_builtin_error(&mut program);
+    let span = align_span::Span::new(0, 0, 0);
+    let local_params = params
+        .iter()
+        .enumerate()
+        .map(|(id, &ty)| hir::Local {
+            id: id as u32,
+            name: format!("arg{id}"),
+            ty,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        })
+        .collect();
+    program.fns.push(hir::Fn {
+        name: "main".to_string(),
+        origin: hir::FnOrigin::Source {
+            is_entry: true,
+            is_public: false,
+        },
+        params: (0..params.len()).map(|id| id as u32).collect(),
+        param_modes,
+        ret,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        locals: local_params,
+        body: hir::Block {
+            stmts: Vec::new(),
+            value: None,
+        },
+        span,
+        drop_locals: Vec::new(),
+        drop_individual_locals: Vec::new(),
+        drop_individual_exprs: Default::default(),
+    });
+    program
+}
+
+fn assert_header_rejected(label: &str, program: &hir::Program) {
+    assert!(
+        validate_hir::global_type_metadata_is_valid(program),
+        "{label}: header fixture must remain graph-valid"
+    );
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(program),
+        "{label}: header fixture must remain placement-valid"
+    );
+    assert!(
+        validate_hir::nominal_link_metadata_is_valid(program),
+        "{label}: header fixture must remain nominal/link-valid"
+    );
+    assert!(
+        !validate_hir::declaration_header_metadata_is_valid(program),
+        "{label}: declaration/header validator accepted malformed metadata"
+    );
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(program),
+        lower_program_located(program, &source_map),
+        lower_program_per_unit(program),
+        lower_program_per_unit_located(program, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "{label}: invalid header published MIR");
+    }
+}
+
+#[test]
+fn malformed_hir_declaration_header_metadata_fails_closed() {
+    let base = declaration_header_program();
+    assert_one_header_mutation("extern-name", &base, |program| {
+        program.externs[0].name.push('\0');
+    });
+    assert_one_header_mutation("extern-main", &base, |program| {
+        program.externs[0].name = "main".to_string();
+    });
+    assert_one_header_mutation("extern-arity", &base, |program| {
+        program.externs[0].param_modes.clear();
+    });
+    assert_one_header_mutation("extern-mode", &base, |program| {
+        program.externs[0].param_modes[0] = align_ast::ParamMode::Out;
+    });
+    assert_one_header_mutation("extern-summary", &base, |program| {
+        program.externs[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("extern-duplicate-name", &base, |program| {
+        program.externs.push(program.externs[0].clone());
+    });
+    assert_one_header_mutation("import-name", &base, |program| {
+        program.imported_fns[0].name.clear();
+    });
+    assert_one_header_mutation("import-main", &base, |program| {
+        program.imported_fns[0].name = "main".to_string();
+    });
+    assert_one_header_mutation("import-mode", &base, |program| {
+        program.imported_fns[0].param_modes[0] = align_ast::ParamMode::Borrow;
+    });
+    assert_one_header_mutation("import-summary-order", &base, |program| {
+        program.imported_fns[0].return_region = ReturnRegionSummary::None;
+    });
+    assert_one_header_mutation("import-summary-captures", &base, |program| {
+        program.imported_fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![0],
+        };
+    });
+    assert_one_header_mutation("import-summary-range", &base, |program| {
+        program.imported_fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        program.imported_fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("import-summary-non-borrowable", &base, |program| {
+        program.imported_fns[0].params[0] = int(64);
+        program.imported_fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        };
+        program.imported_fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("import-duplicate-name", &base, |program| {
+        program.imported_fns.push(program.imported_fns[0].clone());
+    });
+    assert_one_header_mutation("stored-name", &base, |program| {
+        program.fns[0].name.push('\0');
+    });
+    assert_one_header_mutation("stored-duplicate-name", &base, |program| {
+        program.fns.push(program.fns[0].clone());
+    });
+    assert_one_header_mutation("stored-span", &base, |program| {
+        program.fns[0].span = align_span::Span::new(0, 2, 1);
+    });
+    assert_one_header_mutation("stored-parameter-id", &base, |program| {
+        program.fns[0].params[0] = 1;
+    });
+    assert_one_header_mutation("stored-parameter-mode", &base, |program| {
+        program.fns[0].param_modes[0] = align_ast::ParamMode::BorrowMut;
+    });
+    assert_one_header_mutation("stored-parameter-name", &base, |program| {
+        program.fns[0].locals[0].name = "bad-name".to_string();
+    });
+    assert_one_header_mutation("stored-local-id", &base, |program| {
+        program.fns[0].locals[0].id = 1;
+    });
+    assert_one_header_mutation("stored-local-name", &base, |program| {
+        program.fns[0].locals[0].name.clear();
+    });
+    assert_one_header_mutation("stored-local-parameter-bit", &base, |program| {
+        program.fns[0].locals[0].is_param = false;
+    });
+    assert_one_header_mutation("stored-local-alignment", &base, |program| {
+        program.fns[0].locals.push(hir::Local {
+            id: 2,
+            name: "aligned".to_string(),
+            ty: int(32),
+            is_mut: false,
+            is_param: false,
+            align: Some(3),
+        });
+    });
+    assert_one_header_mutation("stored-drop-order", &base, |program| {
+        program.fns[0].drop_locals = vec![0, 0];
+    });
+    assert_one_header_mutation("stored-drop-subset", &base, |program| {
+        program.fns[0].drop_individual_locals = vec![0];
+        program.fns[0].drop_locals.clear();
+    });
+    assert_one_header_mutation("stored-drop-range", &base, |program| {
+        program.fns[0].drop_locals = vec![2];
+    });
+    assert_one_header_mutation("stored-individual-drop-range", &base, |program| {
+        program.fns[0].drop_individual_locals = vec![2];
+    });
+    assert_one_header_mutation("lifted-origin", &base, |program| {
+        program.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 2 };
+    });
+    assert_one_header_mutation("lifted-origin-mode", &base, |program| {
+        program.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
+        program.fns[0].locals[0].is_param = false;
+        program.fns[0].param_modes[0] = align_ast::ParamMode::Out;
+    });
+    assert_one_header_mutation("lifted-origin-summary", &base, |program| {
+        program.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
+        program.fns[0].locals[0].is_param = false;
+    });
+
+    let fn_base = fn_type_header_program();
+    assert!(validate_hir::declaration_header_metadata_is_valid(&fn_base));
+    assert_one_header_mutation("fn-type-mode", &fn_base, |program| {
+        program.fn_types[0].params[0].0 = align_ast::ParamMode::Borrow;
+    });
+    assert_one_header_mutation("fn-type-summary-order", &fn_base, |program| {
+        program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![1, 0],
+            captures: Vec::new(),
+        };
+        program.fn_types[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![1, 0],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("fn-type-summary-duplicate", &fn_base, |program| {
+        program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0, 0],
+            captures: Vec::new(),
+        };
+        program.fn_types[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![0, 0],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("fn-type-summary-range", &fn_base, |program| {
+        program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![2],
+            captures: Vec::new(),
+        };
+        program.fn_types[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![2],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("fn-type-summary-captures", &fn_base, |program| {
+        program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0, 1],
+            captures: vec![0],
+        };
+        program.fn_types[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![0, 1],
+            captures: vec![0],
+        };
+    });
+
+    let summary_base = summary_header_program();
+    assert!(validate_hir::declaration_header_metadata_is_valid(&summary_base));
+    assert_one_header_mutation("stored-summary-order", &summary_base, |program| {
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![1, 0],
+            captures: Vec::new(),
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![1, 0],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("stored-summary-range", &summary_base, |program| {
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![2],
+            captures: Vec::new(),
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![2],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("stored-summary-empty", &summary_base, |program| {
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: Vec::new(),
+            captures: Vec::new(),
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: Vec::new(),
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("stored-summary-non-borrowable", &summary_base, |program| {
+        program.fns[0].locals[1].ty = Ty::String;
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("stored-summary-captures", &summary_base, |program| {
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0, 1],
+            captures: vec![0],
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![0, 1],
+            captures: vec![0],
+        };
+    });
+}
+
+#[test]
+fn main_header_abi_matrix_is_exhaustive() {
+    let result = Ty::Result(Scalar::Unit, Scalar::Enum(1));
+    let argv = Ty::DynArray(Scalar::Str);
+    for (label, params, modes, ret) in [
+        ("main-unit", Vec::new(), Vec::new(), Ty::Unit),
+        ("main-i32", Vec::new(), Vec::new(), int(32)),
+        ("main-result", Vec::new(), Vec::new(), result),
+        (
+            "main-argv-result",
+            vec![argv],
+            vec![align_ast::ParamMode::ByValue],
+            result,
+        ),
+    ] {
+        let program = main_header_program(params, modes, ret);
+        assert!(
+            validate_hir::global_type_metadata_is_valid(&program)
+                && validate_hir::type_placement_metadata_is_valid(&program)
+                && validate_hir::nominal_link_metadata_is_valid(&program)
+                && validate_hir::declaration_header_metadata_is_valid(&program),
+            "{label}: valid main ABI rejected"
+        );
+    }
+
+    assert_header_rejected(
+        "main-no-arg-unsigned-i32",
+        &main_header_program(
+            Vec::new(),
+            Vec::new(),
+            Ty::Int(IntTy {
+                bits: 32,
+                signed: false,
+            }),
+        ),
+    );
+    assert_header_rejected(
+        "main-no-arg-float",
+        &main_header_program(Vec::new(), Vec::new(), Ty::Float(FloatTy { bits: 64 })),
+    );
+    assert_header_rejected(
+        "main-argv-unit",
+        &main_header_program(vec![argv], vec![align_ast::ParamMode::ByValue], Ty::Unit),
+    );
+    assert_header_rejected(
+        "main-argv-i32",
+        &main_header_program(vec![argv], vec![align_ast::ParamMode::ByValue], int(32)),
+    );
+    assert_header_rejected(
+        "main-argv-mode",
+        &main_header_program(vec![argv], vec![align_ast::ParamMode::Out], result),
+    );
+    assert_header_rejected(
+        "main-argv-type",
+        &main_header_program(
+            vec![Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![align_ast::ParamMode::ByValue],
+            result,
+        ),
+    );
+    assert_header_rejected(
+        "main-argument-count",
+        &main_header_program(
+            vec![argv, argv],
+            vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::ByValue],
+            result,
+        ),
+    );
+
+    let source_non_entry = main_header_program(Vec::new(), Vec::new(), Ty::Unit);
+    assert_one_header_mutation("main-non-entry-origin", &source_non_entry, |program| {
+        program.fns[0].origin = hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: true,
+        };
+    });
+    assert_one_header_mutation("main-monomorph-origin", &source_non_entry, |program| {
+        program.fns[0].origin = hir::FnOrigin::Monomorph;
+    });
+    assert_one_header_mutation("main-lifted-origin", &source_non_entry, |program| {
+        program.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
+    });
+
+    let valid_error = main_header_program(vec![argv], vec![align_ast::ParamMode::ByValue], result);
+    assert_one_header_mutation("main-error-code-width", &valid_error, |program| {
+        program.enums[1].variants[4].payload = vec![Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })];
+    });
+    assert_one_header_mutation("main-error-variant-order", &valid_error, |program| {
+        program.enums[1].variants.swap(0, 1);
+    });
+    assert_one_header_mutation("main-error-variant-name", &valid_error, |program| {
+        program.enums[1].variants[0].name = "Unknown".to_string();
+    });
+    assert_one_header_mutation("main-error-name", &valid_error, |program| {
+        program.enums[1].name = "OtherError".to_string();
+    });
+    assert_one_header_mutation("main-error-source-name", &valid_error, |program| {
+        program.enums[1].source_name = "OtherError".to_string();
+    });
+    assert_one_header_mutation("main-error-variant-count", &valid_error, |program| {
+        program.enums[1].variants.pop();
+    });
+    assert_one_header_mutation("main-error-extra-variant", &valid_error, |program| {
+        program.enums[1].variants.insert(4, EnumVariant {
+            name: "Extra".to_string(),
+            payload: Vec::new(),
+            field_base: 1,
+        });
+    });
+}
+
+#[test]
+fn valid_hir_declaration_header_preflight_is_mir_identity() {
+    let mut base = declaration_header_program();
+    for effect in [FnEffect::Pure, FnEffect::Impure, FnEffect::Unknown] {
+        base.imported_fns[0].effect = effect;
+        assert!(validate_hir::declaration_header_metadata_is_valid(&base));
+        let source_map = SourceMap::new();
+        let checked = lower_program_per_unit(&base);
+        let unchecked = lower_program_unchecked(&base, None, true);
+        assert_eq!(format!("{checked:#?}"), format!("{unchecked:#?}"));
+        let located = lower_program_per_unit_located(&base, &source_map);
+        let located_unchecked = lower_program_unchecked(
+            &base,
+            Some(Rc::new(SourceLines::from_map(&source_map))),
+            true,
+        );
+        assert_eq!(format!("{located:#?}"), format!("{located_unchecked:#?}"));
+        assert_eq!(checked.imported_fns.len(), 1);
+        assert_eq!(checked.imported_fns[0].name, "dep$read");
+    }
+
+    let mut lifted = declaration_header_program();
+    lifted.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
+    lifted.fns[0].locals[0].is_param = false;
+    lifted.fns[0].return_borrow = ReturnBorrowSummary::None;
+    lifted.fns[0].return_region = ReturnRegionSummary::None;
+    assert!(validate_hir::declaration_header_metadata_is_valid(&lifted));
+}
+
+#[test]
+fn valid_header_does_not_consume_body_facts() {
+    let mut program = declaration_header_program();
+    program.fns[0]
+        .drop_individual_exprs
+        .insert(align_span::Span::new(999, 4, 4), false);
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+    assert!(!is_empty(&lower_program(&program)));
+
+    let mut body_local_type = declaration_header_program();
+    body_local_type.fns[0].locals.push(hir::Local {
+        id: 2,
+        name: "task_value".to_string(),
+        ty: Ty::Task(Scalar::Int(IntTy { bits: 64, signed: true })),
+        is_mut: false,
+        is_param: false,
+        align: None,
+    });
+    assert!(validate_hir::declaration_header_metadata_is_valid(&body_local_type));
+}
+
+#[test]
+fn deep_hir_header_type_dag_is_stack_bounded() {
+    let mut program = baseline_program();
+    program.structs = (0..4_096)
+        .map(|index| StructDef {
+            name: format!("HeaderDeep{index}"),
+            source_name: format!("HeaderDeep{index}"),
+            fields: vec![FieldDef {
+                name: "next".to_string(),
+                ty: if index == 4_095 {
+                    Ty::Str
+                } else {
+                    Ty::Struct(index + 1)
+                },
+            }],
+            align: None,
+            c_repr: false,
+        })
+        .collect();
+    program.imported_fns.push(ImportedFn {
+        name: "deep$header".to_string(),
+        params: vec![Ty::Struct(0)],
+        param_modes: vec![align_ast::ParamMode::ByValue],
+        ret: Ty::Struct(0),
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+        effect: FnEffect::Unknown,
+    });
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+    assert!(!is_empty(&lower_program_per_unit(&program)));
+
+    let mut malformed = program.clone();
+    malformed.imported_fns.push(ImportedFn {
+        name: String::new(),
+        params: Vec::new(),
+        param_modes: Vec::new(),
+        ret: Ty::Unit,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        effect: FnEffect::Impure,
+    });
+    assert_header_rejected("deep-header-later-sibling", &malformed);
+}
+
+fn assert_one_header_mutation(
+    label: &str,
+    base: &hir::Program,
+    mutate: impl FnOnce(&mut hir::Program),
+) {
+    let mut program = base.clone();
+    mutate(&mut program);
+    assert_header_rejected(label, &program);
+}
+
 fn int(bits: u8) -> Ty {
     Ty::Int(IntTy { bits, signed: true })
 }
@@ -119,6 +757,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        effect: FnEffect::Pure,
     }
 }
 
@@ -183,6 +822,7 @@ fn with_return(ty: Ty) -> hir::Program {
         ret: ty,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        effect: FnEffect::Pure,
     });
     program
 }
@@ -201,7 +841,9 @@ fn is_empty(program: &Program) -> bool {
 fn assert_rejected(label: &str, program: &hir::Program) {
     assert!(
         !validate_hir::global_type_metadata_is_valid(program)
-            || !validate_hir::type_placement_metadata_is_valid(program),
+            || !validate_hir::type_placement_metadata_is_valid(program)
+            || !validate_hir::nominal_link_metadata_is_valid(program)
+            || !validate_hir::declaration_header_metadata_is_valid(program),
         "{label}: validator accepted malformed metadata"
     );
     let source_map = SourceMap::new();
@@ -716,6 +1358,14 @@ fn assert_accepted_impl(label: &str, program: &hir::Program, owner: Option<MirOw
         validate_hir::nominal_link_metadata_is_valid(program),
         "{label}: nominal/link validator rejected valid metadata"
     );
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(program),
+        "{label}: placement validator rejected valid metadata"
+    );
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(program),
+        "{label}: declaration/header validator rejected valid metadata"
+    );
     if let Some(owner) = owner {
         assert_hir_owner_contract(label, program, owner);
     }
@@ -767,7 +1417,7 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: int(64),
@@ -782,7 +1432,6 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -852,7 +1501,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         .push(imported_fn("dep$id_i64", vec![int(64)], int(64)));
     program.fns.push(hir::Fn {
         name: "deep_mixed_eager".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret,
@@ -867,7 +1516,6 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -879,7 +1527,7 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_str_trim".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Str,
@@ -894,7 +1542,6 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -979,7 +1626,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_path_string".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::String,
@@ -994,7 +1641,6 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1021,7 +1667,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_reader_buffered".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Reader,
@@ -1036,7 +1682,6 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1101,7 +1746,7 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
     assert_eq!(expr_depth, target_expr_depth);
     program.fns.push(hir::Fn {
         name: "deep_bytes_str_cycle".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: result_ty,
@@ -1116,7 +1761,6 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1192,7 +1836,7 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_regex_string".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
         ret: Ty::String,
@@ -1214,7 +1858,6 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         drop_locals: vec![0],
         drop_individual_locals: vec![0],
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1262,7 +1905,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_template".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::String,
@@ -1277,7 +1920,6 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1302,7 +1944,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
     };
     program.fns.push(hir::Fn {
         name: "deep_file".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: result_ty,
@@ -1317,7 +1959,6 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1346,7 +1987,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_array_builder".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
         ret: Ty::Unit,
@@ -1368,7 +2009,6 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         drop_locals: vec![0],
         drop_individual_locals: vec![0],
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1397,7 +2037,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_process_command".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
         // `command` is a body-produced builder, not a source-nameable header type. Keep the
@@ -1422,7 +2062,6 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1450,7 +2089,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_http".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         // `http_request` is a body-produced builder, not a source-nameable header type. Keep the
@@ -1468,7 +2107,6 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs,
-        exportable: false,
     });
     program
 }
@@ -1519,7 +2157,7 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         .push(imported_fn("dep$block_stmt_sentinel", Vec::new(), Ty::Unit));
     program.fns.push(hir::Fn {
         name: "deep_block_stmt".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Unit,
@@ -1534,7 +2172,6 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1588,7 +2225,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         .push(imported_fn("dep$wildcard_sentinel", Vec::new(), Ty::Unit));
     program.fns.push(hir::Fn {
         name: "deep_match_arm".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: expr.ty,
@@ -1603,7 +2240,6 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1674,7 +2310,7 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_if_branch".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret,
@@ -1689,7 +2325,6 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1764,7 +2399,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_binary_match".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret,
@@ -1779,7 +2414,6 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1830,7 +2464,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_conditional_operand".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Bool,
@@ -1845,7 +2479,6 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1898,7 +2531,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_scoped_control".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret,
@@ -1913,7 +2546,6 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -1960,7 +2592,7 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_loop".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: int(64),
@@ -1975,7 +2607,6 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }
@@ -2031,7 +2662,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         .push(imported_fn("dep$stage_id", vec![int(64), int(64)], int(64)));
     program.fns.push(hir::Fn {
         name: "deep_stage".to_string(),
-        lifted_capture_count: None,
+        origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
         ret: int(64),
@@ -2053,7 +2684,6 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
-        exportable: false,
     });
     program
 }

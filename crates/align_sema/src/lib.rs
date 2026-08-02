@@ -4479,6 +4479,10 @@ pub fn check_program_with_interface_facts(
             if !is_generic && matches!(f.vis, ast::Vis::Pub) {
                 let mangled = mangle_fn(module, is_entry, &f.name.name);
                 if let Some(sig) = sigs.get(&mangled) {
+                    let effect = external_effects
+                        .get(&mangled)
+                        .copied()
+                        .unwrap_or(FnEffect::Impure);
                     imported_fns.push(hir::ImportedFn {
                         name: mangled,
                         params: sig.params.clone(),
@@ -4486,6 +4490,7 @@ pub fn check_program_with_interface_facts(
                         ret: sig.ret,
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
+                        effect,
                     });
                 }
             }
@@ -4545,7 +4550,10 @@ pub fn check_program_with_interface_facts(
             // under separate compilation (its `module$name` mangling is collision-free). The entry
             // unit's functions are never imported (nothing imports the entry), so they stay
             // internal — which also keeps a single-file (N=1) build byte-identical to today.
-            checked.exportable = !is_entry && matches!(f.vis, ast::Vis::Pub);
+            checked.origin = hir::FnOrigin::Source {
+                is_entry,
+                is_public: matches!(f.vis, ast::Vis::Pub),
+            };
             worklist.extend(cx.instantiations);
             fns.push(checked);
             fns.extend(lifted);
@@ -4605,6 +4613,7 @@ pub fn check_program_with_interface_facts(
         );
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
+        checked.origin = hir::FnOrigin::Monomorph;
         worklist.extend(cx.instantiations);
         // A lambda / pipeline inside a generic function is already rejected when the template is
         // checked in Pass 2, so a monomorph never has lifted helpers here.
@@ -4885,7 +4894,7 @@ fn infer_return_provenance(
         // Lifted lambda parameters append captures after explicit arguments. Treating those slots
         // as ordinary named parameters would publish the wrong domain and disagree with the
         // closure's explicit-parameter signature. L2b-b infers both domains atomically.
-        if function.lifted_capture_count.is_some() {
+        if matches!(function.origin, hir::FnOrigin::Lifted { .. }) {
             continue;
         }
 
@@ -4997,7 +5006,7 @@ fn check_parallelism(
         .fns
         .iter()
         .filter(|function| {
-            function.exportable
+                function.origin.is_exportable()
                 && function.params.iter().any(|local| {
                     function
                         .locals
@@ -5197,7 +5206,7 @@ impl EffectOpenWorld<'_> {
         match self {
             Self::Closed => false,
             Self::Export(name) => {
-                function.exportable && function.name == name
+                function.origin.is_exportable() && function.name == name
             }
         }
     }
@@ -5542,7 +5551,7 @@ pub fn fn_effects(
         .fns
         .iter()
         .filter(|function| {
-            function.exportable
+                function.origin.is_exportable()
                 && function.params.iter().any(|local| {
                     function
                         .locals
@@ -19169,7 +19178,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         Fn {
             name: f.name.name.clone(),
-            lifted_capture_count: None,
+            origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
             params,
             param_modes: f.params.iter().map(|p| p.mode).collect(),
             ret: self.finalize(ret),
@@ -19181,7 +19190,6 @@ impl<'a, 't> Checker<'a, 't> {
             drop_locals: Vec::new(),
             drop_individual_locals: Vec::new(),
             drop_individual_exprs: std::collections::HashMap::new(),
-            exportable: false,
         }
     }
 
@@ -23521,6 +23529,7 @@ impl<'a, 't> Checker<'a, 't> {
             .collect();
 
         // Swap in fresh per-function state; the lambda is a separate function body.
+        let saved_lifted_len = self.lifted.len();
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_scope = std::mem::take(&mut self.scope);
         let saved_int_vars = std::mem::take(&mut self.int_vars);
@@ -23584,6 +23593,34 @@ impl<'a, 't> Checker<'a, 't> {
         // Collect captures: each becomes a trailing parameter of the lifted function, and the
         // enclosing local is passed at the call site. Slice ③ supports copy-value captures only.
         let captured = self.capture.take().unwrap().captured;
+        let capture_count = match u32::try_from(captured.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                self.diags.error(
+                    "a lambda captures more values than the compiler can represent".to_string(),
+                    span,
+                );
+                self.locals = saved_locals;
+                self.scope = saved_scope;
+                self.int_vars = saved_int_vars;
+                self.int_parent = saved_int_parent;
+                self.float_vars = saved_float_vars;
+                self.float_parent = saved_float_parent;
+                self.ret_hint = saved_ret;
+                self.arena_depth = saved_arena;
+                self.unsafe_depth = saved_unsafe_depth;
+                self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
+                self.task_group_depth = saved_tg_depth;
+                self.wait_state = saved_wait_state;
+                self.task_group_fallible = saved_tg_fallible;
+                self.loops = saved_loops;
+                self.slice_bases = saved_bases;
+                self.buffered_readers = saved_buffered_readers;
+                self.capture = saved_capture;
+                self.lifted.truncate(saved_lifted_len);
+                return None;
+            }
+        };
         let mut locals = std::mem::take(&mut self.locals);
         for l in &mut locals {
             l.ty = self.finalize(l.ty);
@@ -23605,7 +23642,7 @@ impl<'a, 't> Checker<'a, 't> {
         let name = format!("{}$lambda{}", self.cur_fn, self.lifted.len());
         self.lifted.push(hir::Fn {
             name: name.clone(),
-            lifted_capture_count: Some(captured.len()),
+            origin: hir::FnOrigin::Lifted { capture_count },
             params: param_ids,
             param_modes: vec![
                 ast::ParamMode::ByValue;
@@ -23620,7 +23657,6 @@ impl<'a, 't> Checker<'a, 't> {
             drop_locals: Vec::new(),
             drop_individual_locals: Vec::new(),
             drop_individual_exprs: std::collections::HashMap::new(),
-            exportable: false,
         });
 
         // Restore the enclosing function's state.
@@ -34884,6 +34920,7 @@ fn main() -> i32 = 0
             "\
 fn identity<T>(value: T) -> T = value
 fn named(value: i64) -> i64 = value
+pub fn exported(value: i64) -> i64 = value
 fn main() -> i32 {
   captured := 2
   plain := [1, 2].map(fn value { value + 1 }).sum()
@@ -34899,22 +34936,63 @@ fn main() -> i32 {
                 .iter()
                 .find(|function| function.name == "named")
                 .expect("ordinary named function")
-                .lifted_capture_count,
-            None
+                .origin,
+            hir::FnOrigin::Source {
+                is_entry: true,
+                is_public: false,
+            }
         );
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == "exported")
+                .expect("public source function")
+                .origin,
+            hir::FnOrigin::Source {
+                is_entry: true,
+                is_public: true,
+            }
+        );
+        assert!(!
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == "exported")
+                .expect("public source function")
+                .origin
+                .is_exportable()
+        );
+        let main = program
+            .fns
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("entry source function");
+        assert_eq!(
+            main.origin,
+            hir::FnOrigin::Source {
+                is_entry: true,
+                is_public: false,
+            }
+        );
+        assert!(!main.origin.is_exportable());
         assert_eq!(
             program
                 .fns
                 .iter()
                 .find(|function| function.name.starts_with("identity$"))
                 .expect("generic monomorph")
-                .lifted_capture_count,
-            None
+                .origin,
+            hir::FnOrigin::Monomorph
         );
+        assert!(!hir::FnOrigin::Monomorph.is_exportable());
         let mut lifted = program
             .fns
             .iter()
-            .filter_map(|function| function.lifted_capture_count)
+            .filter_map(|function| match function.origin {
+                hir::FnOrigin::Lifted { capture_count } => Some(capture_count),
+                _ => None,
+            })
             .collect::<Vec<_>>();
         lifted.sort_unstable();
         assert_eq!(
@@ -34922,6 +35000,116 @@ fn main() -> i32 {
             vec![0, 1],
             "non-capturing and one-capture lambdas keep distinct explicit metadata"
         );
+        assert!(
+            program.fns.iter().filter(|function| matches!(
+                function.origin,
+                hir::FnOrigin::Lifted { .. }
+            )).all(|function| !function.origin.is_exportable())
+        );
+    }
+
+    #[test]
+    fn imported_effect_facts_are_normalized_and_stripped() {
+        let mut diagnostics = Diagnostics::new();
+        let lib_source = "module lib\npub fn read(value: i64) -> i64 = value\n";
+        let main_source = "module main\nimport lib\nfn main() -> i32 = 0\n";
+        let lib_tokens = tokenize(1, lib_source, &mut diagnostics);
+        let lib = parse_file(lib_tokens, &mut diagnostics);
+        let main_tokens = tokenize(0, main_source, &mut diagnostics);
+        let main = parse_file(main_tokens, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture parse failed: {:?}",
+            diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+        );
+        let modules = [
+            Module {
+                path: "lib".to_string(),
+                file: &lib,
+                is_entry: false,
+                interface_only: true,
+            },
+            Module {
+                path: "main".to_string(),
+                file: &main,
+                is_entry: true,
+                interface_only: false,
+            },
+        ];
+
+        for (provided, expected) in [
+            (Some(FnEffect::Pure), FnEffect::Pure),
+            (Some(FnEffect::Impure), FnEffect::Impure),
+            (Some(FnEffect::Unknown), FnEffect::Unknown),
+            (None, FnEffect::Impure),
+        ] {
+            let mut external_effects = HashMap::new();
+            if let Some(effect) = provided {
+                external_effects.insert("lib$read".to_string(), effect);
+            }
+            let mut diagnostics = Diagnostics::new();
+            let program = check_program_with_interface_facts(
+                &modules,
+                &external_effects,
+                &HashMap::new(),
+                &mut diagnostics,
+            );
+            assert!(
+                !diagnostics.has_errors(),
+                "imported effect fixture failed for {provided:?}: {:?}",
+                diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+            );
+            let imported = program
+                .imported_fns
+                .iter()
+                .find(|function| function.name == "lib$read")
+                .expect("imported declaration");
+            assert_eq!(imported.effect, expected, "provided effect: {provided:?}");
+        }
+    }
+
+    #[test]
+    fn non_entry_public_function_origin_is_exportable() {
+        let mut diagnostics = Diagnostics::new();
+        let lib_source = "module lib\npub fn exported(value: i64) -> i64 = value\n";
+        let main_source = "module main\nimport lib\nfn main() -> i32 = 0\n";
+        let lib_tokens = tokenize(1, lib_source, &mut diagnostics);
+        let lib = parse_file(lib_tokens, &mut diagnostics);
+        let main_tokens = tokenize(0, main_source, &mut diagnostics);
+        let main = parse_file(main_tokens, &mut diagnostics);
+        let modules = [
+            Module {
+                path: "lib".to_string(),
+                file: &lib,
+                is_entry: false,
+                interface_only: false,
+            },
+            Module {
+                path: "main".to_string(),
+                file: &main,
+                is_entry: true,
+                interface_only: false,
+            },
+        ];
+        let program = check_program(&modules, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "fixture failed: {:?}",
+            diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+        );
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "lib$exported")
+            .expect("non-entry public source function");
+        assert_eq!(
+            function.origin,
+            hir::FnOrigin::Source {
+                is_entry: false,
+                is_public: true,
+            }
+        );
+        assert!(function.origin.is_exportable());
     }
 
     #[test]
@@ -35303,7 +35491,9 @@ fn rejected_heap_scan() -> i64 = loop {
         let lambda = program
             .fns
             .iter()
-            .find(|function| function.lifted_capture_count == Some(0))
+            .find(|function| {
+                matches!(function.origin, hir::FnOrigin::Lifted { capture_count: 0 })
+            })
             .expect("lifted rejected lambda");
         let rejected_lambda = &lambda.body.stmts[0];
         assert_eq!(int_break(rejected_lambda), (13, false));

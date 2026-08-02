@@ -3131,7 +3131,7 @@ per-unit codegen + N-object link
 until S2b flips them): `build_per_unit` walks the DAG bottom-up producing one `PerUnitArtifact`
 (per-unit MIR + summary + dep hashes) per cleanly-checked unit; a new `alignc build-per-unit` verb
 links the N objects. Visibility model wired end-to-end: a non-entry `pub` user fn gets `external`
-linkage (`hir::Fn.exportable` → `mir::Function.exportable`, set only by `lower_program_per_unit`;
+linkage (`hir::FnOrigin::is_exportable()` → `mir::Function.exportable`, set only by `lower_program_per_unit`;
 whole-program `lower_program` forces every fn internal for byte-identity), the entry unit's fns stay
 internal (nothing imports the entry — this is also what makes N=1 byte-identical), and every
 non-generic `pub` declaration from an interface-only dependency becomes an external Align-ABI

@@ -122,6 +122,9 @@ pub struct ImportedFn {
     pub ret: Ty,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
+    /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
+    /// after declaration validation because the six-field imported ABI record is unchanged.
+    pub effect: crate::FnEffect,
 }
 
 #[derive(Clone, Debug)]
@@ -248,14 +251,25 @@ pub struct FieldDef {
     pub ty: Ty,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FnOrigin {
+    Source { is_entry: bool, is_public: bool },
+    Monomorph,
+    Lifted { capture_count: u32 },
+}
+
+impl FnOrigin {
+    pub fn is_exportable(self) -> bool {
+        matches!(self, Self::Source { is_entry: false, is_public: true })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Fn {
     pub name: String,
-    /// `None` for a source-named function or generic monomorph. A lifted lambda records
-    /// `Some(capture_count)`, including `Some(0)` for a non-capturing lambda. L2b-a1 uses the
-    /// explicit origin bit to defer the distinct capture-root domain; L2b-b will use the count to
-    /// split explicit parameters from trailing capture parameters.
-    pub lifted_capture_count: Option<usize>,
+    /// The producer origin of this stored function. This is HIR-only metadata: MIR derives its
+    /// existing per-unit exportability bit from it and does not persist the origin itself.
+    pub origin: FnOrigin,
     /// Parameter locals, in declaration order. Each is also present in `locals`.
     pub params: Vec<LocalId>,
     /// Parameter access modes, parallel to [`Self::params`].
@@ -279,13 +293,6 @@ pub struct Fn {
     /// lowering uses the per-branch facts to build a runtime ownership join; direct local moves
     /// still forward their path-local flag instead of consulting this conservative table.
     pub drop_individual_exprs: std::collections::HashMap<Span, bool>,
-    /// M15 S2: this is a non-entry, non-generic `pub` **user** function — a candidate external
-    /// symbol under separate compilation (its `module$name` mangling is globally collision-free).
-    /// The *fact* is mode-independent; whether it actually gets `external` linkage is decided at
-    /// lowering (whole-program lowering forces every function `internal` for byte-identity; per-unit
-    /// lowering honors this bit). `false` for the entry unit's functions (nothing imports the
-    /// entry), monomorphs, and lifted lambdas.
-    pub exportable: bool,
 }
 
 #[derive(Clone, Debug)]

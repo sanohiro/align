@@ -5,9 +5,10 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-02. `main` includes the shipped wave through #688 and the merged am-p
-placement-validation PR #690 (`39f9c7d`). The current resumable branch is
-`feat/am-n-nominal-link`, implementing the next am-n nominal/link slice.
+_Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
+placement-validation PR #690 (`39f9c7d`) and am-n nominal/link PR #691 (`755cb9c`). The current
+resumable branch is `feat/am-h-declarations-headers`, implementing the next am-h
+declarations/headers slice.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -409,9 +410,10 @@ contract fixes, graph-valid negative fixtures, four lowering-entrypoint parity, 
 ledger are one atomic boundary; an intermediate split would either publish an unvalidated entrypoint
 or leave the reviewed producer/validator matrix without its required owner evidence.
 
-### am-n implementation checkpoint (2026-08-02)
+### am-n shipped checkpoint (2026-08-02)
 
-The am-n implementation is active on `feat/am-n-nominal-link`. MIR now validates struct/enum
+The am-n implementation shipped in PR #691 (`755cb9c`), after am-p shipped in PR #690
+(`39f9c7d`). MIR now validates struct/enum
 identity text, combined internal-name collisions, ASCII member names, repeated source-name
 structural equality, tuple interning uniqueness, alignment, enum field bases, and link-library
 names before all four HIR-to-MIR entrypoints copy HIR. Source-shape comparison uses an explicit
@@ -437,8 +439,54 @@ required benchmark row is implemented, but this host cannot run the release harn
 `llvm-config-22` is absent. The current diff is about 940 changed lines:
 the validator, four-entrypoint owner matrix, shared-graph regression, and benchmark are one atomic
 am-n boundary, so splitting it would leave an activated identity gate without its complete owner
-evidence. The author self-review is complete; remaining work is the final pre-PR stamp, then one
-bounded post-open review cycle for the am-n SHA.
+evidence. The author self-review, pre-PR stamp, CI, post-open host/independent review records,
+and final attestation all bind to the merged am-n SHA. The branch is now reset to the next am-h
+slice.
+
+### am-h implementation checkpoint (2026-08-02)
+
+The next slice is am-h declarations and headers. It activates body-independent validation for
+externs, imported functions, stored functions, `main`, locals, parameter modes, return-borrow and
+return-region summaries, and structural drop-set records. Imported interface facts gain a
+normalized `FnEffect`: a present compatibility-map entry is copied as-is, while an absent entry
+becomes `Impure`. HIR retains that fact for validation and MIR strips it after validation so the
+existing six-field imported declaration and its structural Debug bytes, interface bytes,
+`impl_hash`, and cache identity remain unchanged. `FnOrigin` replaces the overloaded
+`lifted_capture_count`/`exportable` pair and is derived before per-unit export decisions.
+
+The public contract and owner evidence are recorded in the am-h ledger and implementation
+closure matrix in `docs/impl/17-library-boundary-prerequisites.md`; the universal malformed-record
+rules are in `docs/impl/19-hir-validation-ledger.md`. A fresh independent adversarial review of
+the completed matrix returned `CLEAN`; its record is
+`.git/align-am-h-matrix-review-2026-08-02.log`. The intended owner tests are
+`malformed_hir_declaration_header_metadata_fails_closed`,
+`main_header_abi_matrix_is_exhaustive`,
+`valid_hir_declaration_header_preflight_is_mir_identity`, imported-effect normalization twins,
+deep signature/summary twins, and the `mir-header-validation` benchmark row. The first fresh
+independent am-h preflight found one valid P2 in the parameter-id mutation fixture; the baseline
+now contains a valid non-parameter local so that mutation reaches the header validator. A second
+fresh review found two P2s: capture-count rollback now truncates nested lifted functions, and the
+matrix now covers duplicate declaration names, FnTy mode/summary fields, root order/range/
+borrowability, drop-set ranges, and the full main/Error ABI matrix. The final fresh review is
+required on this revised tree. A follow-up Galileo review was run against the revised worktree
+but returned no verdict after repeated bounded waits and no findings were reported; it was stopped
+as an incomplete review, not treated as CLEAN. The final review must start from the committed SHA
+and record its last completed scope if its bound is reached.
+The current am-h worktree delta is 1,445 changed hand-written lines under `crates/`, above the
+750–950 estimate and the roughly 1,000-line throughput target. The count includes the common
+validator, its all-entrypoint mutation matrix, the expanded exact header/ABI matrix, the
+producer/effect migration and every consumer, the distinct MIR imported record, and the
+codec/producer owners. It cannot be split safely: a producer-only slice would need a temporary
+old/new HIR representation, a validator-only slice would leave the overloaded origin pair, and a
+MIR-only slice would publish an unvalidated effect; the reviewed am-h matrix therefore keeps this
+as one atomic vertical boundary.
+
+The standalone benchmark now checks and runs with the repository LLVM 22 path. Its release
+`provenance` run reported `mir-header-validation 0.730 ms/valid+malformed-lower` for 257
+functions, alongside the unchanged global-type, nominal/link, continuation, and interface rows.
+The revised header owner test compiled but its macOS test binary again paused in dyld startup
+(CPU 0, no output after sampling) and was stopped; this host limitation is recorded with the
+successful compile and benchmark evidence rather than treated as a test pass.
 
 #660's final verification records 48/48 `align_driver` `par_map` tests,
 including 65,537-element worker-range tests for both materializing chunks and
@@ -803,7 +851,7 @@ return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L
 then L2e
 mutable borrow/out and all-peer
 exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; #690 now lands am-p, and am-n is the next implementation slice. The required milestone order
+#678; #690 lands am-p, #691 lands am-n, and am-h is the next implementation slice. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
