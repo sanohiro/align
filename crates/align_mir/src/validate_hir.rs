@@ -43,12 +43,12 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
 /// Am-b1 through am-b3 own this body range; am-b4 owns the single public activation and the
 /// replay of ownership, Drop, effects, and wait proofs. The shared MIR gate calls this helper
 /// before replay so malformed body structure cannot reach the semantic analyses.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
     global_type_metadata_is_valid(program)
         && type_placement_metadata_is_valid(program)
         && nominal_link_metadata_is_valid(program)
-        && body_only_metadata_is_valid(program)
+        && body_core::validate_for_fixtures(program)
 }
 
 /// Validate only stored body records after the shared gate has already checked the program-wide
@@ -2069,6 +2069,11 @@ mod body_core {
         BodyValidator::new(program).validate()
     }
 
+    #[cfg(test)]
+    pub(super) fn validate_for_fixtures(program: &hir::Program) -> bool {
+        BodyValidator::new_for_body_fixtures(program).validate()
+    }
+
 #[derive(Clone, Copy)]
 struct SpawnContext {
     fallible: bool,
@@ -2155,6 +2160,274 @@ enum BodyWork<'a> {
     ExitArm(&'a hir::MatchArm),
 }
 
+enum LocalScopeWork<'a> {
+    EnterBlock(&'a hir::Block),
+    ExitBlock,
+    EnterStmt(&'a hir::Stmt),
+    Bind(hir::LocalId),
+    EnterExpr(&'a hir::Expr),
+    EnterArm(&'a hir::MatchArm),
+    ExitArm,
+}
+
+/// Replays source lexical scopes over stored HIR without using the process stack.
+///
+/// HIR stores locals in one function-wide table, but sema makes a binding visible only after its
+/// initializer and only until the enclosing block/arm ends. The structural body walk validates
+/// local ids and types; this pass supplies the missing path-local visibility/definite-init fact so
+/// a branch-local slot cannot be loaded from an outer fallthrough path. Every binding is created
+/// with an initializer (or a match payload), so `initialized` is deliberately advanced at the same
+/// event as `visible` and restored at the matching lexical boundary.
+struct LocalScopeValidator<'a> {
+    function: &'a hir::Fn,
+    implicit_params: Option<HashSet<hir::LocalId>>,
+    visible: Vec<bool>,
+    initialized: Vec<bool>,
+    scopes: Vec<Vec<hir::LocalId>>,
+}
+
+impl<'a> LocalScopeValidator<'a> {
+    fn new(
+        function: &'a hir::Fn,
+        implicit_params: Option<HashSet<hir::LocalId>>,
+    ) -> Self {
+        Self {
+            function,
+            implicit_params,
+            visible: vec![false; function.locals.len()],
+            initialized: vec![false; function.locals.len()],
+            scopes: Vec::new(),
+        }
+    }
+
+    fn validate(mut self) -> bool {
+        for &parameter in &self.function.params {
+            if !self.activate_parameter(parameter) {
+                return false;
+            }
+        }
+        if let Some(implicit_params) = &self.implicit_params {
+            let implicit = self
+                .function
+                .locals
+                .iter()
+                .filter(|local| implicit_params.contains(&local.id))
+                .map(|local| local.id)
+                .collect::<Vec<_>>();
+            for local in implicit {
+                if !self
+                    .visible
+                    .get(local as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    && !self
+                        .activate_parameter(local)
+                {
+                    return false;
+                }
+            }
+        }
+        let mut work = vec![LocalScopeWork::EnterBlock(&self.function.body)];
+        while let Some(item) = work.pop() {
+            match item {
+                LocalScopeWork::EnterBlock(block) => {
+                    self.scopes.push(Vec::new());
+                    work.push(LocalScopeWork::ExitBlock);
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(LocalScopeWork::EnterExpr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(LocalScopeWork::EnterStmt(statement));
+                    }
+                }
+                LocalScopeWork::ExitBlock => {
+                    if !self.restore_scope() {
+                        return false;
+                    }
+                }
+                LocalScopeWork::EnterStmt(statement) => {
+                    if !self.statement_target_is_initialized(statement) {
+                        return false;
+                    }
+                    match statement {
+                        hir::Stmt::Let { local, init } => {
+                            work.push(LocalScopeWork::Bind(*local));
+                            work.push(LocalScopeWork::EnterExpr(init));
+                        }
+                        hir::Stmt::LetTuple { locals, init, .. } => {
+                            for local in locals.iter().rev().flatten() {
+                                work.push(LocalScopeWork::Bind(*local));
+                            }
+                            work.push(LocalScopeWork::EnterExpr(init));
+                        }
+                        _ => {
+                            for child in statement_children(statement).into_iter().rev() {
+                                work.push(LocalScopeWork::EnterExpr(child));
+                            }
+                        }
+                    }
+                }
+                LocalScopeWork::Bind(local) => {
+                    if !self.activate_binding(local) {
+                        return false;
+                    }
+                }
+                LocalScopeWork::EnterExpr(expression) => {
+                    if !self.expression_locals_are_initialized(expression) {
+                        return false;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(LocalScopeWork::EnterBlock(block));
+                        }
+                        hir::ExprKind::If { cond, then, els } => {
+                            work.push(LocalScopeWork::EnterBlock(els));
+                            work.push(LocalScopeWork::EnterBlock(then));
+                            work.push(LocalScopeWork::EnterExpr(cond));
+                        }
+                        hir::ExprKind::Match { scrutinee, arms } => {
+                            for arm in arms.iter().rev() {
+                                work.push(LocalScopeWork::EnterArm(arm));
+                            }
+                            work.push(LocalScopeWork::EnterExpr(scrutinee));
+                        }
+                        _ => {
+                            for child in align_sema::direct_expr_children(expression)
+                                .into_iter()
+                                .rev()
+                            {
+                                work.push(LocalScopeWork::EnterExpr(child));
+                            }
+                        }
+                    }
+                }
+                LocalScopeWork::EnterArm(arm) => {
+                    self.scopes.push(Vec::new());
+                    for &binding in &arm.bindings {
+                        if !self.activate_binding(binding) {
+                            return false;
+                        }
+                    }
+                    work.push(LocalScopeWork::ExitArm);
+                    work.push(LocalScopeWork::EnterExpr(&arm.body));
+                }
+                LocalScopeWork::ExitArm => {
+                    if !self.restore_scope() {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.scopes.is_empty()
+    }
+
+    fn activate_parameter(&mut self, local: hir::LocalId) -> bool {
+        let Some(index) = usize::try_from(local).ok() else {
+            return false;
+        };
+        let Some(visible) = self.visible.get_mut(index) else {
+            return false;
+        };
+        let Some(initialized) = self.initialized.get_mut(index) else {
+            return false;
+        };
+        if *visible {
+            return false;
+        }
+        *visible = true;
+        *initialized = true;
+        true
+    }
+
+    fn activate_binding(&mut self, local: hir::LocalId) -> bool {
+        let Some(index) = usize::try_from(local).ok() else {
+            return false;
+        };
+        let Some(scope) = self.scopes.last_mut() else {
+            return false;
+        };
+        let Some(visible) = self.visible.get_mut(index) else {
+            return false;
+        };
+        let Some(initialized) = self.initialized.get_mut(index) else {
+            return false;
+        };
+        if *visible {
+            return false;
+        }
+        *visible = true;
+        *initialized = true;
+        scope.push(local);
+        true
+    }
+
+    fn restore_scope(&mut self) -> bool {
+        let Some(locals) = self.scopes.pop() else {
+            return false;
+        };
+        for local in locals {
+            let Some(index) = usize::try_from(local).ok() else {
+                return false;
+            };
+            let Some(visible) = self.visible.get_mut(index) else {
+                return false;
+            };
+            let Some(initialized) = self.initialized.get_mut(index) else {
+                return false;
+            };
+            if !*visible || !*initialized {
+                return false;
+            }
+            *visible = false;
+            *initialized = false;
+        }
+        true
+    }
+
+    fn local_is_initialized(&self, local: hir::LocalId) -> bool {
+        usize::try_from(local)
+            .ok()
+            .and_then(|index| self.visible.get(index).zip(self.initialized.get(index)))
+            .is_some_and(|(&visible, &initialized)| visible && initialized)
+    }
+
+    fn statement_target_is_initialized(&self, statement: &hir::Stmt) -> bool {
+        match statement {
+            hir::Stmt::Assign { local, .. }
+            | hir::Stmt::AssignIndex { base: local, .. }
+            | hir::Stmt::AssignVecLane { local, .. }
+            | hir::Stmt::AssignField { root: local, .. }
+            | hir::Stmt::AssignElemField { base: local, .. }
+            | hir::Stmt::AssignElem { base: local, .. } => {
+                self.local_is_initialized(*local)
+            }
+            hir::Stmt::Let { .. }
+            | hir::Stmt::LetTuple { .. }
+            | hir::Stmt::Return(_)
+            | hir::Stmt::Break { .. }
+            | hir::Stmt::Expr(_) => true,
+        }
+    }
+
+    fn expression_locals_are_initialized(&self, expression: &hir::Expr) -> bool {
+        let local = match &expression.kind {
+            hir::ExprKind::Local(local)
+            | hir::ExprKind::Field { root: local, .. }
+            | hir::ExprKind::SoaColumn { base: local, .. }
+            | hir::ExprKind::IndexField { base: local, .. }
+            | hir::ExprKind::ArrayGroupAgg { base: local, .. }
+            | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
+            | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
+            _ => None,
+        };
+        local.is_none_or(|local| self.local_is_initialized(local))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BodyJsonRoot {
     Struct(u32),
@@ -2178,6 +2451,7 @@ enum BodyJsonWork {
 
 struct BodyValidator<'a> {
     program: &'a hir::Program,
+    allow_implicit_local_params: bool,
     placement: PlacementValidator<'a>,
     exprs: HashMap<usize, BodyFlow>,
     blocks: HashMap<usize, BodyFlow>,
@@ -2197,8 +2471,21 @@ fn tagged_type_as_ty(program: &hir::Program, id: u32) -> Option<Ty> {
 
 impl<'a> BodyValidator<'a> {
     fn new(program: &'a hir::Program) -> Self {
+        Self::with_implicit_local_params(program, false)
+    }
+
+    #[cfg(test)]
+    fn new_for_body_fixtures(program: &'a hir::Program) -> Self {
+        Self::with_implicit_local_params(program, true)
+    }
+
+    fn with_implicit_local_params(
+        program: &'a hir::Program,
+        allow_implicit_local_params: bool,
+    ) -> Self {
         Self {
             program,
+            allow_implicit_local_params,
             placement: PlacementValidator::new(program),
             exprs: HashMap::new(),
             blocks: HashMap::new(),
@@ -2226,6 +2513,21 @@ impl<'a> BodyValidator<'a> {
                 pooled_initializer: None,
             };
             if !self.walk_block(&function.body, context.clone()) {
+                return false;
+            }
+            let implicit_params = self.allow_implicit_local_params.then(|| {
+                function
+                    .locals
+                    .iter()
+                    .filter(|local| {
+                        !self
+                            .binding_counts
+                            .contains_key(&(function_index, local.id))
+                    })
+                    .map(|local| local.id)
+                    .collect::<HashSet<_>>()
+            });
+            if !LocalScopeValidator::new(function, implicit_params).validate() {
                 return false;
             }
             if !self.bindings_valid(function_index, function) {
@@ -4832,7 +5134,7 @@ impl<'a> BodyValidator<'a> {
                     }
                     if scrutinee_flow.falls && flow.falls {
                         any_arm_falls = true;
-                        if result.is_some_and(|ty| ty != flow.ty) {
+                        if result.is_some_and(|ty| !self.body_ty_matches(ty, flow.ty)) {
                             return None;
                         }
                         result = Some(flow.ty);

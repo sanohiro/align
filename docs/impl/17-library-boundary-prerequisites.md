@@ -2371,7 +2371,12 @@ merge dormant validator modules plus exhaustive direct unit tests; they do not c
 lowering entrypoint and make no malformed-HIR promise. Am-b4 completes ownership correlation,
 effect correlation, proves the total discriminator inventory, activates the assembled validator in
 every entrypoint, and adds valid-HIR byte identity, canonical-empty rejection, whole/per-unit
-parity, and cost evidence. Effect correlation replays the existing source-order effect fixed point
+parity, and cost evidence. Its final body pass also replays lexical local visibility and definite
+initialization: parameters enter at function entry, initializers precede `Let`/`LetTuple` bindings,
+match payloads are arm-local, and block/arm exit removes bindings. Every local read and mutable
+place root must therefore be visible on that source path; a function-wide local table is not enough.
+Value joins use the structural body-type relation, including recursively matching fresh `FnTy`
+cells rather than requiring ordinal identity. Effect correlation replays the existing source-order effect fixed point
 using stored imported effects as the only cross-unit seeds, implicit `Impure` for every extern, and
 body-derived effects for stored source/monomorph/lifted functions. It requires every concrete
 function-value `FnTy.effect` cell, aggregate projection/join cell, result boundary, and parallel
@@ -2453,7 +2458,7 @@ stored field are owner tests; multi-invalid precedence follows the universal ord
 | L2b-a2-am-b1 | Dormant total-validator core: every statement, local/place, ordinary expression/call/aggregate, tagged value, and structured-control record. | direct table-driven unit owner plus deep valid/malformed ordinary-body type relation; no public benchmark row yet |
 | L2b-a2-am-b2 | Dormant storage/vector/array/pipeline/template/JSON validator, including every stage, terminal, capture, and descriptor record. | direct table-driven unit owner plus deep valid/malformed storage/pipeline type relation; no public benchmark row yet |
 | L2b-a2-am-b3 | Dormant native/runtime validator plus generated-callable body facts for all I/O through crypto families. | direct table-driven unit owner plus deep valid/malformed native/generated signature relation; no public benchmark row yet |
-| L2b-a2-am-b4 | Add body-derived Drop/ownership and effect correlation, assert the full inventory, activate all body validation globally, and prove valid identity/four-entrypoint parity. | `malformed_hir_body_metadata_fails_closed`, `checked_hir_body_fact_replay_covers_cleanup_and_function_effects`, `valid_hir_body_preflight_is_mir_identity`, `body_contract_function_return_none`, `body_contract_function_root_completion`, `checked_hir_depth_closure_matrix`, `deep_hir_body_core_type_dag_is_stack_bounded`, whole/per-unit codegen; `mir-body-validation` |
+| L2b-a2-am-b4 | Add body-derived Drop/ownership and effect correlation, assert the full inventory, activate all body validation globally, replay lexical visibility/definite initialization, use structural value joins for fresh callable cells, and prove valid identity/four-entrypoint parity. | `malformed_hir_body_metadata_fails_closed`, `checked_hir_body_fact_replay_covers_cleanup_and_function_effects`, `valid_hir_body_preflight_is_mir_identity`, `body_contract_function_return_none`, `body_contract_function_root_completion`, `hir_body_validator_accepts_structural_function_value_match_join`, `hir_body_validator_rejects_out_of_scope_local_use`, `checked_hir_depth_closure_matrix`, `deep_hir_body_core_type_dag_is_stack_bounded`, whole/per-unit codegen; `mir-body-validation` |
 | L2b-a2-am-c | Land typed program/runtime/generated call targets, encoded Align symbols, native registry, generated identities, and all name/collision validation atomically across sema/MIR/codegen and whole/per-unit paths. | callable namespace/collision/golden-symbol suites, deep semantic→bytes→semantic plus malformed deep-reference/truncation owners, and per-unit link parity; `mir-callable-namespace-validation` plus unchanged runtime-call cost |
 
 #### Am-b2a implementation closure matrix

@@ -4550,6 +4550,126 @@ fn hir_body_validator_accepts_function_value_local_specialization() {
 }
 
 #[test]
+fn hir_body_validator_accepts_structural_function_value_match_join() {
+    let fn_one = 1u32;
+    let fn_two = 2u32;
+    let mut program = baseline_program();
+    program.fn_types.extend([fn_type(Ty::Unit), fn_type(Ty::Unit)]);
+    program.fns.push(body_test_named_function(
+        "noop",
+        hir::Block {
+            stmts: Vec::new(),
+            value: None,
+        },
+        Vec::new(),
+        Ty::Unit,
+    ));
+    let match_expr = body_test_expr(
+        hir::ExprKind::Match {
+            scrutinee: Box::new(body_test_expr(
+                hir::ExprKind::EnumValue {
+                    enum_id: 0,
+                    variant: 0,
+                    payload: Vec::new(),
+                },
+                Ty::Enum(0),
+            )),
+            arms: vec![
+                hir::MatchArm {
+                    variants: vec![0],
+                    bindings: Vec::new(),
+                    body: body_test_expr(
+                        hir::ExprKind::FnValue("noop".to_string()),
+                        Ty::Fn(fn_one),
+                    ),
+                },
+                hir::MatchArm {
+                    variants: vec![1],
+                    bindings: vec![1],
+                    body: body_test_expr(
+                        hir::ExprKind::FnValue("noop".to_string()),
+                        Ty::Fn(fn_two),
+                    ),
+                },
+            ],
+        },
+        Ty::Fn(fn_one),
+    );
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: 0,
+                    init: match_expr,
+                },
+                hir::Stmt::Expr(body_test_expr(
+                    hir::ExprKind::CallFnValue {
+                        callee: Box::new(body_test_expr(
+                            hir::ExprKind::Local(0),
+                            Ty::Fn(fn_one),
+                        )),
+                        args: Vec::new(),
+                    },
+                    Ty::Unit,
+                )),
+            ],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        vec![
+            body_test_local(0, "selected", Ty::Fn(fn_one), false, false),
+            body_test_local(1, "ignored", int(64), false, false),
+        ],
+        Ty::Unit,
+    ));
+    assert!(body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_rejects_out_of_scope_local_use() {
+    let integer = int(64);
+    let mut program = baseline_program();
+    program.fns.push(body_test_function(
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::If {
+                    cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+                    then: hir::Block {
+                        stmts: vec![hir::Stmt::Let {
+                            local: 0,
+                            init: body_test_expr(hir::ExprKind::Int(7), integer),
+                        }],
+                        value: None,
+                    },
+                    els: hir::Block {
+                        stmts: Vec::new(),
+                        value: None,
+                    },
+                },
+                Ty::Unit,
+            ))],
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Local(0),
+                integer,
+            ))),
+        },
+        vec![body_test_local(0, "branch_value", integer, false, false)],
+        integer,
+    ));
+    assert!(!validate_hir::body_only_metadata_is_valid(&program));
+
+    let mut unbound = baseline_program();
+    unbound.fns.push(body_tail_case(
+        "unbound_local_use",
+        body_test_expr(hir::ExprKind::Local(0), integer),
+        integer,
+    ));
+    unbound.fns[0]
+        .locals
+        .push(body_test_local(0, "missing", integer, false, false));
+    assert!(!validate_hir::body_only_metadata_is_valid(&unbound));
+}
+
+#[test]
 fn hir_body_validator_accepts_nested_tagged_payload_construction() {
     let program = checked_source_program(
         "Output { text: string, note: Option<string> }\n\

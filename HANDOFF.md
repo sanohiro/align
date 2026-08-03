@@ -39,10 +39,11 @@ CLEAN. Preserve its log, elapsed time, process state, and last completed area; c
 the unfinished or changed slice. A longer user-approved duration extends that invocation only and
 does not authorize polling, restart chains, or a duplicate broad review. This is also a standing
 guardrail in `CLAUDE.md`/`AGENTS.md`.
-The current follow-up tree has passed the MIR library owner (92/92), nested tagged-payload driver
+The current follow-up tree has passed the MIR library owner (94/94), nested tagged-payload driver
 owner (8/8), copy-collection owner (6/6), replay-clone owners (4/4), and targeted `align_sema`/
 `align_mir` Clippy with `-D warnings`; its final exact-base review is pending after the fix
-checkpoint is committed.
+checkpoint is committed. The driver owners required one explicit `align_runtime` build in the
+dedicated target directory before linking; the reruns passed without source changes.
 The one host-native review invocation for the follow-up range
 `62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
 Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as
@@ -55,6 +56,12 @@ scope, but reached its single 600-second bound without a verdict. It is preserve
 `.git/am-b4-followup-path-fixed.log` and remains INCOMPLETE; no pre-PR stamp or PR was created.
 The subsequent fresh independent review of `origin/main...8bb574f` also reached its 120-second
 bound without a verdict; it is recorded as INCOMPLETE in `.git/am-b4-activation-review-incomplete.log`.
+A later fresh independent review of the complete `origin/main...88bdfa3` diff found two valid
+follow-up issues: strict production body validation did not replay lexical local visibility and
+definite initialization, and `match` result joins still compared fresh `FnTy` ids nominally. The
+current follow-up adds the strict iterative scope pass, structural join matching, and one owner for
+each; the ledger now records both closure rules. No review verdict is inferred from the earlier
+incomplete host invocations.
 The narrow `align_sema` test binary was then launched directly with a dedicated `TMPDIR`, fixed
 `DEVELOPER_DIR`, and the prior dyld setting; it still produced no listing within 20 seconds and is
 recorded as INCOMPLETE in `.git/am-b4-followup-body-incomplete.log`.
