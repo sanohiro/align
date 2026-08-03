@@ -43,11 +43,20 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
 /// Am-b1 through am-b3 own this body range; am-b4 owns the single public activation and the
 /// replay of ownership, Drop, effects, and wait proofs. The shared MIR gate calls this helper
 /// before replay so malformed body structure cannot reach the semantic analyses.
+#[allow(dead_code)]
 pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
     global_type_metadata_is_valid(program)
         && type_placement_metadata_is_valid(program)
         && nominal_link_metadata_is_valid(program)
-        && body_core::validate(program)
+        && body_only_metadata_is_valid(program)
+}
+
+/// Validate only stored body records after the shared gate has already checked the program-wide
+/// type, placement, and nominal tables. The public owner helper above keeps its standalone
+/// fail-closed contract for direct tests; MIR activation calls this body-only form so each global
+/// table is traversed once per lowering entrypoint.
+pub(crate) fn body_only_metadata_is_valid(program: &hir::Program) -> bool {
+    body_core::validate(program)
 }
 
 #[cfg(test)]
@@ -222,14 +231,12 @@ impl<'a> DeclarationValidator<'a> {
     fn locals_valid(&self, function: &hir::Fn) -> bool {
         let parameter_ids: HashSet<hir::LocalId> = function.params.iter().copied().collect();
         let lifted = matches!(function.origin, hir::FnOrigin::Lifted { .. });
-        let mut names = HashSet::new();
         for (index, local) in function.locals.iter().enumerate() {
             let Ok(index) = u32::try_from(index) else {
                 return false;
             };
             if local.id != index
                 || !valid_local_name(&local.name)
-                || !names.insert(local.name.as_str())
                 || local.align.is_some_and(|align| {
                     !align.is_power_of_two() || align > (1u32 << 29)
                 })
@@ -2075,13 +2082,20 @@ struct BodyContext {
     arena_depth: u32,
     task_depth: u32,
     task_group_fallible: Vec<bool>,
-    loop_targets: Vec<Ty>,
+    loop_targets: Vec<LoopTarget>,
     spawn: Option<SpawnContext>,
     /// A pooled array literal is valid only as the direct initializer of the named immutable
     /// local.  The producer records no separate parent pointer in HIR, so the worklist carries
     /// this one narrow lexical fact while entering a `let` initializer and clears it for every
     /// retained child.
     pooled_initializer: Option<hir::LocalId>,
+}
+
+#[derive(Clone, Copy)]
+struct LoopTarget {
+    ty: Ty,
+    arena_depth: u32,
+    task_depth: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -2093,6 +2107,33 @@ struct BodyFlow {
     falls: bool,
     /// Accepted breaks that can reach the enclosing loop.  A nested Loop consumes its own breaks.
     breaks: Vec<Ty>,
+}
+
+#[derive(Clone, Copy)]
+struct ProducerFlow {
+    /// Whether the source-level control flow can reach the end of this record. This intentionally
+    /// follows sema's loop discriminator, where process exit/abort are ordinary calls rather than
+    /// syntax-level divergence; MIR's stricter lowering flow remains in [`BodyFlow`].
+    falls: bool,
+    /// Whether an accepted break targeting the current enclosing loop is reachable.
+    reaches_break: bool,
+}
+
+impl ProducerFlow {
+    const FALLS: Self = Self {
+        falls: true,
+        reaches_break: false,
+    };
+
+    fn sequence(self, next: Self) -> Self {
+        if !self.falls {
+            return self;
+        }
+        Self {
+            falls: next.falls,
+            reaches_break: self.reaches_break || next.reaches_break,
+        }
+    }
 }
 
 struct BodySignature {
@@ -2143,6 +2184,15 @@ struct BodyValidator<'a> {
     statements: HashMap<usize, BodyFlow>,
     arms: HashMap<usize, BodyFlow>,
     binding_counts: HashMap<(usize, hir::LocalId), usize>,
+    producer_exprs: HashMap<usize, ProducerFlow>,
+    producer_blocks: HashMap<usize, ProducerFlow>,
+}
+
+fn tagged_type_as_ty(program: &hir::Program, id: u32) -> Option<Ty> {
+    match program.tagged_types.get(id as usize)? {
+        hir::TaggedType::Option(payload) => Some(Ty::Option(*payload)),
+        hir::TaggedType::Result(ok, error) => Some(Ty::Result(*ok, *error)),
+    }
 }
 
 impl<'a> BodyValidator<'a> {
@@ -2155,6 +2205,8 @@ impl<'a> BodyValidator<'a> {
             statements: HashMap::new(),
             arms: HashMap::new(),
             binding_counts: HashMap::new(),
+            producer_exprs: HashMap::new(),
+            producer_blocks: HashMap::new(),
         }
     }
 
@@ -2377,42 +2429,121 @@ impl<'a> BodyValidator<'a> {
     /// Compare stored body types using the source-level function-value relation. Sema gives a
     /// local function value a fresh `FnTy` cell so its inferred effect can be solved independently
     /// of the initializer; the initializer and local therefore can have different `Ty::Fn` ids
-    /// while retaining the same callable ABI. All other body types use canonical ids and must
-    /// match exactly.
+    /// while retaining the same callable ABI. The relation is carried through scalar containers
+    /// and anonymous tagged payloads, so a fresh function-value cell cannot make an otherwise
+    /// valid array, enum, struct, option, result, or function signature fail closed.
     fn body_ty_matches(&self, actual: Ty, expected: Ty) -> bool {
-        let mut work = vec![(actual, expected)];
-        let mut seen = HashSet::new();
-        while let Some((actual, expected)) = work.pop() {
-            if actual == expected || !seen.insert((actual, expected)) {
-                continue;
+        #[derive(Clone, Copy)]
+        enum Pending {
+            Ty(Ty, Ty),
+            Scalar(Scalar, Scalar),
+        }
+
+        let mut work = vec![Pending::Ty(actual, expected)];
+        let mut seen_tys = HashSet::new();
+        let mut seen_scalars = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Pending::Ty(actual, expected) => {
+                    if actual == expected || !seen_tys.insert((actual, expected)) {
+                        continue;
+                    }
+                    match (actual, expected) {
+                        (Ty::Fn(actual_id), Ty::Fn(expected_id)) => {
+                            let Some(actual_fn) = self.program.fn_types.get(actual_id as usize)
+                            else {
+                                return false;
+                            };
+                            let Some(expected_fn) = self.program.fn_types.get(expected_id as usize)
+                            else {
+                                return false;
+                            };
+                            if actual_fn.params.len() != expected_fn.params.len()
+                                || actual_fn
+                                    .params
+                                    .iter()
+                                    .zip(&expected_fn.params)
+                                    .any(|((actual_mode, _), (expected_mode, _))| {
+                                        actual_mode != expected_mode
+                                    })
+                            {
+                                return false;
+                            }
+                            let actual_params = actual_fn.params.clone();
+                            let expected_params = expected_fn.params.clone();
+                            let actual_ret = actual_fn.ret;
+                            let expected_ret = expected_fn.ret;
+                            for ((_, actual), (_, expected)) in
+                                actual_params.into_iter().zip(expected_params)
+                            {
+                                work.push(Pending::Scalar(actual, expected));
+                            }
+                            work.push(Pending::Ty(actual_ret, expected_ret));
+                        }
+                        (Ty::Tagged(actual_id), expected) => {
+                            let Some(actual) = tagged_type_as_ty(self.program, actual_id) else {
+                                return false;
+                            };
+                            work.push(Pending::Ty(actual, expected));
+                        }
+                        (actual, Ty::Tagged(expected_id)) => {
+                            let Some(expected) = tagged_type_as_ty(self.program, expected_id)
+                            else {
+                                return false;
+                            };
+                            work.push(Pending::Ty(actual, expected));
+                        }
+                        (Ty::Option(actual), Ty::Option(expected))
+                        | (Ty::Box(actual), Ty::Box(expected))
+                        | (Ty::Slice(actual), Ty::Slice(expected))
+                        | (Ty::DynArray(actual), Ty::DynArray(expected))
+                        | (Ty::Task(actual), Ty::Task(expected))
+                        | (Ty::ArrayBuilder(actual), Ty::ArrayBuilder(expected)) => {
+                            work.push(Pending::Scalar(actual, expected));
+                        }
+                        (Ty::Result(actual_ok, actual_err), Ty::Result(expected_ok, expected_err)) => {
+                            work.push(Pending::Scalar(actual_ok, expected_ok));
+                            work.push(Pending::Scalar(actual_err, expected_err));
+                        }
+                        (Ty::Array(actual, actual_len), Ty::Array(expected, expected_len))
+                        | (Ty::Vec(actual, actual_len), Ty::Vec(expected, expected_len))
+                        | (Ty::Mask(actual, actual_len), Ty::Mask(expected, expected_len)) => {
+                            if actual_len != expected_len {
+                                return false;
+                            }
+                            work.push(Pending::Scalar(actual, expected));
+                        }
+                        _ => return false,
+                    }
+                }
+                Pending::Scalar(actual, expected) => {
+                    if actual == expected || !seen_scalars.insert((actual, expected)) {
+                        continue;
+                    }
+                    match (actual, expected) {
+                        (Scalar::Fn(actual_id), Scalar::Fn(expected_id)) => {
+                            work.push(Pending::Ty(Ty::Fn(actual_id), Ty::Fn(expected_id)));
+                        }
+                        (Scalar::Tagged(actual_id), Scalar::Tagged(expected_id)) => {
+                            let Some(actual) = tagged_type_as_ty(self.program, actual_id) else {
+                                return false;
+                            };
+                            let Some(expected) = tagged_type_as_ty(self.program, expected_id)
+                            else {
+                                return false;
+                            };
+                            work.push(Pending::Ty(actual, expected));
+                        }
+                        _ => return false,
+                    }
+                }
             }
-            let (Ty::Fn(actual_id), Ty::Fn(expected_id)) = (actual, expected) else {
-                return false;
-            };
-            let Some(actual_fn) = self.program.fn_types.get(actual_id as usize) else {
-                return false;
-            };
-            let Some(expected_fn) = self.program.fn_types.get(expected_id as usize) else {
-                return false;
-            };
-            if actual_fn.params.len() != expected_fn.params.len()
-                || actual_fn
-                    .params
-                    .iter()
-                    .zip(&expected_fn.params)
-                    .any(|((actual_mode, _), (expected_mode, _))| actual_mode != expected_mode)
-            {
-                return false;
-            }
-            for ((_, actual), (_, expected)) in actual_fn.params.iter().zip(&expected_fn.params) {
-                work.push((
-                    align_sema::scalar_to_ty(*actual),
-                    align_sema::scalar_to_ty(*expected),
-                ));
-            }
-            work.push((actual_fn.ret, expected_fn.ret));
         }
         true
+    }
+
+    fn body_scalar_matches(&self, actual: Scalar, expected: Scalar) -> bool {
+        self.body_ty_matches(align_sema::scalar_to_ty(actual), align_sema::scalar_to_ty(expected))
     }
 
     fn body_scalar_ok(&self, scalar: Scalar) -> bool {
@@ -2461,12 +2592,13 @@ impl<'a> BodyValidator<'a> {
         match (actual, expected) {
             (Ty::Option(payload), Scalar::Tagged(id)) => matches!(
                 self.program.tagged_types.get(id as usize),
-                Some(hir::TaggedType::Option(stored)) if *stored == payload
+                Some(hir::TaggedType::Option(stored)) if self.body_scalar_matches(*stored, payload)
             ),
             (Ty::Result(ok, err), Scalar::Tagged(id)) => matches!(
                 self.program.tagged_types.get(id as usize),
                 Some(hir::TaggedType::Result(stored_ok, stored_err))
-                    if *stored_ok == ok && *stored_err == err
+                    if self.body_scalar_matches(*stored_ok, ok)
+                        && self.body_scalar_matches(*stored_err, err)
             ),
             _ => false,
         }
@@ -2478,6 +2610,7 @@ impl<'a> BodyValidator<'a> {
         }
         match ty {
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
+            Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Slice(_) => false,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
@@ -4206,7 +4339,11 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Loop { body, .. } => {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
-                child.loop_targets.push(expression.ty);
+                child.loop_targets.push(LoopTarget {
+                    ty: expression.ty,
+                    arena_depth: context.arena_depth,
+                    task_depth: context.task_depth,
+                });
                 work.push(BodyWork::EnterBlock(body, child));
             }
             hir::ExprKind::ElseUnwrap { opt, fallback } => {
@@ -4503,6 +4640,9 @@ impl<'a> BodyValidator<'a> {
         if !self.body_ty_ok(expression.ty) || !stored_type_matches {
             return false;
         }
+        let Some(producer_flow) = self.producer_expression_flow(expression) else {
+            return false;
+        };
         self.exprs.insert(
             ptr_key(expression),
             BodyFlow {
@@ -4511,6 +4651,8 @@ impl<'a> BodyValidator<'a> {
                 breaks,
             },
         );
+        self.producer_exprs
+            .insert(ptr_key(expression), producer_flow);
         true
     }
 
@@ -4622,7 +4764,7 @@ impl<'a> BodyValidator<'a> {
                 let arg_flows = self.expr_flows(args)?;
                 for (index, ((mode, scalar), arg)) in function.params.iter().zip(&arg_flows).enumerate() {
                     let expected = align_sema::scalar_to_ty(*scalar);
-                    if arg.ty != expected {
+                    if !self.body_ty_matches(arg.ty, expected) {
                         return None;
                     }
                     if *mode == align_ast::ParamMode::Out
@@ -4651,7 +4793,9 @@ impl<'a> BodyValidator<'a> {
                 if flows
                     .iter()
                     .zip(&variant.payload)
-                    .any(|(flow, expected)| flow.ty != align_sema::scalar_to_ty(*expected))
+                    .any(|(flow, expected)| {
+                        !self.body_ty_matches(flow.ty, align_sema::scalar_to_ty(*expected))
+                    })
                 {
                     return None;
                 }
@@ -4844,7 +4988,7 @@ impl<'a> BodyValidator<'a> {
                     .zip(&arg_flows)
                     .enumerate()
                 {
-                    if actual.ty != *expected {
+                    if !self.body_ty_matches(actual.ty, *expected) {
                         return None;
                     }
                     if matches!(mode, align_ast::ParamMode::Out | align_ast::ParamMode::BorrowMut)
@@ -4872,7 +5016,7 @@ impl<'a> BodyValidator<'a> {
                 let result = if !condition.falls {
                     expression.ty
                 } else if then_flow.falls && else_flow.falls {
-                    if then_flow.ty != else_flow.ty {
+                    if !self.body_ty_matches(then_flow.ty, else_flow.ty) {
                         return None;
                     }
                     then_flow.ty
@@ -4891,7 +5035,7 @@ impl<'a> BodyValidator<'a> {
                 if flows
                     .iter()
                     .zip(&definition.fields)
-                    .any(|(flow, field)| flow.ty != field.ty)
+                    .any(|(flow, field)| !self.body_ty_matches(flow.ty, field.ty))
                 {
                     return None;
                 }
@@ -4929,7 +5073,9 @@ impl<'a> BodyValidator<'a> {
                 if flows
                     .iter()
                     .zip(&tuple.elems)
-                    .any(|(flow, expected)| flow.ty != align_sema::scalar_to_ty(*expected))
+                    .any(|(flow, expected)| {
+                        !self.body_ty_matches(flow.ty, align_sema::scalar_to_ty(*expected))
+                    })
                 {
                     return None;
                 }
@@ -4944,7 +5090,7 @@ impl<'a> BodyValidator<'a> {
                 let flows = self.expr_flows(elems)?;
                 let length = u32::try_from(elems.len()).ok()?;
                 if elems.is_empty()
-                    || flows.iter().any(|flow| flow.ty != *elem)
+                    || flows.iter().any(|flow| !self.body_ty_matches(flow.ty, *elem))
                     || !self.array_literal_element_ok(*elem)
                 {
                     return None;
@@ -4953,7 +5099,10 @@ impl<'a> BodyValidator<'a> {
                 match *elem {
                     Ty::Struct(id) => Some((Ty::StructArray(id, length), falls, breaks)),
                     element_ty => {
-                        let scalar = align_sema::ty_to_scalar(element_ty)?;
+                        let scalar = match element_ty {
+                            Ty::Fn(id) => Scalar::Fn(id),
+                            other => align_sema::ty_to_scalar(other)?,
+                        };
                         if matches!(scalar, Scalar::Struct(_)) {
                             return None;
                         }
@@ -5137,8 +5286,15 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::OptionSome(value) => {
                 let flow = self.expr_flow(value)?;
-                let scalar = align_sema::ty_to_scalar(flow.ty)?;
-                Some((Ty::Option(scalar), flow.falls, flow.breaks))
+                let Ty::Option(payload) = expression.ty else {
+                    return None;
+                };
+                if !self.body_scalar_ok(payload)
+                    || !self.result_payload_matches(payload, flow.ty)
+                {
+                    return None;
+                }
+                Some((Ty::Option(payload), flow.falls, flow.breaks))
             }
             hir::ExprKind::OptionNone => {
                 if let Ty::Option(payload) = expression.ty {
@@ -5155,7 +5311,9 @@ impl<'a> BodyValidator<'a> {
                     Ty::Result(ok, _) => ok,
                     _ => return None,
                 };
-                if fallback.falls && fallback.ty != align_sema::scalar_to_ty(payload) {
+                if fallback.falls
+                    && !self.body_ty_matches(fallback.ty, align_sema::scalar_to_ty(payload))
+                {
                     return None;
                 }
                 let mut breaks = option.breaks.clone();
@@ -5205,18 +5363,18 @@ impl<'a> BodyValidator<'a> {
                 ..
             } => {
                 let flow = self.block_flow(body)?;
-                // `diverges` records whether the producer saw an accepted break syntactically.
-                // A break whose payload returns/exits/aborts is accepted but does not contribute
-                // a reachable break flow, so the two bits can legitimately differ. Preserve the
-                // producer distinction while rejecting a forged no-break loop.
-                if *diverges && !flow.breaks.is_empty()
-                    || !*diverges
-                        && flow.breaks.is_empty()
-                        && !self.has_current_loop_break(body)
-                {
+                // `diverges` is the producer's reachable-break discriminator. The separate
+                // presence bit mirrors the producer's `reaches_break` flow, while block
+                // aggregation excludes statements after a non-fallthrough prefix.
+                let has_current_loop_break = self.has_current_loop_break(body);
+                if *diverges == has_current_loop_break {
                     return None;
                 }
-                if !flow.breaks.iter().all(|ty| *ty == expression.ty) {
+                if !flow
+                    .breaks
+                    .iter()
+                    .all(|ty| self.body_ty_matches(*ty, expression.ty))
+                {
                     return None;
                 }
                 Some((expression.ty, !flow.breaks.is_empty(), Vec::new()))
@@ -5353,55 +5511,153 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
-    fn has_current_loop_break(&self, body: &hir::Block) -> bool {
-        enum Work<'a> {
-            Block(&'a hir::Block, usize),
-            Stmt(&'a hir::Stmt, usize),
-            Expr(&'a hir::Expr, usize),
-        }
-        let mut work = vec![Work::Block(body, 0)];
-        while let Some(item) = work.pop() {
-            match item {
-                Work::Block(block, nested_loops) => {
-                    if let Some(value) = block.value.as_deref() {
-                        work.push(Work::Expr(value, nested_loops));
-                    }
-                    for statement in block.stmts.iter().rev() {
-                        work.push(Work::Stmt(statement, nested_loops));
-                    }
-                }
-                Work::Stmt(statement, nested_loops) => {
-                    if nested_loops == 0
-                        && matches!(
-                            statement,
-                            hir::Stmt::Break {
-                                accepted: true,
-                                ..
-                            }
-                        )
-                    {
-                        return true;
-                    }
-                    for child in statement_children(statement).into_iter().rev() {
-                        work.push(Work::Expr(child, nested_loops));
-                    }
-                }
-                Work::Expr(expression, nested_loops) => match &expression.kind {
-                    hir::ExprKind::Loop { body, .. } => {
-                        work.push(Work::Block(body, nested_loops.saturating_add(1)));
-                    }
-                    // A break inside a closure cannot target this loop. Captures are evaluated
-                    // in the enclosing expression but are validated as closure-owned children.
-                    hir::ExprKind::Closure { .. } => {}
-                    _ => {
-                        for child in align_sema::direct_expr_children(expression).into_iter().rev() {
-                            work.push(Work::Expr(child, nested_loops));
-                        }
-                    }
-                },
+    fn producer_children_flow(&self, children: &[&hir::Expr]) -> Option<ProducerFlow> {
+        let mut flow = ProducerFlow::FALLS;
+        for child in children {
+            let child_flow = *self.producer_exprs.get(&ptr_key(*child))?;
+            flow = flow.sequence(child_flow);
+            if !flow.falls {
+                break;
             }
         }
-        false
+        Some(flow)
+    }
+
+    fn producer_statement_flow(&self, statement: &hir::Stmt) -> Option<ProducerFlow> {
+        match statement {
+            hir::Stmt::Return(value) => {
+                let value_flow = value
+                    .as_ref()
+                    .map_or(Some(ProducerFlow::FALLS), |value| {
+                        self.producer_exprs.get(&ptr_key(value)).copied()
+                    })?;
+                Some(ProducerFlow {
+                    falls: false,
+                    reaches_break: value_flow.reaches_break,
+                })
+            }
+            hir::Stmt::Break { value, accepted } => {
+                let value_flow = value
+                    .as_ref()
+                    .map_or(Some(ProducerFlow::FALLS), |value| {
+                        self.producer_exprs.get(&ptr_key(value)).copied()
+                    })?;
+                Some(ProducerFlow {
+                    falls: false,
+                    reaches_break: value_flow.reaches_break
+                        || (value_flow.falls && *accepted),
+                })
+            }
+            _ => self.producer_children_flow(&statement_children(statement)),
+        }
+    }
+
+    fn producer_block_flow(&self, block: &hir::Block) -> Option<ProducerFlow> {
+        let mut flow = ProducerFlow::FALLS;
+        for statement in &block.stmts {
+            if !flow.falls {
+                break;
+            }
+            flow = flow.sequence(self.producer_statement_flow(statement)?);
+        }
+        if flow.falls
+            && let Some(value) = block.value.as_deref()
+        {
+            flow = flow.sequence(*self.producer_exprs.get(&ptr_key(value))?);
+        }
+        Some(flow)
+    }
+
+    fn producer_expression_flow(&self, expression: &hir::Expr) -> Option<ProducerFlow> {
+        match &expression.kind {
+            // Sema's loop reachability helper classifies these as ordinary calls. MIR's body
+            // flow still marks them non-fallthrough so lowering does not emit a dead store.
+            hir::ExprKind::ProcessExit { code } => {
+                let code_flow = *self.producer_exprs.get(&ptr_key(code.as_ref()))?;
+                if !code_flow.falls {
+                    return Some(code_flow);
+                }
+                Some(ProducerFlow {
+                    falls: true,
+                    reaches_break: code_flow.reaches_break,
+                })
+            }
+            hir::ExprKind::ProcessAbort => Some(ProducerFlow::FALLS),
+            // A break in a nested loop belongs to that loop and cannot target this one.
+            hir::ExprKind::Loop { diverges, .. } => Some(ProducerFlow {
+                falls: !diverges,
+                reaches_break: false,
+            }),
+            hir::ExprKind::Block(block)
+            | hir::ExprKind::Arena(block)
+            | hir::ExprKind::TaskGroup(block)
+            | hir::ExprKind::Unsafe(block) => self.producer_block_flow(block),
+            hir::ExprKind::If { cond, then, els } => {
+                let condition = *self.producer_exprs.get(&ptr_key(cond.as_ref()))?;
+                if !condition.falls {
+                    return Some(condition);
+                }
+                let then_flow = self.producer_block_flow(then)?;
+                let else_flow = self.producer_block_flow(els)?;
+                Some(ProducerFlow {
+                    falls: then_flow.falls || else_flow.falls,
+                    reaches_break: condition.reaches_break
+                        || then_flow.reaches_break
+                        || else_flow.reaches_break,
+                })
+            }
+            hir::ExprKind::Match { scrutinee, arms } => {
+                let scrutinee_flow = *self
+                    .producer_exprs
+                    .get(&ptr_key(scrutinee.as_ref()))?;
+                if !scrutinee_flow.falls {
+                    return Some(scrutinee_flow);
+                }
+                let mut falls = false;
+                let mut reaches_break = scrutinee_flow.reaches_break;
+                for arm in arms {
+                    let arm_flow = *self.producer_exprs.get(&ptr_key(&arm.body))?;
+                    falls |= arm_flow.falls;
+                    reaches_break |= arm_flow.reaches_break;
+                }
+                Some(ProducerFlow {
+                    falls,
+                    reaches_break,
+                })
+            }
+            hir::ExprKind::ElseUnwrap { opt, fallback } => {
+                let option_flow = *self.producer_exprs.get(&ptr_key(opt.as_ref()))?;
+                if !option_flow.falls {
+                    return Some(option_flow);
+                }
+                let fallback_flow = *self
+                    .producer_exprs
+                    .get(&ptr_key(fallback.as_ref()))?;
+                Some(ProducerFlow {
+                    falls: true,
+                    reaches_break: option_flow.reaches_break || fallback_flow.reaches_break,
+                })
+            }
+            hir::ExprKind::Binary { op, lhs, rhs } => {
+                let left = *self.producer_exprs.get(&ptr_key(lhs.as_ref()))?;
+                if !left.falls {
+                    return Some(left);
+                }
+                let right = *self.producer_exprs.get(&ptr_key(rhs.as_ref()))?;
+                Some(ProducerFlow {
+                    falls: matches!(op, align_ast::BinOp::And | align_ast::BinOp::Or)
+                        || right.falls,
+                    reaches_break: left.reaches_break || right.reaches_break,
+                })
+            }
+            _ => self.producer_children_flow(&align_sema::direct_expr_children(expression)),
+        }
+    }
+
+    fn has_current_loop_break(&self, body: &hir::Block) -> bool {
+        self.producer_blocks
+            .get(&ptr_key(body))
+            .is_some_and(|flow| flow.reaches_break)
     }
 
     fn derive_native_expression(
@@ -6234,7 +6490,7 @@ impl<'a> BodyValidator<'a> {
             || signature.modes.iter().any(|mode| *mode != align_ast::ParamMode::ByValue)
             || capture_flows.len() != captures.len()
             || capture_flows.iter().zip(captures).any(|(flow, capture)| {
-                flow.ty != capture.ty || !self.ty_copy_ok(flow.ty, context)
+                !self.body_ty_matches(flow.ty, capture.ty) || !self.ty_copy_ok(flow.ty, context)
             })
             || !self.ty_copy_ok(input, context)
             || !self.ty_copy_ok(output, context)
@@ -6244,7 +6500,14 @@ impl<'a> BodyValidator<'a> {
         let mut expected = Vec::with_capacity(1 + captures.len());
         expected.push(input);
         expected.extend(capture_flows.iter().map(|flow| flow.ty));
-        if signature.params != expected || signature.ret != output {
+        if signature.params.len() != expected.len()
+            || signature
+                .params
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| !self.body_ty_matches(*actual, *expected))
+            || !self.body_ty_matches(signature.ret, output)
+        {
             return false;
         }
         match signature.origin {
@@ -6506,7 +6769,7 @@ impl<'a> BodyValidator<'a> {
                 let init_flow = self.expr_flow(init)?;
                 let output_scalar = align_sema::ty_to_scalar(*output_elem)
                     .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some());
-                if init_flow.ty != *output_elem
+                if !self.body_ty_matches(init_flow.ty, *output_elem)
                     || !self.ty_copy_ok(input_elem, context)
                     || !self.ty_copy_ok(*output_elem, context)
                     || output_scalar.is_none()
@@ -7488,13 +7751,19 @@ impl<'a> BodyValidator<'a> {
             || !self.ty_copy_ok(first, context)
             || !self.ty_copy_ok(second, context)
             || !self.ty_copy_ok(output, context)
-            || signature.ret != output
+            || !self.body_ty_matches(signature.ret, output)
         {
             return false;
         }
         let mut expected = vec![first, second];
         expected.extend(capture_flows.iter().map(|flow| flow.ty));
-        if signature.params != expected {
+        if signature.params.len() != expected.len()
+            || signature
+                .params
+                .iter()
+                .zip(&expected)
+                .any(|(actual, expected)| !self.body_ty_matches(*actual, *expected))
+        {
             return false;
         }
         match signature.origin {
@@ -7570,6 +7839,10 @@ impl<'a> BodyValidator<'a> {
                 breaks,
             },
         );
+        let Some(producer_flow) = self.producer_block_flow(block) else {
+            return false;
+        };
+        self.producer_blocks.insert(ptr_key(block), producer_flow);
         true
     }
 
@@ -7582,6 +7855,9 @@ impl<'a> BodyValidator<'a> {
         {
             Some(flows) => flows,
             None => return false,
+        };
+        let Some(_) = self.producer_statement_flow(statement) else {
+            return false;
         };
         let mut sequence_breaks = Vec::new();
         let mut children_fall = true;
@@ -7654,7 +7930,7 @@ impl<'a> BodyValidator<'a> {
                     return false;
                 };
                 if index_flow.ty != i64_ty()
-                    || value_flow.ty != element_ty
+                    || !self.body_ty_matches(value_flow.ty, element_ty)
                     || !self.primitive_store_ty_ok(element_ty)
                 {
                     return false;
@@ -7674,7 +7950,10 @@ impl<'a> BodyValidator<'a> {
                 let Some(leaf) = self.field_path_ty(self.local_type(context, *root), path) else {
                     return false;
                 };
-                if flows.first().is_none_or(|flow| flow.ty != leaf) {
+                if flows
+                    .first()
+                    .is_none_or(|flow| !self.body_ty_matches(flow.ty, leaf))
+                {
                     return false;
                 }
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
@@ -7694,7 +7973,7 @@ impl<'a> BodyValidator<'a> {
                 let [index_flow, value_flow] = flows.as_slice() else {
                     return false;
                 };
-                if index_flow.ty != i64_ty() || value_flow.ty != leaf {
+                if index_flow.ty != i64_ty() || !self.body_ty_matches(value_flow.ty, leaf) {
                     return false;
                 }
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
@@ -7737,7 +8016,10 @@ impl<'a> BodyValidator<'a> {
                     let Some(target) = context.loop_targets.last().copied() else {
                         return false;
                     };
-                    if value_ty != target {
+                    if !self.body_ty_matches(value_ty, target.ty)
+                        || context.arena_depth != target.arena_depth
+                        || context.task_depth != target.task_depth
+                    {
                         return false;
                     }
                 }
@@ -7841,7 +8123,9 @@ impl<'a> BodyValidator<'a> {
         let mut seen = HashSet::new();
         for (&local, &scalar) in arm.bindings.iter().zip(expected) {
             if !seen.insert(local)
-                || self.local_type(context, local) != Some(align_sema::scalar_to_ty(scalar))
+                || self
+                    .local_type(context, local)
+                    .is_none_or(|actual| !self.body_ty_matches(actual, align_sema::scalar_to_ty(scalar)))
             {
                 return false;
             }
@@ -7968,16 +8252,17 @@ impl<'a> BodyValidator<'a> {
         }
         let Some(origin) = signature.origin else {
             return spawn.is_none()
-                && signature
-                    .params
-                    .iter()
-                    .zip(&signature.modes)
-                    .zip(&function.params)
-                    .all(|((ty, mode), (function_mode, scalar))| {
-                        mode == function_mode
-                            && align_sema::fn_sig_scalar(*ty) == Some(*scalar)
-                    })
-                && signature.ret == function.ret;
+                    && signature
+                        .params
+                        .iter()
+                        .zip(&signature.modes)
+                        .zip(&function.params)
+                        .all(|((ty, mode), (function_mode, scalar))| {
+                            mode == function_mode
+                                && align_sema::fn_sig_scalar(*ty)
+                                    .is_some_and(|actual| self.body_scalar_matches(actual, *scalar))
+                        })
+                && self.body_ty_matches(signature.ret, function.ret);
         };
         if signature.is_extern {
             return false;
@@ -7998,13 +8283,13 @@ impl<'a> BodyValidator<'a> {
             } else {
                 align_sema::scalar_to_ty(spawn.ok)
             };
-            return signature.ret == target_ret && function.params.is_empty();
+            return self.body_ty_matches(signature.ret, target_ret) && function.params.is_empty();
         }
         if matches!(origin, hir::FnOrigin::Lifted { capture_count } if capture_count != 0) {
             return false;
         }
         signature.params.len() == function.params.len()
-            && signature.ret == function.ret
+            && self.body_ty_matches(signature.ret, function.ret)
             && signature
                 .params
                 .iter()
@@ -8012,7 +8297,8 @@ impl<'a> BodyValidator<'a> {
                 .zip(&function.params)
                 .all(|((ty, signature_mode), (function_mode, scalar))| {
                     signature_mode == function_mode
-                        && align_sema::fn_sig_scalar(*ty) == Some(*scalar)
+                        && align_sema::fn_sig_scalar(*ty)
+                            .is_some_and(|actual| self.body_scalar_matches(actual, *scalar))
                 })
     }
 
@@ -8053,15 +8339,17 @@ impl<'a> BodyValidator<'a> {
             } else {
                 align_sema::scalar_to_ty(spawn.ok)
             };
-            if signature.ret != expected || function_type.ret != align_sema::scalar_to_ty(spawn.ok) {
+            if !self.body_ty_matches(signature.ret, expected)
+                || !self.body_ty_matches(function_type.ret, align_sema::scalar_to_ty(spawn.ok))
+            {
                 return false;
             }
-        } else if signature.ret != function_type.ret {
+        } else if !self.body_ty_matches(signature.ret, function_type.ret) {
             return false;
         }
         for ((mode, scalar), expected) in function_type.params.iter().zip(&signature.params) {
             if *mode != align_ast::ParamMode::ByValue
-                || align_sema::scalar_to_ty(*scalar) != *expected
+                || !self.body_ty_matches(align_sema::scalar_to_ty(*scalar), *expected)
             {
                 return false;
             }
@@ -8073,7 +8361,7 @@ impl<'a> BodyValidator<'a> {
             .zip(captures)
         {
             let Some(flow) = self.expr_flow(capture) else { return false };
-            if flow.ty != *expected || !self.ty_copy_ok(flow.ty, context) {
+            if !self.body_ty_matches(flow.ty, *expected) || !self.ty_copy_ok(flow.ty, context) {
                 return false;
             }
         }
@@ -8125,6 +8413,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple| {
                 tuple.elems.iter().all(|scalar| self.scalar_copy_ok(*scalar))
             }),
+            Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Box(_) | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) => false,
             other => align_sema::ty_to_scalar(other).is_some_and(|scalar| self.scalar_copy_ok(scalar)),
         }

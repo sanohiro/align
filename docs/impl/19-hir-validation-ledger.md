@@ -227,8 +227,9 @@ recursive HIR Drop.
 The owner tests `clone_frames_distinguish_repeated_same_span_nodes`,
 `clone_and_drop_are_iterative_for_a_deep_body`, and
 `clone_preserves_fn_type_cells_and_assignment_flags` close the occurrence, deep teardown, and
-metadata/cell rows; `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` closes the
-integration replay and fact-equality row.
+metadata/cell rows; `finish_children_rejects_missing_and_extra_children` closes the malformed
+child-cardinality row; `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` closes
+the integration replay and fact-equality row.
 
 The shared am-b4 MIR activation gate calls the structural body validator and this
 predicate only after depth, global type, placement, nominal/link, and
@@ -483,7 +484,7 @@ with parent-plus-first-child and first-child-plus-later-child pairs.
 | `AssignElem` | `env[base,struct_id,soa]`: `STRUCT(struct_id)` is the producer's flat Copy struct; base is exactly `Soa(struct_id)` when true or fixed `StructArray(struct_id,_)` when false. `child[index,value]`. `post[index.ty == i64; value.ty == Struct(struct_id); Copy scatter/store]`. |
 | `Return(None)` | `env[presence=false]`; `child[]`; `post[function ret == Unit; terminates current path]`. |
 | `Return(Some)` | `env[presence=true]`; `child[value]`; `post[value.ty == function ret; returned Move ownership and return-root/region facts equal the recomputed function boundary; terminates]`. |
-| `Break` | `env[value presence,accepted]`: accepted equals the checker-owned loop-target/region decision and a target loop exists only when true. `child[value if present]`. `post[bare break contributes Unit; accepted payload type equals target loop type and contributes one exit; rejected break contributes no exit; either form is non-fallthrough]`. |
+| `Break` | `env[value presence,accepted]`: accepted equals the checker-owned loop-target/region decision and a target loop exists only when true. `child[value if present]`. `post[bare break contributes Unit; an accepted break contributes a loop break when producer control reaches the statement (a nested accepted break in its value may reach the same loop, while a value that returns or enters a diverging nested loop does not); accepted payload type equals the target loop type; rejected break contributes no exit; either form is non-fallthrough]`. |
 | `Expr` | `env[]`; `child[expr]`; `post[resolved child type is not Result(_, _); result is discarded after its required Drop; child non-fallthrough propagates]`. |
 
 ## Expression ledger: am-b1
@@ -530,7 +531,7 @@ The result formula in every row is followed by the universal
 | `ResultOk` | `env[]`; `child[value]`; `post[result Result(payload(value.ty),E) for one concrete admitted E; active Ok ownership transfers]`. |
 | `ResultErr` | `env[]`; `child[value]`; `post[result Result(T,payload(value.ty)) for one concrete admitted T; active Err ownership transfers]`. |
 | `Try` | `env[]`; `child[result]`; `post[result child is Result(T,E), enclosing return is Result(U,E) with exact E; expression result T; Ok continues and Err transfers to one implicit return edge]`. |
-| `Loop` | `env[diverges,body_locals]`: range is ordered, in bounds, and equals exactly all locals declared lexically anywhere inside this loop body and no lifted-function local. `child[body]`; `post[diverges iff no accepted break reaches this loop; non-diverging accepted breaks agree on result type; body tail is discarded; iteration Drop set equals intersection with drop_locals; loop state reaches the existing finite join]`. |
+| `Loop` | `env[diverges,body_locals]`: range is ordered, in bounds, and equals exactly all locals declared lexically anywhere inside this loop body and no lifted-function local. `child[body]`; `post[diverges iff no accepted break reaches this loop; an accepted break must remain at the loop's arena/task region depth; non-diverging accepted breaks agree on result type; body tail is discarded; iteration Drop set equals intersection with drop_locals; loop state reaches the existing finite join]`. |
 | `Arena` | `env[]`; `child[block]`; `post[result block/context-selected divergence type; one arena begins before the block and ends exactly once on each exit; no escaping arena-owned value]`. |
 | `Unsafe` | `env[]`; `child[block at unsafe_depth+1]`; `post[result block/context-selected divergence type; depth is restored before the next sibling; no runtime region; unsafe permission is lexical and effect is Impure]`. |
 | `RawAlloc` | `env[]`; `child[size]`; `post[size i64; result Raw; unsafe lexical owner required; caller manually owns allocation]`. |

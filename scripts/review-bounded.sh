@@ -91,9 +91,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-prompt="Review git diff ${base}...HEAD for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, network commands, or scripts/test-full.sh. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 head_sha="$(git rev-parse HEAD)"
 base_sha="$(git rev-parse "${base}^{commit}")"
+prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, network commands, or scripts/test-full.sh. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
@@ -108,7 +108,6 @@ set -m
 # the inspection-only prompt so the watchdog can require a bounded verdict.
 PATH="$review_path" DEVELOPER_DIR="$review_developer_dir" GIT_OPTIONAL_LOCKS=0 \
 codex review -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
-  -c 'shell_environment_policy.inherit="all"' \
   "$prompt" >>"$output" 2>&1 &
 review_pid=$!
 

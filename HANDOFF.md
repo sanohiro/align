@@ -15,7 +15,10 @@ four-entrypoint gate now runs body-core validation before sema fact replay. Repl
 numeric enter/exit occurrence frames for the 259-record checked-HIR ceiling, with no Span or native
 pointer identity, and iterative teardown for successful, rejected, and panic-after-analysis paths.
 The body envelope also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local
-`FnTy` cells by callable shape. The pre-follow-up focused body owner passed 42/42, alongside
+`FnTy` cells by callable shape. The current follow-up closes nested callable/tagged-payload
+matching, source-reachable loop-break/diverges agreement, and arena/task-group region crossing;
+the body owner now has explicit tests for those cases. The pre-follow-up focused body owner passed
+42/42, alongside
 malformed-body, replay, identity, header, process/HTTP, root-completion, and task-wait owners with
 the configured LLVM environment.
 The full depth matrix reached successful compilation but its test
@@ -36,6 +39,10 @@ CLEAN. Preserve its log, elapsed time, process state, and last completed area; c
 the unfinished or changed slice. A longer user-approved duration extends that invocation only and
 does not authorize polling, restart chains, or a duplicate broad review. This is also a standing
 guardrail in `CLAUDE.md`/`AGENTS.md`.
+The current follow-up tree has passed the MIR library owner (92/92), nested tagged-payload driver
+owner (8/8), copy-collection owner (6/6), replay-clone owners (4/4), and targeted `align_sema`/
+`align_mir` Clippy with `-D warnings`; its final exact-base review is pending after the fix
+checkpoint is committed.
 The one host-native review invocation for the follow-up range
 `62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
 Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as

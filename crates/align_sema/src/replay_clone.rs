@@ -2443,4 +2443,19 @@ mod tests {
         }
         drop_program(cloned);
     }
+
+    #[test]
+    fn finish_children_rejects_missing_and_extra_children() {
+        let missing = finish_children::<()>(Vec::new(), |children| {
+            children.expr()?;
+            Some(())
+        });
+        assert!(missing.is_none(), "missing child must fail closed");
+
+        let extra = finish_children::<()>(
+            vec![CloneValue::Expr(leaf(Span::new(0, 0, 0)))],
+            |_children| Some(()),
+        );
+        assert!(extra.is_none(), "extra child must fail closed");
+    }
 }

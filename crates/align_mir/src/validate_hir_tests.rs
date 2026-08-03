@@ -4550,6 +4550,36 @@ fn hir_body_validator_accepts_function_value_local_specialization() {
 }
 
 #[test]
+fn hir_body_validator_accepts_nested_tagged_payload_construction() {
+    let program = checked_source_program(
+        "Output { text: string, note: Option<string> }\n\
+         NativeError { code: Option<string>, message: string }\n\
+         DbError { Native(NativeError), Decode(string) }\n\
+         fn run(mode: i32) -> Result<Option<Output>, DbError> {\n\
+           if mode == 0 { return Ok(None) }\n\
+           if mode == 1 { return Ok(Some(Output { text: \"row\".clone(), note: Some(\"note\".clone()) })) }\n\
+         if mode == 2 { return Err(DbError.Decode(\"decode\".clone())) }\n\
+           return Err(DbError.Native(NativeError { code: Some(\"7\".clone()), message: \"native\".clone() }))\n\
+         }\n\
+         fn score(result: Result<Option<Output>, DbError>) -> i32 = match result {\n\
+           Ok(value) => match value {\n\
+             Some(output) => output.text.len() as i32 + match output.note { Some(note) => note.len() as i32, None => 0 },\n\
+             None => 2,\n\
+           },\n\
+           Err(error) => match error {\n\
+             Native(value) => value.message.len() as i32 + match value.code { Some(code) => code.len() as i32, None => 0 },\n\
+             Decode(message) => message.len() as i32,\n\
+           },\n\
+         }\n",
+    );
+    assert!(body_core_metadata_is_valid(&program));
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&program),
+        "nested tagged body must satisfy fact replay"
+    );
+}
+
+#[test]
 fn hir_body_validator_rejects_divergent_eager_parent_type_mismatch() {
     let integer = int(64);
     let diverging = body_test_expr(
@@ -11014,6 +11044,113 @@ fn hir_body_validator_loop_and_break() {
     };
     *body_locals = 1..1;
     assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_loop_break_reachability_matches_diverges() {
+    let unit = Ty::Unit;
+    let unreachable_loop = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: vec![
+                    hir::Stmt::Return(None),
+                    hir::Stmt::Break {
+                        value: None,
+                        accepted: true,
+                    },
+                ],
+                value: None,
+            },
+            diverges: false,
+            body_locals: 0..0,
+        },
+        unit,
+    );
+    let mut unreachable = baseline_program();
+    unreachable
+        .fns
+        .push(body_tail_case("unreachable_break", unreachable_loop, unit));
+    assert!(!body_core_metadata_is_valid(&unreachable));
+
+    let nested_break = body_test_expr(
+        hir::ExprKind::If {
+            cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
+            then: hir::Block {
+                stmts: vec![hir::Stmt::Break {
+                    value: None,
+                    accepted: true,
+                }],
+                value: None,
+            },
+            els: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, unit))),
+            },
+        },
+        unit,
+    );
+    let reachable_loop = body_test_expr(
+        hir::ExprKind::Loop {
+            body: hir::Block {
+                stmts: vec![hir::Stmt::Expr(nested_break)],
+                value: None,
+            },
+            diverges: false,
+            body_locals: 0..0,
+        },
+        unit,
+    );
+    let mut reachable = baseline_program();
+    reachable
+        .fns
+        .push(body_tail_case("nested_break", reachable_loop, unit));
+    assert!(body_core_metadata_is_valid(&reachable));
+}
+
+#[test]
+fn hir_body_validator_rejects_break_across_arena_and_task_group() {
+    let nested_break = |kind| body_test_expr(kind, Ty::Unit);
+    let loop_with = |scope| {
+        body_tail_case(
+            "nested_region_break",
+            body_test_expr(
+                hir::ExprKind::Loop {
+                    body: hir::Block {
+                        stmts: vec![hir::Stmt::Expr(scope)],
+                        value: None,
+                    },
+                    diverges: false,
+                    body_locals: 0..0,
+                },
+                Ty::Unit,
+            ),
+            Ty::Unit,
+        )
+    };
+
+    let mut arena = baseline_program();
+    arena.fns.push(loop_with(nested_break(hir::ExprKind::Arena(
+        hir::Block {
+            stmts: vec![hir::Stmt::Break {
+                value: None,
+                accepted: true,
+            }],
+            value: None,
+        },
+    ))));
+    assert!(!body_core_metadata_is_valid(&arena));
+
+    let mut task_group = baseline_program();
+    task_group.fns.push(loop_with(nested_break(
+        hir::ExprKind::TaskGroup(hir::Block {
+            stmts: vec![hir::Stmt::Break {
+                value: None,
+                accepted: true,
+            }],
+            value: None,
+        }),
+    )));
+    assert!(!body_core_metadata_is_valid(&task_group));
 }
 
 #[test]
