@@ -42,6 +42,11 @@ Xcode/git temporary-cache failures left the host review stalled; it was stopped 
 INCOMPLETE in `.git/am-b4-followup-host-review.log` and
 `.git/am-b4-activation-review-incomplete.log`. The same range will not be reviewed again unless it
 changes or the user explicitly requests a new review.
+The subsequent fresh independent review of `origin/main...8bb574f` also reached its 120-second
+bound without a verdict; it is recorded as INCOMPLETE in `.git/am-b4-activation-review-incomplete.log`.
+The narrow `align_sema` test binary was then launched directly with a dedicated `TMPDIR`, fixed
+`DEVELOPER_DIR`, and the prior dyld setting; it still produced no listing within 20 seconds and is
+recorded as INCOMPLETE in `.git/am-b4-followup-body-incomplete.log`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
