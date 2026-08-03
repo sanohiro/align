@@ -1759,24 +1759,27 @@ mod tests {
             span,
         };
         let loop_body = Block {
-            stmts: vec![Stmt::Expr(Expr {
-                kind: ExprKind::If {
-                    cond: Box::new(bool_expr(span)),
-                    then: Block {
-                        stmts: vec![Stmt::Break {
+            stmts: vec![
+                Stmt::Expr(spawn_expr(span)),
+                Stmt::Expr(Expr {
+                    kind: ExprKind::If {
+                        cond: Box::new(bool_expr(span)),
+                        then: Block {
+                            stmts: vec![Stmt::Break {
+                                value: None,
+                                accepted: true,
+                            }],
                             value: None,
-                            accepted: true,
-                        }],
-                        value: None,
+                        },
+                        els: Block {
+                            stmts: Vec::new(),
+                            value: Some(Box::new(unit_expr(span))),
+                        },
                     },
-                    els: Block {
-                        stmts: Vec::new(),
-                        value: Some(Box::new(unit_expr(span))),
-                    },
-                },
-                ty: Ty::Unit,
-                span,
-            })],
+                    ty: Ty::Unit,
+                    span,
+                }),
+            ],
             value: None,
         };
         Expr {
@@ -1909,7 +1912,7 @@ mod tests {
             .map(|key| key.site)
             .collect();
         assert_eq!(initial_groups.len(), 2, "duplicate groups must not alias");
-        assert_eq!(spawn_sites.len(), 6, "duplicate Spawn sites must not alias");
+        assert_eq!(spawn_sites.len(), 8, "duplicate Spawn sites must not alias");
         assert_eq!(err_sites.len(), 2, "duplicate Err sites must not alias");
         assert!(join_sites.len() >= 4, "duplicate join sites must not alias");
     }
