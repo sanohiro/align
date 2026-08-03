@@ -52,8 +52,9 @@ the post-fix ordinary target launch remained at 0% CPU in `_dyld_start` and was 
 INCOMPLETE, while the dedicated `/tmp/align-am-b4-break-owner` target passed the three exact break
 tests and the complete MIR library owner 94/94. A fresh independent review of the reopened
 `Break.accepted` slice returned CLEAN after checking sema production, every downstream consumer,
-both region dimensions, fail-closed lowering, docs, and owner coverage. No final attestation or PR
-exists yet.
+both region dimensions, fail-closed lowering, docs, and owner coverage. The complete exact-base
+review then returned CLEAN, and the repository gate, workspace all-target Clippy, and final MIR
+owner passed under the dedicated target. The branch has not been pushed and no PR exists yet.
 The one host-native review invocation for the follow-up range
 `62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
 Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as
