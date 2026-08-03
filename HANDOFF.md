@@ -36,6 +36,12 @@ CLEAN. Preserve its log, elapsed time, process state, and last completed area; c
 the unfinished or changed slice. A longer user-approved duration extends that invocation only and
 does not authorize polling, restart chains, or a duplicate broad review. This is also a standing
 guardrail in `CLAUDE.md`/`AGENTS.md`.
+The one host-native review invocation for the follow-up range
+`62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
+Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as
+INCOMPLETE in `.git/am-b4-followup-host-review.log` and
+`.git/am-b4-activation-review-incomplete.log`. The same range will not be reviewed again unless it
+changes or the user explicitly requests a new review.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
