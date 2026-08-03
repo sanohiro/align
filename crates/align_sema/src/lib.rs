@@ -4479,6 +4479,8 @@ pub fn check_program_with_interface_facts(
             if !is_generic && matches!(f.vis, ast::Vis::Pub) {
                 let mangled = mangle_fn(module, is_entry, &f.name.name);
                 if let Some(sig) = sigs.get(&mangled) {
+                    let return_provenance_known =
+                        external_return_provenance.contains_key(&mangled);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
@@ -4488,6 +4490,7 @@ pub fn check_program_with_interface_facts(
                         params: sig.params.clone(),
                         param_modes: sig.param_modes.clone(),
                         ret: sig.ret,
+                        return_provenance_known,
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
                         effect,
@@ -4692,7 +4695,22 @@ pub fn check_program_with_interface_facts(
         fn_types,
         imported_fns,
     };
-    infer_return_provenance(&mut program, external_return_provenance);
+    infer_return_provenance(&mut program);
+    run_body_analysis_passes(
+        &mut program,
+        external_effects,
+        diags,
+        false,
+    );
+    program
+}
+
+fn run_body_analysis_passes(
+    program: &mut Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+    replay_effects: bool,
+) {
     let named_return_borrow: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
         .fns
         .iter()
@@ -4701,7 +4719,7 @@ pub fn check_program_with_interface_facts(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_borrow.clone())),
         )
         .collect();
@@ -4713,7 +4731,7 @@ pub fn check_program_with_interface_facts(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_region.clone())),
         )
         .collect();
@@ -4728,7 +4746,7 @@ pub fn check_program_with_interface_facts(
         enums,
         tagged_types,
         ..
-    } = &mut program;
+    } = program;
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
     let enums: &[hir::EnumDef] = enums;
@@ -4820,8 +4838,156 @@ pub fn check_program_with_interface_facts(
     // Pass 4: refine the inferred effect bit carried by each function-value type, then enforce the
     // `par_map` Pure requirement (`draft.md` §11). Cross-unit callees take their effect from
     // `external_effects`; FFI and absent targets fail closed.
-    check_parallelism(&mut program, external_effects, diags);
-    program
+    if replay_effects {
+        replay_parallelism(program, external_effects, diags);
+    } else {
+        check_parallelism(program, external_effects, diags);
+    }
+}
+
+/// Recompute all body-derived facts at the HIR/MIR boundary without trusting producer metadata.
+///
+/// The caller must run the structural, type, placement, nominal, and declaration validators first;
+/// those passes establish the bounds and ids consumed by the sema analyses below. The input HIR is
+/// never mutated. A compiler-owned clone is reset to the producer baseline, replayed through the
+/// same analysis implementations used by [`check_program`], and compared field-by-field with the
+/// input. `task_wait` is included here because its proof state is deliberately analysis-local and
+/// has no stored HIR representation to compare. This entry point is not the structural HIR
+/// validator: direct callers that skip the prerequisite validators receive panic containment and
+/// depth rejection, but non-panicking malformed header/type metadata remains outside this API's
+/// contract.
+pub fn checked_hir_body_facts_are_valid(program: &hir::Program) -> bool {
+    // The MIR gate normally proves all local/type ordinals before reaching this predicate. Keep
+    // the public sema boundary fail-closed for direct malformed-HIR callers too: the legacy
+    // producer analyses still contain indexing assumptions that are valid only after that gate.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        checked_hir_body_facts_are_valid_impl(program)
+    }))
+    .unwrap_or(false)
+}
+
+fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
+    if !hir_depth::checked_hir_body_depth_is_valid(program) {
+        return false;
+    }
+    let mut replay = program.clone();
+    reset_body_analysis_facts(&mut replay);
+
+    let external_effects: std::collections::HashMap<String, FnEffect> = replay
+        .imported_fns
+        .iter()
+        .map(|function| (function.name.clone(), function.effect))
+        .collect();
+    let mut diags = Diagnostics::new();
+    for function in &replay.fns {
+        task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
+    }
+    infer_return_provenance(&mut replay);
+    run_body_analysis_passes(
+        &mut replay,
+        &external_effects,
+        &mut diags,
+        true,
+    );
+    !diags.has_errors() && body_analysis_facts_equal(program, &replay)
+}
+
+fn reset_body_analysis_facts(program: &mut Program) {
+    for function in &mut program.fns {
+        function.return_borrow = hir::ReturnBorrowSummary::None;
+        function.return_region = hir::ReturnRegionSummary::None;
+        function.drop_locals.clear();
+        function.drop_individual_locals.clear();
+        function.drop_individual_exprs.clear();
+
+        // `body_events` is the same bounded explicit traversal used by the producer-side scans.
+        // Assignment cleanup flags use interior mutability, so the shared event references can
+        // reset them without raw pointers or unsafe aliasing.
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::StmtEnter(hir::Stmt::Assign {
+                drop_old, drop_new, ..
+            }) = event
+            {
+                drop_old.set(false);
+                drop_new.set(false);
+            }
+        }
+    }
+    for function in &program.fn_types {
+        function.effect.set(FnEffect::Unknown);
+    }
+}
+
+fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool {
+    if expected.fns.len() != actual.fns.len() || expected.fn_types.len() != actual.fn_types.len() {
+        return false;
+    }
+    if expected
+        .fn_types
+        .iter()
+        .zip(&actual.fn_types)
+        .any(|(expected, actual)| {
+            expected.params != actual.params
+                || expected.ret != actual.ret
+                || expected.return_borrow != actual.return_borrow
+                || expected.return_region != actual.return_region
+        })
+    {
+        return false;
+    }
+    for (expected, actual) in expected.fns.iter().zip(&actual.fns) {
+        if expected.name != actual.name
+            || expected.origin != actual.origin
+            || expected.params != actual.params
+            || expected.param_modes != actual.param_modes
+            || expected.ret != actual.ret
+            || expected.locals.len() != actual.locals.len()
+            || expected
+                .locals
+                .iter()
+                .zip(&actual.locals)
+                .any(|(expected, actual)| {
+                    expected.id != actual.id
+                        || expected.name != actual.name
+                        || expected.ty != actual.ty
+                        || expected.is_mut != actual.is_mut
+                        || expected.is_param != actual.is_param
+                        || expected.align != actual.align
+                })
+            || expected.return_borrow != actual.return_borrow
+            || expected.return_region != actual.return_region
+            || expected.drop_locals != actual.drop_locals
+            || expected.drop_individual_locals != actual.drop_individual_locals
+            || expected.drop_individual_exprs != actual.drop_individual_exprs
+            || assignment_facts(expected) != assignment_facts(actual)
+        {
+            return false;
+        }
+    }
+    expected
+        .fn_types
+        .iter()
+        .zip(&actual.fn_types)
+        .all(|(expected, actual)| expected.effect.get() == actual.effect.get())
+}
+
+fn assignment_facts(function: &hir::Fn) -> Vec<(hir::LocalId, bool, bool)> {
+    hir_depth::body_events(&function.body)
+        .into_iter()
+        .filter_map(|event| match event {
+            hir_depth::BodyEvent::StmtEnter(hir::Stmt::Assign {
+                local,
+                drop_old,
+                drop_new,
+                ..
+            }) => Some((*local, drop_old.get(), drop_new.get())),
+            hir_depth::BodyEvent::StmtEnter(_)
+            | hir_depth::BodyEvent::StmtExit(_)
+            | hir_depth::BodyEvent::ExprEnter(_)
+            | hir_depth::BodyEvent::ExprExit { .. }
+            | hir_depth::BodyEvent::MatchArmEnter { .. } => None,
+        })
+        .collect()
 }
 
 fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
@@ -4861,10 +5027,7 @@ fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRe
 /// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
 /// and function-value targets belong to L2b-b. The existing exhaustive borrow-provenance walker
 /// remains the single expression classifier.
-fn infer_return_provenance(
-    program: &mut Program,
-    external_return_provenance: &ExternalReturnProvenance,
-) {
+fn infer_return_provenance(program: &mut Program) {
     let mut named: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
         .fns
         .iter()
@@ -4873,7 +5036,7 @@ fn infer_return_provenance(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_borrow.clone())),
         )
         .collect();
@@ -4977,7 +5140,34 @@ fn check_parallelism(
     external_effects: &std::collections::HashMap<String, FnEffect>,
     diags: &mut Diagnostics,
 ) {
-    let closed = infer_fn_type_effects(program, external_effects);
+    check_parallelism_impl(program, external_effects, diags, true);
+}
+
+fn replay_parallelism(
+    program: &mut Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) {
+    // The producer allocates fresh local function-value types once before solving. A boundary
+    // replay must preserve that already-published type table, so reset only the interior effect
+    // cells and run the same fixed point without the fresh-type preparation step.
+    for function in &program.fn_types {
+        function.effect.set(FnEffect::Unknown);
+    }
+    check_parallelism_impl(program, external_effects, diags, false);
+}
+
+fn check_parallelism_impl(
+    program: &mut Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+    prepare_local_types: bool,
+) {
+    let closed = if prepare_local_types {
+        infer_fn_type_effects(program, external_effects)
+    } else {
+        solve_fn_type_effects(program, external_effects, EffectOpenWorld::Closed)
+    };
     let mut reported = Vec::new();
     // Every ordinary same-program call site is closed-world and retains precise callback origins.
     for (_, func, span) in &closed.parmaps {

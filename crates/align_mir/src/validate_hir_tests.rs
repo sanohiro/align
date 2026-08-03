@@ -7,6 +7,9 @@ use align_sema::{
         ReturnRegionSummary, StructDef, TaggedType, TupleDef,
     },
 };
+use align_diag::Diagnostics;
+use align_lexer::tokenize;
+use align_parser::parse_file;
 use std::cell::Cell;
 
 fn declaration_header_program() -> hir::Program {
@@ -25,6 +28,7 @@ fn declaration_header_program() -> hir::Program {
         params: vec![slice_i32],
         param_modes: vec![align_ast::ParamMode::Out],
         ret: slice_i32,
+        return_provenance_known: true,
         return_borrow: ReturnBorrowSummary::Roots {
             params: vec![0],
             captures: Vec::new(),
@@ -82,6 +86,81 @@ fn declaration_header_program() -> hir::Program {
         drop_individual_exprs: Default::default(),
     });
     program
+}
+
+fn checked_source_program(source: &str) -> hir::Program {
+    let mut diagnostics = Diagnostics::new();
+    let tokens = tokenize(0, source, &mut diagnostics);
+    let file = parse_file(tokens, &mut diagnostics);
+    let program = align_sema::check_file(&file, &mut diagnostics);
+    assert!(
+        !diagnostics.has_errors(),
+        "replay fixture must check before mutation: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    program
+}
+
+fn checked_interface_program(
+    provenance: Option<(ReturnBorrowSummary, ReturnRegionSummary)>,
+    effect: FnEffect,
+) -> hir::Program {
+    let dependency = "module dep\npub fn identity(value: str) -> str {}\n";
+    let consumer = "import dep\nfn consume(value: str) -> str = dep.identity(value)\nfn main() -> i32 = 0\n";
+    let mut diagnostics = Diagnostics::new();
+    let dependency_tokens = tokenize(0, dependency, &mut diagnostics);
+    let dependency_file = parse_file(dependency_tokens, &mut diagnostics);
+    let consumer_tokens = tokenize(1, consumer, &mut diagnostics);
+    let consumer_file = parse_file(consumer_tokens, &mut diagnostics);
+    assert!(!diagnostics.has_errors(), "interface fixture must parse");
+    let modules = [
+        align_sema::Module {
+            path: "dep".to_string(),
+            file: &dependency_file,
+            is_entry: false,
+            interface_only: true,
+        },
+        align_sema::Module {
+            path: "main".to_string(),
+            file: &consumer_file,
+            is_entry: true,
+            interface_only: false,
+        },
+    ];
+    let mut external_effects = std::collections::HashMap::new();
+    external_effects.insert("dep$identity".to_string(), effect);
+    let mut external_provenance = align_sema::ExternalReturnProvenance::new();
+    if let Some(provenance) = provenance {
+        external_provenance.insert("dep$identity".to_string(), provenance);
+    }
+    let program = if external_provenance.is_empty() {
+        align_sema::check_program_with_effects(&modules, &external_effects, &mut diagnostics)
+    } else {
+        align_sema::check_program_with_interface_facts(
+            &modules,
+            &external_effects,
+            &external_provenance,
+            &mut diagnostics,
+        )
+    };
+    assert!(
+        !diagnostics.has_errors(),
+        "interface fixture must check"
+    );
+    program
+}
+
+fn assert_replay_rejects_without_mutating(program: hir::Program, message: &str) {
+    let before = format!("{program:#?}");
+    assert!(!align_sema::checked_hir_body_facts_are_valid(&program), "{message}");
+    assert_eq!(
+        format!("{program:#?}"),
+        before,
+        "rejected replay must not mutate input HIR: {message}"
+    );
 }
 
 fn fn_type_header_program() -> hir::Program {
@@ -588,6 +667,241 @@ fn valid_header_does_not_consume_body_facts() {
 }
 
 #[test]
+fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
+    let base = declaration_header_program();
+    // The baseline function-type entry is annotation-only in this fixture; its producer value is
+    // the conservative Unknown state, not a synthesized Pure result.
+    base.fn_types[0].effect.set(FnEffect::Unknown);
+    let before = format!("{base:#?}");
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&base),
+        "a producer-valid body must reproduce its stored facts"
+    );
+    assert_eq!(format!("{base:#?}"), before, "replay must not mutate input HIR");
+
+    let mut bad_return_borrow = base.clone();
+    bad_return_borrow.fns[0].return_borrow = ReturnBorrowSummary::None;
+    assert_replay_rejects_without_mutating(
+        bad_return_borrow,
+        "stale return-borrow provenance must fail closed",
+    );
+
+    let mut bad_return_region = base.clone();
+    bad_return_region.fns[0].return_region = ReturnRegionSummary::None;
+    assert_replay_rejects_without_mutating(
+        bad_return_region,
+        "stale return-region provenance must fail closed",
+    );
+
+    let mut bad_drop_locals = base.clone();
+    bad_drop_locals.fns[0].drop_locals = vec![99];
+    assert_replay_rejects_without_mutating(bad_drop_locals, "stale Drop locals must fail closed");
+
+    let mut bad_drop_individual_locals = base.clone();
+    bad_drop_individual_locals.fns[0].drop_individual_locals = vec![99];
+    assert_replay_rejects_without_mutating(
+        bad_drop_individual_locals,
+        "stale individual Drop locals must fail closed",
+    );
+
+    let mut bad_drop_exprs = base.clone();
+    bad_drop_exprs.fns[0]
+        .drop_individual_exprs
+        .insert(align_span::Span::new(0, 99, 100), true);
+    assert_replay_rejects_without_mutating(
+        bad_drop_exprs,
+        "stale individual Drop expression map must fail closed",
+    );
+
+    let mut malformed_local = base.clone();
+    malformed_local.fns[0]
+        .body
+        .value
+        .as_mut()
+        .expect("declaration fixture has a body value")
+        .kind = hir::ExprKind::Local(99);
+    assert_replay_rejects_without_mutating(
+        malformed_local,
+        "a malformed local ordinal must fail closed instead of panicking",
+    );
+
+    let bad_effect = base.clone();
+    bad_effect.fn_types[0].effect.set(FnEffect::Pure);
+    assert_replay_rejects_without_mutating(
+        bad_effect,
+        "stale annotation-only effect must fail closed",
+    );
+}
+
+#[test]
+fn checked_hir_body_fact_replay_preserves_imported_fact_presence() {
+    let roots = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: Vec::new(),
+    };
+    let regions = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: Vec::new(),
+    };
+    for effect in [FnEffect::Pure, FnEffect::Unknown, FnEffect::Impure] {
+        let unknown = checked_interface_program(None, effect);
+        assert_eq!(unknown.imported_fns.len(), 1);
+        assert!(
+            !unknown.imported_fns[0].return_provenance_known,
+            "compatibility API omission must remain distinguishable from exact None"
+        );
+        let unknown_consumer = unknown
+            .fns
+            .iter()
+            .find(|function| function.name == "consume")
+            .expect("consumer function");
+        assert_eq!(unknown_consumer.return_borrow, roots);
+        assert_eq!(unknown_consumer.return_region, regions);
+        assert!(align_sema::checked_hir_body_facts_are_valid(&unknown));
+
+        for (return_borrow, return_region) in [
+            (ReturnBorrowSummary::None, ReturnRegionSummary::None),
+            (roots.clone(), regions.clone()),
+        ] {
+            let program = checked_interface_program(
+                Some((return_borrow.clone(), return_region.clone())),
+                effect,
+            );
+            assert!(program.imported_fns[0].return_provenance_known);
+            let consumer = program
+                .fns
+                .iter()
+                .find(|function| function.name == "consume")
+                .expect("consumer function");
+            if matches!(return_borrow, ReturnBorrowSummary::None) {
+                assert_eq!(consumer.return_borrow, ReturnBorrowSummary::None);
+                assert_eq!(consumer.return_region, ReturnRegionSummary::None);
+            } else {
+                assert_eq!(consumer.return_borrow, roots);
+                assert_eq!(consumer.return_region, regions);
+            }
+            assert!(
+                align_sema::checked_hir_body_facts_are_valid(&program),
+                "known imported provenance/effect combination must replay: {effect:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_hir_body_fact_replay_covers_cleanup_and_function_effects() {
+    let base = checked_source_program(
+        "fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn replace() -> i32 {
+  mut value := \"first\".clone()
+  value = \"second\".clone()
+  return value.len() as i32
+}
+fn main() -> i32 {
+  pure_value := quiet
+  impure_value := loud
+  return replace()
+}
+",
+    );
+    let before = format!("{base:#?}");
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&base),
+        "producer facts for cleanup and concrete function values must replay"
+    );
+    assert_eq!(format!("{base:#?}"), before, "replay must not mutate input HIR");
+
+    let mut malformed_fn_id = base.clone();
+    let main_index = malformed_fn_id
+        .fns
+        .iter()
+        .position(|function| function.name == "main")
+        .expect("main function");
+    let local = malformed_fn_id.fns[main_index]
+        .locals
+        .iter_mut()
+        .find(|local| matches!(local.ty, Ty::Fn(_)))
+        .expect("function-value local");
+    local.ty = Ty::Fn(u32::MAX);
+    assert_replay_rejects_without_mutating(
+        malformed_fn_id,
+        "a malformed local function-type id must fail closed",
+    );
+
+    let replace_index = base
+        .fns
+        .iter()
+        .position(|function| function.name == "replace")
+        .expect("replace function");
+    let assignment_index = base.fns[replace_index]
+        .body
+        .stmts
+        .iter()
+        .position(|statement| matches!(statement, hir::Stmt::Assign { .. }))
+        .expect("string replacement assignment");
+
+    let bad_assignment = base.clone();
+    let hir::Stmt::Assign {
+        drop_old,
+        drop_new,
+        ..
+    } = &bad_assignment.fns[replace_index].body.stmts[assignment_index]
+    else {
+        unreachable!("assignment index was selected from the same body");
+    };
+    let old_drop_old = drop_old.get();
+    let old_drop_new = drop_new.get();
+    drop_old.set(!old_drop_old);
+    assert_replay_rejects_without_mutating(
+        bad_assignment,
+        "stale assignment drop-old fact must fail closed",
+    );
+
+    let bad_assignment_new = base.clone();
+    let hir::Stmt::Assign { drop_new, .. } =
+        &bad_assignment_new.fns[replace_index].body.stmts[assignment_index]
+    else {
+        unreachable!("assignment index was selected from the same body");
+    };
+    drop_new.set(!old_drop_new);
+    assert_replay_rejects_without_mutating(
+        bad_assignment_new,
+        "stale assignment drop-new fact must fail closed",
+    );
+
+    let main = base
+        .fns
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main function");
+    let function_value_ids: Vec<u32> = main
+        .locals
+        .iter()
+        .filter_map(|local| match local.ty {
+            Ty::Fn(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(function_value_ids.len(), 2, "fixture must publish two function values");
+    let bad_effect = base.clone();
+    let effect_id = function_value_ids[0] as usize;
+    let effect = bad_effect.fn_types[effect_id].effect.get();
+    bad_effect.fn_types[effect_id].effect.set(match effect {
+        FnEffect::Pure => FnEffect::Unknown,
+        FnEffect::Unknown => FnEffect::Pure,
+        FnEffect::Impure => FnEffect::Pure,
+    });
+    assert_replay_rejects_without_mutating(
+        bad_effect,
+        "stale concrete function-value effect must fail closed",
+    );
+}
+
+#[test]
 fn deep_hir_header_type_dag_is_stack_bounded() {
     let mut program = baseline_program();
     program.structs = (0..4_096)
@@ -611,6 +925,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         params: vec![Ty::Struct(0)],
         param_modes: vec![align_ast::ParamMode::ByValue],
         ret: Ty::Struct(0),
+        return_provenance_known: true,
         return_borrow: ReturnBorrowSummary::Roots {
             params: vec![0],
             captures: Vec::new(),
@@ -630,6 +945,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: Ty::Unit,
+        return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         effect: FnEffect::Impure,
@@ -843,6 +1159,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
         params,
         ret,
+        return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         effect: FnEffect::Pure,
@@ -908,6 +1225,7 @@ fn with_return(ty: Ty) -> hir::Program {
         params: Vec::new(),
         param_modes: Vec::new(),
         ret: ty,
+        return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         effect: FnEffect::Pure,

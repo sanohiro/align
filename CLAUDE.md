@@ -327,6 +327,10 @@ the change scope explicitly requires that expanded verification.
 - A timeout, invocation bound, missing machine-readable verdict, or killed
   process means **INCOMPLETE**, never CLEAN. Preserve the log, elapsed time,
   last completed area, and process state.
+- A user-approved duration longer than the configured bound extends only the
+  current review invocation; it never authorizes polling/restarting the same
+  review or chaining another broad review. When that invocation ends, preserve
+  its checkpoint and continue only with the unfinished slice.
 - Inspect the process and new log output at least once per minute. Stop orphaned,
   duplicate, stalled, or scope-drifting review processes after recording their
   state; do not leave helper processes running after the parent review stops.
