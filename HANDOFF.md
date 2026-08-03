@@ -11,12 +11,13 @@ declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
 (`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
 replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The current
 working slice is the am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate`: the shared
-four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses an explicit
-child-first HIR clone so the 259-record checked-HIR ceiling does not recurse through derived
-`Clone`, and malformed child lookup fails closed without an internal `expect`. The body envelope
-also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local `FnTy` cells by
-callable shape. The focused body owner passes 42/42, alongside malformed-body, replay, identity,
-header, process/HTTP, root-completion, and task-wait owners with the configured LLVM environment.
+four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses explicit
+numeric enter/exit occurrence frames for the 259-record checked-HIR ceiling, with no Span or native
+pointer identity, and iterative teardown for successful, rejected, and panic-after-analysis paths.
+The body envelope also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local
+`FnTy` cells by callable shape. The pre-follow-up focused body owner passed 42/42, alongside
+malformed-body, replay, identity, header, process/HTTP, root-completion, and task-wait owners with
+the configured LLVM environment.
 The full depth matrix reached successful compilation but its test
 binary remained in macOS `_dyld_start` at 0% CPU before being stopped; that launch is preserved as
 INCOMPLETE rather than CLEAN. The author-side closure matrix is preserved in
@@ -25,9 +26,16 @@ INCOMPLETE rather than CLEAN. The author-side closure matrix is preserved in
 pass with `-D warnings`. The ordinary `scripts/test-pr.sh` reached the codegen test binary, but
 both the normal and `DYLD_SHARED_REGION=private` runs remained in `_dyld_start` with 0% CPU before
 listing tests; the same loader stall also affected the combined `align_driver` library owner.
-Those attempts are preserved as INCOMPLETE in `.git/am-b4-test-pr-dyld-incomplete.log`; no missing
-test verdict is treated as CLEAN. The earlier codegen owner itself passed 56/56 with 5 ignored
-after the validator fixes.
+Those attempts are preserved as INCOMPLETE in `.git/am-b4-test-pr-dyld-incomplete.log`; the latest
+focused body/replay startup stalls are additionally recorded in
+`.git/am-b4-followup-body-incomplete.log`. No missing test verdict is treated as CLEAN. The earlier
+codegen owner itself passed 56/56 with 5 ignored after the validator fixes.
+Review operation rule recorded after the 2026-08-03 incident: one exact `HEAD`/base review gets one
+live invocation. A timeout, invocation bound, missing verdict, or killed process is INCOMPLETE, never
+CLEAN. Preserve its log, elapsed time, process state, and last completed area; continue only with
+the unfinished or changed slice. A longer user-approved duration extends that invocation only and
+does not authorize polling, restart chains, or a duplicate broad review. This is also a standing
+guardrail in `CLAUDE.md`/`AGENTS.md`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -848,12 +856,12 @@ Clippy gates pass;
 the original broad host wrapper's human no-action text lacked its required machine marker and stays
 recorded as INCOMPLETE rather than CLEAN.
 
-The current activation diff is 503 added/90 deleted tracked lines plus the 1,260-line explicit
-replay clone (1,853 changed hand-written lines total), above the 1,000-line split threshold. It
-remains one vertical because the shared gate cannot safely activate while replay uses derived
-recursive `Clone`: a split would leave either an activated recursive path or a temporary parallel
-replay path. This boundary proof is recorded in the am-b4 matrix; am-c, L3 resources, and public
-`pkg.db` remain separate.
+The current follow-up is above the 1,000-line split threshold because it replaces the replay's
+pointer-sensitive reconstruction with numeric occurrence frames, adds exhaustive child-edge
+teardown, and closes the deep/duplicate-span/Cell/FnTy owner rows in one safety invariant. Splitting
+the frame protocol from teardown would leave either an accepted path with recursive Drop or a
+temporary parallel replay path. This boundary proof is recorded in the am-b4 matrix; am-c, L3
+resources, and public `pkg.db` remain separate.
 
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains INCOMPLETE

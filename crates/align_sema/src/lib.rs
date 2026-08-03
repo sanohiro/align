@@ -4874,26 +4874,28 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     let Some(mut replay) = replay_clone::clone_program(program) else {
         return false;
     };
-    reset_body_analysis_facts(&mut replay);
+    let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reset_body_analysis_facts(&mut replay);
 
-    let external_effects: std::collections::HashMap<String, FnEffect> = replay
-        .imported_fns
-        .iter()
-        .map(|function| (function.name.clone(), function.effect))
-        .collect();
-    let mut diags = Diagnostics::new();
-    for function in &replay.fns {
-        task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
-    }
-    infer_return_provenance(&mut replay);
-    run_body_analysis_passes(
-        &mut replay,
-        &external_effects,
-        &mut diags,
-        true,
-    );
-    let facts_equal = body_analysis_facts_equal(program, &replay);
-    !diags.has_errors() && facts_equal
+        let external_effects: std::collections::HashMap<String, FnEffect> = replay
+            .imported_fns
+            .iter()
+            .map(|function| (function.name.clone(), function.effect))
+            .collect();
+        let mut diags = Diagnostics::new();
+        for function in &replay.fns {
+            task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
+        }
+        infer_return_provenance(&mut replay);
+        run_body_analysis_passes(&mut replay, &external_effects, &mut diags, true);
+        let facts_equal = body_analysis_facts_equal(program, &replay);
+        !diags.has_errors() && facts_equal
+    }));
+    replay_clone::drop_program(replay);
+    let Ok(valid) = analysis else {
+        return false;
+    };
+    valid
 }
 
 fn reset_body_analysis_facts(program: &mut Program) {

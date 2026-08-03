@@ -5,238 +5,309 @@
 //! bodies up to `MAX_CHECKED_HIR_DEPTH` on a 2 MiB owner stack, so replay must rebuild the tree from
 //! a child-first explicit worklist instead of calling those derived implementations.
 
-use std::collections::HashMap;
-
 use crate::hir::{self, ExprKind, StageKind, Stmt, TemplatePart};
 
-struct ClonedExprs {
-    values: HashMap<usize, hir::Expr>,
-    failed: bool,
+enum CloneValue {
+    Expr(hir::Expr),
+    Block(hir::Block),
+    Stmt(hir::Stmt),
+    MatchArm(hir::MatchArm),
+    Stage(hir::Stage),
+    TemplatePart(TemplatePart),
 }
 
-impl ClonedExprs {
-    fn new() -> Self {
+struct ChildValues {
+    values: std::vec::IntoIter<CloneValue>,
+}
+
+impl ChildValues {
+    fn new(values: Vec<CloneValue>) -> Self {
         Self {
-            values: HashMap::new(),
-            failed: false,
+            values: values.into_iter(),
         }
     }
 
-    fn insert(&mut self, key: usize, value: hir::Expr) -> Option<hir::Expr> {
-        self.values.insert(key, value)
-    }
-
-    fn remove(&mut self, key: &usize) -> Option<hir::Expr> {
-        self.values.remove(key)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
-
-fn expr_key(expr: &hir::Expr) -> usize {
-    std::ptr::from_ref(expr) as usize
-}
-
-fn take_expr(clones: &mut ClonedExprs, original: &hir::Expr) -> hir::Expr {
-    match clones.remove(&expr_key(original)) {
-        Some(expr) => expr,
-        None => {
-            // A validated body cannot reach this branch. Keep reconstruction total for direct
-            // malformed-HIR callers; the enclosing clone returns None after recording failure.
-            clones.failed = true;
-            hir::Expr {
-                kind: ExprKind::Unit,
-                ty: original.ty,
-                span: original.span,
-            }
+    fn expr(&mut self) -> Option<hir::Expr> {
+        match self.values.next()? {
+            CloneValue::Expr(expr) => Some(expr),
+            _ => None,
         }
     }
+
+    fn expr_box(&mut self) -> Option<Box<hir::Expr>> {
+        Some(Box::new(self.expr()?))
+    }
+
+    fn exprs(&mut self, count: usize) -> Option<Vec<hir::Expr>> {
+        (0..count).map(|_| self.expr()).collect()
+    }
+
+    fn optional_expr_box(&mut self, present: bool) -> Option<Option<Box<hir::Expr>>> {
+        if present {
+            Some(Some(self.expr_box()?))
+        } else {
+            Some(None)
+        }
+    }
+
+    fn block(&mut self) -> Option<hir::Block> {
+        match self.values.next()? {
+            CloneValue::Block(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    fn stmt(&mut self) -> Option<hir::Stmt> {
+        match self.values.next()? {
+            CloneValue::Stmt(stmt) => Some(stmt),
+            _ => None,
+        }
+    }
+
+    fn stmts(&mut self, count: usize) -> Option<Vec<hir::Stmt>> {
+        (0..count).map(|_| self.stmt()).collect()
+    }
+
+    fn arm(&mut self) -> Option<hir::MatchArm> {
+        match self.values.next()? {
+            CloneValue::MatchArm(arm) => Some(arm),
+            _ => None,
+        }
+    }
+
+    fn arms(&mut self, count: usize) -> Option<Vec<hir::MatchArm>> {
+        (0..count).map(|_| self.arm()).collect()
+    }
+
+    fn stage(&mut self) -> Option<hir::Stage> {
+        match self.values.next()? {
+            CloneValue::Stage(stage) => Some(stage),
+            _ => None,
+        }
+    }
+
+    fn stages(&mut self, count: usize) -> Option<Vec<hir::Stage>> {
+        (0..count).map(|_| self.stage()).collect()
+    }
+
+    fn part(&mut self) -> Option<TemplatePart> {
+        match self.values.next()? {
+            CloneValue::TemplatePart(part) => Some(part),
+            _ => None,
+        }
+    }
+
+    fn parts(&mut self, count: usize) -> Option<Vec<TemplatePart>> {
+        (0..count).map(|_| self.part()).collect()
+    }
+
+    fn has_no_remaining(mut self) -> bool {
+        self.values.next().is_none()
+    }
 }
 
-fn take_boxed_expr(clones: &mut ClonedExprs, original: &hir::Expr) -> Box<hir::Expr> {
-    Box::new(take_expr(clones, original))
-}
-
-fn take_optional_boxed_expr(
-    clones: &mut ClonedExprs,
-    original: Option<&hir::Expr>,
-) -> Option<Box<hir::Expr>> {
-    original.map(|expr| take_boxed_expr(clones, expr))
-}
-
-fn take_exprs(clones: &mut ClonedExprs, originals: &[hir::Expr]) -> Vec<hir::Expr> {
-    originals
-        .iter()
-        .map(|expr| take_expr(clones, expr))
-        .collect()
-}
-
-fn clone_match_arm(clones: &mut ClonedExprs, arm: &hir::MatchArm) -> hir::MatchArm {
-    hir::MatchArm {
+fn clone_match_arm(clones: &mut ChildValues, arm: &hir::MatchArm) -> Option<hir::MatchArm> {
+    Some(hir::MatchArm {
         variants: arm.variants.clone(),
         bindings: arm.bindings.clone(),
-        body: take_expr(clones, &arm.body),
-    }
+        body: clones.expr()?,
+    })
 }
 
-fn clone_stage(clones: &mut ClonedExprs, stage: &hir::Stage) -> hir::Stage {
+fn clone_stage(clones: &mut ChildValues, stage: &hir::Stage) -> Option<hir::Stage> {
     let kind = match &stage.kind {
         StageKind::Map { func, captures } => StageKind::Map {
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: clones.exprs(captures.len())?,
         },
         StageKind::Where { func, captures } => StageKind::Where {
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: clones.exprs(captures.len())?,
         },
         StageKind::WhereField { field } => StageKind::WhereField { field: *field },
-        StageKind::WhereStrContains { needle } => StageKind::WhereStrContains {
-            needle: take_expr(clones, needle),
+        StageKind::WhereStrContains { .. } => StageKind::WhereStrContains {
+            needle: clones.expr()?,
         },
         StageKind::Project { field } => StageKind::Project { field: *field },
     };
-    hir::Stage {
+    Some(hir::Stage {
         kind,
         out_ty: stage.out_ty,
-    }
+    })
 }
 
-fn clone_template_part(clones: &mut ClonedExprs, part: &TemplatePart) -> TemplatePart {
-    match part {
+fn clone_template_part(clones: &mut ChildValues, part: &TemplatePart) -> Option<TemplatePart> {
+    Some(match part {
         TemplatePart::Text(text) => TemplatePart::Text(text.clone()),
-        TemplatePart::Hole(expr) => TemplatePart::Hole(take_expr(clones, expr)),
-        TemplatePart::JsonStr(expr) => TemplatePart::JsonStr(take_expr(clones, expr)),
-        TemplatePart::OptionField { access, name } => TemplatePart::OptionField {
-            access: take_expr(clones, access),
+        TemplatePart::Hole(_) => TemplatePart::Hole(clones.expr()?),
+        TemplatePart::JsonStr(_) => TemplatePart::JsonStr(clones.expr()?),
+        TemplatePart::OptionField { name, .. } => TemplatePart::OptionField {
+            access: clones.expr()?,
             name: name.clone(),
         },
         TemplatePart::OptionStructField {
-            access,
-            name,
-            struct_id,
+            name, struct_id, ..
         } => TemplatePart::OptionStructField {
-            access: take_expr(clones, access),
+            access: clones.expr()?,
             name: name.clone(),
             struct_id: *struct_id,
         },
         TemplatePart::PopComma => TemplatePart::PopComma,
-        TemplatePart::StructArrayField { access, struct_id } => TemplatePart::StructArrayField {
-            access: take_expr(clones, access),
+        TemplatePart::StructArrayField { struct_id, .. } => TemplatePart::StructArrayField {
+            access: clones.expr()?,
             struct_id: *struct_id,
         },
-        TemplatePart::ScalarArrayField { access, elem } => TemplatePart::ScalarArrayField {
-            access: take_expr(clones, access),
+        TemplatePart::ScalarArrayField { elem, .. } => TemplatePart::ScalarArrayField {
+            access: clones.expr()?,
             elem: *elem,
         },
-        TemplatePart::UnionValue { access, enum_id } => TemplatePart::UnionValue {
-            access: take_expr(clones, access),
+        TemplatePart::UnionValue { enum_id, .. } => TemplatePart::UnionValue {
+            access: clones.expr()?,
             enum_id: *enum_id,
         },
-    }
+    })
 }
 
-fn clone_block(clones: &mut ClonedExprs, block: &hir::Block) -> hir::Block {
-    hir::Block {
-        stmts: block
-            .stmts
-            .iter()
-            .map(|stmt| clone_stmt(clones, stmt))
-            .collect(),
-        value: block
-            .value
-            .as_deref()
-            .map(|expr| take_boxed_expr(clones, expr)),
-    }
+fn clone_block(clones: &mut ChildValues, block: &hir::Block) -> Option<hir::Block> {
+    let stmts = clones.stmts(block.stmts.len())?;
+    let value = clones.optional_expr_box(block.value.is_some())?;
+    Some(hir::Block { stmts, value })
 }
 
-fn clone_stmt(clones: &mut ClonedExprs, stmt: &Stmt) -> Stmt {
-    match stmt {
-        Stmt::Let { local, init } => Stmt::Let {
+fn clone_stmt(clones: &mut ChildValues, stmt: &Stmt) -> Option<Stmt> {
+    Some(match stmt {
+        Stmt::Let { local, .. } => Stmt::Let {
             local: *local,
-            init: take_expr(clones, init),
+            init: clones.expr()?,
         },
         Stmt::LetTuple {
-            locals,
-            tuple_id,
-            init,
+            locals, tuple_id, ..
         } => Stmt::LetTuple {
             locals: locals.clone(),
             tuple_id: *tuple_id,
-            init: take_expr(clones, init),
+            init: clones.expr()?,
         },
         Stmt::Assign {
             local,
-            value,
             drop_old,
             drop_new,
+            ..
         } => Stmt::Assign {
             local: *local,
-            value: take_expr(clones, value),
+            value: clones.expr()?,
             drop_old: std::cell::Cell::new(drop_old.get()),
             drop_new: std::cell::Cell::new(drop_new.get()),
         },
-        Stmt::AssignIndex { base, index, value } => Stmt::AssignIndex {
+        Stmt::AssignIndex { base, .. } => Stmt::AssignIndex {
             base: *base,
-            index: take_expr(clones, index),
-            value: take_expr(clones, value),
+            index: clones.expr()?,
+            value: clones.expr()?,
         },
-        Stmt::AssignVecLane { local, lane, value } => Stmt::AssignVecLane {
+        Stmt::AssignVecLane { local, lane, .. } => Stmt::AssignVecLane {
             local: *local,
             lane: *lane,
-            value: take_expr(clones, value),
+            value: clones.expr()?,
         },
-        Stmt::AssignField { root, path, value } => Stmt::AssignField {
+        Stmt::AssignField { root, path, .. } => Stmt::AssignField {
             root: *root,
             path: path.clone(),
-            value: take_expr(clones, value),
+            value: clones.expr()?,
         },
         Stmt::AssignElemField {
             base,
-            index,
             path,
             struct_id,
             soa,
-            value,
+            ..
         } => Stmt::AssignElemField {
             base: *base,
-            index: take_expr(clones, index),
+            index: clones.expr()?,
             path: path.clone(),
             struct_id: *struct_id,
             soa: *soa,
-            value: take_expr(clones, value),
+            value: clones.expr()?,
         },
         Stmt::AssignElem {
             base,
-            index,
             struct_id,
             soa,
-            value,
+            ..
         } => Stmt::AssignElem {
             base: *base,
-            index: take_expr(clones, index),
+            index: clones.expr()?,
             struct_id: *struct_id,
             soa: *soa,
-            value: take_expr(clones, value),
+            value: clones.expr()?,
         },
-        Stmt::Return(value) => Stmt::Return(value.as_ref().map(|expr| take_expr(clones, expr))),
-        Stmt::Break { value, accepted } => Stmt::Break {
-            value: value.as_ref().map(|expr| take_expr(clones, expr)),
+        Stmt::Return(_) => Stmt::Return(if matches!(stmt, Stmt::Return(Some(_))) {
+            Some(clones.expr()?)
+        } else {
+            None
+        }),
+        Stmt::Break { accepted, value } => Stmt::Break {
+            value: if value.is_some() {
+                Some(clones.expr()?)
+            } else {
+                None
+            },
             accepted: *accepted,
         },
-        Stmt::Expr(expr) => Stmt::Expr(take_expr(clones, expr)),
+        Stmt::Expr(_) => Stmt::Expr(clones.expr()?),
+    })
+}
+
+fn take_exprs<C: ChildCount>(clones: &mut ChildValues, count: C) -> Option<Vec<hir::Expr>> {
+    clones.exprs(count.child_count())
+}
+
+fn take_boxed_expr(clones: &mut ChildValues) -> Option<Box<hir::Expr>> {
+    clones.expr_box()
+}
+
+fn take_optional_boxed_expr(
+    clones: &mut ChildValues,
+    present: bool,
+) -> Option<Option<Box<hir::Expr>>> {
+    clones.optional_expr_box(present)
+}
+
+fn finish_children<T>(
+    values: Vec<CloneValue>,
+    build: impl FnOnce(&mut ChildValues) -> Option<T>,
+) -> Option<T> {
+    let mut children = ChildValues::new(values);
+    let value = build(&mut children)?;
+    if !children.has_no_remaining() {
+        return None;
+    }
+    Some(value)
+}
+
+trait ChildCount {
+    fn child_count(self) -> usize;
+}
+
+impl ChildCount for usize {
+    fn child_count(self) -> usize {
+        self
     }
 }
 
-fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
+impl ChildCount for &[hir::Expr] {
+    fn child_count(self) -> usize {
+        self.len()
+    }
+}
+
+fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind> {
     macro_rules! boxed {
-        ($expr:expr) => {
-            take_boxed_expr(clones, $expr)
-        };
+        ($expr:expr) => {{
+            let _ = $expr;
+            take_boxed_expr(clones)?
+        }};
     }
 
-    match kind {
+    Some(match kind {
         // These variants contain no nested HIR records. Their derived clones are therefore
         // independent of body depth.
         ExprKind::Unit
@@ -282,17 +353,17 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         },
         ExprKind::MathOp { fn_, operands } => ExprKind::MathOp {
             fn_: *fn_,
-            operands: take_exprs(clones, operands),
+            operands: take_exprs(clones, operands.len())?,
         },
         ExprKind::Closure { lifted, captures } => ExprKind::Closure {
             lifted: lifted.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
         },
         ExprKind::CallFnValue { callee, args } => ExprKind::CallFnValue {
             callee: boxed!(callee),
-            args: take_exprs(clones, args),
+            args: take_exprs(clones, args.len())?,
         },
-        ExprKind::TaskGroup(block) => ExprKind::TaskGroup(clone_block(clones, block)),
+        ExprKind::TaskGroup(_) => ExprKind::TaskGroup(clones.block()?),
         ExprKind::EnumValue {
             enum_id,
             variant,
@@ -300,14 +371,11 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         } => ExprKind::EnumValue {
             enum_id: *enum_id,
             variant: *variant,
-            payload: take_exprs(clones, payload),
+            payload: take_exprs(clones, payload.len())?,
         },
         ExprKind::Match { scrutinee, arms } => ExprKind::Match {
             scrutinee: boxed!(scrutinee),
-            arms: arms
-                .iter()
-                .map(|arm| clone_match_arm(clones, arm))
-                .collect(),
+            arms: clones.arms(arms.len())?,
         },
         ExprKind::ResultMapErr { result, f } => ExprKind::ResultMapErr {
             result: boxed!(result),
@@ -324,27 +392,27 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             type_args,
         } => ExprKind::Call {
             func: func.clone(),
-            args: take_exprs(clones, args),
+            args: take_exprs(clones, args.len())?,
             type_args: type_args.clone(),
         },
-        ExprKind::If { cond, then, els } => ExprKind::If {
+        ExprKind::If { cond, .. } => ExprKind::If {
             cond: boxed!(cond),
-            then: clone_block(clones, then),
-            els: clone_block(clones, els),
+            then: clones.block()?,
+            els: clones.block()?,
         },
         ExprKind::StructLit { struct_id, fields } => ExprKind::StructLit {
             struct_id: *struct_id,
-            fields: take_exprs(clones, fields),
+            fields: take_exprs(clones, fields.len())?,
         },
         ExprKind::Tuple { tuple_id, elems } => ExprKind::Tuple {
             tuple_id: *tuple_id,
-            elems: take_exprs(clones, elems),
+            elems: take_exprs(clones, elems.len())?,
         },
         ExprKind::TupleIndex { recv, index } => ExprKind::TupleIndex {
             recv: boxed!(recv),
             index: *index,
         },
-        ExprKind::Block(block) => ExprKind::Block(clone_block(clones, block)),
+        ExprKind::Block(_) => ExprKind::Block(clones.block()?),
         ExprKind::OptionSome(expr) => ExprKind::OptionSome(boxed!(expr)),
         ExprKind::ElseUnwrap { opt, fallback } => ExprKind::ElseUnwrap {
             opt: boxed!(opt),
@@ -354,16 +422,16 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         ExprKind::ResultErr(expr) => ExprKind::ResultErr(boxed!(expr)),
         ExprKind::Try(expr) => ExprKind::Try(boxed!(expr)),
         ExprKind::Loop {
-            body,
+            body: _,
             diverges,
             body_locals,
         } => ExprKind::Loop {
-            body: clone_block(clones, body),
+            body: clones.block()?,
             diverges: *diverges,
             body_locals: body_locals.clone(),
         },
-        ExprKind::Arena(block) => ExprKind::Arena(clone_block(clones, block)),
-        ExprKind::Unsafe(block) => ExprKind::Unsafe(clone_block(clones, block)),
+        ExprKind::Arena(_) => ExprKind::Arena(clones.block()?),
+        ExprKind::Unsafe(_) => ExprKind::Unsafe(clones.block()?),
         ExprKind::RawAlloc(expr) => ExprKind::RawAlloc(boxed!(expr)),
         ExprKind::RawFree(expr) => ExprKind::RawFree(boxed!(expr)),
         ExprKind::RawLoad {
@@ -403,7 +471,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         },
         ExprKind::StrBorrow(expr) => ExprKind::StrBorrow(boxed!(expr)),
         ExprKind::BuilderNew { capacity } => ExprKind::BuilderNew {
-            capacity: take_optional_boxed_expr(clones, capacity.as_deref()),
+            capacity: take_optional_boxed_expr(clones, capacity.is_some())?,
         },
         ExprKind::BuilderWrite { builder, arg, kind } => ExprKind::BuilderWrite {
             builder: boxed!(builder),
@@ -416,17 +484,17 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
             pooled,
         } => ExprKind::ArrayLit {
-            elems: take_exprs(clones, elems),
+            elems: take_exprs(clones, elems.len())?,
             elem: *elem,
             pooled: *pooled,
         },
         ExprKind::ConstArray { elems, elem, len } => ExprKind::ConstArray {
-            elems: take_exprs(clones, elems),
+            elems: take_exprs(clones, elems.len())?,
             elem: *elem,
             len: *len,
         },
         ExprKind::ArrayZip { sources, tuple_id } => ExprKind::ArrayZip {
-            sources: take_exprs(clones, sources),
+            sources: take_exprs(clones, sources.len())?,
             tuple_id: *tuple_id,
         },
         ExprKind::Select { mask, a, b } => ExprKind::Select {
@@ -472,22 +540,16 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             n: *n,
         },
         ExprKind::VecLit { elems, elem } => ExprKind::VecLit {
-            elems: take_exprs(clones, elems),
+            elems: take_exprs(clones, elems.len())?,
             elem: *elem,
         },
         ExprKind::ArraySum { source, stages } => ExprKind::ArraySum {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
         },
         ExprKind::ArrayCount { source, stages } => ExprKind::ArrayCount {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
         },
         ExprKind::ArrayAnyAll {
             source,
@@ -497,12 +559,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             all,
         } => ExprKind::ArrayAnyAll {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             all: *all,
         },
         ExprKind::ArrayMinMax {
@@ -511,10 +570,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             is_max,
         } => ExprKind::ArrayMinMax {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             is_max: *is_max,
         },
         ExprKind::ArrayReduce {
@@ -525,12 +581,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             init,
         } => ExprKind::ArrayReduce {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             init: boxed!(init),
         },
         ExprKind::ArrayScan {
@@ -542,12 +595,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArrayScan {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             init: boxed!(init),
             elem: *elem,
         },
@@ -562,10 +612,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArraySort {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             elem: *elem,
         },
         ExprKind::ArraySortBy {
@@ -577,12 +624,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArraySortBy {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             key_func: key_func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             key_ty: *key_ty,
             elem: *elem,
         },
@@ -592,10 +636,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArrayToArray {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             elem: *elem,
         },
         ExprKind::ArrayToSoa { source, struct_id } => ExprKind::ArrayToSoa {
@@ -609,10 +650,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArrayMapInto {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             dst: boxed!(dst),
             elem: *elem,
         },
@@ -624,12 +662,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArrayPartition {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             elem: *elem,
         },
         ExprKind::ArrayParMap {
@@ -640,12 +675,9 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             elem,
         } => ExprKind::ArrayParMap {
             source: boxed!(source),
-            stages: stages
-                .iter()
-                .map(|stage| clone_stage(clones, stage))
-                .collect(),
+            stages: clones.stages(stages.len())?,
             func: func.clone(),
-            captures: take_exprs(clones, captures),
+            captures: take_exprs(clones, captures.len())?,
             elem: *elem,
         },
         ExprKind::ArrayChunks { source, n, elem } => ExprKind::ArrayChunks {
@@ -661,8 +693,8 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         },
         ExprKind::SliceRange { recv, start, end } => ExprKind::SliceRange {
             recv: boxed!(recv),
-            start: take_optional_boxed_expr(clones, start.as_deref()),
-            end: take_optional_boxed_expr(clones, end.as_deref()),
+            start: take_optional_boxed_expr(clones, start.is_some())?,
+            end: take_optional_boxed_expr(clones, end.is_some())?,
         },
         ExprKind::ElemField {
             recv,
@@ -675,12 +707,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             path: path.clone(),
             struct_id: *struct_id,
         },
-        ExprKind::Template(parts) => ExprKind::Template(
-            parts
-                .iter()
-                .map(|part| clone_template_part(clones, part))
-                .collect(),
-        ),
+        ExprKind::Template(parts) => ExprKind::Template(clones.parts(parts.len())?),
         ExprKind::JsonDecode { struct_id, input } => ExprKind::JsonDecode {
             struct_id: *struct_id,
             input: boxed!(input),
@@ -984,7 +1011,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
         ExprKind::RegexFind { regex, text, start } => ExprKind::RegexFind {
             regex: boxed!(regex),
             text: boxed!(text),
-            start: take_optional_boxed_expr(clones, start.as_deref()),
+            start: take_optional_boxed_expr(clones, start.is_some())?,
         },
         ExprKind::RegexFindAll { regex, text } => ExprKind::RegexFindAll {
             regex: boxed!(regex),
@@ -1030,7 +1057,7 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             cmd: boxed!(cmd),
             kind: *kind,
             name: boxed!(name),
-            default: take_optional_boxed_expr(clones, default.as_deref()),
+            default: take_optional_boxed_expr(clones, default.is_some())?,
         },
         ExprKind::CliParse { cmd, args } => ExprKind::CliParse {
             cmd: boxed!(cmd),
@@ -1199,31 +1226,160 @@ fn clone_expr_kind(clones: &mut ClonedExprs, kind: &ExprKind) -> ExprKind {
             salt: boxed!(salt),
             params: boxed!(params),
         },
+    })
+}
+
+enum CloneFrame<'a> {
+    Block {
+        id: usize,
+        source: &'a hir::Block,
+        values: Vec<CloneValue>,
+    },
+    Stmt {
+        id: usize,
+        source: &'a Stmt,
+        values: Vec<CloneValue>,
+    },
+    Expr {
+        id: usize,
+        source: &'a hir::Expr,
+        values: Vec<CloneValue>,
+    },
+    MatchArm {
+        id: usize,
+        source: &'a hir::MatchArm,
+        values: Vec<CloneValue>,
+    },
+    Stage {
+        id: usize,
+        source: &'a hir::Stage,
+        values: Vec<CloneValue>,
+    },
+    TemplatePart {
+        id: usize,
+        source: &'a TemplatePart,
+        values: Vec<CloneValue>,
+    },
+}
+
+impl<'a> CloneFrame<'a> {
+    fn new(id: usize, record: crate::hir_depth::BodyRecord<'a>) -> Option<Self> {
+        let values = Vec::new();
+        Some(match record {
+            crate::hir_depth::BodyRecord::Block(source) => Self::Block { id, source, values },
+            crate::hir_depth::BodyRecord::Stmt(source) => Self::Stmt { id, source, values },
+            crate::hir_depth::BodyRecord::Expr(source) => Self::Expr { id, source, values },
+            crate::hir_depth::BodyRecord::MatchArm { arm: source, .. } => {
+                Self::MatchArm { id, source, values }
+            }
+            crate::hir_depth::BodyRecord::Stage(source) => Self::Stage { id, source, values },
+            crate::hir_depth::BodyRecord::TemplatePart(source) => {
+                Self::TemplatePart { id, source, values }
+            }
+            crate::hir_depth::BodyRecord::BlockExit { .. }
+            | crate::hir_depth::BodyRecord::StmtExit { .. }
+            | crate::hir_depth::BodyRecord::ExprExit { .. }
+            | crate::hir_depth::BodyRecord::MatchArmExit { .. }
+            | crate::hir_depth::BodyRecord::StageExit { .. }
+            | crate::hir_depth::BodyRecord::TemplatePartExit { .. } => return None,
+        })
+    }
+
+    fn id(&self) -> usize {
+        match self {
+            Self::Block { id, .. }
+            | Self::Stmt { id, .. }
+            | Self::Expr { id, .. }
+            | Self::MatchArm { id, .. }
+            | Self::Stage { id, .. }
+            | Self::TemplatePart { id, .. } => *id,
+        }
+    }
+
+    fn push(&mut self, value: CloneValue) {
+        match self {
+            Self::Block { values, .. }
+            | Self::Stmt { values, .. }
+            | Self::Expr { values, .. }
+            | Self::MatchArm { values, .. }
+            | Self::Stage { values, .. }
+            | Self::TemplatePart { values, .. } => values.push(value),
+        }
+    }
+
+    fn finish(self) -> Option<CloneValue> {
+        match self {
+            Self::Block { source, values, .. } => {
+                Some(CloneValue::Block(finish_children(values, |children| {
+                    clone_block(children, source)
+                })?))
+            }
+            Self::Stmt { source, values, .. } => {
+                Some(CloneValue::Stmt(finish_children(values, |children| {
+                    clone_stmt(children, source)
+                })?))
+            }
+            Self::Expr { source, values, .. } => {
+                Some(CloneValue::Expr(finish_children(values, |children| {
+                    Some(hir::Expr {
+                        kind: clone_expr_kind(children, &source.kind)?,
+                        ty: source.ty,
+                        span: source.span,
+                    })
+                })?))
+            }
+            Self::MatchArm { source, values, .. } => {
+                Some(CloneValue::MatchArm(finish_children(values, |children| {
+                    clone_match_arm(children, source)
+                })?))
+            }
+            Self::Stage { source, values, .. } => {
+                Some(CloneValue::Stage(finish_children(values, |children| {
+                    clone_stage(children, source)
+                })?))
+            }
+            Self::TemplatePart { source, values, .. } => Some(CloneValue::TemplatePart(
+                finish_children(values, |children| clone_template_part(children, source))?,
+            )),
+        }
     }
 }
 
 fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
-    let mut clones = ClonedExprs::new();
-    for event in crate::hir_depth::body_events(&function.body) {
-        if let crate::hir_depth::BodyEvent::ExprExit { expression, .. } = event {
-            let cloned_kind = clone_expr_kind(&mut clones, &expression.kind);
-            let previous = clones.insert(
-                expr_key(expression),
-                hir::Expr {
-                    kind: cloned_kind,
-                    ty: expression.ty,
-                    span: expression.span,
-                },
-            );
-            if previous.is_some() {
-                clones.failed = true;
+    let events = crate::hir_depth::clone_events(&function.body)?;
+    let mut frames = Vec::new();
+    let mut root = None;
+    for event in events {
+        match event {
+            crate::hir_depth::CloneEvent::RecordEnter { id, record } => {
+                frames.push(CloneFrame::new(id, record)?);
+            }
+            crate::hir_depth::CloneEvent::RecordExit { id } => {
+                let frame = frames.pop()?;
+                if frame.id() != id {
+                    return None;
+                }
+                let value = frame.finish()?;
+                if let Some(parent) = frames.last_mut() {
+                    parent.push(value);
+                } else if root.replace(value).is_some() {
+                    return None;
+                }
             }
         }
     }
-    let body = clone_block(&mut clones, &function.body);
-    if clones.failed || !clones.is_empty() {
+    if !frames.is_empty() {
         return None;
     }
+    let body = match root {
+        Some(CloneValue::Block(body)) => body,
+        Some(CloneValue::Expr(_))
+        | Some(CloneValue::Stmt(_))
+        | Some(CloneValue::MatchArm(_))
+        | Some(CloneValue::Stage(_))
+        | Some(CloneValue::TemplatePart(_))
+        | None => return None,
+    };
     Some(hir::Fn {
         name: function.name.clone(),
         origin: function.origin,
@@ -1244,7 +1400,11 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
 pub(crate) fn clone_program(program: &hir::Program) -> Option<hir::Program> {
     let mut fns = Vec::with_capacity(program.fns.len());
     for function in &program.fns {
-        fns.push(clone_function(function)?);
+        let Some(function) = clone_function(function) else {
+            drop_functions(fns);
+            return None;
+        };
+        fns.push(function);
     }
     Some(hir::Program {
         fns,
@@ -1257,4 +1417,1030 @@ pub(crate) fn clone_program(program: &hir::Program) -> Option<hir::Program> {
         fn_types: program.fn_types.clone(),
         imported_fns: program.imported_fns.clone(),
     })
+}
+
+enum DropWork {
+    Function(hir::Fn),
+    Block(hir::Block),
+    Stmt(hir::Stmt),
+    Expr(hir::Expr),
+    MatchArm(hir::MatchArm),
+    Stage(hir::Stage),
+    TemplatePart(TemplatePart),
+}
+
+/// Drop a cloned HIR tree without following its recursive `Box`/`Vec` shape on the native stack.
+///
+/// This is deliberately separate from `clone_program`: the replay boundary must contain the
+/// teardown of a successful replay, a rejected replay, and a replay whose analysis panics. Every
+/// child-bearing HIR variant is listed in `drop_expr_kind`; adding one without adding its teardown
+/// path is therefore a compile-time review point in the same file as reconstruction.
+pub(crate) fn drop_program(program: hir::Program) {
+    let hir::Program {
+        fns,
+        externs,
+        link_libs,
+        structs,
+        enums,
+        tagged_types,
+        tuples,
+        fn_types,
+        imported_fns,
+    } = program;
+    drop((
+        externs,
+        link_libs,
+        structs,
+        enums,
+        tagged_types,
+        tuples,
+        fn_types,
+        imported_fns,
+    ));
+
+    drop_functions(fns);
+}
+
+fn drop_functions(fns: Vec<hir::Fn>) {
+    let mut work: Vec<DropWork> = fns.into_iter().map(DropWork::Function).collect();
+    while let Some(item) = work.pop() {
+        match item {
+            DropWork::Function(function) => {
+                let hir::Fn {
+                    name,
+                    origin,
+                    params,
+                    param_modes,
+                    ret,
+                    return_borrow,
+                    return_region,
+                    locals,
+                    body,
+                    span,
+                    drop_locals,
+                    drop_individual_locals,
+                    drop_individual_exprs,
+                } = function;
+                drop((
+                    name,
+                    origin,
+                    params,
+                    param_modes,
+                    ret,
+                    return_borrow,
+                    return_region,
+                    locals,
+                    span,
+                    drop_locals,
+                    drop_individual_locals,
+                    drop_individual_exprs,
+                ));
+                work.push(DropWork::Block(body));
+            }
+            DropWork::Block(block) => {
+                let hir::Block { stmts, value } = block;
+                work.extend(stmts.into_iter().map(DropWork::Stmt));
+                if let Some(value) = value {
+                    work.push(DropWork::Expr(*value));
+                }
+            }
+            DropWork::Stmt(stmt) => match stmt {
+                Stmt::Let { local: _, init } => {
+                    work.push(DropWork::Expr(init));
+                }
+                Stmt::LetTuple {
+                    locals,
+                    tuple_id: _,
+                    init,
+                } => {
+                    drop(locals);
+                    work.push(DropWork::Expr(init));
+                }
+                Stmt::Assign {
+                    local: _,
+                    value,
+                    drop_old: _,
+                    drop_new: _,
+                } => {
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::AssignIndex {
+                    base: _,
+                    index,
+                    value,
+                } => {
+                    work.push(DropWork::Expr(index));
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::AssignVecLane {
+                    local: _,
+                    lane: _,
+                    value,
+                } => {
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::AssignField {
+                    root: _,
+                    path,
+                    value,
+                } => {
+                    drop(path);
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::AssignElemField {
+                    base: _,
+                    index,
+                    path,
+                    struct_id: _,
+                    soa: _,
+                    value,
+                } => {
+                    drop(path);
+                    work.push(DropWork::Expr(index));
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::AssignElem {
+                    base: _,
+                    index,
+                    struct_id: _,
+                    soa: _,
+                    value,
+                } => {
+                    work.push(DropWork::Expr(index));
+                    work.push(DropWork::Expr(value));
+                }
+                Stmt::Return(value) | Stmt::Break { value, .. } => {
+                    if let Some(value) = value {
+                        work.push(DropWork::Expr(value));
+                    }
+                }
+                Stmt::Expr(expr) => work.push(DropWork::Expr(expr)),
+            },
+            DropWork::Expr(expression) => {
+                let hir::Expr {
+                    kind,
+                    ty: _,
+                    span: _,
+                } = expression;
+                drop_expr_kind(kind, &mut work);
+            }
+            DropWork::MatchArm(arm) => {
+                let hir::MatchArm {
+                    variants,
+                    bindings,
+                    body,
+                } = arm;
+                drop((variants, bindings));
+                work.push(DropWork::Expr(body));
+            }
+            DropWork::Stage(stage) => {
+                let hir::Stage { kind, out_ty: _ } = stage;
+                match kind {
+                    StageKind::Map { func, captures } | StageKind::Where { func, captures } => {
+                        drop(func);
+                        work.extend(captures.into_iter().map(DropWork::Expr));
+                    }
+                    StageKind::WhereField { field: _ } | StageKind::Project { field: _ } => {}
+                    StageKind::WhereStrContains { needle } => {
+                        work.push(DropWork::Expr(needle));
+                    }
+                }
+            }
+            DropWork::TemplatePart(part) => match part {
+                TemplatePart::Text(text) => drop(text),
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
+                    work.push(DropWork::Expr(expr));
+                }
+                TemplatePart::OptionField { access, name }
+                | TemplatePart::OptionStructField { access, name, .. } => {
+                    drop(name);
+                    work.push(DropWork::Expr(access));
+                }
+                TemplatePart::PopComma => {}
+                TemplatePart::StructArrayField { access, .. }
+                | TemplatePart::ScalarArrayField { access, .. }
+                | TemplatePart::UnionValue { access, .. } => {
+                    work.push(DropWork::Expr(access));
+                }
+            },
+        }
+    }
+}
+
+fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
+    macro_rules! one {
+        ($expr:expr) => {{
+            work.push(DropWork::Expr(*$expr));
+        }};
+    }
+    macro_rules! many {
+        ($exprs:expr) => {{
+            work.extend($exprs.into_iter().map(DropWork::Expr));
+        }};
+    }
+    macro_rules! block {
+        ($block:expr) => {{
+            work.push(DropWork::Block($block));
+        }};
+    }
+    macro_rules! stages {
+        ($stages:expr) => {{
+            work.extend($stages.into_iter().map(DropWork::Stage));
+        }};
+    }
+    macro_rules! arms {
+        ($arms:expr) => {{
+            work.extend($arms.into_iter().map(DropWork::MatchArm));
+        }};
+    }
+    macro_rules! parts {
+        ($parts:expr) => {{
+            work.extend($parts.into_iter().map(DropWork::TemplatePart));
+        }};
+    }
+    macro_rules! optional {
+        ($expr:expr) => {
+            if let Some(expr) = $expr {
+                work.push(DropWork::Expr(*expr));
+            }
+        };
+    }
+
+    match kind {
+        ExprKind::Unit
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Local(_)
+        | ExprKind::FnValue(_)
+        | ExprKind::Wait
+        | ExprKind::Field { .. }
+        | ExprKind::SoaColumn { .. }
+        | ExprKind::IndexField { .. }
+        | ExprKind::OptionNone
+        | ExprKind::ArrayGroupAgg { .. }
+        | ExprKind::ArrayGroupAggMulti { .. }
+        | ExprKind::ArrayDictEncode { .. }
+        | ExprKind::ReaderStdin
+        | ExprKind::WriterStd { .. }
+        | ExprKind::ArrayBuilderNew { .. }
+        | ExprKind::TimeNow
+        | ExprKind::TimeInstant
+        | ExprKind::ProcessCpuCount
+        | ExprKind::ProcessAbort
+        | ExprKind::RandSeed
+        | ExprKind::HttpClient => {}
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast(expr)
+        | ExprKind::TaskGet(expr)
+        | ExprKind::OptionSome(expr)
+        | ExprKind::ResultOk(expr)
+        | ExprKind::ResultErr(expr)
+        | ExprKind::Try(expr)
+        | ExprKind::RawAlloc(expr)
+        | ExprKind::RawFree(expr)
+        | ExprKind::HeapNew(expr)
+        | ExprKind::BoxGet(expr)
+        | ExprKind::BoxClone(expr)
+        | ExprKind::StrClone(expr)
+        | ExprKind::StrBorrow(expr)
+        | ExprKind::BuilderToString(expr)
+        | ExprKind::ArrayToSlice(expr)
+        | ExprKind::Len(expr)
+        | ExprKind::ArrayBuilderBuild(expr) => one!(expr),
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::IntArith { lhs, rhs, .. }
+        | ExprKind::ResultMapErr {
+            result: lhs,
+            f: rhs,
+        }
+        | ExprKind::RawLoad {
+            ptr: lhs,
+            offset: rhs,
+            ..
+        }
+        | ExprKind::RawOffset {
+            ptr: lhs,
+            offset: rhs,
+        }
+        | ExprKind::StrPredicate {
+            haystack: lhs,
+            needle: rhs,
+            ..
+        }
+        | ExprKind::BuilderWrite {
+            builder: lhs,
+            arg: rhs,
+            ..
+        }
+        | ExprKind::ReaderRead {
+            reader: lhs,
+            buffer: rhs,
+        }
+        | ExprKind::ReaderReadLine {
+            reader: lhs,
+            buffer: rhs,
+        }
+        | ExprKind::WriterWrite {
+            writer: lhs,
+            arg: rhs,
+            ..
+        }
+        | ExprKind::IoCopy {
+            reader: lhs,
+            writer: rhs,
+        }
+        | ExprKind::BufferPut {
+            buffer: lhs,
+            value: rhs,
+            ..
+        }
+        | ExprKind::BufferAppend {
+            buffer: lhs,
+            data: rhs,
+        }
+        | ExprKind::ArrayBuilderPush {
+            builder: lhs,
+            value: rhs,
+            ..
+        }
+        | ExprKind::ArrayBuilderAppend {
+            builder: lhs,
+            data: rhs,
+        }
+        | ExprKind::FsWriteFile {
+            path: lhs,
+            data: rhs,
+            ..
+        }
+        | ExprKind::TcpConnect {
+            host: lhs,
+            port: rhs,
+        }
+        | ExprKind::TcpReadTimeout { conn: lhs, ns: rhs }
+        | ExprKind::TcpWriteTimeout { conn: lhs, ns: rhs }
+        | ExprKind::TcpListen {
+            host: lhs,
+            port: rhs,
+        }
+        | ExprKind::UdpBind {
+            host: lhs,
+            port: rhs,
+        }
+        | ExprKind::UdpRecvFrom {
+            sock: lhs,
+            buffer: rhs,
+        }
+        | ExprKind::PathJoin { a: lhs, b: rhs }
+        | ExprKind::EnvSet {
+            name: lhs,
+            value: rhs,
+        }
+        | ExprKind::ProcessSpawn {
+            cmd: lhs,
+            args: rhs,
+        }
+        | ExprKind::ChildKill {
+            child: lhs,
+            sig: rhs,
+        }
+        | ExprKind::ProcessExec {
+            cmd: lhs,
+            args: rhs,
+        }
+        | ExprKind::ProcessCommand {
+            cmd: lhs,
+            args: rhs,
+        }
+        | ExprKind::CommandCwd {
+            command: lhs,
+            dir: rhs,
+        }
+        | ExprKind::CommandTimeout {
+            command: lhs,
+            ns: rhs,
+        }
+        | ExprKind::Compress {
+            data: lhs,
+            level: rhs,
+            ..
+        }
+        | ExprKind::RegexIsMatch {
+            regex: lhs,
+            text: rhs,
+        }
+        | ExprKind::RegexFindAll {
+            regex: lhs,
+            text: rhs,
+        }
+        | ExprKind::RegexSplit {
+            regex: lhs,
+            text: rhs,
+        }
+        | ExprKind::RegexCaptures {
+            regex: lhs,
+            text: rhs,
+        }
+        | ExprKind::RegexGroupIndex {
+            regex: lhs,
+            name: rhs,
+        }
+        | ExprKind::CapturesGroup {
+            caps: lhs,
+            index: rhs,
+        }
+        | ExprKind::CliParse {
+            cmd: lhs,
+            args: rhs,
+        }
+        | ExprKind::CliGetBool {
+            parsed: lhs,
+            name: rhs,
+        }
+        | ExprKind::CliGetI64 {
+            parsed: lhs,
+            name: rhs,
+        }
+        | ExprKind::CliGetStr {
+            parsed: lhs,
+            name: rhs,
+        }
+        | ExprKind::HttpRequest {
+            method: lhs,
+            url: rhs,
+        }
+        | ExprKind::HttpBody {
+            req: lhs,
+            data: rhs,
+        }
+        | ExprKind::HttpRequestTimeout { req: lhs, ns: rhs }
+        | ExprKind::HttpRespHeader {
+            resp: lhs,
+            name: rhs,
+        }
+        | ExprKind::HttpClientTimeout {
+            client: lhs,
+            ns: rhs,
+        }
+        | ExprKind::HttpClientGet {
+            client: lhs,
+            url: rhs,
+        }
+        | ExprKind::HttpClientRequest {
+            client: lhs,
+            req: rhs,
+        }
+        | ExprKind::HttpCtxHeader {
+            headers: lhs,
+            name: rhs,
+        }
+        | ExprKind::HttpRbBody { rb: lhs, data: rhs }
+        | ExprKind::HttpRespond { ctx: lhs, rb: rhs }
+        | ExprKind::HttpRespondStream { ctx: lhs, rb: rhs }
+        | ExprKind::HttpStreamSend {
+            stream: lhs,
+            chunk: rhs,
+            ..
+        }
+        | ExprKind::HttpStreamReject {
+            stream: lhs,
+            rb: rhs,
+        }
+        | ExprKind::CryptoCtEqual { a: lhs, b: rhs }
+        | ExprKind::CryptoHmac {
+            key: lhs,
+            data: rhs,
+        } => {
+            one!(lhs);
+            one!(rhs);
+        }
+        ExprKind::RawStore { ptr, offset, value }
+        | ExprKind::Select {
+            mask: ptr,
+            a: offset,
+            b: value,
+        }
+        | ExprKind::VecStore {
+            dst: ptr,
+            index: offset,
+            value,
+            ..
+        }
+        | ExprKind::RegexReplace {
+            regex: ptr,
+            text: offset,
+            repl: value,
+            ..
+        }
+        | ExprKind::HttpHeader {
+            req: ptr,
+            name: offset,
+            value,
+        }
+        | ExprKind::HttpClientPost {
+            client: ptr,
+            url: offset,
+            body: value,
+        }
+        | ExprKind::HttpRbHeader {
+            rb: ptr,
+            name: offset,
+            value,
+        } => {
+            one!(ptr);
+            one!(offset);
+            one!(value);
+        }
+        ExprKind::MathOp { operands, .. }
+        | ExprKind::Closure {
+            captures: operands, ..
+        }
+        | ExprKind::EnumValue {
+            payload: operands, ..
+        }
+        | ExprKind::Call { args: operands, .. }
+        | ExprKind::StructLit {
+            fields: operands, ..
+        }
+        | ExprKind::Tuple {
+            elems: operands, ..
+        }
+        | ExprKind::ArrayLit {
+            elems: operands, ..
+        }
+        | ExprKind::ConstArray {
+            elems: operands, ..
+        }
+        | ExprKind::ArrayZip {
+            sources: operands, ..
+        }
+        | ExprKind::VecLit {
+            elems: operands, ..
+        } => many!(operands),
+        ExprKind::CallFnValue { callee, args } => {
+            one!(callee);
+            many!(args);
+        }
+        ExprKind::Spawn { closure, .. } => one!(closure),
+        ExprKind::TaskGroup(block)
+        | ExprKind::Block(block)
+        | ExprKind::Arena(block)
+        | ExprKind::Unsafe(block) => block!(block),
+        ExprKind::Loop { body, .. } => block!(body),
+        ExprKind::Match { scrutinee, arms } => {
+            one!(scrutinee);
+            arms!(arms);
+        }
+        ExprKind::ElseUnwrap { opt, fallback } => {
+            one!(opt);
+            one!(fallback);
+        }
+        ExprKind::If { cond, then, els } => {
+            one!(cond);
+            block!(then);
+            block!(els);
+        }
+        ExprKind::TupleIndex { recv, .. }
+        | ExprKind::StrTrim { recv, .. }
+        | ExprKind::ArrayToSoa { source: recv, .. }
+        | ExprKind::JsonDecode { input: recv, .. }
+        | ExprKind::JsonDecodeArray { input: recv, .. }
+        | ExprKind::JsonDecodeScalar { input: recv, .. }
+        | ExprKind::JsonDecodeStructArray { input: recv, .. }
+        | ExprKind::JsonDecodeSoa { input: recv, .. }
+        | ExprKind::JsonDecodeUnion { input: recv, .. }
+        | ExprKind::JsonDoc { input: recv }
+        | ExprKind::JsonDocKind { doc: recv }
+        | ExprKind::JsonDocAsStr { doc: recv }
+        | ExprKind::JsonDocAsScalar { doc: recv, .. }
+        | ExprKind::JsonDocLen { doc: recv }
+        | ExprKind::JsonDocElems { doc: recv }
+        | ExprKind::JsonScan { input: recv, .. }
+        | ExprKind::FsReadFile { path: recv }
+        | ExprKind::ReaderOpen { path: recv }
+        | ExprKind::WriterCreate { path: recv }
+        | ExprKind::ReaderBuffered { reader: recv }
+        | ExprKind::BytesAsStr { bytes: recv }
+        | ExprKind::WriterFlush { writer: recv }
+        | ExprKind::FileCreateRw { path: recv }
+        | ExprKind::FileOpenRw { path: recv }
+        | ExprKind::FileLen { file: recv }
+        | ExprKind::BufferNew { capacity: recv }
+        | ExprKind::BufferBytes { buffer: recv }
+        | ExprKind::StrBytes { inner: recv }
+        | ExprKind::BufferLen { buffer: recv }
+        | ExprKind::FsExists { path: recv }
+        | ExprKind::FsRemove { path: recv }
+        | ExprKind::FsReadDir { path: recv }
+        | ExprKind::DnsResolve { host: recv }
+        | ExprKind::ConnReader { conn: recv }
+        | ExprKind::ConnWriter { conn: recv }
+        | ExprKind::TcpAccept { listener: recv }
+        | ExprKind::FsReadFileView { path: recv }
+        | ExprKind::FsReadBytesView { path: recv }
+        | ExprKind::PathComponent { path: recv, .. }
+        | ExprKind::PathNormalize { path: recv }
+        | ExprKind::EnvGet { name: recv }
+        | ExprKind::TimeSleep { ns: recv }
+        | ExprKind::ProcessExit { code: recv }
+        | ExprKind::ChildWait { child: recv }
+        | ExprKind::CommandEnvClear { command: recv }
+        | ExprKind::CommandRun { command: recv }
+        | ExprKind::RunOutputCode { out: recv }
+        | ExprKind::RunOutputStdout { out: recv }
+        | ExprKind::RunOutputStderr { out: recv }
+        | ExprKind::EncodingEncode { data: recv, .. }
+        | ExprKind::EncodingDecode { input: recv, .. }
+        | ExprKind::Utf8Valid { data: recv }
+        | ExprKind::Decompress { data: recv, .. }
+        | ExprKind::RandSeedWith { seed: recv }
+        | ExprKind::RandNext { rng: recv }
+        | ExprKind::RegexCompile { pattern: recv }
+        | ExprKind::RegexGroupCount { regex: recv }
+        | ExprKind::CliCommand { name: recv }
+        | ExprKind::CliUsage { cmd: recv }
+        | ExprKind::HttpParse { data: recv }
+        | ExprKind::HttpRespStatus { resp: recv }
+        | ExprKind::HttpRespBody { resp: recv }
+        | ExprKind::HttpAccept { server: recv }
+        | ExprKind::HttpCtxMethod { ctx: recv }
+        | ExprKind::HttpCtxPath { ctx: recv }
+        | ExprKind::HttpCtxHeaders { ctx: recv }
+        | ExprKind::HttpCtxBody { ctx: recv }
+        | ExprKind::HttpResponseBuilder { status: recv }
+        | ExprKind::HttpStreamFinish { stream: recv }
+        | ExprKind::CryptoRandom { out: recv }
+        | ExprKind::CryptoHash { data: recv, .. } => one!(recv),
+        ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
+            one!(recv);
+            one!(index);
+        }
+        ExprKind::BuilderNew { capacity } => optional!(capacity),
+        ExprKind::SliceRange { recv, start, end } => {
+            one!(recv);
+            optional!(start);
+            optional!(end);
+        }
+        ExprKind::RegexFind { regex, text, start } => {
+            one!(regex);
+            one!(text);
+            optional!(start);
+        }
+        ExprKind::CliFlag {
+            cmd, name, default, ..
+        } => {
+            one!(cmd);
+            one!(name);
+            optional!(default);
+        }
+        ExprKind::VecSumWhere { vec, mask } | ExprKind::VecDot { a: vec, b: mask } => {
+            one!(vec);
+            one!(mask);
+        }
+        ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec } => one!(vec),
+        ExprKind::VecLoad { src, index, .. } => {
+            one!(src);
+            one!(index);
+        }
+        ExprKind::ArrayChunks { source, n, .. } => {
+            one!(source);
+            one!(n);
+        }
+        ExprKind::ArraySum { source, stages }
+        | ExprKind::ArrayCount { source, stages }
+        | ExprKind::ArrayMinMax { source, stages, .. }
+        | ExprKind::ArraySort { source, stages, .. }
+        | ExprKind::ArrayToArray { source, stages, .. } => {
+            one!(source);
+            stages!(stages);
+        }
+        ExprKind::ArrayAnyAll {
+            source,
+            stages,
+            captures,
+            ..
+        }
+        | ExprKind::ArraySortBy {
+            source,
+            stages,
+            captures,
+            ..
+        }
+        | ExprKind::ArrayPartition {
+            source,
+            stages,
+            captures,
+            ..
+        }
+        | ExprKind::ArrayParMap {
+            source,
+            stages,
+            captures,
+            ..
+        } => {
+            one!(source);
+            stages!(stages);
+            many!(captures);
+        }
+        ExprKind::ArrayReduce {
+            source,
+            stages,
+            captures,
+            init,
+            ..
+        }
+        | ExprKind::ArrayScan {
+            source,
+            stages,
+            captures,
+            init,
+            ..
+        } => {
+            one!(source);
+            stages!(stages);
+            many!(captures);
+            one!(init);
+        }
+        ExprKind::ArrayDot { a, b, .. } => {
+            one!(a);
+            one!(b);
+        }
+        ExprKind::ArrayMapInto {
+            source,
+            stages,
+            dst,
+            ..
+        } => {
+            one!(source);
+            stages!(stages);
+            one!(dst);
+        }
+        ExprKind::Template(parts) => parts!(parts),
+        ExprKind::JsonDocGet { doc, key }
+        | ExprKind::JsonDocAt { doc, index: key }
+        | ExprKind::JsonDocKey { doc, index: key } => {
+            one!(doc);
+            one!(key);
+        }
+        ExprKind::FilePread {
+            file,
+            buffer,
+            offset,
+        }
+        | ExprKind::FilePwrite {
+            file,
+            data: buffer,
+            offset,
+        } => {
+            one!(file);
+            one!(buffer);
+            one!(offset);
+        }
+        ExprKind::BytesRead { bytes, offset, .. } => {
+            one!(bytes);
+            one!(offset);
+        }
+        ExprKind::UdpSendTo {
+            sock,
+            data,
+            host,
+            port,
+        } => {
+            one!(sock);
+            one!(data);
+            one!(host);
+            one!(port);
+        }
+        ExprKind::CommandEnv {
+            command,
+            name,
+            value,
+        } => {
+            one!(command);
+            one!(name);
+            one!(value);
+        }
+        ExprKind::RandRange { rng, lo, hi } => {
+            one!(rng);
+            one!(lo);
+            one!(hi);
+        }
+        ExprKind::RandShuffle { rng, xs, .. } => {
+            one!(rng);
+            one!(xs);
+        }
+        ExprKind::RandSample { rng, xs, k, .. } => {
+            one!(rng);
+            one!(xs);
+            one!(k);
+        }
+        ExprKind::HttpGetMany {
+            client,
+            urls,
+            max_concurrency,
+        } => {
+            one!(client);
+            one!(urls);
+            one!(max_concurrency);
+        }
+        ExprKind::HttpServe { host, port, .. } => {
+            one!(host);
+            one!(port);
+        }
+        ExprKind::CryptoHkdf {
+            salt,
+            ikm,
+            info,
+            len,
+        } => {
+            one!(salt);
+            one!(ikm);
+            one!(info);
+            one!(len);
+        }
+        ExprKind::CryptoAead {
+            key,
+            nonce,
+            input,
+            aad,
+            ..
+        } => {
+            one!(key);
+            one!(nonce);
+            one!(input);
+            one!(aad);
+        }
+        ExprKind::CryptoArgon2 {
+            password,
+            salt,
+            params,
+        } => {
+            one!(password);
+            one!(salt);
+            one!(params);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FnEffect, IntTy, Ty};
+    use align_ast::UnOp;
+    use align_span::Span;
+
+    fn int_ty() -> Ty {
+        Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })
+    }
+
+    fn leaf(span: Span) -> hir::Expr {
+        hir::Expr {
+            kind: ExprKind::Int(0),
+            ty: int_ty(),
+            span,
+        }
+    }
+
+    fn program_with_body(body: hir::Block) -> hir::Program {
+        hir::Program {
+            fns: vec![hir::Fn {
+                name: "clone_test".to_string(),
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
+                params: Vec::new(),
+                param_modes: Vec::new(),
+                ret: int_ty(),
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                locals: Vec::new(),
+                body,
+                span: Span::new(0, 0, 0),
+                drop_locals: Vec::new(),
+                drop_individual_locals: Vec::new(),
+                drop_individual_exprs: Default::default(),
+            }],
+            externs: Vec::new(),
+            link_libs: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            tagged_types: Vec::new(),
+            tuples: Vec::new(),
+            fn_types: Vec::new(),
+            imported_fns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clone_frames_distinguish_repeated_same_span_nodes() {
+        let span = Span::new(0, 7, 7);
+        let repeated = hir::Expr {
+            kind: ExprKind::Unary {
+                op: UnOp::Neg,
+                expr: Box::new(leaf(span)),
+            },
+            ty: int_ty(),
+            span,
+        };
+        let program = program_with_body(hir::Block {
+            stmts: vec![Stmt::Expr(repeated.clone()), Stmt::Expr(repeated)],
+            value: None,
+        });
+        let events = crate::hir_depth::clone_events(&program.fns[0].body);
+        assert!(
+            events.is_some(),
+            "valid test body must produce clone frames"
+        );
+        let Some(events) = events else {
+            return;
+        };
+        let mut next_id = 1usize;
+        let mut enters = 0usize;
+        let mut exits = 0usize;
+        for event in events {
+            match event {
+                crate::hir_depth::CloneEvent::RecordEnter { id, .. } => {
+                    assert_eq!(id, next_id);
+                    next_id += 1;
+                    enters += 1;
+                }
+                crate::hir_depth::CloneEvent::RecordExit { id } => {
+                    assert!(id < next_id);
+                    exits += 1;
+                }
+            }
+        }
+        assert_eq!(enters, exits);
+        let cloned = clone_program(&program);
+        assert!(cloned.is_some());
+        if let Some(cloned) = cloned {
+            drop_program(cloned);
+        }
+    }
+
+    #[test]
+    fn clone_and_drop_are_iterative_for_a_deep_body() {
+        let span = Span::new(0, 0, 0);
+        let mut expression = leaf(span);
+        for _ in 0..4096 {
+            expression = hir::Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: int_ty(),
+                span,
+            };
+        }
+        let program = program_with_body(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(expression)),
+        });
+        let cloned = clone_program(&program);
+        assert!(cloned.is_some());
+        if let Some(cloned) = cloned {
+            drop_program(cloned);
+        }
+        std::mem::forget(program);
+    }
+
+    #[test]
+    fn clone_preserves_fn_type_cells_and_assignment_flags() {
+        let mut program = program_with_body(hir::Block {
+            stmts: vec![Stmt::Assign {
+                local: 0,
+                value: leaf(Span::new(0, 1, 1)),
+                drop_old: std::cell::Cell::new(true),
+                drop_new: std::cell::Cell::new(false),
+            }],
+            value: None,
+        });
+        program.fn_types.push(hir::FnTy {
+            params: Vec::new(),
+            ret: int_ty(),
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            effect: std::cell::Cell::new(FnEffect::Impure),
+        });
+
+        let cloned = clone_program(&program).expect("valid HIR clone");
+        assert_eq!(cloned.fn_types.len(), 1);
+        assert_eq!(cloned.fn_types[0].effect.get(), FnEffect::Impure);
+        match &cloned.fns[0].body.stmts[0] {
+            Stmt::Assign {
+                drop_old, drop_new, ..
+            } => {
+                assert!(drop_old.get());
+                assert!(!drop_new.get());
+            }
+            _ => panic!("clone changed assignment statement kind"),
+        }
+        drop_program(cloned);
+    }
 }

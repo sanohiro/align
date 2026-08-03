@@ -211,6 +211,25 @@ the record was present. This predicate is not the structural HIR validator;
 direct callers must supply the checked type, id, header, and body envelope,
 and direct malformed metadata that does not trigger a replay diagnostic or
 legacy panic is outside this predicate's contract.
+
+Replay reconstruction is an occurrence-frame protocol, not an identity map. The shared depth
+walk emits monotone numeric `RecordEnter{id}`/`RecordExit{id}` events for every `Block`, `Stmt`,
+`Expr`, `MatchArm`, `Stage`, and `TemplatePart` in producer child order. It does not use `Span`
+or native addresses, so repeated nodes and duplicate spans remain distinct. `replay_clone` has an
+exhaustive reconstruction inventory for every current `ExprKind`, every `Stmt`, every
+`MatchArm`, every `StageKind`, and every `TemplatePart`; child order and all non-child metadata are
+explicit, including assignment `Cell<bool>` flags and `FnTy` summaries/effect cells. A completed
+replay, and any functions completed before a fail-closed clone rejection, are torn down through
+the same heterogeneous worklist, including all owned expression, block, statement, arm, stage,
+and template edges. Structural rejection occurs before replay ownership at the shared gate; the
+teardown is also used after a completed replay whose analysis panics, so those paths do not rely on
+recursive HIR Drop.
+The owner tests `clone_frames_distinguish_repeated_same_span_nodes`,
+`clone_and_drop_are_iterative_for_a_deep_body`, and
+`clone_preserves_fn_type_cells_and_assignment_flags` close the occurrence, deep teardown, and
+metadata/cell rows; `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` closes the
+integration replay and fact-equality row.
+
 The shared am-b4 MIR activation gate calls the structural body validator and this
 predicate only after depth, global type, placement, nominal/link, and
 declaration-header validation, and before any MIR construction or downstream
