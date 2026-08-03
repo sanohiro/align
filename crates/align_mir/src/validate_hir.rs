@@ -38,12 +38,11 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
     DeclarationValidator::new(program).validate()
 }
 
-/// Validate the dormant am-b1 through am-b3 portion of stored HIR bodies.
+/// Validate the am-b1 through am-b3 structural and type envelope of stored HIR bodies.
 ///
-/// This helper is deliberately not part of [`hir_program_is_valid`].  Am-b1 through am-b3 own the
-/// structural and type envelope of their body ranges; am-b4 owns the single public activation and
-/// the replay of ownership, Drop, effects, and wait proofs.
-#[allow(dead_code)]
+/// Am-b1 through am-b3 own this body range; am-b4 owns the single public activation and the
+/// replay of ownership, Drop, effects, and wait proofs. The shared MIR gate calls this helper
+/// before replay so malformed body structure cannot reach the semantic analyses.
 pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
     global_type_metadata_is_valid(program)
         && type_placement_metadata_is_valid(program)
@@ -2183,7 +2182,7 @@ impl<'a> BodyValidator<'a> {
             let Some(root) = self.blocks.get(&ptr_key(&function.body)) else {
                 return false;
             };
-            if root.falls && root.ty != function.ret {
+            if root.falls && !self.body_ty_matches(root.ty, function.ret) {
                 return false;
             }
             if !self.body_ty_ok(function.ret) {
@@ -2373,6 +2372,47 @@ impl<'a> BodyValidator<'a> {
             | Ty::StrFinder
             | Ty::Error => false,
         }
+    }
+
+    /// Compare stored body types using the source-level function-value relation. Sema gives a
+    /// local function value a fresh `FnTy` cell so its inferred effect can be solved independently
+    /// of the initializer; the initializer and local therefore can have different `Ty::Fn` ids
+    /// while retaining the same callable ABI. All other body types use canonical ids and must
+    /// match exactly.
+    fn body_ty_matches(&self, actual: Ty, expected: Ty) -> bool {
+        let mut work = vec![(actual, expected)];
+        let mut seen = HashSet::new();
+        while let Some((actual, expected)) = work.pop() {
+            if actual == expected || !seen.insert((actual, expected)) {
+                continue;
+            }
+            let (Ty::Fn(actual_id), Ty::Fn(expected_id)) = (actual, expected) else {
+                return false;
+            };
+            let Some(actual_fn) = self.program.fn_types.get(actual_id as usize) else {
+                return false;
+            };
+            let Some(expected_fn) = self.program.fn_types.get(expected_id as usize) else {
+                return false;
+            };
+            if actual_fn.params.len() != expected_fn.params.len()
+                || actual_fn
+                    .params
+                    .iter()
+                    .zip(&expected_fn.params)
+                    .any(|((actual_mode, _), (expected_mode, _))| actual_mode != expected_mode)
+            {
+                return false;
+            }
+            for ((_, actual), (_, expected)) in actual_fn.params.iter().zip(&expected_fn.params) {
+                work.push((
+                    align_sema::scalar_to_ty(*actual),
+                    align_sema::scalar_to_ty(*expected),
+                ));
+            }
+            work.push((actual_fn.ret, expected_fn.ret));
+        }
+        true
     }
 
     fn body_scalar_ok(&self, scalar: Scalar) -> bool {
@@ -4436,7 +4476,7 @@ impl<'a> BodyValidator<'a> {
         let Some((derived, falls, breaks)) = self.derive_expression(expression, context) else {
             return false;
         };
-        let stored_type_matches = expression.ty == derived
+        let stored_type_matches = self.body_ty_matches(expression.ty, derived)
             || context_polymorphic_expression(&expression.kind, falls);
         if !self.body_ty_ok(expression.ty) || !stored_type_matches {
             return false;
@@ -4704,6 +4744,58 @@ impl<'a> BodyValidator<'a> {
                 args,
                 type_args,
             } => {
+                // These core builtins intentionally remain HIR calls, but they have no
+                // declaration record for `resolve_signature` to find. Validate their complete
+                // producer-side contracts here before handling declaration-backed calls.
+                if func == "print" {
+                    if !type_args.is_empty() {
+                        return None;
+                    }
+                    let [argument] = args.as_slice() else {
+                        return None;
+                    };
+                    let flow = self.expr_flow(argument)?;
+                    // Sema has already lowered an owned `string` display operand to `StrBorrow`;
+                    // a raw `Ty::String` argument is not a producer-valid HIR call.
+                    if matches!(flow.ty, Ty::String) || align_sema::print_kind(flow.ty).is_none() {
+                        return None;
+                    }
+                    return Some((Ty::Unit, flow.falls, flow.breaks));
+                }
+                if matches!(func.as_str(), "hash64" | "hash128") {
+                    if !type_args.is_empty() {
+                        return None;
+                    }
+                    let [argument] = args.as_slice() else {
+                        return None;
+                    };
+                    let flow = self.expr_flow(argument)?;
+                    let u8_scalar = Scalar::Int(align_sema::IntTy { bits: 8, signed: false });
+                    let input_ok = match flow.ty {
+                        Ty::Str => true,
+                        Ty::Slice(element) => element == u8_scalar,
+                        _ => false,
+                    };
+                    if !input_ok {
+                        return None;
+                    }
+                    let u64_scalar = Scalar::Int(align_sema::IntTy { bits: 64, signed: false });
+                    let result_ok = match (func.as_str(), expression.ty) {
+                        ("hash64", Ty::Int(integer)) => {
+                            integer.bits == 64 && !integer.signed
+                        }
+                        ("hash128", Ty::Tuple(id)) => self
+                            .program
+                            .tuples
+                            .get(id as usize)
+                            .is_some_and(|tuple| tuple.elems.as_slice() == [u64_scalar, u64_scalar]),
+                        _ => false,
+                    };
+                    if !result_ok {
+                        return None;
+                    }
+                    return Some((expression.ty, flow.falls, flow.breaks));
+                }
                 let sig = self.resolve_signature(func)?;
                 if sig.is_extern && context.unsafe_depth == 0 {
                     return None;
@@ -7419,7 +7511,10 @@ impl<'a> BodyValidator<'a> {
                 let Some(local_ty) = self.local_type(context, *local) else {
                     return false;
                 };
-                if flows.first().is_none_or(|flow| flow.ty != local_ty) {
+                if flows
+                    .first()
+                    .is_none_or(|flow| !self.body_ty_matches(flow.ty, local_ty))
+                {
                     return false;
                 }
                 self.store_statement(
@@ -7436,15 +7531,17 @@ impl<'a> BodyValidator<'a> {
                 let Some(init) = flows.first() else {
                     return false;
                 };
-                if init.ty != Ty::Tuple(*tuple_id) {
+                if !self.body_ty_matches(init.ty, Ty::Tuple(*tuple_id)) {
                     return false;
                 }
                 for (local, expected) in locals.iter().zip(&tuple.elems) {
-                    if let Some(local) = local
-                        && self.local_type(context, *local)
-                            != Some(align_sema::scalar_to_ty(*expected))
-                    {
-                        return false;
+                    if let Some(local) = local {
+                        let Some(actual) = self.local_type(context, *local) else {
+                            return false;
+                        };
+                        if !self.body_ty_matches(actual, align_sema::scalar_to_ty(*expected)) {
+                            return false;
+                        }
                     }
                 }
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
@@ -7453,7 +7550,10 @@ impl<'a> BodyValidator<'a> {
                 let Some(local_ty) = self.local_type(context, *local) else {
                     return false;
                 };
-                if flows.first().is_none_or(|flow| flow.ty != local_ty) {
+                if flows
+                    .first()
+                    .is_none_or(|flow| !self.body_ty_matches(flow.ty, local_ty))
+                {
                     return false;
                 }
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
@@ -7528,7 +7628,10 @@ impl<'a> BodyValidator<'a> {
                     return false;
                 };
                 if value.is_some() {
-                    if flows.first().is_none_or(|flow| flow.ty != function_ret) {
+                    if flows
+                        .first()
+                        .is_none_or(|flow| !self.body_ty_matches(flow.ty, function_ret))
+                    {
                         return false;
                     }
                 } else if function_ret != Ty::Unit {

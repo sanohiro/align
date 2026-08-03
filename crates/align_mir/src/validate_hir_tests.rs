@@ -163,6 +163,25 @@ fn assert_replay_rejects_without_mutating(program: hir::Program, message: &str) 
     );
 }
 
+fn assert_body_entrypoints_empty(label: &str, program: &hir::Program) {
+    assert!(
+        !body_core_metadata_is_valid(program),
+        "{label}: body validator accepted malformed root"
+    );
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(program),
+        lower_program_located(program, &source_map),
+        lower_program_per_unit(program),
+        lower_program_per_unit_located(program, &source_map),
+    ] {
+        assert!(
+            is_empty(&lowered),
+            "{label}: malformed root published partial MIR"
+        );
+    }
+}
+
 fn fn_type_header_program() -> hir::Program {
     let mut program = baseline_program();
     program.fn_types[0] = FnTy {
@@ -652,7 +671,8 @@ fn valid_header_does_not_consume_body_facts() {
         .drop_individual_exprs
         .insert(align_span::Span::new(999, 4, 4), false);
     assert!(validate_hir::declaration_header_metadata_is_valid(&program));
-    assert!(!is_empty(&lower_program(&program)));
+    assert!(!align_sema::checked_hir_body_facts_are_valid(&program));
+    assert!(is_empty(&lower_program(&program)));
 
     let mut body_local_type = declaration_header_program();
     body_local_type.fns[0].locals.push(hir::Local {
@@ -664,6 +684,196 @@ fn valid_header_does_not_consume_body_facts() {
         align: None,
     });
     assert!(validate_hir::declaration_header_metadata_is_valid(&body_local_type));
+}
+
+#[test]
+fn malformed_hir_body_metadata_fails_closed() {
+    let mut program = declaration_header_program();
+    program.fns[0].return_borrow = ReturnBorrowSummary::None;
+    program.fns[0].return_region = ReturnRegionSummary::None;
+    assert!(validate_hir::global_type_metadata_is_valid(&program));
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+    assert!(!align_sema::checked_hir_body_facts_are_valid(&program));
+
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&program),
+        lower_program_located(&program, &source_map),
+        lower_program_per_unit(&program),
+        lower_program_per_unit_located(&program, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "malformed body published partial MIR");
+    }
+}
+
+#[test]
+fn malformed_hir_body_structure_precedes_fact_replay() {
+    let mut program = declaration_header_program();
+    program.fns[0].return_borrow = ReturnBorrowSummary::None;
+    program.fns[0].return_region = ReturnRegionSummary::None;
+    program.fns[0]
+        .body
+        .value
+        .as_mut()
+        .expect("declaration fixture has a body value")
+        .kind = hir::ExprKind::Local(99);
+    assert!(validate_hir::global_type_metadata_is_valid(&program));
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+    assert!(!validate_hir::body_core_metadata_is_valid(&program));
+
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&program),
+        lower_program_located(&program, &source_map),
+        lower_program_per_unit(&program),
+        lower_program_per_unit_located(&program, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "malformed body structure published MIR");
+    }
+}
+
+#[test]
+fn valid_hir_body_preflight_is_mir_identity() {
+    let program = declaration_header_program();
+    assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+    let source_map = SourceMap::new();
+    for (checked, unchecked) in [
+        (
+            lower_program(&program),
+            lower_program_unchecked(&program, None, false),
+        ),
+        (
+            lower_program_located(&program, &source_map),
+            lower_program_unchecked(
+                &program,
+                Some(Rc::new(SourceLines::from_map(&source_map))),
+                false,
+            ),
+        ),
+        (
+            lower_program_per_unit(&program),
+            lower_program_unchecked(&program, None, true),
+        ),
+        (
+            lower_program_per_unit_located(&program, &source_map),
+            lower_program_unchecked(
+                &program,
+                Some(Rc::new(SourceLines::from_map(&source_map))),
+                true,
+            ),
+        ),
+    ] {
+        assert!(!is_empty(&checked), "valid body did not reach MIR");
+        assert_eq!(format!("{checked:#?}"), format!("{unchecked:#?}"));
+    }
+}
+
+#[test]
+fn body_contract_function_return_none() {
+    let integer = int(64);
+    let mut unit = baseline_program();
+    unit.fns.push(body_test_named_function(
+        "unit_return_none",
+        hir::Block {
+            stmts: vec![hir::Stmt::Return(None)],
+            value: None,
+        },
+        Vec::new(),
+        Ty::Unit,
+    ));
+    assert!(body_core_metadata_is_valid(&unit));
+
+    let mut non_unit = unit.clone();
+    non_unit.fns[0].ret = integer;
+    assert_body_entrypoints_empty("Return(None) in non-Unit function", &non_unit);
+
+    let mut value = baseline_program();
+    value.fns.push(body_test_named_function(
+        "integer_return_some",
+        hir::Block {
+            stmts: vec![hir::Stmt::Return(Some(body_test_expr(
+                hir::ExprKind::Int(1),
+                integer,
+            )))],
+            value: None,
+        },
+        Vec::new(),
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&value));
+
+    let mut missing = value.clone();
+    let hir::Stmt::Return(return_value) = &mut missing.fns[0].body.stmts[0] else {
+        unreachable!("return fixture lost its return statement");
+    };
+    *return_value = None;
+    assert_body_entrypoints_empty("missing value in non-Unit Return", &missing);
+}
+
+#[test]
+fn body_contract_function_root_completion() {
+    let integer = int(64);
+
+    let mut unit_empty = baseline_program();
+    unit_empty.fns.push(body_test_named_function(
+        "unit_empty_body",
+        hir::Block {
+            stmts: Vec::new(),
+            value: None,
+        },
+        Vec::new(),
+        Ty::Unit,
+    ));
+    assert!(body_core_metadata_is_valid(&unit_empty));
+
+    let mut non_unit_missing = baseline_program();
+    non_unit_missing.fns.push(body_test_named_function(
+        "non_unit_missing_tail",
+        hir::Block {
+            stmts: Vec::new(),
+            value: None,
+        },
+        Vec::new(),
+        integer,
+    ));
+    assert_body_entrypoints_empty("reachable non-Unit body without a tail", &non_unit_missing);
+
+    let mut non_unit_statement_fallthrough = baseline_program();
+    non_unit_statement_fallthrough.fns.push(body_test_named_function(
+        "non_unit_statement_fallthrough",
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::Int(1),
+                integer,
+            ))],
+            value: None,
+        },
+        Vec::new(),
+        integer,
+    ));
+    assert_body_entrypoints_empty(
+        "reachable non-Unit statement fallthrough without a tail",
+        &non_unit_statement_fallthrough,
+    );
+
+    let mut non_unit_return = baseline_program();
+    non_unit_return.fns.push(body_test_named_function(
+        "non_unit_return_completion",
+        hir::Block {
+            stmts: vec![hir::Stmt::Return(Some(body_test_expr(
+                hir::ExprKind::Int(1),
+                integer,
+            )))],
+            value: None,
+        },
+        Vec::new(),
+        integer,
+    ));
+    assert!(body_core_metadata_is_valid(&non_unit_return));
 }
 
 #[test]
@@ -977,7 +1187,7 @@ fn fn_type(ret: Ty) -> FnTy {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
-        effect: Cell::new(FnEffect::Pure),
+        effect: Cell::new(FnEffect::Unknown),
     }
 }
 
@@ -1707,12 +1917,13 @@ fn assert_hir_owner_contract(label: &str, program: &hir::Program, owner: MirOwne
             );
         }
         MirOwner::Reader | MirOwner::File | MirOwner::Command | MirOwner::Http => {
-            let mut work = function
-                .body
-                .value
-                .as_deref()
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut work = function.body.value.as_deref().into_iter().collect::<Vec<_>>();
+            // A Move-producing expression may be an expression statement whose result is
+            // discarded. Include those roots in the producer-fact contract just as MIR does.
+            work.extend(function.body.stmts.iter().filter_map(|statement| match statement {
+                hir::Stmt::Expr(expression) => Some(expression),
+                _ => None,
+            }));
             let mut owned_expressions = 0;
             while let Some(expression) = work.pop() {
                 if align_sema::needs_drop_flag(
@@ -2239,6 +2450,10 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         ty: Ty::String,
         span: individual_expr_span(&mut next_offset, &mut drop_individual_exprs),
     };
+    // The regex parameter is a Move handle. Its synthetic Local expression has the zero span
+    // used by this handcrafted boundary fixture, so the producer's DropProvenance map carries
+    // the shared zero-span entry alongside the individually-spanned replacement nodes.
+    drop_individual_exprs.insert(span, true);
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_regex_string".to_string(),
@@ -2377,6 +2592,8 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
     let span = align_span::Span::new(0, 0, 0);
     let elem = scalar_int(64);
     let builder_ty = Ty::ArrayBuilder(elem);
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    drop_individual_exprs.insert(span, true);
     let expr = hir::Expr {
         kind: hir::ExprKind::ArrayBuilderPush {
             builder: Box::new(hir::Expr {
@@ -2414,15 +2631,15 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: vec![0],
         drop_individual_locals: vec![0],
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
     });
     program
 }
 
 fn with_process_command_body_depth(depth: usize) -> hir::Program {
     assert!(
-        depth >= 3,
-        "the root Block, process-command Expr, and command need depth three"
+        depth >= 4,
+        "the root Block, expression statement, process-command Expr, and command need depth four"
     );
     let span = align_span::Span::new(0, 0, 0);
     let argv_ty = Ty::Slice(Scalar::Str);
@@ -2430,7 +2647,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
     let mut next_offset = 1;
     let expr = hir::Expr {
         kind: hir::ExprKind::ProcessCommand {
-            cmd: Box::new(str_trim_expr_depth(depth - 2)),
+            cmd: Box::new(str_trim_expr_depth(depth - 3)),
             args: Box::new(hir::Expr {
                 kind: hir::ExprKind::Local(0),
                 ty: argv_ty,
@@ -2447,8 +2664,8 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         params: vec![0],
         param_modes: vec![align_ast::ParamMode::ByValue],
         // `command` is a body-produced builder, not a source-nameable header type. Keep the
-        // deep producer in the body while giving this synthetic function a valid declaration
-        // return type; am-b owns the later body/result relation.
+        // deep producer as an expression statement so this synthetic function retains a valid
+        // `unit` declaration return while MIR still proves the command owner was lowered.
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
@@ -2461,8 +2678,8 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
             align: None,
         }],
         body: hir::Block {
-            stmts: Vec::new(),
-            value: Some(Box::new(expr)),
+            stmts: vec![hir::Stmt::Expr(expr)],
+            value: None,
         },
         span,
         drop_locals: Vec::new(),
@@ -2474,15 +2691,15 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
 
 fn with_http_body_depth(depth: usize) -> hir::Program {
     assert!(
-        depth >= 3,
-        "the root Block, HTTP Expr, and method need depth three"
+        depth >= 4,
+        "the root Block, expression statement, HTTP Expr, and method need depth four"
     );
     let span = align_span::Span::new(0, 0, 0);
     let mut drop_individual_exprs = std::collections::HashMap::new();
     let mut next_offset = 1;
     let expr = hir::Expr {
         kind: hir::ExprKind::HttpRequest {
-            method: Box::new(str_trim_expr_depth(depth - 2)),
+            method: Box::new(str_trim_expr_depth(depth - 3)),
             url: Box::new(hir::Expr {
                 kind: hir::ExprKind::Str("https://example.invalid".to_string()),
                 ty: Ty::Str,
@@ -2499,15 +2716,15 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         params: Vec::new(),
         param_modes: Vec::new(),
         // `http_request` is a body-produced builder, not a source-nameable header type. Keep the
-        // deep producer in the body while giving this synthetic function a valid declaration
-        // return type; am-b owns the later body/result relation.
+        // deep producer as an expression statement so this synthetic function retains a valid
+        // `unit` declaration return while MIR still proves the request owner was lowered.
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         locals: Vec::new(),
         body: hir::Block {
-            stmts: Vec::new(),
-            value: Some(Box::new(expr)),
+            stmts: vec![hir::Stmt::Expr(expr)],
+            value: None,
         },
         span,
         drop_locals: Vec::new(),
@@ -2629,6 +2846,8 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
     program
         .imported_fns
         .push(imported_fn("dep$wildcard_sentinel", Vec::new(), Ty::Unit));
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    drop_individual_exprs.insert(span, true);
     program.fns.push(hir::Fn {
         name: "deep_match_arm".to_string(),
         origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
@@ -2645,7 +2864,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
     });
     program
 }
@@ -2802,6 +3021,8 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         expr_depth += 2;
     }
     let ret = expr.ty;
+    let mut drop_individual_exprs = std::collections::HashMap::new();
+    drop_individual_exprs.insert(span, true);
     let mut program = baseline_program();
     program.fns.push(hir::Fn {
         name: "deep_binary_match".to_string(),
@@ -2819,7 +3040,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         span,
         drop_locals: Vec::new(),
         drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_individual_exprs,
     });
     program
 }
@@ -3087,9 +3308,13 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
             value: Some(Box::new(expr)),
         },
         span,
-        drop_locals: Vec::new(),
-        drop_individual_locals: Vec::new(),
-        drop_individual_exprs: Default::default(),
+        drop_locals: vec![0],
+        drop_individual_locals: vec![0],
+        drop_individual_exprs: {
+            let mut facts = std::collections::HashMap::new();
+            facts.insert(span, true);
+            facts
+        },
     });
     program
 }
@@ -4235,6 +4460,45 @@ fn hir_body_validator_core() {
     };
     init.ty = Ty::Bool;
     assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_accepts_builtin_display_and_hash_calls() {
+    let program = checked_source_program(
+        "fn main() -> i32 {\n  print(1)\n  print(\"x\")\n  print(hash64(\"x\"))\n  pair := hash128(\"x\")\n  return 0\n}\n",
+    );
+    assert!(body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_rejects_unborrowed_builtin_string() {
+    let mut program = checked_source_program(
+        "fn main() -> i32 {\n  s := \"x\".clone()\n  print(s)\n  return 0\n}\n",
+    );
+    let statement = program.fns[0]
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|statement| match statement {
+            hir::Stmt::Expr(expression) => Some(expression),
+            _ => None,
+        })
+        .expect("builtin display fixture has an expression statement");
+    let hir::ExprKind::Call { args, .. } = &mut statement.kind else {
+        panic!("builtin display fixture lost its call")
+    };
+    let argument = args.first_mut().expect("builtin display call has an argument");
+    argument.kind = hir::ExprKind::Local(0);
+    argument.ty = Ty::String;
+    assert!(!body_core_metadata_is_valid(&program));
+}
+
+#[test]
+fn hir_body_validator_accepts_function_value_local_specialization() {
+    let program = checked_source_program(
+        "fn noop() {}\nfn main() -> i32 {\n  f := noop\n  f()\n  return 0\n}\n",
+    );
+    assert!(body_core_metadata_is_valid(&program));
 }
 
 #[test]

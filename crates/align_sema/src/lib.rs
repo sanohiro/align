@@ -16,6 +16,7 @@ use align_span::Span;
 pub mod hir;
 pub use hir::*;
 mod hir_depth;
+mod replay_clone;
 mod task_wait;
 pub use hir_depth::{
     MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
@@ -4870,7 +4871,9 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     if !hir_depth::checked_hir_body_depth_is_valid(program) {
         return false;
     }
-    let mut replay = program.clone();
+    let Some(mut replay) = replay_clone::clone_program(program) else {
+        return false;
+    };
     reset_body_analysis_facts(&mut replay);
 
     let external_effects: std::collections::HashMap<String, FnEffect> = replay
@@ -4889,7 +4892,8 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
         &mut diags,
         true,
     );
-    !diags.has_errors() && body_analysis_facts_equal(program, &replay)
+    let facts_equal = body_analysis_facts_equal(program, &replay);
+    !diags.has_errors() && facts_equal
 }
 
 fn reset_body_analysis_facts(program: &mut Program) {

@@ -310,7 +310,12 @@ pub fn validate(body: &Block, tagged_types: &[TaggedType], diags: &mut Diagnosti
     let Some((node_ids, record_count)) = collect_node_ids(body) else {
         return;
     };
-    let Some(max_replay_steps) = record_count.max(1).checked_mul(MAX_REPLAY_WORK) else {
+    // `record_count` counts body events; replay starts with one synthetic root dispatcher item.
+    let Some(max_replay_steps) = record_count
+        .max(1)
+        .checked_mul(MAX_REPLAY_WORK)
+        .and_then(|bound| bound.checked_add(1))
+    else {
         return;
     };
     let mut analyzer = Analyzer {

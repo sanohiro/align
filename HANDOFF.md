@@ -5,13 +5,29 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
+_Last updated: 2026-08-03. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
-declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
-implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
-group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no public validator activation yet.
+declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
+(`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
+replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The current
+working slice is the am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate`: the shared
+four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses an explicit
+child-first HIR clone so the 259-record checked-HIR ceiling does not recurse through derived
+`Clone`, and malformed child lookup fails closed without an internal `expect`. The body envelope
+also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local `FnTy` cells by
+callable shape. The focused body owner passes 42/42, alongside malformed-body, replay, identity,
+header, process/HTTP, root-completion, and task-wait owners with the configured LLVM environment.
+The full depth matrix reached successful compilation but its test
+binary remained in macOS `_dyld_start` at 0% CPU before being stopped; that launch is preserved as
+INCOMPLETE rather than CLEAN. The author-side closure matrix is preserved in
+`.git/am-b4-activation-author-matrix.log`, and no public `pkg.db` surface is present yet.
+`cargo build --workspace --locked` and the LLVM-configured full workspace/all-targets Clippy run
+pass with `-D warnings`. The ordinary `scripts/test-pr.sh` reached the codegen test binary, but
+both the normal and `DYLD_SHARED_REGION=private` runs remained in `_dyld_start` with 0% CPU before
+listing tests; the same loader stall also affected the combined `align_driver` library owner.
+Those attempts are preserved as INCOMPLETE in `.git/am-b4-test-pr-dyld-incomplete.log`; no missing
+test verdict is treated as CLEAN. The earlier codegen owner itself passed 56/56 with 5 ignored
+after the validator fixes.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -110,6 +126,8 @@ facts must live in this repository.
 #688  lexical extern invocation permission and non-escaping extern-call closure (am-u)
 #694  dormant am-b1 body-core validator and owner matrix
 #695  dormant am-b2a storage/vector/array validator and owner matrix
+#699  bounded task-wait replay identity and stack closure
+#700  checked-HIR sema body-fact replay and imported-provenance presence closure
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -807,13 +825,13 @@ adds a token-exhaustion owner, and directly observes changed incoming loop Spawn
 duplicate loop-header join site. Per the review policy this is one finding-closure follow-up; no
 second broad review is requested for these non-public-contract fixes.
 
-The next am-b4 checkpoint is intentionally sema-only on top of merged am-w #699 (`9e2d615`):
+The prior am-b4 sema-only checkpoint on top of merged am-w #699 (`9e2d615`) was:
 `checked_hir_body_facts_are_valid` clones checked HIR, resets return/Drop/assignment/effect facts
 through the bounded event walk, replays task-wait, return-provenance, MoveCheck, EscapeCheck, and
 effect solving, then compares the published facts without mutating the caller or creating a new
-function-type topology. The MIR shared gate is not activated in this checkpoint; that is the next
-independent vertical, with its four-entrypoint empty-result and identity owners. The focused replay
-owners `checked_hir_body_fact_replay_rejects_stale_producer_facts` and
+function-type topology. The MIR shared gate was not activated in that checkpoint; the current
+activation adds its four-entrypoint empty-result and identity owners. The focused replay owners
+`checked_hir_body_fact_replay_rejects_stale_producer_facts` and
 `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` pass; the closure matrix is in
 `docs/impl/17-library-boundary-prerequisites.md`.
 
@@ -823,16 +841,25 @@ checks, and one P1 producer/replay mismatch for omitted imported return provenan
 replaces the owner names, qualifies the gate statement, adds the HIR-only
 `return_provenance_known` presence bit so compatibility omissions retain the producer fallback,
 adds absent/explicit-`None`/`Roots` × effect-seed replay coverage, isolates each negative fact, and
-checks rejected-input immutability. The predicate's direct contract now explicitly remains
-prevalidated-HIR plus depth/panic containment; full structural metadata rejection belongs to the
-next MIR activation vertical. Focused replay, declaration-header, check, and Clippy gates pass;
+checks rejected-input immutability. The predicate's direct contract remains
+prevalidated-HIR plus depth/panic containment; the current MIR activation adds the structural
+metadata rejection and canonical-empty boundary. Focused replay, declaration-header, check, and
+Clippy gates pass;
 the original broad host wrapper's human no-action text lacked its required machine marker and stays
 recorded as INCOMPLETE rather than CLEAN.
 
+The current activation diff is 503 added/90 deleted tracked lines plus the 1,260-line explicit
+replay clone (1,853 changed hand-written lines total), above the 1,000-line split threshold. It
+remains one vertical because the shared gate cannot safely activate while replay uses derived
+recursive `Clone`: a split would leave either an activated recursive path or a temporary parallel
+replay path. This boundary proof is recorded in the am-b4 matrix; am-c, L3 resources, and public
+`pkg.db` remain separate.
+
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
-with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
-the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
-tests; this is an environment/toolchain execution blocker, not a compiler test failure. Am-u rejects
+with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains INCOMPLETE
+because the `align_codegen_llvm` and `align_driver` unit-test binaries hang in macOS dyld startup
+before listing tests; this is an environment/toolchain execution blocker, not a compiler test
+failure, and the transcripts are preserved in `.git/am-b4-test-pr-dyld-incomplete.log`. Am-u rejects
 extern declarations as first-class function values and requires direct or non-escaping named
 pipeline/reducer/sort invocation to be lexically
 inside `unsafe`; current HIR function values cannot carry visible unsafe-call permission. These are
