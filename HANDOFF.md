@@ -42,6 +42,10 @@ Xcode/git temporary-cache failures left the host review stalled; it was stopped 
 INCOMPLETE in `.git/am-b4-followup-host-review.log` and
 `.git/am-b4-activation-review-incomplete.log`. The same range will not be reviewed again unless it
 changes or the user explicitly requests a new review.
+The later continuation used `/Applications/Xcode.app/Contents/Developer/usr/bin/git` to avoid the
+read-only Xcode shim cache failure and progressed through the remaining `hir_depth.rs`/`lib.rs`
+scope, but reached its single 600-second bound without a verdict. It is preserved in
+`.git/am-b4-followup-path-fixed.log` and remains INCOMPLETE; no pre-PR stamp or PR was created.
 The subsequent fresh independent review of `origin/main...8bb574f` also reached its 120-second
 bound without a verdict; it is recorded as INCOMPLETE in `.git/am-b4-activation-review-incomplete.log`.
 The narrow `align_sema` test binary was then launched directly with a dedicated `TMPDIR`, fixed
