@@ -44,6 +44,16 @@ owner (8/8), copy-collection owner (6/6), replay-clone owners (4/4), and targete
 `align_mir` Clippy with `-D warnings`; its final exact-base review is pending after the fix
 checkpoint is committed. The driver owners required one explicit `align_runtime` build in the
 dedicated target directory before linking; the reruns passed without source changes.
+The latest independent preflight then found one P1 in the revised break matrix: a forged
+same-region `Break.accepted = false` could suppress a real loop exit. The closure matrix is reopened;
+the current working tree requires exact bidirectional target/arena/task acceptance and adds
+same-region-forged plus targetless/nested-region owner cells. The pre-fix MIR owner passed 94/94;
+the post-fix ordinary target launch remained at 0% CPU in `_dyld_start` and was stopped as
+INCOMPLETE, while the dedicated `/tmp/align-am-b4-break-owner` target passed the three exact break
+tests and the complete MIR library owner 94/94. A fresh independent review of the reopened
+`Break.accepted` slice returned CLEAN after checking sema production, every downstream consumer,
+both region dimensions, fail-closed lowering, docs, and owner coverage. No final attestation or PR
+exists yet.
 The one host-native review invocation for the follow-up range
 `62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
 Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as

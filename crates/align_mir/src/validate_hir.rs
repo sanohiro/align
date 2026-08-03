@@ -8314,14 +8314,19 @@ impl<'a> BodyValidator<'a> {
                 if value.is_some() && flows.is_empty() {
                     return false;
                 }
+                let target = context.loop_targets.last().copied();
+                let expected_accepted = target.is_some_and(|target| {
+                    context.arena_depth == target.arena_depth
+                        && context.task_depth == target.task_depth
+                });
+                if *accepted != expected_accepted {
+                    return false;
+                }
                 if *accepted {
-                    let Some(target) = context.loop_targets.last().copied() else {
+                    let Some(target) = target else {
                         return false;
                     };
-                    if !self.body_ty_matches(value_ty, target.ty)
-                        || context.arena_depth != target.arena_depth
-                        || context.task_depth != target.task_depth
-                    {
+                    if !self.body_ty_matches(value_ty, target.ty) {
                         return false;
                     }
                 }

@@ -2376,7 +2376,11 @@ initialization: parameters enter at function entry, initializers precede `Let`/`
 match payloads are arm-local, and block/arm exit removes bindings. Every local read and mutable
 place root must therefore be visible on that source path; a function-wide local table is not enough.
 Value joins use the structural body-type relation, including recursively matching fresh `FnTy`
-cells rather than requiring ordinal identity. Effect correlation replays the existing source-order effect fixed point
+cells rather than requiring ordinal identity. The checker-owned `Break.accepted` fact is replayed in
+both directions: it is true exactly for an innermost loop target at the same arena/task depth, while
+targetless and nested-region recovery breaks remain false. The owner matrix pairs a forged
+same-region rejection with accepted and rejected arena/task crossings so neither truth direction can
+silently drift. Effect correlation replays the existing source-order effect fixed point
 using stored imported effects as the only cross-unit seeds, implicit `Impure` for every extern, and
 body-derived effects for stored source/monomorph/lifted functions. It requires every concrete
 function-value `FnTy.effect` cell, aggregate projection/join cell, result boundary, and parallel

@@ -10773,22 +10773,13 @@ fn hir_body_validator_statement_inventory() {
         ),
         integer,
     ));
-    program.fns.push(body_tail_case(
+    program.fns.push(no_tail(
         "stmt_break_rejected",
-        expr(
-            hir::ExprKind::Loop {
-                body: hir::Block {
-                    stmts: vec![hir::Stmt::Break {
-                        value: None,
-                        accepted: false,
-                    }],
-                    value: None,
-                },
-                diverges: true,
-                body_locals: 0..0,
-            },
-            integer,
-        ),
+        hir::Stmt::Break {
+            value: None,
+            accepted: false,
+        },
+        Vec::new(),
         integer,
     ));
     program.fns.push(no_tail(
@@ -10993,7 +10984,7 @@ fn hir_body_validator_statement_inventory() {
     }
     assert!(!body_core_metadata_is_valid(&reject));
     let mut reject = program.clone();
-    match body_loop_statement_mut(&mut reject, "stmt_break_rejected") {
+    match body_first_statement_mut(&mut reject, "stmt_break_rejected") {
         hir::Stmt::Break { accepted, .. } => *accepted = true,
         _ => unreachable!(),
     }
@@ -11225,12 +11216,38 @@ fn hir_body_validator_loop_break_reachability_matches_diverges() {
         .fns
         .push(body_tail_case("nested_break", reachable_loop, unit));
     assert!(body_core_metadata_is_valid(&reachable));
+
+    let mut forged_rejection = reachable.clone();
+    let hir::ExprKind::Loop { body, diverges, .. } = &mut forged_rejection
+        .fns
+        .last_mut()
+        .expect("reachable loop function")
+        .body
+        .value
+        .as_mut()
+        .expect("reachable loop value")
+        .kind
+    else {
+        panic!("reachable loop fixture lost its loop");
+    };
+    let hir::Stmt::Expr(hir::Expr {
+        kind: hir::ExprKind::If { then, .. },
+        ..
+    }) = &mut body.stmts[0]
+    else {
+        panic!("reachable loop fixture lost its conditional");
+    };
+    let hir::Stmt::Break { accepted, .. } = &mut then.stmts[0] else {
+        panic!("reachable loop fixture lost its break");
+    };
+    *accepted = false;
+    *diverges = true;
+    assert!(!body_core_metadata_is_valid(&forged_rejection));
 }
 
 #[test]
 fn hir_body_validator_rejects_break_across_arena_and_task_group() {
-    let nested_break = |kind| body_test_expr(kind, Ty::Unit);
-    let loop_with = |scope| {
+    let loop_with = |scope, diverges| {
         body_tail_case(
             "nested_region_break",
             body_test_expr(
@@ -11239,7 +11256,7 @@ fn hir_body_validator_rejects_break_across_arena_and_task_group() {
                         stmts: vec![hir::Stmt::Expr(scope)],
                         value: None,
                     },
-                    diverges: false,
+                    diverges,
                     body_locals: 0..0,
                 },
                 Ty::Unit,
@@ -11247,30 +11264,50 @@ fn hir_body_validator_rejects_break_across_arena_and_task_group() {
             Ty::Unit,
         )
     };
+    let arena_scope = |accepted| {
+        body_test_expr(
+            hir::ExprKind::Arena(hir::Block {
+                stmts: vec![hir::Stmt::Break {
+                    value: None,
+                    accepted,
+                }],
+                value: None,
+            }),
+            Ty::Unit,
+        )
+    };
+    let task_group_scope = |accepted| {
+        body_test_expr(
+            hir::ExprKind::TaskGroup(hir::Block {
+                stmts: vec![hir::Stmt::Break {
+                    value: None,
+                    accepted,
+                }],
+                value: None,
+            }),
+            Ty::Unit,
+        )
+    };
 
     let mut arena = baseline_program();
-    arena.fns.push(loop_with(nested_break(hir::ExprKind::Arena(
-        hir::Block {
-            stmts: vec![hir::Stmt::Break {
-                value: None,
-                accepted: true,
-            }],
-            value: None,
-        },
-    ))));
+    arena.fns.push(loop_with(arena_scope(true), false));
     assert!(!body_core_metadata_is_valid(&arena));
 
+    let mut rejected_arena = baseline_program();
+    rejected_arena.fns.push(loop_with(arena_scope(false), true));
+    assert!(body_core_metadata_is_valid(&rejected_arena));
+
     let mut task_group = baseline_program();
-    task_group.fns.push(loop_with(nested_break(
-        hir::ExprKind::TaskGroup(hir::Block {
-            stmts: vec![hir::Stmt::Break {
-                value: None,
-                accepted: true,
-            }],
-            value: None,
-        }),
-    )));
+    task_group
+        .fns
+        .push(loop_with(task_group_scope(true), false));
     assert!(!body_core_metadata_is_valid(&task_group));
+
+    let mut rejected_task_group = baseline_program();
+    rejected_task_group
+        .fns
+        .push(loop_with(task_group_scope(false), true));
+    assert!(body_core_metadata_is_valid(&rejected_task_group));
 }
 
 #[test]
