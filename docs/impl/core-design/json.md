@@ -132,15 +132,20 @@ omits a `None` field entirely** (never `"k":null`), so `decode(encode(x))` round
 optional field is exempt from `all_required_seen`, and the shared `write_value` writes the payload at
 the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing object to a
 trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
-the static layout). **v1 boundary:** an Option payload used at the JSON boundary must be
-**non-owned**. L1a permits `Option<string>` in ordinary language structs, but `json.decode` and
-`json.encode` reject a target containing that field because the JSON descriptor consumer remains
-deferred; `Option<Move-struct>` remains rejected by the L1b type gate. **`Option<struct>` encode
+the static layout). **JSON ownership boundary:** L1a permits owned `Option<T>` fields in ordinary
+language structs, but each JSON path may still have a narrower descriptor contract. The current
+compiler's Decode schema admits an `Option<Move-struct>` shape; its decoded-owner cleanup is not
+complete and remains a separate ownership request. `Option<string>` remains outside the current
+JSON Decode schema. These ordinary JSON details do not weaken the scanner rule below: a row whose
+reachable graph needs `Drop` is rejected by `json.scan`. **`Option<struct>` encode
 (T1b, SHIPPED):** `Some` renders the nested object via the runtime
 descriptor-driven encoder (a new `OptionStructField` template piece → `align_rt_json_encode_object`, a
 single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
 scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
-own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and stays non-Move.
+own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and must be
+non-Move for this shipped encoding path; `Option<Move-struct>` remains outside this encoding path.
+The current Decode schema's admitted Move shape and its decoded-owner cleanup remain a separate
+ownership request.
 The structural MIR fingerprint includes the payload struct definition, so an `Option<struct>` payload
 field change invalidates both decode and encode objects. JSON MIR nodes carry only target ids; no
 manually threaded schema string exists.
@@ -250,6 +255,91 @@ the few boundaries that remain:
   sharing `lower_json_scan_reduce`'s guarded per-row fold. So the complete streaming reducer set is
   `sum` / `count` / `reduce` / `any` / `all` / `min` / `max`; only materializing terminals stay out (by
   design — they would defeat streaming).
+
+  **J5 safety boundary — Request 6 design gate (implementation pending).** A scanner reuses one
+  row slot for every input value and has no per-row arena or `Drop` transition. Therefore the row
+  schema must be recursively **Copy**: `json.scan` accepts a row only when the canonical recursive
+  `DropPlan` reports no `Drop` for the complete reachable struct, option, and union graph. This is a
+  scanner-only rule; the same declaration remains a valid ordinary Align type and remains eligible
+  for every ordinary JSON path whose own schema contract admits it. Among rows that pass the existing
+  JSON schema whitelist, the rule rejects direct or transitive `array<T>`, `array<Struct>`, or an
+  owning option/union payload, rather than maintaining an ad-hoc list of array forms. A field shape
+  that is not JSON-decode-eligible retains the existing schema diagnostic; the Copy diagnostic below
+  is only the deterministic ownership error for a schema-admitted Move row.
+
+  The semantic check runs after the existing JSON decode-schema whitelist and before input-type
+  checking, MIR construction, descriptor construction, or runtime calls. A schema-admitted rejected
+  row reports the exact source-level diagnostic:
+
+  ```text
+  `json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+  ```
+
+  `<row-type-source-spelling>` is the declared public spelling, including a module qualifier and
+  concrete generic arguments; internal `$`-mangled names and monomorph interner names never appear.
+  `check_json_scan` must receive this spelling from the producer-owned source-type annotation or
+  source-type formatter before the AST spelling is erased into `Ty`. The formatter resolves the
+  local/imported path and concrete generic arguments through the same module/type-resolution tables
+  that produced the expected row type; it must not use `ty_name`, `StructDef::name`,
+  `StructDef::source_name`, or any internal mangled/interner spelling. The producer-owned spelling
+  is part of the diagnostic contract, not runtime reflection or a cache/artifact read.
+  Accepted rows retain the existing scanner handle, input region, framing, terminal `Result`, HIR,
+  MIR, codegen, runtime entrypoint, and cache identity. The change is intentionally a compile-time
+  rejection of an unsafe existing surface, not a per-row cleanup implementation.
+
+  The implementation gate is the following contract ledger:
+
+  | Surface | Contract |
+  | --- | --- |
+  | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`; the row type comes from the expected scanner annotation, not a written call-site type argument. The scanner is a pipeline source only. |
+  | Input and result | `view` is the existing `str` input (or the existing explicit borrow from `string`); its region bounds the scanner. Supported fused terminals return the existing `Result<T, Error>` scalar result and preserve malformed-row and exhaustion behavior. |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` owns source validation and source spelling; the checked-HIR boundary rechecks the row graph with the canonical Copy predicate for imported/per-unit/handcrafted HIR; the existing MIR `JsonScan` lowering, LLVM emission, and `align_rt_json_scan_next` own accepted execution. The gate adds no runtime owner. |
+  | Row eligibility | `json.scan` accepts only a recursively non-owning row whose canonical `DropPlan` is valid and needs no drop. |
+  | Validation order | capability import, arity, scanner annotation/inference, existing JSON schema, recursive Copy check, then input `str` typing and region checks. |
+  | Ownership | rejected rows construct no scanner, descriptor, row slot, allocation, or runtime side effect; accepted rows retain the existing borrowed input and Copy row slot. |
+  | Diagnostic identity | use the producer-owned public local/imported/generic source spelling; never expose internal names or reconstruct spelling from HIR mangling. |
+  | ABI and persistence | N/A: no source syntax, HIR/MIR node, descriptor, runtime ABI, wire format, or cache identity changes for accepted programs. |
+  | Runtime cleanup | N/A for accepted rows because the complete row graph has no `Drop`; existing scanner input and scalar-accumulator cleanup remains authoritative. |
+  | Compatibility prerequisite | The implementation PR is gated on this design and must retain the existing JSON schema and scanner terminal contracts. Request 6 align-llm adoption is a later consumer gate after the implementation release is pinned. |
+  | Acceptance and benchmark | The owner tests and the `json_scan_copy_row_no_owned_alloc` allocation probe below close the contract; performance is N/A and no benchmark improvement is claimed. |
+  | Source-of-truth map | This English design, `impl/core-design/ja/json.md`, `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, `docs/open-questions.md`, and the align-llm Request 6 register must agree. |
+  | Concurrent scanners | N/A to the compile-time gate; independent accepted scanners retain their existing independent handles and slots. |
+  | Performance | N/A: no performance claim and no production MIR, codegen, or runtime change. |
+
+  **Ownership closure matrix (implementation gate).** The following cells are closed before the
+  implementation PR starts; `N/A` is a consequence of the recursively Copy precondition, not an
+  omitted decision.
+
+  | Cell | Intended owner | Exact regression or benchmark |
+  | --- | --- | --- |
+  | Type formation, row validation, and scanner construction | `align_sema::Checker::check_json_scan`; no scanner node is produced until schema and Copy checks pass | `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_rejects_owned_row_fields` |
+  | Move-in, move-out, source nulling, replacement, and returned row ownership | N/A for an accepted row: `DropPlan` proves no Move field; the rejected path returns before construction | `m5::json_scan_copy_row_error_matrix`, `json_scan_copy_row_no_owned_alloc` |
+  | `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, early terminal return, and malformed input | Existing scanner MIR/runtime control flow; no new ownership edge is admitted by this gate | `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_copy_row_error_matrix` |
+  | Direct, nested, optional, union, and invalid/cyclic schema graph | Canonical recursive `DropPlan`/JSON schema producer tables; fail closed on missing or invalid graph nodes | `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_row_schema_matrix`, `hir_body_validator_json_scan_copy_row` |
+  | Generic monomorphization and imported source spelling | Type-resolution producer owns concrete public spelling; the Copy predicate consumes the fully resolved graph | `m5::json_scan_generic_row_ownership`, `modules::json_scan_imported_row_ownership` |
+  | Whole-program, per-unit, cold/hot cache, schema edit/revert | Existing structural MIR/cache identity remains owner; rejected rows publish no artifact | `cache_codegen::json_scan_row_schema_rejection`, accepted Copy-row MIR/raw-LLVM identity comparison |
+  | Interface serialization and persisted/wire identity | N/A: the gate is before interface/runtime construction and accepted source identity is unchanged | `cargo test -p align_interface --test summary` plus `cache_codegen::json_scan_row_schema_rejection` |
+  | Runtime ownership provenance and allocation parity | Existing scanner input/accumulator owners; Copy rows allocate no owned row field | `json_scan_copy_row_no_owned_alloc` |
+  | Exhaustion, empty input, malformed first/later row, and `Result`/`?` cleanup | Existing scanner input and accumulator cleanup; row-slot cleanup is N/A by construction | `m5::json_scan_copy_row_error_matrix`, `m5::json_scan_copy_row_terminal_matrix` |
+  | Concurrent independent scanners | N/A to the new check; existing independent handles, immutable descriptors, and row slots remain separate | two accepted scanner terminals in one program plus the existing nested-scanner rejection |
+  | Performance | N/A: no production performance claim | N/A; record the reason in the implementation PR |
+
+  The design acceptance matrix must cover direct and transitive owned fields, nested and optional
+  structs, every JSON scalar width, borrowed `str`, Copy options and unions, local/imported types,
+  generic monomorphs, semantic rejection before MIR, cold/hot/cache-edit/revert behavior, malformed
+  and exhausted streams, and ordinary `json.decode` compatibility. The focused owner tests are
+  `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_rejects_owned_row_fields`,
+  `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_generic_row_ownership`,
+  `modules::json_scan_imported_row_ownership`, and
+  `cache_codegen::json_scan_row_schema_rejection`; the feature-gated runtime allocation probe is
+  `json_scan_copy_row_no_owned_alloc`. A release compiler built from the pre-change Align commit
+  and one built from the implementation head must emit byte-identical MIR and raw LLVM for an
+  accepted Copy-row fixture. The align-llm Request 6 adoption fixture owns the later pin change.
+
+  The existing compiler currently admits some owning rows; this paragraph is the reviewed target
+  contract, not a claim that the implementation has shipped. The implementation PR must land only
+  after this design gate and must keep the separate decoded-owner cleanup decision explicit for the
+  currently admitted `Option<Move-struct>` JSON shape.
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
 validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`

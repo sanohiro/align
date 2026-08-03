@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-02. `main` includes the shipped wave through #688 plus the merged am-p
+_Last updated: 2026-08-03. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
 (`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
@@ -59,8 +59,10 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **align-llm requests:** all filed requests are complete and answered in
-  `../align-llm/docs/align-requests.md`.
+- **align-llm requests:** Requests 4–14 remain proposed in
+  `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is being
+  prepared on the separate `agent/align-llm-request6-design` worktree and has no compiler
+  implementation or release pin yet. Request 9 remains the later C7 blocker.
 
 ## Latest shipped wave
 
@@ -639,6 +641,16 @@ and the macOS release-build CI path. A local `cargo build --release --workspace`
 was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
+
+Finish and publish the reviewed Request 6 design slice before implementing its compiler gate. The
+design must retain the shipped non-Move `Option<struct>` encoding boundary, include the checked-HIR
+owner in the am-b2b2 verification bundle, and keep the English/Japanese JSON ledgers synchronized.
+After the design is accepted, implement the scanner-only recursive Copy check in a separate slice;
+do not update the align-llm compiler pin until that implementation is merged and its adoption gate
+passes. The current design worktree is docs-only: `git diff --check` and the exact-diagnostic/
+mirror consistency check pass; compiler tests, builds, and `make ci` are N/A until executable code
+changes. The conditional review found four P2 consistency findings; one consolidated repair applied
+all four, and no further local review loop is planned for this design-only repair.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

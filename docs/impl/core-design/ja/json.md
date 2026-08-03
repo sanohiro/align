@@ -121,15 +121,19 @@ scalar / `str` / ネスト構造体）であってよい。**null ポリシー:*
 に `opt_tag`（`-1`=必須、それ以外は `Option` の tag バイトオフセット）を追加。optional フィールドは
 `all_required_seen` の対象外で、共有の `write_value` が payload スロットに書いてから `Some` tag を立てる。
 encode は `Option` を含むオブジェクトを trailing-comma 方式に切替え、`}` の前で `align_rt_builder_pop_comma`
-を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**v1 境界:** Option payload は **非所有**
-でなければならない。L1a 以降、通常の言語構造体では `Option<string>` を許可するが、そのフィールドを含む
-target は JSON descriptor consumer が未実装のため `json.decode` / `json.encode` で拒否する。
-`Option<Move-struct>` は引き続き L1b の型ゲートで拒否する。**`Option<struct>` encode（T1b, SHIPPED）:**
+を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**JSON の ownership 境界:** L1a 以降、
+通常の言語構造体では所有する `Option<T>` field も許可されるが、各 JSON 経路はより狭い descriptor 契約を
+持ち得る。現在の compiler の Decode schema は `Option<Move-struct>` shape を受理するが、decoded-owner
+cleanup はまだ完全ではなく、別の ownership request が所有する。`Option<string>` は現在の JSON Decode
+schema の範囲外である。以下の scanner 規則はこれらの通常 JSON の詳細によって弱められない。到達可能な型
+グラフが `Drop` を必要とする row は `json.scan` が拒否する。**`Option<struct>` encode（T1b, SHIPPED）:**
 `Some` は runtime の descriptor 駆動エンコーダ（新 `OptionStructField` テンプレートピース →
 `align_rt_json_encode_object`、descriptor テーブルで単一 struct を出力）でネストオブジェクトを描画し、
 `None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と
 ネストした `Option<str>` を持つ payload はその `None` も省略）。payload struct は encodable であることを
-検証（`decode_struct_fields_ok`）し、非 Move を維持。構造化 MIR の指紋には payload struct の定義も
+検証（`decode_struct_fields_ok`）し、この shipped encoding path では non-Move でなければならない。
+`Option<Move-struct>` はこの encoding path の対象外である。現在の Decode schema が受理する Move shape と
+その decoded-owner cleanup は別の ownership request が定める。構造化 MIR の指紋には payload struct の定義も
 含まれるため、`Option<struct>` payload のフィールド変更で decode/encode の両オブジェクトが無効化される。
 JSON の MIR ノードは target id だけを持ち、手動で受け渡すスキーマ文字列は存在しない。
 
@@ -225,6 +229,89 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   `Result<T, Error>`。`lower_json_scan_reduce` の guarded な行ごと fold を共有する。よって完全な
   ストリーミング reducer 集合は `sum` / `count` / `reduce` / `any` / `all` / `min` / `max`。
   実体化終端のみ対象外（設計どおり — ストリーミングを無効化するため）。
+
+  **J5 の安全境界 — Request 6 設計ゲート（実装待ち）。** scanner は入力値ごとに 1 つの行
+  スロットを再利用し、行ごとの arena や `Drop` 遷移を持たない。そのため行スキーマは再帰的に
+  **Copy** でなければならない。`json.scan` は、到達可能な struct・option・union の完全な型
+  グラフについて canonical な再帰 `DropPlan` が drop 不要と判定した場合だけ行を受理する。
+  これは scanner 専用の規則であり、同じ宣言は通常の Align 型として有効なまま、各通常 JSON
+  経路のスキーマ契約が許す限り通常の JSON 操作で利用できる。既存 JSON schema whitelist を
+  通過した row について、配列の種類を個別列挙するのではなく、直接または推移的な
+  `array<T>` / `array<Struct>`、所有する option/union payload を拒否する。JSON schema 自体が
+  拒否する field shape（owned `string` や `array<string>` など）には既存の schema 診断を使い、
+  下記の Copy 診断は schema-admitted な Move row の ownership error に限定する。
+
+  意味解析は既存の JSON decode スキーマ検査の後、入力型検査、MIR 構築、descriptor 構築、
+  runtime 呼び出しより前に行う。schema-admitted な row の拒否時の診断は次の exact な
+  source-level 形式とする。
+
+  ```text
+  `json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+  ```
+
+  `<row-type-source-spelling>` は module qualifier と具体化済み generic 引数を含む公開表記であり、
+  内部 `$` mangled 名や monomorph interner 名を出してはならない。`check_json_scan` は AST の
+  spelling が `Ty` に消去される前に、producer-owned な source-type annotation または source-type
+  formatter からこの表記を受け取らなければならない。formatter は expected row type を生成した
+  module/type-resolution table を使って local/imported path と concrete generic argument を解決し、
+  `ty_name`、`StructDef::name`、`StructDef::source_name`、内部 mangled/interner 名を使ってはならない。
+  これは runtime reflection や cache/artifact read ではなく、diagnostic contract の producer-owned
+  spelling である。受理されたプログラムでは既存の
+  scanner handle、入力 region、framing、terminal の `Result`、HIR、MIR、codegen、runtime entrypoint、
+  cache identity は変えない。これは行ごとの cleanup 実装ではなく、危険な既存 surface を compile-time
+  で拒否する変更である。
+
+  実装ゲートの契約 ledger は次のとおり。
+
+  | Surface | 契約 |
+  | --- | --- |
+  | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`。row type は call-site の型引数ではなく expected scanner annotation から得る。scanner は pipeline source のみ。 |
+  | Input と result | `view` は既存の `str` input（または既存の `string` からの明示的 borrow）。region は scanner を束縛する。対応する fused terminal は既存の `Result<T, Error>` scalar result を返し、malformed-row と exhaustion の挙動を保つ。 |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` が validation と source spelling を所有する。checked-HIR boundary は imported/per-unit/handcrafted HIR に対して canonical Copy predicate で row graph を fail-closed に再検査し、source spelling を再構築しない。既存の MIR `JsonScan` lowering、LLVM emission、`align_rt_json_scan_next` が受理時の実行を所有し、gate は runtime owner を追加しない。 |
+  | 行の受理条件 | canonical `DropPlan` が有効で drop 不要な再帰的 non-owning row のみ `json.scan` が受理する。 |
+  | 検査順序 | capability import、arity、scanner annotation/inference、既存 JSON schema、再帰 Copy 検査、最後に入力 `str` 型と region。 |
+  | Ownership | 拒否行では scanner、descriptor、行スロット、allocation、runtime side effect を構築しない。受理行は既存の入力 borrow と Copy 行スロットを保持する。 |
+  | 診断の identity | producer-owned な公開 local/imported/generic source spelling を使い、HIR mangling から復元しない。 |
+  | ABI と永続化 | N/A。accepted program の source syntax、HIR/MIR node、descriptor、runtime ABI、wire format、cache identity は変更しない。 |
+  | Runtime cleanup | accepted row の完全な型グラフは Drop 不要なので N/A。既存の scanner 入力と scalar accumulator の cleanup が引き続き所有する。 |
+  | Compatibility prerequisite | implementation PR はこの design gate 後に作成し、既存 JSON schema と scanner terminal 契約を保持する。Request 6 の align-llm adoption は implementation release を pin した後の consumer gate である。 |
+  | Acceptance と benchmark | 下記 owner test と `json_scan_copy_row_no_owned_alloc` allocation probe が契約を閉じる。性能主張はなく benchmark は N/A。 |
+  | Source-of-truth map | この English design、本文書、`draft.md`、`docs/language-spec.md`、`docs/design-notes.md`、`docs/open-questions.md`、align-llm Request 6 register が一致しなければならない。 |
+  | 並行 scanner | compile-time gate には N/A。accepted scanner は既存の独立した handle と slot を使う。 |
+  | Performance | N/A。性能主張はせず、production MIR・codegen・runtime は変更しない。 |
+
+  **Ownership closure matrix（implementation gate）。** 次の cell は implementation PR の開始前に閉じる。
+  `N/A` は recursively Copy precondition の結果であり、決定の省略ではない。
+
+  | Cell | Intended owner | Exact regression / benchmark |
+  | --- | --- | --- |
+  | Type formation、row validation、scanner construction | `align_sema::Checker::check_json_scan`。schema と Copy check を通るまで scanner node を生成しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_rejects_owned_row_fields` |
+  | Move-in、move-out、source nulling、replacement、returned row ownership | accepted row では N/A。`DropPlan` が Move field なしを証明し、拒否経路は construction 前に戻る。 | `m5::json_scan_copy_row_error_matrix`、`json_scan_copy_row_no_owned_alloc` |
+  | `if`、`match`、`else`、`?`、`map_err`、branch/loop join、early terminal return、malformed input | 既存 scanner MIR/runtime control flow。新しい ownership edge は Copy row invariant を越えて導入しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_copy_row_error_matrix` |
+  | Direct、nested、optional、union、invalid/cyclic schema graph | canonical recursive `DropPlan` と JSON schema の producer table。missing/invalid graph node では fail closed。checked-HIR boundary も同じ graph を再検査する。 | `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_row_schema_matrix`、`hir_body_validator_json_scan_copy_row` |
+  | Generic monomorphization と imported source spelling | type-resolution producer が concrete public spelling を所有し、Copy predicate は fully resolved graph を消費する。 | `m5::json_scan_generic_row_ownership`、`modules::json_scan_imported_row_ownership` |
+  | Whole-program、per-unit、cold/hot cache、schema edit/revert | 既存 structural MIR/cache identity が owner。拒否 row は artifact を publish しない。 | `cache_codegen::json_scan_row_schema_rejection`、accepted Copy-row MIR/raw-LLVM identity comparison |
+  | Interface serialization と persisted/wire identity | N/A。gate は interface/runtime construction 前で、accepted source identity は不変。 | `cargo test -p align_interface --test summary` と `cache_codegen::json_scan_row_schema_rejection` |
+  | Runtime ownership provenance と allocation parity | 既存 scanner input/accumulator owner。Copy row の owned row field allocation はゼロ。 | `json_scan_copy_row_no_owned_alloc` |
+  | Exhaustion、empty input、malformed first/later row、`Result`/`?` cleanup | 既存 scanner input と accumulator cleanup。row-slot cleanup は invariant により N/A。 | `m5::json_scan_copy_row_error_matrix`、`m5::json_scan_copy_row_terminal_matrix` |
+  | Concurrent independent scanners | 新 gate には N/A。既存 independent handle、immutable descriptor、row slot の分離を保持する。 | 1 program 内の accepted scanner terminal 2 つと既存 nested-scanner rejection |
+  | Performance | N/A。production performance claim はしない。 | N/A。implementation PR に理由を記録する。 |
+
+  設計受入マトリクスは、直接・推移的な owned field、nested/optional struct、JSON の全 scalar
+  width、borrowed `str`、Copy option/union、local/imported 型、generic monomorph、MIR より前の
+  semantic rejection、cache の cold/hot/edit/revert、malformed/exhausted stream、通常の
+  `json.decode` 互換性を網羅する。主な owner test は
+  `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_rejects_owned_row_fields`、
+  `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_generic_row_ownership`、
+  `modules::json_scan_imported_row_ownership`、`cache_codegen::json_scan_row_schema_rejection`、
+  runtime の allocation probe は `json_scan_copy_row_no_owned_alloc` とする。変更前の Align
+  release compiler と実装 head の release compiler は、受理された Copy-row fixture の MIR と
+  raw LLVM が byte-identical でなければならない。align-llm Request 6 の adoption fixture が後の
+  pin 変更を所有する。
+
+  現在の compiler は一部の owning row をまだ受理する。この記述は reviewed target contract で
+  あり、実装済みという主張ではない。実装 PR はこの設計ゲート後にのみ作成し、現在受理される
+  `Option<Move-struct>` JSON shape の decoded-owner cleanup 判断を別 request として明示する。
 
 決着済みの削除（未実装のまま残すのではなくカタログから削除）: `json.validate<T>`（decode して
 捨てるのが validation）、`json.token`（doc + scan で覆う。consumer なし）、`json.field_table<T>`

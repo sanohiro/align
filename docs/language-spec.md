@@ -465,7 +465,21 @@ json.scan
 `decode`/`encode` take no written type argument — the target type comes from
 context (`u: User := json.decode(d)?`) or the value argument; Align has no
 expression-position type-argument syntax (no turbofish); `scan`'s row type comes
-from the binding annotation the same way. This is the complete surface —
+from the binding annotation the same way. A scan row must be recursively Copy:
+its complete reachable definition graph must require no `Drop`; among rows admitted
+by the existing JSON decode schema, a direct or transitive owned `array<T>`,
+`array<Struct>`, owning option payload, or owning union payload is rejected before
+MIR or runtime construction with the exact diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape, such as an owned `string` or `array<string>` that
+fails the existing schema whitelist, retains that schema diagnostic instead. The
+diagnostic placeholder uses the declared public local/imported spelling with concrete
+generic arguments; internal `$`-mangled and monomorph-interner names never appear.
+This restriction is scanner-only; the declaration remains a valid ordinary type. This is the complete surface —
 `validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
 
 ### Templates

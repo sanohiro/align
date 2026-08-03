@@ -4338,7 +4338,7 @@ recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
 
-**T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547).** NDJSON /
+**T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
 json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a
 turbofish). The scanner is a **pipeline source only** (fused terminals:
@@ -4350,8 +4350,28 @@ input) + the full streaming reducer family `sum`/`count`/`reduce`/`any`/`all`/`m
 `Result<T, Error>` (a malformed row → `Err`, byte-identical to `decode`'s `Error.Code(1)`), full stage
 set (`.field`/`.where(.field)`/`.where(pred)`/`.map`), one scanner covering both a JSON array and NDJSON.
 Materializing terminals over a stream are rejected in sema. draft.md §18.1 + language-spec.md already
-described it exactly (design ran ahead), so no spec-sync was needed. **With J5, the JSON-completeness
-arc J1–J5 is COMPLETE.**
+described the shipped streaming surface exactly (design ran ahead; the implementation matched).
+The streaming feature is shipped, but its safety completion still requires the Request 6
+scanner-only ownership gate below; until that implementation merges, the current compiler's
+owning-row acceptance is a known gap rather than shipped contract.
+
+**Request 6 — scanner row ownership (DESIGN SETTLED 2026-08-03; implementation pending).** A
+`json.scanner<Row>` is a Copy input view and decodes every declared field into one reusable row slot.
+The accepted row graph must therefore be recursively Copy under the canonical `DropPlan`; among rows
+admitted by the existing JSON Decode schema, any direct or transitive owned field is rejected during
+semantic checking with the source-level diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape retains the existing schema diagnostic before this ownership check.
+The same declaration remains valid for ordinary non-scanner uses, and accepted scanner programs retain
+the existing HIR/MIR, runtime ABI, framing, and cache identity. The implementation gate owns
+direct/nested/optional/union/generic/imported matrices, semantic-before-MIR proof, malformed/exhausted
+row behavior, and cold/hot/cache-edit/revert checks; per-row cleanup is deliberately deferred rather
+than adding a second scanner ownership model. The currently admitted `Option<Move-struct>` JSON decode
+shape remains governed by its separate decoded-owner cleanup request.
 
 **Catalog trimmed (SETTLED — dangling entries removed, not left "unimplemented"):**
 `json.validate<T>` **deleted** (decode-and-discard IS validation with zero-copy costs; one way);
@@ -4547,10 +4567,11 @@ Tests: `m5.rs` `json_doc_elems_materialize_and_iterate` (materialize → index �
 `json_doc_elems_materializes_a_level`. **Follow-up (not required for J4):** full `.map`/`.where`
 **pipeline fusion** over a `slice<json.doc>` (closures taking `json.doc`) — index + len + recursion
 already cover level iteration. →
-**J5** `json.scan` — **COMPLETE** (#546 slice 1 `sum`/`count`, #547 slice 2 `reduce`/`any`/`all`/`min`/
-`max`; streaming typed rows, `Result<T,Error>` terminals). **J6 spec sync — not needed:** draft.md §18.1
-+ language-spec.md already described `json.scan` exactly (design ran ahead; the implementation matched
-it), so the authoritative spec is already consistent. **The JSON-completeness arc J1–J5 is COMPLETE.**
+**J5** `json.scan` — **SHIPPED** (#546 slice 1 `sum`/`count`, #547 slice 2 `reduce`/`any`/`all`/`min`/
+`max`; streaming typed rows, `Result<T,Error>` terminals). **Request 6 design sync recorded above:**
+`draft.md` §18.1, `language-spec.md`, and the authoritative JSON design now describe the pending
+scanner-row safety gate; implementation remains a separate hardening slice. The JSON-completeness arc's
+implementation is shipped, while the Request 6 scanner-row safety gate remains pending.
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

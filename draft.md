@@ -2259,6 +2259,22 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 `scan` cover it), and no public `field_table<T>` (a compiler-internal artifact).
 `doc` is the schema-unknown tier — see §14.
 
+`json.scan` accepts only a recursively Copy row: the complete reachable row definition graph must
+require no `Drop` under Align's canonical ownership classification. Among rows admitted by the
+existing JSON decode schema, a direct or transitive owned `array<T>`, `array<Struct>`, owning option
+payload, or owning union payload is rejected at the scanner call with the exact diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape, such as an owned `string` or `array<string>` that fails the existing
+schema whitelist, retains that schema diagnostic instead. This is a scanner-only restriction; the
+same declaration remains an ordinary valid type and keeps its existing non-scanner JSON behavior.
+The placeholder is the declared public local/imported spelling with concrete generic arguments;
+internal `$`-mangled and monomorph-interner names never appear. The check is semantic and precedes
+input validation, MIR, descriptor construction, and runtime side effects.
+
 A struct field may itself be a `Struct`: `decode` recurses into the nested object
 and `encode` renders it back, so a nested record round-trips in declaration order
 (unknown keys are still skipped at every level, and nested `str` fields stay
@@ -2332,7 +2348,8 @@ arena, bulk-freed).
 `json.scan` streams NDJSON or a top-level array as typed rows without
 materializing the whole input; the row type comes from the binding annotation and
 the scanner is a pipeline source (row views borrow the current chunk and die with
-the stage):
+the stage). The row must be recursively Copy because the scanner reuses one row
+slot without per-row `Drop`:
 
 ```align
 rows: json.scanner<Event> := json.scan(view)
