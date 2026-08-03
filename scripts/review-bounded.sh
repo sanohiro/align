@@ -108,6 +108,7 @@ set -m
 # the inspection-only prompt so the watchdog can require a bounded verdict.
 PATH="$review_path" DEVELOPER_DIR="$review_developer_dir" GIT_OPTIONAL_LOCKS=0 \
 codex review -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
+  -c 'shell_environment_policy.inherit="all"' \
   "$prompt" >>"$output" 2>&1 &
 review_pid=$!
 
