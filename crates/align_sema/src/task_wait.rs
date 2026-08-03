@@ -49,7 +49,7 @@ impl Tokens {
         kind: u8,
         incoming_generation: Token,
         incoming_epoch: Token,
-    ) -> Token {
+    ) -> Option<Token> {
         let key = TokenKey {
             group,
             site,
@@ -58,12 +58,12 @@ impl Tokens {
             incoming_epoch,
         };
         if let Some(token) = self.values.get(&key) {
-            return *token;
+            return Some(*token);
         }
-        let token = self.next.saturating_add(1).max(1);
+        let token = self.next.checked_add(1)?;
         self.next = token;
         self.values.insert(key, token);
-        token
+        Some(token)
     }
 }
 
@@ -374,6 +374,23 @@ impl<'a> Analyzer<'a> {
         self.replay_failure_span.get_or_insert(span);
     }
 
+    fn token(
+        &mut self,
+        group: NodeId,
+        site: NodeId,
+        kind: u8,
+        incoming_generation: Token,
+        incoming_epoch: Token,
+    ) -> Option<Token> {
+        let token = self
+            .tokens
+            .get(group, site, kind, incoming_generation, incoming_epoch);
+        if token.is_none() {
+            self.fail_replay(Span::new(0, 0, 0));
+        }
+        token
+    }
+
     fn group<'b>(&self, state: &'b State, id: NodeId) -> Option<&'b Group> {
         state.groups.iter().rev().find(|group| group.id == id)
     }
@@ -386,12 +403,12 @@ impl<'a> Analyzer<'a> {
         state.groups.last().map(|group| group.id)
     }
 
-    fn new_group(&mut self, id: NodeId) -> Group {
-        let generation = self.tokens.get(id, id, INITIAL_GENERATION, 0, 0);
-        let epoch = self.tokens.get(id, id, INITIAL_EPOCH, 0, 0);
+    fn new_group(&mut self, id: NodeId) -> Option<Group> {
+        let generation = self.token(id, id, INITIAL_GENERATION, 0, 0)?;
+        let epoch = self.token(id, id, INITIAL_EPOCH, 0, 0)?;
         let mut valid_generations = BTreeSet::new();
         valid_generations.insert(generation);
-        Group {
+        Some(Group {
             id,
             generation,
             epoch,
@@ -400,7 +417,7 @@ impl<'a> Analyzer<'a> {
             fallible: false,
             waits: BTreeMap::new(),
             wait_order: Vec::new(),
-        }
+        })
     }
 
     fn task_ready(&self, state: &State, proof: TaskProof) -> bool {
@@ -445,16 +462,14 @@ impl<'a> Analyzer<'a> {
             .group(state, id)
             .map(|group| (group.generation, group.epoch))
             .unwrap_or((0, 0));
-        let generation = self.tokens.get(
+        let generation = self.token(
             id,
             site,
             SPAWN_GENERATION,
             incoming_generation,
             incoming_epoch,
-        );
-        let epoch = self
-            .tokens
-            .get(id, site, SPAWN_EPOCH, incoming_generation, incoming_epoch);
+        )?;
+        let epoch = self.token(id, site, SPAWN_EPOCH, incoming_generation, incoming_epoch)?;
         let group = self.group_mut(state, id)?;
         if pending {
             group.valid_generations.clear();
@@ -485,7 +500,7 @@ impl<'a> Analyzer<'a> {
             self.group_mut(state, id)?.completed = Some(generation);
             return None;
         }
-        let wait = self.tokens.get(id, site, WAIT_TOKEN, generation, epoch);
+        let wait = self.token(id, site, WAIT_TOKEN, generation, epoch)?;
         if let Some(group) = self.group_mut(state, id) {
             if !group.waits.contains_key(&wait) {
                 group.wait_order.push(wait);
@@ -553,13 +568,15 @@ impl<'a> Analyzer<'a> {
         if record.status == WaitStatus::Ok {
             return;
         }
-        let epoch = self.tokens.get(
+        let Some(epoch) = self.token(
             proof.group,
             site,
             ERR_EPOCH,
             snapshot.generation,
             proof.epoch,
-        );
+        ) else {
+            return;
+        };
         let Some(group) = self.group_mut(state, proof.group) else {
             return;
         };
@@ -572,13 +589,13 @@ impl<'a> Analyzer<'a> {
         group.wait_order.clear();
     }
 
-    fn join_group(&mut self, site: NodeId, groups: &[Group]) -> (Group, bool) {
+    fn join_group(&mut self, site: NodeId, groups: &[Group]) -> Option<(Group, bool)> {
         let Some(first) = groups.first() else {
-            let generation = self.tokens.get(site, site, JOIN_GENERATION, 0, 0);
-            let epoch = self.tokens.get(site, site, JOIN_EPOCH, 0, 0);
+            let generation = self.token(site, site, JOIN_GENERATION, 0, 0)?;
+            let epoch = self.token(site, site, JOIN_EPOCH, 0, 0)?;
             let mut valid_generations = BTreeSet::new();
             valid_generations.insert(generation);
-            return (
+            return Some((
                 Group {
                     id: site,
                     generation,
@@ -590,19 +607,19 @@ impl<'a> Analyzer<'a> {
                     wait_order: Vec::new(),
                 },
                 true,
-            );
+            ));
         };
         if groups.iter().all(|group| group == first) {
-            return (first.clone(), false);
+            return Some((first.clone(), false));
         }
-        let generation = self.tokens.get(first.id, site, JOIN_GENERATION, 0, 0);
-        let epoch = self.tokens.get(first.id, site, JOIN_EPOCH, 0, 0);
+        let generation = self.token(first.id, site, JOIN_GENERATION, 0, 0)?;
+        let epoch = self.token(first.id, site, JOIN_EPOCH, 0, 0)?;
         let completed = groups
             .iter()
             .all(|group| group.completed == Some(group.generation));
         let mut valid_generations = BTreeSet::new();
         valid_generations.insert(generation);
-        (
+        Some((
             Group {
                 id: first.id,
                 generation,
@@ -614,7 +631,7 @@ impl<'a> Analyzer<'a> {
                 wait_order: Vec::new(),
             },
             true,
-        )
+        ))
     }
 
     fn merge_states(&mut self, site: NodeId, states: &[State]) -> Option<State> {
@@ -637,7 +654,7 @@ impl<'a> Analyzer<'a> {
                 *changed_entry = true;
                 continue;
             }
-            let (group, differs) = self.join_group(site, &groups);
+            let (group, differs) = self.join_group(site, &groups)?;
             merged.groups[index] = group;
             *changed_entry = differs;
         }
@@ -1148,7 +1165,11 @@ impl<'a> Analyzer<'a> {
                             continue;
                         };
                         let mut nested = state;
-                        nested.groups.push(self.new_group(group_id));
+                        let Some(group) = self.new_group(group_id) else {
+                            last = Flow::dead();
+                            continue;
+                        };
+                        nested.groups.push(group);
                         work.push(ReplayWork::ExprAfterTaskGroup { group_id });
                         work.push(ReplayWork::EvalBlock {
                             block,
@@ -1807,6 +1828,22 @@ mod tests {
         }
     }
 
+    fn identity_loop_sites(group: &Expr) -> (&Expr, &Expr) {
+        let ExprKind::TaskGroup(block) = &group.kind else {
+            unreachable!("identity fixture must be a task group");
+        };
+        let Stmt::Expr(loop_expr) = &block.stmts[5] else {
+            unreachable!("identity fixture must end with a loop");
+        };
+        let ExprKind::Loop { body, .. } = &loop_expr.kind else {
+            unreachable!("identity fixture must end with a loop");
+        };
+        let Stmt::Expr(spawn_expr) = &body.stmts[0] else {
+            unreachable!("loop fixture must start with a Spawn");
+        };
+        (loop_expr, spawn_expr)
+    }
+
     #[test]
     fn task_wait_duplicate_span_identity() {
         let span = Span::new(7, 11, 11);
@@ -1877,6 +1914,17 @@ mod tests {
             value: None,
         };
         let (node_ids, _) = collect_node_ids(&body).expect("valid body has stable node ids");
+        let loop_ids: std::collections::BTreeSet<NodeId> = body
+            .stmts
+            .iter()
+            .map(|stmt| {
+                let Stmt::Expr(group) = stmt else {
+                    unreachable!("identity fixture statement must be an expression");
+                };
+                let (loop_expr, _) = identity_loop_sites(group);
+                node_ids[&(loop_expr as *const Expr as usize)]
+            })
+            .collect();
         let mut diagnostics = Diagnostics::new();
         let mut analyzer = test_analyzer(&[], &mut diagnostics, node_ids);
         let flow = analyzer.replay(&body, State::default(), true);
@@ -1915,6 +1963,17 @@ mod tests {
         assert_eq!(spawn_sites.len(), 8, "duplicate Spawn sites must not alias");
         assert_eq!(err_sites.len(), 2, "duplicate Err sites must not alias");
         assert!(join_sites.len() >= 4, "duplicate join sites must not alias");
+        let loop_join_sites: std::collections::BTreeSet<NodeId> = analyzer
+            .tokens
+            .values
+            .keys()
+            .filter(|key| key.kind == JOIN_GENERATION && loop_ids.contains(&key.site))
+            .map(|key| key.site)
+            .collect();
+        assert_eq!(
+            loop_join_sites, loop_ids,
+            "loop headers must retain identity"
+        );
     }
 
     #[test]
@@ -1925,6 +1984,29 @@ mod tests {
         };
         let mut diagnostics = Diagnostics::new();
         let mut analyzer = test_analyzer(&[], &mut diagnostics, HashMap::new());
+        let flow = analyzer.replay(&body, State::default(), true);
+        assert!(flow.state.is_none());
+        assert!(analyzer.replay_failed);
+    }
+
+    #[test]
+    fn task_wait_token_exhaustion_fails_closed() {
+        let span = Span::new(0, 0, 1);
+        let body = Block {
+            stmts: vec![Stmt::Expr(Expr {
+                kind: ExprKind::TaskGroup(Block {
+                    stmts: Vec::new(),
+                    value: None,
+                }),
+                ty: Ty::Unit,
+                span,
+            })],
+            value: None,
+        };
+        let (node_ids, _) = collect_node_ids(&body).expect("valid body has stable node ids");
+        let mut diagnostics = Diagnostics::new();
+        let mut analyzer = test_analyzer(&[], &mut diagnostics, node_ids);
+        analyzer.tokens.next = Token::MAX;
         let flow = analyzer.replay(&body, State::default(), true);
         assert!(flow.state.is_none());
         assert!(analyzer.replay_failed);
@@ -2004,9 +2086,38 @@ mod tests {
             stmts: vec![Stmt::Expr(identity_group(span))],
             value: None,
         };
+        let group = match &body.stmts[0] {
+            Stmt::Expr(group) => group,
+            _ => unreachable!(),
+        };
+        let (loop_expr, loop_spawn) = identity_loop_sites(group);
+        let (node_ids, _) = collect_node_ids(&body).expect("valid body has stable node ids");
+        let loop_site = node_ids[&(loop_expr as *const Expr as usize)];
+        let loop_spawn_site = node_ids[&(loop_spawn as *const Expr as usize)];
         let mut diagnostics = Diagnostics::new();
-        validate(&body, &[], &mut diagnostics);
-        assert!(!diagnostics.has_errors());
+        let mut analyzer = test_analyzer(&[], &mut diagnostics, node_ids);
+        let flow = analyzer.replay(&body, State::default(), true);
+        assert!(flow.state.is_some());
+        assert!(!analyzer.diags.has_errors());
+        let loop_spawn_inputs: std::collections::BTreeSet<(Token, Token)> = analyzer
+            .tokens
+            .values
+            .keys()
+            .filter(|key| key.kind == SPAWN_GENERATION && key.site == loop_spawn_site)
+            .map(|key| (key.incoming_generation, key.incoming_epoch))
+            .collect();
+        assert!(
+            loop_spawn_inputs.len() >= 2,
+            "loop header must be recomputed after its first state-changing pass"
+        );
+        let loop_join_sites: std::collections::BTreeSet<NodeId> = analyzer
+            .tokens
+            .values
+            .keys()
+            .filter(|key| key.kind == JOIN_GENERATION && key.site == loop_site)
+            .map(|key| key.site)
+            .collect();
+        assert_eq!(loop_join_sites, [loop_site].into_iter().collect());
     }
 
     #[test]

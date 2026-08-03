@@ -797,6 +797,15 @@ the owner to six sites, and removed the more-than-64 claim. Its targeted closure
 loop fixture still had no header-state change. The final fixture adds a loop-body Spawn before the
 branch/break join, so the header state changes and reaches the stable tokenized join; the owner now
 has eight structural Spawn sites. No unrelated broad review or test rerun is started.
+The post-open PR #699 review cycle returned INCOMPLETE rather than CLEAN: the host-native reviewer
+stalled after roughly ten minutes while inspecting the large diff and its bounded log was preserved;
+the independent reviewer found P2 token exhaustion aliasing, a matrix overclaim that treated
+dispatcher steps as a total CPU bound, and weak direct owner evidence for loop/header convergence.
+The coherent follow-up changes token allocation to checked `Option<Token>` with analyzer fail-closed
+propagation, narrows the bound wording to dispatcher steps plus explicit input/live-entry costs,
+adds a token-exhaustion owner, and directly observes changed incoming loop Spawn tokens and each
+duplicate loop-header join site. Per the review policy this is one finding-closure follow-up; no
+second broad review is requested for these non-public-contract fixes.
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
