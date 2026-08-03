@@ -3004,7 +3004,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
                 }),
                 arms: vec![
                     hir::MatchArm {
-                        variants: vec![0],
+                        variants: vec![1],
                         bindings: Vec::new(),
                         body: expr,
                     },
@@ -3960,6 +3960,54 @@ fn valid_hir_nominal_link_preflight_is_mir_identity() {
         align: None,
         c_repr: false,
     });
+    effect_origin.fns.push(body_test_named_function(
+        "effect_target",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(hir::Expr {
+                kind: hir::ExprKind::Call {
+                    func: "print".to_string(),
+                    args: vec![hir::Expr {
+                        kind: hir::ExprKind::Int(0),
+                        ty: int(64),
+                        span: align_span::Span::new(0, 0, 0),
+                    }],
+                    type_args: Vec::new(),
+                },
+                ty: Ty::Unit,
+                span: align_span::Span::new(0, 0, 0),
+            })),
+        },
+        Vec::new(),
+        Ty::Unit,
+    ));
+    effect_origin.fns.push(body_test_named_function(
+        "effect_value",
+        hir::Block {
+            stmts: vec![hir::Stmt::Let {
+                local: 0,
+                init: hir::Expr {
+                    kind: hir::ExprKind::FnValue("effect_target".to_string()),
+                    ty: Ty::Fn(1),
+                    span: align_span::Span::new(0, 0, 0),
+                },
+            }],
+            value: Some(Box::new(hir::Expr {
+                kind: hir::ExprKind::Unit,
+                ty: Ty::Unit,
+                span: align_span::Span::new(0, 0, 0),
+            })),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "handler".to_string(),
+            ty: Ty::Fn(1),
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        Ty::Unit,
+    ));
     assert!(validate_hir::nominal_link_metadata_is_valid(&effect_origin));
     assert_accepted("function effect origin excluded from source shape", &effect_origin);
 }

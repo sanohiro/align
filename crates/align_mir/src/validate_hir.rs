@@ -2450,6 +2450,28 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
+    /// Match a source-level payload expression against the scalar stored in an enclosing
+    /// `Option`/`Result`. A nested source `Option<T>`/`Result<T, E>` is represented as
+    /// `Ty::Option`/`Ty::Result` in HIR but as `Scalar::Tagged(id)` in the enclosing payload, so
+    /// the ordinary `ty_to_scalar` conversion cannot establish this relation.
+    fn result_payload_matches(&self, expected: Scalar, actual: Ty) -> bool {
+        if align_sema::ty_to_scalar(actual) == Some(expected) {
+            return true;
+        }
+        match (actual, expected) {
+            (Ty::Option(payload), Scalar::Tagged(id)) => matches!(
+                self.program.tagged_types.get(id as usize),
+                Some(hir::TaggedType::Option(stored)) if *stored == payload
+            ),
+            (Ty::Result(ok, err), Scalar::Tagged(id)) => matches!(
+                self.program.tagged_types.get(id as usize),
+                Some(hir::TaggedType::Result(stored_ok, stored_err))
+                    if *stored_ok == ok && *stored_err == err
+            ),
+            _ => false,
+        }
+    }
+
     fn array_literal_element_ok(&self, ty: Ty) -> bool {
         if !self.body_ty_ok(ty) {
             return false;
@@ -5144,23 +5166,27 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::ResultOk(value) => {
                 let flow = self.expr_flow(value)?;
-                let scalar = align_sema::ty_to_scalar(flow.ty)?;
-                let Ty::Result(_, error) = expression.ty else {
+                let Ty::Result(ok, error) = expression.ty else {
                     return None;
                 };
-                if !self.body_scalar_ok(error) {
+                if !self.body_scalar_ok(ok)
+                    || !self.body_scalar_ok(error)
+                    || !self.result_payload_matches(ok, flow.ty)
+                {
                     return None;
                 }
-                Some((Ty::Result(scalar, error), flow.falls, flow.breaks))
+                Some((Ty::Result(ok, error), flow.falls, flow.breaks))
             }
             hir::ExprKind::ResultErr(value) => {
                 let flow = self.expr_flow(value)?;
-                let scalar = align_sema::ty_to_scalar(flow.ty)?;
                 let Ty::Result(ok, error) = expression.ty else { return None };
-                if error != scalar || !self.body_scalar_ok(ok) {
+                if !self.body_scalar_ok(ok)
+                    || !self.body_scalar_ok(error)
+                    || !self.result_payload_matches(error, flow.ty)
+                {
                     return None;
                 }
-                Some((Ty::Result(ok, scalar), flow.falls, flow.breaks))
+                Some((Ty::Result(ok, error), flow.falls, flow.breaks))
             }
             hir::ExprKind::Try(value) => {
                 let flow = self.expr_flow(value)?;
@@ -5179,13 +5205,21 @@ impl<'a> BodyValidator<'a> {
                 ..
             } => {
                 let flow = self.block_flow(body)?;
-                if *diverges != flow.breaks.is_empty() {
+                // `diverges` records whether the producer saw an accepted break syntactically.
+                // A break whose payload returns/exits/aborts is accepted but does not contribute
+                // a reachable break flow, so the two bits can legitimately differ. Preserve the
+                // producer distinction while rejecting a forged no-break loop.
+                if *diverges && !flow.breaks.is_empty()
+                    || !*diverges
+                        && flow.breaks.is_empty()
+                        && !self.has_current_loop_break(body)
+                {
                     return None;
                 }
                 if !flow.breaks.iter().all(|ty| *ty == expression.ty) {
                     return None;
                 }
-                Some((expression.ty, !*diverges, Vec::new()))
+                Some((expression.ty, !flow.breaks.is_empty(), Vec::new()))
             }
             hir::ExprKind::Arena(block) => {
                 let flow = self.block_flow(block)?;
@@ -5317,6 +5351,57 @@ impl<'a> BodyValidator<'a> {
                 .derive_pipeline_expression(expression, context)
                 .or_else(|| self.derive_native_expression(expression, context)),
         }
+    }
+
+    fn has_current_loop_break(&self, body: &hir::Block) -> bool {
+        enum Work<'a> {
+            Block(&'a hir::Block, usize),
+            Stmt(&'a hir::Stmt, usize),
+            Expr(&'a hir::Expr, usize),
+        }
+        let mut work = vec![Work::Block(body, 0)];
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Block(block, nested_loops) => {
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Work::Expr(value, nested_loops));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(Work::Stmt(statement, nested_loops));
+                    }
+                }
+                Work::Stmt(statement, nested_loops) => {
+                    if nested_loops == 0
+                        && matches!(
+                            statement,
+                            hir::Stmt::Break {
+                                accepted: true,
+                                ..
+                            }
+                        )
+                    {
+                        return true;
+                    }
+                    for child in statement_children(statement).into_iter().rev() {
+                        work.push(Work::Expr(child, nested_loops));
+                    }
+                }
+                Work::Expr(expression, nested_loops) => match &expression.kind {
+                    hir::ExprKind::Loop { body, .. } => {
+                        work.push(Work::Block(body, nested_loops.saturating_add(1)));
+                    }
+                    // A break inside a closure cannot target this loop. Captures are evaluated
+                    // in the enclosing expression but are validated as closure-owned children.
+                    hir::ExprKind::Closure { .. } => {}
+                    _ => {
+                        for child in align_sema::direct_expr_children(expression).into_iter().rev() {
+                            work.push(Work::Expr(child, nested_loops));
+                        }
+                    }
+                },
+            }
+        }
+        false
     }
 
     fn derive_native_expression(
