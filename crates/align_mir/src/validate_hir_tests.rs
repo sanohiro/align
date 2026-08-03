@@ -735,14 +735,6 @@ fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
 
 #[test]
 fn checked_hir_body_fact_replay_preserves_imported_fact_presence() {
-    let unknown = checked_interface_program(None, FnEffect::Unknown);
-    assert_eq!(unknown.imported_fns.len(), 1);
-    assert!(
-        !unknown.imported_fns[0].return_provenance_known,
-        "compatibility API omission must remain distinguishable from exact None"
-    );
-    assert!(align_sema::checked_hir_body_facts_are_valid(&unknown));
-
     let roots = ReturnBorrowSummary::Roots {
         params: vec![0],
         captures: Vec::new(),
@@ -752,15 +744,42 @@ fn checked_hir_body_fact_replay_preserves_imported_fact_presence() {
         captures: Vec::new(),
     };
     for effect in [FnEffect::Pure, FnEffect::Unknown, FnEffect::Impure] {
+        let unknown = checked_interface_program(None, effect);
+        assert_eq!(unknown.imported_fns.len(), 1);
+        assert!(
+            !unknown.imported_fns[0].return_provenance_known,
+            "compatibility API omission must remain distinguishable from exact None"
+        );
+        let unknown_consumer = unknown
+            .fns
+            .iter()
+            .find(|function| function.name == "consume")
+            .expect("consumer function");
+        assert_eq!(unknown_consumer.return_borrow, roots);
+        assert_eq!(unknown_consumer.return_region, regions);
+        assert!(align_sema::checked_hir_body_facts_are_valid(&unknown));
+
         for (return_borrow, return_region) in [
             (ReturnBorrowSummary::None, ReturnRegionSummary::None),
             (roots.clone(), regions.clone()),
         ] {
             let program = checked_interface_program(
-                Some((return_borrow, return_region)),
+                Some((return_borrow.clone(), return_region.clone())),
                 effect,
             );
             assert!(program.imported_fns[0].return_provenance_known);
+            let consumer = program
+                .fns
+                .iter()
+                .find(|function| function.name == "consume")
+                .expect("consumer function");
+            if matches!(return_borrow, ReturnBorrowSummary::None) {
+                assert_eq!(consumer.return_borrow, ReturnBorrowSummary::None);
+                assert_eq!(consumer.return_region, ReturnRegionSummary::None);
+            } else {
+                assert_eq!(consumer.return_borrow, roots);
+                assert_eq!(consumer.return_region, regions);
+            }
             assert!(
                 align_sema::checked_hir_body_facts_are_valid(&program),
                 "known imported provenance/effect combination must replay: {effect:?}"
