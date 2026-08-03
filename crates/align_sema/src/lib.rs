@@ -4479,6 +4479,8 @@ pub fn check_program_with_interface_facts(
             if !is_generic && matches!(f.vis, ast::Vis::Pub) {
                 let mangled = mangle_fn(module, is_entry, &f.name.name);
                 if let Some(sig) = sigs.get(&mangled) {
+                    let return_provenance_known =
+                        external_return_provenance.contains_key(&mangled);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
@@ -4488,6 +4490,7 @@ pub fn check_program_with_interface_facts(
                         params: sig.params.clone(),
                         param_modes: sig.param_modes.clone(),
                         ret: sig.ret,
+                        return_provenance_known,
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
                         effect,
@@ -4692,10 +4695,9 @@ pub fn check_program_with_interface_facts(
         fn_types,
         imported_fns,
     };
-    infer_return_provenance(&mut program, external_return_provenance);
+    infer_return_provenance(&mut program);
     run_body_analysis_passes(
         &mut program,
-        external_return_provenance,
         external_effects,
         diags,
         false,
@@ -4705,7 +4707,6 @@ pub fn check_program_with_interface_facts(
 
 fn run_body_analysis_passes(
     program: &mut Program,
-    external_return_provenance: &ExternalReturnProvenance,
     external_effects: &std::collections::HashMap<String, FnEffect>,
     diags: &mut Diagnostics,
     replay_effects: bool,
@@ -4718,7 +4719,7 @@ fn run_body_analysis_passes(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_borrow.clone())),
         )
         .collect();
@@ -4730,7 +4731,7 @@ fn run_body_analysis_passes(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_region.clone())),
         )
         .collect();
@@ -4851,7 +4852,10 @@ fn run_body_analysis_passes(
 /// never mutated. A compiler-owned clone is reset to the producer baseline, replayed through the
 /// same analysis implementations used by [`check_program`], and compared field-by-field with the
 /// input. `task_wait` is included here because its proof state is deliberately analysis-local and
-/// has no stored HIR representation to compare.
+/// has no stored HIR representation to compare. This entry point is not the structural HIR
+/// validator: direct callers that skip the prerequisite validators receive panic containment and
+/// depth rejection, but non-panicking malformed header/type metadata remains outside this API's
+/// contract.
 pub fn checked_hir_body_facts_are_valid(program: &hir::Program) -> bool {
     // The MIR gate normally proves all local/type ordinals before reaching this predicate. Keep
     // the public sema boundary fail-closed for direct malformed-HIR callers too: the legacy
@@ -4869,16 +4873,6 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     let mut replay = program.clone();
     reset_body_analysis_facts(&mut replay);
 
-    let external_return_provenance: ExternalReturnProvenance = replay
-        .imported_fns
-        .iter()
-        .map(|function| {
-            (
-                function.name.clone(),
-                (function.return_borrow.clone(), function.return_region.clone()),
-            )
-        })
-        .collect();
     let external_effects: std::collections::HashMap<String, FnEffect> = replay
         .imported_fns
         .iter()
@@ -4888,10 +4882,9 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     for function in &replay.fns {
         task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
     }
-    infer_return_provenance(&mut replay, &external_return_provenance);
+    infer_return_provenance(&mut replay);
     run_body_analysis_passes(
         &mut replay,
-        &external_return_provenance,
         &external_effects,
         &mut diags,
         true,
@@ -5034,10 +5027,7 @@ fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRe
 /// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
 /// and function-value targets belong to L2b-b. The existing exhaustive borrow-provenance walker
 /// remains the single expression classifier.
-fn infer_return_provenance(
-    program: &mut Program,
-    external_return_provenance: &ExternalReturnProvenance,
-) {
+fn infer_return_provenance(program: &mut Program) {
     let mut named: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
         .fns
         .iter()
@@ -5046,7 +5036,7 @@ fn infer_return_provenance(
             program
                 .imported_fns
                 .iter()
-                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .filter(|function| function.return_provenance_known)
                 .map(|function| (function.name.clone(), function.return_borrow.clone())),
         )
         .collect();

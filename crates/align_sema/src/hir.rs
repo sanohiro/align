@@ -120,6 +120,10 @@ pub struct ImportedFn {
     pub param_modes: Vec<align_ast::ParamMode>,
     /// The return type; [`crate::Ty::Unit`] for a `()` return.
     pub ret: Ty,
+    /// Whether the producer received a validated external provenance record for this declaration.
+    /// `false` preserves the compatibility API's conservative all-compatible-input fallback;
+    /// the summaries below are exact only when this bit is `true`.
+    pub return_provenance_known: bool,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it

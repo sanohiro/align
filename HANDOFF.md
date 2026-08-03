@@ -817,6 +817,18 @@ owners `checked_hir_body_fact_replay_rejects_stale_producer_facts` and
 `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` pass; the closure matrix is in
 `docs/impl/17-library-boundary-prerequisites.md`.
 
+The post-open review of PR #700 then found stale am-w owner placeholders, a premature MIR-gate
+statement, combined rather than per-field stale-fact mutations, missing rejected-input immutability
+checks, and one P1 producer/replay mismatch for omitted imported return provenance. The follow-up
+replaces the owner names, qualifies the gate statement, adds the HIR-only
+`return_provenance_known` presence bit so compatibility omissions retain the producer fallback,
+adds absent/explicit-`None`/`Roots` × effect-seed replay coverage, isolates each negative fact, and
+checks rejected-input immutability. The predicate's direct contract now explicitly remains
+prevalidated-HIR plus depth/panic containment; full structural metadata rejection belongs to the
+next MIR activation vertical. Focused replay, declaration-header, check, and Clippy gates pass;
+the original broad host wrapper's human no-action text lacked its required machine marker and stays
+recorded as INCOMPLETE rather than CLEAN.
+
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero

@@ -198,9 +198,17 @@ assignment cleanup `Cell<bool>`, and every concrete `FnTy.effect` cell; imported
 return provenance and effect seeds come only from the already validated
 imported declaration fields. A diagnostic, fact mismatch, or panic from a
 legacy analysis receiving a direct malformed-HIR call returns `false`.
-The MIR activation gate calls this predicate only after depth, global type,
-placement, nominal/link, and declaration-header validation, and before any MIR
-construction or downstream identity is published.
+`ImportedFn.return_provenance_known` preserves whether the producer received
+an external provenance record: `false` retains the compatibility API's
+all-compatible-input fallback, while an explicit `None` is trusted only when
+the record was present. This predicate is not the structural HIR validator;
+direct callers must supply the checked type, id, header, and body envelope,
+and direct malformed metadata that does not trigger a replay diagnostic or
+legacy panic is outside this predicate's contract.
+The later am-b4 MIR activation gate will call this predicate only after depth,
+global type, placement, nominal/link, and declaration-header validation, and
+before any MIR construction or downstream identity is published. This
+sema-only checkpoint does not activate that gate.
 
 Am-b4 independently recomputes the existing producer facts rather than
 trusting the stored bits:
