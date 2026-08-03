@@ -806,6 +806,17 @@ propagation, narrows the bound wording to dispatcher steps plus explicit input/l
 adds a token-exhaustion owner, and directly observes changed incoming loop Spawn tokens and each
 duplicate loop-header join site. Per the review policy this is one finding-closure follow-up; no
 second broad review is requested for these non-public-contract fixes.
+
+The next am-b4 checkpoint is intentionally sema-only on top of merged am-w #699 (`9e2d615`):
+`checked_hir_body_facts_are_valid` clones checked HIR, resets return/Drop/assignment/effect facts
+through the bounded event walk, replays task-wait, return-provenance, MoveCheck, EscapeCheck, and
+effect solving, then compares the published facts without mutating the caller or creating a new
+function-type topology. The MIR shared gate is not activated in this checkpoint; that is the next
+independent vertical, with its four-entrypoint empty-result and identity owners. The focused replay
+owners `checked_hir_body_fact_replay_rejects_stale_producer_facts` and
+`checked_hir_body_fact_replay_covers_cleanup_and_function_effects` pass; the closure matrix is in
+`docs/impl/17-library-boundary-prerequisites.md`.
+
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
 with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
 the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero

@@ -7,6 +7,9 @@ use align_sema::{
         ReturnRegionSummary, StructDef, TaggedType, TupleDef,
     },
 };
+use align_diag::Diagnostics;
+use align_lexer::tokenize;
+use align_parser::parse_file;
 use std::cell::Cell;
 
 fn declaration_header_program() -> hir::Program {
@@ -81,6 +84,22 @@ fn declaration_header_program() -> hir::Program {
         drop_individual_locals: Vec::new(),
         drop_individual_exprs: Default::default(),
     });
+    program
+}
+
+fn checked_source_program(source: &str) -> hir::Program {
+    let mut diagnostics = Diagnostics::new();
+    let tokens = tokenize(0, source, &mut diagnostics);
+    let file = parse_file(tokens, &mut diagnostics);
+    let program = align_sema::check_file(&file, &mut diagnostics);
+    assert!(
+        !diagnostics.has_errors(),
+        "replay fixture must check before mutation: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
     program
 }
 
@@ -585,6 +604,154 @@ fn valid_header_does_not_consume_body_facts() {
         align: None,
     });
     assert!(validate_hir::declaration_header_metadata_is_valid(&body_local_type));
+}
+
+#[test]
+fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
+    let base = declaration_header_program();
+    // The baseline function-type entry is annotation-only in this fixture; its producer value is
+    // the conservative Unknown state, not a synthesized Pure result.
+    base.fn_types[0].effect.set(FnEffect::Unknown);
+    let before = format!("{base:#?}");
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&base),
+        "a producer-valid body must reproduce its stored facts"
+    );
+    assert_eq!(format!("{base:#?}"), before, "replay must not mutate input HIR");
+
+    let mut bad_return = base.clone();
+    bad_return.fns[0].return_borrow = ReturnBorrowSummary::None;
+    bad_return.fns[0].return_region = ReturnRegionSummary::None;
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_return),
+        "stale return provenance must fail closed"
+    );
+
+    let mut bad_drop = base.clone();
+    bad_drop.fns[0].drop_locals = vec![99];
+    bad_drop.fns[0].drop_individual_locals = vec![99];
+    bad_drop.fns[0]
+        .drop_individual_exprs
+        .insert(align_span::Span::new(0, 99, 100), true);
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_drop),
+        "stale Drop vectors and expression map must fail closed"
+    );
+
+    let mut malformed_local = base.clone();
+    malformed_local.fns[0]
+        .body
+        .value
+        .as_mut()
+        .expect("declaration fixture has a body value")
+        .kind = hir::ExprKind::Local(99);
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&malformed_local),
+        "a malformed local ordinal must fail closed instead of panicking"
+    );
+
+    let bad_effect = base.clone();
+    bad_effect.fn_types[0].effect.set(FnEffect::Pure);
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_effect),
+        "stale annotation-only effect must fail closed"
+    );
+}
+
+#[test]
+fn checked_hir_body_fact_replay_covers_cleanup_and_function_effects() {
+    let base = checked_source_program(
+        "fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn replace() -> i32 {
+  mut value := \"first\".clone()
+  value = \"second\".clone()
+  return value.len() as i32
+}
+fn main() -> i32 {
+  pure_value := quiet
+  impure_value := loud
+  return replace()
+}
+",
+    );
+    let before = format!("{base:#?}");
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&base),
+        "producer facts for cleanup and concrete function values must replay"
+    );
+    assert_eq!(format!("{base:#?}"), before, "replay must not mutate input HIR");
+
+    let replace_index = base
+        .fns
+        .iter()
+        .position(|function| function.name == "replace")
+        .expect("replace function");
+    let assignment_index = base.fns[replace_index]
+        .body
+        .stmts
+        .iter()
+        .position(|statement| matches!(statement, hir::Stmt::Assign { .. }))
+        .expect("string replacement assignment");
+
+    let bad_assignment = base.clone();
+    let hir::Stmt::Assign {
+        drop_old,
+        drop_new,
+        ..
+    } = &bad_assignment.fns[replace_index].body.stmts[assignment_index]
+    else {
+        unreachable!("assignment index was selected from the same body");
+    };
+    let old_drop_old = drop_old.get();
+    let old_drop_new = drop_new.get();
+    drop_old.set(!old_drop_old);
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_assignment),
+        "stale assignment drop-old fact must fail closed"
+    );
+
+    let bad_assignment_new = base.clone();
+    let hir::Stmt::Assign { drop_new, .. } =
+        &bad_assignment_new.fns[replace_index].body.stmts[assignment_index]
+    else {
+        unreachable!("assignment index was selected from the same body");
+    };
+    drop_new.set(!old_drop_new);
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_assignment_new),
+        "stale assignment drop-new fact must fail closed"
+    );
+
+    let main = base
+        .fns
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main function");
+    let function_value_ids: Vec<u32> = main
+        .locals
+        .iter()
+        .filter_map(|local| match local.ty {
+            Ty::Fn(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(function_value_ids.len(), 2, "fixture must publish two function values");
+    let bad_effect = base.clone();
+    let effect_id = function_value_ids[0] as usize;
+    let effect = bad_effect.fn_types[effect_id].effect.get();
+    bad_effect.fn_types[effect_id].effect.set(match effect {
+        FnEffect::Pure => FnEffect::Unknown,
+        FnEffect::Unknown => FnEffect::Pure,
+        FnEffect::Impure => FnEffect::Pure,
+    });
+    assert!(
+        !align_sema::checked_hir_body_facts_are_valid(&bad_effect),
+        "stale concrete function-value effect must fail closed"
+    );
 }
 
 #[test]

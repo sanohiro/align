@@ -187,6 +187,21 @@ roots. Canonical semantic-to-byte and byte-to-semantic traversal retains
 depth-first first-visit order through explicit work items; no slice may add an
 ambient type-depth cap.
 
+The sema boundary entrypoint is
+`align_sema::checked_hir_body_facts_are_valid(&hir::Program) -> bool`. It first
+rejects a body above `MAX_CHECKED_HIR_DEPTH`, clones the already structurally
+validated HIR, and performs all replay/reset work on that compiler-owned clone.
+The caller's HIR, its type-table length, local `Ty::Fn` ordinals, and all
+compiler/runtime/cache state remain unchanged. Reset clears function return
+summaries, both Drop-local vectors, the exact Drop-expression map, every
+assignment cleanup `Cell<bool>`, and every concrete `FnTy.effect` cell; imported
+return provenance and effect seeds come only from the already validated
+imported declaration fields. A diagnostic, fact mismatch, or panic from a
+legacy analysis receiving a direct malformed-HIR call returns `false`.
+The MIR activation gate calls this predicate only after depth, global type,
+placement, nominal/link, and declaration-header validation, and before any MIR
+construction or downstream identity is published.
+
 Am-b4 independently recomputes the existing producer facts rather than
 trusting the stored bits:
 
@@ -212,12 +227,14 @@ trusting the stored bits:
    direct, indirect, closure, aggregate projection, assignment join, return
    join, open-world exported callback boundary, and structurally retained dead
    child follows the current producer reachability rules.
-8. Require every concrete `FnTy.effect` cell and every internal boundary cell
-   reached through a local, aggregate field, tuple element, enum/tagged
-   payload, array element, expression result, function return, or capture to
-   equal the replay. An unused annotation-only `FnTy` has `Unknown`; unrelated
-   equal source signatures retain distinct cells. `Impure` dominates
-   `Unknown`, which dominates `Pure`.
+8. Require every concrete `FnTy.effect` cell reached through a local,
+   aggregate field, tuple element, enum/tagged payload, array element,
+   expression result, function return, or capture to equal the replay. Recreate
+   the same compiler-owned internal boundary cells while solving; they have no
+   persisted producer snapshot, so replay diagnostics and complete parallel
+   eligibility are the evidence for their equality. An unused annotation-only
+   `FnTy` has `Unknown`; unrelated equal source signatures retain distinct
+   cells. `Impure` dominates `Unknown`, which dominates `Pure`.
 9. Require every `ArrayParMap` and widened parallel-stage callable to resolve
    to complete replayed `Pure`. `Unknown`, `Impure`, an absent target, and an
    incomplete boundary cell reject before any MIR or generated-kernel identity
