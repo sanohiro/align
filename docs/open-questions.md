@@ -4207,8 +4207,10 @@ close the rest — no "this JSON shape works, that one doesn't" gap).**
     `struct_has_str`/`tracks_region`/`ty_may_borrow` recurse through Options (region soundness).
     **The original v1 non-owned-payload restriction is superseded by L1a (#667).**
     `Option<string>` and `Option<Move-struct>` fields now use the canonical recursive DropPlan and
-    conditional "free iff Some" lowering. JSON decode/encode may retain narrower package-specific
-    shape rules independently of the language field type.
+    conditional "free iff Some" lowering. The current ordinary JSON path admits and encodes
+    `Option<Move-struct>` as well; cleanup after a later sibling decode error remains a separate
+    ownership request. JSON may still retain narrower schema rules independently of the language
+    field type, but the scanner-only Copy gate does not narrow ordinary decode/encode.
   - **Null policy SHIPPED as settled: missing key → `None`; JSON `null` → `None`; type mismatch →
     `Err`; a required (non-`Option`) field still `Err`s when missing.** `encode` omits a `None`
     field entirely (never `"k": null`). One absence representation (One way); `decode(encode(x))`
@@ -4338,7 +4340,7 @@ recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
 
-**T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547).** NDJSON /
+**T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
 json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a
 turbofish). The scanner is a **pipeline source only** (fused terminals:
@@ -4350,8 +4352,29 @@ input) + the full streaming reducer family `sum`/`count`/`reduce`/`any`/`all`/`m
 `Result<T, Error>` (a malformed row → `Err`, byte-identical to `decode`'s `Error.Code(1)`), full stage
 set (`.field`/`.where(.field)`/`.where(pred)`/`.map`), one scanner covering both a JSON array and NDJSON.
 Materializing terminals over a stream are rejected in sema. draft.md §18.1 + language-spec.md already
-described it exactly (design ran ahead), so no spec-sync was needed. **With J5, the JSON-completeness
-arc J1–J5 is COMPLETE.**
+described the shipped streaming surface exactly (design ran ahead; the implementation matched).
+The streaming feature is shipped, but its safety completion still requires the Request 6
+scanner-only ownership gate below; until that implementation merges, the current compiler's
+owning-row acceptance is a known gap rather than shipped contract.
+
+**Request 6 — scanner row ownership (DESIGN SETTLED 2026-08-03; implementation pending).** A
+`json.scanner<Row>` is a Copy input view and decodes every declared field into one reusable row slot.
+The accepted row graph must therefore be recursively Copy under the canonical `DropPlan`; among rows
+admitted by the existing JSON Decode schema, any direct or transitive owned field is rejected during
+semantic checking with the source-level diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape retains the existing schema diagnostic before this ownership check.
+The same declaration remains valid for ordinary non-scanner uses, and accepted scanner programs retain
+the existing HIR/MIR, runtime ABI, framing, and cache identity. The implementation gate owns
+direct/nested/optional/union/generic/imported matrices, semantic-before-MIR proof, malformed/exhausted
+row behavior, and cold/hot/cache-edit/revert checks; per-row cleanup is deliberately deferred rather
+than adding a second scanner ownership model. The currently admitted `Option<Move-struct>` JSON decode
+shape remains supported for ordinary decode, encode, and scope Drop; cleanup after a later required
+sibling decode error is governed by a separate ownership request.
 
 **Catalog trimmed (SETTLED — dangling entries removed, not left "unimplemented"):**
 `json.validate<T>` **deleted** (decode-and-discard IS validation with zero-copy costs; one way);
@@ -4506,8 +4529,9 @@ checks; trailing non-whitespace → `Err`). Bare `str` (input-borrowing view) / 
 top-level `array<scalar>` target already existed — MMv2 slice 8c.) **T1b (part 3) — SHIPPED: `Option<struct>` ENCODE** (the Slice-B follow-up; decode already supported it).
 `Some` → the nested object via the runtime descriptor-driven encoder (a new `OptionStructField` template
 piece + `align_rt_json_encode_object` FFI); `None` → the field omitted (trailing-comma + `PopComma`).
-Composes recursively; this JSON encoder slice still requires a non-Move payload struct
-(`Option<Move-struct>` is a legal language field but remains unsupported by this encoding path).
+Composes recursively, including the currently admitted `Option<Move-struct>` payload. Ordinary scope
+Drop frees a decoded `Some` payload; cleanup after a later required sibling decode error remains a
+separate ownership request. The scanner-only Copy gate does not narrow this ordinary encoding path.
 The structural MIR fingerprint includes the Option payload's type table, so a decode-only
 payload field rename invalidates the cache without a recursively threaded schema string. Tests:
 `m5.rs` T1b, `cache_codegen` gate2e. **T1b is now COMPLETE** — `array<Option<T>>` is DEFERRED as a language-type gap (an owned array
@@ -4547,10 +4571,11 @@ Tests: `m5.rs` `json_doc_elems_materialize_and_iterate` (materialize → index �
 `json_doc_elems_materializes_a_level`. **Follow-up (not required for J4):** full `.map`/`.where`
 **pipeline fusion** over a `slice<json.doc>` (closures taking `json.doc`) — index + len + recursion
 already cover level iteration. →
-**J5** `json.scan` — **COMPLETE** (#546 slice 1 `sum`/`count`, #547 slice 2 `reduce`/`any`/`all`/`min`/
-`max`; streaming typed rows, `Result<T,Error>` terminals). **J6 spec sync — not needed:** draft.md §18.1
-+ language-spec.md already described `json.scan` exactly (design ran ahead; the implementation matched
-it), so the authoritative spec is already consistent. **The JSON-completeness arc J1–J5 is COMPLETE.**
+**J5** `json.scan` — **SHIPPED** (#546 slice 1 `sum`/`count`, #547 slice 2 `reduce`/`any`/`all`/`min`/
+`max`; streaming typed rows, `Result<T,Error>` terminals). **Request 6 design sync recorded above:**
+`draft.md` §18.1, `language-spec.md`, and the authoritative JSON design now describe the pending
+scanner-row safety gate; implementation remains a separate hardening slice. The JSON-completeness arc's
+implementation is shipped, while the Request 6 scanner-row safety gate remains pending.
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 
