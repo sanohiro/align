@@ -19,7 +19,33 @@ implementation or release pin exists. The fresh preflight review of `def2fe6` fo
 documentation-only P2: the Request 6 source-of-truth map used a stale Japanese path and omitted the
 two changed implementation ledgers. The current follow-up repair corrects both mirrors and names
 the exact ledger paths; it does not change the scanner contract or implementation scope. The repair
-is committed as `4832d8b`.
+is committed as `4832d8b`. The implementation preflight reopened this design after finding that
+the active scanner replay did not validate the full HIR envelope, and that the implementation gate
+needed explicit generic return-context, per-unit reconstruction, cross-compiler identity, and
+composite runtime/allocation owners. The focused independent review of that follow-up found six
+additional P2/P3 contract gaps: validation-order precedence, generic unresolved/ambiguous rules,
+the active-gate/ledger owner mapping, reproducible identity inputs, composite Some/None/union/string
+coverage, and one omitted envelope-test anchor. The consolidated repair updates the English and
+Japanese JSON mirrors plus the HIR validation ledger for all six and is committed as `decb2a0`. Its
+conditional final design review found a new P1: the current Align resolver cannot instantiate an
+unresolved `json.scanner<Row<T>>` generic row argument. Under the repository review rule, the design
+is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
+calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
+Span, identity, composite, and implementation-matrix findings. The re-scoped design checkpoint is
+`a66248f` on `agent/align-llm-request6-design`; the consolidated repair was committed as `28e28c3`
+and reviewed at `36fd7b2`. The redesigned contract is committed as `be89026` on the same branch;
+the current reviewed design checkpoint and handoff state is `0319712`; no compiler implementation
+or release pin exists. The final independent
+review of `36fd7b2` found two P1 and three P2 findings: cross-compiler cache identity must treat
+`compiler_build_id` as an intentional difference, generic expected-return propagation must name its
+new resolver owner and numeric-default boundary, HIR precedence needs a reason-valued test seam,
+scanner coverage must distinguish five HIR variants from seven public terminals, and this handoff
+must bind the current head. The closure matrix was reopened and redesigned; the fresh independent
+review of `0319712` by Lorentz found only the handoff-binding P2, which is fixed in `f270d43`.
+The design gate is now clean; implementation remains paused until the design PR merges, while
+publication may proceed. At `0319712`, `git diff --check` and the targeted `rg` contract/source-of-truth
+checks passed; no repository Markdown linter is available, so that check is N/A. The handoff metadata
+for the reviewed checkpoint is recorded in the branch; no intentional uncommitted files remain.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -651,23 +677,19 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Publish the corrected Request 6 design slice before implementing its compiler gate. Ordinary JSON
+Publish the clean Request 6 redesign and record its review envelope, then merge the design before
+implementing its scanner gate. Ordinary JSON
 decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
 scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
-`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
-on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
-wording. The conditional final review found two further valid contract findings; the current
-redesign incorporates both and reopens the closure matrix. The fresh preflight review then found
-one documentation-only P2 in the source-of-truth map; the current repair fixes the stale path and
-adds the changed implementation ledgers. Run the affected static checks and the HEAD-bound
-preflight after this narrow repair; it does not require another full-diff review unless its scope
-expands. After this design is accepted, implement the scanner-only recursive Copy check in a
-separate slice; do not update the align-llm compiler pin until that implementation is merged and its
-adoption gate passes. On `4832d8b`, `git diff --check`, exact-diagnostic consistency, active-gate
-references, ordinary Move-option boundary checks, and `scripts/pre-pr.sh --reviewer
-codex-final-redesign --owner-test docs-request6-contract` all passed. Compiler tests, builds, and
-`make ci` are N/A until executable code changes.
+`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The redesign must preserve
+the concrete-row-only generic boundary, universal-Span precedence, complete active-HIR envelope,
+expanded composite/per-unit owners, and canonical cross-compiler identity probe. The required
+design review is clean at `f270d43`; rerun `git diff --check` after any base-tip integration change.
+After the design gate merges, implement the
+scanner-only recursive Copy check in a separate slice; do not update the align-llm compiler pin
+until that implementation is merged and its adoption gate passes. Compiler tests, builds, and
+`make ci` remain N/A while this worktree is documentation-only.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

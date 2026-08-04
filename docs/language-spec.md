@@ -486,6 +486,16 @@ generic arguments; internal `$`-mangled and monomorph-interner names never appea
 This restriction is scanner-only; the declaration remains a valid ordinary type. This is the complete surface —
 `validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
 
+The scanner generic boundary is concrete-row-only. Concrete generic monomorphs
+such as `Wrap<i64>` remain eligible after row resolution, and ordinary generic
+calls use expected-return propagation owned by `align_sema::Checker::check_generic_call`;
+numeric `IntVar`/`FloatVar` retain deterministic `i64`/`f64` defaults. An
+unresolved `Wrap<T>` / `json.scanner<Wrap<T>>` type argument inside a generic
+function retains the exact resolver diagnostic `instantiating a generic struct
+with a type parameter ('Row<…>' inside a generic function) is not supported yet`.
+That unresolved-row capability is a separate compiler prerequisite, not an
+implicit extension of the scanner surface.
+
 ### Templates
 
 ```text
