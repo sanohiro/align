@@ -13,9 +13,9 @@ implementation slice is am-b2b2: templates, JSON descriptors/document/scanner re
 group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
 history. There is no general public validator activation yet; Request 6's design specifies the
 narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
-repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is in the current
-worktree and restores ordinary Move-option JSON encode plus the interface-reconstruction ordering;
-no compiler implementation or release pin exists.
+repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
+restores ordinary Move-option JSON encode plus the interface-reconstruction ordering; no compiler
+implementation or release pin exists.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
