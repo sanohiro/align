@@ -6,23 +6,24 @@ per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
 _Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; the
-implementation head is `c241beb`, with the expected-seed and return-spelling repair implemented. The earlier
+implementation head is `aa5bb7d`, with the expected-seed, return-spelling, and diagnostic-order
+repairs implemented. The earlier
 implementation commit `43211ec` is followed by consolidated review repair `2688681` and the
 baseline-compatible identity-harness repair `50912db`. The branch is based on implementation
 checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
-`0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is not yet complete or merged.
-Align PR #704 is pushed through `66dfeb6`; focused verification and the identity probe pass at
-that head. Preflight and final attestations are still pending. No `.align-revision` adoption pin or
-align-llm `make ci` verification exists yet.
+`0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete, but PR #704 is not
+yet merged. The PR branch is pushed through `aa5bb7d`; focused verification and the identity probe
+pass at that head. Fresh final review, preflight attestation, hosted CI, and merge are pending. No
+`.align-revision` adoption pin or align-llm `make ci` verification exists yet.
 
 ## Active Request 6 implementation checkpoint
 
 - Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script; explicit rejection of partially substituted generic composites before argument checking.
 - Complete: the independent review finding at `2858d63` is closed by `1ac708d` and `5663c23`. Inferred scanner-typed locals now retain initializer spelling, generic-call results propagate spelling through their scanner arguments, and lambda captures inherit the repaired local map; no HIR field was added.
 - Complete: the final-review P2s at `2f0c7b5` are closed by design commit `a8719cf` and implementation commit `c241beb`. Expected-return seeding now validates concrete leaves before arguments, and generic call expressions carry producer-owned annotated return spelling even without a scanner argument. The repair adds m5 and cache no-publication owners; no HIR field was added.
-- Verification: at `5663c23`, generic m5 owners pass 10/10, imported-module owners pass 4/4, and the cache generic no-publication owner passes 1/1. `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, the matching clippy command, and `git diff --check` pass. The prior `scripts/compare-json-scan-identity.sh 7b88b97` identity probe remains green; the latest full m5 aggregate before this narrow repair was 189/194, with the same five existing link/diagnostic failures reproducing on the pre-change checkpoint and outside Request 6. The full aggregate and exact identity probe must be rerun by final preflight for the final head.
-- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. A later independent final pass found one additional P1: a partially substituted `Result<T, U>` expected argument could reach constructor checking without a sound partial-type contract. The closure matrix was reopened; `b5b3f4d` narrows the contract and `7b88b97` rejects the state before checking or publishing the argument. The redesigned independent pass at `2858d63` found the alias/call-result spelling gap; `1ac708d` updated the contract and `5663c23` closed its first root-cause class. Final reviews at `2f0c7b5` found the concrete expected-seed and no-scanner-argument return-spelling gaps; `a8719cf` updated the contract and `c241beb` closes both with exact owners. Fresh final review evidence must bind the pushed repair head.
-- Next, in order: push `c241beb`, run the focused verification already described above on the pushed head, obtain final SHA-bound review evidence, run preflight and hosted CI, merge, refresh `.align-revision`, and run `make ci` as the real-client adoption gate. This is the terminal PR for the current user goal; do not start another PR or roadmap item after it.
+- Verification at `aa5bb7d`: generic m5 owners pass 11/11, imported-module owners pass 4/4, and the cache generic no-publication owner passes 1/1. `cargo +1.96.1 test -p align_sema --lib function_return_completeness_matrix -- --nocapture`, `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, the matching clippy command, `scripts/test-pr.sh`, and `git diff --check` pass. The full m5 aggregate is 193/198; the same five known pre-existing link/diagnostic failures remain outside Request 6. `scripts/compare-json-scan-identity.sh HEAD` passes with interface, MIR, raw LLVM, object bytes, and non-build-id CodegenKey fields matching the fixed baseline while compiler-isolated identity fields differ as required.
+- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. A later independent final pass found one additional P1: a partially substituted `Result<T, U>` expected argument could reach constructor checking without a sound partial-type contract. The closure matrix was reopened; `b5b3f4d` narrows the contract and `7b88b97` rejects the state before checking or publishing the argument. The redesigned independent pass at `2858d63` found the alias/call-result spelling gap; `1ac708d` updated the contract and `5663c23` closed its first root-cause class. Final reviews at `2f0c7b5` found the concrete expected-seed and no-scanner-argument return-spelling gaps; `a8719cf` updated the contract and `c241beb` closes both with exact owners. Final HOST and INDEPENDENT reviews at `f467ddb` found only the stale Handoff SHA; `aa5bb7d` also preserves the established generic mismatch diagnostic order. Fresh final review evidence must bind the final pushed repair head.
+- Next, in order: update this Handoff for the final branch head, obtain fresh SHA-bound clean review evidence, run preflight and hosted CI, merge, refresh `.align-revision`, and run `make ci` as the real-client adoption gate. This is the terminal PR for the current user goal; do not start another PR or roadmap item after it.
 - Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
@@ -668,17 +669,16 @@ outer scanner source spelling through bare generic calls, stops at the first gen
 snapshots all cache-owned files on rejected walks, closes valid-Span precedence pairs, and exercises
 the production CodegenKey classifier and non-build-id digest.
 
-Latest verification on `50912db`: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests
---locked`; targeted clippy; `cargo +1.96.1 test -p align_sema --lib` (202 passed); `cargo +1.96.1
-test -p align_mir --lib` (85 passed); `cargo +1.96.1 test -p align_driver --test modules` (41
-passed); `cargo +1.96.1 test -p align_driver --test cache_codegen` (27 passed including the additional
-identity-owner test); the JSON cache owners after the repair are 5/5; generic m5 owners (6 passed);
-full m5 (189 passed / 5 pre-existing failures); and `scripts/compare-json-scan-identity.sh 50912db`
-(both clean worktrees, 1 test each). `git diff --check`, `bash -n scripts/compare-json-scan-identity.sh`,
-and the pinned rustfmt check for `json_scan_identity.rs` are clean. `cargo fmt --all -- --check`
-remains N/A because the checkout has pre-existing workspace-wide rustfmt drift; the changed cache
-test shares that pre-existing file-wide drift. The exact identity script is green at the final
-implementation head; preflight is still pending.
+Latest verification on `aa5bb7d`: `scripts/test-pr.sh` passes (workspace build, all bounded library
+tests, interface/formatter integration tests, and m0); `cargo +1.96.1 test -p align_sema --lib
+function_return_completeness_matrix -- --nocapture` passes; generic m5 owners pass 11/11; imported
+module owners pass 4/4; the cache generic no-publication owner passes 1/1; the full m5 aggregate is
+193 passed / 5 known pre-existing failures; and `scripts/compare-json-scan-identity.sh HEAD` passes
+with the required baseline parity and compiler-isolated identity. `cargo +1.96.1 check -p align_sema
+-p align_mir -p align_driver --tests --locked`, the matching clippy command, and `git diff --check`
+are clean. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
+workspace-wide rustfmt drift; the changed sema file shares that pre-existing file-wide drift.
+Fresh final review and preflight evidence must bind the final pushed head.
 Do not update `.align-revision` or the align-llm Request 6 verification status until this
 implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
 gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
