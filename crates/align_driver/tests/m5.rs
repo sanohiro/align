@@ -1546,6 +1546,39 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn json_scan_generic_return_context_expected_concrete_conflict_no_cascade() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T) -> Result<T, Error> {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  bad: Result<i64, bool> := choose(json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-expected-concrete-conflict", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "the concrete expected-return conflict must fail");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the concrete return leaf must own the only conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "argument checking must stop after a concrete expected-return conflict:\n{diagnostics}"
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "a concrete expected-return conflict must not publish a scanner HIR/MIR source:\n{mir}"
+    );
+}
+
+#[test]
 fn json_scan_generic_argument_source_spelling() {
     let local = r#"
 import core.json
@@ -1588,6 +1621,29 @@ fn main() -> i32 = 0
         "the generic call result's producer spelling must own the Copy diagnostic:\n{call_result_diags}"
     );
     assert!(!call_result_diags.contains("cannot determine the scan row type spelling"), "generic call result spelling fallback leaked:\n{call_result_diags}");
+
+    let return_producer = r#"
+import core.json
+Owned { values: array<i64> }
+fn make<T>(value: T) -> json.scanner<Owned> {
+  loop {}
+}
+fn choose<T>(first: T, second: T) -> T = first
+fn outer() -> Result<(), Error> {
+  bad := choose(make(1), json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let return_producer_diags = check_diagnostics("json-scan-generic-return-producer-spelling", return_producer);
+    assert_eq!(return_producer_diags.matches("must be Copy").count(), 1, "generic scanner return spelling was lost:\n{return_producer_diags}");
+    assert!(
+        return_producer_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the annotated generic return spelling must own the Copy diagnostic:\n{return_producer_diags}"
+    );
+    assert!(!return_producer_diags.contains("cannot determine the scan row type spelling"), "generic return spelling fallback leaked:\n{return_producer_diags}");
 
     let lambda = r#"
 import core.json

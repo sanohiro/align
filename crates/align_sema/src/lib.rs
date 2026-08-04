@@ -20295,9 +20295,11 @@ impl<'a, 't> Checker<'a, 't> {
                 .as_deref()
                 .and_then(|value| self.json_scan_source_spelling_of_expr(value)),
             ExprKind::StrBorrow(inner) => self.json_scan_source_spelling_of_expr(inner),
-            ExprKind::Call { args, .. } => {
-                args.iter().find_map(|arg| self.json_scan_source_spelling_of_expr(arg))
-            }
+            ExprKind::Call { func, args, .. } => self
+                .sigs
+                .get(func)
+                .and_then(|sig| sig.json_scan_return_spelling.clone())
+                .or_else(|| args.iter().find_map(|arg| self.json_scan_source_spelling_of_expr(arg))),
             _ => None,
         }
     }
@@ -21225,7 +21227,7 @@ impl<'a, 't> Checker<'a, 't> {
                     } else {
                         self.check_expr(&fi.value, Some(declared))
                     };
-                    self.match_param(declared, ce.ty, &mut subst, fi.span, false);
+                    self.match_param(declared, ce.ty, &mut subst, fi.span);
                     values[idx] = Some(ce);
                 }
                 None => {
@@ -22202,7 +22204,10 @@ impl<'a, 't> Checker<'a, 't> {
         let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
         let mut subst_json_scan_spellings: Vec<Option<String>> = vec![None; type_params.len()];
         if let Some(exp) = expected {
-            self.match_param(ret, self.resolve(exp), &mut subst, span, true);
+            // Seed and validate the complete expected return before touching any argument. Generic
+            // slots bind here, while concrete leaves still use the normal mismatch diagnostic so
+            // a scanner argument cannot produce a secondary error for a bad return context.
+            self.match_param(ret, self.resolve(exp), &mut subst, span);
             // Expected-return seeding is the first source-order inference phase. Its conflict owns
             // the call diagnostic and must prevent argument checking from producing unrelated
             // scanner or constructor errors.
@@ -22267,7 +22272,7 @@ impl<'a, 't> Checker<'a, 't> {
             // reconciliation and diagnostic. Re-unifying the same bound slot would emit a
             // reversed duplicate mismatch. Only an unresolved parameter needs inference here.
             if slot_state.unbound {
-                self.match_param(declared, ce.ty, &mut subst, a.span, false);
+                self.match_param(declared, ce.ty, &mut subst, a.span);
             }
             // Generic argument checking is a source-order publication boundary. Do not inspect a
             // later argument after the first conflict: its diagnostics are not actionable and a
@@ -22326,10 +22331,10 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Match an `actual` type against a `declared` parameter/return type, binding each `Ty::Param`
-    /// it carries into `subst` (unifying repeated occurrences). `bind_only` skips unifying concrete
-    /// leaves (used when seeding from the expected type). Handles `Param` bare or nested one level
+    /// it carries into `subst` (unifying repeated occurrences) and validating concrete leaves.
+    /// Handles `Param` bare or nested one level
     /// in a scalar-payload composite (`Option`/`Result`/`slice`/`box`/`array`/`Task`).
-    fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
+    fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span) {
         let a = self.resolve(actual);
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
@@ -22338,36 +22343,32 @@ impl<'a, 't> Checker<'a, 't> {
                 a,
                 subst,
                 span,
-                bind_only,
             ),
             (_, Ty::Tagged(_)) => self.match_param(
                 declared,
                 expand_tagged_ty(a, self.tagged_types),
                 subst,
                 span,
-                bind_only,
             ),
-            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
+            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span),
             (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
-                self.match_scalar_param(dok, aok, subst, span, bind_only);
-                self.match_scalar_param(derr, aerr, subst, span, bind_only);
+                self.match_scalar_param(dok, aok, subst, span);
+                self.match_scalar_param(derr, aerr, subst, span);
             }
             (Ty::Slice(ds), Ty::Slice(asc))
             | (Ty::Box(ds), Ty::Box(asc))
             | (Ty::Array(ds, _), Ty::Array(asc, _))
-            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
+            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span),
             _ => {
-                if !bind_only {
-                    self.unify(a, declared, span);
-                }
+                self.unify(a, declared, span);
             }
         }
     }
 
     /// The scalar-level companion of [`match_param`]: bind a `Scalar::Param` from the actual scalar,
-    /// or (when not seeding) unify a concrete declared scalar against the actual so a mismatch in a
-    /// concrete nested position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
-    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
+    /// or unify a concrete declared scalar against the actual so a mismatch in a concrete nested
+    /// position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
+    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span) {
         if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
@@ -22378,9 +22379,8 @@ impl<'a, 't> Checker<'a, 't> {
                 scalar_to_ty(actual),
                 subst,
                 span,
-                bind_only,
             );
-        } else if !bind_only {
+        } else {
             self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
         }
     }
@@ -31128,7 +31128,6 @@ impl<'a, 't> Checker<'a, 't> {
                     actual,
                     &mut subst,
                     a.span,
-                    false,
                 );
             }
             checked.push(ce);
