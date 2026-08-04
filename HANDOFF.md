@@ -5,18 +5,21 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ The current local branch is `agent/pkg-db-am-c`, rebased onto current
-`main` `a1c12552` after the am-b4 activation merged as PR #706. Draft PR #702 is being restacked to
-target `main`. The rebased c1 implementation commit is `b25a65e`; the first coherent pre-PR finding
-closure is `c04378d`; the row-authority closure is `1877ccd`; and the current HEAD is the coherent
+_Last updated: 2026-08-05._ The current local branch is `agent/pkg-db-am-c2a1`, rebased onto
+current `main` `ca26c68e` after C1 merged as PR #702. Draft PR #705 carries pushed C2a1
+implementation head `54185e5`; its final document-only review closure is pending. The rebased C1 implementation commit is
+`b25a65e`; its first coherent pre-PR finding closure is `c04378d`; its row-authority closure is
+`1877ccd`; and C1 head `e466be4` is the coherent
 post-open finding closure. Four
 mandatory am-c matrix reviews repaired the public contracts and PR boundaries; the final fresh
 pre-implementation matrix review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
-now splits am-c into c1 (fixed typed runtime ABI registry), c2a (private canonical graph/encoder),
-c2b (effect-free MIR function-table retention/remap), c2c (dormant public canonical decoder), c2d
-(dormant generated-identity codecs), and c3 (typed program/generated activation). These are six
-am-c implementation PRs; the amended prerequisite plan has nineteen verticals, L2b 28 PRs, and L2
-32. `docs/impl/20-runtime-abi-ledger.md` owns c1.
+now splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed field codec), c2a2
+(shared private source-shape comparator), c2a3 (private `ValidatedGraph` traversal/am-n validation),
+c2a4 (private equivalence/canonical bytes), c2b (effect-free MIR function-table retention/remap),
+c2c (dormant public canonical decoder), c2d (dormant generated-identity codecs), and c3 (typed
+program/generated activation). These are nine am-c implementation PRs; the amended prerequisite
+plan has twenty-two verticals, L2b 31 PRs, and L2 35.
+`docs/impl/20-runtime-abi-ledger.md` owns c1.
 
 The local tree now implements c1. `align_mir::RuntimeKey` supplies the exact 281 semantic keys and
 alphabetical `ALL`; the backend-private 286-row typed ABI registry is the sole fixed-native
@@ -77,19 +80,64 @@ a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s) on
 finding-closure affected-crate Clippy runs pass. The post-open closure additionally passes the
 14 focused runtime-ABI owners, the one changed string-filter execution owner, the isolated export
 audit with an unchanged ordinary-archive SHA-256, and `align_codegen_llvm` library Clippy with
-`-D warnings`. PR #702's pre-restack review head passed Linux x86_64, Linux ARM64, and macOS Apple
-Silicon CI. The rebased final SHA still requires refreshed preflight and post-open review markers,
-push, and CI before merge. C1 must close those exact-SHA records before c2a begins. No public
-`pkg.db` surface exists yet.
+`-D warnings`. PR #702's final head passed Linux x86_64, Linux ARM64, macOS Apple Silicon,
+Pre-PR attestation, and Post-open review before merging as `ca26c68e`. The rebased c2a1 candidate
+stack now owns only the public effect-free `FunctionTypeDef`, private semantic error/node identities,
+and closed primitive/scalar/root field encoder; its
+implementation closure matrix is in the plan of record. Its first independent boundary review found the summary/mode, semantic-versus-byte,
+private-error, count, reachable-only, fixed-point-topology, and split-trigger gaps; those findings
+were addressed. The revised review correctly rejected the first review's am-h ownership expansion
+and found cross-node charge-point plus tuple/anonymous/nominal-equivalence ambiguities; those are
+resolved in the matrix. The final review found only private error-order/mapping gaps; those are
+resolved, and the bounded finding-closure check returned CLEAN. The first combined c2a source
+checkpoint then measured 407 source lines before tests, exceeding the recorded 360-source trigger;
+with the projected 380 test lines it would also have exceeded the 750-total trigger. Coding stopped
+before fixing its two compile diagnostics. The first split review
+then measured ordinary formatted size at 777 combined lines (about 663/115), rejected the untyped
+seam and duplicate DFS/raw-byte authorities, found later-sibling precedence/complexity gaps, and
+found stale project-truth paragraphs below. The rejected three-way plan still bundled the existing
+372-line formatted comparator with graph validation, misstated its worst-case pair complexity and
+fixed-point refinement cost, and left the source-size estimate implausible. The plan now splits
+c2a1 field codec, c2a2 typed source-shape comparator extraction, c2a3's sole `ValidatedGraph`
+traversal, and c2a4 equivalence/canonical bytes, with explicit compiler-only complexity owners. A
+fresh independent four-way split review found only variable-length signature-sort complexity and
+measured-versus-projected wording gaps. Both were closed in the ledger, and the bounded follow-up
+returned CLEAN. C2a1 now implements only the reviewed boundary: public effect-free
+`FunctionTypeDef`, the behavior-neutral relocation of the existing five-variant HIR `Node`
+identity, and a private transactional primitive/scalar/root field codec. The final new module is
+338 production lines plus 260 test lines, below the recorded 400/260 caps. Complete-byte owners pin
+all 57 root, 34 scalar, and six primitive cases; width owners cross all 256 `u8` values, lane owners
+cross every admitted value and invalid boundaries, and success-prefix/error-rollback owners pin the
+caller-buffer contract. On the pre-restack dedicated macOS target the first focused owner passed
+6/6, the then-current full `align_mir` suite passed 101/101, and all-target `align_mir` Clippy
+passed with `-D warnings`. The
+ordinary-target focused launch compiled but stopped INCOMPLETE after sampling confirmed CPU 0 in
+`_dyld_start`; no failed test was observed. The fresh implementation preflight found incomplete
+payload/invalid-domain coverage, extra `Node` ordering derives, unspecified error-time buffer
+mutation, and this stale status. The coherent fix removes the derives, makes every compound helper
+transactional, expands the exact owners, and passes the final focused 6/6 plus Clippy. After
+restacking onto C1 and PR #706, the refreshed exact-pair focused owner passes 6/6, the full MIR
+owner passes 108/108, and all-target MIR Clippy passes; this directly covers the behavior-neutral
+`Node` relocation against the current validator. The bounded finding-closure review verified all
+four pre-restack fixes and returned CLEAN. The
+ordinary `scripts/test-pr.sh` run completed its workspace build in 2m32s and the zero-test
+`align_ast` owner, then the `align_codegen_llvm` binary remained at 0% CPU in `_dyld_start`; the
+sample is preserved and that invocation is INCOMPLETE. Checkpointed continuation on the dedicated
+target passed every then-unrun library owner (`align_codegen_llvm` 70/70 with five intentional
+ignores, `align_driver` 28/28, `align_mir` 101/101, `align_sema` 206/206, and all remaining listed crates),
+both interface integration owners (4/4 and 34/34), the formatter example owner (1/1), and all three
+driver M0 owners. The executable M0 owner required first building `libalign_runtime.a` in that
+dedicated target; its rerun passed without a source change. Workspace all-target Clippy passes with
+`-D warnings` in 11m04s. No public `pkg.db` surface exists yet.
 
-Historical am-b4 operational record: before PR #706, `main` included the shipped wave through #688
-plus the merged am-p
+Prior am-b4 operational record (historical): `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
 (`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
-replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The merged
-am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate` activated the shared
-four-entrypoint gate, which runs body-core validation before sema fact replay. Replay uses explicit
+replay PR #699 (`9e2d615`), checked-HIR body-fact replay merge #700 (`1296b97`), and the later
+am-b4 activation checkpoint `22e5ba3`. At that historical checkpoint the working slice was the
+am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate`: the shared
+four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses explicit
 numeric enter/exit occurrence frames for the 259-record checked-HIR ceiling, with no Span or native
 pointer identity, and iterative teardown for successful, rejected, and panic-after-analysis paths.
 The body envelope also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local
@@ -665,7 +713,7 @@ The revised header owner test compiled but its macOS test binary again paused in
 (CPU 0, no output after sampling) and was stopped; this host limitation is recorded with the
 successful compile and benchmark evidence rather than treated as a test pass.
 
-PR #694 completes the dormant am-b1 body-core validator: statements, ordinary expressions,
+Historical am-b1 checkpoint: PR #694 completed the dormant am-b1 body-core validator: statements, ordinary expressions,
 calls, aggregates, tagged values, and structured control are checked through an explicit
 child-first worklist without general public activation. PR #695 adds the dormant am-b2a
 storage/vector/array records. The next slice is am-b2b1 for pipeline and array-view records;
@@ -911,10 +959,12 @@ focused sema, MIR, LLVM, and whole/per-unit driver matrices pass, including raw/
 execution, and cold/hot object-cache parity. The reviewed order is am-w
 outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
 #688 completes am-u lexical extern invocation, #690 am-p placement, #691 am-n nominal/link, and
-#692 am-h declarations/headers. The next sequence is am-b1, am-b2, am-b3, and am-b4 total-body
-validation, then am-c typed callable namespaces.
-Am-c follows am-b4 because it consumes body-validated callable facts. #678 fixes the
-twenty-three/twenty-seven counts as project truth.
+#692 am-h declarations/headers, #694 am-b1, #695 am-b2a, #696 am-b2b, commit `af5e17a` am-b3,
+#699 task-wait replay, #700 body-fact replay, am-b4 activation PR #706, merged #702 am-c1, and
+draft #705 am-c2a1. The next implementation slice after #705 is
+am-c2a2, followed by c2a3/c2a4/c2b/c2c/c2d/c3 and then af/ar/ap/t.
+Am-c follows am-b4 because it consumes body-validated callable facts. The amended current project
+truth is thirty-one L2b and thirty-five L2 implementation PRs; the older #678 counts below are historical.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
 checked HIR, so a later handcrafted-HIR preflight could not replay parallel purity independently.
@@ -1170,8 +1220,8 @@ ownership row in `docs/impl/19-hir-validation-ledger.md`; any body failure retur
 canonical all-empty program as a global failure. Concrete MIR call-target types, structural
 generated-identity bytes, and semantic/byte goldens are now recorded in the am-r ledger. Body
 construction remains scheduled as three dormant exhaustive validator PRs and one atomic activation
-PR so no partial malformed-HIR claim is exposed. #678 fixed the twenty-three/twenty-seven counts and
-strategy after the clean reviewed ledger passed the repository gate.
+PR so no partial malformed-HIR claim is exposed. Historically, #678 fixed the then-current
+twenty-three/twenty-seven counts and strategy; the current amended totals are thirty-one/thirty-five.
 
 Am-g-t's type-domain implementation is preserved separately. The split applies the existing
 review-size and closure-matrix rules; it does not justify a new process rule.
@@ -1182,18 +1232,16 @@ discriminating deferred-array/liveness owners in the same PR; separating any of 
 an under-approximating or dangling fact.
 Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface bytes, and
 1.844 ms/import on Apple Silicon.
-Do not begin a
-SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. The reviewed part of the L2 sequence is L2a
+Do not begin a SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7 are
+complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate, a2-am-d, a2-am-e, and a2-am-f. #679 completes
-am-d, #681 completes am-e, and #683 completes am-f; the remaining sequence is a2-am-b1/a2-am-b2/a2-am-b3/a2-am-b4/a2-am-c/
+L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate through am-b4 and c1. The remaining
+sequence is a2-am-c2a1/a2-am-c2a2/a2-am-c2a3/a2-am-c2a4/a2-am-c2b/a2-am-c2c/a2-am-c2d/a2-am-c3/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
-exclusivity, for twenty-three L2b and twenty-seven L2 implementation PRs. The counts are fixed by
-#678; #690 lands am-p, #691 lands am-n, and #692 lands am-h; am-b1 is the next implementation slice. The required milestone order
+exclusivity, for thirty-one L2b and thirty-five L2 implementation PRs. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and

@@ -20,9 +20,11 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub mod print;
+mod canonical_graph;
 mod validate_hir;
 mod runtime_key;
 
+pub use canonical_graph::FunctionTypeDef;
 pub use runtime_key::RuntimeKey;
 
 #[cfg(test)]
