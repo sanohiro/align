@@ -25,9 +25,14 @@ needed explicit generic return-context, per-unit reconstruction, cross-compiler 
 composite runtime/allocation owners. The focused independent review of that follow-up found six
 additional P2/P3 contract gaps: validation-order precedence, generic unresolved/ambiguous rules,
 the active-gate/ledger owner mapping, reproducible identity inputs, composite Some/None/union/string
-coverage, and one omitted envelope-test anchor. The current uncommitted consolidated repair updates
-the English and Japanese JSON mirrors plus the HIR validation ledger for all six; its fresh focused
-review is still pending.
+coverage, and one omitted envelope-test anchor. The consolidated repair updates the English and
+Japanese JSON mirrors plus the HIR validation ledger for all six and is committed as `decb2a0`. Its
+conditional final design review found a new P1: the current Align resolver cannot instantiate an
+unresolved `json.scanner<Row<T>>` generic row argument. Under the repository review rule, the design
+is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
+calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
+Span, identity, composite, and implementation-matrix findings. The re-scoped design is currently
+in the working tree; no compiler implementation or release pin exists.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -659,24 +664,18 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Publish the corrected Request 6 design slice before implementing its compiler gate. Ordinary JSON
+Publish the re-scoped Request 6 design slice before implementing its compiler gate. Ordinary JSON
 decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
 scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
-`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
-on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
-wording. The conditional final review found two further valid contract findings; the current
-redesign incorporates both and reopens the closure matrix. The fresh preflight review then found
-one documentation-only P2 in the source-of-truth map; the current repair fixes the stale path and
-adds the changed implementation ledgers. Run the affected static checks and the HEAD-bound
-preflight after this narrow repair; it does not require another full-diff review unless its scope
-expands. After this design is accepted, implement the scanner-only recursive Copy check in a
-separate slice; do not update the align-llm compiler pin until that implementation is merged and its
-adoption gate passes. On `4832d8b`, `git diff --check`, exact-diagnostic consistency, active-gate
-references, ordinary Move-option boundary checks, and `scripts/pre-pr.sh --reviewer
-codex-final-redesign --owner-test docs-request6-contract` all passed before the current six-finding
-repair. Rerun those static/design checks and the focused review after the consolidated repair;
-compiler tests, builds, and `make ci` remain N/A until executable code changes.
+`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The redesign must preserve
+the concrete-row-only generic boundary, universal-Span precedence, complete active-HIR envelope,
+expanded composite/per-unit owners, and canonical cross-compiler identity probe. Run
+`git diff --check`, targeted Markdown/source-of-truth checks, and one fresh SHA-bound independent
+design review for this redesigned slice. After that design gate is clean, implement the
+scanner-only recursive Copy check in a separate slice; do not update the align-llm compiler pin
+until that implementation is merged and its adoption gate passes. Compiler tests, builds, and
+`make ci` remain N/A while this worktree is documentation-only.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
