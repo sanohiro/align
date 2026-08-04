@@ -1567,12 +1567,35 @@ fn main() -> i32 = 0
     );
     assert!(!local_diags.contains("cannot determine the scan row type spelling"), "local spelling fallback leaked:\n{local_diags}");
 
+    let call_result = r#"
+import core.json
+Owned { values: array<i64> }
+fn identity<T>(value: T) -> T = value
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  forwarded := identity(rows)
+  bad := choose(forwarded, json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let call_result_diags = check_diagnostics("json-scan-generic-call-result-spelling", call_result);
+    assert_eq!(call_result_diags.matches("must be Copy").count(), 1, "generic call result spelling was lost:\n{call_result_diags}");
+    assert!(
+        call_result_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the generic call result's producer spelling must own the Copy diagnostic:\n{call_result_diags}"
+    );
+    assert!(!call_result_diags.contains("cannot determine the scan row type spelling"), "generic call result spelling fallback leaked:\n{call_result_diags}");
+
     let lambda = r#"
 import core.json
 Owned { values: array<i64> }
 fn choose<T>(first: T, second: T) -> T = first
 fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
-  values := [1].map(fn n { choose(rows, json.scan("[]")); n }).sum()
+  alias := rows
+  values := [1].map(fn n { choose(alias, json.scan("[]")); n }).sum()
   return Ok(())
 }
 fn main() -> i32 = 0

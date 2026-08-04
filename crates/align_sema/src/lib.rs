@@ -19513,11 +19513,11 @@ impl<'a, 't> Checker<'a, 't> {
             match s {
                 ast::Stmt::Let { is_mut, name, ty, init, align } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
-                    let saved_json_scan_source_spelling = self.json_scan_source_spelling.clone();
-                    if let Some(spelling) = ty
+                    let annotation_spelling = ty
                         .as_ref()
-                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
-                    {
+                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation));
+                    let saved_json_scan_source_spelling = self.json_scan_source_spelling.clone();
+                    if let Some(spelling) = annotation_spelling.clone() {
                         self.json_scan_source_spelling = Some(spelling);
                     }
                     // A struct literal is only legal here, as a `let` initializer.
@@ -19533,14 +19533,12 @@ impl<'a, 't> Checker<'a, 't> {
                             _ => self.check_expr(init, ann),
                         },
                     };
+                    let initializer_spelling = self.json_scan_source_spelling_of_expr(&init);
                     self.json_scan_source_spelling = saved_json_scan_source_spelling;
                     let local_ty = ann.unwrap_or(init.ty);
                     self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
-                    if let Some(spelling) = ty
-                        .as_ref()
-                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
-                    {
+                    if let Some(spelling) = annotation_spelling.or(initializer_spelling) {
                         self.json_scan_local_spellings.insert(local, spelling);
                     }
                     // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
@@ -20283,10 +20281,13 @@ impl<'a, 't> Checker<'a, 't> {
         result
     }
 
-    /// Recover checker-only scanner spelling from a checked expression whose value is a local.
+    /// Recover checker-only scanner spelling from a checked expression whose value is a scanner.
     /// Transparent wrappers are included so inference does not lose producer identity merely
-    /// because an expression was checked through a block or a borrow boundary.
+    /// because an expression was checked through a block, borrow, or generic-call boundary.
     fn json_scan_source_spelling_of_expr(&self, e: &Expr) -> Option<String> {
+        if !matches!(self.resolve(e.ty), Ty::JsonScanner(_)) {
+            return None;
+        }
         match &e.kind {
             ExprKind::Local(id) => self.json_scan_local_spellings.get(id).cloned(),
             ExprKind::Block(block) | ExprKind::Unsafe(block) => block
@@ -20294,6 +20295,9 @@ impl<'a, 't> Checker<'a, 't> {
                 .as_deref()
                 .and_then(|value| self.json_scan_source_spelling_of_expr(value)),
             ExprKind::StrBorrow(inner) => self.json_scan_source_spelling_of_expr(inner),
+            ExprKind::Call { args, .. } => {
+                args.iter().find_map(|arg| self.json_scan_source_spelling_of_expr(arg))
+            }
             _ => None,
         }
     }
