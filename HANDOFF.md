@@ -15,7 +15,10 @@ history. There is no general public validator activation yet; Request 6's design
 narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
 repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
 restores ordinary Move-option JSON encode plus the interface-reconstruction ordering; no compiler
-implementation or release pin exists.
+implementation or release pin exists. The fresh preflight review of `def2fe6` found one valid
+documentation-only P2: the Request 6 source-of-truth map used a stale Japanese path and omitted the
+two changed implementation ledgers. The current follow-up repair corrects both mirrors and names
+the exact ledger paths; it does not change the scanner contract or implementation scope.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -654,12 +657,15 @@ imported/per-unit consumers, interface/import reconstruction precedes active
 `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
 on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
 wording. The conditional final review found two further valid contract findings; the current
-redesign incorporates both and reopens the closure matrix. Run one fresh independent review on this
-re-scoped coherent design slice before publication; do not begin another repair/review loop after
-that review. After this design is accepted, implement the scanner-only recursive Copy check in a
+redesign incorporates both and reopens the closure matrix. The fresh preflight review then found
+one documentation-only P2 in the source-of-truth map; the current repair fixes the stale path and
+adds the changed implementation ledgers. Run the affected static checks and the HEAD-bound
+preflight after this narrow repair; it does not require another full-diff review unless its scope
+expands. After this design is accepted, implement the scanner-only recursive Copy check in a
 separate slice; do not update the align-llm compiler pin until that implementation is merged and its
-adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-gate references
-pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
+adoption gate passes. The pre-repair `git diff --check`, exact-diagnostic consistency, and
+active-gate references passed; rerun them on the final repair commit. Compiler tests, builds, and
+`make ci` are N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

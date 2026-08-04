@@ -279,7 +279,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | Runtime cleanup | accepted row の完全な型グラフは Drop 不要なので N/A。既存の scanner 入力と scalar accumulator の cleanup が引き続き所有する。 |
   | Compatibility prerequisite | implementation PR はこの design gate 後に作成し、既存 JSON schema と scanner terminal 契約を保持する。Request 6 の align-llm adoption は implementation release を pin した後の consumer gate である。 |
   | Acceptance と benchmark | 下記 owner test と `json_scan_copy_row_no_owned_alloc` allocation probe が契約を閉じる。性能主張はなく benchmark は N/A。 |
-  | Source-of-truth map | この English design、本文書、`draft.md`、`docs/language-spec.md`、`docs/design-notes.md`、`docs/open-questions.md`、align-llm Request 6 register が一致しなければならない。 |
+  | Source-of-truth map | この English design、本文書、`draft.md`、`docs/language-spec.md`、`docs/design-notes.md`、`docs/open-questions.md`、`docs/impl/17-library-boundary-prerequisites.md`、`docs/impl/19-hir-validation-ledger.md`、align-llm Request 6 register が一致しなければならない。 |
   | 並行 scanner | compile-time gate には N/A。accepted scanner は既存の独立した handle と slot を使う。 |
   | Performance | N/A。性能主張はせず、production MIR・codegen・runtime は変更しない。 |
 
