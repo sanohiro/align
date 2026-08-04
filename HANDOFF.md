@@ -19,12 +19,13 @@ and bounded closure reviews of the exact projection contract, focused gates, and
 returned CLEAN. The first exact-diff implementation preflight found four valid owner gaps: the
 matcher was not compile-closed over every current type, function parameter mode/type comparisons
 were not reached independently, missing/cross-kind nodes were incomplete, and the source inventory
-was manual only. Closing those rows measures 437 production lines plus 209 test lines. Coding
+was manual only. Closing those rows, including the bounded final-SHA `Scalar::Param` ID finding,
+measures 437 production lines plus 210 test lines. Coding
 stopped again at the recorded 150-test cap. The cap is amended to 440/210 because these parity and
 inventory owners cannot be split from the atomic comparator extraction without publishing an
-unclosed matcher; the measured total is 646 and the cap is 650, both below 1,000. The fresh
+unclosed matcher; the measured total is 647 and the cap is 650, both below 1,000. The fresh
 independent boundary review found one P3 counting ambiguity, then returned CLEAN after the measured
-646 and capped 650 conventions were made exact. The four implementation findings are now closed;
+647 and capped 650 conventions were made exact. The implementation findings are now closed;
 the focused comparator/field-codec owners, all 109 `align_mir` tests, and `align_mir` all-target
 Clippy with `-D warnings` pass. Neither slice may add `CanonicalTypeView`, `ValidatedGraph`,
 canonical bytes, a stored MIR field, or a public/package consumer.

@@ -530,6 +530,7 @@ pub(super) mod tests {
             Ty::DynStructArray(0, Layout::Aos) => Ty::DynStructArray(0, Layout::Soa),
             Ty::DictEncoded(0, 1) => Ty::DictEncoded(0, 2),
             Ty::Option(Scalar::Int(i(8))) => Ty::Option(Scalar::Int(i(16))),
+            Ty::Option(Scalar::Param(0)) => Ty::Option(Scalar::Param(1)),
         );
         assert_ty_matrix(&[Ty::Param(0), Ty::IntVar(0), Ty::FloatVar(0), Ty::Error]);
         assert!(ty_equal(
