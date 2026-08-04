@@ -30,6 +30,14 @@ the focused comparator/field-codec owners, all 109 `align_mir` tests, and `align
 Clippy with `-D warnings` pass. Neither slice may add `CanonicalTypeView`, `ValidatedGraph`,
 canonical bytes, a stored MIR field, or a public/package consumer.
 
+Draft PR #707 is open from pushed reviewed head `2ec3228b`. Its final-SHA preflight passed
+`scripts/test-pr.sh`, workspace all-target locked Clippy with `-D warnings`, and eight canonical
+owners. The bounded host-native post-open review found no implementation issue; Codex CLI 0.146
+duplicated its identical CLEAN result, so the raw log is preserved and normalized without rerunning
+the unchanged diff. The independent post-open review also found no implementation issue and one P3:
+this handoff had not recorded PR #707 or pushed head `2ec3228b`. This documentation-only follow-up
+closes that operational-state finding; the comparator code and its successful gates are unchanged.
+
 The plan of record splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed
 field codec), c2a2a (shared private source-shape comparator), c2a2b (complexity observation), c2a3 (private `ValidatedGraph`
 traversal/am-n validation), c2a4 (private equivalence/canonical bytes), c2b (effect-free MIR
