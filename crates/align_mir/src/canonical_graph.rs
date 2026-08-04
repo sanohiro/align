@@ -382,6 +382,10 @@ mod tests {
     }
 
     macro_rules! cases {
+        (encoded_ty; $($value:expr => $bytes:expr),+ $(,)?) => {{
+            crate::source_shape::tests::assert_ty_matrix(&[$($value),+]); $(assert_eq!(encoded_ty($value).unwrap(), $bytes, "{:?}", $value);)+ }};
+        (encoded_scalar; $($value:expr => $bytes:expr),+ $(,)?) => {{
+            crate::source_shape::tests::assert_scalar_matrix(&[$($value),+]); $(assert_eq!(encoded_scalar($value).unwrap(), $bytes, "{:?}", $value);)+ }};
         ($encoder:ident; $($value:expr => $bytes:expr),+ $(,)?) => {
             $(assert_eq!($encoder($value).unwrap(), $bytes, "{:?}", $value);)+
         };

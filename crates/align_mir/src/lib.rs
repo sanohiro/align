@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 pub mod print;
 mod canonical_graph;
+mod source_shape;
 mod validate_hir;
 mod runtime_key;
 

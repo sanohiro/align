@@ -1954,7 +1954,7 @@ fn body_fn_type(params: Vec<(align_ast::ParamMode, Scalar)>, ret: Ty) -> FnTy {
     }
 }
 
-fn baseline_program() -> hir::Program {
+pub(super) fn baseline_program() -> hir::Program {
     hir::Program {
         fns: Vec::new(),
         externs: Vec::new(),
