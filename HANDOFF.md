@@ -5,13 +5,15 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-03. `main` includes the shipped wave through #688 plus the merged am-p
+_Last updated: 2026-08-04. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
 (`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
 implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
 group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no public validator activation yet.
+history. There is no general public validator activation yet; Request 6's design specifies the
+narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
+repair is `bd93f7b` after base design `1cb666f`; no compiler implementation or release pin exists.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -498,10 +500,11 @@ successful compile and benchmark evidence rather than treated as a test pass.
 
 PR #694 completes the dormant am-b1 body-core validator: statements, ordinary expressions,
 calls, aggregates, tagged values, and structured control are checked through an explicit
-child-first worklist without public activation. PR #695 adds the dormant am-b2a
+child-first worklist without general public activation. PR #695 adds the dormant am-b2a
 storage/vector/array records. The next slice is am-b2b1 for pipeline and array-view records;
-am-b2b2 then adds templates, JSON, groups, and dictionary records, followed by am-b3, am-b4,
-and am-c typed callable namespaces.
+am-b2b2 then adds templates, JSON, groups, and dictionary records. Request 6's scanner Copy
+predicate is the one narrow pre-lowering safety exception and must be routed through the active
+`hir_program_is_valid` gate; am-b3, am-b4, and am-c typed callable namespaces follow.
 
 ### am-b2b1 working checkpoint (2026-08-02)
 
@@ -643,14 +646,15 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 ## Next work
 
 Finish and publish the reviewed Request 6 design slice before implementing its compiler gate. The
-design must retain the shipped non-Move `Option<struct>` encoding boundary, include the checked-HIR
-owner in the am-b2b2 verification bundle, and keep the English/Japanese JSON ledgers synchronized.
-After the design is accepted, implement the scanner-only recursive Copy check in a separate slice;
-do not update the align-llm compiler pin until that implementation is merged and its adoption gate
-passes. The current design worktree is docs-only: `git diff --check` and the exact-diagnostic/
-mirror consistency check pass; compiler tests, builds, and `make ci` are N/A until executable code
-changes. The conditional review found four P2 consistency findings; one consolidated repair applied
-all four, and no further local review loop is planned for this design-only repair.
+design retains the shipped Decode-versus-Encode `Option<Move-struct>` boundary, routes the checked-
+HIR owner through active `align_mir::hir_program_is_valid`, and keeps the English/Japanese JSON
+ledgers synchronized. The first independent review on `1cb666f` found one P1 and one P2; the
+consolidated repair `bd93f7b` applied both and also corrected the b2b2 roadmap/closure wording.
+Because the P1 changes the design boundary, run the one conditional final review on the repaired
+diff before publication. After the design is accepted, implement the scanner-only recursive Copy
+check in a separate slice; do not update the align-llm compiler pin until that implementation is
+merged and its adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-
+gate references pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
