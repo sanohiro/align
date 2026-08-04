@@ -134,18 +134,19 @@ the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing o
 trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
 the static layout). **JSON ownership boundary:** L1a permits owned `Option<T>` fields in ordinary
 language structs, but each JSON path may still have a narrower descriptor contract. The current
-compiler's Decode schema admits an `Option<Move-struct>` shape; its decoded-owner cleanup is not
-complete and remains a separate ownership request. `Option<string>` remains outside the current
-JSON Decode schema. These ordinary JSON details do not weaken the scanner rule below: a row whose
-reachable graph needs `Drop` is rejected by `json.scan`. **`Option<struct>` encode
-(T1b, SHIPPED):** `Some` renders the nested object via the runtime
-descriptor-driven encoder (a new `OptionStructField` template piece → `align_rt_json_encode_object`, a
-single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
-scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
-own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and must be
-non-Move for this shipped encoding path; `Option<Move-struct>` remains outside this encoding path.
-The current Decode schema's admitted Move shape and its decoded-owner cleanup remain a separate
-ownership request.
+compiler's Decode schema admits an `Option<Move-struct>` shape; ordinary decode constructs it and
+ordinary encode plus scope Drop preserve that admitted shape. A known partial-error cleanup defect
+remains a separate ownership request: if a later required sibling fails after a `Some` payload has
+been decoded, the decoded optional owner must still be released. `Option<string>` remains outside
+the current JSON Decode schema. These ordinary JSON details do not weaken the scanner rule below:
+a row whose reachable graph needs `Drop` is rejected by `json.scan`. **`Option<struct>` encode
+(T1b, SHIPPED):** `Some` renders the nested object via the runtime descriptor-driven encoder (a new
+`OptionStructField` template piece → `align_rt_json_encode_object`, a single struct by its descriptor
+table), `None` omits the field (the same trailing-comma + `PopComma` scheme); it composes recursively
+(a payload with a nested plain struct + a nested `Option<str>` omits its own `None`s). The payload
+struct is validated encodable (`decode_struct_fields_ok`), including the currently admitted
+`Option<Move-struct>` shape. The scanner-only Copy restriction does not narrow ordinary JSON
+decode, encode, or scope Drop.
 The structural MIR fingerprint includes the payload struct definition, so an `Option<struct>` payload
 field change invalidates both decode and encode objects. JSON MIR nodes carry only target ids; no
 manually threaded schema string exists.
@@ -267,11 +268,14 @@ the few boundaries that remain:
   that is not JSON-decode-eligible retains the existing schema diagnostic; the Copy diagnostic below
   is only the deterministic ownership error for a schema-admitted Move row.
 
-  The semantic check runs after the existing JSON decode-schema whitelist and before input-type
-  checking, MIR construction, descriptor construction, or runtime calls. The active
-  `align_mir::hir_program_is_valid` pre-lowering gate then applies the same pure row predicate to
-  imported, per-unit, or handcrafted HIR; the dormant body validator is not a substitute. A
-  schema-admitted rejected row reports the exact source-level diagnostic:
+  The source semantic check runs after the existing JSON decode-schema whitelist and before input-type
+  checking, MIR construction, descriptor construction, or runtime calls. For a whole-program check,
+  the active `align_mir::hir_program_is_valid` pre-lowering gate then applies the same pure row
+  predicate to the checked HIR. For imported or per-unit consumers, interface/import reconstruction
+  first materializes the checked HIR; the active gate then applies the predicate to that reconstructed
+  HIR before MIR lowering, descriptor construction, or runtime calls. The gate never reconstructs
+  source spelling, and the dormant body validator is not a substitute. A schema-admitted rejected row
+  reports the exact source-level diagnostic:
 
   ```text
   `json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
@@ -295,7 +299,7 @@ the few boundaries that remain:
   | --- | --- |
   | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`; the row type comes from the expected scanner annotation, not a written call-site type argument. The scanner is a pipeline source only. |
   | Input and result | `view` is the existing `str` input (or the existing explicit borrow from `string`); its region bounds the scanner. Supported fused terminals return the existing `Result<T, Error>` scalar result and preserve malformed-row and exhaustion behavior. |
-  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` owns source validation and source spelling. The active `align_mir::hir_program_is_valid` pre-lowering gate must recheck the complete row graph with the canonical Copy predicate for imported/per-unit/handcrafted HIR; the dormant `body_core_metadata_is_valid` helper alone is insufficient and may share only pure predicate helpers. The existing MIR `JsonScan` lowering, LLVM emission, and `align_rt_json_scan_next` own accepted execution. The gate adds no runtime owner. |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` owns source validation and source spelling. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate must then recheck the complete row graph with the canonical Copy predicate before MIR lowering, descriptor construction, or runtime calls. The dormant `body_core_metadata_is_valid` helper alone is insufficient and may share only pure predicate helpers. The existing MIR `JsonScan` lowering, LLVM emission, and `align_rt_json_scan_next` own accepted execution. The gate adds no runtime owner. |
   | Row eligibility | `json.scan` accepts only a recursively non-owning row whose canonical `DropPlan` is valid and needs no drop. |
   | Validation order | capability import, arity, scanner annotation/inference, existing JSON schema, recursive Copy check, then input `str` typing and region checks. |
   | Ownership | rejected rows construct no scanner, descriptor, row slot, allocation, or runtime side effect; accepted rows retain the existing borrowed input and Copy row slot. |
@@ -320,7 +324,7 @@ the few boundaries that remain:
   | Direct, nested, optional, union, and invalid/cyclic schema graph | Canonical recursive `DropPlan`/JSON schema producer tables; fail closed on missing or invalid graph nodes. The active pre-lowering gate must apply the same pure predicate after interface/import reconstruction. | `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_row_schema_matrix`, `hir_body_validator_json_scan_copy_row`, `hir_program_json_scan_copy_row` |
   | Generic monomorphization and imported source spelling | Type-resolution producer owns concrete public spelling; the Copy predicate consumes the fully resolved graph | `m5::json_scan_generic_row_ownership`, `modules::json_scan_imported_row_ownership` |
   | Whole-program, per-unit, cold/hot cache, schema edit/revert | Existing structural MIR/cache identity remains owner; rejected rows publish no artifact | `cache_codegen::json_scan_row_schema_rejection`, accepted Copy-row MIR/raw-LLVM identity comparison |
-  | Interface serialization and persisted/wire identity | N/A: the gate is before interface/runtime construction and accepted source identity is unchanged | `cargo test -p align_interface --test summary` plus `cache_codegen::json_scan_row_schema_rejection` |
+  | Interface serialization and persisted/wire identity | Interface/import reconstruction is an input to checked HIR for imported/per-unit consumers; the active gate validates that reconstructed HIR before MIR/runtime construction, while accepted source identity remains unchanged | `cargo test -p align_interface --test summary` plus `cache_codegen::json_scan_row_schema_rejection` |
   | Runtime ownership provenance and allocation parity | Existing scanner input/accumulator owners; Copy rows allocate no owned row field | `json_scan_copy_row_no_owned_alloc` |
   | Exhaustion, empty input, malformed first/later row, and `Result`/`?` cleanup | Existing scanner input and accumulator cleanup; row-slot cleanup is N/A by construction | `m5::json_scan_copy_row_error_matrix`, `m5::json_scan_copy_row_terminal_matrix` |
   | Concurrent independent scanners | N/A to the new check; existing independent handles, immutable descriptors, and row slots remain separate | two accepted scanner terminals in one program plus the existing nested-scanner rejection |
@@ -340,8 +344,9 @@ the few boundaries that remain:
 
   The existing compiler currently admits some owning rows; this paragraph is the reviewed target
   contract, not a claim that the implementation has shipped. The implementation PR must land only
-  after this design gate and must keep the separate decoded-owner cleanup decision explicit for the
-  currently admitted `Option<Move-struct>` JSON shape.
+  after this design gate and must keep ordinary decode, encode, and scope Drop for the currently
+  admitted `Option<Move-struct>` JSON shape explicit; cleanup after a later required sibling decode
+  error remains a separate ownership request.
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
 validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`

@@ -13,7 +13,9 @@ implementation slice is am-b2b2: templates, JSON descriptors/document/scanner re
 group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
 history. There is no general public validator activation yet; Request 6's design specifies the
 narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
-repair is `bd93f7b` after base design `1cb666f`; no compiler implementation or release pin exists.
+repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is in the current
+worktree and restores ordinary Move-option JSON encode plus the interface-reconstruction ordering;
+no compiler implementation or release pin exists.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -645,16 +647,18 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Finish and publish the reviewed Request 6 design slice before implementing its compiler gate. The
-design retains the shipped Decode-versus-Encode `Option<Move-struct>` boundary, routes the checked-
-HIR owner through active `align_mir::hir_program_is_valid`, and keeps the English/Japanese JSON
-ledgers synchronized. The first independent review on `1cb666f` found one P1 and one P2; the
-consolidated repair `bd93f7b` applied both and also corrected the b2b2 roadmap/closure wording.
-Because the P1 changes the design boundary, run the one conditional final review on the repaired
-diff before publication. After the design is accepted, implement the scanner-only recursive Copy
-check in a separate slice; do not update the align-llm compiler pin until that implementation is
-merged and its adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-
-gate references pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
+Publish the corrected Request 6 design slice before implementing its compiler gate. Ordinary JSON
+decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
+scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
+imported/per-unit consumers, interface/import reconstruction precedes active
+`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
+on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
+wording. The conditional final review found two further valid contract findings; the current
+redesign incorporates both and reopens the closure matrix. Per policy, do not start another local
+review/repair loop. After this design is accepted, implement the scanner-only recursive Copy check
+in a separate slice; do not update the align-llm compiler pin until that implementation is merged
+and its adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-gate
+references pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

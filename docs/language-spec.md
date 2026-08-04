@@ -402,9 +402,10 @@ round-trips; the strict contract recurses; nested `str` fields stay zero-copy vi
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
 `decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field
-contract also admits the current Decode schema's `Option<Move-struct>` nested-record shape; its
-decoded-owner cleanup remains a separate request. The shipped nested-struct Option Encode path
-requires a non-Move payload, so `Option<Move-struct>` is outside that encoding path. A field may also
+contract also admits the current Decode schema's `Option<Move-struct>` nested-record shape. Ordinary
+decode, encode, and scope Drop preserve that admitted shape; a known partial-error cleanup defect
+after a later required sibling fails is a separate ownership request. The scanner-only Copy
+restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;
