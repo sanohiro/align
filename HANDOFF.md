@@ -5,21 +5,18 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04. `main` includes the shipped wave through #688 plus the merged am-p
-placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
-declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The historical
-implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
-group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no general public validator activation yet; Request 6's design specifies the
-narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
-repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
-restores ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701
-merged the initial design at `576e573`; the reviewed redesign in Align PR #703 merged at
-`0ab7a30d6e7bfda56d4c8145b4672306634b9fea` with final design head `712317b`. The implementation
-branch is `agent/align-llm-request6-implementation-v2`, based on the prior implementation
-checkpoint `8b55352` plus this merged design, with code repair `3d7b118`; no release pin or
-align-llm adoption verification exists yet.
+_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`, based on
+implementation checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged
+in Align at `0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is in progress and is
+not yet published or merged. No `.align-revision` adoption pin or align-llm `make ci` verification
+exists yet.
+
+## Active Request 6 implementation checkpoint
+
+- Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script.
+- Verification: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, targeted m5 scanner tests, modules (41/41), cache_codegen (26/26), MIR validator (85/85), and targeted clippy pass. The m5 aggregate has 188/193 passing; five failures reproduce on the pre-change checkpoint as existing link/diagnostic failures and are not Request 6 failures.
+- Next, in order: finish the implementation diff review; commit/publish the implementation PR; run `scripts/compare-json-scan-identity.sh <implementation-head-sha>` in the required Linux toolchain; perform the one comprehensive adversarial review and repair; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
+- Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -68,10 +65,10 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **align-llm requests:** Requests 4–14 remain proposed in
-  `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is merged in
-  Align PR #701 and its reviewed implementation is complete on the separate
-  `agent/align-llm-request6-implementation` worktree, pending publication and merge. No release
-  pin or align-llm adoption verification exists yet. Request 9 remains the later C7 blocker.
+  `../align-llm/docs/align-requests.md`; Request 6 is accepted with its reviewed design merged in
+  Align PR #703. Its implementation/adoption is the active work on the branch named above. No
+  release pin or align-llm adoption verification exists yet. Request 9 remains the later C7
+  blocker.
 
 ## Latest shipped wave
 

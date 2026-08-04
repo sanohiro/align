@@ -22127,33 +22127,46 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // One inference slot per type parameter. Each argument's type is matched structurally
-        // against its declared parameter type, binding any `Param` it carries (bare `T`, or nested
-        // in `Option<T>` / `Result<T, E>` / `slice<T>` / `box<T>` / a fixed `array<T>`).
+        // One inference slot per type parameter. Seed a concrete expected return before checking
+        // any argument: a nested `json.scan(view)` must see the concrete scanner annotation at its
+        // own source-check boundary rather than failing with the direct missing-context diagnostic.
+        let error_checkpoint = self.diags.error_count();
         let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
+        if let Some(exp) = expected {
+            self.match_param(ret, self.resolve(exp), &mut subst, span, true);
+        }
+
+        // Each argument's type is then matched structurally against its declared parameter type,
+        // binding any `Param` it carries (bare `T`, or nested in `Option<T>` / `Result<T, E>` /
+        // `slice<T>` / `box<T>` / a fixed `array<T>`). Every parameter already bound by the return
+        // context is substituted into the argument's expected type before the argument is checked.
         let mut checked = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let declared = param_tys[i];
-            // A position mentioning a type parameter applies no coercion (the type is unknown), so
-            // check the argument unconstrained; a fully concrete parameter checks against it.
-            let ce = if ty_mentions_param(declared, self.tagged_types) {
+            let known_args: Vec<Ty> = subst
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value.unwrap_or(Ty::Param(index as u32)))
+                .collect();
+            let expected_param = {
+                let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
+                (!ty_mentions_param(substituted, self.tagged_types)).then_some(substituted)
+            };
+            let ce = if expected_param.is_none() && ty_mentions_param(declared, self.tagged_types) {
+                // A position whose parameter is still unknown applies no coercion, so check the
+                // argument unconstrained. A later argument or the final expected-result boundary
+                // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
                 self.check_expr(a, None)
             } else {
                 self.check_arg_with_json_scan_source_spelling(
                     a,
-                    Some(declared),
+                    expected_param,
                     json_scan_param_spellings.get(i).cloned().flatten(),
                 )
             };
             self.match_param(declared, ce.ty, &mut subst, a.span, false);
             checked.push(ce);
-        }
-        // Seed the remaining parameters from the expected type (the binding annotation), structurally
-        // — `o: Option<i32> := wrap(x)` gives `T = i32` from the return position. Bind-only: do not
-        // unify concrete leaves against `expected` (that constraint comes later via `result_ty`).
-        if let Some(exp) = expected {
-            self.match_param(ret, exp, &mut subst, span, true);
         }
         // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a
         // concrete scalar now — a `Scalar` cannot hold an inference variable, so leaving it deferred
@@ -22190,6 +22203,13 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let result_ty = subst_param_ty(ret, &type_args, self.tagged_types);
         self.constrain(result_ty, expected, span);
+        // A generic call is an inference boundary: if any argument or the result constraint failed,
+        // return the error sentinel instead of attaching the partially checked arguments to a HIR
+        // `Call`. In particular, a scanner argument checked with a concrete expected type must not
+        // become a published scanner artifact when a later argument conflicts with that type.
+        if self.diags.error_count() > error_checkpoint {
+            return err;
+        }
         // The type arguments are kept (still possibly inference variables) and finalized in
         // `finalize_expr`, which then records the instantiation and rewrites `func` to the
         // monomorph's mangled name — by then a literal argument's type has flowed from context.

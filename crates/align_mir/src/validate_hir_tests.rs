@@ -777,6 +777,11 @@ fn hir_program_json_scan_copy_row() {
     let mut program = baseline_program();
     program.fns.push(body_unit_case("json_scan_copy_row", scanner));
     assert!(validate_hir::json_scan_copy_rows_are_valid(&program));
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&program),
+        Ok(()),
+        "the accepted scanner envelope must pass the reason seam"
+    );
     assert!(align_sema::checked_hir_body_depth_is_valid(&program));
     assert!(validate_hir::global_type_metadata_is_valid(&program));
     assert!(validate_hir::type_placement_metadata_is_valid(&program));
@@ -838,6 +843,169 @@ fn hir_program_json_scan_copy_row() {
     let mut cyclic_row = program.clone();
     cyclic_row.structs[0].fields[0].ty = Ty::Struct(0);
     assert!(!validate_hir::json_scan_copy_rows_are_valid(&cyclic_row));
+
+    let mut invalid_span = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut invalid_span.fns[0].body.stmts[0] {
+        expression.span = align_span::Span::new(0, 2, 1);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_span),
+        Err(validate_hir::JsonScanValidationReason::InvalidSpan)
+    );
+
+    let mut wrong_stored_type = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut wrong_stored_type.fns[0].body.stmts[0] {
+        expression.ty = Ty::JsonScanner(99);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&wrong_stored_type),
+        Err(validate_hir::JsonScanValidationReason::StoredType)
+    );
+
+    let mut unknown_row = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut unknown_row.fns[0].body.stmts[0] {
+        if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+            *struct_id = 99;
+        }
+        expression.ty = Ty::JsonScanner(99);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&unknown_row),
+        Err(validate_hir::JsonScanValidationReason::UnknownRow)
+    );
+
+    let mut wrong_input_type = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut wrong_input_type.fns[0].body.stmts[0]
+        && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+    {
+        input.ty = Ty::String;
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&wrong_input_type),
+        Err(validate_hir::JsonScanValidationReason::InputType)
+    );
+
+    let mut invalid_schema_reason = program.clone();
+    invalid_schema_reason.structs[0].fields[1].ty = Ty::Char;
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_schema_reason),
+        Err(validate_hir::JsonScanValidationReason::Schema)
+    );
+
+    let mut invalid_copy = program.clone();
+    invalid_copy.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_copy),
+        Err(validate_hir::JsonScanValidationReason::Copy)
+    );
+
+    // The scanner envelope has one explicit exception to the universal span rule: its enclosing
+    // expression span wins even when a later field is independently malformed. Keep every pair in
+    // the precedence matrix so a future validator cannot accidentally reorder these checks while
+    // preserving the one-fault cases above.
+    let paired_reason = |mut candidate: hir::Program, expected| {
+        if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+            expression.span = align_span::Span::new(0, 2, 1);
+        }
+        assert_eq!(
+            validate_hir::json_scan_validation_reason(&candidate),
+            Err(expected)
+        );
+    };
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                expression.ty = Ty::JsonScanner(99);
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+                    *struct_id = 99;
+                }
+                expression.ty = Ty::JsonScanner(99);
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0]
+                && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+            {
+                input.ty = Ty::String;
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            candidate.structs[0].fields[1].ty = Ty::Char;
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            candidate.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+}
+
+#[test]
+fn hir_program_json_scan_envelope_mismatch() {
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_envelope_mismatch", scanner));
+    if let hir::Stmt::Expr(expression) = &mut program.fns[0].body.stmts[0]
+        && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+    {
+        input.ty = Ty::String;
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&program),
+        Err(validate_hir::JsonScanValidationReason::InputType)
+    );
+}
+
+#[test]
+fn hir_program_json_scan_envelope_precedence_matrix() {
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_envelope_precedence", scanner));
+    if let hir::Stmt::Expr(expression) = &mut program.fns[0].body.stmts[0] {
+        expression.span = align_span::Span::new(0, 2, 1);
+        expression.ty = Ty::JsonScanner(99);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&program),
+        Err(validate_hir::JsonScanValidationReason::InvalidSpan)
+    );
 }
 
 #[test]

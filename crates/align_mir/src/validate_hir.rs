@@ -38,16 +38,31 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
     DeclarationValidator::new(program).validate()
 }
 
-/// Validate the scanner-only JSON schema and ownership boundary before MIR can allocate a
-/// reusable row slot.
+/// The first active-HIR envelope or row-graph reason for rejecting a `JsonScan` expression.
 ///
-/// This is intentionally a small active replay rather than activation of [`body_core`]. The sema
-/// rejects source `json.scan` rows with an invalid Decode descriptor or a non-empty recursive
-/// [`align_sema::DropPlan`], while this producer-independent pass rechecks imported, per-unit, or
-/// handcrafted checked HIR. Walking direct expression children keeps the replay iterative and
-/// covers nested blocks, stages, templates, and lifted function bodies without duplicating the
-/// exhaustive `ExprKind` traversal.
-pub(crate) fn json_scan_copy_rows_are_valid(program: &hir::Program) -> bool {
+/// This is deliberately compiler-internal observability for the precedence matrix. It is not a
+/// user-facing diagnostic and production lowering continues to consume the boolean gate below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsonScanValidationReason {
+    InvalidSpan,
+    StoredType,
+    UnknownRow,
+    InputType,
+    Schema,
+    Copy,
+}
+
+/// Validate the active scanner-only JSON envelope and ownership boundary before MIR can allocate
+/// a reusable row slot.
+///
+/// The scanner envelope is intentionally checked in its own order. `JsonScan` is the one active
+/// exception to the universal stored-field-before-span rule: the enclosing expression span is
+/// checked first, then the stored scanner type, row id, input type, Decode schema, and recursive
+/// Copy predicate. This producer-independent pass rechecks whole-program, imported, per-unit, or
+/// handcrafted checked HIR without activating the dormant body validator.
+pub(crate) fn json_scan_validation_reason(
+    program: &hir::Program,
+) -> Result<(), JsonScanValidationReason> {
     let mut work = Vec::new();
     for function in &program.fns {
         for statement in &function.body.stmts {
@@ -59,21 +74,42 @@ pub(crate) fn json_scan_copy_rows_are_valid(program: &hir::Program) -> bool {
     }
 
     while let Some(expression) = work.pop() {
-        if let hir::ExprKind::JsonScan { struct_id, .. } = &expression.kind
-            && (program.structs.get(*struct_id as usize).is_none()
-                || !body_core::json_struct_descriptor_is_valid(program, *struct_id, false)
-                || !align_sema::json_scan_row_is_copy(
-                    *struct_id,
-                    &program.structs,
-                    &program.enums,
-                    &program.tagged_types,
-                ))
-        {
-            return false;
+        if let hir::ExprKind::JsonScan { struct_id, input } = &expression.kind {
+            if !valid_span(expression.span) {
+                return Err(JsonScanValidationReason::InvalidSpan);
+            }
+            if expression.ty != Ty::JsonScanner(*struct_id) {
+                return Err(JsonScanValidationReason::StoredType);
+            }
+            if program.structs.get(*struct_id as usize).is_none() {
+                return Err(JsonScanValidationReason::UnknownRow);
+            }
+            if input.ty != Ty::Str {
+                return Err(JsonScanValidationReason::InputType);
+            }
+            if !body_core::json_struct_descriptor_is_valid(program, *struct_id, false) {
+                return Err(JsonScanValidationReason::Schema);
+            }
+            if !align_sema::json_scan_row_is_copy(
+                *struct_id,
+                &program.structs,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                return Err(JsonScanValidationReason::Copy);
+            }
         }
         work.extend(align_sema::direct_expr_children(expression));
     }
-    true
+    Ok(())
+}
+
+/// Boolean production caller for the active scanner gate. Keep this wrapper stable so the four
+/// MIR lowerers have one unchanged fail-closed entrypoint while the reason-valued seam remains
+/// available to the crate's precedence tests.
+#[allow(dead_code)]
+pub(crate) fn json_scan_copy_rows_are_valid(program: &hir::Program) -> bool {
+    json_scan_validation_reason(program).is_ok()
 }
 
 fn push_statement_expressions<'a>(statement: &'a hir::Stmt, work: &mut Vec<&'a hir::Expr>) {

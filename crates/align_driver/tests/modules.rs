@@ -254,6 +254,61 @@ fn json_scan_imported_generic_row_ownership() {
 }
 
 #[test]
+fn json_scan_imported_copy_row_whole_and_per_unit() {
+    if !backend_available() {
+        return;
+    }
+    let geom = "module geom\npub Row { score: i64, label: Option<str> }\n";
+    let main = r#"module main
+import core.json
+import geom
+fn score(row: geom.Row) -> i64 = row.score + match row.label { Some(label) => label.len(), None => 0 }
+fn main() -> Result<(), Error> {
+  rows: json.scanner<geom.Row> := json.scan("[{\"score\":7,\"label\":\"a\"},{\"score\":5,\"label\":null},{\"score\":3}]")
+  print(rows.map(score).sum()?)
+  return Ok(())
+}
+"#;
+    let files = [("geom.align", geom), ("main.align", main)];
+    let whole = build_and_run_multi("mod-json-scan-copy-whole", &files, "main.align");
+    let per = build_per_unit_multi("mod-json-scan-copy-per-unit", &files, "main.align");
+    let per_output = per.link_and_run();
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(per_output.status.code(), Some(0));
+    assert_eq!(whole.stdout, per_output.stdout);
+    assert_eq!(String::from_utf8_lossy(&per_output.stdout), "16\n");
+}
+
+#[test]
+fn json_scan_imported_generic_return_context_ownership() {
+    if !backend_available() {
+        return;
+    }
+    let geom = r#"module geom
+import core.json
+pub Row { score: i64 }
+pub fn identity<T>(value: T) -> T = value
+"#;
+    let main = r#"module main
+import core.json
+import geom
+fn main() -> Result<(), Error> {
+  rows: json.scanner<geom.Row> := geom.identity(json.scan("[{\"score\":7},{\"score\":9}]"))
+  print(rows.score.sum()?)
+  return Ok(())
+}
+"#;
+    let files = [("geom.align", geom), ("main.align", main)];
+    let whole = build_and_run_multi("mod-json-scan-generic-whole", &files, "main.align");
+    let per = build_per_unit_multi("mod-json-scan-generic-per-unit", &files, "main.align");
+    let per_output = per.link_and_run();
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(per_output.status.code(), Some(0));
+    assert_eq!(whole.stdout, per_output.stdout);
+    assert_eq!(String::from_utf8_lossy(&per_output.stdout), "16\n");
+}
+
+#[test]
 fn same_struct_name_in_two_modules_does_not_collide() {
     if !backend_available() {
         return;

@@ -436,6 +436,70 @@ fn json_scan_row_schema_rejection() {
 }
 
 #[test]
+fn json_scan_per_unit_interface_row_ownership() {
+    if !backend() {
+        return;
+    }
+    let geom_copy = "module geom\npub Row { score: i64, label: Option<str> }\n";
+    let geom_move = "module geom\npub Row { values: array<i64> }\n";
+    let main = "module main\nimport core.json\nimport geom\nfn main() -> Result<(), Error> {\n  rows: json.scanner<geom.Row> := json.scan(\"[]\")\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-per-unit-row-ownership", &[("geom.align", geom_copy), ("main.align", main)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert_eq!(cold.outcomes.len(), 2, "the imported Copy row must produce both per-unit artifacts");
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+    let published = action_manifest_count(&proj.cache_root());
+    assert_eq!(published, 2, "the cold imported-row build publishes one artifact per unit");
+
+    proj.write("geom.align", geom_move);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(
+        rejected.units.iter().all(|unit| unit.unit != "main"),
+        "a Move row must not produce the dependent artifact; units={:?}, diagnostics:\n{}",
+        rejected.units.iter().map(|unit| unit.unit.as_str()).collect::<Vec<_>>(),
+        diagnostics
+    );
+    assert!(diagnostics.contains("must be Copy"), "unexpected imported-row rejection:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected per-unit input must not publish cache actions");
+
+    proj.write("geom.align", geom_copy);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "restoring the imported Copy row must hit both prior artifacts");
+}
+
+#[test]
+fn json_scan_generic_return_context_no_publication() {
+    if !backend() {
+        return;
+    }
+    let valid = "module main\nimport core.json\nRow { score: i64 }\nfn identity<T>(value: T) -> T = value\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := identity(json.scan(\"[]\"))\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let conflicting = "module main\nimport core.json\nRow { score: i64 }\nfn choose<T>(first: T, second: T) -> T = first\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := choose(json.scan(\"[]\"), 1)\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-generic-no-publication", &[("main.align", valid)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit, "the accepted generic scanner must publish a cold artifact");
+    let published = action_manifest_count(&proj.cache_root());
+
+    proj.write("main.align", conflicting);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "failed generic inference must produce no per-unit artifact");
+    assert!(diagnostics.contains("type mismatch"), "unexpected generic rejection:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "failed generic inference must not publish a cache action");
+
+    proj.write("main.align", valid);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.outcome("main").hit, "restoring the accepted generic scanner must hit the prior artifact");
+}
+
+#[test]
 fn json_scan_copy_row_mir_and_raw_llvm_identity() {
     if !backend() {
         return;
