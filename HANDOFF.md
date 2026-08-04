@@ -18,7 +18,8 @@ restores ordinary Move-option JSON encode plus the interface-reconstruction orde
 implementation or release pin exists. The fresh preflight review of `def2fe6` found one valid
 documentation-only P2: the Request 6 source-of-truth map used a stale Japanese path and omitted the
 two changed implementation ledgers. The current follow-up repair corrects both mirrors and names
-the exact ledger paths; it does not change the scanner contract or implementation scope.
+the exact ledger paths; it does not change the scanner contract or implementation scope. The repair
+is committed as `4832d8b`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -663,8 +664,9 @@ adds the changed implementation ledgers. Run the affected static checks and the 
 preflight after this narrow repair; it does not require another full-diff review unless its scope
 expands. After this design is accepted, implement the scanner-only recursive Copy check in a
 separate slice; do not update the align-llm compiler pin until that implementation is merged and its
-adoption gate passes. The pre-repair `git diff --check`, exact-diagnostic consistency, and
-active-gate references passed; rerun them on the final repair commit. Compiler tests, builds, and
+adoption gate passes. On `4832d8b`, `git diff --check`, exact-diagnostic consistency, active-gate
+references, ordinary Move-option boundary checks, and `scripts/pre-pr.sh --reviewer
+codex-final-redesign --owner-test docs-request6-contract` all passed. Compiler tests, builds, and
 `make ci` are N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
