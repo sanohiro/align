@@ -37,6 +37,16 @@ command -v codex >/dev/null 2>&1 || {
   echo "codex is required for the bounded host-native review" >&2
   exit 2
 }
+review_path="$PATH"
+review_developer_dir="${DEVELOPER_DIR:-}"
+if [[ "$(uname -s)" == "Darwin" && -x "/Applications/Xcode.app/Contents/Developer/usr/bin/git" ]]; then
+  # /usr/bin/git is an xcrun shim on macOS. A read-only review sandbox cannot
+  # populate xcrun's cache, so use Xcode's real Git binary for review helpers.
+  review_path="/Applications/Xcode.app/Contents/Developer/usr/bin:$review_path"
+  if [[ -z "$review_developer_dir" ]]; then
+    review_developer_dir="/Applications/Xcode.app/Contents/Developer"
+  fi
+fi
 [[ -z "$(git status --porcelain)" ]] || {
   echo "review requires a clean worktree" >&2
   exit 1
@@ -81,9 +91,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-prompt="Review git diff ${base}...HEAD for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, network commands, or scripts/test-full.sh. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 head_sha="$(git rev-parse HEAD)"
 base_sha="$(git rev-parse "${base}^{commit}")"
+prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, network commands, or scripts/test-full.sh. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
@@ -96,6 +106,7 @@ set -m
 # codex-cli 0.145 rejects a custom PROMPT together with --base even though its
 # help text displays both. Keep code-review mode and put the explicit base in
 # the inspection-only prompt so the watchdog can require a bounded verdict.
+PATH="$review_path" DEVELOPER_DIR="$review_developer_dir" GIT_OPTIONAL_LOCKS=0 \
 codex review -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
   "$prompt" >>"$output" 2>&1 &
 review_pid=$!

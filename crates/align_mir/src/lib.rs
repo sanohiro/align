@@ -1581,6 +1581,8 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
         && validate_hir::nominal_link_metadata_is_valid(program)
         && validate_hir::declaration_header_metadata_is_valid(program)
         && validate_hir::json_scan_validation_reason(program).is_ok()
+        && validate_hir::body_only_metadata_is_valid(program)
+        && align_sema::checked_hir_body_facts_are_valid(program)
 }
 
 fn empty_program() -> Program {
@@ -14356,7 +14358,9 @@ fn main() -> i32 = 0
         };
         callee.ty = Ty::Fn(u32::MAX);
 
-        let program = lower_program(&hir);
+        // The public entrypoint rejects this malformed checked-HIR record before lowering. This
+        // owner exercises the internal fail-closed continuation path directly.
+        let program = lower_program_unchecked(&hir, None, false);
         for name in ["field", "dynamic", "soa"] {
             let function = program
                 .fns
@@ -14659,9 +14663,9 @@ fn bad() -> i32 {
             "the malformed-HIR fixture must contain a rejected checked break"
         );
 
-        // Force malformed checked HIR across the ordinary driver diagnostic gate. The rejected
+        // Bypass the public malformed-HIR gate to exercise MIR's recovery path. The rejected
         // break is outside every loop, so any accidental loop-frame lookup panics this owner test.
-        let program = lower_program(&hir);
+        let program = lower_program_unchecked(&hir, None, false);
         let bad = program
             .fns
             .iter()
@@ -14697,7 +14701,7 @@ fn bad() -> i32 {
             panic!("bad first statement must remain a checked break");
         };
         *accepted = true;
-        let malformed = lower_program(&hir);
+        let malformed = lower_program_unchecked(&hir, None, false);
         let malformed_bad = malformed
             .fns
             .iter()

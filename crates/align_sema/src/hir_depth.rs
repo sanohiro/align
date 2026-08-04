@@ -5,21 +5,43 @@ use crate::hir::{self, Block, Expr, ExprKind, MatchArm, Stage, StageKind, Stmt, 
 pub const MAX_CHECKED_HIR_DEPTH: usize = 259;
 
 #[derive(Clone, Copy)]
-enum BodyRecord<'a> {
+pub(crate) enum BodyRecord<'a> {
     Block(&'a Block),
+    BlockExit {
+        id: usize,
+    },
     Stmt(&'a Stmt),
-    StmtExit(&'a Stmt),
+    StmtExit {
+        stmt: &'a Stmt,
+        id: usize,
+    },
     Expr(&'a Expr),
     ExprExit {
         expression: &'a Expr,
+        id: usize,
         children_completed: bool,
     },
     MatchArm {
         scrutinee: &'a Expr,
         arm: &'a MatchArm,
     },
+    MatchArmExit {
+        id: usize,
+    },
     Stage(&'a Stage),
+    StageExit {
+        id: usize,
+    },
     TemplatePart(&'a TemplatePart),
+    TemplatePartExit {
+        id: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CloneEvent<'a> {
+    RecordEnter { id: usize, record: BodyRecord<'a> },
+    RecordExit { id: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -69,9 +91,13 @@ fn transparent_record_diverges(record: BodyRecord<'_>) -> bool {
             TemplatePart::Text(_) | TemplatePart::PopComma => false,
         },
         BodyRecord::Block(_)
-        | BodyRecord::StmtExit(_)
+        | BodyRecord::MatchArm { .. }
+        | BodyRecord::BlockExit { .. }
+        | BodyRecord::StmtExit { .. }
         | BodyRecord::ExprExit { .. }
-        | BodyRecord::MatchArm { .. } => false,
+        | BodyRecord::MatchArmExit { .. }
+        | BodyRecord::StageExit { .. }
+        | BodyRecord::TemplatePartExit { .. } => false,
     }
 }
 
@@ -80,6 +106,27 @@ fn record_is_strict_expression_child(record: BodyRecord<'_>) -> bool {
         record,
         BodyRecord::Expr(_) | BodyRecord::Stage(_) | BodyRecord::TemplatePart(_)
     )
+}
+
+fn exit_record(record: BodyRecord<'_>, id: usize, children_completed: bool) -> BodyRecord<'_> {
+    match record {
+        BodyRecord::Block(_) => BodyRecord::BlockExit { id },
+        BodyRecord::Stmt(stmt) => BodyRecord::StmtExit { stmt, id },
+        BodyRecord::Expr(expression) => BodyRecord::ExprExit {
+            expression,
+            id,
+            children_completed,
+        },
+        BodyRecord::MatchArm { .. } => BodyRecord::MatchArmExit { id },
+        BodyRecord::Stage(_) => BodyRecord::StageExit { id },
+        BodyRecord::TemplatePart(_) => BodyRecord::TemplatePartExit { id },
+        BodyRecord::BlockExit { .. }
+        | BodyRecord::StmtExit { .. }
+        | BodyRecord::ExprExit { .. }
+        | BodyRecord::MatchArmExit { .. }
+        | BodyRecord::StageExit { .. }
+        | BodyRecord::TemplatePartExit { .. } => record,
+    }
 }
 
 /// Check every stored function body before a recursive checked-HIR consumer can run.
@@ -91,6 +138,7 @@ pub fn checked_hir_body_depth_is_valid(program: &hir::Program) -> bool {
         if !walk_body_records(
             BodyRecord::Block(&function.body),
             MAX_CHECKED_HIR_DEPTH,
+            None,
             None,
             false,
             None,
@@ -108,6 +156,7 @@ pub(crate) fn checked_hir_block_depth_is_valid(body: &Block) -> bool {
         BodyRecord::Block(body),
         MAX_CHECKED_HIR_DEPTH,
         None,
+        None,
         false,
         None,
     )
@@ -117,36 +166,94 @@ fn walk_body_records<'a>(
     root: BodyRecord<'a>,
     max_depth: usize,
     mut events: Option<&mut Vec<BodyEvent<'a>>>,
+    mut clone_events: Option<&mut Vec<CloneEvent<'a>>>,
     reachable_only: bool,
     stop_below_expression: Option<&'a Expr>,
 ) -> bool {
     let mut work = vec![(root, 1usize)];
+    let mut next_clone_id = 1usize;
     while let Some((record, depth)) = work.pop() {
         if depth > max_depth {
             return false;
         }
-        let exit_expr = match record {
-            BodyRecord::Expr(expr) => Some(expr),
-            _ => None,
+        let (clone_id, children_completed) = match record {
+            BodyRecord::BlockExit { id, .. }
+            | BodyRecord::StmtExit { id, .. }
+            | BodyRecord::MatchArmExit { id, .. }
+            | BodyRecord::StageExit { id, .. }
+            | BodyRecord::TemplatePartExit { id, .. } => (id, true),
+            BodyRecord::ExprExit {
+                id,
+                children_completed,
+                ..
+            } => (id, children_completed),
+            BodyRecord::Block(_)
+            | BodyRecord::Stmt(_)
+            | BodyRecord::Expr(_)
+            | BodyRecord::MatchArm { .. }
+            | BodyRecord::Stage(_)
+            | BodyRecord::TemplatePart(_) => (0, true),
+        };
+        if clone_id != 0
+            || matches!(
+                record,
+                BodyRecord::BlockExit { .. }
+                    | BodyRecord::StmtExit { .. }
+                    | BodyRecord::ExprExit { .. }
+                    | BodyRecord::MatchArmExit { .. }
+                    | BodyRecord::StageExit { .. }
+                    | BodyRecord::TemplatePartExit { .. }
+            )
+        {
+            if let Some(clone_events) = clone_events.as_mut() {
+                clone_events.push(CloneEvent::RecordExit { id: clone_id });
+            }
+            if let Some(events) = events.as_mut() {
+                match record {
+                    BodyRecord::StmtExit { stmt, .. } => events.push(BodyEvent::StmtExit(stmt)),
+                    BodyRecord::ExprExit { expression, .. } => events.push(BodyEvent::ExprExit {
+                        expression,
+                        children_completed,
+                    }),
+                    BodyRecord::BlockExit { .. }
+                    | BodyRecord::MatchArmExit { .. }
+                    | BodyRecord::StageExit { .. }
+                    | BodyRecord::TemplatePartExit { .. }
+                    | BodyRecord::Block(_)
+                    | BodyRecord::Stmt(_)
+                    | BodyRecord::Expr(_)
+                    | BodyRecord::MatchArm { .. }
+                    | BodyRecord::Stage(_)
+                    | BodyRecord::TemplatePart(_) => {}
+                }
+            }
+            continue;
+        }
+        let clone_id = if let Some(clone_events) = clone_events.as_mut() {
+            let id = next_clone_id;
+            next_clone_id = match next_clone_id.checked_add(1) {
+                Some(next) => next,
+                None => return false,
+            };
+            clone_events.push(CloneEvent::RecordEnter { id, record });
+            id
+        } else {
+            0
         };
         if let Some(events) = events.as_mut() {
             match record {
                 BodyRecord::Stmt(stmt) => events.push(BodyEvent::StmtEnter(stmt)),
-                BodyRecord::StmtExit(stmt) => events.push(BodyEvent::StmtExit(stmt)),
                 BodyRecord::Expr(expr) => events.push(BodyEvent::ExprEnter(expr)),
-                BodyRecord::ExprExit {
-                    expression,
-                    children_completed,
-                } => events.push(BodyEvent::ExprExit {
-                    expression,
-                    children_completed,
-                }),
                 BodyRecord::MatchArm { scrutinee, arm } => {
                     events.push(BodyEvent::MatchArmEnter { scrutinee, arm });
                 }
-                BodyRecord::Block(_)
-                | BodyRecord::Stage(_)
-                | BodyRecord::TemplatePart(_) => {}
+                BodyRecord::Block(_) | BodyRecord::Stage(_) | BodyRecord::TemplatePart(_) => {}
+                BodyRecord::BlockExit { .. }
+                | BodyRecord::StmtExit { .. }
+                | BodyRecord::ExprExit { .. }
+                | BodyRecord::MatchArmExit { .. }
+                | BodyRecord::StageExit { .. }
+                | BodyRecord::TemplatePartExit { .. } => {}
             }
         }
         if let (Some(root_expression), BodyRecord::Expr(expression)) =
@@ -159,797 +266,791 @@ fn walk_body_records<'a>(
                     children_completed: true,
                 });
             }
+            if let Some(clone_events) = clone_events.as_mut() {
+                clone_events.push(CloneEvent::RecordExit { id: clone_id });
+            }
             continue;
         }
         let child_depth = depth + 1;
         let child_start = work.len();
-        let exit_stmt = match record {
-            BodyRecord::Stmt(stmt) => Some(stmt),
-            _ => None,
-        };
         match record {
-                BodyRecord::StmtExit(_) | BodyRecord::ExprExit { .. } => {}
-                BodyRecord::Block(block) => {
+            BodyRecord::Block(block) => {
+                work.extend(
+                    block
+                        .stmts
+                        .iter()
+                        .map(|stmt| (BodyRecord::Stmt(stmt), child_depth)),
+                );
+                if let Some(value) = block.value.as_deref() {
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+            }
+            BodyRecord::Stmt(stmt) => match stmt {
+                Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                    work.push((BodyRecord::Expr(init), child_depth));
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::AssignVecLane { value, .. }
+                | Stmt::AssignField { value, .. } => {
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                Stmt::AssignIndex { index, value, .. }
+                | Stmt::AssignElemField { index, value, .. }
+                | Stmt::AssignElem { index, value, .. } => {
+                    work.push((BodyRecord::Expr(index), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                Stmt::Return(value) | Stmt::Break { value, .. } => {
+                    if let Some(value) = value.as_ref() {
+                        work.push((BodyRecord::Expr(value), child_depth));
+                    }
+                }
+                Stmt::Expr(expr) => work.push((BodyRecord::Expr(expr), child_depth)),
+            },
+            BodyRecord::MatchArm { arm, .. } => {
+                work.push((BodyRecord::Expr(&arm.body), child_depth));
+            }
+            BodyRecord::Stage(stage) => match &stage.kind {
+                StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
                     work.extend(
-                        block
-                            .stmts
+                        captures
                             .iter()
-                            .map(|stmt| (BodyRecord::Stmt(stmt), child_depth)),
+                            .map(|capture| (BodyRecord::Expr(capture), child_depth)),
                     );
-                    if let Some(value) = block.value.as_deref() {
+                }
+                StageKind::WhereStrContains { needle } => {
+                    work.push((BodyRecord::Expr(needle), child_depth));
+                }
+                StageKind::WhereField { .. } | StageKind::Project { .. } => {}
+            },
+            BodyRecord::TemplatePart(part) => match part {
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
+                    work.push((BodyRecord::Expr(expr), child_depth));
+                }
+                TemplatePart::OptionField { access, .. }
+                | TemplatePart::OptionStructField { access, .. }
+                | TemplatePart::StructArrayField { access, .. }
+                | TemplatePart::ScalarArrayField { access, .. }
+                | TemplatePart::UnionValue { access, .. } => {
+                    work.push((BodyRecord::Expr(access), child_depth));
+                }
+                TemplatePart::Text(_) | TemplatePart::PopComma => {}
+            },
+            BodyRecord::Expr(expr) => match &expr.kind {
+                ExprKind::Unit
+                | ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Char(_)
+                | ExprKind::Str(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Local(_)
+                | ExprKind::FnValue(_)
+                | ExprKind::Wait
+                | ExprKind::Field { .. }
+                | ExprKind::SoaColumn { .. }
+                | ExprKind::IndexField { .. }
+                | ExprKind::OptionNone
+                | ExprKind::ArrayGroupAgg { .. }
+                | ExprKind::ArrayGroupAggMulti { .. }
+                | ExprKind::ArrayDictEncode { .. }
+                | ExprKind::ReaderStdin
+                | ExprKind::WriterStd { .. }
+                | ExprKind::ArrayBuilderNew { .. }
+                | ExprKind::TimeNow
+                | ExprKind::TimeInstant
+                | ExprKind::ProcessCpuCount
+                | ExprKind::ProcessAbort
+                | ExprKind::RandSeed
+                | ExprKind::HttpClient => {}
+                ExprKind::Unary { expr, .. }
+                | ExprKind::Cast(expr)
+                | ExprKind::TaskGet(expr)
+                | ExprKind::OptionSome(expr)
+                | ExprKind::ResultOk(expr)
+                | ExprKind::ResultErr(expr)
+                | ExprKind::Try(expr)
+                | ExprKind::RawAlloc(expr)
+                | ExprKind::RawFree(expr)
+                | ExprKind::HeapNew(expr)
+                | ExprKind::BoxGet(expr)
+                | ExprKind::BoxClone(expr)
+                | ExprKind::StrClone(expr)
+                | ExprKind::StrBorrow(expr)
+                | ExprKind::BuilderToString(expr)
+                | ExprKind::ArrayToSlice(expr)
+                | ExprKind::Len(expr)
+                | ExprKind::ArrayBuilderBuild(expr) => {
+                    work.push((BodyRecord::Expr(expr), child_depth));
+                }
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::IntArith { lhs, rhs, .. }
+                | ExprKind::ResultMapErr {
+                    result: lhs,
+                    f: rhs,
+                }
+                | ExprKind::RawLoad {
+                    ptr: lhs,
+                    offset: rhs,
+                    ..
+                }
+                | ExprKind::RawOffset {
+                    ptr: lhs,
+                    offset: rhs,
+                }
+                | ExprKind::StrPredicate {
+                    haystack: lhs,
+                    needle: rhs,
+                    ..
+                }
+                | ExprKind::BuilderWrite {
+                    builder: lhs,
+                    arg: rhs,
+                    ..
+                }
+                | ExprKind::ArrayDot { a: lhs, b: rhs, .. }
+                | ExprKind::ArrayChunks {
+                    source: lhs,
+                    n: rhs,
+                    ..
+                }
+                | ExprKind::Index {
+                    recv: lhs,
+                    index: rhs,
+                }
+                | ExprKind::ElemField {
+                    recv: lhs,
+                    index: rhs,
+                    ..
+                }
+                | ExprKind::JsonDocGet { doc: lhs, key: rhs }
+                | ExprKind::JsonDocAt {
+                    doc: lhs,
+                    index: rhs,
+                }
+                | ExprKind::JsonDocKey {
+                    doc: lhs,
+                    index: rhs,
+                }
+                | ExprKind::ReaderRead {
+                    reader: lhs,
+                    buffer: rhs,
+                }
+                | ExprKind::ReaderReadLine {
+                    reader: lhs,
+                    buffer: rhs,
+                }
+                | ExprKind::WriterWrite {
+                    writer: lhs,
+                    arg: rhs,
+                    ..
+                }
+                | ExprKind::IoCopy {
+                    reader: lhs,
+                    writer: rhs,
+                }
+                | ExprKind::BufferPut {
+                    buffer: lhs,
+                    value: rhs,
+                    ..
+                }
+                | ExprKind::BufferAppend {
+                    buffer: lhs,
+                    data: rhs,
+                }
+                | ExprKind::ArrayBuilderPush {
+                    builder: lhs,
+                    value: rhs,
+                    ..
+                }
+                | ExprKind::ArrayBuilderAppend {
+                    builder: lhs,
+                    data: rhs,
+                }
+                | ExprKind::FsWriteFile {
+                    path: lhs,
+                    data: rhs,
+                    ..
+                }
+                | ExprKind::TcpConnect {
+                    host: lhs,
+                    port: rhs,
+                }
+                | ExprKind::TcpReadTimeout { conn: lhs, ns: rhs }
+                | ExprKind::TcpWriteTimeout { conn: lhs, ns: rhs }
+                | ExprKind::TcpListen {
+                    host: lhs,
+                    port: rhs,
+                }
+                | ExprKind::UdpBind {
+                    host: lhs,
+                    port: rhs,
+                }
+                | ExprKind::UdpRecvFrom {
+                    sock: lhs,
+                    buffer: rhs,
+                }
+                | ExprKind::PathJoin { a: lhs, b: rhs }
+                | ExprKind::EnvSet {
+                    name: lhs,
+                    value: rhs,
+                }
+                | ExprKind::ProcessSpawn {
+                    cmd: lhs,
+                    args: rhs,
+                }
+                | ExprKind::ChildKill {
+                    child: lhs,
+                    sig: rhs,
+                }
+                | ExprKind::ProcessExec {
+                    cmd: lhs,
+                    args: rhs,
+                }
+                | ExprKind::ProcessCommand {
+                    cmd: lhs,
+                    args: rhs,
+                }
+                | ExprKind::CommandCwd {
+                    command: lhs,
+                    dir: rhs,
+                }
+                | ExprKind::CommandTimeout {
+                    command: lhs,
+                    ns: rhs,
+                }
+                | ExprKind::Compress {
+                    data: lhs,
+                    level: rhs,
+                    ..
+                }
+                | ExprKind::RegexIsMatch {
+                    regex: lhs,
+                    text: rhs,
+                }
+                | ExprKind::RegexFindAll {
+                    regex: lhs,
+                    text: rhs,
+                }
+                | ExprKind::RegexSplit {
+                    regex: lhs,
+                    text: rhs,
+                }
+                | ExprKind::RegexCaptures {
+                    regex: lhs,
+                    text: rhs,
+                }
+                | ExprKind::RegexGroupIndex {
+                    regex: lhs,
+                    name: rhs,
+                }
+                | ExprKind::CapturesGroup {
+                    caps: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CliParse {
+                    cmd: lhs,
+                    args: rhs,
+                }
+                | ExprKind::CliGetBool {
+                    parsed: lhs,
+                    name: rhs,
+                }
+                | ExprKind::CliGetI64 {
+                    parsed: lhs,
+                    name: rhs,
+                }
+                | ExprKind::CliGetStr {
+                    parsed: lhs,
+                    name: rhs,
+                }
+                | ExprKind::HttpRequest {
+                    method: lhs,
+                    url: rhs,
+                }
+                | ExprKind::HttpBody {
+                    req: lhs,
+                    data: rhs,
+                }
+                | ExprKind::HttpRequestTimeout { req: lhs, ns: rhs }
+                | ExprKind::HttpRespHeader {
+                    resp: lhs,
+                    name: rhs,
+                }
+                | ExprKind::HttpClientTimeout {
+                    client: lhs,
+                    ns: rhs,
+                }
+                | ExprKind::HttpClientGet {
+                    client: lhs,
+                    url: rhs,
+                }
+                | ExprKind::HttpClientRequest {
+                    client: lhs,
+                    req: rhs,
+                }
+                | ExprKind::HttpCtxHeader {
+                    headers: lhs,
+                    name: rhs,
+                }
+                | ExprKind::HttpRbBody { rb: lhs, data: rhs }
+                | ExprKind::HttpRespond { ctx: lhs, rb: rhs }
+                | ExprKind::HttpRespondStream { ctx: lhs, rb: rhs }
+                | ExprKind::HttpStreamSend {
+                    stream: lhs,
+                    chunk: rhs,
+                    ..
+                }
+                | ExprKind::HttpStreamReject {
+                    stream: lhs,
+                    rb: rhs,
+                }
+                | ExprKind::CryptoCtEqual { a: lhs, b: rhs }
+                | ExprKind::CryptoHmac {
+                    key: lhs,
+                    data: rhs,
+                } => {
+                    work.push((BodyRecord::Expr(lhs), child_depth));
+                    work.push((BodyRecord::Expr(rhs), child_depth));
+                }
+                ExprKind::MathOp { operands, .. }
+                | ExprKind::Closure {
+                    captures: operands, ..
+                }
+                | ExprKind::EnumValue {
+                    payload: operands, ..
+                }
+                | ExprKind::Call { args: operands, .. }
+                | ExprKind::StructLit {
+                    fields: operands, ..
+                }
+                | ExprKind::Tuple {
+                    elems: operands, ..
+                }
+                | ExprKind::ArrayLit {
+                    elems: operands, ..
+                }
+                | ExprKind::ConstArray {
+                    elems: operands, ..
+                }
+                | ExprKind::ArrayZip {
+                    sources: operands, ..
+                }
+                | ExprKind::VecLit {
+                    elems: operands, ..
+                } => {
+                    work.extend(
+                        operands
+                            .iter()
+                            .map(|operand| (BodyRecord::Expr(operand), child_depth)),
+                    );
+                }
+                ExprKind::CallFnValue { callee, args } => {
+                    work.push((BodyRecord::Expr(callee), child_depth));
+                    work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
+                }
+                ExprKind::TaskGroup(block)
+                | ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::Unsafe(block) => {
+                    work.push((BodyRecord::Block(block), child_depth));
+                }
+                ExprKind::Loop { body, .. } => {
+                    work.push((BodyRecord::Block(body), child_depth));
+                }
+                ExprKind::Match { scrutinee, arms } => {
+                    work.push((BodyRecord::Expr(scrutinee), child_depth));
+                    work.extend(
+                        arms.iter()
+                            .map(|arm| (BodyRecord::MatchArm { scrutinee, arm }, child_depth)),
+                    );
+                }
+                ExprKind::Spawn { closure, .. } => {
+                    work.push((BodyRecord::Expr(closure), child_depth));
+                }
+                ExprKind::If { cond, then, els } => {
+                    work.push((BodyRecord::Expr(cond), child_depth));
+                    work.push((BodyRecord::Block(then), child_depth));
+                    work.push((BodyRecord::Block(els), child_depth));
+                }
+                ExprKind::TupleIndex { recv, .. }
+                | ExprKind::StrTrim { recv, .. }
+                | ExprKind::ArrayToSoa { source: recv, .. }
+                | ExprKind::JsonDecode { input: recv, .. }
+                | ExprKind::JsonDecodeArray { input: recv, .. }
+                | ExprKind::JsonDecodeScalar { input: recv, .. }
+                | ExprKind::JsonDecodeStructArray { input: recv, .. }
+                | ExprKind::JsonDecodeSoa { input: recv, .. }
+                | ExprKind::JsonDecodeUnion { input: recv, .. }
+                | ExprKind::JsonDoc { input: recv }
+                | ExprKind::JsonDocKind { doc: recv }
+                | ExprKind::JsonDocAsStr { doc: recv }
+                | ExprKind::JsonDocAsScalar { doc: recv, .. }
+                | ExprKind::JsonDocLen { doc: recv }
+                | ExprKind::JsonDocElems { doc: recv }
+                | ExprKind::JsonScan { input: recv, .. }
+                | ExprKind::FsReadFile { path: recv }
+                | ExprKind::ReaderOpen { path: recv }
+                | ExprKind::WriterCreate { path: recv }
+                | ExprKind::ReaderBuffered { reader: recv }
+                | ExprKind::BytesAsStr { bytes: recv }
+                | ExprKind::WriterFlush { writer: recv }
+                | ExprKind::FileCreateRw { path: recv }
+                | ExprKind::FileOpenRw { path: recv }
+                | ExprKind::FileLen { file: recv }
+                | ExprKind::BufferNew { capacity: recv }
+                | ExprKind::BufferBytes { buffer: recv }
+                | ExprKind::StrBytes { inner: recv }
+                | ExprKind::BufferLen { buffer: recv }
+                | ExprKind::FsExists { path: recv }
+                | ExprKind::FsRemove { path: recv }
+                | ExprKind::FsReadDir { path: recv }
+                | ExprKind::DnsResolve { host: recv }
+                | ExprKind::ConnReader { conn: recv }
+                | ExprKind::ConnWriter { conn: recv }
+                | ExprKind::TcpAccept { listener: recv }
+                | ExprKind::FsReadFileView { path: recv }
+                | ExprKind::FsReadBytesView { path: recv }
+                | ExprKind::PathComponent { path: recv, .. }
+                | ExprKind::PathNormalize { path: recv }
+                | ExprKind::EnvGet { name: recv }
+                | ExprKind::TimeSleep { ns: recv }
+                | ExprKind::ProcessExit { code: recv }
+                | ExprKind::ChildWait { child: recv }
+                | ExprKind::CommandEnvClear { command: recv }
+                | ExprKind::CommandRun { command: recv }
+                | ExprKind::RunOutputCode { out: recv }
+                | ExprKind::RunOutputStdout { out: recv }
+                | ExprKind::RunOutputStderr { out: recv }
+                | ExprKind::EncodingEncode { data: recv, .. }
+                | ExprKind::EncodingDecode { input: recv, .. }
+                | ExprKind::Utf8Valid { data: recv }
+                | ExprKind::Decompress { data: recv, .. }
+                | ExprKind::RandSeedWith { seed: recv }
+                | ExprKind::RandNext { rng: recv }
+                | ExprKind::RegexCompile { pattern: recv }
+                | ExprKind::RegexGroupCount { regex: recv }
+                | ExprKind::CliCommand { name: recv }
+                | ExprKind::CliUsage { cmd: recv }
+                | ExprKind::HttpParse { data: recv }
+                | ExprKind::HttpRespStatus { resp: recv }
+                | ExprKind::HttpRespBody { resp: recv }
+                | ExprKind::HttpAccept { server: recv }
+                | ExprKind::HttpCtxMethod { ctx: recv }
+                | ExprKind::HttpCtxPath { ctx: recv }
+                | ExprKind::HttpCtxHeaders { ctx: recv }
+                | ExprKind::HttpCtxBody { ctx: recv }
+                | ExprKind::HttpResponseBuilder { status: recv }
+                | ExprKind::HttpStreamFinish { stream: recv }
+                | ExprKind::CryptoRandom { out: recv }
+                | ExprKind::CryptoHash { data: recv, .. } => {
+                    work.push((BodyRecord::Expr(recv), child_depth));
+                }
+                ExprKind::ElseUnwrap { opt, fallback } => {
+                    work.push((BodyRecord::Expr(opt), child_depth));
+                    work.push((BodyRecord::Expr(fallback), child_depth));
+                }
+                ExprKind::RawStore { ptr, offset, value }
+                | ExprKind::Select {
+                    mask: ptr,
+                    a: offset,
+                    b: value,
+                }
+                | ExprKind::VecStore {
+                    dst: ptr,
+                    index: offset,
+                    value,
+                    ..
+                }
+                | ExprKind::RegexReplace {
+                    regex: ptr,
+                    text: offset,
+                    repl: value,
+                    ..
+                }
+                | ExprKind::HttpHeader {
+                    req: ptr,
+                    name: offset,
+                    value,
+                }
+                | ExprKind::HttpClientPost {
+                    client: ptr,
+                    url: offset,
+                    body: value,
+                }
+                | ExprKind::HttpRbHeader {
+                    rb: ptr,
+                    name: offset,
+                    value,
+                } => {
+                    work.push((BodyRecord::Expr(ptr), child_depth));
+                    work.push((BodyRecord::Expr(offset), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::BuilderNew { capacity } => {
+                    if let Some(value) = capacity.as_deref() {
                         work.push((BodyRecord::Expr(value), child_depth));
                     }
                 }
-                BodyRecord::Stmt(stmt) => match stmt {
-                    Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
-                        work.push((BodyRecord::Expr(init), child_depth));
+                ExprKind::RegexFind { regex, text, start } => {
+                    work.push((BodyRecord::Expr(regex), child_depth));
+                    work.push((BodyRecord::Expr(text), child_depth));
+                    if let Some(start) = start.as_deref() {
+                        work.push((BodyRecord::Expr(start), child_depth));
                     }
-                    Stmt::Assign { value, .. }
-                    | Stmt::AssignVecLane { value, .. }
-                    | Stmt::AssignField { value, .. } => {
-                        work.push((BodyRecord::Expr(value), child_depth));
-                    }
-                    Stmt::AssignIndex { index, value, .. }
-                    | Stmt::AssignElemField { index, value, .. }
-                    | Stmt::AssignElem { index, value, .. } => {
-                        work.push((BodyRecord::Expr(index), child_depth));
-                        work.push((BodyRecord::Expr(value), child_depth));
-                    }
-                    Stmt::Return(value) | Stmt::Break { value, .. } => {
-                        if let Some(value) = value.as_ref() {
-                            work.push((BodyRecord::Expr(value), child_depth));
-                        }
-                    }
-                    Stmt::Expr(expr) => work.push((BodyRecord::Expr(expr), child_depth)),
-                },
-                BodyRecord::MatchArm { arm, .. } => {
-                    work.push((BodyRecord::Expr(&arm.body), child_depth));
                 }
-                BodyRecord::Stage(stage) => match &stage.kind {
-                    StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => {
-                        work.extend(
-                            captures
-                                .iter()
-                                .map(|capture| (BodyRecord::Expr(capture), child_depth)),
-                        );
+                ExprKind::CliFlag {
+                    cmd, name, default, ..
+                } => {
+                    work.push((BodyRecord::Expr(cmd), child_depth));
+                    work.push((BodyRecord::Expr(name), child_depth));
+                    if let Some(default) = default.as_deref() {
+                        work.push((BodyRecord::Expr(default), child_depth));
                     }
-                    StageKind::WhereStrContains { needle } => {
-                        work.push((BodyRecord::Expr(needle), child_depth));
-                    }
-                    StageKind::WhereField { .. } | StageKind::Project { .. } => {}
-                },
-                BodyRecord::TemplatePart(part) => match part {
-                    TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
-                        work.push((BodyRecord::Expr(expr), child_depth));
-                    }
-                    TemplatePart::OptionField { access, .. }
-                    | TemplatePart::OptionStructField { access, .. }
-                    | TemplatePart::StructArrayField { access, .. }
-                    | TemplatePart::ScalarArrayField { access, .. }
-                    | TemplatePart::UnionValue { access, .. } => {
-                        work.push((BodyRecord::Expr(access), child_depth));
-                    }
-                    TemplatePart::Text(_) | TemplatePart::PopComma => {}
-                },
-                BodyRecord::Expr(expr) => match &expr.kind {
-                    ExprKind::Unit
-                    | ExprKind::Int(_)
-                    | ExprKind::Float(_)
-                    | ExprKind::Char(_)
-                    | ExprKind::Str(_)
-                    | ExprKind::Bool(_)
-                    | ExprKind::Local(_)
-                    | ExprKind::FnValue(_)
-                    | ExprKind::Wait
-                    | ExprKind::Field { .. }
-                    | ExprKind::SoaColumn { .. }
-                    | ExprKind::IndexField { .. }
-                    | ExprKind::OptionNone
-                    | ExprKind::ArrayGroupAgg { .. }
-                    | ExprKind::ArrayGroupAggMulti { .. }
-                    | ExprKind::ArrayDictEncode { .. }
-                    | ExprKind::ReaderStdin
-                    | ExprKind::WriterStd { .. }
-                    | ExprKind::ArrayBuilderNew { .. }
-                    | ExprKind::TimeNow
-                    | ExprKind::TimeInstant
-                    | ExprKind::ProcessCpuCount
-                    | ExprKind::ProcessAbort
-                    | ExprKind::RandSeed
-                    | ExprKind::HttpClient => {}
-                    ExprKind::Unary { expr, .. }
-                    | ExprKind::Cast(expr)
-                    | ExprKind::TaskGet(expr)
-                    | ExprKind::OptionSome(expr)
-                    | ExprKind::ResultOk(expr)
-                    | ExprKind::ResultErr(expr)
-                    | ExprKind::Try(expr)
-                    | ExprKind::RawAlloc(expr)
-                    | ExprKind::RawFree(expr)
-                    | ExprKind::HeapNew(expr)
-                    | ExprKind::BoxGet(expr)
-                    | ExprKind::BoxClone(expr)
-                    | ExprKind::StrClone(expr)
-                    | ExprKind::StrBorrow(expr)
-                    | ExprKind::BuilderToString(expr)
-                    | ExprKind::ArrayToSlice(expr)
-                    | ExprKind::Len(expr)
-                    | ExprKind::ArrayBuilderBuild(expr) => {
-                        work.push((BodyRecord::Expr(expr), child_depth));
-                    }
-                    ExprKind::Binary { lhs, rhs, .. }
-                    | ExprKind::IntArith { lhs, rhs, .. }
-                    | ExprKind::ResultMapErr {
-                        result: lhs,
-                        f: rhs,
-                    }
-                    | ExprKind::RawLoad {
-                        ptr: lhs,
-                        offset: rhs,
-                        ..
-                    }
-                    | ExprKind::RawOffset {
-                        ptr: lhs,
-                        offset: rhs,
-                    }
-                    | ExprKind::StrPredicate {
-                        haystack: lhs,
-                        needle: rhs,
-                        ..
-                    }
-                    | ExprKind::BuilderWrite {
-                        builder: lhs,
-                        arg: rhs,
-                        ..
-                    }
-                    | ExprKind::ArrayDot { a: lhs, b: rhs, .. }
-                    | ExprKind::ArrayChunks {
-                        source: lhs,
-                        n: rhs,
-                        ..
-                    }
-                    | ExprKind::Index {
-                        recv: lhs,
-                        index: rhs,
-                    }
-                    | ExprKind::ElemField {
-                        recv: lhs,
-                        index: rhs,
-                        ..
-                    }
-                    | ExprKind::JsonDocGet { doc: lhs, key: rhs }
-                    | ExprKind::JsonDocAt {
-                        doc: lhs,
-                        index: rhs,
-                    }
-                    | ExprKind::JsonDocKey {
-                        doc: lhs,
-                        index: rhs,
-                    }
-                    | ExprKind::ReaderRead {
-                        reader: lhs,
-                        buffer: rhs,
-                    }
-                    | ExprKind::ReaderReadLine {
-                        reader: lhs,
-                        buffer: rhs,
-                    }
-                    | ExprKind::WriterWrite {
-                        writer: lhs,
-                        arg: rhs,
-                        ..
-                    }
-                    | ExprKind::IoCopy {
-                        reader: lhs,
-                        writer: rhs,
-                    }
-                    | ExprKind::BufferPut {
-                        buffer: lhs,
-                        value: rhs,
-                        ..
-                    }
-                    | ExprKind::BufferAppend {
-                        buffer: lhs,
-                        data: rhs,
-                    }
-                    | ExprKind::ArrayBuilderPush {
-                        builder: lhs,
-                        value: rhs,
-                        ..
-                    }
-                    | ExprKind::ArrayBuilderAppend {
-                        builder: lhs,
-                        data: rhs,
-                    }
-                    | ExprKind::FsWriteFile {
-                        path: lhs,
-                        data: rhs,
-                        ..
-                    }
-                    | ExprKind::TcpConnect {
-                        host: lhs,
-                        port: rhs,
-                    }
-                    | ExprKind::TcpReadTimeout { conn: lhs, ns: rhs }
-                    | ExprKind::TcpWriteTimeout { conn: lhs, ns: rhs }
-                    | ExprKind::TcpListen {
-                        host: lhs,
-                        port: rhs,
-                    }
-                    | ExprKind::UdpBind {
-                        host: lhs,
-                        port: rhs,
-                    }
-                    | ExprKind::UdpRecvFrom {
-                        sock: lhs,
-                        buffer: rhs,
-                    }
-                    | ExprKind::PathJoin { a: lhs, b: rhs }
-                    | ExprKind::EnvSet {
-                        name: lhs,
-                        value: rhs,
-                    }
-                    | ExprKind::ProcessSpawn {
-                        cmd: lhs,
-                        args: rhs,
-                    }
-                    | ExprKind::ChildKill {
-                        child: lhs,
-                        sig: rhs,
-                    }
-                    | ExprKind::ProcessExec {
-                        cmd: lhs,
-                        args: rhs,
-                    }
-                    | ExprKind::ProcessCommand {
-                        cmd: lhs,
-                        args: rhs,
-                    }
-                    | ExprKind::CommandCwd {
-                        command: lhs,
-                        dir: rhs,
-                    }
-                    | ExprKind::CommandTimeout {
-                        command: lhs,
-                        ns: rhs,
-                    }
-                    | ExprKind::Compress {
-                        data: lhs,
-                        level: rhs,
-                        ..
-                    }
-                    | ExprKind::RegexIsMatch {
-                        regex: lhs,
-                        text: rhs,
-                    }
-                    | ExprKind::RegexFindAll {
-                        regex: lhs,
-                        text: rhs,
-                    }
-                    | ExprKind::RegexSplit {
-                        regex: lhs,
-                        text: rhs,
-                    }
-                    | ExprKind::RegexCaptures {
-                        regex: lhs,
-                        text: rhs,
-                    }
-                    | ExprKind::RegexGroupIndex {
-                        regex: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::CapturesGroup {
-                        caps: lhs,
-                        index: rhs,
-                    }
-                    | ExprKind::CliParse {
-                        cmd: lhs,
-                        args: rhs,
-                    }
-                    | ExprKind::CliGetBool {
-                        parsed: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::CliGetI64 {
-                        parsed: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::CliGetStr {
-                        parsed: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::HttpRequest {
-                        method: lhs,
-                        url: rhs,
-                    }
-                    | ExprKind::HttpBody {
-                        req: lhs,
-                        data: rhs,
-                    }
-                    | ExprKind::HttpRequestTimeout { req: lhs, ns: rhs }
-                    | ExprKind::HttpRespHeader {
-                        resp: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::HttpClientTimeout {
-                        client: lhs,
-                        ns: rhs,
-                    }
-                    | ExprKind::HttpClientGet {
-                        client: lhs,
-                        url: rhs,
-                    }
-                    | ExprKind::HttpClientRequest {
-                        client: lhs,
-                        req: rhs,
-                    }
-                    | ExprKind::HttpCtxHeader {
-                        headers: lhs,
-                        name: rhs,
-                    }
-                    | ExprKind::HttpRbBody { rb: lhs, data: rhs }
-                    | ExprKind::HttpRespond { ctx: lhs, rb: rhs }
-                    | ExprKind::HttpRespondStream { ctx: lhs, rb: rhs }
-                    | ExprKind::HttpStreamSend {
-                        stream: lhs,
-                        chunk: rhs,
-                        ..
-                    }
-                    | ExprKind::HttpStreamReject {
-                        stream: lhs,
-                        rb: rhs,
-                    }
-                    | ExprKind::CryptoCtEqual { a: lhs, b: rhs }
-                    | ExprKind::CryptoHmac {
-                        key: lhs,
-                        data: rhs,
-                    } => {
-                        work.push((BodyRecord::Expr(lhs), child_depth));
-                        work.push((BodyRecord::Expr(rhs), child_depth));
-                    }
-                    ExprKind::MathOp { operands, .. }
-                    | ExprKind::Closure {
-                        captures: operands, ..
-                    }
-                    | ExprKind::EnumValue {
-                        payload: operands, ..
-                    }
-                    | ExprKind::Call { args: operands, .. }
-                    | ExprKind::StructLit {
-                        fields: operands, ..
-                    }
-                    | ExprKind::Tuple {
-                        elems: operands, ..
-                    }
-                    | ExprKind::ArrayLit {
-                        elems: operands, ..
-                    }
-                    | ExprKind::ConstArray {
-                        elems: operands, ..
-                    }
-                    | ExprKind::ArrayZip {
-                        sources: operands, ..
-                    }
-                    | ExprKind::VecLit {
-                        elems: operands, ..
-                    } => {
-                        work.extend(
-                            operands
-                                .iter()
-                                .map(|operand| (BodyRecord::Expr(operand), child_depth)),
-                        );
-                    }
-                    ExprKind::CallFnValue { callee, args } => {
-                        work.push((BodyRecord::Expr(callee), child_depth));
-                        work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
-                    }
-                    ExprKind::TaskGroup(block)
-                    | ExprKind::Block(block)
-                    | ExprKind::Arena(block)
-                    | ExprKind::Unsafe(block) => {
-                        work.push((BodyRecord::Block(block), child_depth));
-                    }
-                    ExprKind::Loop { body, .. } => {
-                        work.push((BodyRecord::Block(body), child_depth));
-                    }
-                    ExprKind::Match { scrutinee, arms } => {
-                        work.push((BodyRecord::Expr(scrutinee), child_depth));
-                        work.extend(arms.iter().map(|arm| {
-                            (
-                                BodyRecord::MatchArm { scrutinee, arm },
-                                child_depth,
-                            )
-                        }));
-                    }
-                    ExprKind::Spawn { closure, .. } => {
-                        work.push((BodyRecord::Expr(closure), child_depth));
-                    }
-                    ExprKind::If { cond, then, els } => {
-                        work.push((BodyRecord::Expr(cond), child_depth));
-                        work.push((BodyRecord::Block(then), child_depth));
-                        work.push((BodyRecord::Block(els), child_depth));
-                    }
-                    ExprKind::TupleIndex { recv, .. }
-                    | ExprKind::StrTrim { recv, .. }
-                    | ExprKind::ArrayToSoa { source: recv, .. }
-                    | ExprKind::JsonDecode { input: recv, .. }
-                    | ExprKind::JsonDecodeArray { input: recv, .. }
-                    | ExprKind::JsonDecodeScalar { input: recv, .. }
-                    | ExprKind::JsonDecodeStructArray { input: recv, .. }
-                    | ExprKind::JsonDecodeSoa { input: recv, .. }
-                    | ExprKind::JsonDecodeUnion { input: recv, .. }
-                    | ExprKind::JsonDoc { input: recv }
-                    | ExprKind::JsonDocKind { doc: recv }
-                    | ExprKind::JsonDocAsStr { doc: recv }
-                    | ExprKind::JsonDocAsScalar { doc: recv, .. }
-                    | ExprKind::JsonDocLen { doc: recv }
-                    | ExprKind::JsonDocElems { doc: recv }
-                    | ExprKind::JsonScan { input: recv, .. }
-                    | ExprKind::FsReadFile { path: recv }
-                    | ExprKind::ReaderOpen { path: recv }
-                    | ExprKind::WriterCreate { path: recv }
-                    | ExprKind::ReaderBuffered { reader: recv }
-                    | ExprKind::BytesAsStr { bytes: recv }
-                    | ExprKind::WriterFlush { writer: recv }
-                    | ExprKind::FileCreateRw { path: recv }
-                    | ExprKind::FileOpenRw { path: recv }
-                    | ExprKind::FileLen { file: recv }
-                    | ExprKind::BufferNew { capacity: recv }
-                    | ExprKind::BufferBytes { buffer: recv }
-                    | ExprKind::StrBytes { inner: recv }
-                    | ExprKind::BufferLen { buffer: recv }
-                    | ExprKind::FsExists { path: recv }
-                    | ExprKind::FsRemove { path: recv }
-                    | ExprKind::FsReadDir { path: recv }
-                    | ExprKind::DnsResolve { host: recv }
-                    | ExprKind::ConnReader { conn: recv }
-                    | ExprKind::ConnWriter { conn: recv }
-                    | ExprKind::TcpAccept { listener: recv }
-                    | ExprKind::FsReadFileView { path: recv }
-                    | ExprKind::FsReadBytesView { path: recv }
-                    | ExprKind::PathComponent { path: recv, .. }
-                    | ExprKind::PathNormalize { path: recv }
-                    | ExprKind::EnvGet { name: recv }
-                    | ExprKind::TimeSleep { ns: recv }
-                    | ExprKind::ProcessExit { code: recv }
-                    | ExprKind::ChildWait { child: recv }
-                    | ExprKind::CommandEnvClear { command: recv }
-                    | ExprKind::CommandRun { command: recv }
-                    | ExprKind::RunOutputCode { out: recv }
-                    | ExprKind::RunOutputStdout { out: recv }
-                    | ExprKind::RunOutputStderr { out: recv }
-                    | ExprKind::EncodingEncode { data: recv, .. }
-                    | ExprKind::EncodingDecode { input: recv, .. }
-                    | ExprKind::Utf8Valid { data: recv }
-                    | ExprKind::Decompress { data: recv, .. }
-                    | ExprKind::RandSeedWith { seed: recv }
-                    | ExprKind::RandNext { rng: recv }
-                    | ExprKind::RegexCompile { pattern: recv }
-                    | ExprKind::RegexGroupCount { regex: recv }
-                    | ExprKind::CliCommand { name: recv }
-                    | ExprKind::CliUsage { cmd: recv }
-                    | ExprKind::HttpParse { data: recv }
-                    | ExprKind::HttpRespStatus { resp: recv }
-                    | ExprKind::HttpRespBody { resp: recv }
-                    | ExprKind::HttpAccept { server: recv }
-                    | ExprKind::HttpCtxMethod { ctx: recv }
-                    | ExprKind::HttpCtxPath { ctx: recv }
-                    | ExprKind::HttpCtxHeaders { ctx: recv }
-                    | ExprKind::HttpCtxBody { ctx: recv }
-                    | ExprKind::HttpResponseBuilder { status: recv }
-                    | ExprKind::HttpStreamFinish { stream: recv }
-                    | ExprKind::CryptoRandom { out: recv }
-                    | ExprKind::CryptoHash { data: recv, .. } => {
-                        work.push((BodyRecord::Expr(recv), child_depth));
-                    }
-                    ExprKind::ElseUnwrap { opt, fallback } => {
-                        work.push((BodyRecord::Expr(opt), child_depth));
-                        work.push((BodyRecord::Expr(fallback), child_depth));
-                    }
-                    ExprKind::RawStore { ptr, offset, value }
-                    | ExprKind::Select {
-                        mask: ptr,
-                        a: offset,
-                        b: value,
-                    }
-                    | ExprKind::VecStore {
-                        dst: ptr,
-                        index: offset,
-                        value,
-                        ..
-                    }
-                    | ExprKind::RegexReplace {
-                        regex: ptr,
-                        text: offset,
-                        repl: value,
-                        ..
-                    }
-                    | ExprKind::HttpHeader {
-                        req: ptr,
-                        name: offset,
-                        value,
-                    }
-                    | ExprKind::HttpClientPost {
-                        client: ptr,
-                        url: offset,
-                        body: value,
-                    }
-                    | ExprKind::HttpRbHeader {
-                        rb: ptr,
-                        name: offset,
-                        value,
-                    } => {
-                        work.push((BodyRecord::Expr(ptr), child_depth));
-                        work.push((BodyRecord::Expr(offset), child_depth));
-                        work.push((BodyRecord::Expr(value), child_depth));
-                    }
-                    ExprKind::BuilderNew { capacity } => {
-                        if let Some(value) = capacity.as_deref() {
-                            work.push((BodyRecord::Expr(value), child_depth));
-                        }
-                    }
-                    ExprKind::RegexFind { regex, text, start } => {
-                        work.push((BodyRecord::Expr(regex), child_depth));
-                        work.push((BodyRecord::Expr(text), child_depth));
-                        if let Some(start) = start.as_deref() {
-                            work.push((BodyRecord::Expr(start), child_depth));
-                        }
-                    }
-                    ExprKind::CliFlag {
-                        cmd, name, default, ..
-                    } => {
-                        work.push((BodyRecord::Expr(cmd), child_depth));
-                        work.push((BodyRecord::Expr(name), child_depth));
-                        if let Some(default) = default.as_deref() {
-                            work.push((BodyRecord::Expr(default), child_depth));
-                        }
-                    }
-                    ExprKind::SliceRange { recv, start, end } => {
-                        work.push((BodyRecord::Expr(recv), child_depth));
-                        if let Some(start) = start.as_deref() {
-                            work.push((BodyRecord::Expr(start), child_depth));
-                        }
-                        if let Some(end) = end.as_deref() {
-                            work.push((BodyRecord::Expr(end), child_depth));
-                        }
-                    }
-                    ExprKind::VecSumWhere { vec, mask } => {
-                        work.push((BodyRecord::Expr(vec), child_depth));
-                        work.push((BodyRecord::Expr(mask), child_depth));
-                    }
-                    ExprKind::VecDot { a, b } => {
-                        work.push((BodyRecord::Expr(a), child_depth));
-                        work.push((BodyRecord::Expr(b), child_depth));
-                    }
-                    ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec } => {
-                        work.push((BodyRecord::Expr(vec), child_depth));
-                    }
-                    ExprKind::VecLoad { src, index, .. } => {
-                        work.push((BodyRecord::Expr(src), child_depth));
-                        work.push((BodyRecord::Expr(index), child_depth));
-                    }
-                    ExprKind::ArraySum { source, stages }
-                    | ExprKind::ArrayCount { source, stages }
-                    | ExprKind::ArrayMinMax { source, stages, .. }
-                    | ExprKind::ArraySort { source, stages, .. }
-                    | ExprKind::ArrayToArray { source, stages, .. } => {
-                        work.push((BodyRecord::Expr(source), child_depth));
-                        work.extend(
-                            stages
-                                .iter()
-                                .map(|stage| (BodyRecord::Stage(stage), child_depth)),
-                        );
-                    }
-                    ExprKind::ArrayAnyAll {
-                        source,
-                        stages,
-                        captures,
-                        ..
-                    }
-                    | ExprKind::ArraySortBy {
-                        source,
-                        stages,
-                        captures,
-                        ..
-                    }
-                    | ExprKind::ArrayPartition {
-                        source,
-                        stages,
-                        captures,
-                        ..
-                    }
-                    | ExprKind::ArrayParMap {
-                        source,
-                        stages,
-                        captures,
-                        ..
-                    } => {
-                        work.push((BodyRecord::Expr(source), child_depth));
-                        work.extend(
-                            stages
-                                .iter()
-                                .map(|stage| (BodyRecord::Stage(stage), child_depth)),
-                        );
-                        work.extend(
-                            captures
-                                .iter()
-                                .map(|capture| (BodyRecord::Expr(capture), child_depth)),
-                        );
-                    }
-                    ExprKind::ArrayReduce {
-                        source,
-                        stages,
-                        captures,
-                        init,
-                        ..
-                    }
-                    | ExprKind::ArrayScan {
-                        source,
-                        stages,
-                        captures,
-                        init,
-                        ..
-                    } => {
-                        work.push((BodyRecord::Expr(source), child_depth));
-                        work.extend(
-                            stages
-                                .iter()
-                                .map(|stage| (BodyRecord::Stage(stage), child_depth)),
-                        );
-                        work.extend(
-                            captures
-                                .iter()
-                                .map(|capture| (BodyRecord::Expr(capture), child_depth)),
-                        );
-                        work.push((BodyRecord::Expr(init), child_depth));
-                    }
-                    ExprKind::ArrayMapInto {
-                        source,
-                        stages,
-                        dst,
-                        ..
-                    } => {
-                        work.push((BodyRecord::Expr(source), child_depth));
-                        work.extend(
-                            stages
-                                .iter()
-                                .map(|stage| (BodyRecord::Stage(stage), child_depth)),
-                        );
-                        work.push((BodyRecord::Expr(dst), child_depth));
-                    }
-                    ExprKind::Template(parts) => {
-                        work.extend(
-                            parts
-                                .iter()
-                                .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
-                        );
-                    }
-                    ExprKind::FilePread {
-                        file,
-                        buffer,
-                        offset,
-                    }
-                    | ExprKind::FilePwrite {
-                        file,
-                        data: buffer,
-                        offset,
-                    } => {
-                        work.push((BodyRecord::Expr(file), child_depth));
-                        work.push((BodyRecord::Expr(buffer), child_depth));
-                        work.push((BodyRecord::Expr(offset), child_depth));
-                    }
-                    ExprKind::BytesRead { bytes, offset, .. } => {
-                        work.push((BodyRecord::Expr(bytes), child_depth));
-                        work.push((BodyRecord::Expr(offset), child_depth));
-                    }
-                    ExprKind::UdpSendTo {
-                        sock,
-                        data,
-                        host,
-                        port,
-                    } => {
-                        work.push((BodyRecord::Expr(sock), child_depth));
-                        work.push((BodyRecord::Expr(data), child_depth));
-                        work.push((BodyRecord::Expr(host), child_depth));
-                        work.push((BodyRecord::Expr(port), child_depth));
-                    }
-                    ExprKind::CommandEnv {
-                        command,
-                        name,
-                        value,
-                    } => {
-                        work.push((BodyRecord::Expr(command), child_depth));
-                        work.push((BodyRecord::Expr(name), child_depth));
-                        work.push((BodyRecord::Expr(value), child_depth));
-                    }
-                    ExprKind::RandRange { rng, lo, hi } => {
-                        work.push((BodyRecord::Expr(rng), child_depth));
-                        work.push((BodyRecord::Expr(lo), child_depth));
-                        work.push((BodyRecord::Expr(hi), child_depth));
-                    }
-                    ExprKind::RandShuffle { rng, xs, .. } => {
-                        work.push((BodyRecord::Expr(rng), child_depth));
-                        work.push((BodyRecord::Expr(xs), child_depth));
-                    }
-                    ExprKind::RandSample { rng, xs, k, .. } => {
-                        work.push((BodyRecord::Expr(rng), child_depth));
-                        work.push((BodyRecord::Expr(xs), child_depth));
-                        work.push((BodyRecord::Expr(k), child_depth));
-                    }
-                    ExprKind::HttpGetMany {
-                        client,
-                        urls,
-                        max_concurrency,
-                    } => {
-                        work.push((BodyRecord::Expr(client), child_depth));
-                        work.push((BodyRecord::Expr(urls), child_depth));
-                        work.push((BodyRecord::Expr(max_concurrency), child_depth));
-                    }
-                    ExprKind::HttpServe { host, port, .. } => {
-                        work.push((BodyRecord::Expr(host), child_depth));
-                        work.push((BodyRecord::Expr(port), child_depth));
-                    }
-                    ExprKind::CryptoHkdf {
-                        salt,
-                        ikm,
-                        info,
-                        len,
-                    } => {
-                        work.push((BodyRecord::Expr(salt), child_depth));
-                        work.push((BodyRecord::Expr(ikm), child_depth));
-                        work.push((BodyRecord::Expr(info), child_depth));
-                        work.push((BodyRecord::Expr(len), child_depth));
-                    }
-                    ExprKind::CryptoAead {
-                        key,
-                        nonce,
-                        input,
-                        aad,
-                        ..
-                    } => {
-                        work.push((BodyRecord::Expr(key), child_depth));
-                        work.push((BodyRecord::Expr(nonce), child_depth));
-                        work.push((BodyRecord::Expr(input), child_depth));
-                        work.push((BodyRecord::Expr(aad), child_depth));
-                    }
-                    ExprKind::CryptoArgon2 {
-                        password,
-                        salt,
-                        params,
-                    } => {
-                        work.push((BodyRecord::Expr(password), child_depth));
-                        work.push((BodyRecord::Expr(salt), child_depth));
-                        work.push((BodyRecord::Expr(params), child_depth));
-                    }
-                },
-            }
-            let mut expression_children_completed = true;
-            if reachable_only {
-                let first_diverging = work[child_start..]
-                    .iter()
-                    .position(|(child, _)| transparent_record_diverges(*child));
-                if let Some(index) = first_diverging {
-                    expression_children_completed =
-                        !record_is_strict_expression_child(work[child_start + index].0);
-                    work.truncate(child_start + index + 1);
                 }
-            }
-            if let Some(stmt) = exit_stmt {
-                work.push((BodyRecord::StmtExit(stmt), depth));
-            }
-            if let Some(expr) = exit_expr {
-                work.push((
-                    BodyRecord::ExprExit {
-                        expression: expr,
-                        children_completed: expression_children_completed,
-                    },
-                    depth,
-                ));
-            }
-            // Children were appended in producer order. Reverse only this record's suffix so the
-            // LIFO worklist completes the first child before starting the next one.
-            work[child_start..].reverse();
+                ExprKind::SliceRange { recv, start, end } => {
+                    work.push((BodyRecord::Expr(recv), child_depth));
+                    if let Some(start) = start.as_deref() {
+                        work.push((BodyRecord::Expr(start), child_depth));
+                    }
+                    if let Some(end) = end.as_deref() {
+                        work.push((BodyRecord::Expr(end), child_depth));
+                    }
+                }
+                ExprKind::VecSumWhere { vec, mask } => {
+                    work.push((BodyRecord::Expr(vec), child_depth));
+                    work.push((BodyRecord::Expr(mask), child_depth));
+                }
+                ExprKind::VecDot { a, b } => {
+                    work.push((BodyRecord::Expr(a), child_depth));
+                    work.push((BodyRecord::Expr(b), child_depth));
+                }
+                ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec } => {
+                    work.push((BodyRecord::Expr(vec), child_depth));
+                }
+                ExprKind::VecLoad { src, index, .. } => {
+                    work.push((BodyRecord::Expr(src), child_depth));
+                    work.push((BodyRecord::Expr(index), child_depth));
+                }
+                ExprKind::ArraySum { source, stages }
+                | ExprKind::ArrayCount { source, stages }
+                | ExprKind::ArrayMinMax { source, stages, .. }
+                | ExprKind::ArraySort { source, stages, .. }
+                | ExprKind::ArrayToArray { source, stages, .. } => {
+                    work.push((BodyRecord::Expr(source), child_depth));
+                    work.extend(
+                        stages
+                            .iter()
+                            .map(|stage| (BodyRecord::Stage(stage), child_depth)),
+                    );
+                }
+                ExprKind::ArrayAnyAll {
+                    source,
+                    stages,
+                    captures,
+                    ..
+                }
+                | ExprKind::ArraySortBy {
+                    source,
+                    stages,
+                    captures,
+                    ..
+                }
+                | ExprKind::ArrayPartition {
+                    source,
+                    stages,
+                    captures,
+                    ..
+                }
+                | ExprKind::ArrayParMap {
+                    source,
+                    stages,
+                    captures,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(source), child_depth));
+                    work.extend(
+                        stages
+                            .iter()
+                            .map(|stage| (BodyRecord::Stage(stage), child_depth)),
+                    );
+                    work.extend(
+                        captures
+                            .iter()
+                            .map(|capture| (BodyRecord::Expr(capture), child_depth)),
+                    );
+                }
+                ExprKind::ArrayReduce {
+                    source,
+                    stages,
+                    captures,
+                    init,
+                    ..
+                }
+                | ExprKind::ArrayScan {
+                    source,
+                    stages,
+                    captures,
+                    init,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(source), child_depth));
+                    work.extend(
+                        stages
+                            .iter()
+                            .map(|stage| (BodyRecord::Stage(stage), child_depth)),
+                    );
+                    work.extend(
+                        captures
+                            .iter()
+                            .map(|capture| (BodyRecord::Expr(capture), child_depth)),
+                    );
+                    work.push((BodyRecord::Expr(init), child_depth));
+                }
+                ExprKind::ArrayMapInto {
+                    source,
+                    stages,
+                    dst,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(source), child_depth));
+                    work.extend(
+                        stages
+                            .iter()
+                            .map(|stage| (BodyRecord::Stage(stage), child_depth)),
+                    );
+                    work.push((BodyRecord::Expr(dst), child_depth));
+                }
+                ExprKind::Template(parts) => {
+                    work.extend(
+                        parts
+                            .iter()
+                            .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
+                    );
+                }
+                ExprKind::FilePread {
+                    file,
+                    buffer,
+                    offset,
+                }
+                | ExprKind::FilePwrite {
+                    file,
+                    data: buffer,
+                    offset,
+                } => {
+                    work.push((BodyRecord::Expr(file), child_depth));
+                    work.push((BodyRecord::Expr(buffer), child_depth));
+                    work.push((BodyRecord::Expr(offset), child_depth));
+                }
+                ExprKind::BytesRead { bytes, offset, .. } => {
+                    work.push((BodyRecord::Expr(bytes), child_depth));
+                    work.push((BodyRecord::Expr(offset), child_depth));
+                }
+                ExprKind::UdpSendTo {
+                    sock,
+                    data,
+                    host,
+                    port,
+                } => {
+                    work.push((BodyRecord::Expr(sock), child_depth));
+                    work.push((BodyRecord::Expr(data), child_depth));
+                    work.push((BodyRecord::Expr(host), child_depth));
+                    work.push((BodyRecord::Expr(port), child_depth));
+                }
+                ExprKind::CommandEnv {
+                    command,
+                    name,
+                    value,
+                } => {
+                    work.push((BodyRecord::Expr(command), child_depth));
+                    work.push((BodyRecord::Expr(name), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::RandRange { rng, lo, hi } => {
+                    work.push((BodyRecord::Expr(rng), child_depth));
+                    work.push((BodyRecord::Expr(lo), child_depth));
+                    work.push((BodyRecord::Expr(hi), child_depth));
+                }
+                ExprKind::RandShuffle { rng, xs, .. } => {
+                    work.push((BodyRecord::Expr(rng), child_depth));
+                    work.push((BodyRecord::Expr(xs), child_depth));
+                }
+                ExprKind::RandSample { rng, xs, k, .. } => {
+                    work.push((BodyRecord::Expr(rng), child_depth));
+                    work.push((BodyRecord::Expr(xs), child_depth));
+                    work.push((BodyRecord::Expr(k), child_depth));
+                }
+                ExprKind::HttpGetMany {
+                    client,
+                    urls,
+                    max_concurrency,
+                } => {
+                    work.push((BodyRecord::Expr(client), child_depth));
+                    work.push((BodyRecord::Expr(urls), child_depth));
+                    work.push((BodyRecord::Expr(max_concurrency), child_depth));
+                }
+                ExprKind::HttpServe { host, port, .. } => {
+                    work.push((BodyRecord::Expr(host), child_depth));
+                    work.push((BodyRecord::Expr(port), child_depth));
+                }
+                ExprKind::CryptoHkdf {
+                    salt,
+                    ikm,
+                    info,
+                    len,
+                } => {
+                    work.push((BodyRecord::Expr(salt), child_depth));
+                    work.push((BodyRecord::Expr(ikm), child_depth));
+                    work.push((BodyRecord::Expr(info), child_depth));
+                    work.push((BodyRecord::Expr(len), child_depth));
+                }
+                ExprKind::CryptoAead {
+                    key,
+                    nonce,
+                    input,
+                    aad,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(key), child_depth));
+                    work.push((BodyRecord::Expr(nonce), child_depth));
+                    work.push((BodyRecord::Expr(input), child_depth));
+                    work.push((BodyRecord::Expr(aad), child_depth));
+                }
+                ExprKind::CryptoArgon2 {
+                    password,
+                    salt,
+                    params,
+                } => {
+                    work.push((BodyRecord::Expr(password), child_depth));
+                    work.push((BodyRecord::Expr(salt), child_depth));
+                    work.push((BodyRecord::Expr(params), child_depth));
+                }
+            },
+            BodyRecord::BlockExit { .. }
+            | BodyRecord::StmtExit { .. }
+            | BodyRecord::ExprExit { .. }
+            | BodyRecord::MatchArmExit { .. }
+            | BodyRecord::StageExit { .. }
+            | BodyRecord::TemplatePartExit { .. } => {}
         }
+        let mut expression_children_completed = true;
+        if reachable_only {
+            let first_diverging = work[child_start..]
+                .iter()
+                .position(|(child, _)| transparent_record_diverges(*child));
+            if let Some(index) = first_diverging {
+                expression_children_completed =
+                    !record_is_strict_expression_child(work[child_start + index].0);
+                work.truncate(child_start + index + 1);
+            }
+        }
+        work.push((
+            exit_record(record, clone_id, expression_children_completed),
+            depth,
+        ));
+        // Children were appended in producer order. Reverse only this record's suffix so the
+        // LIFO worklist completes the first child before starting the next one.
+        work[child_start..].reverse();
+    }
     true
 }
 
@@ -965,6 +1066,7 @@ pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
         BodyRecord::Expr(root),
         usize::MAX,
         Some(&mut events),
+        None,
         false,
         None,
     );
@@ -972,9 +1074,7 @@ pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
     events
         .into_iter()
         .filter_map(|event| match event {
-            BodyEvent::ExprExit { expression, .. } => {
-                Some(expression as *const Expr as *mut Expr)
-            }
+            BodyEvent::ExprExit { expression, .. } => Some(expression as *const Expr as *mut Expr),
             BodyEvent::StmtEnter(_)
             | BodyEvent::StmtExit(_)
             | BodyEvent::ExprEnter(_)
@@ -990,6 +1090,7 @@ pub(crate) fn expr_postorder(root: &Expr) -> Vec<&Expr> {
         BodyRecord::Expr(root),
         usize::MAX,
         Some(&mut events),
+        None,
         false,
         None,
     );
@@ -1018,6 +1119,7 @@ pub fn direct_expr_children(root: &Expr) -> Vec<&Expr> {
         BodyRecord::Expr(root),
         usize::MAX,
         Some(&mut events),
+        None,
         false,
         Some(root),
     );
@@ -1038,9 +1140,7 @@ pub fn direct_expr_children(root: &Expr) -> Vec<&Expr> {
                     .checked_sub(1)
                     .expect("expression exits follow their enters");
             }
-            BodyEvent::StmtEnter(_)
-            | BodyEvent::StmtExit(_)
-            | BodyEvent::MatchArmEnter { .. } => {}
+            BodyEvent::StmtEnter(_) | BodyEvent::StmtExit(_) | BodyEvent::MatchArmEnter { .. } => {}
         }
     }
     debug_assert_eq!(expression_depth, 0);
@@ -1053,11 +1153,32 @@ pub(crate) fn body_events(root: &Block) -> Vec<BodyEvent<'_>> {
         BodyRecord::Block(root),
         usize::MAX,
         Some(&mut events),
+        None,
         false,
         None,
     );
     debug_assert!(valid);
     events
+}
+
+/// Full numeric enter/exit frames for iterative HIR reconstruction.
+///
+/// Unlike the analysis event stream, this includes blocks, statements, stages, template parts,
+/// and match arms. Each occurrence receives a monotone frame id, so a consumer can rebuild or
+/// tear down the owned tree without using source spans or address identity.
+pub(crate) fn clone_events(root: &Block) -> Option<Vec<CloneEvent<'_>>> {
+    let mut events = Vec::new();
+    if !walk_body_records(
+        BodyRecord::Block(root),
+        usize::MAX,
+        None,
+        Some(&mut events),
+        false,
+        None,
+    ) {
+        return None;
+    }
+    Some(events)
 }
 
 /// Source-order enter/exit events with unreachable siblings removed after a diverging child.
@@ -1071,6 +1192,7 @@ pub(crate) fn reachable_body_events(root: &Block) -> Vec<BodyEvent<'_>> {
         BodyRecord::Block(root),
         usize::MAX,
         Some(&mut events),
+        None,
         true,
         None,
     );
@@ -1213,7 +1335,10 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep".to_string(),
-                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
                 params: Vec::new(),
                 param_modes: Vec::new(),
                 ret: int_ty(),
@@ -1268,7 +1393,10 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move".to_string(),
-                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret: result_ty,
@@ -1333,7 +1461,10 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_call".to_string(),
-                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret: Ty::String,
@@ -1400,7 +1531,10 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_shape".to_string(),
-                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret,
@@ -1434,9 +1568,7 @@ mod tests {
         }
     }
 
-    fn move_control_program_at_boundary(
-        shape: MoveControlShape,
-    ) -> hir::Program {
+    fn move_control_program_at_boundary(shape: MoveControlShape) -> hir::Program {
         let span = Span::new(0, 0, 0);
         let target_expression_depth = MAX_CHECKED_HIR_DEPTH - 1;
         let delta = match shape {
@@ -1683,31 +1815,27 @@ mod tests {
                     }],
                     value: None,
                 }),
-                MoveControlShape::BlockAssign => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::Assign {
-                            local: 0,
-                            value: expression,
-                            drop_old: std::cell::Cell::new(false),
-                            drop_new: std::cell::Cell::new(false),
-                        }],
-                        value: None,
-                    })
-                }
+                MoveControlShape::BlockAssign => ExprKind::Block(Block {
+                    stmts: vec![Stmt::Assign {
+                        local: 0,
+                        value: expression,
+                        drop_old: std::cell::Cell::new(false),
+                        drop_new: std::cell::Cell::new(false),
+                    }],
+                    value: None,
+                }),
                 MoveControlShape::BlockReturn => ExprKind::Block(Block {
                     stmts: vec![Stmt::Return(Some(expression))],
                     value: None,
                 }),
-                MoveControlShape::BlockLetTuple => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::LetTuple {
-                            locals: vec![Some(0)],
-                            tuple_id: 0,
-                            init: expression,
-                        }],
-                        value: None,
-                    })
-                }
+                MoveControlShape::BlockLetTuple => ExprKind::Block(Block {
+                    stmts: vec![Stmt::LetTuple {
+                        locals: vec![Some(0)],
+                        tuple_id: 0,
+                        init: expression,
+                    }],
+                    value: None,
+                }),
                 MoveControlShape::BlockBreak => ExprKind::Block(Block {
                     stmts: vec![Stmt::Break {
                         value: Some(expression),
@@ -1715,86 +1843,71 @@ mod tests {
                     }],
                     value: None,
                 }),
-                MoveControlShape::BlockAssignField => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignField {
-                            root: 0,
-                            path: vec![0],
-                            value: expression,
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockAssignVecLane => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignVecLane {
-                            local: 0,
-                            lane: 0,
-                            value: expression,
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockAssignIndexValue => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignIndex {
-                            base: 0,
-                            index: leaf(),
-                            value: expression,
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockAssignIndexIndex => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignIndex {
-                            base: 0,
-                            index: expression,
-                            value: leaf(),
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockAssignElemValue => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignElem {
-                            base: 0,
-                            index: leaf(),
-                            struct_id: 0,
-                            soa: false,
-                            value: expression,
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockAssignElemIndex => {
-                    ExprKind::Block(Block {
-                        stmts: vec![Stmt::AssignElem {
-                            base: 0,
-                            index: expression,
-                            struct_id: 0,
-                            soa: false,
-                            value: leaf(),
-                        }],
-                        value: None,
-                    })
-                }
-                MoveControlShape::BlockExprSequence => {
-                    ExprKind::Block(Block {
-                        stmts: vec![
-                            Stmt::Expr(leaf()),
-                            Stmt::Expr(expression),
-                            Stmt::Expr(leaf()),
-                        ],
-                        value: None,
-                    })
-                }
+                MoveControlShape::BlockAssignField => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignField {
+                        root: 0,
+                        path: vec![0],
+                        value: expression,
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssignVecLane => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignVecLane {
+                        local: 0,
+                        lane: 0,
+                        value: expression,
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssignIndexValue => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignIndex {
+                        base: 0,
+                        index: leaf(),
+                        value: expression,
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssignIndexIndex => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignIndex {
+                        base: 0,
+                        index: expression,
+                        value: leaf(),
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssignElemValue => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignElem {
+                        base: 0,
+                        index: leaf(),
+                        struct_id: 0,
+                        soa: false,
+                        value: expression,
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockAssignElemIndex => ExprKind::Block(Block {
+                    stmts: vec![Stmt::AssignElem {
+                        base: 0,
+                        index: expression,
+                        struct_id: 0,
+                        soa: false,
+                        value: leaf(),
+                    }],
+                    value: None,
+                }),
+                MoveControlShape::BlockExprSequence => ExprKind::Block(Block {
+                    stmts: vec![
+                        Stmt::Expr(leaf()),
+                        Stmt::Expr(expression),
+                        Stmt::Expr(leaf()),
+                    ],
+                    value: None,
+                }),
             };
             expression = Expr {
                 kind,
                 ty: match shape {
-                    MoveControlShape::ShortCircuit
-                    | MoveControlShape::ShortCircuitLhs => Ty::Bool,
+                    MoveControlShape::ShortCircuit | MoveControlShape::ShortCircuitLhs => Ty::Bool,
                     MoveControlShape::ElseUnwrap
                     | MoveControlShape::ElseOpt
                     | MoveControlShape::If
@@ -1841,7 +1954,10 @@ mod tests {
         hir::Program {
             fns: vec![hir::Fn {
                 name: "deep_move_control".to_string(),
-                origin: hir::FnOrigin::Source { is_entry: false, is_public: false },
+                origin: hir::FnOrigin::Source {
+                    is_entry: false,
+                    is_public: false,
+                },
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 ret,

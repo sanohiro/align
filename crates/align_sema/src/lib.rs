@@ -16,6 +16,7 @@ use align_span::Span;
 pub mod hir;
 pub use hir::*;
 mod hir_depth;
+mod replay_clone;
 mod task_wait;
 pub use hir_depth::{
     MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
@@ -1962,6 +1963,24 @@ fn is_owned_droppable(
         && drop_plan(ty, structs, enums, tagged_types).needs_drop())
         // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
+}
+
+/// Canonical source-impossible local name for an owned `_` in tuple destructuring.
+pub fn tuple_drop_local_name(ordinal: usize) -> String {
+    format!("$tuple_drop{ordinal}")
+}
+
+/// Whether an ignored tuple element needs the hidden local named by [`tuple_drop_local_name`].
+///
+/// Sema formation and checked-HIR validation share this exact predicate; it deliberately excludes
+/// the wider Move-tuple branch in [`needs_drop_flag`].
+pub fn tuple_discard_needs_hidden_local(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    is_owned_droppable(ty, structs, enums, tagged_types)
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
@@ -4929,26 +4948,31 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     if !hir_depth::checked_hir_body_depth_is_valid(program) {
         return false;
     }
-    let mut replay = program.clone();
-    reset_body_analysis_facts(&mut replay);
+    let Some(mut replay) = replay_clone::clone_program(program) else {
+        return false;
+    };
+    let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reset_body_analysis_facts(&mut replay);
 
-    let external_effects: std::collections::HashMap<String, FnEffect> = replay
-        .imported_fns
-        .iter()
-        .map(|function| (function.name.clone(), function.effect))
-        .collect();
-    let mut diags = Diagnostics::new();
-    for function in &replay.fns {
-        task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
-    }
-    infer_return_provenance(&mut replay);
-    run_body_analysis_passes(
-        &mut replay,
-        &external_effects,
-        &mut diags,
-        true,
-    );
-    !diags.has_errors() && body_analysis_facts_equal(program, &replay)
+        let external_effects: std::collections::HashMap<String, FnEffect> = replay
+            .imported_fns
+            .iter()
+            .map(|function| (function.name.clone(), function.effect))
+            .collect();
+        let mut diags = Diagnostics::new();
+        for function in &replay.fns {
+            task_wait::validate(&function.body, &replay.tagged_types, &mut diags);
+        }
+        infer_return_provenance(&mut replay);
+        run_body_analysis_passes(&mut replay, &external_effects, &mut diags, true);
+        let facts_equal = body_analysis_facts_equal(program, &replay);
+        !diags.has_errors() && facts_equal
+    }));
+    replay_clone::drop_program(replay);
+    let Ok(valid) = analysis else {
+        return false;
+    };
+    valid
 }
 
 fn reset_body_analysis_facts(program: &mut Program) {
@@ -19238,7 +19262,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// sibling's binding is never visible here. `_` (discard) never shadows.
     ///
     /// Every user-named binding site must call this before [`Checker::declare`]; synthetic names
-    /// (the `_drop{i}` tuple-drop placeholders, error-recovery declares) skip it deliberately.
+    /// (the `$tuple_drop{i}` tuple-drop placeholders, error-recovery declares) skip it deliberately.
     fn check_shadow(&mut self, name: &str, span: Span, floor: usize) {
         if name == "_" {
             return;
@@ -19649,7 +19673,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bind it to a fresh hidden local so it joins the normal drop path
                                 // (freed once at scope exit, or bulk-freed if arena-regioned). A
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
-                                None if is_owned_droppable(
+                                None if tuple_discard_needs_hidden_local(
                                     ety,
                                     self.structs,
                                     self.enums,
@@ -19657,7 +19681,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 ) =>
                                 {
                                     locals.push(Some(self.declare(
-                                        &format!("_drop{i}"),
+                                        &tuple_drop_local_name(i),
                                         ety,
                                         false,
                                     )));

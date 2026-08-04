@@ -307,10 +307,21 @@ pub fn validate(body: &Block, tagged_types: &[TaggedType], diags: &mut Diagnosti
     if !crate::hir_depth::checked_hir_block_depth_is_valid(body) {
         return;
     }
+    // Bodies without task-group constructs cannot contain a wait proof or a task-read error. Skip
+    // the fixed-point replay so a deeply nested ordinary loop does not consume the task-specific
+    // work budget at the checked-HIR boundary.
+    if !contains_task_wait_construct(body) {
+        return;
+    }
     let Some((node_ids, record_count)) = collect_node_ids(body) else {
         return;
     };
-    let Some(max_replay_steps) = record_count.max(1).checked_mul(MAX_REPLAY_WORK) else {
+    // `record_count` counts body events; replay starts with one synthetic root dispatcher item.
+    let Some(max_replay_steps) = record_count
+        .max(1)
+        .checked_mul(MAX_REPLAY_WORK)
+        .and_then(|bound| bound.checked_add(1))
+    else {
         return;
     };
     let mut analyzer = Analyzer {
@@ -334,6 +345,23 @@ pub fn validate(body: &Block, tagged_types: &[TaggedType], diags: &mut Diagnosti
                 .unwrap_or_else(|| Span::new(0, 0, 0)),
         );
     }
+}
+
+fn contains_task_wait_construct(body: &Block) -> bool {
+    crate::hir_depth::body_events(body)
+        .into_iter()
+        .any(|event| {
+            let crate::hir_depth::BodyEvent::ExprEnter(expression) = event else {
+                return false;
+            };
+            matches!(
+                expression.kind,
+                ExprKind::Spawn { .. }
+                    | ExprKind::TaskGet(_)
+                    | ExprKind::TaskGroup(_)
+                    | ExprKind::Wait
+            )
+        })
 }
 
 fn collect_node_ids(body: &Block) -> Option<(HashMap<usize, NodeId>, usize)> {

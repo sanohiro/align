@@ -41,6 +41,34 @@ The following notation is closed and exact:
 - `L(id)` means `id` is in range, `locals[id].id == id`, and denotes that exact
   local record. `LT(id)` is its type. `M(id)` additionally requires
   `locals[id].is_mut`.
+- `LV(id)` means `L(id)` at a source-lexically visible, definitely initialized
+  use site. Function parameters (including lifted capture parameters) enter at
+  function entry. A `Let`/`LetTuple` initializer is visited before its binding;
+  a successful binding becomes visible for the remainder of its block. Match
+  payload bindings are visible only in that arm body. Leaving a block or arm
+  removes its bindings, and sibling branches do not share them. Every local
+  place root and every direct local/projection/aggregate-base read uses `LV`,
+  while a declaration record itself uses `L` and the binding-order rule above.
+  Every non-discard local name is unique among the parameters and bindings
+  visible at its activation point. Same-scope rebinding and inner shadowing
+  reject; disjoint sibling blocks and match arms may reuse a name after their
+  prior lexical scope exits. `_` remains a non-binding discard spelling. An
+  owned tuple discard is stored with the exact compiler-reserved
+  `$tuple_drop<ordinal>` name returned by
+  `tuple_drop_local_name(ordinal: usize) -> String`; `$` cannot occur in a
+  source identifier. At that exact `LetTuple` ordinal and only when the shared
+  `tuple_discard_needs_hidden_local(Ty, structs, enums, tagged_types) -> bool`
+  producer predicate succeeds, the source-hidden local does not enter the
+  visible-name set. Its id still activates after the initializer, remains
+  initialized until block exit, and retains its exact Drop membership/cleanup.
+  Source-visible `_drop0`, `$tuple_drop00`, a wrong ordinal, and every other
+  near spelling do not satisfy the hidden-record predicate.
+- `MV(id)` means `M(id)` and `LV(id)` for an assignment or other mutable place
+  root. The structural local table alone is not a definite-initialization or
+  lexical-scope proof.
+- Every nonparameter local table record has exactly one `Let`, `LetTuple`, or
+  match-payload binding. An unused orphan record is malformed even when no
+  expression reads it.
 - `B(T)` means a block whose statements validate in stored order and whose
   optional tail validates last. A present tail has type `T`; an absent tail has
   type `Unit`. A block known non-fallthrough may carry the context-selected
@@ -61,6 +89,12 @@ The following notation is closed and exact:
 - `FT(id)` is the in-range `FnTy`; `TAG(id)`, `ENUM(id)`, `STRUCT(id)`, and
   `TUPLE(id)` are the corresponding in-range records already accepted by
   am-g-t/am-p/am-n.
+- `FABI(A,B)` means `A` and `B` are in-range `Ty::Fn` records with the same
+  parameter count, parameter modes, recursively matching scalar parameter and
+  return types, and no comparison of am-b4-owned effect/borrow/region cells.
+  A body expression and its local expected type may use different compiler-local
+  `FnTy` ordinals when `FABI` holds; sema creates such a fresh local cell so its
+  inferred effect can be solved independently.
 - Validation carries an exact lexical `unsafe_depth`, initialized zero for
   every stored function and incremented only while validating the child block
   of `Unsafe`. A `SIG(name)` whose declaration is extern may be invoked by
@@ -238,20 +272,35 @@ the record was present. This predicate is not the structural HIR validator;
 direct callers must supply the checked type, id, header, and body envelope,
 and direct malformed metadata that does not trigger a replay diagnostic or
 legacy panic is outside this predicate's contract.
-The later am-b4 MIR activation gate will call this predicate only after depth,
-global type, placement, nominal/link, and declaration-header validation, and
-before any MIR construction or downstream identity is published. This
-sema-only checkpoint does not activate that gate.
 
-The narrow Request 6 scanner exception is a separate active pre-lowering gate:
-the four MIR lowerers call the private
-`align_mir::hir_program_is_valid(&hir::Program) -> bool`, after the structural
-preflight and before MIR construction. Its
-`validate_hir::json_scan_copy_rows_are_valid` walk rechecks only the scanner
-envelope and canonical row Copy predicate, including imported/per-unit
-reconstructed HIR. It does not call
-`align_sema::checked_hir_body_facts_are_valid`; the latter remains the dormant
-general body replay until am-b4.
+Replay reconstruction is an occurrence-frame protocol, not an identity map. The shared depth
+walk emits monotone numeric `RecordEnter{id}`/`RecordExit{id}` events for every `Block`, `Stmt`,
+`Expr`, `MatchArm`, `Stage`, and `TemplatePart` in producer child order. It does not use `Span`
+or native addresses, so repeated nodes and duplicate spans remain distinct. `replay_clone` has an
+exhaustive reconstruction inventory for every current `ExprKind`, every `Stmt`, every
+`MatchArm`, every `StageKind`, and every `TemplatePart`; child order and all non-child metadata are
+explicit, including assignment `Cell<bool>` flags and `FnTy` summaries/effect cells. A completed
+replay, and any functions completed before a fail-closed clone rejection, are torn down through
+the same heterogeneous worklist, including all owned expression, block, statement, arm, stage,
+and template edges. Structural rejection occurs before replay ownership at the shared gate; the
+teardown is also used after a completed replay whose analysis panics, so those paths do not rely on
+recursive HIR Drop.
+The owner tests `clone_frames_distinguish_repeated_same_span_nodes`,
+`clone_and_drop_are_iterative_for_a_deep_body`, and
+`clone_preserves_fn_type_cells_and_assignment_flags` close the occurrence, deep teardown, and
+metadata/cell rows; `finish_children_rejects_missing_and_extra_children` closes the malformed
+child-cardinality row; `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` closes
+the integration replay and fact-equality row.
+
+The shared am-b4 MIR activation gate runs depth, global type, placement,
+nominal/link, and declaration-header validation first. It then runs the active
+Request 6 `validate_hir::json_scan_validation_reason` envelope/Copy validator,
+the structural body validator, and this replay predicate, in that exact order,
+before any MIR construction or downstream identity is published. The scanner
+walk rechecks only the scanner envelope and canonical row Copy predicate,
+including imported/per-unit reconstructed HIR. A scanner or structural body
+failure therefore wins over replay, and all four lowering entrypoints return
+the canonical empty program.
 
 Am-b4 independently recomputes the existing producer facts rather than
 trusting the stored bits:
@@ -483,24 +532,24 @@ with parent-plus-first-child and first-child-plus-later-child pairs.
 | `MathFn::Trunc` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Pow` | Two operands of one exact scalar `F`; vectors reject; result is that `F`. |
 | `MathFn::Fma` | Exactly three operands of one exact scalar `F` or vector `V(FS,n)`; result equals operand type. |
-| `MatchArm` | `env[variants,bindings]`: variants are distinct in-range tags of the scrutinee sum in preserved source or-pattern order; empty means wildcard. The sum table is the declared user `Enum`, `Option` as ordered `Some(T),None`, or `Result` as ordered `Ok(T),Err(E)`. Wildcard or multi-tag arms have no bindings. A one-tag arm has exactly the selected variant payload count of distinct in-range local ids, whose local types equal payload types and whose locals are scoped to the arm. `child[body]`; `post[a reachable fallthrough body type equals the Match result; a divergent body is context-polymorphic and contributes no result join]`. |
-| `Block` | `env[stmts.len,value presence]`; `child[stmts in stored source order,value if present]`; `post[all retained dead children are structurally valid but contribute no reachable state; an absent reachable tail gives Unit, a present reachable tail gives its type, and an already non-fallthrough block uses its context-selected result type]`. |
+| `MatchArm` | `env[variants,bindings]`: variants are distinct in-range tags of the scrutinee sum in preserved source or-pattern order; empty means wildcard. The sum table is the declared user `Enum`, `Option` as ordered `Some(T),None`, or `Result` as ordered `Ok(T),Err(E)`. Wildcard or multi-tag arms have no bindings. A one-tag arm has exactly the selected variant payload count of distinct in-range local ids, whose local types equal payload types and whose locals are bound before the arm body, visible only in that arm, and removed before the next sibling or enclosing tail. `child[body]`; `post[a reachable fallthrough body type equals the Match result under the structural body-type relation (including `FABI` for fresh function-value ids); a divergent body is context-polymorphic and contributes no result join]`. |
+| `Block` | `env[stmts.len,value presence]`; `child[stmts in stored source order,value if present]`; `post[all retained dead children are structurally valid but contribute no reachable state; each `Let`/`LetTuple` initializer is checked before its binding enters the block scope; an absent reachable tail gives Unit, a present reachable tail gives its type, and an already non-fallthrough block uses its context-selected result type; block exit removes its bindings]`. |
 
 ## Statement ledger
 
 | Discriminator | Exact envelope, children, and postcondition |
 |---|---|
-| `Let` | `env[local]`: `L(local)` and the id is the declaration at this statement. `child[init]`. `post[init.ty == LT(local); initialize local once; Move init is consumed into local; recomputed individual flag matches local membership]`. |
-| `LetTuple` | `env[locals,tuple_id]`: `TUPLE(tuple_id)`; vector length equals tuple arity; every present id is distinct and `L(id)` with the matching tuple element type. `child[init]`. `post[init.ty == Ty::Tuple(tuple_id); each present binding receives its ordinal projection exactly once; init is evaluated once]`. |
-| `Assign` | `env[local,drop_old,drop_new]`: `M(local)`. `child[value]`. `post[value.ty == LT(local); replacement Move transfer/nulling is exact; both cells equal the recomputed facts]`. |
-| `AssignIndex` | `env[base]`: `M(base)` is fixed/dynamic scalar array or writable slice. `child[index,value]`. `post[index.ty == i64; value.ty equals the exact element type; base is mutated, index/value are borrowed or consumed according to value type; bounds action occurs only after both children]`. |
-| `AssignVecLane` | `env[local,lane]`: `M(local)` has `Ty::Vec(s,n)` and `lane < n`. `child[value]`. `post[value.ty == scalar_to_ty(s); vector replacement is Copy]`. |
-| `AssignField` | `env[root,path]`: `M(root)` and `P(root,path)` succeeds. `child[value]`. `post[value.ty == P(root,path); replacement/drop-old fact for the leaf is recomputed; root remains the owner]`. |
-| `AssignElemField` | `env[base,path,struct_id,soa]`: non-empty `path`; `STRUCT(struct_id)`; base kind agrees exactly with `soa` (`Soa(struct_id)` when true, fixed/dynamic struct array of that id when false); path succeeds from that struct; SoA path length is one and leaf is a permitted SoA scalar. `child[index,value]`. `post[index.ty == i64; value.ty == EP(Struct(struct_id),path); base mutation and fixed/dynamic old-leaf Drop are recomputed]`. |
-| `AssignElem` | `env[base,struct_id,soa]`: `STRUCT(struct_id)` is the producer's flat Copy struct; base is exactly `Soa(struct_id)` when true or fixed `StructArray(struct_id,_)` when false. `child[index,value]`. `post[index.ty == i64; value.ty == Struct(struct_id); Copy scatter/store]`. |
+| `Let` | `env[local]`: `L(local)` and the id is the declaration at this statement. `child[init before bind]`. `post[init.ty == LT(local); initialize local once; Move init is consumed into local; recomputed individual flag matches local membership; the new binding is then visible in the enclosing block]`. |
+| `LetTuple` | `env[locals,tuple_id]`: `TUPLE(tuple_id)`; vector length equals tuple arity; every present id is distinct and `L(id)` with the matching tuple element type. `child[init before all binds]`. `post[init.ty == Ty::Tuple(tuple_id); each present binding receives its ordinal projection exactly once and becomes visible after init; init is evaluated once]`. |
+| `Assign` | `env[local,drop_old,drop_new]`: `MV(local)`. `child[value]`. `post[value.ty == LT(local); replacement Move transfer/nulling is exact; both cells equal the recomputed facts]`. |
+| `AssignIndex` | `env[base]`: `MV(base)` is fixed/dynamic scalar array or writable slice. `child[index,value]`. `post[index.ty == i64; value.ty equals the exact element type; base is mutated, index/value are borrowed or consumed according to value type; bounds action occurs only after both children]`. |
+| `AssignVecLane` | `env[local,lane]`: `MV(local)` has `Ty::Vec(s,n)` and `lane < n`. `child[value]`. `post[value.ty == scalar_to_ty(s); vector replacement is Copy]`. |
+| `AssignField` | `env[root,path]`: `MV(root)` and `P(root,path)` succeeds. `child[value]`. `post[value.ty == P(root,path); replacement/drop-old fact for the leaf is recomputed; root remains the owner]`. |
+| `AssignElemField` | `env[base,path,struct_id,soa]`: non-empty `path`; `STRUCT(struct_id)`; `MV(base)` agrees exactly with `soa` (`Soa(struct_id)` when true, fixed/dynamic struct array of that id when false); path succeeds from that struct; SoA path length is one and leaf is a permitted SoA scalar. `child[index,value]`. `post[index.ty == i64; value.ty == EP(Struct(struct_id),path); base mutation and fixed/dynamic old-leaf Drop are recomputed]`. |
+| `AssignElem` | `env[base,struct_id,soa]`: `STRUCT(struct_id)` is the producer's flat Copy struct; `MV(base)` is exactly `Soa(struct_id)` when true or fixed `StructArray(struct_id,_)` when false. `child[index,value]`. `post[index.ty == i64; value.ty == Struct(struct_id); Copy scatter/store]`. |
 | `Return(None)` | `env[presence=false]`; `child[]`; `post[function ret == Unit; terminates current path]`. |
 | `Return(Some)` | `env[presence=true]`; `child[value]`; `post[value.ty == function ret; returned Move ownership and return-root/region facts equal the recomputed function boundary; terminates]`. |
-| `Break` | `env[value presence,accepted]`: accepted equals the checker-owned loop-target/region decision and a target loop exists only when true. `child[value if present]`. `post[bare break contributes Unit; accepted payload type equals target loop type and contributes one exit; rejected break contributes no exit; either form is non-fallthrough]`. |
+| `Break` | `env[value presence,accepted]`: accepted equals the checker-owned loop-target/region decision in both directions: it is true exactly when the innermost target exists and the break remains at that loop's arena/task depth, and false only when no target exists or a nested arena/task region rejects the edge. `child[value if present]`. `post[bare break contributes Unit; an accepted break contributes a loop break when producer control reaches the statement (a nested accepted break in its value may reach the same loop, while a value that returns or enters a diverging nested loop does not); accepted payload type equals the target loop type; rejected break contributes no exit; either form is non-fallthrough]`. |
 | `Expr` | `env[]`; `child[expr]`; `post[resolved child type is not Result(_, _); result is discarded after its required Drop; child non-fallthrough propagates]`. |
 
 ## Expression ledger: am-b1
@@ -516,23 +565,23 @@ The result formula in every row is followed by the universal
 | `Char` | `env[value]`: Unicode scalar `0..=0x10ffff` excluding surrogates. `child[]; post[result(Char),copy]`. |
 | `Str` | `env[UTF-8 bytes]`; embedded NUL is permitted. `child[]; post[result(Str),view(Static)]`. |
 | `Bool` | `env[value]; child[]; post[result(Bool),copy]`. |
-| `Local` | `env[id]`: `L(id)`. `child[]; post[result(LT(id)); Copy reads borrow, Move reads follow the producer's move/borrow use classification]`. |
+| `Local` | `env[id]`: `LV(id)`. `child[]; post[result(LT(id)); Copy reads borrow, Move reads follow the producer's move/borrow use classification]`. |
 | `Unary` | `env[op]`; `child[expr]`; `post[Neg: expr/result same signed Int or Float; Not: expr/result Bool; BitNot: expr/result concrete signed or unsigned Int; copy]`. |
 | `Cast` | `env[]`; `child[expr]`; `post[source/result pair is Int→Int/Float/Char, Float→Int/Float, or Char→Int/Char; Float↔Char and every generic/composite pair reject; copy]`. |
 | `Binary` | `env[op]`; `child[lhs,rhs]`; `post[Add/Sub/Mul/Div/Rem: same numeric scalar result or valid scalar-broadcast/vector pair producing V(s,n); Eq/Ne: same Eq scalar/Str gives Bool or valid vector/broadcast pair gives K(s,n); Lt/Le/Gt/Ge: same Ord scalar/Str gives Bool or vector/broadcast pair gives K(s,n); And/Or: Bool×Bool→Bool with short-circuit control; BitAnd/BitOr/BitXor/Shl/Shr: same concrete I→I; no structural, owned-string, generic-param, vector-bitwise, or mismatched-lane case; copy]`. |
 | `IntArith` | `env[op,mode]`: op is Add/Sub/Mul only. `child[lhs,rhs]`: same concrete I. `post[Saturating→I; Checked→Option<IS(I)>; copy]`. |
 | `MathOp` | `env[fn_,operands.len]`; `child[operands in order]`; `post[the exact MathFn row above; copy]`. |
-| `FnValue` | `env[name]`: non-empty NUL-free exact bytes and one non-extern `SIG(name)`. Outside `SPAWN`, the target is stored `Source`, `Monomorph`, or `Lifted { capture_count: 0 }`, or imported; its exact concrete scalar modes/parameters/return map to the in-range stored `FnTy`. In `SPAWN(fallible,ok)`, the target is stored `Lifted { capture_count: 0 }` and obeys the contextual signature rule above. `child[]; post[result(Fn(id)),copy; callable fact belongs to am-b3 and is consumed by am-c]`. |
+| `FnValue` | `env[name]`: non-empty NUL-free exact bytes and one non-extern `SIG(name)`. Outside `SPAWN`, the target is stored `Source`, `Monomorph`, or `Lifted { capture_count: 0 }`, or imported; its exact concrete scalar modes/parameters/return map to the in-range stored `FnTy`. In `SPAWN(fallible,ok)`, the target is stored `Lifted { capture_count: 0 }` and obeys the contextual signature rule above. A local binding may receive a fresh `FnTy` ordinal; its initializer and local type correlate by `FABI`, while effect/borrow/region cells remain am-b4 facts. `child[]; post[result(Fn(id)),copy; callable fact belongs to am-b3 and is consumed by am-c]`. |
 | `Closure` | `env[lifted,captures.len]`: NUL-free `lifted` resolves exactly one stored function with `FnOrigin::Lifted { capture_count }`, `capture_count as usize == captures.len()`, and `capture_count > 0`; it is therefore non-exportable. `child[captures in order]`; `post[capture types equal the lifted trailing parameter types; outside SPAWN, explicit parameter modes/types and return equal result FnTy; in SPAWN, the contextual signature rule above applies; every capture is Copy and borrowed into one non-escaping environment; callable fact belongs to am-b3]`. |
 | `CallFnValue` | `env[args.len]`; `child[callee,args in order]`; `post[callee.ty == Fn(id); argument count/modes/types equal FT(id); disabled Borrow/BorrowMut reject; ByValue Move arguments are consumed, Out is a writable Slice place; result == FT(id).ret; return provenance maps through exact actuals]`. |
 | `TaskGroup` | `env[]`; `child[block]`; `post[result == block/context-selected divergence type; one structured task region; all spawned tasks are joined exactly once on every fallthrough/exit path]`. |
 | `EnumValue` | `env[enum_id,variant,payload.len]`: in-range enum/variant and exact payload arity. `child[payload in order]`; `post[each payload type equals its declared ordinal; result Enum(enum_id); active Move payload transfers once]`. |
-| `Match` | `env[arms.len]`: non-empty. `child[scrutinee,arms in order]`; `post[scrutinee is one sum type: user Enum(id), Option(T), or Result(T,E); each MatchArm uses that exact sum table; no tag repeats across arms, at most one wildcard occurs at its preserved source position, and coverage is exhaustive by all tags or that wildcard; all fallthrough arm bodies have one result type, while divergent arms are context-polymorphic; scrutinee evaluated once; branch ownership joins exactly]`. |
+| `Match` | `env[arms.len]`: non-empty. `child[scrutinee,arms in order]`; `post[scrutinee is one sum type: user Enum(id), Option(T), or Result(T,E); each MatchArm uses that exact sum table; no tag repeats across arms, at most one wildcard occurs at its preserved source position, and coverage is exhaustive by all tags or that wildcard; all fallthrough arm bodies have one result type under the structural body-type relation (including recursively matching fresh `FnTy` ids), while divergent arms are context-polymorphic; scrutinee evaluated once; branch ownership joins exactly]`. |
 | `ResultMapErr` | `env[]`; `child[result,f]`; `post[result.ty == Result(ok,err); f.ty == Fn(id) with one ByValue err parameter and return err2; FT summary/effect apply; result Result(ok,err2); Ok ownership passes unchanged and Err ownership transfers through f]`. |
 | `Spawn` | `env[fallible]`; `child[closure with SPAWN(fallible,ok)]`; `post[inside task_group; ok is one primitive Int/Float/Bool/Char/Unit scalar; closure.ty == Fn(id) with zero explicit parameters and stored return ok; Pure/Impure allowed by current task rule; the exact lifted target returns ok when false or Result(ok,builtin Error) when true; result Task(ok); closure/environment transfers to task storage]`. |
 | `TaskGet` | `env[]`; `child[task]`; `post[task.ty == Task(T) for current primitive Copy T; task has recomputed `TaskProof { group, born_generation }`; that group remains active, `born_generation >= valid_from`, and `completed_generation == Some(current_generation)` on this exact path; that completion proves every Wait registered before its establishing success resolved Ok, while a later no-task unresolved Wait is irrelevant; an inner group's Wait cannot discharge it; failed-check diagnostic uses that group's fallibility; result T is copied without consuming the Move task handle, TaskProof remains available, and repeated get is valid; owned task results are not producer-reachable]`. |
 | `Wait` | `env[]`; `child[]`; `post[inside task_group; result Unit for infallible group or Result(Unit,builtin Error) for a fallible group exactly as producer records; joins registered tasks once]`. |
-| `Call` | `env[func,type_args]`: non-empty NUL-free func resolves one `SIG`; an extern target requires current lexical `unsafe_depth > 0`. Empty type_args require a non-Monomorph target. Non-empty type_args are concrete graph-valid types; encoding them with the single producer/validator-owned `mangle_mono_suffix(type_args)` (the current `mangle_mono("", type_args)` bytes) yields a non-empty `$...` suffix, func must equal a non-empty base plus that exact suffix, and the stored target must have `FnOrigin::Monomorph`. HIR stores neither the discarded generic template nor its bounds, so this row makes no uncheckable template/bound claim. `child[args in order]`; `post[arity/modes/types and disabled modes match the concrete SIG; Move/Out behavior and return provenance are exact; result SIG.ret; a source spelling equal to a RuntimeKey still resolves ProgramCall]`. |
+| `Call` | `env[func,type_args]`: `print` is a declaration-free core builtin with no type arguments, exactly one printable HIR argument (`Int`, `Float`, `Bool`, `Char`, or `Str`; source `String` is already a `StrBorrow`), and result `Unit`; `hash64` and `hash128` are declaration-free core builtins with no type arguments, exactly one `Str` or `slice<u8>` argument, and result respectively `u64` or `(u64,u64)`. Otherwise non-empty NUL-free func resolves one `SIG`; an extern target requires current lexical `unsafe_depth > 0`. Empty type_args require a non-Monomorph target. Non-empty type_args are concrete graph-valid types; encoding them with the single producer/validator-owned `mangle_mono_suffix(type_args)` (the current `mangle_mono("", type_args)` bytes) yields a non-empty `$...` suffix, func must equal a non-empty base plus that exact suffix, and the stored target must have `FnOrigin::Monomorph`. HIR stores neither the discarded generic template nor its bounds, so this row makes no uncheckable template/bound claim. `child[args in order]`; `post[arity/modes/types and disabled modes match the concrete SIG; Move/Out behavior and return provenance are exact; result SIG.ret for declaration-backed calls; a source spelling equal to a RuntimeKey still resolves ProgramCall]`. |
 | `If` | `env[]`; `child[cond,then,els]`; `post[cond Bool; all fallthrough branches have one result type; missing-source else is represented by empty Unit block; divergent branch is context-polymorphic; state/ownership joins only fallthrough predecessors]`. |
 | `StructLit` | `env[struct_id,fields.len]`: in-range struct and exact field count. It is a general value expression and may occur in every consumer that accepts the resulting struct; `Stmt::Let.init` merely has a direct in-place lowering. `child[fields in declaration order]`; `post[field types equal definitions; result Struct(struct_id); each Move field transfers once]`. |
 | `Field` | `env[root,path]`: `L(root)` and `P(root,path)`. `child[]`; `post[result P(root,path); Copy/borrowed projection preserves root, Move projection follows the producer's permitted move-out rule]`. |
@@ -547,7 +596,7 @@ The result formula in every row is followed by the universal
 | `ResultOk` | `env[]`; `child[value]`; `post[result Result(payload(value.ty),E) for one concrete admitted E; active Ok ownership transfers]`. |
 | `ResultErr` | `env[]`; `child[value]`; `post[result Result(T,payload(value.ty)) for one concrete admitted T; active Err ownership transfers]`. |
 | `Try` | `env[]`; `child[result]`; `post[result child is Result(T,E), enclosing return is Result(U,E) with exact E; expression result T; Ok continues and Err transfers to one implicit return edge]`. |
-| `Loop` | `env[diverges,body_locals]`: range is ordered, in bounds, and equals exactly all locals declared lexically anywhere inside this loop body and no lifted-function local. `child[body]`; `post[diverges iff no accepted break reaches this loop; non-diverging accepted breaks agree on result type; body tail is discarded; iteration Drop set equals intersection with drop_locals; loop state reaches the existing finite join]`. |
+| `Loop` | `env[diverges,body_locals]`: range is ordered, in bounds, and equals exactly all locals declared lexically anywhere inside this loop body and no lifted-function local. `child[body]`; `post[diverges iff no accepted break reaches this loop; an accepted break must remain at the loop's arena/task region depth; non-diverging accepted breaks agree on result type; body tail is discarded; iteration Drop set equals intersection with drop_locals; loop state reaches the existing finite join]`. |
 | `Arena` | `env[]`; `child[block]`; `post[result block/context-selected divergence type; one arena begins before the block and ends exactly once on each exit; no escaping arena-owned value]`. |
 | `Unsafe` | `env[]`; `child[block at unsafe_depth+1]`; `post[result block/context-selected divergence type; depth is restored before the next sibling; no runtime region; unsafe permission is lexical and effect is Impure]`. |
 | `RawAlloc` | `env[]`; `child[size]`; `post[size i64; result Raw; unsafe lexical owner required; caller manually owns allocation]`. |
@@ -661,7 +710,7 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; `validate_hir::json_scan_validation_reason` returns the exact first reason for the precedence matrix while production lowering keeps the boolean gate. Unresolved `json.scanner<Row<T>>` row arguments and partially substituted composite generic arguments remain outside this row: sema rejects them before constructing a scanner expression and retains the exact producer diagnostics. Generic call checking classifies only the callee's own inference slots, so an enclosing generic parameter carried by a bound slot is valid forwarding; an expected-return seed error stops before any argument is checked. Producer-owned scanner spelling travels through checker-only inference slots, annotated or inferred locals, transparent generic-call results, parameters, and lambda captures; the checker derives it only across producer-owned local/block/borrow/call boundaries, with no HIR field or artifact/source reconstruction. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; five accepted HIR terminal variants expose seven public methods Sum/Count/Reduce/Any/All/Min/Max, each with exact Result(scalar,builtin Error)]`. |
+| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; `validate_hir::json_scan_validation_reason` returns the exact first reason for the precedence matrix while production lowering keeps the boolean gate. Unresolved `json.scanner<Row<T>>` row arguments and partially substituted composite generic arguments remain outside this row: sema rejects them before constructing a scanner expression and retains the exact producer diagnostics. Generic call checking classifies only the callee's own inference slots, so an enclosing generic parameter carried by a bound slot is valid forwarding; an expected-return seed error stops before any argument is checked. Producer-owned scanner spelling travels through checker-only inference slots, annotated or inferred locals, transparent generic-call results, parameters, and lambda captures; the checker derives it only across producer-owned local/block/borrow/call boundaries, with no HIR field or artifact/source reconstruction. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the structural body validator alone is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; five accepted HIR terminal variants expose seven public methods Sum/Count/Reduce/Any/All/Min/Max, each with exact Result(scalar,builtin Error)]`. |
 | `JsonScanGenericCall` | `env[callee_slots,expected]`: expected-return seeding binds generic slots while validating concrete return leaves, so a concrete mismatch stops before any argument; annotated scanner return spelling is retained even when the call has no scanner argument. `child[args]`; `post[callee-local slot classification, source-order argument checking, checker-only spelling through signature/local/block/borrow/call boundaries, no partial HIR or cache publication on failure]`. Owner tests are `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade` and `m5::json_scan_generic_argument_source_spelling`. |
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |

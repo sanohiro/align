@@ -5,7 +5,113 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; the
+_Last updated: 2026-08-05._ The current branch is `agent/pkg-db-am-b4-activate`, integrating
+AM-B4 activation head `22e5ba3` with current `main` `e65448b7`. The integration preserves both the
+complete checked-HIR body gate and Request 6's active `json.scan` envelope/Copy gate. Conflict
+closure is complete. The pre-open integrated MIR library owner passed 99/99 and the Request 6 generic-return
+context driver owner passes 9/9 after the dedicated target's explicit runtime build. The fresh
+review of the pre-integration AM-B4 range found one P2: an unused orphan nonparameter local record
+was not required to have a binding. Production validation now requires exactly one `Let`,
+`LetTuple`, or match-payload binding, and the four-entrypoint regression owner passes. A separate
+focused sema replay launch remained at 0% CPU in macOS `_dyld_start` and was stopped and preserved
+as INCOMPLETE; the MIR owner exercises the integrated replay path successfully. Draft PR #706 is
+open. Its host review found one P1: `ArrayPartition` and `ArrayParMap` derivation consumed terminal
+capture flows that the structural child worklist had not visited, rejecting producer-valid captured
+closures at all four lowerers. The current follow-up passes those captures through the shared
+pipeline child walk; the new four-entrypoint owner, the existing four lambda-capture driver owners,
+the MIR library owner (100/100), and focused MIR Clippy all pass. Fresh independent review, refreshed
+preflight, and push then completed at `69c56b2`; the exact pushed-pair independent review is CLEAN.
+The final host review found one P2: lexical replay tracked local ids but not visible names, so
+handcrafted checked HIR could encode duplicate parameters, same-scope rebinding, or inner shadowing.
+The bounded follow-up tracks non-discard visible names and closes parameter, `Let`, `LetTuple`,
+nested-block, match-payload, and sibling scope cells. Two required reviews found P1 ambiguity in the
+old source-spellable `_dropN` cleanup names and drift between producer/validator Drop predicates; the
+patch loop stopped and the closure matrix was redesigned and reviewed CLEAN before implementation.
+Sema and MIR now share exact source-impossible `$tuple_drop<ordinal>` spelling and one owned-discard
+predicate while retaining hidden-id scope and cleanup. The Cartesian four-entrypoint owner covers
+canonical/near names, Drop/Copy, binding kind, collision state, lifecycle, Drop sets, and once-only
+cleanup. The complete MIR suite passes 101/101, tuple driver 29/29, and focused sema/MIR Clippy is
+clean. The required implementation review confirmed the design and found only missing acceptance
+halves; the owner-only closure adds them, and its focused test plus all-test-target MIR Clippy pass.
+Revised follow-up commit/push, final
+attestation, bounded finding closure, and CI are pending. The cross-worktree Request 6 identity
+rerun remains INCOMPLETE on this macOS host because the Linux C cross-compiler is absent and the
+temporary Linux container stalled while fetching its base image; the previously merged Request 6
+identity evidence remains intact. Stacked AM-C1 draft #702 and AM-C2a1 draft #705 remain open behind
+this prerequisite. No public `pkg.db` surface exists yet.
+
+Historical AM-B4 activation record: as of 2026-08-03, `main` included the shipped wave through #688 plus the merged am-p
+placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
+declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
+(`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
+replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The current
+working slice is the am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate`: the shared
+four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses explicit
+numeric enter/exit occurrence frames for the 259-record checked-HIR ceiling, with no Span or native
+pointer identity, and iterative teardown for successful, rejected, and panic-after-analysis paths.
+The body envelope also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local
+`FnTy` cells by callable shape. The current follow-up closes nested callable/tagged-payload
+matching, source-reachable loop-break/diverges agreement, and arena/task-group region crossing;
+the body owner now has explicit tests for those cases. The pre-follow-up focused body owner passed
+42/42, alongside
+malformed-body, replay, identity, header, process/HTTP, root-completion, and task-wait owners with
+the configured LLVM environment.
+The full depth matrix reached successful compilation but its test
+binary remained in macOS `_dyld_start` at 0% CPU before being stopped; that launch is preserved as
+INCOMPLETE rather than CLEAN. The author-side closure matrix is preserved in
+`.git/am-b4-activation-author-matrix.log`, and no public `pkg.db` surface is present yet.
+`cargo build --workspace --locked` and the LLVM-configured full workspace/all-targets Clippy run
+pass with `-D warnings`. The ordinary `scripts/test-pr.sh` reached the codegen test binary, but
+both the normal and `DYLD_SHARED_REGION=private` runs remained in `_dyld_start` with 0% CPU before
+listing tests; the same loader stall also affected the combined `align_driver` library owner.
+Those attempts are preserved as INCOMPLETE in `.git/am-b4-test-pr-dyld-incomplete.log`; the latest
+focused body/replay startup stalls are additionally recorded in
+`.git/am-b4-followup-body-incomplete.log`. No missing test verdict is treated as CLEAN. The earlier
+codegen owner itself passed 56/56 with 5 ignored after the validator fixes.
+Review operation rule recorded after the 2026-08-03 incident: one exact `HEAD`/base review gets one
+live invocation. A timeout, invocation bound, missing verdict, or killed process is INCOMPLETE, never
+CLEAN. Preserve its log, elapsed time, process state, and last completed area; continue only with
+the unfinished or changed slice. A longer user-approved duration extends that invocation only and
+does not authorize polling, restart chains, or a duplicate broad review. This is also a standing
+guardrail in `CLAUDE.md`/`AGENTS.md`.
+The current follow-up tree has passed the MIR library owner (94/94), nested tagged-payload driver
+owner (8/8), copy-collection owner (6/6), replay-clone owners (4/4), and targeted `align_sema`/
+`align_mir` Clippy with `-D warnings`; its final exact-base review is pending after the fix
+checkpoint is committed. The driver owners required one explicit `align_runtime` build in the
+dedicated target directory before linking; the reruns passed without source changes.
+The latest independent preflight then found one P1 in the revised break matrix: a forged
+same-region `Break.accepted = false` could suppress a real loop exit. The closure matrix is reopened;
+the current working tree requires exact bidirectional target/arena/task acceptance and adds
+same-region-forged plus targetless/nested-region owner cells. The pre-fix MIR owner passed 94/94;
+the post-fix ordinary target launch remained at 0% CPU in `_dyld_start` and was stopped as
+INCOMPLETE, while the dedicated `/tmp/align-am-b4-break-owner` target passed the three exact break
+tests and the complete MIR library owner 94/94. A fresh independent review of the reopened
+`Break.accepted` slice returned CLEAN after checking sema production, every downstream consumer,
+both region dimensions, fail-closed lowering, docs, and owner coverage. The complete exact-base
+review then returned CLEAN, and the repository gate, workspace all-target Clippy, and final MIR
+owner passed under the dedicated target. The branch has not been pushed and no PR exists yet.
+The one host-native review invocation for the follow-up range
+`62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
+Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as
+INCOMPLETE in `.git/am-b4-followup-host-review.log` and
+`.git/am-b4-activation-review-incomplete.log`. The same range will not be reviewed again unless it
+changes or the user explicitly requests a new review.
+The later continuation used `/Applications/Xcode.app/Contents/Developer/usr/bin/git` to avoid the
+read-only Xcode shim cache failure and progressed through the remaining `hir_depth.rs`/`lib.rs`
+scope, but reached its single 600-second bound without a verdict. It is preserved in
+`.git/am-b4-followup-path-fixed.log` and remains INCOMPLETE; no pre-PR stamp or PR was created.
+The subsequent fresh independent review of `origin/main...8bb574f` also reached its 120-second
+bound without a verdict; it is recorded as INCOMPLETE in `.git/am-b4-activation-review-incomplete.log`.
+A later fresh independent review of the complete `origin/main...88bdfa3` diff found two valid
+follow-up issues: strict production body validation did not replay lexical local visibility and
+definite initialization, and `match` result joins still compared fresh `FnTy` ids nominally. The
+current follow-up adds the strict iterative scope pass, structural join matching, and one owner for
+each; the ledger now records both closure rules. No review verdict is inferred from the earlier
+incomplete host invocations.
+The narrow `align_sema` test binary was then launched directly with a dedicated `TMPDIR`, fixed
+`DEVELOPER_DIR`, and the prior dyld setting; it still produced no listing within 20 seconds and is
+recorded as INCOMPLETE in `.git/am-b4-followup-body-incomplete.log`.
+Historical Request 6 record: as of 2026-08-04, the current branch was `agent/align-llm-request6-implementation-v2`; the
 implementation code head is `aa5bb7d`, with the expected-seed, return-spelling, and
 diagnostic-order repairs implemented. The current branch also contains this continuity-only
 handoff commit; its exact branch-head SHA is bound by the final review and preflight records rather
@@ -129,6 +235,8 @@ facts must live in this repository.
 #688  lexical extern invocation permission and non-escaping extern-call closure (am-u)
 #694  dormant am-b1 body-core validator and owner matrix
 #695  dormant am-b2a storage/vector/array validator and owner matrix
+#699  bounded task-wait replay identity and stack closure
+#700  checked-HIR sema body-fact replay and imported-provenance presence closure
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -854,13 +962,13 @@ adds a token-exhaustion owner, and directly observes changed incoming loop Spawn
 duplicate loop-header join site. Per the review policy this is one finding-closure follow-up; no
 second broad review is requested for these non-public-contract fixes.
 
-The next am-b4 checkpoint is intentionally sema-only on top of merged am-w #699 (`9e2d615`):
+The prior am-b4 sema-only checkpoint on top of merged am-w #699 (`9e2d615`) was:
 `checked_hir_body_facts_are_valid` clones checked HIR, resets return/Drop/assignment/effect facts
 through the bounded event walk, replays task-wait, return-provenance, MoveCheck, EscapeCheck, and
 effect solving, then compares the published facts without mutating the caller or creating a new
-function-type topology. The MIR shared gate is not activated in this checkpoint; that is the next
-independent vertical, with its four-entrypoint empty-result and identity owners. The focused replay
-owners `checked_hir_body_fact_replay_rejects_stale_producer_facts` and
+function-type topology. The MIR shared gate was not activated in that checkpoint; the current
+activation adds its four-entrypoint empty-result and identity owners. The focused replay owners
+`checked_hir_body_fact_replay_rejects_stale_producer_facts` and
 `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` pass; the closure matrix is in
 `docs/impl/17-library-boundary-prerequisites.md`.
 
@@ -870,16 +978,25 @@ checks, and one P1 producer/replay mismatch for omitted imported return provenan
 replaces the owner names, qualifies the gate statement, adds the HIR-only
 `return_provenance_known` presence bit so compatibility omissions retain the producer fallback,
 adds absent/explicit-`None`/`Roots` × effect-seed replay coverage, isolates each negative fact, and
-checks rejected-input immutability. The predicate's direct contract now explicitly remains
-prevalidated-HIR plus depth/panic containment; full structural metadata rejection belongs to the
-next MIR activation vertical. Focused replay, declaration-header, check, and Clippy gates pass;
+checks rejected-input immutability. The predicate's direct contract remains
+prevalidated-HIR plus depth/panic containment; the current MIR activation adds the structural
+metadata rejection and canonical-empty boundary. Focused replay, declaration-header, check, and
+Clippy gates pass;
 the original broad host wrapper's human no-action text lacked its required machine marker and stays
 recorded as INCOMPLETE rather than CLEAN.
 
+The current follow-up is above the 1,000-line split threshold because it replaces the replay's
+pointer-sensitive reconstruction with numeric occurrence frames, adds exhaustive child-edge
+teardown, and closes the deep/duplicate-span/Cell/FnTy owner rows in one safety invariant. Splitting
+the frame protocol from teardown would leave either an accepted path with recursive Drop or a
+temporary parallel replay path. This boundary proof is recorded in the am-b4 matrix; am-c, L3
+resources, and public `pkg.db` remain separate.
+
 The LLVM 22 toolchain is available at `/opt/homebrew/opt/llvm`, and focused task-group tests pass
-with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains blocked by
-the `align_codegen_llvm` unit-test binary hanging in macOS dyld startup before listing its zero
-tests; this is an environment/toolchain execution blocker, not a compiler test failure. Am-u rejects
+with `LLVM_CONFIG`/`LIBRARY_PATH` set. The ordinary `scripts/test-pr.sh` gate remains INCOMPLETE
+because the `align_codegen_llvm` and `align_driver` unit-test binaries hang in macOS dyld startup
+before listing tests; this is an environment/toolchain execution blocker, not a compiler test
+failure, and the transcripts are preserved in `.git/am-b4-test-pr-dyld-incomplete.log`. Am-u rejects
 extern declarations as first-class function values and requires direct or non-escaping named
 pipeline/reducer/sort invocation to be lexically
 inside `unsafe`; current HIR function values cannot carry visible unsafe-call permission. These are
