@@ -363,7 +363,7 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
 /// `build_module` (data layout / triple / ABI classification) and `write_object` (optimization +
 /// object emission), so the two stages always agree on the same target settings.
 /// `rt_lto` = the baked `--rt-lto` runtime bitcode (`Some(bytes)`), or `None` for the default
-/// (flag-off) path, which stays byte-identical to before this slice. When `Some`, the fast-path
+/// flag-off path, which performs no runtime-bitcode probe or link. When `Some`, the fast-path
 /// string primitives' bodies are linked into the RAW module and internalized before the single opt
 /// run, so the optimizer can inline them (probe: `str_eq` 2.1×) — M14 Slice 2. Probe-then-annotate:
 /// the baked bitcode is parsed FIRST; only if that succeeds are the guarded declares left
@@ -418,7 +418,8 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
 /// (see [`pgo::run_pgo_pipeline`]'s contract). Returns the run's [`pgo::PgoRunReport`]
 /// (USE staleness warnings; empty for GEN) so the driver can aggregate one report.
 ///
-/// This is a SEPARATE entry from [`emit_object`] so the flag-off path stays byte-identical.
+/// This remains a separate entry so selecting PGO cannot alter the non-PGO entry's construction or
+/// emission semantics.
 pub fn emit_object_pgo(
     program: &Program,
     out: &Path,
@@ -511,7 +512,8 @@ fn probe_rt_lto<'c>(ctx: &'c Context, bitcode: &[u8]) -> Option<Module<'c>> {
 /// - `--stage optimized --rt-lto` = after the one `O2` run: the merged/inlined shape (an
 ///   `x == "literal"` filter with no `call @align_rt_str_eq`).
 ///
-/// `None` is the default path, byte-identical to before this slice (no link, no probe).
+/// `None` is the default path and performs no rt-LTO link or probe. The canonical C1 runtime
+/// declaration order applies to both paths.
 pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, exports: &[String], rt_lto: Option<&[u8]>) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
@@ -5070,11 +5072,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let hl = self.builder.build_extract_value(current_str, 1, "contains.hay.len").map_err(|e| self.err(e))?;
                     let np = self.builder.build_extract_value(needle_str, 0, "contains.needle.ptr").map_err(|e| self.err(e))?;
                     let nl = self.builder.build_extract_value(needle_str, 1, "contains.needle.len").map_err(|e| self.err(e))?;
-                    let contains_fn = self
-                        .funcs
-                        .get("str_contains")
-                        .copied()
-                        .ok_or_else(|| self.err("par_map string filter is missing the str_contains runtime declaration"))?;
+                    let contains_fn = self.runtime(RuntimeKey::StrContains);
                     let contains_value = self
                         .builder
                         .build_call(contains_fn, &[hp.into(), hl.into(), np.into(), nl.into()], "contains")
@@ -12007,6 +12005,11 @@ mod tests {
         assert_eq!(string_lookups.len(), 2, "unexpected dedicated string lookup: {string_lookups:?}");
         assert!(implementation.contains("self.funcs[&format!(\"tramp${}\""));
         assert!(implementation.contains("let callee = self.funcs[name];"));
+        let compact: String = implementation.split_whitespace().collect();
+        assert!(
+            !compact.contains("self.funcs.get(\""),
+            "fixed runtime consumers must not use method-style string lookups"
+        );
         assert!(!include_str!("drop_codegen.rs").contains("self.funcs["));
 
         let wrapper = source

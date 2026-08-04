@@ -5,11 +5,11 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04._ The current local branch is `agent/pkg-db-am-c`, stacked on the clean
-unpushed am-b4 activation checkpoint `22e5ba3`; no PR exists. The user authorized the c1 commit,
-SHA-bound preflight, base-branch publication, push, and draft PR on 2026-08-04. The c1 implementation
-commit is `cc9da75`; the first coherent pre-PR finding-closure commit is `3b6041f`, and the latest
-finding closure is the current HEAD. Four
+_Last updated: 2026-08-05._ The current local branch is `agent/pkg-db-am-c`, rebased onto current
+`main` `a1c12552` after the am-b4 activation merged as PR #706. Draft PR #702 is being restacked to
+target `main`. The rebased c1 implementation commit is `b25a65e`; the first coherent pre-PR finding
+closure is `c04378d`; the row-authority closure is `1877ccd`; and the current HEAD is the coherent
+post-open finding closure. Four
 mandatory am-c matrix reviews repaired the public contracts and PR boundaries; the final fresh
 pre-implementation matrix review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
 now splits am-c into c1 (fixed typed runtime ABI registry), c2a (private canonical graph/encoder),
@@ -46,10 +46,24 @@ all 286 returns and every parameter ordinal. It also covers the five attribute c
 ordinary probe spellings, and whole/per-unit-shaped declaration parity. The next exact-diff review
 found that the five unkeyed identities still kept symbol/type facts outside the 281 keyed rows,
 that the `ArgsBuild` unreachability owner omitted the closest source-valid aggregate, and that this
-handoff was stale. The current HEAD closes the class with one 286-identity `RuntimeAbiId` row
+handoff was stale. Pushed review head `d240a57` closes the class with one 286-identity `RuntimeAbiId` row
 iterator, makes the keyed-only iterator explicit for declaration order and typed MIR lookup, and
 passes a source-valid `layout(C) { u64, i64 }` return through x86-64 SysV extern ABI formation to
 prove it mismatches the native `{ptr, i64}` view. (`raw` itself is not a valid `layout(C)` field.)
+Post-open host review found two P2s: the export audit overwrote the ordinary runtime archive with
+the last feature build, and the `FilterStrContains` dedicated consumer still used a method-style
+string lookup. The independent review found three P3s: the private unkeyed/id enum representation
+drifted from the concrete c1 design, three old comments overclaimed pre-c1 byte identity, and this
+handoff still described the unpushed pre-PR state. The current HEAD closes all five findings.
+
+| Post-open finding | Closure | Focused evidence |
+|---|---|---|
+| P2 export-audit archive contamination | Build every feature case under one temporary audit target; never write the caller/default target. Restore the already-contaminated local archive with a default build. | Exact base/alloc/par/task/all export sets are 286/290/290/286/294; the ordinary archive remains byte-identical across the audit. |
+| P2 method-style fixed-runtime lookup | Route `FilterStrContains` through `self.runtime(RuntimeKey::StrContains)` and normalize whitespace in the source inventory before rejecting literal `self.funcs.get("...")` seams. | `runtime_abi` owners 14/14 and the string-filter stable-compaction owner 1/1. |
+| P3 private enum representation drift | Give `UnkeyedRuntimeKey` exact `repr(u8)` discriminants 0–4 and restore ordered derives on it and `RuntimeAbiId`; compile-pin the `Ord` bound and discriminants. | Registry completeness/uniqueness and exact representation assertions pass in the 14-owner group. |
+| P3 stale byte-identity comments | State only the current no-probe/no-link and PGO separation semantics; acknowledge canonical c1 declaration order. | Author comment-to-ledger inspection against the c1 whole/per-unit/cache row. |
+| P3 stale operational handoff | Record pushed base/head branches, draft PR #702, post-open findings, closure, and current gates. | Current branch/PR/check state inspected before the follow-up. |
+
 Focused c1 owners pass 14/14; `align_codegen_llvm` passes 70/70 with 5 intentional PGO ignores;
 `align_mir` passes 95/95; the runtime source/registry owner passes; compiled
 base Rust signatures match 286/286 and base, `alloc-count`, `par-map-probe`, task-only, and
@@ -60,17 +74,22 @@ build and codegen owners, then its combined driver binary remained at 0% CPU in 
 was stopped as INCOMPLETE; the exact driver binary and every not-yet-run library/integration target
 then passed without source changes, so the gate was closed by checkpointed continuation rather than
 a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s) on `cc9da75`; both
-finding-closure affected-crate Clippy runs pass. The next action is to obtain a bounded exact-SHA
-review of the final finding-closure slice, then run the final-SHA preflight and open the authorized
-stacked draft PR, not c2 implementation. No public `pkg.db` surface exists yet.
+finding-closure affected-crate Clippy runs pass. The post-open closure additionally passes the
+14 focused runtime-ABI owners, the one changed string-filter execution owner, the isolated export
+audit with an unchanged ordinary-archive SHA-256, and `align_codegen_llvm` library Clippy with
+`-D warnings`. PR #702's pre-restack review head passed Linux x86_64, Linux ARM64, and macOS Apple
+Silicon CI. The rebased final SHA still requires refreshed preflight and post-open review markers,
+push, and CI before merge. C1 must close those exact-SHA records before c2a begins. No public
+`pkg.db` surface exists yet.
 
-Prior am-b4 operational record: `main` includes the shipped wave through #688 plus the merged am-p
+Historical am-b4 operational record: before PR #706, `main` included the shipped wave through #688
+plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
 (`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
-replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The current
-working slice is the am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate`: the shared
-four-entrypoint gate now runs body-core validation before sema fact replay. Replay uses explicit
+replay PR #699 (`9e2d615`), and checked-HIR body-fact replay PR #700 (`1296b97`). The merged
+am-b4 MIR activation vertical on `agent/pkg-db-am-b4-activate` activated the shared
+four-entrypoint gate, which runs body-core validation before sema fact replay. Replay uses explicit
 numeric enter/exit occurrence frames for the 259-record checked-HIR ceiling, with no Span or native
 pointer identity, and iterative teardown for successful, rejected, and panic-after-analysis paths.
 The body envelope also validates declaration-free `print`/`hash64`/`hash128` calls and fresh local
@@ -113,7 +132,8 @@ tests and the complete MIR library owner 94/94. A fresh independent review of th
 `Break.accepted` slice returned CLEAN after checking sema production, every downstream consumer,
 both region dimensions, fail-closed lowering, docs, and owner coverage. The complete exact-base
 review then returned CLEAN, and the repository gate, workspace all-target Clippy, and final MIR
-owner passed under the dedicated target. The branch has not been pushed and no PR exists yet.
+owner passed under the dedicated target. The branch is now pushed as the stacked base for PR #702;
+it has no standalone PR.
 The one host-native review invocation for the follow-up range
 `62f487713561693cd93228928145010507680fcf..87b45b4` also produced no verdict because repeated
 Xcode/git temporary-cache failures left the host review stalled; it was stopped and preserved as

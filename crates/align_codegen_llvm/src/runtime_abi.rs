@@ -143,13 +143,14 @@ pub(super) struct RuntimeAbi {
     shape: RuntimeAbiShape,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
 pub(super) enum UnkeyedRuntimeKey {
-    ReportError,
-    ArgsBuild,
-    ArenaReset,
-    Realloc,
-    HttpSerialize,
+    ReportError = 0,
+    ArgsBuild = 1,
+    ArenaReset = 2,
+    Realloc = 3,
+    HttpSerialize = 4,
 }
 
 pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 5] = [
@@ -160,7 +161,7 @@ pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 5] = [
     UnkeyedRuntimeKey::HttpSerialize,
 ];
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum RuntimeAbiId {
     Keyed(RuntimeKey),
     Unkeyed(UnkeyedRuntimeKey),
@@ -2953,6 +2954,10 @@ mod tests {
 
     #[test]
     fn runtime_abi_registry_is_complete_and_unique() {
+        fn assert_ord<T: Ord>() {}
+
+        assert_ord::<RuntimeAbiId>();
+        assert_eq!(UNKEYED_RUNTIME_KEYS.map(|key| key as u8), [0, 1, 2, 3, 4]);
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
         assert_eq!(rows.len(), 286);

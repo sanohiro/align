@@ -3,8 +3,6 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 golden="$repo_root/crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt"
-target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
-archive="$target_dir/debug/libalign_runtime.a"
 cd "$repo_root"
 
 if [[ -n "${LLVM_CONFIG:-}" && -x "${LLVM_CONFIG}" ]]; then
@@ -22,6 +20,8 @@ fi
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
+audit_target="$work_dir/audit-target"
+archive="$audit_target/debug/libalign_runtime.a"
 sed -nE 's/.*@(align_rt_[A-Za-z0-9_]+)\(.*/\1/p' "$golden" | sort -u > "$work_dir/base"
 if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 286 ]]; then
   echo "test-runtime-abi-exports: declaration golden does not contain 286 base symbols" >&2
@@ -120,9 +120,10 @@ audit_case() {
 
   if [[ -n "$features" ]]; then
     cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
-      -p align_runtime --features "$features"
+      -p align_runtime --target-dir "$audit_target" --features "$features"
   else
-    cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" -p align_runtime
+    cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
+      -p align_runtime --target-dir "$audit_target"
   fi
   "$llvm_nm" --defined-only --extern-only "$archive" 2>/dev/null \
     | awk '{print $NF}' \
