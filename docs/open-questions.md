@@ -4376,6 +4376,16 @@ than adding a second scanner ownership model. The currently admitted `Option<Mov
 shape remains supported for ordinary decode, encode, and scope Drop; cleanup after a later required
 sibling decode error is governed by a separate ownership request.
 
+Request 6's generic boundary is concrete-row-only. Concrete generic monomorphs such as `Wrap<i64>`
+remain eligible after row resolution, and an ordinary generic call may use the new expected-return
+propagation rule owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar`
+continue to default deterministically to `i64`/`f64`. An unresolved `Wrap<T>` /
+`json.scanner<Wrap<T>>` type argument inside a generic function remains outside this gate and keeps
+the exact resolver diagnostic `instantiating a generic struct with a type parameter ('Row<…>' inside
+a generic function) is not supported yet`. That unresolved-row capability is a separate compiler
+prerequisite tracked by align-llm; no Request 6 implementation or client may assume it before that
+prerequisite is accepted and merged.
+
 **Catalog trimmed (SETTLED — dangling entries removed, not left "unimplemented"):**
 `json.validate<T>` **deleted** (decode-and-discard IS validation with zero-copy costs; one way);
 `json.token` **deleted** (doc + scan cover the realistic cases; no consumer — build it only if one

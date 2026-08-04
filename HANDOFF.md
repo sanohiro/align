@@ -11,14 +11,15 @@ declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #
 (`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The historical
 implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
 group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no general public validator activation; Request 6's design specifies the narrow
-scanner Copy predicate as an exception through the active pre-lowering gate. The design repair is
-`bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and restores
-ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701 merged
-the design at `576e573`; the implementation branch is
-`agent/align-llm-request6-implementation`, based on the post-merge checkpoint `6e48b46` and the
-implementation commit `f52eb6d`. The consolidated closure-matrix and generic source-spelling
-repair is `3d7b118`; the design handoff checkpoint remains `3a05c87`.
+history. There is no general public validator activation yet; Request 6's design specifies the
+narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
+repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
+restores ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701
+merged the initial design at `576e573`; the reviewed redesign in Align PR #703 merged at
+`0ab7a30d6e7bfda56d4c8145b4672306634b9fea` with final design head `712317b`. The implementation
+branch is `agent/align-llm-request6-implementation-v2`, based on the prior implementation
+checkpoint `8b55352` plus this merged design, with code repair `3d7b118`; no release pin or
+align-llm adoption verification exists yet.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.

@@ -654,6 +654,13 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   `Drop`, so semantic checking admits only rows whose complete reachable definition graph is
   recursively Copy under the canonical `DropPlan`. This is a scanner-only restriction; ordinary
   JSON decode and the declaration's other uses retain their own explicit ownership contracts.
+- **Request 6's scanner generic boundary is concrete-row-only.** Concrete generic monomorphs such
+  as `Wrap<i64>` remain eligible after row resolution, and ordinary generic calls use expected-return
+  propagation owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain
+  deterministic `i64`/`f64` defaults. An unresolved `Wrap<T>` / `json.scanner<Wrap<T>>` type argument
+  inside a generic function keeps the exact resolver diagnostic `instantiating a generic struct
+  with a type parameter ('Row<…>' inside a generic function) is not supported yet`; that capability
+  is a separate compiler prerequisite, not an implicit extension of the scanner surface.
 - **The catalog carries no dangling entries.** `validate<T>` (decode-and-discard is validation),
   `token` (no consumer; doc + scan cover it), and `field_table<T>` (compiler-internal) were
   deleted rather than left "spec'd but unimplemented" — a catalog entry is a promise, and unkept
