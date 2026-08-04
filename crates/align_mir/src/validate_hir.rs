@@ -4833,10 +4833,22 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayCount { source, stages }
             | hir::ExprKind::ArrayMinMax { source, stages, .. }
             | hir::ExprKind::ArraySort { source, stages, .. }
-            | hir::ExprKind::ArrayToArray { source, stages, .. }
-            | hir::ExprKind::ArrayParMap { source, stages, .. }
-            | hir::ExprKind::ArrayPartition { source, stages, .. } => {
+            | hir::ExprKind::ArrayToArray { source, stages, .. } => {
                 self.push_pipeline_children(source, stages, &[], context, work);
+            }
+            hir::ExprKind::ArrayParMap {
+                source,
+                stages,
+                captures,
+                ..
+            }
+            | hir::ExprKind::ArrayPartition {
+                source,
+                stages,
+                captures,
+                ..
+            } => {
+                self.push_pipeline_children(source, stages, captures, context, work);
             }
             hir::ExprKind::ArrayAnyAll {
                 source,

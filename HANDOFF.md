@@ -8,16 +8,23 @@ per-PR journal is preserved in
 _Last updated: 2026-08-05._ The current branch is `agent/pkg-db-am-b4-activate`, integrating
 AM-B4 activation head `22e5ba3` with current `main` `e65448b7`. The integration preserves both the
 complete checked-HIR body gate and Request 6's active `json.scan` envelope/Copy gate. Conflict
-closure is complete. The integrated MIR library owner passes 99/99 and the Request 6 generic-return
+closure is complete. The pre-open integrated MIR library owner passed 99/99 and the Request 6 generic-return
 context driver owner passes 9/9 after the dedicated target's explicit runtime build. The fresh
 review of the pre-integration AM-B4 range found one P2: an unused orphan nonparameter local record
 was not required to have a binding. Production validation now requires exactly one `Let`,
 `LetTuple`, or match-payload binding, and the four-entrypoint regression owner passes. A separate
 focused sema replay launch remained at 0% CPU in macOS `_dyld_start` and was stopped and preserved
-as INCOMPLETE; the MIR owner exercises the integrated replay path successfully. A fresh exact-SHA
-review, final preflight, and a PR to `main` are pending. The cross-worktree Request 6
-identity owner must bind the committed integration head. Stacked AM-C1 draft #702 and AM-C2a1 draft
-#705 remain open behind this prerequisite. No public `pkg.db` surface exists yet.
+as INCOMPLETE; the MIR owner exercises the integrated replay path successfully. Draft PR #706 is
+open. Its host review found one P1: `ArrayPartition` and `ArrayParMap` derivation consumed terminal
+capture flows that the structural child worklist had not visited, rejecting producer-valid captured
+closures at all four lowerers. The current follow-up passes those captures through the shared
+pipeline child walk; the new four-entrypoint owner, the existing four lambda-capture driver owners,
+the MIR library owner (100/100), and focused MIR Clippy all pass. Fresh independent review, refreshed
+preflight/push, bounded finding closure, and CI are pending. The cross-worktree Request 6 identity
+rerun remains INCOMPLETE on this macOS host because the Linux C cross-compiler is absent and the
+temporary Linux container stalled while fetching its base image; the previously merged Request 6
+identity evidence remains intact. Stacked AM-C1 draft #702 and AM-C2a1 draft #705 remain open behind
+this prerequisite. No public `pkg.db` surface exists yet.
 
 Historical AM-B4 activation record: as of 2026-08-03, `main` included the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h

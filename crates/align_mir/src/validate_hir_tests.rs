@@ -1160,6 +1160,21 @@ fn malformed_hir_unused_local_record_fails_closed() {
 }
 
 #[test]
+fn capturing_partition_and_par_map_reach_all_lowerers() {
+    let program = checked_source_program(
+        "fn captured() -> i64 {\n\
+           t := 2\n\
+           (big, small) := [1, 2, 3, 4].partition(fn x { x > t })\n\
+           b := 10\n\
+           ys := [1, 2, 3].par_map(fn x { x + b })\n\
+           return big.len() + small.len() + ys.len()\n\
+         }\n\
+         fn main() -> i32 = 0\n",
+    );
+    assert_accepted("capturing partition/par_map terminals", &program);
+}
+
+#[test]
 fn valid_hir_body_preflight_is_mir_identity() {
     let program = declaration_header_program();
     assert!(align_sema::checked_hir_body_facts_are_valid(&program));
