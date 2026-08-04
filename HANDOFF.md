@@ -33,14 +33,16 @@ is being redesigned rather than patched in place: Request 6 now covers only conc
 calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
 Span, identity, composite, and implementation-matrix findings. The re-scoped design checkpoint is
 `a66248f` on `agent/align-llm-request6-design`; the consolidated repair was committed as `28e28c3`
-and reviewed at `36fd7b2`; no compiler implementation or release pin exists. The final independent
+and reviewed at `36fd7b2`. The redesigned contract is committed as `be89026` on the same branch;
+no compiler implementation or release pin exists. The final independent
 review of `36fd7b2` found two P1 and three P2 findings: cross-compiler cache identity must treat
 `compiler_build_id` as an intentional difference, generic expected-return propagation must name its
 new resolver owner and numeric-default boundary, HIR precedence needs a reason-valued test seam,
 scanner coverage must distinguish five HIR variants from seven public terminals, and this handoff
 must bind the current head. The closure matrix is reopened for a redesign; implementation and
-publication remain paused. `git diff --check` passed before the redesign; targeted
-Markdown/source-of-truth checks remain pending.
+publication remain paused. After `be89026`, `git diff --check` and the targeted `rg` contract/source-of-truth
+checks passed; no repository Markdown linter is available, so that check is N/A. The handoff metadata
+update itself is the only remaining uncommitted change until this checkpoint commit is recorded.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
