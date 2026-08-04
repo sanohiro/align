@@ -5,17 +5,18 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`, based on
-implementation checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged
-in Align at `0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is in progress and is
-not yet published or merged. No `.align-revision` adoption pin or align-llm `make ci` verification
-exists yet.
+_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; relevant
+implementation commit `43211ec` is based on implementation checkpoint `8b55352` plus the reviewed
+Align Request 6 design head `712317b`, merged in Align at
+`0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete locally but is not yet
+published or merged. No `.align-revision` adoption pin or align-llm `make ci` verification exists
+yet.
 
 ## Active Request 6 implementation checkpoint
 
 - Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script.
-- Verification: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, targeted m5 scanner tests, modules (41/41), cache_codegen (26/26), MIR validator (85/85), and targeted clippy pass. The m5 aggregate has 188/193 passing; five failures reproduce on the pre-change checkpoint as existing link/diagnostic failures and are not Request 6 failures.
-- Next, in order: finish the implementation diff review; commit/publish the implementation PR; run `scripts/compare-json-scan-identity.sh <implementation-head-sha>` in the required Linux toolchain; perform the one comprehensive adversarial review and repair; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
+- Verification: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, scanner-focused m5 (32/32), modules (41/41), cache_codegen (26/26), MIR validator (85/85), sema (202/202), and targeted clippy pass. `scripts/compare-json-scan-identity.sh 43211ec` passed in the required release Linux environment: interface/MIR/raw LLVM/object and every non-build-id CodegenKey field matched; only `FirstDiff::CompilerBuildId` differed. The m5 aggregate has 188/193 passing; five failures reproduce on the pre-change checkpoint as existing link/diagnostic failures and are not Request 6 failures.
+- Next, in order: perform the one comprehensive adversarial review; publish the implementation PR; apply any valid findings in one repair; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
 - Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
