@@ -18729,6 +18729,9 @@ struct Checker<'a, 't> {
 struct CaptureScope {
     /// The enclosing function's visible names → (enclosing LocalId, type), snapshot at lambda entry.
     enclosing: Vec<(String, LocalId, Ty)>,
+    /// Producer-owned scanner spellings for the enclosing locals. This snapshot remains available
+    /// while the lambda's ordinary local spelling map is swapped out.
+    json_scan_local_spellings: HashMap<LocalId, String>,
     /// Captured enclosing locals, in capture order: (name, lifted-fn param LocalId, enclosing LocalId).
     captured: Vec<(String, LocalId, LocalId)>,
 }
@@ -19267,7 +19270,7 @@ impl<'a, 't> Checker<'a, 't> {
         if let Some(id) = self.lookup(name) {
             return Some(id);
         }
-        let (enc_id, ty) = {
+        let (enc_id, ty, spelling) = {
             let cap = self.capture.as_ref()?;
             if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
                 return Some(param_id);
@@ -19276,9 +19279,8 @@ impl<'a, 't> Checker<'a, 't> {
                 .iter()
                 .rev()
                 .find(|(n, _, _)| n == name)
-                .map(|(_, id, ty)| (*id, *ty))?
+                .map(|(_, id, ty)| (*id, *ty, cap.json_scan_local_spellings.get(id).cloned()))?
         };
-        let spelling = self.json_scan_local_spellings.get(&enc_id).cloned();
         // A captured value becomes a synthetic parameter local (tracked in `captured`, *not*
         // pushed into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
@@ -20279,6 +20281,59 @@ impl<'a, 't> Checker<'a, 't> {
         let result = self.check_arg(a, param);
         self.json_scan_source_spelling = saved;
         result
+    }
+
+    /// Recover checker-only scanner spelling from a checked expression whose value is a local.
+    /// Transparent wrappers are included so inference does not lose producer identity merely
+    /// because an expression was checked through a block or a borrow boundary.
+    fn json_scan_source_spelling_of_expr(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Local(id) => self.json_scan_local_spellings.get(id).cloned(),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .and_then(|value| self.json_scan_source_spelling_of_expr(value)),
+            ExprKind::StrBorrow(inner) => self.json_scan_source_spelling_of_expr(inner),
+            _ => None,
+        }
+    }
+
+    /// Return the spelling carried by a fully bound generic scanner slot for a bare argument
+    /// position. The declared position is owned by the callee, so its slot index is interpreted
+    /// against this call's substitution vector rather than against the enclosing function's
+    /// symbolic parameters.
+    fn json_scan_spelling_for_generic_argument(
+        &self,
+        declared: Ty,
+        subst: &[Option<Ty>],
+        subst_spellings: &[Option<String>],
+    ) -> Option<String> {
+        let Ty::Param(p) = declared else { return None };
+        let Some(Some(bound)) = subst.get(p as usize) else { return None };
+        if !matches!(self.resolve(*bound), Ty::JsonScanner(_)) {
+            return None;
+        }
+        subst_spellings.get(p as usize).cloned().flatten()
+    }
+
+    /// Store the producer-owned spelling when a generic slot is inferred from a scanner value.
+    /// Request 6 currently admits scanner values only as a bare generic argument; keeping the
+    /// declared/actual pair explicit makes that boundary fail closed if a composite scanner shape
+    /// is added later without a corresponding spelling owner.
+    fn record_json_scan_slot_spelling(
+        &self,
+        declared: Ty,
+        actual: Ty,
+        spelling: Option<String>,
+        subst_spellings: &mut [Option<String>],
+    ) {
+        let Some(spelling) = spelling else { return };
+        let Ty::Param(p) = declared else { return };
+        if matches!(self.resolve(actual), Ty::JsonScanner(_))
+            && let Some(slot) = subst_spellings.get_mut(p as usize)
+        {
+            *slot = Some(spelling);
+        }
     }
 
     /// Check a function, block, or match-arm completion expression. Process termination has an
@@ -22111,8 +22166,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// binds `p` from the corresponding argument's type (all occurrences of `p` are unified
     /// together); a `Param` appearing only in the return type is taken from the expected type. Every
     /// parameter must be inferable. A parameter position may be bare or a scalar-payload composite,
-    /// but a composite that is only partially substituted by the expected return is rejected before
-    /// its argument is checked; `Ty::Param` is not a wildcard for the ordinary expression checker.
+    /// but a position that mixes bound and unbound callee slots is rejected before its argument is
+    /// checked; an enclosing function's symbolic parameter is valid forwarding, and `Ty::Param` is
+    /// not a wildcard for the ordinary expression checker.
     /// `type_args` is recorded for monomorphization, which generates the concrete instance and
     /// rewrites the call target.
     #[allow(clippy::too_many_arguments)]
@@ -22140,17 +22196,24 @@ impl<'a, 't> Checker<'a, 't> {
         // own source-check boundary rather than failing with the direct missing-context diagnostic.
         let error_checkpoint = self.diags.error_count();
         let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
+        let mut subst_json_scan_spellings: Vec<Option<String>> = vec![None; type_params.len()];
         if let Some(exp) = expected {
             self.match_param(ret, self.resolve(exp), &mut subst, span, true);
+            // Expected-return seeding is the first source-order inference phase. Its conflict owns
+            // the call diagnostic and must prevent argument checking from producing unrelated
+            // scanner or constructor errors.
+            if self.diags.error_count() > error_checkpoint {
+                return err;
+            }
         }
 
         // Each argument's type is then matched structurally against its declared parameter type,
         // binding any `Param` it carries (bare `T`, or nested in `Option<T>` / `Result<T, E>` /
         // `slice<T>` / `box<T>` / a fixed `array<T>`). Every parameter already bound by the return
         // context is substituted into the argument's expected type before the argument is checked.
-        // A partially substituted composite is rejected here: passing its remaining `Ty::Param` into
-        // the ordinary expression checker would either lose constructor context or leak an inference
-        // variable into HIR.
+        // A position that mixes bound and unbound callee slots is rejected here: passing a partial
+        // expected composite into the ordinary expression checker would either lose constructor
+        // context or leak a callee inference variable into HIR.
         let mut checked = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let declared = param_tys[i];
@@ -22160,7 +22223,8 @@ impl<'a, 't> Checker<'a, 't> {
                 .map(|(index, value)| value.unwrap_or(Ty::Param(index as u32)))
                 .collect();
             let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
-            if ty_mentions_param(substituted, self.tagged_types) && substituted != declared {
+            let slot_state = generic_param_state(declared, &subst, self.tagged_types);
+            if slot_state.bound && slot_state.unbound {
                 self.diags.error(
                     format!(
                         "generic argument {} of '{name}' has a partially inferred type; annotate the argument or use a bare generic parameter",
@@ -22170,24 +22234,35 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             }
-            let expected_param = (!ty_mentions_param(substituted, self.tagged_types)).then_some(substituted);
-            let ce = if expected_param.is_none() && ty_mentions_param(declared, self.tagged_types) {
+            let expected_param = (!slot_state.unbound).then_some(substituted);
+            let argument_spelling = json_scan_param_spellings
+                .get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| self.json_scan_spelling_for_generic_argument(declared, &subst, &subst_json_scan_spellings));
+            let inherited_spelling = self.json_scan_source_spelling.clone();
+            let ce = if slot_state.unbound {
                 // A position whose parameter is still unknown applies no coercion, so check the
                 // argument unconstrained. A later argument or the final expected-result boundary
                 // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
-                self.check_expr(a, None)
+                self.check_expr_with_json_scan_source_spelling(a, None, argument_spelling.clone())
             } else {
                 self.check_arg_with_json_scan_source_spelling(
                     a,
                     expected_param,
-                    json_scan_param_spellings.get(i).cloned().flatten(),
+                    argument_spelling.clone(),
                 )
             };
+            let spelling = self
+                .json_scan_source_spelling_of_expr(&ce)
+                .or(argument_spelling)
+                .or(inherited_spelling);
+            self.record_json_scan_slot_spelling(declared, ce.ty, spelling, &mut subst_json_scan_spellings);
             // When the substituted parameter is concrete, `check_arg` already owns the exact
             // reconciliation and diagnostic. Re-unifying the same bound slot would emit a
             // reversed duplicate mismatch. Only an unresolved parameter needs inference here.
-            if expected_param.is_none() {
+            if slot_state.unbound {
                 self.match_param(declared, ce.ty, &mut subst, a.span, false);
             }
             // Generic argument checking is a source-order publication boundary. Do not inspect a
@@ -24034,6 +24109,7 @@ impl<'a, 't> Checker<'a, 't> {
             .iter()
             .map(|(n, id)| (n.clone(), *id, self.finalize(self.locals[*id as usize].ty)))
             .collect();
+        let enclosing_json_scan_local_spellings = self.json_scan_local_spellings.clone();
 
         // Swap in fresh per-function state; the lambda is a separate function body.
         let saved_lifted_len = self.lifted.len();
@@ -24070,7 +24146,11 @@ impl<'a, 't> Checker<'a, 't> {
         self.unsafe_depth = 0;
         self.extern_boundary_error = false;
         self.task_group_depth = 0;
-        self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
+        self.capture = Some(CaptureScope {
+            enclosing,
+            json_scan_local_spellings: enclosing_json_scan_local_spellings,
+            captured: Vec::new(),
+        });
 
         let mut param_ids = Vec::with_capacity(params.len());
         for (p, ty) in params.iter().zip(&param_tys) {
@@ -33804,6 +33884,61 @@ fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         }
     }
     false
+}
+
+/// The state of the callee's own inference slots in one declared argument position. An enclosing
+/// generic function may contribute a symbolic `Ty::Param` as a bound value; that value is not an
+/// unresolved slot of this call and must not be mistaken for a partial substitution.
+#[derive(Clone, Copy, Default)]
+struct GenericParamState {
+    bound: bool,
+    unbound: bool,
+}
+
+fn generic_param_state(ty: Ty, subst: &[Option<Ty>], tagged_types: &[hir::TaggedType]) -> GenericParamState {
+    let mut state = GenericParamState::default();
+    let mut work = Vec::new();
+    match ty {
+        Ty::Param(p) => {
+            if subst.get(p as usize).is_some_and(Option::is_some) {
+                state.bound = true;
+            } else {
+                state.unbound = true;
+            }
+        }
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => work.push(s),
+        Ty::Result(ok, err) => {
+            work.push(err);
+            work.push(ok);
+        }
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
+    }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
+        match scalar {
+            Scalar::Param(p) => {
+                if subst.get(p as usize).is_some_and(Option::is_some) {
+                    state.bound = true;
+                } else {
+                    state.unbound = true;
+                }
+            }
+            Scalar::Tagged(id) if visited.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(payload),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(err);
+                            work.push(ok);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    state
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument

@@ -1513,6 +1513,82 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn json_scan_generic_return_context_expected_conflict_no_cascade() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> Result<T, T> {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  bad: Result<i64, bool> := choose(json.scan("[]"), 1)
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-expected-conflict", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "the expected return conflict must fail");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the expected-return seed must own the only conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "argument checking must stop after an expected-return conflict:\n{diagnostics}"
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "an expected-return conflict must not publish a scanner HIR/MIR source:\n{mir}"
+    );
+}
+
+#[test]
+fn json_scan_generic_argument_source_spelling() {
+    let local = r#"
+import core.json
+Owned { values: array<i64> }
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  bad := choose(rows, json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let local_diags = check_diagnostics("json-scan-generic-local-spelling", local);
+    assert_eq!(local_diags.matches("must be Copy").count(), 1, "local scanner spelling was lost:\n{local_diags}");
+    assert!(
+        local_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the local producer spelling must own the Copy diagnostic:\n{local_diags}"
+    );
+    assert!(!local_diags.contains("cannot determine the scan row type spelling"), "local spelling fallback leaked:\n{local_diags}");
+
+    let lambda = r#"
+import core.json
+Owned { values: array<i64> }
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  values := [1].map(fn n { choose(rows, json.scan("[]")); n }).sum()
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let lambda_diags = check_diagnostics("json-scan-generic-lambda-spelling", lambda);
+    assert_eq!(lambda_diags.matches("must be Copy").count(), 1, "lambda scanner spelling was lost:\n{lambda_diags}");
+    assert!(
+        lambda_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the captured producer spelling must own the Copy diagnostic:\n{lambda_diags}"
+    );
+    assert!(!lambda_diags.contains("cannot determine the scan row type spelling"), "lambda spelling fallback leaked:\n{lambda_diags}");
+}
+
+#[test]
 fn json_scan_generic_return_context_ownership() {
     let source = r#"
 import core.json
@@ -1534,9 +1610,11 @@ fn json_scan_generic_return_context_wrapper_matrix() {
 import core.json
 Row { score: i64 }
 fn identity<T>(value: T) -> T = value
-fn wrapper<T>(value: T) -> T = identity(value)
+fn wrapper<A, B>(first: A, value: B) -> B = identity(value)
+fn forward<T, U>(value: Result<T, U>) -> Result<T, U> = value
+fn forward_wrapper<A, B>(value: Result<A, B>) -> Result<A, B> = forward(value)
 fn main() -> Result<(), Error> {
-  rows: json.scanner<Row> := wrapper(json.scan("[]"))
+  rows: json.scanner<Row> := wrapper(0, json.scan("[]"))
   rows.count()?
   value := identity(1)
   print(value)
