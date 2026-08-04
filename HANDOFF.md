@@ -6,19 +6,20 @@ per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
 _Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; the
+implementation head is `7b88b97`, with the reviewed contract repair in `b5b3f4d`. The earlier
 implementation commit `43211ec` is followed by consolidated review repair `2688681` and the
 baseline-compatible identity-harness repair `50912db`. The branch is based on implementation
 checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
 `0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete locally but is not yet
-merged. Align PR #704 is now pushed through `50912db`; preflight and final attestations are still
+merged. Align PR #704 is pushed through `7b88b97`; preflight and final attestations are still
 pending. No `.align-revision` adoption pin or align-llm `make ci` verification exists yet.
 
 ## Active Request 6 implementation checkpoint
 
-- Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script.
-- Verification: the focused owner tests pass: generic scanner m5 (6/6), active HIR scanner envelope (3/3), modules (41/41), JSON cache owners (5/5), MIR (85/85), sema (202/202), targeted check, and targeted clippy. The full m5 aggregate is 189/194; the same five existing link/diagnostic failures reproduce on the pre-change checkpoint and are outside Request 6. The exact cross-compiler identity script passes against baseline `576e573` and final implementation `50912db`; the pushed head has compatible baseline/test separation.
-- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. The repair preserves the scanner-only scope and updates the English/Japanese design closure matrix before implementation repair. Fresh final host and independent attestations remain pending for the complete pushed head.
-- Next, in order: rerun focused checks and identity against `50912db`; obtain final host and independent clean attestations; run preflight and update PR #704 markers; wait for required CI; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
+- Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script; explicit rejection of partially substituted generic composites before argument checking.
+- Verification: after `7b88b97`, `cargo +1.96.1 test -p align_driver --test m5 'json_scan_generic_return_context_' -- --nocapture` passes 7/7; `cargo +1.96.1 test -p align_driver --test cache_codegen -- --nocapture` passes 27/27; `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked` passes; the matching clippy command passes; `git diff --check` passes; and `scripts/compare-json-scan-identity.sh 7b88b97` passes with interface/MIR/LLVM/object and all non-build-id fields equal. The latest full m5 aggregate before this narrow repair was 189/194; the same five existing link/diagnostic failures reproduce on the pre-change checkpoint and are outside Request 6. The full aggregate must be rerun by preflight for the final head.
+- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. A later independent final pass found one additional P1: a partially substituted `Result<T, U>` expected argument could reach constructor checking without a sound partial-type contract. The closure matrix was reopened; `b5b3f4d` narrows the contract and `7b88b97` rejects the state before checking or publishing the argument. Fresh final host and independent attestations remain pending for the complete pushed head.
+- Next, in order: obtain final host and independent clean attestations for `7b88b97`; run preflight and update PR #704 markers; wait for required CI; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
 - Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
