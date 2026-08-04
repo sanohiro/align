@@ -32,16 +32,16 @@ unresolved `json.scanner<Row<T>>` generic row argument. Under the repository rev
 is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
 calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
 Span, identity, composite, and implementation-matrix findings. The re-scoped design checkpoint is
-`a66248f` on `agent/align-llm-request6-design`; the consolidated repair is in progress in this
-worktree and no compiler implementation or release pin exists. The fresh independent review of
+`a66248f` on `agent/align-llm-request6-design`; the consolidated design repair is committed as
+`28e28c3`, and no compiler implementation or release pin exists. The fresh independent review of
 `a66248f` found eight actionable design gaps: the explicit `JsonScan` Span precedence exception,
 generic return-context propagation and wrapper/multi-argument order, no-HIR/no-artifact failure
 ownership, nested optional/object-union composite coverage, the stale implementation execution
 row, the distinction between `InterfaceSummary.interface_hash` and actual `CodegenKey` fields,
 authoritative Align source synchronization, and this checkpoint record. All valid findings are
-being applied in this one consolidated repair; the required final independent review is pending.
-`git diff --check` passed on the pre-repair design; targeted Markdown/source-of-truth checks remain
-pending.
+were applied in that one consolidated repair; the required final independent review is pending.
+`git diff --check` passed before and after the repair commit; no executable or compiler checks apply
+to this documentation-only slice. Targeted Markdown/source-of-truth checks remain pending.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
