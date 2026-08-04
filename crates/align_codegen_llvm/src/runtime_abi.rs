@@ -1767,6 +1767,21 @@ pub(super) fn function_type<'c>(id: RuntimeAbiId, ctx: &'c Context) -> FunctionT
     }
 }
 
+/// Whether a source-derived extern type is compatible with the fixed native row of the same
+/// physical name. Unknown names are ordinary user externs and therefore have no fixed row to
+/// compare. Fixed names compare the complete LLVM function type, including the return and every
+/// parameter ordinal.
+pub(super) fn native_extern_abi_matches<'c>(
+    symbol: &str,
+    actual: FunctionType<'c>,
+    ctx: &'c Context,
+) -> bool {
+    match runtime_abi_for_symbol(symbol) {
+        Some(id) => actual == function_type(id, ctx),
+        None => true,
+    }
+}
+
 fn native_type<'c>(ctx: &'c Context, ty: NativeType) -> BasicTypeEnum<'c> {
     match ty {
         NativeType::I32 => ctx.i32_type().into(),
@@ -2842,12 +2857,25 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
 #[cfg(test)]
 mod tests {
     use super::{
-        UNKEYED_RUNTIME_KEYS, runtime_abi, runtime_abi_for_symbol, runtime_abis, unkeyed_symbol,
-        unkeyed_function_type, validate_registry,
+        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, function_type, native_extern_abi_matches, runtime_abi,
+        runtime_abi_for_symbol, runtime_abis, unkeyed_function_type, unkeyed_symbol,
+        validate_registry,
     };
     use align_mir::RuntimeKey;
+    use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
     use std::collections::HashSet;
     use std::fmt::Write;
+
+    fn rebuilt_function_type<'c>(
+        ctx: &'c inkwell::context::Context,
+        ret: Option<BasicTypeEnum<'c>>,
+        params: &[BasicMetadataTypeEnum<'c>],
+    ) -> FunctionType<'c> {
+        match ret {
+            Some(ret) => ret.fn_type(params, false),
+            None => ctx.void_type().fn_type(params, false),
+        }
+    }
 
     #[test]
     fn runtime_abi_registry_is_complete_and_unique() {
@@ -2890,6 +2918,64 @@ mod tests {
         }
         assert_eq!(base_symbols.len(), 286);
         assert!(runtime_abi_for_symbol("align_rt_not_a_fixed_row").is_none());
+    }
+
+    #[test]
+    fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
+        let ctx = inkwell::context::Context::create();
+        let mut rows: Vec<_> = RuntimeKey::ALL
+            .into_iter()
+            .map(|key| {
+                let abi = runtime_abi(key);
+                (abi.symbol, RuntimeAbiId::Keyed(key))
+            })
+            .collect();
+        rows.extend(
+            UNKEYED_RUNTIME_KEYS
+                .into_iter()
+                .map(|key| (unkeyed_symbol(key), RuntimeAbiId::Unkeyed(key))),
+        );
+        assert_eq!(rows.len(), 286);
+
+        for (symbol, id) in rows {
+            let expected = function_type(id, &ctx);
+            assert!(
+                native_extern_abi_matches(symbol, expected, &ctx),
+                "rejected exact native extern type for {symbol}",
+            );
+
+            let params = expected.get_param_types();
+            let wrong_return = match expected.get_return_type() {
+                Some(_) => rebuilt_function_type(&ctx, None, &params),
+                None => rebuilt_function_type(&ctx, Some(ctx.i32_type().into()), &params),
+            };
+            assert!(
+                !native_extern_abi_matches(symbol, wrong_return, &ctx),
+                "accepted mutated native extern return for {symbol}",
+            );
+
+            for ordinal in 0..params.len() {
+                let mut wrong_params = params.clone();
+                wrong_params[ordinal] = if wrong_params[ordinal] == ctx.i32_type().into() {
+                    ctx.i64_type().into()
+                } else {
+                    ctx.i32_type().into()
+                };
+                let wrong_param =
+                    rebuilt_function_type(&ctx, expected.get_return_type(), &wrong_params);
+                assert!(
+                    !native_extern_abi_matches(symbol, wrong_param, &ctx),
+                    "accepted mutated native extern parameter {ordinal} for {symbol}",
+                );
+            }
+        }
+
+        let ordinary = ctx.void_type().fn_type(&[], false);
+        assert!(native_extern_abi_matches(
+            "align_rt_not_a_fixed_row",
+            ordinary,
+            &ctx,
+        ));
     }
 
     #[test]

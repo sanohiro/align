@@ -7,9 +7,10 @@ per-PR journal is preserved in
 
 _Last updated: 2026-08-04._ The current local branch is `agent/pkg-db-am-c`, stacked on the clean
 unpushed am-b4 activation checkpoint `22e5ba3`; no PR exists. The user authorized the c1 commit,
-SHA-bound preflight, base-branch publication, push, and draft PR on 2026-08-04. Four mandatory am-c
-matrix reviews repaired the public contracts and PR
-boundaries; the final fresh review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
+SHA-bound preflight, base-branch publication, push, and draft PR on 2026-08-04. The c1 implementation
+commit is `cc9da75`; one coherent pre-PR finding-closure follow-up is in the working tree. Four
+mandatory am-c matrix reviews repaired the public contracts and PR boundaries; the final fresh
+pre-implementation matrix review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
 now splits am-c into c1 (fixed typed runtime ABI registry), c2a (private canonical graph/encoder),
 c2b (effect-free MIR function-table retention/remap), c2c (dormant public canonical decoder), c2d
 (dormant generated-identity codecs), and c3 (typed program/generated activation). These are six
@@ -31,18 +32,31 @@ and adds a compiled default/feature export script with compile-time probe-signat
 required bounded follow-up review confirmed those fixes and found one further P2 in the same class:
 a parseable rt-LTO artifact could omit a guarded body and leave its declaration un-curated. The
 follow-up now preflights all four guarded rows for presence, exact type, and a body, with loud
-all-row re-curation/fallback owners for missing, declaration-only, and wrong-type artifacts.
-Focused c1 owners pass 9/9; `align_codegen_llvm` passes 65/65 with 5 intentional PGO ignores;
+all-row re-curation/fallback owners for missing, declaration-only, and wrong-type artifacts. The
+fresh `cc9da75` final-SHA review then found three valid P2 closure gaps and one stale-state P3:
+linkage/calling convention were not preflighted and a declaration-only post-link handle could still
+continue; `ArgsBuild` was incorrectly claimed as a source-compatible extern despite the settled
+view-return rejection; and the machine gates compared all names but not all 286 compiled Rust
+signatures or every return/parameter ordinal. The working follow-up requires external+C guarded
+definitions before link and a body-bearing external+C typed handle after link, adds seven exact
+malformed artifact cells plus a post-link error owner, records `ArgsBuild` as wrapper-only, compares
+all 286 compiled Rust LLVM signatures independently, and runs the production extern predicate over
+all 286 returns and every parameter ordinal. It also covers the five attribute classes, all eight
+ordinary probe spellings, and whole/per-unit-shaped declaration parity.
+Focused c1 owners pass 14/14; `align_codegen_llvm` passes 65/65 with 5 intentional PGO ignores;
 `align_mir` passes 95/95; the runtime source/registry owner passes; compiled
-base, `alloc-count`, `par-map-probe`, task-only, and all-feature runtime export sets are exactly
-286/290/290/286/294; and all nine rt-LTO integration owners pass. Changed-crate all-target Clippy
+base Rust signatures match 286/286 and base, `alloc-count`, `par-map-probe`, task-only, and
+all-feature runtime export sets are exactly 286/290/290/286/294; and all nine rt-LTO integration
+owners pass. Changed-crate all-target Clippy
 passes with `-D warnings`. The ordinary `scripts/test-pr.sh` invocation completed the workspace
 build and codegen owners, then its combined driver binary remained at 0% CPU in `_dyld_start` and
 was stopped as INCOMPLETE; the exact driver binary and every not-yet-run library/integration target
 then passed without source changes, so the gate was closed by checkpointed continuation rather than
-a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s). C1 is a local pre-PR
-checkpoint; the next action is the authorized commit/SHA-bound attestation and stacked draft PR,
-not c2 implementation. No public `pkg.db` surface exists yet.
+a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s) on `cc9da75`; the
+finding follow-up's affected-crate Clippy passes. The next action is to commit the coherent finding
+closure, run the required fresh high-risk review for the rt-LTO/ABI change, then run the final-SHA
+preflight and open the authorized stacked draft PR, not c2 implementation. No public `pkg.db`
+surface exists yet.
 
 Prior am-b4 operational record: `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h

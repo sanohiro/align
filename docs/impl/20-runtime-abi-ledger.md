@@ -187,8 +187,12 @@ that row. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
 shape; only `ReportError` and `ArgsBuild` have a dedicated Align main-wrapper
 declaration policy and yield typed wrapper handles when that wrapper requires
 them. The other three yield no unconditional compiler handle. An exact
-compatible extern may still declare or reuse any of the five unkeyed rows
-through the ordinary extern path. The legacy mixed string map remains as a handle-only alias seam
+compatible source extern may declare or reuse `ReportError`, `ArenaReset`,
+`Realloc`, or `HttpSerialize` through the ordinary extern path. `ArgsBuild`
+returns the native `{ptr, i64}` argv view, which no source-valid extern return
+can express: `str`/slice view returns are rejected and `layout(C) { raw, i64 }`
+lowers as `{i64, i64}`. It is therefore wrapper-only, not a fifth compatible
+source-extern row. The legacy mixed string map remains as a handle-only alias seam
 for unchanged `Rvalue::Call(String)` resolution through c1: it is populated in
 post-c1 class order from stored definitions, non-shadowed imports, externs,
 alphabetical `RuntimeKey::ALL` aliases, then existing generated aliases. The
@@ -212,10 +216,10 @@ curated native attributes. The selected native row supplies every curated
 attribute and rt-LTO policy to the one reused handle. A stored/imported program
 function with the same physical spelling is not native reuse and retains the
 current LLVM uniquification result until c3 encodes program symbols.
-Main-wrapper emission likewise reuses a type-compatible
-`ReportError`/`ArgsBuild` extern or otherwise adds the row in current wrapper
-order. Attributes are applied through typed row handles, never by a symbol
-prefix scan that could select a program claimant. Thus a same-spelled program
+Main-wrapper emission reuses a type-compatible `ReportError` extern or adds its
+row, and always adds the wrapper-only `ArgsBuild` row when argv marshalling is
+required. Both remain in current wrapper order. Attributes are applied through
+typed row handles, never by a symbol prefix scan that could select a program claimant. Thus a same-spelled program
 claimant keeps its current physical name/uniquification but loses accidental
 native attributes, while the actual possibly-suffixed native declaration gains
 the row attributes.
@@ -232,32 +236,44 @@ Tests compare:
 - all 281 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 286 base native symbols against default-feature `align_runtime` exports
-  and fail on either direction's difference through
-  `scripts/test-runtime-abi-exports.sh`;
+- the 286 base native symbols against default-feature `align_runtime` exports,
+  plus every actual Rust definition's normalized native return and ordered
+  parameter types against the declaration golden, failing on either direction's
+  difference through `scripts/test-runtime-abi-exports.sh`;
 - the 290 `alloc-count` and 290 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
 - the 294 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
-- rt-LTO off/on attributes for every guarded symbol;
-- compatible extern reuse against only the fixed 286-row base registry's
-  complete source-derived LLVM function type, with the native row then supplying
-  its curated declaration attributes; incompatible-type rejection; keyed
-  extern+builtin and unkeyed extern+wrapper single-declaration link success;
-  plus ordinary extern/export positives using each probe spelling in a normal runtime build;
-- one mutation of return type, every parameter ordinal, each registry attribute class,
-  symbol, and key; and
-- trivial whole/per-unit emitted IR against a checked-in declaration golden
-  whose body is exactly the expanded rows above.
+- rt-LTO off/on attributes for every guarded symbol, with missing,
+  declaration-only, wrong-type, internal, private, available-externally, and
+  non-C-calling-convention artifact negatives;
+- all 286 exact registry function types through the production compatibility
+  predicate, one return mutation per row, and one mutation of every parameter
+  ordinal; source-valid compatible reuse for a keyed builtin and the four
+  source-reachable unkeyed rows; exact `ArgsBuild` source rejection; and
+  compatible reuse representatives for each of the five checked-in attribute
+  classes (`#0`–`#4`), with the native row supplying its curated attributes;
+- one mutation of each registry attribute class, symbol, and key through the
+  checked-in golden and uniqueness owners;
+- ordinary extern and program-definition positives for all eight probe
+  spellings while the normal runtime export set excludes them; and
+- trivial whole-program and per-unit-shaped emitted IR with identical
+  alphabetical runtime declarations, whose exact rows are owned by the
+  checked-in declaration golden above.
 
-For rt-LTO, codegen first requires all four guarded logical symbols to have the
-exact registry function type and a body. A missing, declaration-only, or
-wrong-type row loudly falls back without merging and reapplies the curated
-attributes to every guarded declaration. The complete baked definitions then
-begin with their logical symbols. Before linking, codegen renames each one to
+For rt-LTO, codegen first requires all four guarded logical symbols in this
+deterministic order: present, exact registry function type, body present,
+external linkage, and C calling convention. Any failed check loudly falls back
+without merging and reapplies the curated attributes to every guarded
+declaration. The complete baked definitions then begin with their logical
+symbols. Before linking, codegen renames each one to
 the captured physical LLVM name of its typed declaration. This is normally the
 same spelling; when a preceding program/import claimant forced LLVM
 uniquification, it is the suffixed native name. The merge therefore fills only
-the typed native handle and never the same-spelled program claimant.
+the typed native handle and never the same-spelled program claimant. After
+linking, every captured typed handle must still be an external C-convention
+definition with a body before attributes are removed and linkage becomes
+internal; a missing body or changed linkage/convention is a compiler error,
+never a silent static-runtime fallback after partial mutation.

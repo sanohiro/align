@@ -973,9 +973,7 @@ fn build_module<'c>(
                 )));
             }
         };
-        if let Some(id) = runtime_abi::runtime_abi_for_symbol(&ext.name)
-            && fn_ty != runtime_abi::function_type(id, ctx)
-        {
+        if !runtime_abi::native_extern_abi_matches(&ext.name, fn_ty, ctx) {
             return Err(CodegenError::Lowering(format!(
                 "native extern ABI mismatch:{}",
                 lowercase_hex(ext.name.as_bytes()),
@@ -3535,6 +3533,67 @@ fn parse_rt_lto_module<'c>(ctx: &'c Context, bitcode: &[u8]) -> Result<Module<'c
     Module::parse_bitcode_from_buffer(&buf, ctx).map_err(|e| e.to_string())
 }
 
+fn restore_rt_lto_guarded_attributes<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    runtime: &RuntimeDeclarations,
+) -> Result<(), CodegenError> {
+    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let physical = runtime.physical_names.get(&abi.key).ok_or_else(|| {
+            CodegenError::Target(format!(
+                "--rt-lto: missing captured physical name for {}",
+                abi.symbol,
+            ))
+        })?;
+        let function = module.get_function(physical).ok_or_else(|| {
+            CodegenError::Target(format!(
+                "--rt-lto: typed guarded runtime declaration {physical} is missing",
+            ))
+        })?;
+        abi.apply_attributes(ctx, function);
+    }
+    Ok(())
+}
+
+const LLVM_C_CALL_CONVENTION: u32 = 0;
+
+fn normalize_linked_rt_lto_guarded_definitions(
+    module: &Module<'_>,
+    runtime: &RuntimeDeclarations,
+) -> Result<(), CodegenError> {
+    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let physical = runtime.physical_names.get(&abi.key).ok_or_else(|| {
+            CodegenError::Target(format!(
+                "--rt-lto: missing captured physical name for {}",
+                abi.symbol,
+            ))
+        })?;
+        let function = module.get_function(physical).ok_or_else(|| {
+            CodegenError::Target(format!(
+                "--rt-lto: linked typed guarded runtime definition {physical} is missing",
+            ))
+        })?;
+        if function.count_basic_blocks() == 0 {
+            return Err(CodegenError::Target(format!(
+                "--rt-lto: linked typed guarded runtime definition {physical} has no body",
+            )));
+        }
+        if function.get_linkage() != Linkage::External {
+            return Err(CodegenError::Target(format!(
+                "--rt-lto: linked typed guarded runtime definition {physical} does not have external linkage",
+            )));
+        }
+        if function.get_call_conventions() != LLVM_C_CALL_CONVENTION {
+            return Err(CodegenError::Target(format!(
+                "--rt-lto: linked typed guarded runtime definition {physical} does not use the C calling convention",
+            )));
+        }
+        abi.remove_attributes(function);
+        mark_internal(function);
+    }
+    Ok(())
+}
+
 /// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
 /// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
 /// the program's — a mismatch means blindly overwriting it (the old unconditional
@@ -3542,11 +3601,12 @@ fn parse_rt_lto_module<'c>(ctx: &'c Context, bitcode: &[u8]) -> Result<Module<'c
 /// baked for, a latent miscompile; instead this falls back exactly like an unparseable artifact
 /// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
 /// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
-/// datalayout too (now known equal); (2) rename every incoming guarded definition to the captured
-/// physical name of its typed declaration, then `link_in_module` (the definitions replace those
-/// declarations even when an earlier program claimant forced LLVM uniquification); (3) for every
-/// typed guarded row that now has a body, shed exactly
-/// that row's curated attrs and set it `internal` DIRECTLY (never the
+/// datalayout too (now known equal); (2) require every guarded row to have the exact type, a body,
+/// external linkage, and the C calling convention, then rename it to the captured physical name of
+/// its typed declaration and `link_in_module` (the definitions replace those declarations even when
+/// an earlier program claimant forced LLVM uniquification); (3) require every captured typed handle
+/// to remain a body-bearing external C definition, then shed exactly that row's curated attrs and
+/// set it `internal` DIRECTLY (never the
 /// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
 /// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
 /// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
@@ -3576,12 +3636,7 @@ fn link_in_rt_lto<'c>(
             rt.get_data_layout().as_str(),
             want.as_str()
         );
-        for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
-            let function = module
-                .get_function(&runtime.physical_names[&abi.key])
-                .expect("typed guarded runtime declaration remains present on rt-LTO fallback");
-            abi.apply_attributes(ctx, function);
-        }
+        restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
         return Ok(());
     }
     // (1) Match target so the linker never complains about a triple mismatch (cosmetic — datalayout
@@ -3589,8 +3644,8 @@ fn link_in_rt_lto<'c>(
     rt.set_triple(&module.get_triple());
     rt.set_data_layout(&want);
     // (2) Require the baked artifact to provide the complete guarded surface before mutating or
-    // linking either module. A parseable but incomplete/wrong-type artifact is still a compiler
-    // build defect; fall back as one unit so no guarded declaration remains un-curated.
+    // linking either module. A parseable but incomplete, wrong-type, non-external, or non-C artifact
+    // is still a compiler build defect; fall back as one unit so no declaration remains un-curated.
     for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
         let defect = match rt.get_function(abi.symbol) {
             None => Some("is missing"),
@@ -3598,6 +3653,12 @@ fn link_in_rt_lto<'c>(
                 Some("has the wrong function type")
             }
             Some(function) if function.count_basic_blocks() == 0 => Some("has no body"),
+            Some(function) if function.get_linkage() != Linkage::External => {
+                Some("does not have external linkage")
+            }
+            Some(function) if function.get_call_conventions() != LLVM_C_CALL_CONVENTION => {
+                Some("does not use the C calling convention")
+            }
             Some(_) => None,
         };
         if let Some(defect) = defect {
@@ -3607,12 +3668,7 @@ fn link_in_rt_lto<'c>(
                  your program.",
                 abi.symbol, defect
             );
-            for guarded in runtime_abi::runtime_abis().filter(|row| row.is_rt_lto_guarded()) {
-                let function = module
-                    .get_function(&runtime.physical_names[&guarded.key])
-                    .expect("typed guarded runtime declaration remains present on rt-LTO fallback");
-                guarded.apply_attributes(ctx, function);
-            }
+            restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
             return Ok(());
         }
     }
@@ -3643,16 +3699,7 @@ fn link_in_rt_lto<'c>(
         .map_err(|e| CodegenError::Target(format!("--rt-lto: linking runtime bitcode failed: {e}")))?;
     // (3) Normalize exactly the typed guarded runtime definitions. Physical names are captured
     // from their declaration handles, so a same-spelled program claimant can never be selected.
-    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
-        let function = module
-            .get_function(&runtime.physical_names[&abi.key])
-            .expect("typed guarded runtime declaration remains present after rt-LTO link");
-        if function.count_basic_blocks() == 0 {
-            continue;
-        }
-        abi.remove_attributes(function);
-        mark_internal(function);
-    }
+    normalize_linked_rt_lto_guarded_definitions(module, runtime)?;
     // (4) A merged module that does not verify is a compiler bug (our own baked bitcode), not a user
     // error — surface it loudly rather than emitting a broken object.
     module
@@ -11474,7 +11521,11 @@ mod tests {
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
-        assert!(!d.has_errors());
+        assert!(
+            !d.has_errors(),
+            "{:?}",
+            d.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>(),
+        );
         lower_program(&hir)
     }
 
@@ -11484,17 +11535,33 @@ mod tests {
 
     #[test]
     fn runtime_abi_declaration_order_is_runtime_key_all_order() {
-        let text = ir("fn main() -> i32 = 0\n");
-        let expected: Vec<_> = runtime_abi::runtime_abis().map(|abi| abi.symbol).collect();
-        let expected_set: HashSet<_> = expected.iter().copied().collect();
-        let actual: Vec<_> = text
-            .lines()
-            .filter(|line| line.starts_with("declare "))
-            .filter_map(|line| line.split_once('@').map(|(_, rest)| rest))
-            .filter_map(|rest| rest.split_once('(').map(|(symbol, _)| symbol))
-            .filter(|symbol| expected_set.contains(*symbol))
+        let expected: Vec<_> = runtime_abi::runtime_abis()
+            .map(|abi| abi.symbol.to_string())
             .collect();
-        assert_eq!(actual, expected);
+        let expected_set: HashSet<_> = expected.iter().cloned().collect();
+        let declarations = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| line.starts_with("declare "))
+                .filter_map(|line| line.split_once('@').map(|(_, rest)| rest))
+                .filter_map(|rest| rest.split_once('(').map(|(symbol, _)| symbol.to_string()))
+                .filter(|symbol| expected_set.contains(symbol))
+                .collect()
+        };
+
+        let whole = ir("fn main() -> i32 = 0\n");
+        assert_eq!(declarations(&whole), expected);
+
+        let mut per_unit = mir("fn main() -> i32 = 0\n");
+        per_unit.imported_fns.push(align_mir::ImportedFn {
+            name: "dep$identity".to_string(),
+            params: vec![Ty::Int(IntTy { bits: 64, signed: true })],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            ret: Ty::Int(IntTy { bits: 64, signed: true }),
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+        });
+        let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, false, &[], None).unwrap();
+        assert_eq!(declarations(&per_unit), expected);
     }
 
     #[test]
@@ -11533,30 +11600,6 @@ mod tests {
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
         };
-        let mut args_program = mir(
-            "fn main(args: array<str>) -> Result<(), Error> = Ok(())\n",
-        );
-        args_program.externs.push(ext(
-            "align_rt_args_build",
-            vec![i32_ty, Ty::Raw],
-            Ty::Str,
-        ));
-        let args_ir = emit_llvm_ir(
-            &args_program,
-            &BuildTarget::Baseline,
-            false,
-            &[],
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            args_ir
-                .lines()
-                .filter(|line| line.starts_with("declare ") && line.contains("@align_rt_args_build("))
-                .count(),
-            1,
-        );
-
         let mut internal_program = mir("fn main() -> i32 = 0\n");
         internal_program.externs = vec![
             ext("align_rt_arena_reset", vec![Ty::Raw], Ty::Unit),
@@ -11595,6 +11638,147 @@ mod tests {
             error.to_string(),
             "lowering failed: native extern ABI mismatch:616c69676e5f72745f7072696e745f693634"
         );
+    }
+
+    #[test]
+    fn runtime_abi_args_build_is_wrapper_only_and_not_a_source_compatible_extern() {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "extern \"C\" fn align_rt_args_build(argc: i32, argv: raw) -> str\n\
+             fn main() -> i32 = 0\n",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let _ = check_file(&file, &mut diagnostics);
+        assert!(diagnostics.has_errors());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("not an FFI-safe return type")),
+            "{:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn runtime_abi_source_compatible_externs_receive_each_attribute_class() {
+        let program = mir(
+            "extern \"C\" fn align_rt_alloc(n: i64) -> raw\n\
+             extern \"C\" fn align_rt_div_fail()\n\
+             extern \"C\" fn align_rt_arena_alloc(a: raw, n: i64, m: i64) -> raw\n\
+             extern \"C\" fn align_rt_hash64(p: raw, n: i64) -> u64\n\
+             extern \"C\" fn align_rt_utf8_valid(p: raw, n: i64) -> i32\n\
+             fn main() -> i32 = 0\n",
+        );
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        let function = |key| {
+            let physical = &runtime.physical_names[&key];
+            assert_eq!(physical, runtime_abi::runtime_abi(key).symbol);
+            assert_eq!(
+                module
+                    .get_functions()
+                    .filter(|candidate| candidate.get_name().to_bytes() == physical.as_bytes())
+                    .count(),
+                1,
+            );
+            module.get_function(physical).unwrap()
+        };
+        let function_loc = inkwell::attributes::AttributeLoc::Function;
+        let return_loc = inkwell::attributes::AttributeLoc::Return;
+        let param0 = inkwell::attributes::AttributeLoc::Param(0);
+        let has = |function: FunctionValue<'_>, location, name| {
+            function
+                .get_enum_attribute(location, enum_kind_id(name))
+                .is_some()
+        };
+
+        let alloc = function(RuntimeKey::Alloc);
+        assert!(has(alloc, return_loc, "noalias"));
+        assert!(has(alloc, function_loc, "nofree"));
+        assert!(has(alloc, function_loc, "nounwind"));
+
+        let div_fail = function(RuntimeKey::DivFail);
+        assert!(has(div_fail, function_loc, "noreturn"));
+
+        let arena_alloc = function(RuntimeKey::ArenaAlloc);
+        assert!(has(arena_alloc, return_loc, "noalias"));
+        assert!(has(arena_alloc, function_loc, "nounwind"));
+
+        let hash64 = function(RuntimeKey::Hash64);
+        for name in ["nofree", "nosync", "willreturn", "memory"] {
+            assert!(has(hash64, function_loc, name), "missing {name} on hash64");
+        }
+        assert!(has(hash64, param0, "readonly"));
+        assert!(has(hash64, param0, "captures"));
+
+        let utf8_valid = function(RuntimeKey::Utf8Valid);
+        for name in ["nofree", "nosync", "willreturn"] {
+            assert!(has(utf8_valid, function_loc, name), "missing {name} on utf8_valid");
+        }
+        assert!(!has(utf8_valid, function_loc, "memory"));
+        assert!(has(utf8_valid, param0, "readonly"));
+        assert!(has(utf8_valid, param0, "captures"));
+    }
+
+    #[test]
+    fn runtime_abi_probe_spellings_remain_ordinary_program_and_extern_names() {
+        let symbols = [
+            "align_rt_alloc_count",
+            "align_rt_free_count",
+            "align_rt_str_finder_new_count",
+            "align_rt_str_finder_free_count",
+            "align_rt_test_par_map_force_caller",
+            "align_rt_test_par_map_min_chunk",
+            "align_rt_test_par_map_min_chunk_for",
+            "align_rt_test_par_map_workers",
+        ];
+        let extern_ir = ir(
+            "extern \"C\" fn align_rt_alloc_count() -> i64\n\
+             extern \"C\" fn align_rt_free_count() -> i64\n\
+             extern \"C\" fn align_rt_str_finder_new_count() -> i64\n\
+             extern \"C\" fn align_rt_str_finder_free_count() -> i64\n\
+             extern \"C\" fn align_rt_test_par_map_force_caller(force: i32)\n\
+             extern \"C\" fn align_rt_test_par_map_min_chunk() -> i64\n\
+             extern \"C\" fn align_rt_test_par_map_min_chunk_for(len: i64, workers: i64, grain: i64) -> i64\n\
+             extern \"C\" fn align_rt_test_par_map_workers() -> i64\n\
+             fn main() -> i32 = 0\n",
+        );
+        for symbol in symbols {
+            assert_eq!(
+                extern_ir
+                    .lines()
+                    .filter(|line| line.starts_with("declare ") && line.contains(&format!("@{symbol}(")))
+                    .count(),
+                1,
+            );
+        }
+
+        let program_ir = ir(
+            "fn align_rt_alloc_count() -> i64 = 0\n\
+             fn align_rt_free_count() -> i64 = 0\n\
+             fn align_rt_str_finder_new_count() -> i64 = 0\n\
+             fn align_rt_str_finder_free_count() -> i64 = 0\n\
+             fn align_rt_test_par_map_force_caller(force: i32) { }\n\
+             fn align_rt_test_par_map_min_chunk() -> i64 = 0\n\
+             fn align_rt_test_par_map_min_chunk_for(len: i64, workers: i64, grain: i64) -> i64 = len + workers + grain\n\
+             fn align_rt_test_par_map_workers() -> i64 = 0\n\
+             fn main() -> i32 = 0\n",
+        );
+        for symbol in symbols {
+            assert!(
+                program_ir
+                    .lines()
+                    .any(|line| line.starts_with("define ") && line.contains(&format!("@{symbol}("))),
+                "missing ordinary program definition for {symbol}",
+            );
+        }
     }
 
     #[test]
@@ -11663,8 +11847,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_abi_rt_lto_incomplete_or_wrong_type_guarded_artifact_falls_back() {
-        for malformed in ["missing", "declaration", "wrong-type"] {
+    fn runtime_abi_rt_lto_malformed_guarded_artifact_falls_back_as_one_unit() {
+        for malformed in [
+            "missing",
+            "declaration",
+            "wrong-type",
+            "internal",
+            "private",
+            "available-externally",
+            "non-c-cc",
+        ] {
             let program = mir("fn main() -> i32 = 0\n");
             let ctx = Context::create();
             let module = ctx.create_module("align");
@@ -11675,20 +11867,42 @@ mod tests {
             let rt = ctx.create_module("align_rt_malformed_fixture");
             let layout = module.get_data_layout();
             rt.set_data_layout(&layout);
-            if malformed == "declaration" {
-                runtime_abi::runtime_abi(RuntimeKey::StrEndsWith).declare(&ctx, &rt);
-            } else if malformed == "wrong-type" {
-                let function = rt.add_function(
-                    runtime_abi::runtime_abi(RuntimeKey::StrEndsWith).symbol,
-                    ctx.i64_type().fn_type(&[], false),
-                    None,
-                );
+            for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+                let target = abi.key == RuntimeKey::StrEndsWith;
+                if target && malformed == "missing" {
+                    continue;
+                }
+                let function = if target && malformed == "wrong-type" {
+                    rt.add_function(abi.symbol, ctx.i64_type().fn_type(&[], false), None)
+                } else {
+                    abi.declare(&ctx, &rt)
+                };
+                if target && malformed == "declaration" {
+                    continue;
+                }
                 let builder = ctx.create_builder();
                 let entry = ctx.append_basic_block(function, "entry");
                 builder.position_at_end(entry);
-                builder
-                    .build_return(Some(&ctx.i64_type().const_zero()))
-                    .unwrap();
+                if target && malformed == "wrong-type" {
+                    builder
+                        .build_return(Some(&ctx.i64_type().const_zero()))
+                        .unwrap();
+                } else {
+                    builder
+                        .build_return(Some(&ctx.i32_type().const_int(1, false)))
+                        .unwrap();
+                }
+                if target {
+                    match malformed {
+                        "internal" => function.set_linkage(Linkage::Internal),
+                        "private" => function.set_linkage(Linkage::Private),
+                        "available-externally" => {
+                            function.set_linkage(Linkage::AvailableExternally)
+                        }
+                        "non-c-cc" => function.set_call_conventions(8),
+                        _ => {}
+                    }
+                }
             }
 
             link_in_rt_lto(&ctx, &module, rt, &runtime).unwrap();
@@ -11707,6 +11921,41 @@ mod tests {
                     "{malformed}: guarded declaration remained un-curated",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn runtime_abi_rt_lto_post_link_invariants_are_errors() {
+        for (malformed, expected) in [
+            ("declaration", "has no body"),
+            ("internal", "does not have external linkage"),
+            ("non-c-cc", "does not use the C calling convention"),
+        ] {
+            let program = mir("fn main() -> i32 = 0\n");
+            let ctx = Context::create();
+            let module = ctx.create_module("align");
+            let tm =
+                create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+            let function = module
+                .get_function(&runtime.physical_names[&RuntimeKey::StrEndsWith])
+                .unwrap();
+            if malformed != "declaration" {
+                let builder = ctx.create_builder();
+                let entry = ctx.append_basic_block(function, "entry");
+                builder.position_at_end(entry);
+                builder
+                    .build_return(Some(&ctx.i32_type().const_int(1, false)))
+                    .unwrap();
+            }
+            match malformed {
+                "internal" => function.set_linkage(Linkage::Internal),
+                "non-c-cc" => function.set_call_conventions(8),
+                _ => {}
+            }
+            let error = normalize_linked_rt_lto_guarded_definitions(&module, &runtime)
+                .expect_err("a malformed post-link typed handle must not be internalized");
+            assert!(error.to_string().contains(expected), "{malformed}: {error}");
         }
     }
 
