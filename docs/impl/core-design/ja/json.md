@@ -302,17 +302,22 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   になっている通常の generic call だけである。checker は全 argument の検査前に concrete な expected return を
   bind-only で bare substitution に seed し、各 declared argument type へ bound parameter を substitute する。
   argument は source order で substituted expected type を使って検査するため、nested な `json.scan(view)` にも
-  concrete な `json.scanner<Row>` context が自身の source check 前に伝播する。substituted expected type が concrete
-  なら、その argument 検査が mismatch を所有し、inference pass は未束縛 parameter だけを bind する（逆順の重複
-  mismatch を報告しない）。parameter position は wholly unresolved で argument から推論するか、argument 検査前に
-  fully concrete でなければならない。Request 6 は、例えば return context から `T` だけを seed した後の
-  `Result<T, U>` のような partially substituted composite を意図的に拒否する。`Ty::Param` は通常の expression
-  checker で wildcard ではなく、この状態を受理すると constructor の expected context を失うか、type parameter
-  が HIR に漏れるためである。source checker は argument を検査する前に、次の deterministic な exact diagnostic を出す。
+  concrete な `json.scanner<Row>` context が自身の source check 前に伝播する。expected-return の seed 自体も
+  inference boundary であり、structural match が error を出した場合は argument を一つも検査せず既存の error
+  sentinel を返す。substituted expected type が完全に bound なら、その argument 検査が mismatch を所有し、inference
+  pass は未束縛 parameter だけを bind する（逆順の重複 mismatch を報告しない）。partial 判定は raw な `Ty::Param`
+  の数値ではなく callee 固有の inference slot の束縛状態で行う。position 内の callee slot が全て unbound なら
+  wholly unresolved、全て bound なら（外側の generic parameter を symbolic に運ぶ場合も含め）fully substituted、両方
+  があれば partial とする。parameter position は wholly unresolved で argument から推論するか、argument 検査前に
+  fully bound でなければならない。Request 6 は、例えば return context から `T` だけを seed した後の `Result<T, U>`
+  のような partially substituted composite を意図的に拒否する。`Ty::Param` は通常の expression checker で wildcard
+  ではなく、この状態を受理すると constructor の expected context を失うか、callee の inference slot が HIR に漏れる
+  ためである。source checker は argument を検査する前に、次の deterministic な exact diagnostic を出す。
   `generic argument {ordinal} of '<function>' has a partially inferred type; annotate the argument or use a bare generic parameter`。
-  argument は最初の新しい error で source order のまま停止し、partial call/scanner を publish しない。parameter 固有の scanner
-  spelling がない場合は active な外側の expected scanner spelling を継承し、bare wrapper が正確な diagnostic identity
-  を消去しない。その後 actual type を元の declared
+  argument は最初の新しい error で source order のまま停止し、partial call/scanner を publish しない。scanner の
+  producer-owned spelling は checker-only の inference slot と一緒に local、parameter、lambda capture を越えて運ぶ。
+  annotated parameter の spelling、slot の spelling、active な外側の expected spelling の順で優先し、HIR には保存しない。
+  これにより bare wrapper が正確な diagnostic identity を消去しない。その後 actual type を元の declared
   parameter と unify し、未束縛の bare parameter を bind するか、最初の conflicting な
   `type mismatch: <actual> vs <declared>` を出す。全 argument 後に bound parameter を finalize し、unresolved な bare
   parameter が残れば既存の
@@ -327,8 +332,10 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   source-order type mismatch とする。新しい ambiguous diagnostic は設けない。未解決の `json.scanner<Row<T>>` type argument は Request 6 が追加する
   inference state ではない。別の Align prerequisite として残し、既存の正確な resolver 診断
   `instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet`
-  を使う。`m5::json_scan_generic_return_context_wrapper_matrix` が wrapper propagation を、
+  を使う。`m5::json_scan_generic_return_context_wrapper_matrix` が wrapper propagation（異なる外側 generic slot 番号を跨ぐ forwarding を含む）を、
   `m5::json_scan_generic_return_context_argument_order_matrix` が 2 つ以上の argument の source order を所有し、
+  `m5::json_scan_generic_return_context_expected_conflict_no_cascade` が expected-return seed の conflict 境界を、
+  `m5::json_scan_generic_argument_source_spelling` が local と lambda capture の spelling 伝播を、
   `m5::json_scan_generic_return_context_partial_composite_rejection` が上記の partial composite rejection を所有する。
   `m5::json_scan_generic_return_context_inference_matrix` は missing、unresolved、numeric-defaulted、conflicting state と
   failed state で `ExprKind::JsonScan` HIR node が生成されないことを検査する。wrapper/argument-order owner は exact
@@ -345,7 +352,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | Move-in、move-out、source nulling、replacement、returned row ownership | accepted row では N/A。`DropPlan` が Move field なしを証明し、拒否経路は construction 前に戻る。 | `m5::json_scan_copy_row_error_matrix`、`json_scan_copy_row_no_owned_alloc` |
   | `if`、`match`、`else`、`?`、`map_err`、branch/loop join、early terminal return、malformed input | 既存 scanner MIR/runtime control flow。新しい ownership edge は Copy row invariant を越えて導入しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_copy_row_error_matrix` |
   | Direct、nested、optional、union、invalid/cyclic schema graph | canonical recursive `DropPlan` と JSON schema の producer table。missing/invalid graph node では fail closed。active gate は interface/import reconstruction 後も同じ pure predicate を適用し、scanner envelope の type/id mismatch と non-`str` input も fail closed にする。 | `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_row_schema_matrix`、`hir_body_validator_json_scan_copy_row`、`hir_program_json_scan_copy_row`、`hir_program_json_scan_envelope_mismatch` |
-  | Generic monomorphization、return-context inference、imported source spelling | Request 6 が扱うのは、scanner row が call checking 前に concrete である通常の generic function call だけである。`align_sema::Checker::check_generic_call` が新しい enabling rule を所有し、全 argument の検査前に expected return を bare substitution に seed し、bound parameter を declared argument type へ substitute して source order で検査し、各 concrete instantiation が既存 Decode schema と canonical `DropPlan` を再検査する。substituted expected type が concrete なら argument 検査が concrete mismatch を所有し、inference は未束縛 parameter だけを bind する。parameter position は argument 検査前に wholly unresolved または fully concrete でなければならず、partially substituted composite は上記の exact diagnostic で拒否する。最初の新しい error 後は後続 argument を検査せず、partial call/scanner を publish しない。parameter 固有 spelling がなければ外側の expected scanner spelling を継承する。numeric `IntVar`/`FloatVar` は既存 finalizer の `i64`/`f64` default を使い、unresolved bare parameter は既存 generic inference diagnostic、conflicting な inference は expected-context/argument order で最初の既存 type-mismatch diagnostic を使う。wrapper propagation、2 つ以上の argument の source order、partially substituted composite rejection は別 fixture とする。未解決 row parameter を含む `json.scanner<Row<T>>` は追加しない。current resolver の exact な「generic type parameter inside a generic type argument is not supported yet」diagnostic を明示的な Align prerequisite として deferred にする。失敗状態では `ExprKind::JsonScan` HIR node と artifact を生成しない。 | `m5::json_scan_generic_row_ownership`、`m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、`m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_partial_composite_rejection`、`m5::json_scan_generic_return_context_numeric_default`、`m5::json_scan_generic_return_context_inference_matrix`、`modules::json_scan_imported_row_ownership`、`modules::json_scan_imported_generic_return_context_ownership` |
+  | Generic monomorphization、return-context inference、imported source spelling | Request 6 が扱うのは、scanner row が call checking 前に concrete である通常の generic function call だけである。`align_sema::Checker::check_generic_call` が新しい enabling rule を所有し、全 argument の検査前に expected return を bare substitution に seed し、seed が error を出した時点で直ちに止まり、bound parameter を declared argument type へ substitute して source order で検査し、各 concrete instantiation が既存 Decode schema と canonical `DropPlan` を再検査する。parameter position は callee 固有の inference slot で判定し、全て unbound なら wholly unresolved、全て bound なら（外側 generic parameter を運ぶ symbolic forwarding を含め）fully substituted、両方なら partially substituted とする。partially substituted composite は上記の exact diagnostic で argument 検査前に拒否する。最初の新しい error 後は後続 argument を検査せず、partial call/scanner を publish しない。producer-owned scanner spelling は inference slot と一緒に local、parameter、lambda capture を越えて運び、annotated parameter、slot、active な外側 expected の順で選ぶ。これは checker-only state であり HIR には保存しない。numeric `IntVar`/`FloatVar` は既存 finalizer の `i64`/`f64` default を使い、unresolved bare parameter は既存 generic inference diagnostic、conflicting な inference は expected-context/argument order で最初の既存 type-mismatch diagnostic を使う。wrapper propagation、expected-return conflict、source spelling、2 つ以上の argument の source order、partially substituted composite rejection は別 fixture とする。未解決 row parameter を含む `json.scanner<Row<T>>` は追加しない。current resolver の exact な「generic type parameter inside a generic type argument is not supported yet」diagnostic を明示的な Align prerequisite として deferred にする。失敗状態では `ExprKind::JsonScan` HIR node と artifact を生成しない。 | `m5::json_scan_generic_row_ownership`、`m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、`m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_expected_conflict_no_cascade`、`m5::json_scan_generic_argument_source_spelling`、`m5::json_scan_generic_return_context_partial_composite_rejection`、`m5::json_scan_generic_return_context_numeric_default`、`m5::json_scan_generic_return_context_inference_matrix`、`modules::json_scan_imported_row_ownership`、`modules::json_scan_imported_generic_return_context_ownership` |
   | Whole-program、per-unit、cold/hot cache、schema edit/revert | 既存 structural MIR/cache identity が owner。拒否 row は artifact を publish しない。per-unit fixture は interface reconstruction、accepted Copy row、rejected Move row、全ての failed generic inference state を網羅し、拒否時は `cas`、`actions`、`index` の全 cache-owned file を snapshot する。 | `cache_codegen::json_scan_row_schema_rejection`、`cache_codegen::json_scan_per_unit_interface_row_ownership`、`cache_codegen::json_scan_generic_return_context_no_publication`、accepted Copy-row MIR/raw-LLVM identity comparison |
   | Interface serialization と persisted/wire identity | imported/per-unit の checked HIR には interface/import reconstruction が入力される。その reconstructed HIR の scanner envelope と row graph を active gate が MIR/runtime construction 前に検証し、accepted source identity は不変。 | `cargo test -p align_interface --test summary`、`modules::json_scan_imported_row_ownership`、`cache_codegen::json_scan_per_unit_interface_row_ownership` |
   | Runtime ownership provenance と allocation parity | 既存 scanner input/accumulator owner。exact な composite fixture は `Leaf { score: i64, name: str }`、`CopyContent { Text(str), Count(i64), Flag(bool), Object(Leaf) }`、`CopyRow { maybe_i64: Option<i64>, maybe_f64: Option<f64>, maybe_bool: Option<bool>, maybe_text: Option<str>, maybe_leaf: Option<Leaf>, leaf: Leaf, content: CopyContent, label: str }` とする。nonempty stream は全 optional field（`maybe_leaf` を含む）の Some、明示的 `null`、欠落 optional field、`Text`/`Count`/`Flag`/`Object` の全 arm、nested `Leaf`、borrowed `label` を含み、別 stream は valid first row の後に malformed input を置く。LLVM allocation oracle は `align_rt_json_scan_next` を要求し、`align_rt_alloc` と `align_rt_arena_alloc` の call を禁止する。 | `json_scan_copy_row_no_owned_alloc`、`json_scan_copy_row_copy_composites_no_owned_alloc`、`m5::json_scan_copy_composite_runtime_matrix` |
@@ -355,7 +362,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 
   設計受入マトリクスは、直接・推移的な owned field、nested/optional struct（`Option<Leaf>` の
   Some/null/omitted を含む）、JSON の全 scalar width、borrowed `str`、Copy option/union（object-payload arm を含む）、
-  local/imported 型、concrete row generic call における resolved/numeric-defaulted/unresolved-bare/conflicting/partially-substituted-rejected return-context
+  local/imported 型、concrete row generic call における resolved/numeric-defaulted/unresolved-bare/conflicting/expected-seed-conflicting/forwarding/source-spelling/partially-substituted-rejected return-context
   inference、wrapper propagation、multi-argument source order、未解決 row-type generic argument の明示的 deferred
   境界、MIR より前の semantic rejection、active scanner envelope の valid-`Span` における `StoredType`、`UnknownRow`、
   `InputType`、`Schema`、`Copy` の全 precedence pair と malformed-`Span` pair、whole-program/per-unit interface reconstruction、cache の cold/hot/edit/revert、
@@ -363,7 +370,8 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_rejects_owned_row_fields`、
   `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_generic_row_ownership`、
   `m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、
-  `m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_partial_composite_rejection`、
+  `m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_expected_conflict_no_cascade`、
+  `m5::json_scan_generic_argument_source_spelling`、`m5::json_scan_generic_return_context_partial_composite_rejection`、
   `m5::json_scan_generic_return_context_numeric_default`、
   `m5::json_scan_generic_return_context_inference_matrix`、
   `m5::json_scan_copy_composite_runtime_matrix`、
