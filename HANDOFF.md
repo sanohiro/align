@@ -5,42 +5,46 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ The current branch is `agent/pkg-db-am-b4-activate`, integrating
-AM-B4 activation head `22e5ba3` with current `main` `e65448b7`. The integration preserves both the
-complete checked-HIR body gate and Request 6's active `json.scan` envelope/Copy gate. Conflict
-closure is complete. The pre-open integrated MIR library owner passed 99/99 and the Request 6 generic-return
-context driver owner passes 9/9 after the dedicated target's explicit runtime build. The fresh
-review of the pre-integration AM-B4 range found one P2: an unused orphan nonparameter local record
-was not required to have a binding. Production validation now requires exactly one `Let`,
-`LetTuple`, or match-payload binding, and the four-entrypoint regression owner passes. A separate
-focused sema replay launch remained at 0% CPU in macOS `_dyld_start` and was stopped and preserved
-as INCOMPLETE; the MIR owner exercises the integrated replay path successfully. Draft PR #706 is
-open. Its host review found one P1: `ArrayPartition` and `ArrayParMap` derivation consumed terminal
-capture flows that the structural child worklist had not visited, rejecting producer-valid captured
-closures at all four lowerers. The current follow-up passes those captures through the shared
-pipeline child walk; the new four-entrypoint owner, the existing four lambda-capture driver owners,
-the MIR library owner (100/100), and focused MIR Clippy all pass. Fresh independent review, refreshed
-preflight, and push then completed at `69c56b2`; the exact pushed-pair independent review is CLEAN.
-The final host review found one P2: lexical replay tracked local ids but not visible names, so
-handcrafted checked HIR could encode duplicate parameters, same-scope rebinding, or inner shadowing.
-The bounded follow-up tracks non-discard visible names and closes parameter, `Let`, `LetTuple`,
-nested-block, match-payload, and sibling scope cells. Two required reviews found P1 ambiguity in the
-old source-spellable `_dropN` cleanup names and drift between producer/validator Drop predicates; the
-patch loop stopped and the closure matrix was redesigned and reviewed CLEAN before implementation.
-Sema and MIR now share exact source-impossible `$tuple_drop<ordinal>` spelling and one owned-discard
-predicate while retaining hidden-id scope and cleanup. The Cartesian four-entrypoint owner covers
-canonical/near names, Drop/Copy, binding kind, collision state, lifecycle, Drop sets, and once-only
-cleanup. The complete MIR suite passes 101/101, tuple driver 29/29, and focused sema/MIR Clippy is
-clean. The required implementation review confirmed the design and found only missing acceptance
-halves; the owner-only closure adds them, and its focused test plus all-test-target MIR Clippy pass.
-Revised follow-up commit/push, final
-attestation, bounded finding closure, and CI are pending. The cross-worktree Request 6 identity
-rerun remains INCOMPLETE on this macOS host because the Linux C cross-compiler is absent and the
-temporary Linux container stalled while fetching its base image; the previously merged Request 6
-identity evidence remains intact. Stacked AM-C1 draft #702 and AM-C2a1 draft #705 remain open behind
-this prerequisite. No public `pkg.db` surface exists yet.
+_Last updated: 2026-08-04._ The current local branch is `agent/pkg-db-am-c`, stacked on the clean
+unpushed am-b4 activation checkpoint `22e5ba3`; no PR exists. The user authorized the c1 commit,
+SHA-bound preflight, base-branch publication, push, and draft PR on 2026-08-04. Four mandatory am-c
+matrix reviews repaired the public contracts and PR
+boundaries; the final fresh review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
+now splits am-c into c1 (fixed typed runtime ABI registry), c2a (private canonical graph/encoder),
+c2b (effect-free MIR function-table retention/remap), c2c (dormant public canonical decoder), c2d
+(dormant generated-identity codecs), and c3 (typed program/generated activation). These are six
+am-c implementation PRs; the amended prerequisite plan has nineteen verticals, L2b 28 PRs, and L2
+32. `docs/impl/20-runtime-abi-ledger.md` owns c1.
 
-Historical AM-B4 activation record: as of 2026-08-03, `main` included the shipped wave through #688 plus the merged am-p
+The local tree now implements c1. `align_mir::RuntimeKey` supplies the exact 281 semantic keys and
+alphabetical `ALL`; the backend-private 286-row typed ABI registry is the sole fixed-native
+declaration/type/attribute/rt-LTO authority. Extern compatibility rejects before function
+declaration construction, exact keyed and unkeyed externs reuse one handle, same-spelled program
+claimants keep legacy LLVM uniquification while attributes and dedicated calls stay on the typed
+native handle, and every dedicated allocation/drop/cleanup/native consumer is keyed. Only the
+explicitly deferred generated-trampoline and generic direct-call mixed-map seams remain string
+indexed through c3. The two main-wrapper calls use typed unkeyed handles. The fresh exact-diff
+adversarial review found one P2 guarded rt-LTO physical-name collision and two P3 machine-gate
+gaps; the bounded follow-up retargets incoming guarded bodies to captured typed physical names,
+adds the guarded program-collision owner, checks all 286 declarations against a checked-in golden,
+and adds a compiled default/feature export script with compile-time probe-signature pins. The
+required bounded follow-up review confirmed those fixes and found one further P2 in the same class:
+a parseable rt-LTO artifact could omit a guarded body and leave its declaration un-curated. The
+follow-up now preflights all four guarded rows for presence, exact type, and a body, with loud
+all-row re-curation/fallback owners for missing, declaration-only, and wrong-type artifacts.
+Focused c1 owners pass 9/9; `align_codegen_llvm` passes 65/65 with 5 intentional PGO ignores;
+`align_mir` passes 95/95; the runtime source/registry owner passes; compiled
+base, `alloc-count`, `par-map-probe`, task-only, and all-feature runtime export sets are exactly
+286/290/290/286/294; and all nine rt-LTO integration owners pass. Changed-crate all-target Clippy
+passes with `-D warnings`. The ordinary `scripts/test-pr.sh` invocation completed the workspace
+build and codegen owners, then its combined driver binary remained at 0% CPU in `_dyld_start` and
+was stopped as INCOMPLETE; the exact driver binary and every not-yet-run library/integration target
+then passed without source changes, so the gate was closed by checkpointed continuation rather than
+a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s). C1 is a local pre-PR
+checkpoint; the next action is the authorized commit/SHA-bound attestation and stacked draft PR,
+not c2 implementation. No public `pkg.db` surface exists yet.
+
+Prior am-b4 operational record: `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
 (`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait

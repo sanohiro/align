@@ -3,16 +3,17 @@
 ## Status and authority
 
 This is the exact native symbol/type/attribute appendix for L2b-a2-am-r and
-L2b-a2-am-c. It records the LLVM 22 declaration surface emitted by the current
+L2b-a2-am-c1. It records the LLVM 22 declaration surface emitted by the current
 backend for every validated runtime target and the additional externally
 visible runtime definitions that occupy link identities. The keyed surface is
 generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
-Am-c has 281 `RuntimeKey` variants and a one-to-one native-symbol record. Four
+Am-c1 has 281 `RuntimeKey` variants and a one-to-one native-symbol record. Four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Five always-built
-runtime records have no `RuntimeKey`: the two main-wrapper callees
+runtime records have no `RuntimeKey` and instead use the five-variant
+`UnkeyedRuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
 `align_rt_http_serialize`. The base native registry therefore has 286 records.
@@ -177,13 +178,49 @@ Unkeyed native records:
 
 ## Machine gates
 
-Am-c replaces the current declaration statements, runtime string map, AEAD
-selection match, and attribute lookup with one typed `RuntimeAbi` row per key:
+Am-c1 replaces the current ABI/declaration, dedicated-consumer, AEAD-selection,
+and attribute authorities with one typed `RuntimeAbi` row per identity:
 `{ key, symbol, return type, ordered parameter types, return attrs, parameter
 attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
-that row. The five base unkeyed records use the same ABI shape without a key;
-only the two wrapper records have an Align module declaration policy. The
-eight probe rows have
+that row. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
+`Unkeyed(UnkeyedRuntimeKey)`. The five base unkeyed records use the same ABI
+shape; only `ReportError` and `ArgsBuild` have a dedicated Align main-wrapper
+declaration policy and yield typed wrapper handles when that wrapper requires
+them. The other three yield no unconditional compiler handle. An exact
+compatible extern may still declare or reuse any of the five unkeyed rows
+through the ordinary extern path. The legacy mixed string map remains as a handle-only alias seam
+for unchanged `Rvalue::Call(String)` resolution through c1: it is populated in
+post-c1 class order from stored definitions, non-shadowed imports, externs,
+alphabetical `RuntimeKey::ALL` aliases, then existing generated aliases. The
+keyed aliases are mutually unique, so their relative normalization preserves
+every final binding. The alias seam cannot define a symbol, type, attribute,
+membership, or reuse rule. C3 deletes it.
+
+Registry and extern-compatibility preflight create no LLVM value. C1 fixes LLVM
+construction order as stored definitions in vector order, non-shadowed imports
+in vector order, externs in vector order, keyed native rows in alphabetical
+`RuntimeKey::ALL` order, then generated helpers in their existing order. This
+intentionally changes only the relative keyed-native declaration order from the
+hand-written pre-c1 source; keyed physical symbols are mutually unique and all
+program/import/extern claimants still precede them. Textual/raw LLVM order
+changes once; object bytes may change or remain equal and have no equality
+promise. Compiler build id changes cache identity for one miss then an
+unchanged-input hit. Every symbol spelling and final legacy alias binding
+remains fixed. A source extern is compatible exactly when its
+source-derived LLVM function type equals the fixed row; source externs carry no
+curated native attributes. The selected native row supplies every curated
+attribute and rt-LTO policy to the one reused handle. A stored/imported program
+function with the same physical spelling is not native reuse and retains the
+current LLVM uniquification result until c3 encodes program symbols.
+Main-wrapper emission likewise reuses a type-compatible
+`ReportError`/`ArgsBuild` extern or otherwise adds the row in current wrapper
+order. Attributes are applied through typed row handles, never by a symbol
+prefix scan that could select a program claimant. Thus a same-spelled program
+claimant keeps its current physical name/uniquification but loses accidental
+native attributes, while the actual possibly-suffixed native declaration gains
+the row attributes.
+
+The eight probe rows have
 `verification_presence = AllocCount | ParMapProbe`: their exact signatures are
 checked against the corresponding runtime fixture, but their names do not
 participate in compiler collision validation and no compatible-extern reuse
@@ -193,9 +230,11 @@ LLVM construction and receives no runtime-feature input.
 Tests compare:
 
 - all 281 keys, mapped symbols, LLVM declaration types, and default attributes
-  against this table;
+  against this table through the checked-in
+  `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
 - the 286 base native symbols against default-feature `align_runtime` exports
-  and fail on either direction's difference;
+  and fail on either direction's difference through
+  `scripts/test-runtime-abi-exports.sh`;
 - the 290 `alloc-count` and 290 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
@@ -204,9 +243,21 @@ Tests compare:
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol;
 - compatible extern reuse against only the fixed 286-row base registry's
-  complete LLVM type and curated declaration attributes, plus ordinary
-  extern/export positives using each probe spelling in a normal runtime build;
-- one mutation of return type, every parameter ordinal, each attribute class,
+  complete source-derived LLVM function type, with the native row then supplying
+  its curated declaration attributes; incompatible-type rejection; keyed
+  extern+builtin and unkeyed extern+wrapper single-declaration link success;
+  plus ordinary extern/export positives using each probe spelling in a normal runtime build;
+- one mutation of return type, every parameter ordinal, each registry attribute class,
   symbol, and key; and
 - trivial whole/per-unit emitted IR against a checked-in declaration golden
   whose body is exactly the expanded rows above.
+
+For rt-LTO, codegen first requires all four guarded logical symbols to have the
+exact registry function type and a body. A missing, declaration-only, or
+wrong-type row loudly falls back without merging and reapplies the curated
+attributes to every guarded declaration. The complete baked definitions then
+begin with their logical symbols. Before linking, codegen renames each one to
+the captured physical LLVM name of its typed declaration. This is normally the
+same spelling; when a preceding program/import claimant forced LLVM
+uniquification, it is the suffixed native name. The merge therefore fills only
+the typed native handle and never the same-spelled program claimant.

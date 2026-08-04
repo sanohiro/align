@@ -1490,8 +1490,10 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-The clean reviewed am-r ledger merged in #678 and fixes twenty-seven L2 implementation PRs. Am-r
-itself is a design-only gate and is not one of those implementation PRs. L2b-a2
+The clean reviewed am-r ledger merged in #678 originally fixed twenty-seven L2 implementation PRs.
+The mandatory am-c pre-implementation review later split its one callable PR into six, so the
+current plan has thirty-two. Am-r itself is a design-only gate and is not one of those
+implementation PRs. L2b-a2
 first isolates product, MIR
 action-continuation, and global type-domain validation. Placement, nominal, callable namespace,
 declaration/header, and four body-validator construction/activation verticals follow the explicit
@@ -1506,7 +1508,7 @@ not accept source syntax whose complete safety contract belongs to a later miles
 | L2b-a2-s | Add the projection fact and refine named summaries through structs, tuples, block/`if`/loop, field assignment, and destructuring | No new borrow mode; array, pipeline, tagged/control residuals, and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported product-view projection matrix and per-unit parity |
 | L2b-a2-ac | Close MIR fallthrough propagation after every terminating eager expression child, including enclosing consumers and later siblings | No new borrow mode or provenance precision; source semantics are unchanged; the normal driver still supplies semantically checked HIR | exhaustive recursive-call-site classification, representative family-level no-action assertions, runtime twins, and whole/per-unit continuation parity |
 | L2b-a2-am-g-t | Validate concrete roots through every global type table before MIR construction | No source, semantic, HIR, MIR, interface, or ABI change; direct handcrafted-HIR lowering returns a canonical empty program only for an invalid global type domain while every placement, nominal, namespace, declaration/header, and body predicate remains the semantic-checker contract | exhaustive type-domain/root/reference/cycle mutation matrix across all lowering entrypoints and unchanged valid-program MIR |
-| L2b-a2-am-r | Design gate completed in #678: the public-contract ledger below isolates five producer corrections and one checked-HIR depth-safety closure, then splits per-position type admissibility, nominal/link metadata, declarations/headers, body validation, and the dependent callable representation change into fourteen independently correct verticals | This row authorizes no implementation itself. Its clean reviewed merge fixes L2b at twenty-three and L2 at twenty-seven implementation PRs and authorizes am-d | completed fresh independent adversarial ledger review covering the entry ABI, return completeness, task-wait dominance, native output buffers, extern unsafe-callability, the proved conservative HIR depth ceiling and body/type-consumer safety, every producer placement predicate, exact body discriminator record, runtime key and native ABI row, compiler/generated emitted identity, validation order, valid producer twin, and owner test |
+| L2b-a2-am-r | Design gate completed in #678 and amended by the mandatory am-c pre-implementation review: the public-contract ledger below isolates five producer corrections and one checked-HIR depth-safety closure, then splits per-position type admissibility, nominal/link metadata, declarations/headers, body validation, and the dependent callable work into nineteen independently correct verticals | This row authorizes no implementation itself. The amended plan fixes L2b at twenty-eight and L2 at thirty-two implementation PRs and authorizes am-d/c1 | completed #678 adversarial ledger review plus the am-c matrix review and finding-to-ledger closure covering exact runtime, codec, callable applicability, collision, precedence, and PR boundaries |
 | L2b-a2-am-d | Make the fixed conservative checked-HIR record ceiling and the unbounded valid type-DAG domain stack-safe end to end | Preserve every parser-valid source, including diagnosed HIR before producer finalization, while rejecting handcrafted HIR deeper than the fixed 259 ceiling before semantic consumption; every depth-259 body and every finite am-g-t-valid acyclic-inline/header-mediated type DAG at a producer-valid root remains stack-safe from HIR entry through LLVM verification on the 2 MiB test stack | exhaustive constructor-expansion ceiling proof, complete recursive body/type-consumer inventory, common iterative traversal closure, 258/259/260 body cases, deep valid/malformed type-DAG roots, and whole/per-unit MIR/LLVM parity |
 | L2b-a2-am-e | Implemented: make the entry producer and backend ABI exact so no-arg `main` returns only Unit, exact signed i32, or `Result<Unit,builtin Error>` and argv main remains the exact Result form | The compiler rejects previously accepted non-C-ABI entry returns with one source diagnostic; Unit/Result wrappers and direct i32 entry behavior remain exact | completed sema signature matrix, whole/per-unit Unit/i32/Result exit behavior, every rejected graph-valid return category, LLVM signature/link/ThinLTO parity |
 | L2b-a2-am-f | Implemented: make function completion exact before a non-Unit body reaches HIR/MIR | Bare return and reachable absent tail are valid only for Unit; every non-Unit path returns a typed value or is proven non-fallthrough | completed bare/value return, tail/absent tail, every-control-family, whole/per-unit MIR/LLVM verifier matrix |
@@ -1521,7 +1523,12 @@ not accept source syntax whose complete safety contract belongs to a later miles
 | L2b-a2-am-b2b | Split the same dormant validator after b2a: am-b2b1 closes pipeline terminals/views, while am-b2b2 closes templates, JSON, and group/dictionary records | No general public entrypoint activation; Request 6's scanner Copy predicate is the explicitly named narrow pre-lowering safety exception | exhaustive direct b2b1 pipeline/view owners plus exhaustive b2b2 template/JSON/group owners and the active scanner gate |
 | L2b-a2-am-b3 | Extend the dormant validator through every native/runtime family and generated-callable body fact | No public entrypoint activation | exhaustive direct native/helper/generated metadata unit owners |
 | L2b-a2-am-b4 | Correlate body-derived ownership and effect facts and activate the complete body validator in every lowering entrypoint | Any invalid body makes the whole MIR program canonical-empty; valid HIR stays byte-identical | full inventory assertion, ownership/effect-cell mutations, parallel-effect twins, depth bound, whole/per-unit identity and benchmark |
-| L2b-a2-am-c | After am-b4, separate program, runtime, and generated call targets and give Align/generated symbols injective compiler-owned identities | Existing source spellings remain accepted; internal MIR and LLVM/object symbol bytes change atomically, while interface and C/runtime ABI stay fixed | complete runtime-key/native-symbol registry, generated-family collision matrix, whole/per-unit link parity |
+| L2b-a2-am-c1 | Make the fixed typed native ABI registry authoritative for declarations, attributes, export verification, compatible extern reuse, and dedicated native consumers while preserving all legacy program/generated string lookups until c3 | Normal MIR/interface/C-runtime ABI, emitted symbol spellings, and legacy mixed-map resolution stay fixed; keyed native LLVM declarations normalize once from hand-written source order to alphabetical `RuntimeKey::ALL` order, changing raw LLVM order and cache identity but not linkage; object-byte equality is not promised either way; an extern that claims a 286-row fixed native symbol with an incompatible source-derived LLVM function type now fails before LLVM, while an exact compatible keyed extern plus builtin or unkeyed extern plus needed wrapper newly shares one declaration and links; a program definition/import with a native physical spelling retains program-before-native uniquification but no longer receives the native row's attributes by prefix accident; dedicated keyed consumers use `RuntimeKey`, and the two main-wrapper consumers use typed unkeyed handles | exact 281-key/286-base-row declarations/order, physical/logical collision order and attribute ownership, export-set, dedicated-consumer, compatible/incompatible extern, eight-specialized/seven-legacy direct parity, and runtime-cost parity |
+| L2b-a2-am-c2a | Land `FunctionTypeDef`, the private borrowed `CanonicalTypeView`, and the private canonical graph/equivalence and semantic-to-byte engine over read-only validated type tables | No `Program` field, public codec, callable activation, hash, or emitted-symbol change | private 57-root/34-scalar/5-node equivalence/encode/deep traversal matrix, direct transient Fn-table/Fn-root owner, and semantic-byte goldens |
+| L2b-a2-am-c2b | Retain the compact effect-free MIR function-type table, consume c2a to sort/equate it, remap every function-type id, and change structural MIR/cache identity once | No public codec/callable activation or emitted-symbol change; interface bytes/hashes stay fixed | table compactness, every type-bearing field/remap, whole/per-unit MIR/hash parity |
+| L2b-a2-am-c2c | Expose dormant `ProgramCall`, canonical type/function wrappers, and the complete public decoder/error surface over c2a's engine and c2b's retained canonical `Program` table | No generated record, MIR call-field, interface, emitted-symbol, or runtime change | public type/Fn semantic↔byte goldens including `from_program` Fn roots, every malformed field/error-precedence row, deep decode owners |
+| L2b-a2-am-c2d | Expose dormant `GeneratedId`/parallel records and record-local codecs over c2c without LLVM naming or collection publication | No MIR call-field, collection pairing, interface, emitted-symbol, or runtime change | generated family/record-local semantic↔byte and malformed owners; collection pairing remains c3 |
+| L2b-a2-am-c3 | Separate program/runtime direct targets, type every program declaration/callback, activate encoded Align symbols and generated identities, and preflight every collision before LLVM construction | Existing source spellings remain accepted; internal MIR and LLVM/object program/generated symbol bytes change together, while interface and C/runtime ABI stay fixed | callable applicability matrix, generated-family/pair/probe matrix, external-identity collision/precedence matrix, whole/per-unit/ThinLTO link parity |
 | L2b-a2-af | Extend the projection fact through validated fixed arrays and exact/dynamic element reads/writes | No new borrow mode; pipeline, tagged/control, non-fixed collection, and indirect-call residuals retain the L2b-a1 all-compatible-input fallback | direct/imported fixed-array projection matrix and per-unit parity |
 | L2b-a2-ar | Close eager retained-storage lifetime for non-fixed `Index`, `ElemField`, `SliceRange`, `ArrayChunks`, and `HttpRespHeader`; make non-fixed `ElemField` receiver-first | No new borrow mode or projection precision; non-fixed results remain flattened | invalidated eager-action matrix, terminating-operand twins, runtime source-order checks, malformed-HIR rejection, and per-unit parity |
 | L2b-a2-ap | Extend the projection fact through pipeline `Project`/`WhereField` and terminal formation | No new borrow mode; tagged/control and indirect calls retain the L2b-a1 all-compatible-input fallback; unsupported stages and terminals widen explicitly | direct/imported pipeline-view projection matrix and per-unit parity |
@@ -1574,8 +1581,8 @@ both the closed and open-world effects `Impure`; a direct external callback para
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
 
-The clean reviewed am-r ledger in #678 fixes twenty-three independently sound L2b implementation
-PRs. L2b-a1 owns named/direct/imported
+The amended am-r ledger fixes twenty-eight independently sound L2b implementation PRs; the five added
+boundaries are c1 plus the four dormant c2a/c2b/c2c/c2d prerequisites for the final am-c3 activation. L2b-a1 owns named/direct/imported
 parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
 flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
 targets. L2b-a2-s adds the projection fact and closes struct/tuple construction, selection,
@@ -1875,9 +1882,82 @@ The concrete Rust representation is:
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProgramCall(Box<str>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramCallError {
+    Empty,
+    EmbeddedNul,
+    TooLong,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalTy(Box<[u8]>);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalFnAbi(Box<[u8]>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCodecError {
+    Truncated,
+    TrailingBytes,
+    UnsupportedVersion,
+    UnknownTag,
+    InvalidBool,
+    InvalidUtf8,
+    EmbeddedNul,
+    InvalidWidth,
+    InvalidCount,
+    MissingReference,
+    DuplicateMember,
+    NonCanonicalOrder,
+    InvalidSummary,
+    InvalidGraph,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionTypeDef {
+    pub params: Vec<(ParamMode, Scalar)>,
+    pub ret: Ty,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
+}
+
+struct CanonicalTypeView<'a> {
+    structs: &'a [StructDef],
+    enums: &'a [EnumDef],
+    tuples: &'a [TupleDef],
+    tagged_types: &'a [hir::TaggedType],
+    fn_types: &'a [FunctionTypeDef],
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramExtern {
+    pub name: ProgramCall,
+    pub params: Vec<Ty>,
+    pub param_modes: Vec<ParamMode>,
+    pub ret: Ty,
+    pub return_borrow: ReturnBorrowSummary,
+    pub return_region: ReturnRegionSummary,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u16)]
 pub enum RuntimeKey { /* the 281 variants below, in that exact order */ }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum UnkeyedRuntimeKey {
+    ReportError = 0,
+    ArgsBuild = 1,
+    ArenaReset = 2,
+    Realloc = 3,
+    HttpSerialize = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeAbiId {
+    Keyed(RuntimeKey),
+    Unkeyed(UnkeyedRuntimeKey),
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DirectCall {
@@ -1904,19 +1984,56 @@ pub enum GeneratedId {
 }
 ```
 
-`ProgramCall::new` is crate-private and accepts only a non-empty, NUL-free exact UTF-8 logical name
-already present in the validated program/import/extern registry. It owns one boxed copy; that
+`ProgramCall`, `ProgramCallError`, `CanonicalTy`, `CanonicalFnAbi`, `CanonicalCodecError`,
+`FunctionTypeDef`, `ProgramExtern`, `RuntimeKey`, `DirectCall`, `GeneratedId`, and the parallel
+identity records are public types in `align_mir`.
+`RuntimeKey` lands in c1. C2a lands the public effect-free `FunctionTypeDef` record plus the private
+`CanonicalTypeView` and graph/encoder; the view is borrowed for one engine call and stores/hashes
+nothing. C2b forms that exact record vector from validated HIR, passes it with the existing MIR
+tables through the view, then retains the remapped vector as `Program.fn_types`. `ProgramCall`/errors and canonical wrappers/errors/decoders
+land in c2c; dormant generated identity records/codecs land in c2d;
+`ProgramExtern`, `DirectCall`, and every callable-field conversion activate in c3.
+`CanonicalTypeView` remains private to `align_mir`; all other types named public above retain that
+visibility in their landing slice. `RuntimeKey` contains only the backend-agnostic semantic target and exact logical MIR spelling;
+it contains no LLVM type, attribute, or physical-symbol policy. `UnkeyedRuntimeKey`,
+`RuntimeAbiId`, the LLVM-only `RuntimeAbi` row, and all declaration/attribute materialization remain
+private to `align_codegen_llvm`; no MIR, package, or runtime API exposes them. The code snippets use
+`pub` on the two unkeyed identity enums only within that private codegen module.
+
+`ProgramCall::try_from_logical(&str) -> Result<ProgramCall, ProgramCallError>` is public because
+hand-built MIR and the separate codegen crate must be able to form declaration keys. It accepts
+only a non-empty, NUL-free exact UTF-8 logical name whose byte length fits `u32`; the error is
+exactly `Empty`, `EmbeddedNul`, or `TooLong`, checked in that order. Registry membership is not a
+constructor precondition: whole-record validation later proves that each call target is present in
+the already-formed declaration registry. It owns one boxed copy; that
 storage and its clones are ordinary compiler allocations. The allocation itself never reaches an
 artifact, while the semantic name bytes participate in the structural MIR hash, encoded
 `align_fn$...` identity, `GeneratedId` canonical bytes/stems, LLVM/object symbols, and debug output
 exactly as specified below.
-`RuntimeKey` is `Copy`. `DirectCall` and `GeneratedId` are compiler-owned values with lowering-call
+`ProgramCall::as_str(&self) -> &str` and `ProgramCall::as_bytes(&self) -> &[u8]` publicly borrow
+that exact owned UTF-8 allocation; neither normalizes, copies, nor appends a terminator. Codegen
+uses only these accessors for encoded symbols and generated readable stems.
+`RuntimeKey::ALL: [RuntimeKey; 281]` lists declaration order, and
+`RuntimeKey::logical_name(self) -> &'static str` returns the exact snake-case MIR alias from the
+key list below (`Print` returns `"print"`). Each public Rust variant is formed mechanically by
+splitting that listed ASCII name on `_`, uppercasing only the first ASCII letter of each nonempty
+segment, preserving every remaining letter and digit byte exactly, then concatenating the segments:
+`utf8_valid -> Utf8Valid`, `base64url_decode -> Base64urlDecode`,
+`crypto_aes_gcm_open -> CryptoAesGcmOpen`, and `print_f32 -> PrintF32`. This rule plus the exact
+snake-case list is the complete variant table. Neither API exposes or derives the physical native
+symbol; the backend-private exhaustive `RuntimeAbi` match owns that mapping and its three
+exceptions.
+`RuntimeKey`, `UnkeyedRuntimeKey`, and `RuntimeAbiId` are `Copy`. `DirectCall` and `GeneratedId` are compiler-owned values with lowering-call
 or codegen-module lifetime; no runtime allocation or Drop contract is introduced.
 
 The exact MIR field change is one-for-one:
 
 | Current field | Am-c field |
 |---|---|
+| `Function.name: String` | `Function.name: ProgramCall` |
+| `ImportedFn.name: String` | `ImportedFn.name: ProgramCall` |
+| `Program.externs: Vec<hir::ExternFn>` | `Program.externs: Vec<ProgramExtern>` |
+| discarded `hir::Program::fn_types` | c2b: `Program.fn_types: Vec<FunctionTypeDef>`: compact, effect-free, canonical, and the owner of every retained `Ty::Fn`/`Scalar::Fn` id |
 | `Rvalue::Call(String, Vec<Operand>)` | `Rvalue::Call(DirectCall, Vec<Operand>)` |
 | `Rvalue::FnAddr { name: String, signature }` | `Rvalue::FnAddr { target: ProgramCall, signature }` |
 | `Rvalue::Closure { lifted: String, captures, capture_tys, signature }` | `Rvalue::Closure { lifted: ProgramCall, captures, capture_tys, signature }` |
@@ -1931,11 +2048,115 @@ target to `ProgramCall`, and converts a compiler builtin/native selection direct
 `RuntimeKey`; it never classifies a program target by spelling. Codegen accepts `DirectCall` and
 cannot perform a string lookup that crosses the two classes.
 
+Declaration-registry construction visits stored functions, imports, then externs in vector order.
+The typed declaration fields above let it include uncalled declarations, exports, and main without
+reconstructing a key from a call site. HIR-to-MIR conversion first forms `FunctionTypeDef` records
+by dropping only `FnEffect`. It then computes the canonical definition equivalence described below,
+removes unreachable and equivalent function definitions, sorts the surviving equivalence classes
+by their canonical root bytes, and remaps every `Ty::Fn` and `Scalar::Fn` in headers,
+nominal/tuple/tagged/function tables, slots, values, and embedded MIR fields to the new `u32`
+ordinal. The stored table is compact and canonical before `impl_hash` or codegen; whole-program and
+per-unit lowering produce the same table for the same retained type roots. A missing/out-of-range
+function reference, a non-compact table, a duplicate canonical definition, an unreachable retained
+definition, or any table/reference semantic mismatch makes hand-built MIR invalid before registry
+or cache publication. Producer owners prove that every old id is remapped; an in-range numeric id
+carries no provenance, so the consumer does not claim to distinguish a stale old ordinal from the
+same valid new ordinal. The effect-free `FunctionTypeDef` cannot represent an effect-bearing replay
+record; effect removal is instead proved by HIR-to-MIR construction and the record's closed field
+shape.
+
 `CanonicalFnAbi` is the ordered parameter list of `{ mode, CanonicalTy }`, the return
 `CanonicalTy`, and exact borrow and region summaries. It has no return-cleanup field in am-c:
 `ReturnCleanupAbi` does not exist until later L2c, which must extend this record and its byte
 encoding atomically when it lands. It excludes effect because effect changes call legality, not the
 physical thunk signature.
+
+The two canonical wrappers own already-validated canonical bytes. Their exact API is:
+
+```rust
+impl CanonicalTy {
+    pub fn from_program(root: Ty, program: &Program) -> Result<Self, CanonicalCodecError>;
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError>;
+    pub fn as_bytes(&self) -> &[u8];
+}
+
+impl CanonicalFnAbi {
+    pub fn from_parts(
+        params: &[(ParamMode, Ty)],
+        ret: Ty,
+        borrow: &ReturnBorrowSummary,
+        region: &ReturnRegionSummary,
+        program: &Program,
+    ) -> Result<Self, CanonicalCodecError>;
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError>;
+    pub fn as_bytes(&self) -> &[u8];
+}
+```
+
+Each successful `CanonicalTy::from_program`, `CanonicalFnAbi::from_parts`, and `decode` retains
+exactly one caller-owned `Box<[u8]>` containing the canonical bytes. Decode never borrows into or
+retains its input: it validates and re-encodes/copies into that one box. An error returns no retained
+allocation. The shared c2a engine may use transient compiler-owned vectors/worklists proportional to
+visited nodes/edges and one growable output buffer; all are released before either return, and
+`into_boxed_slice` transfers that output allocation as the one retained box on success.
+`as_bytes` borrows the box for `&self`'s lifetime and allocates/copies nothing. Derived `Clone`
+deep-copies the canonical bytes into exactly one new box and shares no mutable storage; dropping
+either clone releases only its own box. None of these allocations is an Align/runtime/artifact
+allocation. `ProgramCall::clone` follows the same one-new-box deep-copy rule for its UTF-8 bytes.
+
+The closed public `CanonicalCodecError` mapping is exact:
+
+| First failing condition | Error |
+|---|---|
+| input ends before the current fixed-width scalar, declared text bytes, vector element, node, or nested record completes, including a decoded count whose promised elements are absent | `Truncated` |
+| bytes remain after the one requested top-level record | `TrailingBytes` |
+| top-level version byte is not `1` | `UnsupportedVersion` |
+| any otherwise complete discriminator, parameter mode, or enum tag is outside its listed set | `UnknownTag` |
+| a boolean byte is not `0` or `1` | `InvalidBool` |
+| a complete text payload is not UTF-8 | `InvalidUtf8` |
+| a complete UTF-8 callable, nominal, or member text contains NUL | `EmbeddedNul` |
+| a concrete integer/float width or vector lane is outside the am-g-t-admitted set | `InvalidWidth` |
+| an encoder-side text, vector, or node count does not fit `u32`; no decoder-side `u32` value itself overflows | `InvalidCount` |
+| the first definition reference in field order is out of range or does not name the required node kind | `MissingReference` |
+| the first repeated field/variant name or second serialized node in one canonical equivalence class | `DuplicateMember` |
+| all semantic fields are valid but root/node/member/reference order or re-encoded bytes are noncanonical | `NonCanonicalOrder` |
+| the first summary has an empty explicit root set, unsorted/duplicate/out-of-range index, nonempty capture before enabled, or borrow/region disagreement | `InvalidSummary` |
+| the first remaining record-local invariant fails: an empty decoded `ProgramCall`; a serialized nominal/member invariant listed below; invalid `work_weight`; impossible generated mode/stage relation; or another explicitly listed record-local semantic rule | `InvalidGraph` |
+
+Decode checks fields from left to right. It reports an incomplete field before inspecting later
+bytes; otherwise it validates that field's version/tag/bool/text/NUL/width constraint immediately.
+Every semantic constraint is charged to the earliest canonical field whose value can violate it,
+even if a reference or cross-node shape can be decided only after the complete graph is parsed.
+After parsing, the decoder returns the failure with the lowest field encounter ordinal. At the same
+field the tie order is scalar syntax/UTF-8/NUL/width, local `InvalidGraph`, `DuplicateMember`,
+`MissingReference`, then `InvalidSummary`. A cross-node nominal/equivalence failure is charged to
+the end of the second node; an overall generated mode/stage relation is charged after the last
+stage, then `work_weight` is charged at its later stored field. Only when every record field is
+semantically valid does trailing input yield `TrailingBytes`; canonical re-encoding/order is the
+final check and yields `NonCanonicalOrder`. Encoding uses the same field ordinals and tie order,
+with `InvalidCount` checked before allocating output.
+
+Canonical node decoding replays every am-n invariant that is representable in these bytes. In node
+ordinal and stored member order, `InvalidGraph` applies immediately to an empty `source_name`; a
+present struct alignment that is not a power of two in `1..=2^29`; a field/variant name that does
+not match `[A-Za-z_][A-Za-z0-9_]*` (including empty); an enum whose first `field_base` is not `1`,
+whose later base is not the checked preceding base plus preceding payload length, or whose flattened
+payload count overflows `u32`; and the second nominal node with the same `source_name` but a
+different kind or different complete recursively id-free shape. NUL text still fails earlier as
+`EmbeddedNul`; a repeated valid member/variant name, repeated anonymous tuple vector, or second
+same-kind/same-source/same-shape nominal equivalence class is `DuplicateMember`; a missing/wrong-kind
+reference remains `MissingReference`. At a single member, text/NUL/identifier checks precede its
+duplicate-name check, then its type/reference. An earlier member reference therefore beats a later
+member's invalid identifier/base, while an identifier or duplicate on the same member beats that
+member's missing reference. At a nominal collision, the failure is charged after the second node's
+full shape. Internal nominal names and link libraries are not serialized and
+therefore remain enclosing `Program` validation, not decoder claims.
+`CanonicalTy::decode` proves only closed graph validity. Position-specific am-p/am-h rules are
+checked by the enclosing function ABI, task, parallel, declaration, or MIR-field validator after
+decode; a standalone type decoder does not claim a parameter/return/capture placement.
+There is no encoded canonical-type artifact or cache ingress in am-c. Decode is the independently
+tested inverse and the required gate for any future ingress; current registries construct semantic
+records and encode them before cache publication.
 
 The parallel record is closed:
 
@@ -2011,7 +2232,14 @@ byte length is `u32`; values that do not fit reject. A boolean is one byte, exac
 UTF-8 text is `u32 byte_length || bytes`, with no normalization; callable/nominal/member text also
 rejects embedded NUL before encoding. Decoders reject unknown tags, invalid booleans, overflow,
 truncation, trailing bytes, duplicate definition fields/variants, out-of-range definition
-references, non-canonical root/definition order, and any type the am-g-t/am-p/am-h contract rejects.
+references, non-canonical root/definition order, every serialized am-n invariant above, and any
+graph the am-g-t contract rejects.
+Every version, definition/root/scalar/primitive/generated/stage tag, parameter mode, layout,
+optional-alignment discriminator, summary discriminator, kernel mode, and boolean occupies exactly
+one `u8`. Integer and float bit widths are one `u8`; only the already-valid concrete widths admitted
+by am-g-t encode. Definition references, field ordinals/bases, vector lanes, fixed-array lengths,
+summary indices, counts, and text lengths are `u32`. No native `usize`, signed integer, enum memory
+layout, padding, or host endianness enters the bytes.
 
 `CanonicalTy` is `version=1:u8 || node_count:u32 || nodes || root_type`. Nodes are assigned ordinals
 by first visit in a depth-first walk from the root; struct fields, enum variants/payloads, tuple
@@ -2032,6 +2260,20 @@ origin-aware private `name`. The fingerprint is nominal plus structural: differe
 never merge, and the same source nominal with a different reachable graph never shares a helper or
 cache key. Cycles through box, function, or another header-mediated edge terminate through node
 references rather than truncation.
+
+“Visited” means a canonical definition-equivalence class, never a raw table id. Struct and enum ids
+are equivalent exactly when kind and `source_name` agree; am-n has already proved that every such
+alias has the same complete reachable source shape, and a mismatch is invalid rather than a second
+class. Tuple, tagged, and effect-free function nodes use the greatest fixed-point structural
+equivalence over kind, every non-reference field, ordered member/parameter sequence, summary, and
+the current equivalence classes of referenced nodes; nominal references contribute their
+kind/`source_name` class. Implementations compute that partition iteratively to stability with the
+initial class keyed by kind plus non-reference fields, never with recursion or source id. Equal
+anonymous/function definitions therefore merge even when HIR assigned fresh ids; unequal reachable
+graphs never merge. Encoding walks the root's stable equivalence classes depth-first and assigns
+ordinals on first visit. Decoding rebuilds the same partition, rejects two serialized nodes in one
+equivalence class as `DuplicateMember`, and rejects any node/ordinal order different from the
+depth-first first-visit re-encoding as `NonCanonicalOrder`.
 
 The `root_type` tags `0..=56`, in exact order, are:
 
@@ -2072,6 +2314,25 @@ indices are `u32`, strictly increasing in each vector. In am-c every capture vec
 `CanonicalFnAbi` is
 `version=1 || param_count || (mode || CanonicalTy)* || return CanonicalTy || borrow || region`.
 
+The public cross-crate codec surface is exact:
+
+```rust
+impl GeneratedId {
+    pub fn to_canonical_bytes(&self) -> Result<Box<[u8]>, CanonicalCodecError>;
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError>;
+}
+```
+
+`to_canonical_bytes` validates every record-local tag, width, count, and mode/stage relation,
+allocates exactly one caller-owned boxed result, and returns no partial bytes on error. The
+enclosing preflight separately validates program-target membership/signature, capture relations,
+and collection pairing before it calls this method; this argument-free codec does not claim access
+to a declaration registry or sibling record. Callers retain that box as the borrowed byte
+view for sorting, deduplication, cache lookup, and printed-stem construction; `GeneratedId` does not
+hide a second cache or allocation. `decode` owns all nested values in the returned record and
+borrows the input only for the call. Both use only the closed `CanonicalCodecError` enum and the
+same left-to-right field, record-local semantic, and trailing-byte precedence specified above.
+
 `GeneratedId` is `version=1` followed by `0=FnValue`, `1=Closure`, `2=Task`, or `3=Parallel`, then
 the fields in the Rust declaration order above. `ProgramCall` is encoded as its length-prefixed
 UTF-8 bytes. A vector is `u32 count` then elements. `ParallelGeneratedId` encodes its nine fields
@@ -2079,6 +2340,11 @@ in declaration order. `ParallelKernelMode` is its explicit `repr(u8)` value.
 `ParallelStageId` is `0=Map`, `1=Filter`, `2=FilterStrContains`, `3=Project`, or
 `4=FilterField`, followed by that variant's fields in declaration order. Decoding repeats the
 semantic validity relations above and rejects a mode/stage combination that no producer emits.
+All tags in these records are `u8`; all vector and text lengths are `u32`. Individual
+`GeneratedId::decode` validates one record only. Collection validation separately requires every
+`FilterCount` record to have exactly one otherwise-byte-identical `FilterScatter` record and vice
+versa after equal-record deduplication; a missing or non-identical twin is `InvalidGraph` before
+name reservation. No individual decoder claims that its collection twin exists.
 Semantic-to-byte and independent byte-to-semantic goldens are:
 
 | Semantic value | Canonical hex |
@@ -2103,7 +2369,9 @@ HIR lowering, MIR, whole/per-unit codegen, serialization-free consumers, tests, 
 It does not reserve a new source spelling. Non-exported whole-program Align definitions and
 per-unit Align definitions/imports use the injective emitted identity
 `align_fn$<UTF-8-byte-length>$<lowercase-hex-bytes>`; the same function gets the same identity in
-producer and consumer units. Explicit `--export` roots retain their requested exact external
+producer and consumer units. The length is canonical base-10 ASCII with no leading zero, and each
+raw logical-name UTF-8 byte contributes exactly two lowercase hexadecimal digits; the length prefix
+itself is not hex-encoded. Explicit `--export` roots retain their requested exact external
 identity. Extern C symbols retain their exact identifier. Direct-i32 `main` emits `main`; Unit or
 `Result` main emits the encoded Align identity plus the generated external `main` wrapper.
 Explicit exports, extern definitions, and the external `main` identity are pairwise distinct. An
@@ -2142,22 +2410,31 @@ The collision matrix is exhaustive:
 | repeated compatible declarations within the imported class or within the extern class | dedupe to one program registry entry |
 | incompatible repeated extern declaration | reject |
 | non-exported program logical name equal to a RuntimeKey, native symbol, `align_gen$...` stem, or encoded-name-looking string | accept; emit the length-plus-hex `align_fn$...` identity |
+| encoded identity of a stored definition or import equals a different-logical-name extern's exact symbol | reject before LLVM; neither declaration wins |
+| encoded identity of a stored definition/import or wrapped-main body equals a different function's exact explicit-export identity | reject before LLVM; neither claimant wins |
+| encoded identity of a wrapped-main body equals an extern's exact symbol | reject before LLVM; neither claimant wins while external `main` remains separately reserved |
 | compatible extern logical/emitted name equal to one of the 286 fixed base native symbols | accept and reuse the one native declaration |
 | extern or export equal to one of the eight verification-only probe spellings | accept under the ordinary program/external rules in a normal build; probe-feature runtime fixtures never link user artifacts |
 | incompatible extern equal to a fixed base native symbol | reject |
+| repeated identical `--export` root for the same function and exact external identity | idempotent dedupe at the first CLI occurrence; cache identity remains sorted/deduped |
+| same explicit-export external identity claimed by a different function or claimant class | reject at the later CLI occurrence |
 | explicit export equal to a native symbol, extern emitted identity, or external `main` | reject |
 | direct-i32 `main` plus any other claimant of external `main` | reject; otherwise direct main alone emits `main` |
 | wrapped main plus any other claimant of external `main` | reject; otherwise wrapper alone emits `main` and Align body remains encoded |
 | two equal `GeneratedId` values | dedupe |
-| unequal generated values with the same readable stem | deterministic `$0`, `$1`, … probe |
-| generated candidate equal to any program/native/external identity | probe; never reject the source spelling |
+| unequal valid generated values with the same readable stem | unavailable: family prefixes and complete canonical identity make stems injective; conflicting FnValue/Closure metadata rejects before naming |
+| generated candidate equal to an extern exact symbol or explicit-export external identity beginning `align_gen$` | probe; never reject the source spelling |
+| generated candidate equal to an encoded non-exported program identity, fixed native identity, or external `main` | unavailable: their prefixes/exact spelling are respectively `align_fn$`, `align_rt_`, and `main` |
 
 Owner tests include separate positives for a non-exported runtime-key-equal logical name, a
 non-exported native-symbol-equal name, and a generated-stem-equal name; compatible and incompatible
 native externs; stored-definition/extern and imported/extern cross-class rejection even when unused;
 ordinary extern/export use of every probe spelling in a normal build; explicit export collision;
-direct and wrapped main; duplicate equal generated records; and unequal generated records with
-one/two occupied probe candidates.
+repeated identical export-root idempotence and a later different-claimant twin;
+direct and wrapped main; duplicate equal generated records; semantic rejection of conflicting
+FnValue/Closure records before naming; generated candidates with one/two candidates occupied by
+extern or explicit-export global-registry identities; and unavailable fixed-native/encoded-program/
+`main` generated-collision assertions.
 
 The exact `RuntimeKey` set is:
 
@@ -2240,6 +2517,16 @@ printed stem below with `$0`, then `$1`, and so on, selecting the first emitted 
 global registry. The checked increment rejects on integer exhaustion. This exact probe rule keeps
 every program/extern/export spelling accepted instead of reserving `align_gen$...`; probe choice is
 object identity but never ABI or interface identity.
+
+The `ProgramCall hex` in a readable stem is exactly two lowercase hexadecimal digits per raw
+logical-name UTF-8 byte; it excludes the canonical `u32` text-length prefix. Fallibility is the
+single ASCII digit `0` or `1`; kernel mode is the single ASCII digit `0` through `3`; every
+`complete structural-key hex` is two lowercase digits per complete canonical byte. The probe
+counter is `u64`, rendered as canonical base-10 ASCII without leading zero. Probing begins at zero;
+if candidate `$18446744073709551615` is occupied, the request fails with
+`CodegenError::Lowering("generated name exhausted:<complete occupied candidate ASCII hex>")`
+before LLVM construction. The owner injects a starting counter to test the
+maximum/occupied case without iterating through earlier values.
 
 | Generated family | Exact identity and cache dimensions | Owner evidence |
 |---|---|---|
@@ -2515,7 +2802,12 @@ stored field are owner tests; multi-invalid precedence follows the universal ord
 | L2b-a2-am-b2 | Dormant storage/vector/array/pipeline/template/JSON validator, including every stage, terminal, capture, and descriptor record. | direct table-driven unit owner plus deep valid/malformed storage/pipeline type relation; no public benchmark row yet |
 | L2b-a2-am-b3 | Dormant native/runtime validator plus generated-callable body facts for all I/O through crypto families. | direct table-driven unit owner plus deep valid/malformed native/generated signature relation; no public benchmark row yet |
 | L2b-a2-am-b4 | Add body-derived Drop/ownership and effect correlation, assert the full inventory, activate all body validation globally, replay lexical visibility/definite initialization, use structural value joins for fresh callable cells, and prove valid identity/four-entrypoint parity. | `malformed_hir_body_metadata_fails_closed`, `checked_hir_body_fact_replay_covers_cleanup_and_function_effects`, `valid_hir_body_preflight_is_mir_identity`, `body_contract_function_return_none`, `body_contract_function_root_completion`, `hir_body_validator_accepts_structural_function_value_match_join`, `hir_body_validator_rejects_out_of_scope_local_use`, `checked_hir_depth_closure_matrix`, `deep_hir_body_core_type_dag_is_stack_bounded`, whole/per-unit codegen; `mir-body-validation` |
-| L2b-a2-am-c | Land typed program/runtime/generated call targets, encoded Align symbols, native registry, generated identities, and all name/collision validation atomically across sema/MIR/codegen and whole/per-unit paths. | callable namespace/collision/golden-symbol suites, deep semantic→bytes→semantic plus malformed deep-reference/truncation owners, and per-unit link parity; `mir-callable-namespace-validation` plus unchanged runtime-call cost |
+| L2b-a2-am-c1 | Land the fixed typed runtime ABI registry and migrate declarations, attributes, export verification, compatible native extern reuse, and every dedicated native LLVM consumer without activating typed MIR calls or changing symbols. | 281-key/286-base-row bidirectional ABI/export goldens, each probe-feature export set, every dedicated native consumer, compatible/incompatible extern rows; unchanged runtime-call cost |
+| L2b-a2-am-c2a | Land `FunctionTypeDef`, one private borrowed `CanonicalTypeView`, and one private canonical graph/equivalence and semantic-to-byte engine over read-only validated type tables. A direct unit fixture forms a transient effect-free function vector and passes it in `fn_types`, proving Fn-node/root closure before any `Program` stores the vector. It has no stored `Program` field, public wrapper/decoder, generated record, or hash consumer. | private semantic→bytes goldens including direct Fn root and recursive Fn reference, greatest-fixed-point equivalence/non-equivalence, every tag/member/reference/am-n invariant, deep valid traversal; no public runtime benchmark row |
+| L2b-a2-am-c2b | Retain the compact effect-free MIR function-type table, use only c2a canonical bytes/equivalence to remove/sort definitions, and remap every raw `Ty::Fn`/`Scalar::Fn` occurrence. | definition-equivalence/remap owners, table compactness, every type-bearing field, whole/per-unit MIR/hash parity; no public runtime benchmark row |
+| L2b-a2-am-c2c | Expose `ProgramCall`, `CanonicalTy`, `CanonicalFnAbi`, `ProgramCallError`, and `CanonicalCodecError`, plus the complete independent canonical decoder over c2a. `from_program`/`from_parts` construct the private view from c2b's already-canonical `Program` tables, including `Program.fn_types`; they do not rebuild or effect-strip a second function graph. No generated identity type lands. | independent bytes→semantic type/Fn goldens, `from_program` and `from_parts` Fn-root positives, every malformed field and exact error-precedence row, deep truncation owners, proof that no LLVM/symbol/runtime path consumes the dormant wrappers; no public runtime benchmark row |
+| L2b-a2-am-c2d | Expose `GeneratedId` and parallel identity records plus record-local encode/decode over c2c. No collection validator, name reservation, MIR field, or codegen consumer lands. | generated-family semantic↔byte goldens, every record-local malformed/error row, deep nested decode, proof that no LLVM/symbol/runtime path consumes the dormant records; no public runtime benchmark row |
+| L2b-a2-am-c3 | Land typed program declarations/call targets, encoded program symbols, generated identities, collection pairing/probing, and all name/collision validation atomically across MIR/codegen and whole/per-unit paths. | callable applicability/unavailable cells, external collision/precedence and golden-symbol suites, generated family/pair/probe owners, per-unit/ThinLTO link parity; `mir-callable-namespace-validation` plus unchanged continuation cost |
 
 #### Am-b2a implementation closure matrix
 
@@ -2835,13 +3127,168 @@ ownership/control matrix is the per-record ledger in
 | move-in, move-out, source nulling, Drop, replacement, and return | `FnOrigin`, `RuntimeKey`, and kernel modes are Copy compiler metadata; boxed calls, canonical records, and generated ids use ordinary Rust ownership. They introduce no Align value, source nulling, Drop plan, replacement, return cleanup bit, runtime allocation, or allocation provenance. Existing callable operands/captures retain the am-b4-proved Move/Drop behavior byte-for-byte. | MIR equality excluding the typed metadata field, existing closure/task/parallel Drop and allocation-count owners, and explicit N/A assertions for new metadata |
 | body and control paths | HIR `Call`, `FnValue`, `Closure`, `Spawn`, every stage/terminal callable, `ResultMapErr`, and indirect-call signature/effect correlation are validated before conversion. `if`, `match`, `else`, `?`, `map_err`, loop/branch joins, early exits, and malformed input never create or publish a typed target or effect join after a rejected child/body. | all corresponding am-b owner ids, stored/local/projection/result effect-cell mutations, Pure/Unknown/Impure parallel twins, plus malformed-before-registry/cache tests and canonical-empty four-entrypoint parity |
 | generic and interface | Concrete generic instances record `Monomorph`; generic templates remain discarded. Imported declarations carry the already-existing interface effect fact only inside checked HIR, convert to the effect-free MIR declaration, and later convert to `ProgramCall` using their exact producer identity. Interface serialization/hash and source ABI fingerprints do not add `FnOrigin`, imported-effect transport, `DirectCall`, or `GeneratedId` and remain byte-identical. | generic source/mono name-equality twins, two-unit import/call/link, imported effect parity, effect-stripped MIR/impl-hash identity, unchanged interface/hash goldens |
-| whole-program and per-unit | Whole-program lowering derives internal linkage; per-unit lowering derives external linkage only for `Source { is_entry: false, is_public: true }`. Producer definitions and consumer imports encode the same program identity; direct/wrapped main and explicit exports follow the collision matrix. | whole/per-unit MIR, LLVM, executable, export, main, and ThinLTO off/on parity |
-| native/FFI and allocation parity | The compiler registry is the fixed 286-row base surface. The eight probe rows are verification-only runtime exports: never RuntimeKeys, callable declarations, collision reservations, compatible-extern reuse targets, compiler inputs, or cache identity. Probe-feature runtime fixtures never link user artifacts. A compatible extern may reuse only an exact base row; incompatible ABI/attribute or fixed-base external-name collisions reject before LLVM. Native calls, runtime ownership provenance, and success/error allocation counts are unchanged. | base/`alloc-count`/`par-map-probe`/all-feature bidirectional export sets, fixed 281 declaration ABI rows, base compatible/incompatible extern twins, eight ordinary probe-spelling extern/export positives under a normal runtime, cumulative native allocation owners |
+| whole-program and per-unit | Whole-program lowering derives internal linkage; per-unit lowering derives external linkage only for `Source { is_entry: false, is_public: true }`. Producer definitions and consumer imports encode the same program identity; direct/wrapped main and explicit exports follow the collision matrix. Before rt-LTO linking, codegen requires every guarded logical symbol to have its exact registry function type and a body; any missing, declaration-only, or wrong-type row loudly falls back and re-curates all guarded declarations without merging. It then renames every valid incoming guarded definition from its logical runtime symbol to the typed declaration's captured physical LLVM name, so a preceding same-spelled program/import claimant cannot receive or conflict with the runtime body. | whole/per-unit MIR, LLVM, executable, export, main, guarded artifact completeness/type/body/physical-collision, and ThinLTO off/on parity |
+| native/FFI and allocation parity | The compiler registry is the fixed 286-row base surface. The eight probe rows are verification-only runtime exports: never RuntimeKeys, callable declarations, collision reservations, compatible-extern reuse targets, compiler inputs, or cache identity. Probe-feature runtime fixtures never link user artifacts. A source extern is compatible with a base row exactly when its source-derived LLVM function type equals the row type; it supplies no curated attributes. The reused native row then supplies all return/parameter/function attributes and rt-LTO policy. A type-incompatible fixed-base external claim rejects before LLVM; attribute mutations are registry/runtime-fixture self-validation failures, not source-extern mismatch inputs. Native calls, runtime ownership provenance, and success/error allocation counts are unchanged. | base/`alloc-count`/`par-map-probe`/all-feature bidirectional export sets, fixed 281 declaration ABI rows, base compatible/incompatible-type extern twins, compatible attributed-row reuse, every registry attribute mutation, eight ordinary probe-spelling extern/export positives under a normal runtime, cumulative native allocation owners |
 | cache and monomorphization | Typed target bytes participate in structural MIR `impl_hash`; the compiler build changes `compiler_build_id`. Monomorph keys and interface hashes remain unchanged. No generated lookup uses a printed stem or raw table id. | one representation-change miss then unchanged hit, monomorph identity twins, generated collision/probe matrix |
 | benchmark | Am-h and am-c retain linear validation/registry construction and do no artifact or runtime allocation during validation. Canonical encoding and decoding preserve depth-first first-visit bytes through explicit enter/exit work items rather than native recursion. | `mir-header-validation`, `mir-callable-namespace-validation`, deep semantic→bytes→semantic and malformed-decode rows, unchanged runtime-call and continuation rows |
 
-The clean reviewed #678 approval of these fourteen implementation boundaries fixes L2b at
-twenty-three implementation PRs and L2 at twenty-seven. Target the repository's
+#### Am-c1 implementation closure matrix
+
+Am-c1 is the next implementation checkpoint. It consumes the already-authoritative 281-key/286-base
+row ABI ledger in [`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) and does not depend on the
+dormant c2a–c2d prerequisites or c3 MIR activation.
+
+| Cell | Required am-c1 closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | One semantic declaration in `align_mir` forms every `RuntimeKey` variant, its exact logical spelling, and `RuntimeKey::ALL`; compile-time cardinality pins 281. One wildcard-free exhaustive `match RuntimeKey` in `align_codegen_llvm` supplies exactly one backend-private `RuntimeAbi` row per variant, so adding a semantic key without a physical row fails compilation without placing LLVM facts in MIR. Five explicit unkeyed rows make 286 fixed base rows. Registry preflight proves key and symbol uniqueness and the three exceptional key-to-symbol mappings. No environment, target, runtime feature, linked artifact, or MIR string changes membership. | every key/logical spelling/symbol/type/return/parameter/attribute/rt-LTO-policy mutation; missing keyed row compile failure; duplicate key/symbol and base-cardinality test failures; exact default/feature export-set comparison |
+| declaration and legacy string seams | Registry and extern-compatibility preflight finish before LLVM construction but create no declaration. C1 fixes the post-change LLVM construction order exactly: stored definitions in vector order; non-shadowed imports in vector order; externs in vector order; keyed native rows in alphabetical `RuntimeKey::ALL` order; then existing generated helpers in their existing order. This intentionally normalizes only the relative keyed-native declaration order; all keyed physical symbols are unique, and every program/import/extern claimant still precedes them. A compatible extern claiming a fixed native physical symbol creates/reuses that exact row declaration during the extern phase; the later keyed row reuses the same handle. A same-physical-name stored definition/import is not compatible native reuse: the later native row retains current program-before-native LLVM uniquification behavior until c3 encodes program symbols. Main-wrapper emission later reuses a compatible `ReportError`/`ArgsBuild` extern or otherwise adds its row in the current wrapper order; a colliding stored/imported program symbol retains program-before-wrapper uniquification. Curated attributes attach through the selected typed row handle, never by scanning a symbol prefix that could hit the program claimant; this intentionally removes the current accidental native attributes from a program claimant and applies them to the possibly-suffixed native declaration. Separately, c1 does not classify generic old `Rvalue::Call(String, ..)`: the temporary mixed legacy map preserves the same stored/import/extern/keyed-runtime/generated alias insertion and overwrite behavior, with keyed aliases now inserted in `RuntimeKey::ALL` order. Because keyed aliases are mutually unique, their relative order changes no final binding. The map remains the string-indexed owner for generic direct calls, FnAddr/closure targets, generated helpers, and program/parallel signatures; only dedicated runtime consumers leave it in c1. C3 deletes all these program/generated/direct seams. The exact compiler-produced direct-runtime semantic set is 15 keys. Eight are already specialized codegen branches and become typed dedicated choices in c1: `Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, and `Hash128`. Seven still traverse the generic legacy direct seam: `ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, and `LenMismatchFail`. `AllocSizeFail` is a separate dedicated consumer and `error(code)` is the existing non-runtime identity case. | exact post-c1 declaration/reuse order and one checked pre-c1→post-c1 native-order golden; stored/imported physical-native-symbol collision keeps spelling/program-before-native uniquification while program/native attribute ownership becomes correct; compatible keyed extern+builtin and compatible unkeyed extern+wrapper new single-declaration link success; exact 281 legacy-alias insertions and final-binding parity; each eight-key specialized typed choice and seven-key legacy generic direct call; every program-name/runtime-alias collision preserves baseline resolution/result; unknown/error cases; declaration golden |
+| dedicated native consumers and control | Every specialized MIR native/drop/allocation/cleanup path outside the seven-key generic legacy direct seam indexes the typed keyed runtime function registry with a `RuntimeKey`, including dynamic choices represented as typed key matches. This explicitly includes the six `print` type choices and two `hash` width choices. When a main wrapper needs them, it obtains `align_rt_report_error` and conditional `align_rt_args_build` only through `UnkeyedRuntimeKey::{ReportError, ArgsBuild}` handles formed from their two declaration-policy rows. The other three unkeyed rows create no unconditional dedicated handle; an exact compatible extern may still cause ordinary declaration/reuse through its row. Every success, error, early exit, branch/loop cleanup, arena/task cleanup, and main-wrapper path preserves call order and result handling. No dedicated consumer indexes a runtime function by `&str`; an exhaustive source assertion inventories the keyed and two unkeyed consumers separately. | exact keyed consumer inventory including six print/two hash choice rows; exact two-wrapper-handle inventory and three-unkeyed-no-unconditional-declaration negatives; compatible-extern positives for all five unkeyed rows; representative and cumulative existing runtime behavior/cleanup/allocation owners; main Unit/Result/argv owners |
+| ownership, Drop, allocation, and FFI | Keys/ABI rows are compiler metadata and allocate no Align value. Existing native ownership provenance, argument coercion, return reconstruction, Drop/null-safety, success/error allocation counts, and runtime ABI are unchanged. Compatible extern reuse compares only the complete source-derived LLVM function type against the fixed base row, then applies that row's curated return/parameter/function attributes; an incompatible function type rejects before LLVM. | every compatible/incompatible extern return/parameter type ordinal; compatible reuse of each attributed ABI shape; registry attribute mutation owners; allocation-count and ownership owners; view/layout(C)/raw FFI parity |
+| whole/per-unit, ThinLTO, interface, and cache | Whole/per-unit/located/unlocated/diagnostic/object/ThinLTO paths share the same registry builder. rt-LTO policy comes from each row. Program/generated/native symbol spellings, MIR print/structural bytes, interface bytes/hash, source ABI, and runtime ABI remain unchanged; alphabetical keyed-native declaration order changes textual/raw LLVM once. Object bytes may change or remain equal, so no byte-equality promise is made. Compiler build id changes cache identity, causing one miss and then a hit on unchanged rebuilt input. Probe rows remain verification-only and never enter user module collision/reuse. | raw/optimized whole/per-unit alphabetical declaration identity, object link/behavior without a byte-equality assertion, rt-LTO off/on guarded attributes, unchanged MIR/interface/impl hashes, build-id miss then hit, ordinary probe-spelling extern/export positives |
+| benchmark and PR boundary | Registry construction and lookup are linear/constant-time compiler work; emitted calls and runtime cost are unchanged. C1 may exceed 1,000 hand-written lines because the exact 286 rows, their attributes, every declaration producer, and all dedicated consumers must move to one ABI authority in one pass. The temporary legacy alias seam contains handles only, is populated from that authority, and preserves old direct-call resolution until c3; it cannot declare a runtime ABI. A table-only PR would create two drifting ABI authorities, while a partial dedicated-consumer migration would retain an untyped lookup outside the explicitly deferred seam. | unchanged runtime-call benchmark, author table-to-declaration/consumer pass, focused owners, full codegen owners and applicable Clippy |
+
+The am-c author-side construction/consumption inventory is exact for the current tree:
+
+| Class | Producers that must change together | Consumers that must change together |
+|---|---|---|
+| program | validated stored functions, per-unit imports, extern declarations, HIR `Call`, `FnValue`, lifted `Closure`, every scalar/AoS pipeline stage, `reduce`/`any`/`all`, `scan`, `partition`, `sort_by_key`, and parallel terminal/stage callables | MIR print/debug, work-weight scan, tagged-type remap/embedded-type scan, LLVM definition/import/extern declaration registry, direct-call lowering, extern coercion, function-value and closure thunk discovery/lowering, parallel signature checks, whole/per-unit symbol/linkage, explicit exports, and main wrapping |
+| runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 281 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
+| generated | every distinct `FnAddr`, capturing `Closure`, `SpawnTask` result/fallibility pair, `ParMapParallel` materialize/filter count/filter scatter request, and `ParMapReduce` request | pre-body collection/validation, canonical byte sorting/deduplication, global-name reservation/probing, helper declaration/body emission, call-site pointer selection, debug names, and malformed-before-publication rejection |
+| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 286 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
+
+The callable applicability matrix is exhaustive; “unavailable” is an invalid hand-built MIR cell,
+not a missing positive owner:
+
+| MIR/callable form | Program definition | Program import | Program extern | RuntimeKey | GeneratedId |
+|---|---|---|---|---|---|
+| direct `Rvalue::Call` | `DirectCall::Program` | `DirectCall::Program` | `DirectCall::Program`, with existing FFI coercion | `DirectCall::Runtime`, exact fixed `RuntimeAbi` | unavailable |
+| `FnAddr` | allowed | allowed | unavailable by am-u | unavailable | produces one `FnValue` request |
+| lifted `Closure` | exact stored lifted target only | unavailable | unavailable | unavailable | produces one `Closure` request |
+| task spawn | indirect closure operand, no named target | unavailable | unavailable | `tg_*` only through dedicated MIR nodes | produces one `Task` request |
+| sequential map/filter/reducer/scan/partition/sort target | allowed | allowed | allowed only with am-u lexical permission already proved in HIR | unavailable | unavailable |
+| parallel terminal or named stage | allowed only when proved Pure | allowed only when proved Pure | unavailable because extern effect is not Pure | runtime orchestration uses dedicated `par_map*` nodes only | produces the applicable `Parallel` request(s) |
+
+Each program target keeps its one validated logical signature; owners cover Unit, scalar, aggregate,
+and existing extern-coercion signatures on targets that admit them. Each `RuntimeKey` has exactly
+the single return/parameter ABI in its `RuntimeAbi` row, so no test crosses a key with invented
+Unit/scalar/aggregate alternatives. A program callable whose bytes equal a RuntimeKey remains
+`Program`; an unregistered or wrong-class target rejects before MIR/codegen registry publication.
+Every applicable cell runs whole/per-unit; definition/import/external cells also run ThinLTO off/on.
+
+The parallel mode/stage/collection matrix is exact:
+
+| Ordered stage list | Materialize | Reduce | FilterCount | FilterScatter | Collection rule |
+|---|---|---|---|---|---|
+| empty | valid one record | valid only for the stage-free integer reduction form | unavailable | unavailable | no pair |
+| one or more `Map`/`Project`, no filter-kind stage | valid one record | unavailable | unavailable | unavailable | no pair |
+| contains `Filter`, `FilterStrContains`, or `FilterField`, optionally interleaved with `Map`/`Project` | unavailable | unavailable | valid individual record | valid individual record | exactly one otherwise-identical count/scatter pair after dedupe |
+| any unknown stage, invalid ordinal/type/signature, invalid work weight, or other mode/stage combination | reject | reject | reject | reject | reject before reservation |
+
+Canonical-type owners cross every root tag `0..=56`, scalar tag `0..=33`, primitive tag `0..=5`,
+definition tag `0..=4`, parameter mode, summary state, equivalence/non-equivalence class, repeated and
+recursive reference, shallow/deep graph, and encode/decode direction. Malformed owners mutate one
+version, tag, boolean, width, count, UTF-8/NUL, reference/order, duplicate member/equivalence class,
+empty nominal source, member identifier byte, alignment presence/power/range, enum first/later
+`field_base`/flattened-count overflow, same-source nominal kind/complete-shape equality, repeated
+anonymous tuple vector, summary index/order, truncation, or trailing byte at a time. Multi-invalid
+owners cross invalid-text-before-duplicate/reference, earlier-node-before-later-node, and
+same-member duplicate-before-missing-reference, earlier-member missing-reference-before-later
+identifier/`field_base`, and field-base-before-shape/equivalence precedence. Generated owners then cross family,
+equal dedupe/unequal identity, signature/capture/result shape, applicable parallel rows, stage order,
+field ordinal, source/terminal type, weight `1/2/4`, zero/one/two occupied candidates, and injected
+`u64::MAX` exhaustion. Ownership/control owners retain the am-b4 clean/already-invalid,
+fallthrough/divergence, branch/loop/early-exit, moved/captured-value, and heap/arena/task provenance
+matrix; metadata has explicit no-Align-allocation/source-nulling/Drop/replacement/return-cleanup rows.
+
+Validation and error precedence is one pre-LLVM sequence: (1) fixed native-registry self-check;
+(2) MIR type/header/`ProgramCall`/reference validation in program/table order; (3) stored, imported,
+then extern declaration-class compatibility in vector order; (4) extern ABI and exact native-reuse
+validation in extern order; (5) every direct/function-value/closure/pipeline/parallel program target
+membership, signature, capture metadata, and claimant-class relation in function/block/statement
+field order; a repeated FnValue/Closure target with different metadata necessarily fails here at
+the first mismatching occurrence because each program target has one exact declaration; (6)
+encoded/exact external-identity reservation for stored definitions,
+imports, externs, explicit exports in CLI order (an identical same-function/same-identity repeat is
+idempotent at its first occurrence; any different claimant at that identity fails at the later
+occurrence), then direct/wrapped main; (7) generated requests in function/block/statement encounter
+order: equal records dedupe while retaining the first ordinal, then collection closure scans the
+retained records in encounter order and reports the first count/scatter record without its
+otherwise-identical twin;
+(8) canonical
+byte sort/equal dedupe and deterministic name probing. The first failing phase wins; within a phase
+the stated order wins. Malformed canonical metadata therefore precedes duplicate/conflicting
+generated requests; declaration conflict precedes native ABI mismatch, which precedes target
+invalid, which precedes external collision; external collision precedes
+generated pair/probe failure; pair failure precedes probe exhaustion. No phase publishes a partial
+registry, cache key, LLVM declaration, helper, or artifact.
+
+These pre-LLVM failures preserve the existing public `CodegenError` enum and return
+`CodegenError::Lowering(String)`; no new public error variant lands. The inner string is exact, and
+the existing `Display` prefix remains `lowering failed: `. `<hex>` below is two lowercase
+hexadecimal digits per raw identity/canonical byte with no prefix or separators. The closed mapping
+is:
+
+| First failing condition | Exact `Lowering` inner string |
+|---|---|
+| keyed/base cardinality differs from 281/286 | `runtime ABI registry invariant: key-count` or `runtime ABI registry invariant: base-count` |
+| duplicate semantic key | `runtime ABI registry invariant: duplicate-key:<logical-name hex>` |
+| duplicate fixed physical symbol | `runtime ABI registry invariant: duplicate-symbol:<symbol hex>` |
+| one of the three exceptional key/symbol mappings is wrong | `runtime ABI registry invariant: key-symbol:<logical-name hex>` |
+| source extern claims a fixed native symbol with a different source-derived LLVM function type | `native extern ABI mismatch:<symbol hex>` |
+| public canonical decoder/record-local validation fails | `callable metadata invalid:<CanonicalCodecError variant name>` |
+| stored/imported/extern class relation conflicts for one logical program name | `callable declaration conflict:<ProgramCall raw UTF-8 hex>` |
+| a typed program target is absent or has a mismatched signature/class | `callable target invalid:<ProgramCall raw UTF-8 hex>` |
+| two different claimants reserve one exact external identity | `callable external identity collision:<identity raw-byte hex>` |
+| one count/scatter record lacks its otherwise-identical twin | `generated count-scatter pair mismatch:<GeneratedId canonical hex>` |
+| the occupied `$18446744073709551615` candidate exhausts probing | `generated name exhausted:<complete occupied candidate ASCII hex>` |
+
+`CanonicalCodecError variant name` is exactly the Rust identifier declared above. Registry
+attribute/ABI-row mutations that cannot arise from compiler input are compile-time or owner-test
+failures and do not invent a public runtime error. The eight validation phases and their within-phase
+orders above select which one string is returned for multi-invalid input; owners assert both the
+`CodegenError::Lowering` variant and exact inner bytes. Differing repeated FnValue/Closure metadata
+owners expect `callable target invalid` at the first mismatching occurrence. Generated
+multi-invalid owners include two such target mismatches in opposite encounter order, two missing
+pairs in opposite encounter order, and a target mismatch plus missing pair proving phase 5 wins.
+Cross-phase owners combine declaration conflict, native ABI mismatch, invalid target,
+external-identity collision, generated conflict, missing pair, and occupied-maximum probe in one
+fixture, then remove the earliest invalidity one at a time to prove that exact phase sequence.
+
+Am-c is six independently correct mergeable PRs. Am-c1 is the closed fixed-native-ABI
+`RuntimeKey`/`RuntimeAbi` vertical owned by doc 20. It rejects an extern that claims a fixed native
+symbol with an incompatible source-derived LLVM function type and newly makes a compatible keyed
+extern+builtin or compatible unkeyed extern+wrapper share one declaration and link. Otherwise MIR
+call strings, final mixed-map bindings, and symbol spellings remain unchanged; keyed-native
+declarations normalize to alphabetical `RuntimeKey::ALL` order and change raw LLVM plus cache
+identity once; object bytes have no equality promise. Typed handle application also deliberately
+moves native attributes off a same-spelled program claimant and onto the actual native declaration.
+C1 neither claims to repair nor newly changes the
+spelling ambiguity that c3's typed discriminant owns. Am-c2a lands the effect-free record plus only
+the private borrowed view and canonical graph/equivalence/semantic-to-byte engine. Am-c2b consumes that engine to retain, sort, and remap the
+effect-free function table, changing structural MIR/compiler-build cache identity once. Am-c2c
+exposes the dormant canonical type/function wrappers and complete decoder/error API. Am-c2d exposes
+only generated/parallel identity records and their record-local codecs; collection validation and
+LLVM consumption remain c3. None can drift into a second graph implementation.
+
+The author estimate, measured against the existing 273-line tagged canonicalizer and 340-line
+codegen type-graph validator while reusing am-d traversal, is: c2a 360 source + 390 table-driven test
+lines = 750; c2b 210 source + 260 tests = 470; c2c 360 source + 420 malformed/golden tests = 780;
+c2d 270 source + 330 tests = 600 hand-written changed lines. Generated fixtures/hex tables are
+counted as hand-written. Each is below 1,000 and targets 500 where feasible; if the author inventory
+exceeds the stated slice estimate before coding, this ledger must split again before implementation.
+C2a is independently dormant; c2b cannot retain/remap before its stable equivalence/bytes exist;
+c2c calls c2a's engine over c2b's canonical retained table; c2d calls c2c. Their focused owners
+invoke each boundary directly.
+Am-c3 activates typed declarations/direct calls, encoded program identities, every generated
+family, collection pairing, collision preflight, and whole/per-unit consumers together. C3 may
+exceed 1,000 hand-written lines: splitting its MIR producer from codegen leaves an unreadable target,
+splitting definition/import symbols breaks producer-consumer linkage, and splitting any generated
+family leaves accepted extern/export spellings able to collide with an unprobed helper. C1 and
+C2a–c2d must be merged before C3 begins; no unrecorded dormant local commit is claimed as a seventh
+implementation PR.
+
+The #678 approval plus the mandatory am-c pre-implementation amendment fixes these nineteen
+implementation boundaries, L2b at twenty-eight implementation PRs, and L2 at thirty-two. Target the repository's
 500-line implementation checkpoint. If an implementation PR is expected to exceed roughly 1,000
 changed hand-written lines, record why it cannot split safely before coding.
 Am-d is one cross-cutting vertical even if that exceeds roughly 1,000 hand-written changed lines:
@@ -2850,10 +3297,9 @@ producer-depth body can still overflow a remaining recursive consumer, while spl
 type visitor would leave a later phase free to reintroduce the same failure for a valid deep DAG.
 The exact body preflight, every current recursive body consumer, the common type traversal, and
 their boundary/deep-graph owners therefore land atomically.
-Am-c is cross-cutting by necessity because an untagged call string cannot distinguish a
-source-accepted user spelling from its runtime key; its closure matrix and complete source/MIR/
-codegen owner set land in the same PR. If any body construction PR approaches the bound, split its
-dormant inventory row before coding and update this ledger; do not activate a partial validator.
+Am-c3 remains cross-cutting by necessity for the exact activation subset stated above. If any body
+construction PR approaches the bound, split its dormant inventory row before coding and update this
+ledger; do not activate a partial validator.
 
 Am-e deliberately narrows one unsound source corner: a no-argument `main` with any return other
 than Unit, exact i32, or `Result<Unit,builtin Error>` receives a source diagnostic before HIR.
@@ -2892,7 +3338,7 @@ construction/selection/replacement, destructuring, ordinary block/`if`/loop flow
 and the product half of the public boundary. L2b-a2-ac first closes the MIR continuation
 prerequisite above without changing a projection fact. L2b-a2-am-g-t closes only direct
 handcrafted-HIR global type-domain validation without changing valid HIR. The completed am-r
-ledger inserts am-d, am-e, am-f, am-w, am-v, am-u, am-p, am-n, am-h, am-b1–b4, and am-c before
+ledger inserts am-d, am-e, am-f, am-w, am-v, am-u, am-p, am-n, am-h, am-b1–b4, and am-c1/c2a/c2b/c2c/c2d/c3 before
 L2b-a2-af adds validated fixed-array paths
 and exact/dynamic element selection and replacement. L2b-a2-ar closes eager retained-storage
 actions for non-fixed reads. L2b-a2-ap adds pipeline `Project`/`WhereField` and terminal formation.
@@ -2917,16 +3363,17 @@ owners to the shared focused targets. Every implementation slice retains the sco
 
 L2b-a2-s, L2b-a2-ac, L2b-a2-am-g-t, the am-r design gate, am-d, am-e, and am-f are fixed completed verticals.
 PR #679 implements am-d, #681 implements am-e, and #683 implements am-f. After it, the mandatory remaining sequence is am-w, am-v,
-am-u, am-p, am-n, am-h, am-b1, am-b2, am-b3, am-b4, am-c, af, ar, ap, and t. The first PR
+am-u, am-p, am-n, am-h, am-b1, am-b2, am-b3, am-b4, am-c1, am-c2a, am-c2b, am-c2c, am-c2d, am-c3, af, ar, ap, and t. The first PR
 publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
 retain the shipped flattened result. It must include product construction, reads, partial writes,
 destructuring, ordinary control joins, direct/imported consumption, and whole/per-unit parity
 together: omitting a writer or join can under-approximate the same public product fact. The second
 PR closes the general MIR continuation invariant for checked HIR. The third adds only global
-type-domain validation. The fourteen am-r implementation verticals then apply stack-safety before
-the five producer corrections, followed by placement, nominal/link, header, total body metadata, and finally
-the callable representation change; af, ar, ap, and t retain their existing dependency order.
-Am-c follows am-b4 because its typed/generated identities
+type-domain validation. The nineteen amended am-r implementation verticals then apply stack-safety before
+the five producer corrections, followed by placement, nominal/link, header, total body metadata,
+the c1 runtime registry, c2a private graph/encoder, c2b table/remap activation, c2c public canonical
+decoder, c2d generated codecs, and finally c3 callable activation; af, ar, ap, and t retain their
+existing dependency order. Am-c1/c2a/c2b/c2c/c2d/c3 follow am-b4 because their typed/generated identities
 consume already validated body callable facts; it must not duplicate or anticipate the b3/b4 body
 contract. The tagged slice still
 replaces its explicit and implicit `Result` fallbacks atomically. A PR expected to exceed roughly
@@ -3257,7 +3704,12 @@ their first owning slice and remain cumulative gates afterward.
 | L2b-a2-am-b2b2 | `cargo test -p align_mir hir_body_validator_pipeline_template_json_group`; `cargo test -p align_mir hir_body_validator_pipeline_template_json_group_control_flow`; `cargo test -p align_mir deep_hir_body_pipeline_b2b2_type_dag_is_stack_bounded`; `cargo test -p align_mir hir_body_validator_pipeline_deferred_b2b2`; `cargo test -p align_mir hir_body_validator_json_scan_copy_row`; `cargo test -p align_mir hir_program_json_scan_copy_row`; `cargo test -p align_mir hir_program_json_scan_envelope_mismatch`; `cargo test -p align_mir hir_program_json_scan_envelope_precedence_matrix`; `cargo test -p align_driver --test m5 json_scan_copy_`; `cargo test -p align_driver --test m5 json_scan_generic_return_context_`; `cargo test -p align_driver --test modules json_scan_imported_`; `cargo test -p align_driver --test cache_codegen json_scan_row_schema_rejection`; `cargo test -p align_driver --test cache_codegen json_scan_per_unit_interface_row_ownership`; `cargo test -p align_driver --test cache_codegen json_scan_generic_return_context_no_publication`; `env LC_ALL=C ALIGNC_CACHE=off cargo test --release --locked --target x86_64-unknown-linux-gnu -p align_driver --test json_scan_identity -- --exact json_scan_cross_compiler_identity` under `rustc 1.96.1`, `llvm-config-22 22.1.8`, `cc`, and no custom `RUSTFLAGS`; no general public-entrypoint activation | `scripts/compare-json-scan-identity.sh` with baseline `576e57307fe4ef34e74566f5e389a2f0e2a04acd` and the implementation-head SHA in the PR/HANDOFF; compare exact interface bytes and `InterfaceSummary.interface_hash`, all actual `CodegenKey` fields except the intentional `compiler_build_id` difference (recorded as `FirstDiff::CompilerBuildId`), codegen-input MIR, raw LLVM, and release object bytes with `cmp` and no normalization; fail on any other cache-key difference and share no cache object across compiler builds; no new runtime benchmark |
 | L2b-a2-am-b3 | `cargo test -p align_mir hir_body_validator_native`; `cargo test -p align_mir hir_body_validator_generated_callables`; `cargo test -p align_mir hir_body_validator_native_control_flow`; `cargo test -p align_mir deep_hir_body_native_type_dag_is_stack_bounded`; no public-entrypoint activation | none |
 | L2b-a2-am-b4 | `cargo test -p align_mir malformed_hir_body_metadata_fails_closed`; `cargo test -p align_mir checked_hir_body_fact_replay_covers_cleanup_and_function_effects`; `cargo test -p align_mir valid_hir_body_preflight_is_mir_identity`; `cargo test -p align_mir body_contract_function_return_none`; `cargo test -p align_mir body_contract_function_root_completion`; `cargo test -p align_mir checked_hir_depth_closure_matrix`; `cargo test -p align_mir deep_hir_body_core_type_dag_is_stack_bounded`; `cargo test -p align_sema replay_clone`; `cargo test -p align_mir`; `cargo test -p align_driver --test expr_depth within_limit_chain_compiles_and_runs`; `cargo test -p align_driver --test per_unit_codegen` | `bench/library_boundary/run.sh provenance`: `mir-body-validation`, `mir-continuation-lowering` |
-| L2b-a2-am-c | `cargo test -p align_mir malformed_hir_callable_namespace_fails_closed`; `cargo test -p align_mir deep_canonical_type_codec_is_stack_bounded`; `cargo test -p align_codegen_llvm callable_namespace`; `cargo test -p align_driver --test per_unit_codegen --test exports`; `cargo test -p align_mir`; `cargo test -p align_codegen_llvm` | `bench/library_boundary/run.sh provenance`: `mir-callable-namespace-validation`, `mir-continuation-lowering` |
+| L2b-a2-am-c1 | `cargo test -p align_codegen_llvm runtime_abi_registry`; `cargo test -p align_codegen_llvm runtime_abi_legacy_direct_parity`; `cargo test -p align_codegen_llvm runtime_abi_dedicated_consumers`; `cargo test -p align_codegen_llvm runtime_abi_compatible_extern`; `cargo test -p align_codegen_llvm runtime_abi_guarded_program_collision`; `cargo test -p align_codegen_llvm runtime_abi_rt_lto_incomplete`; `cargo test -p align_runtime runtime_export_source_inventory_matches_registry`; `scripts/test-runtime-abi-exports.sh`; `cargo test -p align_codegen_llvm` | `bench/library_boundary/run.sh provenance`: unchanged runtime-call cost |
+| L2b-a2-am-c2a | `cargo test -p align_mir canonical_graph_engine`; `cargo test -p align_mir canonical_graph_equivalence`; `cargo test -p align_mir canonical_graph_function_root`; `cargo test -p align_mir deep_canonical_graph_is_stack_bounded`; `cargo test -p align_mir` | no public runtime benchmark row |
+| L2b-a2-am-c2b | `cargo test -p align_mir canonical_function_type_remap`; `cargo test -p align_driver --test per_unit_codegen gate_f_impl_hash`; `cargo test -p align_mir` | no public runtime benchmark row |
+| L2b-a2-am-c2c | `cargo test -p align_mir canonical_type_codec`; `cargo test -p align_mir canonical_type_codec_function_root`; `cargo test -p align_mir canonical_codec_error_precedence`; `cargo test -p align_mir deep_canonical_type_codec_is_stack_bounded`; `cargo test -p align_mir` | no public runtime benchmark row |
+| L2b-a2-am-c2d | `cargo test -p align_mir generated_identity_codec`; `cargo test -p align_mir generated_identity_error_precedence`; `cargo test -p align_mir deep_generated_identity_codec_is_stack_bounded`; `cargo test -p align_mir` | no public runtime benchmark row |
+| L2b-a2-am-c3 | `cargo test -p align_mir malformed_hir_callable_namespace_fails_closed`; `cargo test -p align_codegen_llvm callable_namespace`; `cargo test -p align_codegen_llvm generated_identity_collection`; `cargo test -p align_driver --test per_unit_codegen --test export_roots --test thin_lto`; `cargo test -p align_mir`; `cargo test -p align_codegen_llvm` | `bench/library_boundary/run.sh provenance`: `mir-callable-namespace-validation`, `mir-continuation-lowering` |
 | L2b-a2-af | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-ar | `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test borrow_liveness --test struct_index --test chunks --test soa --test m11_http --test m11_http_get_many` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2-ap | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_mir eager_expression_termination_matrix`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |

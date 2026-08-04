@@ -23,9 +23,10 @@ pub mod thinlto_spike;
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
 mod drop_codegen;
+mod runtime_abi;
 
 use align_ast::{BinOp, UnOp};
-use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
+use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{
     DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
@@ -49,7 +50,9 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType};
+use inkwell::types::{
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
+};
 use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue};
 
 pub fn is_available() -> bool {
@@ -98,6 +101,16 @@ pub fn target_object_format() -> Result<ObjectFormat, String> {
 pub enum CodegenError {
     Lowering(String),
     Target(String),
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 impl std::fmt::Display for CodegenError {
@@ -376,11 +389,11 @@ fn build_program_module<'c>(
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
     // Probe the baked bitcode before deciding whether to skip curating the guarded declares.
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(ctx, bc));
-    build_module(ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    let runtime = build_module(ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
     if let Some(rt) = rt_module {
         // On a datalayout mismatch `link_in_rt_lto` falls back on its own (loud diagnostic, guarded
         // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
-        link_in_rt_lto(ctx, &module, rt)?;
+        link_in_rt_lto(ctx, &module, rt, &runtime)?;
     }
     // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
@@ -508,9 +521,9 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     // Probe-then-annotate mirrors `emit_object`. Linked into the raw module (before any opt run) so
     // `--stage raw --rt-lto` exposes the pre-opt merged shape for the attr-xor gate.
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
-    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    let runtime = build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
     if let Some(rt) = rt_module {
-        link_in_rt_lto(&ctx, &module, rt)?;
+        link_in_rt_lto(&ctx, &module, rt, &runtime)?;
     }
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
@@ -562,7 +575,7 @@ pub fn collect_opt_remarks(
 
     // `explain-opt` never auto-enables `--rt-lto` (the default lens stays curated-declare shape).
     let built = build_module(&ctx, &module, program, &tm, Some(debug), &[], false);
-    let ran = built.and_then(|()| run_opt_pipeline(&module, &tm, "default<O2>"));
+    let ran = built.and_then(|_| run_opt_pipeline(&module, &tm, "default<O2>"));
 
     drop(_detach_guard);
     ran?;
@@ -655,6 +668,10 @@ struct DebugCtx<'c> {
     scope: inkwell::debug_info::DIScope<'c>,
 }
 
+struct RuntimeDeclarations {
+    physical_names: HashMap<RuntimeKey, String>,
+}
+
 fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -663,7 +680,8 @@ fn build_module<'c>(
     debug: Option<&DebugInfo>,
     exports: &[String],
     rt_lto_skip_guarded: bool,
-) -> Result<(), CodegenError> {
+) -> Result<RuntimeDeclarations, CodegenError> {
+    runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
     validate_tagged_program(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -854,6 +872,118 @@ fn build_module<'c>(
         })
         .collect();
 
+    // Compute every source extern's physical ABI and reject fixed-native mismatches before
+    // declaring any LLVM function. Type formation is side-effect-free with respect to the module;
+    // the declaration pass below is therefore all-or-nothing for this compatibility boundary.
+    let triple = tm.get_triple();
+    let triple_s = triple.as_str().to_string_lossy().to_ascii_lowercase();
+    let x86_64_sysv = triple_s.starts_with("x86_64") && triple_s.contains("linux");
+    for ext in &program.externs {
+        let uses_byval_struct = matches!(ext.ret, Ty::Struct(_))
+            || ext.params.iter().any(|p| matches!(p, Ty::Struct(_)));
+        if uses_byval_struct && !x86_64_sysv {
+            return Err(CodegenError::Lowering(format!(
+                "extern '{}' passes or returns a struct by value, which is only supported on x86-64 SysV (Linux) — the target is '{}'; pass the struct by pointer (`raw`) instead",
+                ext.name, triple_s,
+            )));
+        }
+    }
+    let extern_abi: HashMap<String, ExternAbi> = program
+        .externs
+        .iter()
+        .map(|e| {
+            let params = e
+                .params
+                .iter()
+                .map(|&ty| match ty {
+                    Ty::Struct(id) => match classify_struct_abi(
+                        id,
+                        &struct_types[id as usize],
+                        &program.structs[id as usize],
+                        &target_data,
+                    ) {
+                        Some(abi) => ParamAbi::StructRegs(abi),
+                        None => ParamAbi::StructMemory,
+                    },
+                    _ if is_ffi_view(ty) => ParamAbi::ViewPtr,
+                    _ => ParamAbi::Direct,
+                })
+                .collect();
+            let ret = match e.ret {
+                Ty::Struct(id) => match classify_struct_abi(
+                    id,
+                    &struct_types[id as usize],
+                    &program.structs[id as usize],
+                    &target_data,
+                ) {
+                    Some(abi) => ReturnAbi::StructRegs(abi),
+                    None => ReturnAbi::StructMemory,
+                },
+                _ => ReturnAbi::Direct,
+            };
+            (e.name.clone(), ExternAbi { params, ret })
+        })
+        .collect();
+    let mut extern_fn_types: HashMap<String, FunctionType<'c>> =
+        HashMap::with_capacity(program.externs.len());
+    for ext in &program.externs {
+        let abi = &extern_abi[&ext.name];
+        check_sysv_struct_args_fit(&ext.name, abi, &ext.params, &program.structs)?;
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
+        for (pa, &ty) in abi.params.iter().zip(&ext.params) {
+            match pa {
+                ParamAbi::Direct => param_types
+                    .push(abi_type(ctx, ty, &struct_types, &enum_types, &tagged_types).into()),
+                ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
+                ParamAbi::StructRegs(sabi) => {
+                    for &eb in &sabi.ebs {
+                        param_types.push(eb.llvm(ctx).into());
+                    }
+                }
+                ParamAbi::StructMemory => {
+                    let sname = match ty {
+                        Ty::Struct(id) => program.structs[id as usize].name.as_str(),
+                        _ => "?",
+                    };
+                    return Err(CodegenError::Lowering(format!(
+                        "extern '{}': passing struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (a `byval` pointer), which is not supported in FFI v1 — pass it by pointer (`raw`) instead",
+                        ext.name,
+                    )));
+                }
+            }
+        }
+        let fn_ty = match &abi.ret {
+            ReturnAbi::Direct => {
+                if ext.ret == Ty::Unit {
+                    ctx.void_type().fn_type(&param_types, false)
+                } else {
+                    abi_type(ctx, ext.ret, &struct_types, &enum_types, &tagged_types)
+                        .fn_type(&param_types, false)
+                }
+            }
+            ReturnAbi::StructRegs(sabi) => struct_ret_type(ctx, sabi).fn_type(&param_types, false),
+            ReturnAbi::StructMemory => {
+                let sname = match ext.ret {
+                    Ty::Struct(id) => program.structs[id as usize].name.as_str(),
+                    _ => "?",
+                };
+                return Err(CodegenError::Lowering(format!(
+                    "extern '{}': returning struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (an `sret` pointer), which is not supported in FFI v1 — return it through an out-pointer (`raw`) parameter instead",
+                    ext.name,
+                )));
+            }
+        };
+        if let Some(id) = runtime_abi::runtime_abi_for_symbol(&ext.name)
+            && fn_ty != runtime_abi::function_type(id, ctx)
+        {
+            return Err(CodegenError::Lowering(format!(
+                "native extern ABI mismatch:{}",
+                lowercase_hex(ext.name.as_bytes()),
+            )));
+        }
+        extern_fn_types.insert(ext.name.clone(), fn_ty);
+    }
+
     // Pass 1: declare all functions so calls resolve regardless of order. A `Result`- or
     // `Unit`-returning `main` is emitted under `align_main`; a C `main` wrapper is
     // generated after the bodies (see below).
@@ -912,1864 +1042,58 @@ fn build_module<'c>(
             ret: imp.ret,
         });
     }
-    // A by-value struct in an `extern "C"` signature uses the SysV AMD64 register ABI, which we
-    // implement for x86-64 Linux only. On any other target we refuse rather than guess a per-target
-    // register rule (that is the one FFI corner a wrong rule *silently miscompiles*) — the user must
-    // pass the struct by pointer (`raw`) instead. Scalar/`raw`/view externs are unaffected.
-    let triple = tm.get_triple();
-    let triple_s = triple.as_str().to_string_lossy().to_ascii_lowercase();
-    let x86_64_sysv = triple_s.starts_with("x86_64") && triple_s.contains("linux");
-    for ext in &program.externs {
-        let uses_byval_struct = matches!(ext.ret, Ty::Struct(_))
-            || ext.params.iter().any(|p| matches!(p, Ty::Struct(_)));
-        if uses_byval_struct && !x86_64_sysv {
-            return Err(CodegenError::Lowering(format!(
-                "extern '{}' passes or returns a struct by value, which is only supported on x86-64 SysV (Linux) — the target is '{}'; pass the struct by pointer (`raw`) instead",
-                ext.name, triple_s,
-            )));
-        }
-    }
-
-    // The SysV ABI plan for each `extern "C"` symbol: how every parameter and the return value cross
-    // the C boundary (a `layout(C)` struct by value flattens to `i64`/`double` register slots; a
-    // `str`/`slice` view passes as its data pointer; everything else is direct). Computed once and
-    // reused for both the declaration signature (here) and the coerced call site.
-    let extern_abi: HashMap<String, ExternAbi> = program
-        .externs
-        .iter()
-        .map(|e| {
-            let params = e
-                .params
-                .iter()
-                .map(|&ty| match ty {
-                    Ty::Struct(id) => {
-                        match classify_struct_abi(id, &struct_types[id as usize], &program.structs[id as usize], &target_data) {
-                            Some(abi) => ParamAbi::StructRegs(abi),
-                            None => ParamAbi::StructMemory,
-                        }
-                    }
-                    _ if is_ffi_view(ty) => ParamAbi::ViewPtr,
-                    _ => ParamAbi::Direct,
-                })
-                .collect();
-            let ret = match e.ret {
-                Ty::Struct(id) => {
-                    match classify_struct_abi(id, &struct_types[id as usize], &program.structs[id as usize], &target_data) {
-                        Some(abi) => ReturnAbi::StructRegs(abi),
-                        None => ReturnAbi::StructMemory,
-                    }
-                }
-                _ => ReturnAbi::Direct,
-            };
-            (e.name.clone(), ExternAbi { params, ret })
-        })
-        .collect();
-
     // Declare foreign (`extern "C"`) functions under their C symbol, so a `Rvalue::Call` keyed by
     // that name resolves. FFI-safe params/returns are scalars/`raw`/views/`layout(C)` structs — the
     // signature reflects the SysV coerce plan above (flattened register slots for a by-value struct).
     // No `mark_nounwind`: unlike an Align function, foreign code is outside our control, so we do not
     // assert it never unwinds.
     for ext in &program.externs {
-        let abi = &extern_abi[&ext.name];
-        // Reject any signature where a by-value struct argument would fall to the MEMORY-class
-        // `byval` ABI because preceding arguments exhaust the class registers (the SysV all-or-
-        // nothing rule) — we cannot reproduce `byval` by flattening. See `check_sysv_struct_args_fit`.
-        check_sysv_struct_args_fit(&ext.name, abi, &ext.params, &program.structs)?;
-        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
-        for (pa, &ty) in abi.params.iter().zip(&ext.params) {
-            match pa {
-                ParamAbi::Direct => param_types
-                    .push(abi_type(ctx, ty, &struct_types, &enum_types, &tagged_types).into()),
-                ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
-                // A by-value struct flattens to one `i64`/`double` per eightbyte — byte-identical to
-                // clang's own flattened parameter form. This is sound only because
-                // `check_sysv_struct_args_fit` has already rejected the register-exhaustion boundary
-                // where clang would switch to a `byval` pointer (which flattening cannot mimic).
-                ParamAbi::StructRegs(sabi) => {
-                    for &eb in &sabi.ebs {
-                        param_types.push(eb.llvm(ctx).into());
-                    }
-                }
-                ParamAbi::StructMemory => {
-                    let sname = match ty {
-                        Ty::Struct(id) => program.structs[id as usize].name.as_str(),
-                        _ => "?",
-                    };
-                    return Err(CodegenError::Lowering(format!(
-                        "extern '{}': passing struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (a `byval` pointer), which is not supported in FFI v1 — pass it by pointer (`raw`) instead",
-                        ext.name,
-                    )));
-                }
-            }
-        }
-        let fn_ty = match &abi.ret {
-            ReturnAbi::Direct => {
-                if ext.ret == Ty::Unit {
-                    ctx.void_type().fn_type(&param_types, false)
-                } else {
-                    abi_type(ctx, ext.ret, &struct_types, &enum_types, &tagged_types)
-                        .fn_type(&param_types, false)
-                }
-            }
-            ReturnAbi::StructRegs(sabi) => struct_ret_type(ctx, sabi).fn_type(&param_types, false),
-            ReturnAbi::StructMemory => {
-                let sname = match ext.ret {
-                    Ty::Struct(id) => program.structs[id as usize].name.as_str(),
-                    _ => "?",
-                };
-                return Err(CodegenError::Lowering(format!(
-                    "extern '{}': returning struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (an `sret` pointer), which is not supported in FFI v1 — return it through an out-pointer (`raw`) parameter instead",
-                    ext.name,
-                )));
-            }
-        };
+        let fn_ty = extern_fn_types[&ext.name];
         // Defensive: if the symbol is already in the module (e.g. it coincides with a symbol
         // declared earlier), reuse that declaration. A fresh `add_function` on a duplicate name
         // makes LLVM silently rename it (`@abs.1`), which then fails to link against the real
         // external symbol.
-        let fv = module.get_function(&ext.name).unwrap_or_else(|| module.add_function(&ext.name, fn_ty, None));
+        let fv = module
+            .get_function(&ext.name)
+            .unwrap_or_else(|| module.add_function(&ext.name, fn_ty, None));
         funcs.insert(ext.name.clone(), fv);
     }
-    // Declare runtime builtins, keyed by the MIR call name they back.
-    let print_ty = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);
-    funcs.insert(
-        "print".to_string(),
-        module.add_function("align_rt_print_i64", print_ty, None),
-    );
-    // Out-of-bounds index failure: report `(index, len)` and abort (`-> !`).
-    funcs.insert(
-        "bounds_fail".to_string(),
-        module.add_function(
-            "align_rt_bounds_fail",
-            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    // `map_into` destination/source length mismatch: report `(dst_len, src_len)` and abort (`-> !`).
-    funcs.insert(
-        "len_mismatch_fail".to_string(),
-        module.add_function(
-            "align_rt_len_mismatch_fail",
-            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    // Out-of-bounds range-slice failure: report `(start, end, len)` and abort (`-> !`).
-    funcs.insert(
-        "range_fail".to_string(),
-        module.add_function(
-            "align_rt_range_fail",
-            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    // A `str` range endpoint that splits a UTF-8 scalar: report `(index, len)` and abort (`-> !`).
-    funcs.insert(
-        "utf8_boundary_fail".to_string(),
-        module.add_function(
-            "align_rt_utf8_boundary_fail",
-            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    // Integer division/remainder by zero: report and abort (`-> !`). Codegen emits the
-    // `divisor == 0` guard inline (see MIR `lower_int_div`) and calls this on the failing path.
-    funcs.insert(
-        "div_fail".to_string(),
-        module.add_function("align_rt_div_fail", ctx.void_type().fn_type(&[], false), None),
-    );
-    funcs.insert(
-        "alloc_size_fail".to_string(),
-        module.add_function("align_rt_alloc_size_fail", ctx.void_type().fn_type(&[], false), None),
-    );
-    // `std.process` (M11) — `process.exit(code)` (cleanup runs first, in MIR) and `process.abort()`.
-    // Both are diverging (`-> !`); MIR emits `Unreachable` after the call (like `bounds_fail`), so no
-    // `noreturn` attribute is required for correctness.
-    funcs.insert(
-        "process_exit".to_string(),
-        module.add_function("align_rt_process_exit", ctx.void_type().fn_type(&[ctx.i64_type().into()], false), None),
-    );
-    funcs.insert(
-        "process_abort".to_string(),
-        module.add_function("align_rt_process_abort", ctx.void_type().fn_type(&[], false), None),
-    );
-    // Arena allocator (M3).
+    // The fixed native ABI table is the sole declaration/type/attribute authority. Program,
+    // imported, and extern declarations intentionally remain earlier in the module. Keyed native
+    // rows are then emitted in alphabetical RuntimeKey::ALL order; the legacy mixed alias map is
+    // populated from the same handles until typed MIR direct calls land in am-c3.
     let ptr = ctx.ptr_type(AddressSpace::default());
-    let i64t = ctx.i64_type();
-    let arena_begin = module.add_function("align_rt_arena_begin", ptr.fn_type(&[], false), None);
-    mark_alloc_like(ctx, arena_begin);
-    funcs.insert("arena_begin".to_string(), arena_begin);
-    let arena_alloc = module.add_function(
-        "align_rt_arena_alloc",
-        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
-        None,
-    );
-    mark_bump_alloc(ctx, arena_alloc);
-    funcs.insert("arena_alloc".to_string(), arena_alloc);
-    funcs.insert(
-        "arena_end".to_string(),
-        module.add_function(
-            "align_rt_arena_end",
-            ctx.void_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    // `task_group` runtime (slice ④b).
-    let tg_begin = module.add_function("align_rt_tg_begin", ptr.fn_type(&[], false), None);
-    mark_alloc_like(ctx, tg_begin);
-    funcs.insert("tg_begin".to_string(), tg_begin);
-    let tg_alloc = module.add_function(
-        "align_rt_tg_alloc",
-        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
-        None,
-    );
-    mark_bump_alloc(ctx, tg_alloc);
-    funcs.insert("tg_alloc".to_string(), tg_alloc);
-    funcs.insert(
-        "tg_register".to_string(),
-        module.add_function(
-            "align_rt_tg_register",
-            // (tg, tramp, thunk, env, slot, err_slot)
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "tg_wait".to_string(),
-        // Returns the lowest-spawn-index errored task's `err_slot` pointer (null if all succeeded).
-        module.add_function("align_rt_tg_wait", ptr.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "tg_end".to_string(),
-        module.add_function("align_rt_tg_end", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // Free-standing heap allocation for owned arrays (MMv2 slice 4).
-    let alloc = module.add_function("align_rt_alloc", ptr.fn_type(&[i64t.into()], false), None);
-    mark_alloc_like(ctx, alloc);
-    funcs.insert("alloc".to_string(), alloc);
-    funcs.insert(
-        "free".to_string(),
-        module.add_function("align_rt_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `chunks(n)`: (src_ptr, src_len, n, elem_size) -> { chunk_buf, count } (a `{ptr,len}`).
-    funcs.insert(
-        "chunks".to_string(),
-        module.add_function(
-            "align_rt_chunks",
-            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into()], false),
-            None,
-        ),
-    );
-    // `par_map`: (capture_ctx, in_buf, count, in_stride, out_stride, work_weight, range_kernel)
-    // -> out_buf. `work_weight` is a compiler-generated 1/2/4 hint; the runtime combines it with
-    // the element byte width to choose a conservative caller-only floor.
-    // Allocates the output, applies the generated kernel to disjoint ranges across threads, and
-    // returns the owned buffer. The call-scoped capture context is never retained by the runtime.
-    let par_map = module.add_function(
-        "align_rt_par_map",
-        ptr.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
-        None,
-    );
-    // Only `noalias` on the return: the output buffer is a fresh allocation disjoint from the inputs.
-    // NOT `nounwind` (it may `resume_unwind` a worker panic) and NOT `nofree` (it invokes the user
-    // range kernel, so we don't assert anything about what that does).
-    add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
-    funcs.insert("par_map".to_string(), par_map);
-    // `par_map` with callable `where` stages: (capture_ctx, in_buf, count, in_stride, out_stride,
-    // work_weight, count_kernel, scatter_kernel) -> {out_buf, survivor_count}. The runtime first
-    // counts stable survivors per range, then reruns the Pure stage chain to scatter in source
-    // order at prefix-computed offsets.
-    let par_map_filter = module.add_function(
-        "align_rt_par_map_filter",
-        slice_struct_type(ctx).fn_type(
-            &[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into(), ptr.into()],
-            false,
-        ),
-        None,
-    );
-    // The result is an `{ptr, i64}` descriptor returned by value, not a pointer return. LLVM's
-    // `noalias` return attribute is legal only on pointer returns; freshness applies to the
-    // descriptor's `ptr` field and is already enforced by the runtime's exact allocation path.
-    funcs.insert("par_map_filter".to_string(), par_map_filter);
-    // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, work_weight,
-    // range_kernel) -> wrapping integer sum. The runtime keeps only one partial result per claimed
-    // range, so no full transformed output buffer is materialized.
-    funcs.insert(
-        "par_map_reduce".to_string(),
-        module.add_function(
-            "align_rt_par_map_reduce",
-            i64t.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "print_str".to_string(),
-        module.add_function(
-            "align_rt_print_str",
-            ctx.void_type().fn_type(&[ptr.into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "print_bool".to_string(),
-        module.add_function(
-            "align_rt_print_bool",
-            ctx.void_type().fn_type(&[ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "print_char".to_string(),
-        module.add_function(
-            "align_rt_print_char",
-            ctx.void_type().fn_type(&[ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "print_f32".to_string(),
-        module.add_function(
-            "align_rt_print_f32",
-            ctx.void_type().fn_type(&[ctx.f32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "print_f64".to_string(),
-        module.add_function(
-            "align_rt_print_f64",
-            ctx.void_type().fn_type(&[ctx.f64_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "str_eq".to_string(),
-        module.add_function(
-            "align_rt_str_eq",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    // `core.string` byte predicates + the `Ord(str)` comparator — all share the
-    // `i32 (ptr, i64, ptr, i64)` signature of `str_eq` (`str_cmp` returns -1/0/1 instead of 0/1).
-    for (key, sym) in [
-        ("str_contains", "align_rt_str_contains"),
-        ("str_starts_with", "align_rt_str_starts_with"),
-        ("str_ends_with", "align_rt_str_ends_with"),
-        ("str_cmp", "align_rt_str_cmp"),
-    ] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(
-                sym,
-                ctx.i32_type().fn_type(
-                    &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
-                    false,
-                ),
-                None,
-            ),
+    let mut runtime_funcs: HashMap<RuntimeKey, FunctionValue<'c>> =
+        HashMap::with_capacity(RuntimeKey::ALL.len());
+    let mut runtime_physical_names: HashMap<RuntimeKey, String> =
+        HashMap::with_capacity(RuntimeKey::ALL.len());
+    for abi in runtime_abi::runtime_abis() {
+        let compatible_extern = program.externs.iter().any(|ext| ext.name == abi.symbol);
+        let function = if compatible_extern {
+            let existing = module
+                .get_function(abi.symbol)
+                .expect("extern declaration was emitted before runtime ABI reuse");
+            if existing.get_type() != abi.function_type(ctx) {
+                return Err(CodegenError::Lowering(format!(
+                    "native extern ABI mismatch:{}",
+                    lowercase_hex(abi.symbol.as_bytes()),
+                )));
+            }
+            existing
+        } else {
+            abi.declare(ctx, module)
+        };
+        if !(rt_lto_skip_guarded && abi.is_rt_lto_guarded()) {
+            abi.apply_attributes(ctx, function);
+        }
+        funcs.insert(abi.key.logical_name().to_string(), function);
+        runtime_funcs.insert(abi.key, function);
+        runtime_physical_names.insert(
+            abi.key,
+            function.get_name().to_string_lossy().into_owned(),
         );
     }
-    // `s.find(needle)` / `s.rfind(needle)` → the byte index (i64) or -1 (→ Option<i64>); same args.
-    for (key, sym) in [("str_find", "align_rt_str_find"), ("str_rfind", "align_rt_str_rfind")] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(
-                sym,
-                ctx.i64_type().fn_type(
-                    &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
-                    false,
-                ),
-                None,
-            ),
-        );
-    }
-    // `s.eq_ignore_ascii_case(other)` → i32 (0/1), the predicate arg shape.
-    funcs.insert(
-        "str_eq_ignore_case".to_string(),
-        module.add_function(
-            "align_rt_str_eq_ignore_case",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    // doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. `str_finder_new(nptr, nlen) -> plan` is
-    // allocator-class (like `builder_new`/`array_builder_new`: `noalias`/`nounwind`/`nofree`, NOT
-    // `willreturn` — a `Box` allocation aborts on OOM). `str_finder_find(plan, hptr, hlen) -> i64`
-    // gets `memory(argmem: read)` + `readonly captures(none)` on both pointers via `rt_contract`
-    // (verified: no CPU-feature detect at find time). `str_finder_free(plan)` is a plain null-safe
-    // deallocator declare (mirrors `builder_free`/`array_builder_free` — free fns take no attrs).
-    let str_finder_new = module.add_function(
-        "align_rt_str_finder_new",
-        ctx.ptr_type(AddressSpace::default()).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
-        None,
-    );
-    mark_alloc_like(ctx, str_finder_new);
-    funcs.insert("str_finder_new".to_string(), str_finder_new);
-    funcs.insert(
-        "str_finder_find".to_string(),
-        module.add_function(
-            "align_rt_str_finder_find",
-            ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "str_finder_free".to_string(),
-        module.add_function("align_rt_str_finder_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // String builder (M5: `template` desugaring).
-    let i64t2 = ctx.i64_type();
-    let builder_new =
-        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None);
-    mark_alloc_like(ctx, builder_new);
-    funcs.insert("builder_new".to_string(), builder_new);
-    funcs.insert(
-        "builder_init_stack".to_string(),
-        module.add_function(
-            "align_rt_builder_init_stack",
-            ptr.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write".to_string(),
-        module.add_function(
-            "align_rt_builder_write",
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_pop_comma".to_string(),
-        module.add_function("align_rt_builder_pop_comma", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "json_encode_struct_array".to_string(),
-        module.add_function(
-            "align_rt_json_encode_struct_array",
-            // (builder, ptr, len, descs, n_descs, esz) -> void
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "json_encode_scalar_array".to_string(),
-        module.add_function(
-            "align_rt_json_encode_scalar_array",
-            // (builder, ptr, len, elem_tag: i32) -> void
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "json_encode_object".to_string(),
-        module.add_function(
-            "align_rt_json_encode_object",
-            // (builder, base, descs, n_descs) -> void
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_int".to_string(),
-        module.add_function(
-            "align_rt_builder_write_int",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_str_int_str".to_string(),
-        module.add_function(
-            "align_rt_builder_write_str_int_str",
-            ctx.void_type().fn_type(
-                &[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_bool".to_string(),
-        module.add_function(
-            "align_rt_builder_write_bool",
-            ctx.void_type().fn_type(&[ptr.into(), ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_char".to_string(),
-        module.add_function(
-            "align_rt_builder_write_char",
-            ctx.void_type().fn_type(&[ptr.into(), ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_f32".to_string(),
-        module.add_function(
-            "align_rt_builder_write_f32",
-            ctx.void_type().fn_type(&[ptr.into(), ctx.f32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_f64".to_string(),
-        module.add_function(
-            "align_rt_builder_write_f64",
-            ctx.void_type().fn_type(&[ptr.into(), ctx.f64_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_write_json_str".to_string(),
-        module.add_function(
-            "align_rt_builder_write_json_str",
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode(input, fields, n, out, out_size, phf, phf_len, phf_seed) -> i32 status
-        // (0 = ok). The trailing 3 args are the compile-time perfect-hash field table (`phf_len = 0`
-        // → linear scan).
-        "json_decode".to_string(),
-        module.add_function(
-            "align_rt_json_decode",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode into a shape-directed union (input, input_len, union_desc, out) -> i32 status
-        // (JSON completeness J1b): parse one JSON value, select the variant by shape class, write the
-        // payload + tag into `out`.
-        "json_decode_union".to_string(),
-        module.add_function(
-            "align_rt_json_decode_union",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.encode of a union value (builder, base, union_desc) -> void (JSON completeness J1b):
-        // write the live variant's payload bare into the builder.
-        "json_encode_union".to_string(),
-        module.add_function(
-            "align_rt_json_encode_union",
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode into array (input, input_len, elem_tag, out: *{ptr,len}) -> i32 status.
-        "json_decode_array".to_string(),
-        module.add_function(
-            "align_rt_json_decode_array",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ctx.i32_type().into(), ptr.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode into a bare scalar (input, input_len, elem_tag, out: *scalar) -> i32 status (T1b).
-        "json_decode_scalar".to_string(),
-        module.add_function(
-            "align_rt_json_decode_scalar",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ctx.i32_type().into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // ── json.doc (J4) ──────────────────────────────────────────────────────────────────────────
-    funcs.insert(
-        // json.doc(input, input_len, arena, out: *{tape,node}) -> i32 status (0 = ok). Parse into an
-        // arena-backed tape; on malformed input returns 1 (out stays zeroed → Err(Error.Invalid)).
-        "json_doc_parse".to_string(),
-        module.add_function(
-            "align_rt_json_doc_parse",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // d.kind()(tape, node) -> i32 the json.kind tag (6 = Missing). Total.
-        "json_doc_kind".to_string(),
-        module.add_function("align_rt_json_doc_kind", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // d.get(tape, node, key, key_len, out: *{tape,node}) -> void. Writes the child handle (Missing if absent).
-        "json_doc_get".to_string(),
-        module.add_function(
-            "align_rt_json_doc_get",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // d.at(tape, node, index, out: *{tape,node}) -> void. Writes the element handle (Missing if OOB).
-        "json_doc_at".to_string(),
-        module.add_function(
-            "align_rt_json_doc_at",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // d.len(tape, node) -> i64 the member/element count (0 on a non-container / Missing).
-        "json_doc_len".to_string(),
-        module.add_function("align_rt_json_doc_len", i64t2.fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // d.key(tape, node, index, out: *{ptr,len}) -> i32 present flag. Writes the index-th object key view.
-        "json_doc_key".to_string(),
-        module.add_function(
-            "align_rt_json_doc_key",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // d.elems(tape, node, arena, out: *{ptr,len}) -> void. Materializes the level's handle buffer.
-        "json_doc_elems".to_string(),
-        module.add_function(
-            "align_rt_json_doc_elems",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // The three leaf accessors share the (tape, node, out) -> i32 present-flag shape; the out slot's
-    // type (str view / i64 / f64 / u8) differs but is an opaque `ptr` at the ABI.
-    for (name, sym) in [
-        ("json_doc_as_str", "align_rt_json_doc_as_str"),
-        ("json_doc_as_i64", "align_rt_json_doc_as_i64"),
-        ("json_doc_as_f64", "align_rt_json_doc_as_f64"),
-        ("json_doc_as_bool", "align_rt_json_doc_as_bool"),
-    ] {
-        funcs.insert(
-            name.to_string(),
-            module.add_function(sym, ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-        );
-    }
-    funcs.insert(
-        // fs.read_file (path_ptr, path_len, out: *{ptr,len}) -> i32 status (std.fs).
-        "fs_read_file".to_string(),
-        module.add_function(
-            "align_rt_fs_read_file",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // fs.write_file (path_ptr, path_len, data_ptr, data_len) -> i32 errno-status.
-        "fs_write_file".to_string(),
-        module.add_function(
-            "align_rt_fs_write_file",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // fs.write_file (path_ptr, path_len, b: *Builder) -> i32 errno-status.
-        "fs_write_file_builder".to_string(),
-        module.add_function(
-            "align_rt_fs_write_file_builder",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // fs.exists (path_ptr, path_len) -> i32 (1/0; every error folds to 0).
-        "fs_exists".to_string(),
-        module.add_function("align_rt_fs_exists", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // fs.remove (path_ptr, path_len) -> i32 errno-status.
-        "fs_remove".to_string(),
-        module.add_function("align_rt_fs_remove", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // fs.read_dir (path_ptr, path_len, out: *{ptr,len}) -> i32 errno-status (owned array<string>).
-        "fs_read_dir".to_string(),
-        module.add_function("align_rt_fs_read_dir", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // dns.resolve (host_ptr, host_len, out: *{ptr,len}) -> i32 status (owned array<string>).
-        "dns_resolve".to_string(),
-        module.add_function("align_rt_dns_resolve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // tcp.connect (host_ptr, host_len, port: i64, timeout_ns: i64, out: **TcpConn) -> i32 status
-        // (owned conn). `timeout_ns == 0` = the blocking connect; positive = a deadline-bounded connect.
-        "tcp_connect".to_string(),
-        module.add_function(
-            "align_rt_tcp_connect",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // c.read_timeout_ns(ns: i64) (c: *TcpConn) -> void; setsockopt(SO_RCVTIMEO) on the conn's fd.
-        "tcp_read_timeout".to_string(),
-        module.add_function("align_rt_tcp_read_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // c.write_timeout_ns(ns: i64) (c: *TcpConn) -> void; setsockopt(SO_SNDTIMEO) on the conn's fd.
-        "tcp_write_timeout".to_string(),
-        module.add_function("align_rt_tcp_write_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // drop(c) (c: *TcpConn) -> void; close its fd.
-        "tcp_conn_free".to_string(),
-        module.add_function("align_rt_tcp_conn_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // c.reader() (c: *TcpConn) -> *Reader (borrowed over the conn's fd, owns_fd:false).
-        "tcp_conn_reader".to_string(),
-        module.add_function("align_rt_tcp_conn_reader", ptr.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // c.writer() (c: *TcpConn) -> *Writer (borrowed over the conn's fd, owns_fd:false).
-        "tcp_conn_writer".to_string(),
-        module.add_function("align_rt_tcp_conn_writer", ptr.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // tcp.listen (host_ptr, host_len, port: i64, out: **TcpListener) -> i32 status (owned listener).
-        "tcp_listen".to_string(),
-        module.add_function("align_rt_tcp_listen", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(l) (l: *TcpListener) -> void; close its fd.
-        "tcp_listener_free".to_string(),
-        module.add_function("align_rt_tcp_listener_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // l.accept() (l: *TcpListener, out: **TcpConn) -> i32 status (owned accepted conn).
-        "tcp_accept".to_string(),
-        module.add_function("align_rt_tcp_accept", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // udp.bind (host_ptr, host_len: i64, port: i64, out: **UdpSocket) -> i32 status (owned socket).
-        "udp_bind".to_string(),
-        module.add_function("align_rt_udp_bind", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(u) (u: *UdpSocket) -> void; close its fd.
-        "udp_socket_free".to_string(),
-        module.add_function("align_rt_udp_socket_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // u.send_to (u: *UdpSocket, data_ptr, data_len: i64, host_ptr, host_len: i64, port: i64)
-        // -> i64 (bytes sent, or -(status) on error).
-        "udp_send_to".to_string(),
-        module.add_function("align_rt_udp_send_to", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // u.recv_from (u: *UdpSocket, buf: *Buffer) -> i64 (bytes received, or -(status) on error).
-        "udp_recv_from".to_string(),
-        module.add_function("align_rt_udp_recv_from", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // process.spawn (cmd_ptr, cmd_len: i64, args_ptr: *AlignStr, args_len: i64, out: **Child)
-        // -> i32 status (owned child; 0 = ok). fork+execvp; a failed exec `_exit(127)`s in the child.
-        "process_spawn".to_string(),
-        module.add_function("align_rt_process_spawn", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // ch.wait (ch: *Child) -> i64 (exit code >= 0: WEXITSTATUS / 128+sig, or -(status) on error).
-        "child_wait".to_string(),
-        module.add_function("align_rt_child_wait", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(ch) (ch: *Child) -> void; reap via blocking waitpid if not yet waited (no zombie).
-        "child_free".to_string(),
-        module.add_function("align_rt_child_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // ch.kill (ch: *Child, sig: i64) -> i32 status (0 = ok; AL_INVALID for a bad sig / reaped child,
-        // else the mapped errno — EPERM/ESRCH). libc kill(pid, sig); sig 0 = liveness probe.
-        "child_kill".to_string(),
-        module.add_function("align_rt_child_kill", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // process.exec (cmd_ptr, cmd_len: i64, args_ptr: *AlignStr, args_len: i64) -> i32 status.
-        // execvp in the CURRENT process: on success it replaces the image and never returns, so this
-        // returns only on failure (the mapped errno; AL_INVALID for a bad cmd/argv).
-        "process_exec".to_string(),
-        module.add_function("align_rt_process_exec", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    // `std.process` (Slice 4) — `process.command(...).run()` capture. `command_new(cmd{ptr,len},
-    // args{ptr,len}) -> *Command` (owned builder; aborts on a bad argv); `command_cwd(c, dir{ptr,len})`
-    // sets the working directory in place (void); `command_run(c, out: **RunOutput) -> i32` forks +
-    // captures both streams, writing an owned `run_output` handle to `out`; `run_output_code(o) -> i64`;
-    // `run_output_stdout/stderr(o) -> {ptr,len}` str views; the two `*_free` drop the handles.
-    funcs.insert(
-        "command_new".to_string(),
-        module.add_function("align_rt_command_new", ptr.fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "command_cwd".to_string(),
-        module.add_function("align_rt_command_cwd", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    // `command_timeout(c, ns: i64)` sets the child run timeout in place (void; aborts on a negative ns).
-    funcs.insert(
-        "command_timeout".to_string(),
-        module.add_function("align_rt_command_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    // `command_env(c, name{ptr,len}, value{ptr,len})` adds/overrides one child env var in place (void;
-    // aborts on an interior NUL / non-UTF-8, or a name containing `=`); `command_env_clear(c)` starts the
-    // child environment empty (void).
-    funcs.insert(
-        "command_env".to_string(),
-        module.add_function("align_rt_command_env", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "command_env_clear".to_string(),
-        module.add_function("align_rt_command_env_clear", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "command_run".to_string(),
-        module.add_function("align_rt_command_run", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "run_output_code".to_string(),
-        module.add_function("align_rt_run_output_code", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "run_output_stdout".to_string(),
-        module.add_function("align_rt_run_output_stdout", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "run_output_stderr".to_string(),
-        module.add_function("align_rt_run_output_stderr", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "command_free".to_string(),
-        module.add_function("align_rt_command_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "run_output_free".to_string(),
-        module.add_function("align_rt_run_output_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
-        "fs_read_file_view".to_string(),
-        module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // fs.read_bytes_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
-        "fs_read_bytes_view".to_string(),
-        module.add_function("align_rt_fs_read_bytes_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(array<string>) (ptr, len) -> void; deep free (each element's buffer, then the header).
-        "free_string_array".to_string(),
-        module.add_function("align_rt_free_string_array", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    // std.io / std.fs — reader / writer (own an fd) + buffer (owned bytes).
-    funcs.insert(
-        // fs.open (path_ptr, path_len, out: **Reader) -> i32 errno-status.
-        "io_reader_open".to_string(),
-        module.add_function("align_rt_io_reader_open", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // io.stdin () -> *Reader (opaque handle).
-        "io_reader_stdin".to_string(),
-        module.add_function("align_rt_io_reader_stdin", ptr.fn_type(&[], false), None),
-    );
-    funcs.insert(
-        // r.read(b) (r: *Reader, b: *Buffer) -> i64 (count, or -(status)).
-        "io_reader_read".to_string(),
-        module.add_function("align_rt_io_reader_read", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // r.buffered() (r: *Reader) -> *Reader (same handle, now buffered).
-        "io_reader_buffered".to_string(),
-        module.add_function("align_rt_io_reader_buffered", ptr.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // r.read_line(b) (r: *Reader, b: *Buffer) -> i64 (consumed incl. terminator, 0 = EOF, or -(status)).
-        "io_reader_read_line".to_string(),
-        module.add_function("align_rt_io_reader_read_line", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // bytes.as_str() (ptr, len, out: *{ptr,len}) -> i32 errno-status (AL_INVALID on bad UTF-8).
-        "bytes_as_str".to_string(),
-        module.add_function("align_rt_bytes_as_str", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(r) (r: *Reader) -> void; close if owned.
-        "io_reader_free".to_string(),
-        module.add_function("align_rt_io_reader_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // fs.create (path_ptr, path_len, out: **Writer) -> i32 errno-status.
-        "io_writer_create".to_string(),
-        module.add_function("align_rt_io_writer_create", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // io.stdout / io.stderr / .buffered() (fd: i32, buffered: i32) -> *Writer (opaque handle).
-        "io_writer_std".to_string(),
-        module.add_function("align_rt_io_writer_std", ptr.fn_type(&[ctx.i32_type().into(), ctx.i32_type().into()], false), None),
-    );
-    funcs.insert(
-        // w.write(s) (w: *Writer, ptr, len) -> i32 errno-status.
-        "io_writer_write".to_string(),
-        module.add_function("align_rt_io_writer_write", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // w.write(builder) (w: *Writer, b: *Builder) -> i32 errno-status.
-        "io_writer_write_builder".to_string(),
-        module.add_function("align_rt_io_writer_write_builder", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // w.flush() (w: *Writer) -> i32 errno-status.
-        "io_writer_flush".to_string(),
-        module.add_function("align_rt_io_writer_flush", ctx.i32_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(w) (w: *Writer) -> void; final flush + close if owned.
-        "io_writer_free".to_string(),
-        module.add_function("align_rt_io_writer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // io.copy(r, w) (r: *Reader, w: *Writer) -> i64 (bytes transferred, or -(status)).
-        "io_copy".to_string(),
-        module.add_function("align_rt_io_copy", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // fs.create_rw (path_ptr, path_len, out: **RwFile) -> i32 errno-status.
-        "io_file_create".to_string(),
-        module.add_function("align_rt_io_file_create", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // fs.open_rw (path_ptr, path_len, out: **RwFile) -> i32 errno-status.
-        "io_file_open".to_string(),
-        module.add_function("align_rt_io_file_open", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // f.pread(b, off) (f: *RwFile, b: *Buffer, off: i64) -> i64 (count, or -(status)).
-        "io_file_pread".to_string(),
-        module.add_function("align_rt_io_file_pread", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // f.pwrite(data, off) (f: *RwFile, ptr, len, off: i64) -> i64 (full count, or -(status)).
-        "io_file_pwrite".to_string(),
-        module.add_function("align_rt_io_file_pwrite", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // f.len() (f: *RwFile) -> i64 (length, or -(status)).
-        "io_file_len".to_string(),
-        module.add_function("align_rt_io_file_len", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(f) (f: *RwFile) -> void; close the fd.
-        "io_file_free".to_string(),
-        module.add_function("align_rt_io_file_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // buffer(cap) (cap: i64) -> *Buffer (opaque handle).
-        "buffer_new".to_string(),
-        module.add_function("align_rt_buffer_new", ptr.fn_type(&[i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // b.bytes() (b: *Buffer, out: *{ptr,len}) -> void; a slice<u8> view.
-        "buffer_bytes".to_string(),
-        module.add_function("align_rt_buffer_bytes", ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // b.len() (b: *Buffer) -> i64.
-        "buffer_len".to_string(),
-        module.add_function("align_rt_buffer_len", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // drop(b) (b: *Buffer) -> void; free.
-        "buffer_free".to_string(),
-        module.add_function("align_rt_buffer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        // b.put_*(v) (b: *Buffer, bits: i64, width: i64, be: i32) -> void; append `width` bytes.
-        "buffer_put".to_string(),
-        module.add_function(
-            "align_rt_buffer_put",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ctx.i32_type().into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // b.append(data) (b: *Buffer, ptr: *u8, len: i64) -> void; copy-append a byte blob.
-        "buffer_append".to_string(),
-        module.add_function("align_rt_buffer_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    // array_builder<T> (M12 A6): new/push/push_str/append/build + the two Drop frees.
-    // array_builder(elem_size: i64) -> *ArrayBuilder (opaque handle).
-    let array_builder_new =
-        module.add_function("align_rt_array_builder_new", ptr.fn_type(&[i64t2.into()], false), None);
-    mark_alloc_like(ctx, array_builder_new);
-    funcs.insert("array_builder_new".to_string(), array_builder_new);
-    funcs.insert(
-        "array_builder_init_stack".to_string(),
-        module.add_function(
-            "align_rt_array_builder_init_stack",
-            ptr.fn_type(&[ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // b.push(v) (b: *ArrayBuilder, bits: i64) -> void; append one scalar element.
-        "array_builder_push".to_string(),
-        module.add_function("align_rt_array_builder_push", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // b.push(s) (b: *ArrayBuilder, ptr: *u8, len: i64) -> void; append one moved-in string.
-        "array_builder_push_str".to_string(),
-        module.add_function("align_rt_array_builder_push_str", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // b.append(xs) (b: *ArrayBuilder, src: *u8, count: i64) -> void; bulk-append scalar elements.
-        "array_builder_append".to_string(),
-        module.add_function("align_rt_array_builder_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // b.build() (b: *ArrayBuilder) -> {ptr,len}; freeze into an owned array<T> (zero-copy).
-        "array_builder_build".to_string(),
-        module.add_function("align_rt_array_builder_build", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "array_builder_build_stack".to_string(),
-        module.add_function(
-            "align_rt_array_builder_build_stack",
-            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // drop(b) scalar element (b: *ArrayBuilder) -> void; free storage + header.
-        "array_builder_free".to_string(),
-        module.add_function("align_rt_array_builder_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "array_builder_free_stack".to_string(),
-        module.add_function(
-            "align_rt_array_builder_free_stack",
-            ctx.void_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // drop(b) string element (b: *ArrayBuilder) -> void; deep-free each string, then storage.
-        "array_builder_free_strings".to_string(),
-        module.add_function("align_rt_array_builder_free_strings", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "array_builder_free_strings_stack".to_string(),
-        module.add_function(
-            "align_rt_array_builder_free_strings_stack",
-            ctx.void_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
-        // phf, phf_len, phf_seed) -> i32 status (MMv2 slice 8d; trailing 3 = perfect-hash table).
-        "json_decode_struct_array".to_string(),
-        module.add_function(
-            "align_rt_json_decode_struct_array",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.scan one row (J5): (input, input_len, cursor: *i64, fields, n, out_row: *u8, out_size,
-        // phf, phf_len, phf_seed) -> i32 status (0 = row / 1 = done / 2 = malformed). Reuses the
-        // struct decode descriptor; `cursor` is the mutable byte offset into the input.
-        "json_scan_next".to_string(),
-        module.add_function(
-            "align_rt_json_scan_next",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        // json.decode directly into soa<Struct> (input, input_len, fields, n, arena, out: *{ptr,len},
-        // phf, phf_len, phf_seed) -> i32 status. Direct-fill rail: the runtime counts rows, arena-
-        // allocates the columns, and fills them (no AoS / transpose). `arena` replaces `elem_size`.
-        "json_decode_soa".to_string(),
-        module.add_function(
-            "align_rt_json_decode_soa",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), ptr.into(), i64t2.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_finish".to_string(),
-        module.add_function(
-            "align_rt_builder_finish",
-            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_finish_stack".to_string(),
-        module.add_function(
-            "align_rt_builder_finish_stack",
-            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    // group_by(.key).{sum,min,max}(.value): (keys, vals, len, out_keys, out_vals, cap) -> group count.
-    let group_vty = ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false);
-    for (key, sym) in [
-        ("group_sum_i64", "align_rt_group_sum_i64"),
-        ("group_min_i64", "align_rt_group_min_i64"),
-        ("group_max_i64", "align_rt_group_max_i64"),
-    ] {
-        funcs.insert(key.to_string(), module.add_function(sym, group_vty, None));
-    }
-    funcs.insert(
-        // group_by(.key).count(): (keys, len, out_keys, out_vals, cap) -> group count (no value col).
-        "group_count_i64".to_string(),
-        module.add_function(
-            "align_rt_group_count_i64",
-            ctx.i64_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    // group_by(.str_key).{sum,min,max}(.i64_value) / .count() over an AoS array<Struct> — the
-    // dictionary-id rail: (base, n, stride, key_off, val_off, out_keys, out_vals, cap) -> group count.
-    let group_str_ty = ctx.i64_type().fn_type(
-        &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
-        false,
-    );
-    for (key, sym) in [
-        ("group_sum_str", "align_rt_group_sum_str"),
-        ("group_min_str", "align_rt_group_min_str"),
-        ("group_max_str", "align_rt_group_max_str"),
-        ("group_count_str", "align_rt_group_count_str"),
-    ] {
-        funcs.insert(key.to_string(), module.add_function(sym, group_str_ty, None));
-    }
-    // group_by(.str_key).{sum,min,max}(.i64_value) / .count() over a soa<Struct> with a str key
-    // column — the two-contiguous-column form: (key_col, val_col, n, out_keys, out_vals, cap) ->
-    // count. Same 6-arg shape as the i64 `group_vty`; all four ops share it (count ignores val_col).
-    for (key, sym) in [
-        ("group_sum_str_cols", "align_rt_group_sum_str_cols"),
-        ("group_min_str_cols", "align_rt_group_min_str_cols"),
-        ("group_max_str_cols", "align_rt_group_max_str_cols"),
-        ("group_count_str_cols", "align_rt_group_count_str_cols"),
-    ] {
-        funcs.insert(key.to_string(), module.add_function(sym, group_vty, None));
-    }
-    // Fused multi-aggregate str group-by: (base, n, stride, key_off, specs, k, out_keys, cap) -> count.
-    // `specs` is a `[k x {i64 val_off, i64 op, ptr out_vals}]` table built at the call site.
-    funcs.insert(
-        "group_multi_str".to_string(),
-        module.add_function(
-            "align_rt_group_multi_str",
-            ctx.i64_type().fn_type(
-                &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    // A2 dictionary reuse rail. `dict_encode`: (base, n, stride, key_off, out_ids, out_dict, cap) ->
-    // dict size. `gather_i64`: (base, n, stride, off, out) -> (). `dict_lookup`: (ids, n, dict,
-    // dict_len, out) -> ().
-    funcs.insert(
-        "dict_encode_str".to_string(),
-        module.add_function(
-            "align_rt_dict_encode_str",
-            ctx.i64_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "gather_i64".to_string(),
-        module.add_function(
-            "align_rt_gather_i64",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "dict_lookup".to_string(),
-        module.add_function(
-            "align_rt_dict_lookup",
-            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
-    funcs.insert(
-        "str_clone".to_string(),
-        module.add_function(
-            "align_rt_str_clone",
-            slice_struct_type(ctx).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
-            None,
-        ),
-    );
-    // `core.hash` — wyhash over a byte view `{ptr,len}`. `hash64` → u64; `hash128` → {u64,u64}
-    // returned by value (matching the `(u64,u64)` tuple struct, like `str_clone`'s `{ptr,len}`).
-    funcs.insert(
-        "hash64".to_string(),
-        module.add_function(
-            "align_rt_hash64",
-            i64t.fn_type(&[ptr.into(), i64t.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "hash128".to_string(),
-        module.add_function(
-            "align_rt_hash128",
-            ctx.struct_type(&[i64t.into(), i64t.into()], false).fn_type(&[ptr.into(), i64t.into()], false),
-            None,
-        ),
-    );
-    // `std.encoding` — encode (byte view `{ptr,len}`) -> owned `string` `{ptr,len}`.
-    for (key, sym) in [
-        ("base64_encode", "align_rt_base64_encode"),
-        ("base64url_encode", "align_rt_base64url_encode"),
-        ("hex_encode", "align_rt_hex_encode"),
-        ("percent_encode", "align_rt_percent_encode"),
-        ("form_encode", "align_rt_form_encode"),
-        ("html_escape", "align_rt_html_escape"),
-    ] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(sym, slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
-        );
-    }
-    // `std.encoding` — decode (`str` view `{ptr,len}`, out: *handle) -> i32 status (0 ok / AL_INVALID).
-    for (key, sym) in [
-        ("base64_decode", "align_rt_base64_decode"),
-        ("base64url_decode", "align_rt_base64url_decode"),
-        ("hex_decode", "align_rt_hex_decode"),
-        ("percent_decode", "align_rt_percent_decode"),
-        ("form_decode", "align_rt_form_decode"),
-    ] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(sym, ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-        );
-    }
-    funcs.insert(
-        // encoding.utf8_valid (ptr, len) -> i32 (1 valid / 0 invalid).
-        "utf8_valid".to_string(),
-        module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    // `std.crypto` (M11 Slice 1). constant_time_equal (a_ptr, a_len, b_ptr, b_len) -> i32 (1 equal /
-    // 0 not; length is public, the equal-length compare is branchless). random (buf: *Buffer) -> void
-    // (fills the buffer's full capacity from the OS CSPRNG; aborts on failure).
-    funcs.insert(
-        "crypto_ct_equal".to_string(),
-        module.add_function(
-            "align_rt_crypto_ct_equal",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "crypto_random".to_string(),
-        module.add_function("align_rt_crypto_random", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `std.crypto` (M11 Slice 2). sha256 / sha512 (data view `{ptr,len}`) -> a fresh owned `array<u8>`
-    // `{ptr,len}` (32 / 64 bytes; the digest, returned by value like `rng_sample`; the bound local
-    // `Drop`-frees it). Both wrap libcrypto's `EVP_Q_digest`; an engine failure aborts in the runtime.
-    funcs.insert(
-        "crypto_sha256".to_string(),
-        module.add_function("align_rt_crypto_sha256", slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "crypto_sha512".to_string(),
-        module.add_function("align_rt_crypto_sha512", slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    // `std.crypto` (M11 Slice 3). hmac_sha256 (key view + data view) -> a fresh owned `array<u8>`
-    // `{ptr,len}` (32-byte tag, returned by value like the digests). hkdf_sha256 (salt/ikm/info views
-    // + i64 len, out: *handle) returns an i32 status, writing an owned `buffer` handle into `out`
-    // (the `std.compress` status shape).
-    funcs.insert(
-        "crypto_hmac_sha256".to_string(),
-        module.add_function(
-            "align_rt_crypto_hmac_sha256",
-            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "crypto_hkdf_sha256".to_string(),
-        module.add_function(
-            "align_rt_crypto_hkdf_sha256",
-            ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    // `std.crypto` (M11 Slice 4) — AEAD. Each of the four `{aes_gcm,chacha20_poly1305}_{seal,open}`
-    // entry points takes four byte views (key/nonce/input/aad, each `{ptr,len}`) + an out handle slot,
-    // returns an i32 status, and writes an owned `buffer` handle (ciphertext||tag on seal, plaintext on
-    // open) into `out` (the `std.compress`/hkdf status shape).
-    for name in ["crypto_aes_gcm_seal", "crypto_aes_gcm_open", "crypto_chacha20_poly1305_seal", "crypto_chacha20_poly1305_open"] {
-        funcs.insert(
-            name.to_string(),
-            module.add_function(
-                &format!("align_rt_{name}"),
-                ctx.i32_type().fn_type(
-                    &[
-                        ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(),
-                        ptr.into(),
-                    ],
-                    false,
-                ),
-                None,
-            ),
-        );
-    }
-    // `std.crypto` (M11 Slice 5) — argon2id. `argon2id` takes two byte views (password/salt, each
-    // `{ptr,len}`) + four i64 tuning knobs (m_cost/t_cost/parallelism/len) + an out handle slot,
-    // returns an i32 status, and writes an owned `buffer` handle (the derived tag) into `out` (the
-    // `std.compress`/hkdf status shape).
-    funcs.insert(
-        "crypto_argon2id".to_string(),
-        module.add_function(
-            "align_rt_crypto_argon2id",
-            ctx.i32_type().fn_type(
-                &[
-                    ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(),
-                    i64t2.into(), ptr.into(),
-                ],
-                false,
-            ),
-            None,
-        ),
-    );
-    // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
-    // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
-    // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
-    // the same ABI shape.
-    funcs.insert(
-        "compress_gzip_compress".to_string(),
-        module.add_function(
-            "align_rt_compress_gzip_compress",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "compress_gzip_decompress".to_string(),
-        module.add_function(
-            "align_rt_compress_gzip_decompress",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "compress_zstd_compress".to_string(),
-        module.add_function(
-            "align_rt_compress_zstd_compress",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "compress_zstd_decompress".to_string(),
-        module.add_function(
-            "align_rt_compress_zstd_decompress",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // `std.rand` — the `rng` state is always passed by pointer to its `[4 x i64]` slot (mutated in
-    // place). `seed_with(out, s)` / `seed_os(out)` initialize it; `next`/`range` advance + return an
-    // i64; `shuffle`/`sample` take the slice `{ptr,len}` split into a raw pointer + length + element
-    // size. `sample` returns a fresh owned `array<T>` `{ptr,len}`.
-    funcs.insert(
-        "rng_seed_with".to_string(),
-        module.add_function("align_rt_rng_seed_with", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "rng_seed_os".to_string(),
-        module.add_function("align_rt_rng_seed_os", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "rng_next".to_string(),
-        module.add_function("align_rt_rng_next", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "rng_range".to_string(),
-        module.add_function("align_rt_rng_range", i64t2.fn_type(&[ptr.into(), i64t2.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "rng_shuffle".to_string(),
-        module.add_function("align_rt_rng_shuffle", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "rng_sample".to_string(),
-        module.add_function(
-            "align_rt_rng_sample",
-            slice_struct_type(ctx).fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    // `std.cli` — the command / parsed handles are opaque pointers. `command(name)` allocates one;
-    // `flag_*` register into it (void); `parse(cmd, argv{ptr,len}, out)` -> i32 status; `get_*` read
-    // a flag (i32/i64/`{ptr,len}` view); `usage` renders an owned `string` `{ptr,len}`; the two
-    // `*_free` symbols drop the handles.
-    funcs.insert(
-        "cli_command".to_string(),
-        module.add_function("align_rt_cli_command_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_flag_bool".to_string(),
-        module.add_function("align_rt_cli_flag_bool", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_flag_str".to_string(),
-        module.add_function("align_rt_cli_flag_str", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_flag_i64".to_string(),
-        module.add_function("align_rt_cli_flag_i64", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_parse".to_string(),
-        module.add_function("align_rt_cli_parse", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "cli_get_bool".to_string(),
-        module.add_function("align_rt_cli_get_bool", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_get_i64".to_string(),
-        module.add_function("align_rt_cli_get_i64", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_get_str".to_string(),
-        module.add_function("align_rt_cli_get_str", slice_struct_type(ctx).fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "cli_usage".to_string(),
-        module.add_function("align_rt_cli_usage", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "cli_command_free".to_string(),
-        module.add_function("align_rt_cli_command_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "cli_parsed_free".to_string(),
-        module.add_function("align_rt_cli_parsed_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `std.http` (Slice 1) — the request / response handles are opaque pointers. `request(method,url)`
-    // allocates a request; `header`/`body` mutate it (void); `parse(data{ptr,len}, out)` -> i32 status
-    // writes a response handle; `resp_status` -> i64; `resp_header(resp, name{ptr,len}, out)` -> i32
-    // present-flag writes a `str` view; `resp_body` -> a `{ptr,len}` view; the two `*_free` drop the
-    // handles. (`align_rt_http_serialize` is a runtime-only codec — Slice 2's client calls it — so it
-    // is not declared here.)
-    funcs.insert(
-        "http_request".to_string(),
-        module.add_function("align_rt_http_request_new", ptr.fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_header".to_string(),
-        module.add_function("align_rt_http_header", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_body".to_string(),
-        module.add_function("align_rt_http_body", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    // `http_timeout(r, ns: i64)` sets the request's per-request I/O timeout in place (void; aborts on a
-    // negative ns). `http_client_timeout(c, ns: i64)` sets the client's default I/O timeout in place.
-    funcs.insert(
-        "http_timeout".to_string(),
-        module.add_function("align_rt_http_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_parse".to_string(),
-        module.add_function("align_rt_http_parse", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_resp_status".to_string(),
-        module.add_function("align_rt_http_resp_status", i64t2.fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_resp_header".to_string(),
-        module.add_function("align_rt_http_resp_header", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_resp_body".to_string(),
-        module.add_function("align_rt_http_resp_body", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_request_free".to_string(),
-        module.add_function("align_rt_http_request_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_resp_free".to_string(),
-        module.add_function("align_rt_http_resp_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `std.http` (Slice 2) — the client is an opaque pointer. `client()` allocates one (no args);
-    // `get(client, url{ptr,len}, out)` / `post(client, url{ptr,len}, body{ptr,len}, out)` /
-    // `request(client, req, out)` each -> i32 status, writing an `http response` handle to `out`;
-    // `client_free` drops the handle (and, from Slice 3, closes pooled conns).
-    funcs.insert(
-        "http_client_new".to_string(),
-        module.add_function("align_rt_http_client_new", ptr.fn_type(&[], false), None),
-    );
-    funcs.insert(
-        "http_client_timeout".to_string(),
-        module.add_function("align_rt_http_client_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_client_get".to_string(),
-        module.add_function("align_rt_http_client_get", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_client_post".to_string(),
-        module.add_function(
-            "align_rt_http_client_post",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "http_client_request".to_string(),
-        module.add_function("align_rt_http_client_request", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // cl.get_many (client, urls_ptr, urls_len, max_concurrency, out: *{ptr,len}) -> i32 status.
-        // Writes an owned `array<response>` `{ptr,len}` header (buffer of response handles) into `out`.
-        "http_get_many".to_string(),
-        module.add_function(
-            "align_rt_http_get_many",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // drop(array<response>) (ptr, len) -> void; deep free (each response handle, then the header).
-        "free_response_array".to_string(),
-        module.add_function("align_rt_free_response_array", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_client_free".to_string(),
-        module.add_function("align_rt_http_client_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `std.http` (Slice 4) — the server primitive. All handles are opaque pointers. `serve(host{ptr,
-    // len}, port, out)` / `accept(server, out)` -> i32 status, writing an owned handle to `out`;
-    // `respond(ctx, rb)` -> i32 status (consumes both). The ctx getters return a `{ptr,len}` view
-    // (method/path/body) or write one to `out` + return an i32 present flag (header). `response(status)`
-    // allocates a builder; `rb_header`/`rb_body` mutate it; the three `*_free` fns drop the handles.
-    funcs.insert(
-        "http_serve".to_string(),
-        module.add_function("align_rt_http_serve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // The `SO_REUSEPORT` prefork sibling (http.md item 9 ①) — identical ABI to `http_serve`.
-        "http_serve_shared".to_string(),
-        module.add_function("align_rt_http_serve_shared", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_server_free".to_string(),
-        module.add_function("align_rt_http_server_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `std.regex` — opaque compiled handle. `compile(pattern, out)` returns status;
-    // `is_match(handle, text)` returns an i32 flag; `find(handle, text, start, out_match)` returns
-    // an i32 flag and writes the two-i64 builtin `regex_match`; `free` drops the compiled plan.
-    funcs.insert(
-        "regex_compile".to_string(),
-        module.add_function(
-            "align_rt_regex_compile",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_is_match".to_string(),
-        module.add_function(
-            "align_rt_regex_is_match",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_find".to_string(),
-        module.add_function(
-            "align_rt_regex_find",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // `find_all(handle, text, out)` / `split(handle, text, out)` materialize an owned
-    // `array<regex_match>` (`{ptr,len}`) into `out` and return i32 status (always 0).
-    funcs.insert(
-        "regex_find_all".to_string(),
-        module.add_function(
-            "align_rt_regex_find_all",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_split".to_string(),
-        module.add_function(
-            "align_rt_regex_split",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    // `replace(handle, text, repl, all)` -> {ptr,len} owned string (by-value AlignStr return).
-    funcs.insert(
-        "regex_replace".to_string(),
-        module.add_function(
-            "align_rt_regex_replace",
-            slice_struct_type(ctx).fn_type(
-                &[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ctx.i32_type().into()],
-                false,
-            ),
-            None,
-        ),
-    );
-    // `captures(handle, text, out) -> i32` present flag (writes a captures handle ptr);
-    // `captures_group(caps, i, out_match) -> i32`; `group_count(handle) -> i64`;
-    // `group_index(handle, name) -> i64` (-1 = none); `captures_free` drops the handle.
-    funcs.insert(
-        "regex_captures".to_string(),
-        module.add_function(
-            "align_rt_regex_captures",
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_captures_group".to_string(),
-        module.add_function(
-            "align_rt_regex_captures_group",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_group_count".to_string(),
-        module.add_function("align_rt_regex_group_count", ctx.i64_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "regex_group_index".to_string(),
-        module.add_function(
-            "align_rt_regex_group_index",
-            ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "regex_captures_free".to_string(),
-        module.add_function("align_rt_regex_captures_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "regex_free".to_string(),
-        module.add_function("align_rt_regex_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_accept".to_string(),
-        module.add_function("align_rt_http_accept", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_ctx_method".to_string(),
-        module.add_function("align_rt_http_ctx_method", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_ctx_path".to_string(),
-        module.add_function("align_rt_http_ctx_path", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_ctx_header".to_string(),
-        module.add_function("align_rt_http_ctx_header", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_ctx_body".to_string(),
-        module.add_function("align_rt_http_ctx_body", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_ctx_free".to_string(),
-        module.add_function("align_rt_http_ctx_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_response_new".to_string(),
-        module.add_function("align_rt_http_response_new", ptr.fn_type(&[i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_rb_header".to_string(),
-        module.add_function("align_rt_http_rb_header", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_rb_body".to_string(),
-        module.add_function("align_rt_http_rb_body", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_response_free".to_string(),
-        module.add_function("align_rt_http_response_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_respond".to_string(),
-        module.add_function("align_rt_http_respond", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    // Streaming response (SSE/chunked): `respond_stream(ctx, rb, out) -> i32` (writes the head + framing,
-    // lifts the fd into an owned `http_stream` at `out`); `stream_send(s, ptr, len) -> i32`;
-    // `stream_finish(s) -> i32` (consumes `s`); `stream_free(s)` (Drop: close-only).
-    funcs.insert(
-        "http_respond_stream".to_string(),
-        module.add_function("align_rt_http_respond_stream", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_stream_send".to_string(),
-        module.add_function("align_rt_http_stream_send", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_stream_send_event".to_string(),
-        module.add_function("align_rt_http_stream_send_event", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        "http_stream_finish".to_string(),
-        module.add_function("align_rt_http_stream_finish", ctx.i32_type().fn_type(&[ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_stream_reject".to_string(),
-        module.add_function("align_rt_http_stream_reject", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        "http_stream_free".to_string(),
-        module.add_function("align_rt_http_stream_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
-    );
-    // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
-    for (key, sym) in [
-        ("str_trim", "align_rt_str_trim"),
-        ("str_trim_start", "align_rt_str_trim_start"),
-        ("str_trim_end", "align_rt_str_trim_end"),
-    ] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(
-                sym,
-                slice_struct_type(ctx).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
-                None,
-            ),
-        );
-    }
-    // `std.path` — `base`/`dir`/`ext(p)` return a borrowed sub-`str` `{ptr,len}` of `p`; `normalize(p)`
-    // returns a freshly-allocated owned `string` `{ptr,len}`. Each is (ptr, len) -> {ptr,len}.
-    for (key, sym) in [
-        ("path_base", "align_rt_path_base"),
-        ("path_dir", "align_rt_path_dir"),
-        ("path_ext", "align_rt_path_ext"),
-        ("path_normalize", "align_rt_path_normalize"),
-    ] {
-        funcs.insert(
-            key.to_string(),
-            module.add_function(sym, slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
-        );
-    }
-    funcs.insert(
-        // path.join (a_ptr, a_len, b_ptr, b_len) -> {ptr,len} owned string.
-        "path_join".to_string(),
-        module.add_function(
-            "align_rt_path_join",
-            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        // env.get (name_ptr, name_len, out: *{ptr,len}) -> i32 present flag (1/0).
-        "env_get".to_string(),
-        module.add_function("align_rt_env_get", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
-    );
-    funcs.insert(
-        // env.set (name_ptr, name_len, val_ptr, val_len) -> i32 errno-status.
-        "env_set".to_string(),
-        module.add_function("align_rt_env_set", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
-    );
-    funcs.insert(
-        // time.now () -> i64 (UNIX-epoch ns, CLOCK_REALTIME).
-        "time_now".to_string(),
-        module.add_function("align_rt_time_now", i64t2.fn_type(&[], false), None),
-    );
-    funcs.insert(
-        // time.instant () -> i64 (monotonic ns, CLOCK_MONOTONIC).
-        "time_instant".to_string(),
-        module.add_function("align_rt_time_instant", i64t2.fn_type(&[], false), None),
-    );
-    funcs.insert(
-        // process.cpu_count () -> i64 (available parallelism, >= 1).
-        "process_cpu_count".to_string(),
-        module.add_function("align_rt_process_cpu_count", i64t2.fn_type(&[], false), None),
-    );
-    funcs.insert(
-        // time.sleep (ns: i64) -> void.
-        "time_sleep".to_string(),
-        module.add_function("align_rt_time_sleep", ctx.void_type().fn_type(&[i64t2.into()], false), None),
-    );
-    // Surface `builder` (MMv2 slice 7c): `to_string()` finishes into an owned `string`; `free`
-    // drops an unfinished builder at scope exit.
-    funcs.insert(
-        "builder_into_string".to_string(),
-        module.add_function(
-            "align_rt_builder_into_string",
-            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_into_string_stack".to_string(),
-        module.add_function(
-            "align_rt_builder_into_string_stack",
-            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_free".to_string(),
-        module.add_function(
-            "align_rt_builder_free",
-            ctx.void_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    funcs.insert(
-        "builder_free_stack".to_string(),
-        module.add_function(
-            "align_rt_builder_free_stack",
-            ctx.void_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    // M13 Slice 5A — every `align_rt_*` declare now exists; hand-annotate the audited subset whose
-    // contract is provable from the runtime body (LLVM can't see those Rust bodies and never inlines
-    // the calls, so it infers nothing without this). Fail-safe: an unlisted symbol gets no attribute.
-    // `rt_lto_skip_guarded` (the `--rt-lto` path) additionally withholds curation from the guarded
-    // set — they are about to gain real bodies whose attributes LLVM infers (M14 Slice 2).
-    apply_rt_contract_attrs(ctx, module, rt_lto_skip_guarded);
+
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
     // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
     // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
@@ -2999,6 +1323,7 @@ fn build_module<'c>(
             module,
             builder: &builder,
             funcs: &funcs,
+            runtime_funcs: &runtime_funcs,
             fn_sigs: &fn_sigs,
             extern_abi: &extern_abi,
             structs: &program.structs,
@@ -3044,9 +1369,16 @@ fn build_module<'c>(
     if let Some(f) =
         program.fns.iter().find(|f| f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit))
     {
-        emit_main_wrapper(ctx, module, funcs["main"], f.ret, !f.params.is_empty())?;
+        emit_main_wrapper(
+            ctx,
+            module,
+            funcs["main"],
+            f.ret,
+            !f.params.is_empty(),
+            &extern_fn_types,
+        )?;
     }
-    Ok(())
+    Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
 }
 
 /// Validate the nested tagged table before any LLVM type lookup. This is the fail-closed seam for
@@ -4145,6 +2477,7 @@ fn emit_main_wrapper<'c>(
     align_main: FunctionValue<'c>,
     ret: Ty,
     has_args: bool,
+    extern_fn_types: &HashMap<String, FunctionType<'c>>,
 ) -> Result<(), CodegenError> {
     if !matches!(ret, Ty::Result(_, _)) && ret != Ty::Unit {
         return Err(CodegenError::Lowering("main wrapper on a non-Result, non-Unit return".into()));
@@ -4152,12 +2485,18 @@ fn emit_main_wrapper<'c>(
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
     let ptr_t = ctx.ptr_type(AddressSpace::default());
+    let unkeyed = |key| {
+        let symbol = runtime_abi::unkeyed_symbol(key);
+        if extern_fn_types.contains_key(symbol) {
+            module
+                .get_function(symbol)
+                .expect("compatible native extern was declared before main-wrapper emission")
+        } else {
+            module.add_function(symbol, runtime_abi::unkeyed_function_type(key, ctx), None)
+        }
+    };
     // Returns the clamped (nonzero u8) exit code; reporting/clamping live in the runtime.
-    let report = module.add_function(
-        "align_rt_report_error",
-        i32t.fn_type(&[i32t.into()], false),
-        None,
-    );
+    let report = unkeyed(runtime_abi::UnkeyedRuntimeKey::ReportError);
     // `main(args: array<str>)`: the C entry takes (argc, argv) and the runtime builds the
     // `array<str>` value; otherwise the C entry takes no args.
     let main_ty = if has_args {
@@ -4173,11 +2512,7 @@ fn emit_main_wrapper<'c>(
 
     // Marshal argv into the `array<str>` argument, or call with no args.
     let call_args: Vec<inkwell::values::BasicMetadataValueEnum> = if has_args {
-        let args_build = module.add_function(
-            "align_rt_args_build",
-            slice_struct_type(ctx).fn_type(&[i32t.into(), ptr_t.into()], false),
-            None,
-        );
+        let args_build = unkeyed(runtime_abi::UnkeyedRuntimeKey::ArgsBuild);
         let argc = main.get_nth_param(0).expect("argc").into_int_value();
         let argv = main.get_nth_param(1).expect("argv").into_pointer_value();
         let args_val = builder
@@ -4814,29 +3149,29 @@ fn is_signed(ty: Ty) -> bool {
 /// admits as fields (`is_move_handle`) — a type allowed as a field but missing here would leak.
 /// `Builder`/`StrFinder`/`ArrayBuilder` are Move but NOT here (distinct non-pointer drops); they are
 /// correspondingly rejected as fields.
-fn handle_free_fn(ty: Ty) -> Option<&'static str> {
+fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
     Some(match ty {
-        Ty::Writer => "io_writer_free",
-        Ty::Reader => "io_reader_free",
-        Ty::Buffer => "buffer_free",
-        Ty::File => "io_file_free",
-        Ty::Regex => "regex_free",
-        Ty::Captures => "regex_captures_free",
-        Ty::CliCommand => "cli_command_free",
-        Ty::CliParsed => "cli_parsed_free",
-        Ty::TcpConn => "tcp_conn_free",
-        Ty::TcpListener => "tcp_listener_free",
-        Ty::UdpSocket => "udp_socket_free",
-        Ty::Child => "child_free",
-        Ty::Command => "command_free",
-        Ty::RunOutput => "run_output_free",
-        Ty::HttpRequest => "http_request_free",
-        Ty::HttpResponse => "http_resp_free",
-        Ty::HttpClient => "http_client_free",
-        Ty::HttpServer => "http_server_free",
-        Ty::HttpRequestCtx => "http_ctx_free",
-        Ty::ResponseBuilder => "http_response_free",
-        Ty::HttpStream => "http_stream_free",
+        Ty::Writer => RuntimeKey::IoWriterFree,
+        Ty::Reader => RuntimeKey::IoReaderFree,
+        Ty::Buffer => RuntimeKey::BufferFree,
+        Ty::File => RuntimeKey::IoFileFree,
+        Ty::Regex => RuntimeKey::RegexFree,
+        Ty::Captures => RuntimeKey::RegexCapturesFree,
+        Ty::CliCommand => RuntimeKey::CliCommandFree,
+        Ty::CliParsed => RuntimeKey::CliParsedFree,
+        Ty::TcpConn => RuntimeKey::TcpConnFree,
+        Ty::TcpListener => RuntimeKey::TcpListenerFree,
+        Ty::UdpSocket => RuntimeKey::UdpSocketFree,
+        Ty::Child => RuntimeKey::ChildFree,
+        Ty::Command => RuntimeKey::CommandFree,
+        Ty::RunOutput => RuntimeKey::RunOutputFree,
+        Ty::HttpRequest => RuntimeKey::HttpRequestFree,
+        Ty::HttpResponse => RuntimeKey::HttpRespFree,
+        Ty::HttpClient => RuntimeKey::HttpClientFree,
+        Ty::HttpServer => RuntimeKey::HttpServerFree,
+        Ty::HttpRequestCtx => RuntimeKey::HttpCtxFree,
+        Ty::ResponseBuilder => RuntimeKey::HttpResponseFree,
+        Ty::HttpStream => RuntimeKey::HttpStreamFree,
         _ => return None,
     })
 }
@@ -5164,52 +3499,13 @@ fn add_valued_enum_attr<'c>(
 /// (the printer now emits the canonical `captures(none)` spelling `llvm-as-22` accepts).
 const CAPTURES_NONE: u64 = 0;
 
-/// Attributes shared by every allocator-family runtime declaration, verified per function:
-///
-/// - `noalias` (return): each returns a *fresh* allocation (C `malloc`, a bump-region slice never
-///   handed out before, or a `Box::into_raw`), disjoint from any pointer live before the call.
-///   `noalias` is compatible with a possible null return (`align_rt_alloc`/`arena_alloc` hand back
-///   null for an empty/invalid request), so the null-returning ones keep it.
-/// - `nounwind` (function): none unwind — on OOM (C `malloc` null, or a Rust global-alloc failure)
-///   they `abort`, and a panic (e.g. a `Vec` capacity overflow) can't escape the `extern "C"`
-///   boundary either (it aborts), so no unwind ever leaves the call.
-///
-/// Deliberately **NOT** added: `willreturn`/`mustprogress` — each of these can `abort` on OOM, so
-/// asserting it always returns to the caller would be unsound (a miscompile). Over-declaration on
-/// the allocator hot path is the dangerous direction, so we stay conservative.
-fn mark_alloc_common<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
-    add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Return, "noalias");
-    mark_nounwind(ctx, f);
-}
-
-/// A **single-shot** allocator that never frees memory reachable at entry (`align_rt_alloc` = one
-/// `malloc`; the `*_begin`, `builder_new`, and `array_builder_new` handle allocators = one
-/// `Box::new`) — so it additionally gets `nofree`.
-fn mark_alloc_like<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
-    mark_alloc_common(ctx, f);
-    add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "nofree");
-}
-
-/// A **bump** allocator (`align_rt_arena_alloc` / `align_rt_tg_alloc`): like `mark_alloc_like` but
-/// **without `nofree`**. Growing the region does `Vec::push` on the chunk list, which can reallocate
-/// that list's backing buffer — freeing memory allocated *before* the call — so `nofree` would be
-/// unsound even though the returned bump pointer itself is fresh (`noalias` still holds: the chunk
-/// buffers the pointer aliases into are never moved, only the chunk-*index* vector is).
-fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
-    mark_alloc_common(ctx, f);
-}
-
 // ---------------------------------------------------------------------------------------------
 // M13 Slice 5A — contract attributes for the opaque `align_rt_*` runtime declarations.
 //
 // LLVM cannot see the Rust bodies behind the `align_rt_*` declares in `align_runtime`, and these
-// calls never inline, so its FunctionAttrs pass infers nothing for them: every runtime call is an
-// opaque "reads+writes all memory, may not return, may unwind" barrier. `RT_CONTRACT_ATTRS`
-// hand-annotates the small, individually-audited set whose contract is *provable from the runtime
-// body* (each entry cites `crates/align_runtime/src/lib.rs` and its verified reasoning). A wrong
-// attribute here is a silent miscompile, so the fail-safe default is NO attribute: any symbol
-// absent from the table gets nothing. Applied once by `apply_rt_contract_attrs`, after every
-// runtime declare exists (all `align_rt_*` are external declares — never Align definitions).
+// calls never inline, so its FunctionAttrs pass infers nothing for them. The typed ABI rows in
+// `runtime_abi` are the single declaration-and-attribute authority; this module retains only the
+// LLVM-version-specific numeric encodings those rows apply.
 // ---------------------------------------------------------------------------------------------
 
 /// LLVM 19's packed `MemoryEffects` bitmask (`llvm/IR/ModRef.h`): 2 bits per location —
@@ -5220,181 +3516,6 @@ fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// `rt_contract_attrs_pin_encoding_and_curation` pins the emitted attribute's textual form —
 /// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
 const MEM_ARGMEM_READ: u64 = 1;
-
-/// The contract of one runtime declaration: which function-level valueless enum attributes it
-/// carries, its LLVM `memory(...)` effect bitmask (if any), and which pointer parameters are
-/// `readonly` + `captures(none)` (the function only reads through them and never stores/returns
-/// them).
-struct RtContract {
-    fn_attrs: &'static [&'static str],
-    memory: Option<u64>,
-    read_ptr_params: &'static [u32],
-}
-
-/// Function-level attributes shared by the provably pure-finite reader fns: they always return
-/// (a loop bounded by the input length — never abort, never spin), never free reachable memory, and
-/// never synchronize with other threads (any internal atomic is `monotonic`-or-weaker, permitted
-/// under `nosync`). Paired with `memory(argmem: read)` where the body touches ONLY argument memory.
-const PURE_READ: &[&str] = &["willreturn", "nofree", "nosync"];
-
-/// The contract for `sym` (a full `align_rt_*` symbol), or `None` (fail-safe: no attributes). Every
-/// entry was read against the runtime body; the justification cites the function and why each
-/// attribute holds. Curated conservatively — when a fn touched non-argument memory (a feature-detect
-/// cache) `memory(...)` is deliberately withheld even though the fn is otherwise pure.
-fn rt_contract(sym: &str) -> Option<RtContract> {
-    // `hash64`/`hash128` (align_runtime `align_rt_hash64`/`_hash128`): `wyhash` over `safe_slice`d
-    // argument bytes — pure arithmetic, no allocation, no global reads/writes (`WY_SEED`/`WY_SECRET`
-    // are `const`, baked into code, not memory), always terminates, returns a scalar/`{u64,u64}` and
-    // never stores the pointer. → `memory(argmem: read)` + pure-finite + `readonly captures(none)` on ptr.
-    // `str_eq`/`str_cmp`/`eq_ignore_case`/`starts_with`/`ends_with`: slice compare (`==`/`.cmp()`/
-    // `eq_ignore_ascii_case`) over `safe_slice`d argument bytes → `memcmp`-class, argument memory
-    // only, no globals, no feature-detect, returns an `i32`/`i64`. Same treatment; both ptr params
-    // (`0` and `2`) are `readonly captures(none)`.
-    let memcmp_class = |params: &'static [u32]| RtContract {
-        fn_attrs: PURE_READ,
-        memory: Some(MEM_ARGMEM_READ),
-        read_ptr_params: params,
-    };
-    // `utf8_valid` (`align_rt_utf8_valid` → `validate_utf8`) and the `memchr::memmem`-backed
-    // `str_contains`/`str_find`/`str_rfind`: pure-finite readers, BUT their dispatch runs
-    // `is_x86_feature_detected!` / memchr's runtime CPU-feature detection, which reads (and, on the
-    // first call, writes) a process-global cache — non-argument memory. So `memory(...)` is WITHHELD
-    // (an `argmem: read` / `read` claim would be a lie the first time). They keep the pure-finite
-    // flags and `readonly captures(none)` params (all still true), just no memory-effects attribute.
-    let feature_detect_reader = |params: &'static [u32]| RtContract {
-        fn_attrs: PURE_READ,
-        memory: None,
-        read_ptr_params: params,
-    };
-    match sym {
-        "align_rt_hash64" | "align_rt_hash128" => Some(memcmp_class(&[0])),
-        "align_rt_str_eq"
-        | "align_rt_str_cmp"
-        | "align_rt_str_eq_ignore_case"
-        | "align_rt_str_starts_with"
-        | "align_rt_str_ends_with" => Some(memcmp_class(&[0, 2])),
-        "align_rt_utf8_valid" => Some(feature_detect_reader(&[0])),
-        "align_rt_str_contains" | "align_rt_str_find" | "align_rt_str_rfind" => {
-            Some(feature_detect_reader(&[0, 2]))
-        }
-        // `str_finder_find` (doc-13 §6.6): searches a prepared plan. For a *multi-byte* needle the
-        // vector/Two-Way setup and feature detection all happened in `str_finder_new`
-        // (`is_available()` → `with_pair()` → `Searcher::new`), so `Finder::find` would touch only
-        // argument memory. BUT for a **one-byte** needle `memchr 2.8.2` routes `Finder::find` through
-        // `searcher_kind_one_byte` → `crate::memchr(byte, haystack)`, whose `unsafe_ifunc!` reads —
-        // and on the first call writes — a process-global `static FN: AtomicPtr<()>` dispatch cache
-        // (non-argument memory). That is the SAME feature-detect-at-find-time lie this file forbids
-        // for the one-shot `str_contains`/`str_find`. So `memory(...)` is WITHHELD: `finder_find` gets
-        // the `feature_detect_reader` contract (pure-finite flags + `readonly captures(none)` on both
-        // pointers, no memory-effects attribute) — identical to `str_find`. The plan-reuse win is the
-        // point of hoisting; the memory-effects upgrade was an optional extra and is falsified here.
-        "align_rt_str_finder_find" => Some(feature_detect_reader(&[0, 1])),
-        // The abort family (`align_rt_bounds_fail`/`len_mismatch_fail`/`range_fail`/`div_fail`/
-        // `process_exit`/`process_abort`): each is `-> !` in the runtime — it prints then calls
-        // `std::process::abort()` / `_exit` / `std::process::exit`, none of which return. MIR already
-        // emits `unreachable` after the call, so `noreturn` is free hygiene (it lets LLVM drop the
-        // fall-through and mark the path cold). No pointer params; no memory claim needed.
-        "align_rt_bounds_fail"
-        | "align_rt_len_mismatch_fail"
-        | "align_rt_range_fail"
-        | "align_rt_utf8_boundary_fail"
-        | "align_rt_div_fail"
-        | "align_rt_alloc_size_fail"
-        | "align_rt_process_exit"
-        | "align_rt_process_abort" => Some(RtContract {
-            fn_attrs: &["noreturn"],
-            memory: None,
-            read_ptr_params: &[],
-        }),
-        _ => None,
-    }
-}
-
-/// The `align_rt_*` symbols whose bodies the `--rt-lto` bitcode artifact defines (M14 Slice 2):
-/// the `memcmp`-class fast-path string primitives the probe measured as an LTO win (`str_eq` 2.1×).
-/// `str_cmp` is deliberately EXCLUDED (it regressed ~0.72× under post-link reoptimization);
-/// `utf8_valid` is excluded from v1 (SIMD body + non-argument feature-detect memory, unmeasured).
-/// This set is the single seam for two structural facts: (a) `apply_rt_contract_attrs` skips
-/// hand-curating these declares when `--rt-lto` is on (they will gain real bodies whose attributes
-/// LLVM infers — a stale curated attr shadowing a visible body is a latent miscompile), and (b)
-/// `link_in_rt_lto` sheds exactly [`rt_contract`]'s attrs from each once its body is merged in.
-const RT_LTO_GUARDED: &[&str] = &[
-    "align_rt_str_eq",
-    "align_rt_str_starts_with",
-    "align_rt_str_ends_with",
-    "align_rt_str_eq_ignore_case",
-];
-
-/// Whether `sym` is a `--rt-lto` guarded symbol (see [`RT_LTO_GUARDED`]).
-fn is_rt_lto_guarded(sym: &str) -> bool {
-    RT_LTO_GUARDED.contains(&sym)
-}
-
-/// Apply `RT_CONTRACT_ATTRS` to every runtime declaration in the module. Runs once, after all
-/// `align_rt_*` declares are created. Filters to `align_rt_`-prefixed *declarations* (zero basic
-/// blocks) so it can never touch an Align-generated definition; a symbol without a contract entry is
-/// left untouched (the fail-safe default).
-///
-/// `skip_guarded` = the `--rt-lto` path: the guarded set ([`RT_LTO_GUARDED`]) is left UN-annotated
-/// because [`link_in_rt_lto`] is about to give each a real body (curating a declare we then define
-/// would just shadow LLVM's body-derived inference — the probe's `rt_contract` split). Off (`false`,
-/// the flag-off default and the fallback re-annotate) → curate every contracted declare, today's
-/// behavior. The decision is made by the caller AFTER probing the baked bitcode (probe-then-annotate),
-/// so an unparseable artifact re-annotates correctly instead of silently dropping the contract.
-fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>, skip_guarded: bool) {
-    for f in module.get_functions() {
-        let name = f.get_name();
-        let Ok(name) = name.to_str() else { continue };
-        if !name.starts_with("align_rt_") || f.count_basic_blocks() != 0 {
-            continue;
-        }
-        if skip_guarded && is_rt_lto_guarded(name) {
-            continue;
-        }
-        let Some(c) = rt_contract(name) else { continue };
-        for a in c.fn_attrs {
-            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, a);
-        }
-        if let Some(mem) = c.memory {
-            add_valued_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "memory", mem);
-        }
-        for &p in c.read_ptr_params {
-            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "readonly");
-            // `captures(none)`: the pointer's address/provenance never escapes (LLVM 22's `captures`
-            // replaces the removed `nocapture` — see `CAPTURES_NONE`). Emitting the modern attribute
-            // directly (value 0) keeps the `emit-llvm | llvm-as-22` textual round-trip valid.
-            add_valued_enum_attr(
-                ctx,
-                f,
-                inkwell::attributes::AttributeLoc::Param(p),
-                "captures",
-                CAPTURES_NONE,
-            );
-        }
-    }
-}
-
-/// Strip exactly [`rt_contract`]`(sym)`'s hand-curated attributes from a now-body-carrying runtime
-/// function `f` (the `--rt-lto` safety-net shed). Once a body is visible, LLVM's own FunctionAttrs
-/// pass infers memory/`nofree`/etc. from the real code; a stale hand-curated attr shadowing that
-/// body is a latent miscompile (the `rt_contract` split, M14 Slice 2). We remove ONLY this symbol's
-/// curated attrs — never a blanket all-attr wipe, which would also strip rustc's body-derived attrs
-/// and *weaken* the result. `remove_enum_attribute` is a no-op when the attribute is absent, so this
-/// is safe even though `apply_rt_contract_attrs(skip_guarded=true)` already withheld them on the
-/// declare (the merged definition could still carry them from a future annotate path).
-fn shed_rt_contract_attrs<'c>(f: FunctionValue<'c>, c: &RtContract) {
-    use inkwell::attributes::AttributeLoc;
-    for a in c.fn_attrs {
-        f.remove_enum_attribute(AttributeLoc::Function, enum_kind_id(a));
-    }
-    if c.memory.is_some() {
-        f.remove_enum_attribute(AttributeLoc::Function, enum_kind_id("memory"));
-    }
-    for &p in c.read_ptr_params {
-        f.remove_enum_attribute(AttributeLoc::Param(p), enum_kind_id("readonly"));
-        f.remove_enum_attribute(AttributeLoc::Param(p), enum_kind_id("captures"));
-    }
-}
 
 /// Parse the baked `--rt-lto` bitcode (`build.rs` → `str_prims.bc`, `include_bytes!`) into a module
 /// in `ctx`. The probe half of "probe-then-annotate": the caller decides whether to skip curating
@@ -5421,23 +3542,29 @@ fn parse_rt_lto_module<'c>(ctx: &'c Context, bitcode: &[u8]) -> Result<Module<'c
 /// baked for, a latent miscompile; instead this falls back exactly like an unparseable artifact
 /// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
 /// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
-/// datalayout too (now known equal); (2) `link_in_module` (the definitions replace the program's
-/// external `align_rt_*` declares); (3) for every `align_rt_*` function that now has a body, shed its
-/// `rt_contract` attrs ([`shed_rt_contract_attrs`]) and set it `internal` DIRECTLY (never the
+/// datalayout too (now known equal); (2) rename every incoming guarded definition to the captured
+/// physical name of its typed declaration, then `link_in_module` (the definitions replace those
+/// declarations even when an earlier program claimant forced LLVM uniquification); (3) for every
+/// typed guarded row that now has a body, shed exactly
+/// that row's curated attrs and set it `internal` DIRECTLY (never the
 /// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
 /// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
 /// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
 /// run (the probe's double-opt is what regressed `str_cmp`).
 ///
 /// On the datalayout-mismatch fallback (step 0), no merge happens and this re-curates the guarded
-/// declares itself (`apply_rt_contract_attrs(ctx, module, false)`) before returning `Ok(())` — the
+/// declares through their typed rows before returning `Ok(())` — the
 /// caller passed `rt_lto_skip_guarded = true` to `build_module` on the strength of the bitcode merely
 /// parsing, so without this the guarded declares would be left permanently un-curated.
-fn link_in_rt_lto<'c>(ctx: &'c Context, module: &Module<'c>, rt: Module<'c>) -> Result<(), CodegenError> {
+fn link_in_rt_lto<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    rt: Module<'c>,
+    runtime: &RuntimeDeclarations,
+) -> Result<(), CodegenError> {
     // (0) A parsed-but-wrong-target artifact is the same class of compiler build defect as an
     // unparseable one — fail loud, fall back, never force a mismatched layout onto the runtime's IR.
     // Compared via a bool first (rather than holding the `Ref<DataLayout>` borrows across the branch
-    // below) so `rt`'s data-layout `RefCell` is free again before `rt.set_data_layout` needs it
     // mutably on the match path.
     let want = module.get_data_layout();
     let matches = rt.get_data_layout().as_str() == want.as_str();
@@ -5449,29 +3576,82 @@ fn link_in_rt_lto<'c>(ctx: &'c Context, module: &Module<'c>, rt: Module<'c>) -> 
             rt.get_data_layout().as_str(),
             want.as_str()
         );
-        apply_rt_contract_attrs(ctx, module, false);
+        for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+            let function = module
+                .get_function(&runtime.physical_names[&abi.key])
+                .expect("typed guarded runtime declaration remains present on rt-LTO fallback");
+            abi.apply_attributes(ctx, function);
+        }
         return Ok(());
     }
     // (1) Match target so the linker never complains about a triple mismatch (cosmetic — datalayout
     // is already confirmed equal above).
     rt.set_triple(&module.get_triple());
     rt.set_data_layout(&want);
-    // (2) Merge. On success `rt` is consumed; its `align_rt_*` definitions override the program's
-    // external declares of the same name.
+    // (2) Require the baked artifact to provide the complete guarded surface before mutating or
+    // linking either module. A parseable but incomplete/wrong-type artifact is still a compiler
+    // build defect; fall back as one unit so no guarded declaration remains un-curated.
+    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let defect = match rt.get_function(abi.symbol) {
+            None => Some("is missing"),
+            Some(function) if function.get_type() != abi.function_type(ctx) => {
+                Some("has the wrong function type")
+            }
+            Some(function) if function.count_basic_blocks() == 0 => Some("has no body"),
+            Some(_) => None,
+        };
+        if let Some(defect) = defect {
+            eprintln!(
+                "alignc: --rt-lto disabled: baked runtime bitcode definition {} {}; falling back \
+                 to the runtime staticlib. This is a compiler build defect, not a problem with \
+                 your program.",
+                abi.symbol, defect
+            );
+            for guarded in runtime_abi::runtime_abis().filter(|row| row.is_rt_lto_guarded()) {
+                let function = module
+                    .get_function(&runtime.physical_names[&guarded.key])
+                    .expect("typed guarded runtime declaration remains present on rt-LTO fallback");
+                guarded.apply_attributes(ctx, function);
+            }
+            return Ok(());
+        }
+    }
+
+    // Retarget each incoming definition to the physical declaration selected before lowering.
+    // A same-spelled program/import claimant precedes native declarations until c3, so LLVM may
+    // have named the typed native handle `align_rt_*.N`. Linking the bitcode's unsuffixed definition
+    // unchanged would collide with the program claimant instead of filling that typed handle.
+    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let Some(incoming) = rt.get_function(abi.symbol) else {
+            continue;
+        };
+        let physical = &runtime.physical_names[&abi.key];
+        if incoming.get_name().to_bytes() != physical.as_bytes() {
+            incoming.as_global_value().set_name(physical);
+            if incoming.get_name().to_bytes() != physical.as_bytes() {
+                return Err(CodegenError::Target(format!(
+                    "--rt-lto: cannot retarget {} to its typed declaration {}",
+                    abi.symbol, physical
+                )));
+            }
+        }
+    }
+    // Merge. On success `rt` is consumed; its guarded definitions override exactly the typed
+    // external declarations selected above.
     module
         .link_in_module(rt)
         .map_err(|e| CodegenError::Target(format!("--rt-lto: linking runtime bitcode failed: {e}")))?;
-    // (3) Normalize every runtime symbol that now carries a body.
-    for f in module.get_functions() {
-        let name = f.get_name();
-        let Ok(name) = name.to_str() else { continue };
-        if !name.starts_with("align_rt_") || f.count_basic_blocks() == 0 {
+    // (3) Normalize exactly the typed guarded runtime definitions. Physical names are captured
+    // from their declaration handles, so a same-spelled program claimant can never be selected.
+    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let function = module
+            .get_function(&runtime.physical_names[&abi.key])
+            .expect("typed guarded runtime declaration remains present after rt-LTO link");
+        if function.count_basic_blocks() == 0 {
             continue;
         }
-        if let Some(c) = rt_contract(name) {
-            shed_rt_contract_attrs(f, &c);
-        }
-        mark_internal(f);
+        abi.remove_attributes(function);
+        mark_internal(function);
     }
     // (4) A merged module that does not verify is a compiler bug (our own baked bitcode), not a user
     // error — surface it loudly rather than emitting a broken object.
@@ -5485,9 +3665,8 @@ fn link_in_rt_lto<'c>(ctx: &'c Context, module: &Module<'c>, rt: Module<'c>) -> 
 /// implies `optsize`, but clang `-Oz` emits both explicitly, so we do too). All other profiles are a
 /// no-op — the speed profiles carry no size attrs.
 ///
-/// Filters to definitions (`count_basic_blocks() > 0`), so it never touches an `align_rt_*`
-/// declaration: the target set is completely disjoint from [`apply_rt_contract_attrs`], which only
-/// touches declarations. Called on the object path (after `build_module`, before the opt pipeline);
+/// Filters to definitions (`count_basic_blocks() > 0`), so it never touches a native declaration.
+/// Called on the object path (after `build_module`, before the opt pipeline);
 /// the diagnostic lenses never run it, keeping their IR shape profile-independent.
 fn apply_size_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile) {
     let names: &[&str] = match profile {
@@ -5510,6 +3689,9 @@ struct FnGen<'c, 'a> {
     module: &'a Module<'c>,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
+    /// Typed handles for every fixed keyed native declaration. Dedicated native lowering must use
+    /// this table; `funcs` remains only for the explicitly deferred mixed program/direct seams.
+    runtime_funcs: &'a HashMap<RuntimeKey, FunctionValue<'c>>,
     /// Semantic signatures for every direct callable. LLVM's physical integer types do not retain
     /// signedness, so the range-kernel boundary checks these `Ty`s as well as the generated LLVM
     /// function type before emitting a direct call.
@@ -5805,6 +3987,10 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    fn runtime(&self, key: RuntimeKey) -> FunctionValue<'c> {
+        self.runtime_funcs[&key]
     }
 
     /// LLVM's store size omits an aggregate's tail padding, while typed GEP and the runtime's
@@ -6248,7 +4434,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_conditional_branch(invalid, fail, ok).map_err(|e| self.err(e))?;
         self.builder.position_at_end(fail);
         self.builder
-            .build_call(self.funcs["alloc_size_fail"], &[], "")
+            .build_call(self.runtime(RuntimeKey::AllocSizeFail), &[], "")
             .map_err(|e| self.err(e))?;
         self.builder.build_unreachable().map_err(|e| self.err(e))?;
         self.builder.position_at_end(ok);
@@ -7112,7 +5298,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let fp = self.elem_field_ptr(*slot, idx, path)?;
                     let agg = self.builder.build_load(slice_struct_type(self.ctx), fp, "dropelemfldv").map_err(|e| self.err(e))?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropelemfldptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
                 Stmt::StoreElemField(slot, idx, path, op) => {
                     let ep = self.elem_field_ptr(*slot, idx, path)?;
@@ -7229,14 +5415,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Stmt::ArenaEnd(op) => {
                     let handle = self.operand(op)?.into();
                     self.builder
-                        .build_call(self.funcs["arena_end"], &[handle], "")
+                        .build_call(self.runtime(RuntimeKey::ArenaEnd), &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::RawFree(op) => {
                     // `raw.free(p)` → `align_rt_free(p)` (a null-safe libc `free`).
                     let p = self.operand(op)?.into();
                     self.builder
-                        .build_call(self.funcs["free"], &[p], "")
+                        .build_call(self.runtime(RuntimeKey::Free), &[p], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::RawStore { ptr, offset, value } => {
@@ -7252,13 +5438,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Stmt::TgWait(op) => {
                     let handle = self.operand(op)?.into();
                     self.builder
-                        .build_call(self.funcs["tg_wait"], &[handle], "")
+                        .build_call(self.runtime(RuntimeKey::TgWait), &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::TgEnd(op) => {
                     let handle = self.operand(op)?.into();
                     self.builder
-                        .build_call(self.funcs["tg_end"], &[handle], "")
+                        .build_call(self.runtime(RuntimeKey::TgEnd), &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::DropFlagInit(slot) => {
@@ -7346,9 +5532,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .into(),
                         // A Move **handle** field is a single opaque POINTER, not a `{ptr,len}` —
                         // zeroing it with a 16-byte slice struct would clobber the next field.
-                        // `handle_free_fn` is the same predicate that decides its drop is a pointer
+                        // `handle_free_key` is the same predicate that decides its drop is a pointer
                         // free, so the two can never disagree about the field's shape.
-                        ty if handle_free_fn(ty).is_some() => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
+                        ty if handle_free_key(ty).is_some() => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
                         _ => slice_struct_type(self.ctx).const_zero().into(),
                     };
                     self.builder.build_store(field_ptr, zero).map_err(|e| self.err(e))?;
@@ -7363,12 +5549,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropb")
                             .map_err(|e| self.err(e))?;
                         let free = if self.stack_header_slots.contains(slot) {
-                            "builder_free_stack"
+                            RuntimeKey::BuilderFreeStack
                         } else {
-                            "builder_free"
+                            RuntimeKey::BuilderFree
                         };
                         self.builder
-                            .build_call(self.funcs[free], &[p.into()], "")
+                            .build_call(self.runtime(free), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if ty == Ty::StrFinder {
                         // A hoisted repeated-needle plan (doc-13 §6.6): free the boxed searcher
@@ -7379,7 +5565,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropf")
                             .map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs["str_finder_free"], &[p.into()], "")
+                            .build_call(self.runtime(RuntimeKey::StrFinderFree), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if let Ty::ArrayBuilder(elem) = ty {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
@@ -7388,34 +5574,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
                         // slot was nulled at `build`'s move site).
                         let stack = self.stack_header_slots.contains(slot);
-                        let free_fn = if elem == align_sema::Scalar::String && stack {
-                            "array_builder_free_strings_stack"
+                        let free_key = if elem == align_sema::Scalar::String && stack {
+                            RuntimeKey::ArrayBuilderFreeStringsStack
                         } else if elem == align_sema::Scalar::String {
-                            "array_builder_free_strings"
+                            RuntimeKey::ArrayBuilderFreeStrings
                         } else if stack {
-                            "array_builder_free_stack"
+                            RuntimeKey::ArrayBuilderFreeStack
                         } else {
-                            "array_builder_free"
+                            RuntimeKey::ArrayBuilderFree
                         };
                         let p = self
                             .builder
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropab")
                             .map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs[free_fn], &[p.into()], "")
+                            .build_call(self.runtime(free_key), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if let Some(free_fn) = handle_free_fn(ty) {
+                    } else if let Some(free_key) = handle_free_key(ty) {
                         // A bare Move **handle**: a writer flushes + closes; a reader closes; a buffer /
                         // cli / http handle frees; a tcp_conn / tcp_listener / udp_socket closes its
                         // socket fd; a `child` reaps its pid. Each runtime `*_free` is null-safe (a
                         // moved-out / never-initialised slot drops harmlessly). One source of truth
-                        // with the struct-field drop (`handle_free_fn`).
+                        // with the struct-field drop (`handle_free_key`).
                         let p = self
                             .builder
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "droph")
                             .map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs[free_fn], &[p.into()], "")
+                            .build_call(self.runtime(free_key), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if matches!(ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
                         && drop_plan(ty, self.structs, self.enums, self.tagged_defs).needs_drop()
@@ -7472,7 +5658,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             let sl = self.builder.build_extract_value(agg, idx, "dropencsl").map_err(|e| self.err(e))?.into_struct_value();
                             let ptr = self.builder.build_extract_value(sl, 0, "dropencptr").map_err(|e| self.err(e))?;
                             self.builder
-                                .build_call(self.funcs["free"], &[ptr.into()], "")
+                                .build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                     } else if matches!(ty, Ty::DynArray(Scalar::String)) {
@@ -7488,7 +5674,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let ptr = self.builder.build_extract_value(agg, 0, "dropstrarrptr").map_err(|e| self.err(e))?;
                         let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
+                            .build_call(self.runtime(RuntimeKey::FreeStringArray), &[ptr.into(), len.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if matches!(ty, Ty::DynResponseArray) {
                         // An owned `array<response>` (`cl.get_many`): each element is an owned `http
@@ -7504,7 +5690,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let ptr = self.builder.build_extract_value(agg, 0, "droprsparrptr").map_err(|e| self.err(e))?;
                         let len = self.builder.build_extract_value(agg, 1, "droprsparrlen").map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
+                            .build_call(self.runtime(RuntimeKey::FreeResponseArray), &[ptr.into(), len.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if let Ty::Enum(eid) = ty {
                         // A Move sum type (J2): tag-switched drop — free the live variant's owned
@@ -7528,7 +5714,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .into_struct_value();
                         let ptr = self.builder.build_extract_value(agg, 0, "dropptr").map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs["free"], &[ptr.into()], "")
+                            .build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                 }
@@ -7981,14 +6167,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ArenaBegin => {
                 let cs = self
                     .builder
-                    .build_call(self.funcs["arena_begin"], &[], "arena")
+                    .build_call(self.runtime(RuntimeKey::ArenaBegin), &[], "arena")
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("arena_begin returns a pointer")
             }
             Rvalue::TgBegin => {
                 let cs = self
                     .builder
-                    .build_call(self.funcs["tg_begin"], &[], "tg")
+                    .build_call(self.runtime(RuntimeKey::TgBegin), &[], "tg")
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("tg_begin returns a pointer")
             }
@@ -8020,7 +6206,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let align = self.target_data.get_abi_alignment(&env_struct) as u64;
                     let re = self
                         .builder
-                        .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(size, false).into(), i64t.const_int(align, false).into()], "env")
+                        .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(size, false).into(), i64t.const_int(align, false).into()], "env")
                         .map_err(|e| self.err(e))?
                         .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
                     self.builder
@@ -8051,7 +6237,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 )) as u64;
                 let slot = self
                     .builder
-                    .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
+                    .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
                 // A fallible task also gets an `err_slot` (sized for the `Error` enum) the trampoline
@@ -8062,7 +6248,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ebytes = self.target_data.get_store_size(&ety);
                     let ealign = self.target_data.get_abi_alignment(&ety) as u64;
                     self.builder
-                        .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(ebytes, false).into(), i64t.const_int(ealign, false).into()], "errslot")
+                        .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(ebytes, false).into(), i64t.const_int(ealign, false).into()], "errslot")
                         .map_err(|e| self.err(e))?
                         .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value()
                 } else {
@@ -8071,7 +6257,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // The per-(R, fallibility) trampoline runs the closure and writes the slot at `wait`.
                 let tramp = self.funcs[&format!("tramp${}", spawn_tramp_key(*r, *fallible))].as_global_value().as_pointer_value();
                 self.builder
-                    .build_call(self.funcs["tg_register"], &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into()], "")
+                    .build_call(self.runtime(RuntimeKey::TgRegister), &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into()], "")
                     .map_err(|e| self.err(e))?;
                 slot.into()
             }
@@ -8080,7 +6266,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `tg_wait` returns the lowest-spawn-index errored task's `err_slot` (null if all succeeded).
                 let errp = self
                     .builder
-                    .build_call(self.funcs["tg_wait"], &[tgv], "tgwait")
+                    .build_call(self.runtime(RuntimeKey::TgWait), &[tgv], "tgwait")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8152,7 +6338,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ];
                 let ptr = self
                     .builder
-                    .build_call(self.funcs["arena_alloc"], &argv, "box")
+                    .build_call(self.runtime(RuntimeKey::ArenaAlloc), &argv, "box")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8176,7 +6362,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_int_cast_sign_flag(sz.into_int_value(), i64t, false, "sizew")
                     .map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["alloc"], &[sz64.into()], "rawptr")
+                    .build_call(self.runtime(RuntimeKey::Alloc), &[sz64.into()], "rawptr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8502,7 +6688,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
-                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle)?.into(), bytes.into(), elem_align.into()], "buf")
+                    .build_call(self.runtime(RuntimeKey::ArenaAlloc), &[self.operand(handle)?.into(), bytes.into(), elem_align.into()], "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8515,7 +6701,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
-                    .build_call(self.funcs["alloc"], &[bytes.into()], "buf")
+                    .build_call(self.runtime(RuntimeKey::Alloc), &[bytes.into()], "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8536,7 +6722,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let total = self.checked_allocation_add(last_off, last_bytes, "soabytes")?;
                 let max_align = sizes.iter().copied().max().unwrap_or(1);
                 self.builder
-                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle)?.into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
+                    .build_call(self.runtime(RuntimeKey::ArenaAlloc), &[self.operand(handle)?.into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8570,7 +6756,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ov = self.operand(out_vals)?;
                 let call = if let GroupOp::Count = op {
                     self.builder.build_call(
-                        self.funcs["group_count_i64"],
+                        self.runtime(RuntimeKey::GroupCountI64),
                         &[kptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
                         "groupagg",
                     )
@@ -8579,14 +6765,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_extract_value(self.operand(vals)?.into_struct_value(), 0, "vptr")
                         .map_err(|e| self.err(e))?;
-                    let f = match op {
-                        GroupOp::Sum => "group_sum_i64",
-                        GroupOp::Min => "group_min_i64",
-                        GroupOp::Max => "group_max_i64",
+                    let key = match op {
+                        GroupOp::Sum => RuntimeKey::GroupSumI64,
+                        GroupOp::Min => RuntimeKey::GroupMinI64,
+                        GroupOp::Max => RuntimeKey::GroupMaxI64,
                         GroupOp::Count => unreachable!(),
                     };
                     self.builder.build_call(
-                        self.funcs[f],
+                        self.runtime(key),
                         &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
                         "groupagg",
                     )
@@ -8611,15 +6797,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let ok = self.operand(out_keys)?;
                 let ov = self.operand(out_vals)?;
-                let f = match op {
-                    GroupOp::Sum => "group_sum_str_cols",
-                    GroupOp::Min => "group_min_str_cols",
-                    GroupOp::Max => "group_max_str_cols",
-                    GroupOp::Count => "group_count_str_cols",
+                let key = match op {
+                    GroupOp::Sum => RuntimeKey::GroupSumStrCols,
+                    GroupOp::Min => RuntimeKey::GroupMinStrCols,
+                    GroupOp::Max => RuntimeKey::GroupMaxStrCols,
+                    GroupOp::Count => RuntimeKey::GroupCountStrCols,
                 };
                 self.builder
                     .build_call(
-                        self.funcs[f],
+                        self.runtime(key),
                         &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
                         "groupaggstrcols",
                     )
@@ -8642,11 +6828,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let key_off = self.field_byte_offset(*struct_id, *key_field);
                 // `count` has no value field; the runtime entry ignores `val_off`, so pass 0.
                 let val_off = value_field.map(|v| self.field_byte_offset(*struct_id, v)).unwrap_or(0);
-                let f = match op {
-                    GroupOp::Sum => "group_sum_str",
-                    GroupOp::Min => "group_min_str",
-                    GroupOp::Max => "group_max_str",
-                    GroupOp::Count => "group_count_str",
+                let key = match op {
+                    GroupOp::Sum => RuntimeKey::GroupSumStr,
+                    GroupOp::Min => RuntimeKey::GroupMinStr,
+                    GroupOp::Max => RuntimeKey::GroupMaxStr,
+                    GroupOp::Count => RuntimeKey::GroupCountStr,
                 };
                 let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
                 let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
@@ -8656,7 +6842,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ov = self.operand(out_vals)?;
                 self.builder
                     .build_call(
-                        self.funcs[f],
+                        self.runtime(key),
                         &[
                             bptr.into(),
                             blen.into(),
@@ -8716,7 +6902,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ok = self.operand(out_keys)?;
                 self.builder
                     .build_call(
-                        self.funcs["group_multi_str"],
+                        self.runtime(RuntimeKey::GroupMultiStr),
                         &[
                             bptr.into(),
                             blen.into(),
@@ -8751,7 +6937,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let od = self.operand(out_dict)?;
                 self.builder
                     .build_call(
-                        self.funcs["dict_encode_str"],
+                        self.runtime(RuntimeKey::DictEncodeStr),
                         &[bptr.into(), blen.into(), i64t.const_int(stride, false).into(), i64t.const_int(key_off, false).into(), oi.into(), od.into(), blen.into()],
                         "dictenc",
                     )
@@ -8789,7 +6975,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let o = self.operand(out)?;
                 self.builder
                     .build_call(
-                        self.funcs["gather_i64"],
+                        self.runtime(RuntimeKey::GatherI64),
                         &[sptr.into(), slen.into(), i64t.const_int(stride, false).into(), i64t.const_int(off, false).into(), o.into()],
                         "",
                     )
@@ -8805,7 +6991,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let dlen = self.builder.build_extract_value(dagg, 1, "dictlen").map_err(|e| self.err(e))?;
                 let o = self.operand(out)?;
                 self.builder
-                    .build_call(self.funcs["dict_lookup"], &[ids_ptr.into(), nn.into(), dptr.into(), dlen.into(), o.into()], "")
+                    .build_call(self.runtime(RuntimeKey::DictLookup), &[ids_ptr.into(), nn.into(), dptr.into(), dlen.into(), o.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -8819,7 +7005,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let scalar = align_sema::ty_to_scalar(*elem).expect("chunks element is a scalar");
                 let esz = self.ctx.i64_type().const_int(scalar_bytes(scalar), false);
                 self.builder
-                    .build_call(self.funcs["chunks"], &[src_ptr.into(), src_len.into(), n.into(), esz.into()], "chunks")
+                    .build_call(self.runtime(RuntimeKey::Chunks), &[src_ptr.into(), src_len.into(), n.into(), esz.into()], "chunks")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -8980,7 +7166,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // the Pure chain to scatter survivors in source order into the exact buffer.
                     self.builder
                         .build_call(
-                            self.funcs["par_map_filter"],
+                            self.runtime(RuntimeKey::ParMapFilter),
                             &[
                                 context.into(),
                                 in_ptr.into(),
@@ -9013,7 +7199,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let out_buf = self
                         .builder
                         .build_call(
-                            self.funcs["par_map"],
+                            self.runtime(RuntimeKey::ParMap),
                             &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
                             "obuf",
                         )
@@ -9128,7 +7314,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let raw = self
                     .builder
                     .build_call(
-                        self.funcs["par_map_reduce"],
+                        self.runtime(RuntimeKey::ParMapReduce),
                         &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
                         "parsum",
                     )
@@ -9184,7 +7370,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["str_clone"], &[ptr.into(), len.into()], "strclone")
+                    .build_call(self.runtime(RuntimeKey::StrClone), &[ptr.into(), len.into()], "strclone")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9193,16 +7379,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrTrim { kind, recv } => {
                 // Extract the receiver `{ptr,len}` and call the trim; the runtime returns a sub-view
                 // `{ptr,len}` aliasing the same bytes (no allocation).
-                let fk = match kind {
-                    align_sema::hir::StrTrimKind::Both => "str_trim",
-                    align_sema::hir::StrTrimKind::Start => "str_trim_start",
-                    align_sema::hir::StrTrimKind::End => "str_trim_end",
+                let key = match kind {
+                    align_sema::hir::StrTrimKind::Both => RuntimeKey::StrTrim,
+                    align_sema::hir::StrTrimKind::Start => RuntimeKey::StrTrimStart,
+                    align_sema::hir::StrTrimKind::End => RuntimeKey::StrTrimEnd,
                 };
                 let agg = self.operand(recv)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "trimptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "trimlen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs[fk], &[ptr.into(), len.into()], "strtrim")
+                    .build_call(self.runtime(key), &[ptr.into(), len.into()], "strtrim")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9221,16 +7407,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 match kind {
                     // The bool scans: an `i32` (0/1) returned as a `bool` (`i1`).
                     StrPredKind::Contains | StrPredKind::StartsWith | StrPredKind::EndsWith | StrPredKind::EqIgnoreCase => {
-                        let fk = match kind {
-                            StrPredKind::Contains => "str_contains",
-                            StrPredKind::StartsWith => "str_starts_with",
-                            StrPredKind::EndsWith => "str_ends_with",
-                            StrPredKind::EqIgnoreCase => "str_eq_ignore_case",
+                        let key = match kind {
+                            StrPredKind::Contains => RuntimeKey::StrContains,
+                            StrPredKind::StartsWith => RuntimeKey::StrStartsWith,
+                            StrPredKind::EndsWith => RuntimeKey::StrEndsWith,
+                            StrPredKind::EqIgnoreCase => RuntimeKey::StrEqIgnoreCase,
                             StrPredKind::Find | StrPredKind::Rfind => unreachable!(),
                         };
                         let r = self
                             .builder
-                            .build_call(self.funcs[fk], &args, "strpred")
+                            .build_call(self.runtime(key), &args, "strpred")
                             .map_err(|e| self.err(e))?
                             .try_as_basic_value()
                             .basic()
@@ -9247,10 +7433,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let Ty::Option(s) = result_ty else {
                             return Err(self.err("find result is not an Option"));
                         };
-                        let fk = if matches!(kind, StrPredKind::Rfind) { "str_rfind" } else { "str_find" };
+                        let key = if matches!(kind, StrPredKind::Rfind) {
+                            RuntimeKey::StrRfind
+                        } else {
+                            RuntimeKey::StrFind
+                        };
                         let idx = self
                             .builder
-                            .build_call(self.funcs[fk], &args, "strfind")
+                            .build_call(self.runtime(key), &args, "strfind")
                             .map_err(|e| self.err(e))?
                             .try_as_basic_value()
                             .basic()
@@ -9294,7 +7484,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let np = self.builder.build_extract_value(ne, 0, "fnp").map_err(|e| self.err(e))?;
                 let nl = self.builder.build_extract_value(ne, 1, "fnl").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["str_finder_new"], &[np.into(), nl.into()], "finder")
+                    .build_call(self.runtime(RuntimeKey::StrFinderNew), &[np.into(), nl.into()], "finder")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9310,7 +7500,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let hp = self.builder.build_extract_value(ha, 0, "fhp").map_err(|e| self.err(e))?;
                 let hl = self.builder.build_extract_value(ha, 1, "fhl").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["str_finder_find"], &[plan_ptr.into(), hp.into(), hl.into()], "finderfind")
+                    .build_call(self.runtime(RuntimeKey::StrFinderFind), &[plan_ptr.into(), hp.into(), hl.into()], "finderfind")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9327,7 +7517,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Ok(Some(
                         self.builder
                             .build_call(
-                                self.funcs["builder_init_stack"],
+                                self.runtime(RuntimeKey::BuilderInitStack),
                                 &[header.into(), null.into(), cap.into()],
                                 "builder.stack",
                             )
@@ -9338,7 +7528,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     ));
                 }
                 self.builder
-                    .build_call(self.funcs["builder_new"], &[null.into(), cap.into()], "builder")
+                    .build_call(self.runtime(RuntimeKey::BuilderNew), &[null.into(), cap.into()], "builder")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9350,7 +7540,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["builder_write"], &[b, ptr.into(), len.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BuilderWrite), &[b, ptr.into(), len.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9370,7 +7560,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     v
                 };
                 self.builder
-                    .build_call(self.funcs["builder_write_int"], &[b, wide.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BuilderWriteInt), &[b, wide.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9398,7 +7588,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let l2 = self.builder.build_extract_value(a2, 1, "wlen2").map_err(|e| self.err(e))?;
                 self.builder
                     .build_call(
-                        self.funcs["builder_write_str_int_str"],
+                        self.runtime(RuntimeKey::BuilderWriteStrIntStr),
                         &[b, p1.into(), l1.into(), wide.into(), p2.into(), l2.into()],
                         "",
                     )
@@ -9411,7 +7601,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let val = self.operand(v)?.into_int_value();
                 let wide = self.builder.build_int_z_extend(val, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["builder_write_bool"], &[b, wide.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BuilderWriteBool), &[b, wide.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9420,7 +7610,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let b = self.operand(bld)?.into();
                 let val = self.operand(c)?;
                 self.builder
-                    .build_call(self.funcs["builder_write_char"], &[b, val.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BuilderWriteChar), &[b, val.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9429,9 +7619,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let b = self.operand(bld)?.into();
                 let ty = self.f.operand_ty(x);
                 let val = self.operand(x)?;
-                let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
+                let key = if ty == Ty::Float(FloatTy { bits: 32 }) {
+                    RuntimeKey::BuilderWriteF32
+                } else {
+                    RuntimeKey::BuilderWriteF64
+                };
                 self.builder
-                    .build_call(self.funcs[callee], &[b, val.into()], "")
+                    .build_call(self.runtime(key), &[b, val.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9441,12 +7635,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // whole-MIR noescape proof selected that local.
                 let b = self.operand(bld)?.into();
                 let finish = if self.stack_header_slot_for_operand(bld).is_some() {
-                    "builder_into_string_stack"
+                    RuntimeKey::BuilderIntoStringStack
                 } else {
-                    "builder_into_string"
+                    RuntimeKey::BuilderIntoString
                 };
                 self.builder
-                    .build_call(self.funcs[finish], &[b], "tostr")
+                    .build_call(self.runtime(finish), &[b], "tostr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -9479,7 +7673,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDocLen { doc } => {
                 let (tape, node) = self.split_doc(doc)?;
                 self.builder
-                    .build_call(self.funcs["json_doc_len"], &[tape.into(), node.into()], "jlen")
+                    .build_call(self.runtime(RuntimeKey::JsonDocLen), &[tape.into(), node.into()], "jlen")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("json_doc_len returns i64")
             }
@@ -9497,8 +7691,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
-            Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
-            Rvalue::WriterCreate { path, out } => self.gen_open_handle("io_writer_create", path, *out)?,
+            Rvalue::ReaderOpen { path, out } => self.gen_open_handle(RuntimeKey::IoReaderOpen, path, *out)?,
+            Rvalue::WriterCreate { path, out } => self.gen_open_handle(RuntimeKey::IoWriterCreate, path, *out)?,
             // All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len) go through ONE
             // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
@@ -9507,14 +7701,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
-                .build_call(self.funcs["io_reader_stdin"], &[], "stdin")
+                .build_call(self.runtime(RuntimeKey::IoReaderStdin), &[], "stdin")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("io_reader_stdin returns a pointer"),
             Rvalue::WriterStd { fd, buffered } => {
                 let fd = self.ctx.i32_type().const_int(*fd as u64, true);
                 let buffered = self.ctx.i32_type().const_int(*buffered as u64, false);
                 self.builder
-                    .build_call(self.funcs["io_writer_std"], &[fd.into(), buffered.into()], "wstd")
+                    .build_call(self.runtime(RuntimeKey::IoWriterStd), &[fd.into(), buffered.into()], "wstd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_std returns a pointer")
             }
@@ -9522,7 +7716,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let rp = self.operand(r)?.into();
                 let bp = self.operand(buf)?.into();
                 self.builder
-                    .build_call(self.funcs["io_reader_read"], &[rp, bp], "read")
+                    .build_call(self.runtime(RuntimeKey::IoReaderRead), &[rp, bp], "read")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_reader_read returns i64")
             }
@@ -9538,7 +7732,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let rp = self.operand(r)?.into();
                 let wp = self.operand(w)?.into();
                 self.builder
-                    .build_call(self.funcs["io_copy"], &[rp, wp], "copy")
+                    .build_call(self.runtime(RuntimeKey::IoCopy), &[rp, wp], "copy")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_copy returns i64")
             }
@@ -9548,7 +7742,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["io_writer_write"], &[wp, ptr.into(), len.into()], "wr")
+                    .build_call(self.runtime(RuntimeKey::IoWriterWrite), &[wp, ptr.into(), len.into()], "wr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_write returns i32")
             }
@@ -9556,21 +7750,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let wp = self.operand(w)?.into();
                 let bp = self.operand(bld)?.into();
                 self.builder
-                    .build_call(self.funcs["io_writer_write_builder"], &[wp, bp], "wrb")
+                    .build_call(self.runtime(RuntimeKey::IoWriterWriteBuilder), &[wp, bp], "wrb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_write_builder returns i32")
             }
             Rvalue::WriterFlush(w) => {
                 let wp = self.operand(w)?.into();
                 self.builder
-                    .build_call(self.funcs["io_writer_flush"], &[wp], "wflush")
+                    .build_call(self.runtime(RuntimeKey::IoWriterFlush), &[wp], "wflush")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_flush returns i32")
             }
             Rvalue::BufferNew(cap) => {
                 let cap = self.operand(cap)?.into();
                 self.builder
-                    .build_call(self.funcs["buffer_new"], &[cap], "buf")
+                    .build_call(self.runtime(RuntimeKey::BufferNew), &[cap], "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_new returns a pointer")
             }
@@ -9579,14 +7773,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bp = self.operand(buf)?.into();
                 let slot = self.alloca_at_entry(slice_struct_type(self.ctx).into(), "bytesslot")?;
                 self.builder
-                    .build_call(self.funcs["buffer_bytes"], &[bp, slot.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BufferBytes), &[bp, slot.into()], "")
                     .map_err(|e| self.err(e))?;
                 self.builder.build_load(slice_struct_type(self.ctx), slot, "bytes").map_err(|e| self.err(e))?
             }
             Rvalue::BufferLen(buf) => {
                 let bp = self.operand(buf)?.into();
                 self.builder
-                    .build_call(self.funcs["buffer_len"], &[bp], "buflen")
+                    .build_call(self.runtime(RuntimeKey::BufferLen), &[bp], "buflen")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_len returns i64")
             }
@@ -9649,7 +7843,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let width_c = i64t.const_int(width, false);
                 let be_c = self.ctx.i32_type().const_int(u64::from(*be), false);
                 self.builder
-                    .build_call(self.funcs["buffer_put"], &[bp, bits.into(), width_c.into(), be_c.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BufferPut), &[bp, bits.into(), width_c.into(), be_c.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9658,7 +7852,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bp = self.operand(buffer)?.into();
                 let (ptr, len) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["buffer_append"], &[bp, ptr.into(), len.into()], "")
+                    .build_call(self.runtime(RuntimeKey::BufferAppend), &[bp, ptr.into(), len.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9675,7 +7869,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 let (d_ptr, d_len) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["fs_write_file"], &[p_ptr.into(), p_len.into(), d_ptr.into(), d_len.into()], "fwf")
+                    .build_call(self.runtime(RuntimeKey::FsWriteFile), &[p_ptr.into(), p_len.into(), d_ptr.into(), d_len.into()], "fwf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_write_file returns i32")
             }
@@ -9683,21 +7877,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 let bp = self.operand(builder)?.into();
                 self.builder
-                    .build_call(self.funcs["fs_write_file_builder"], &[p_ptr.into(), p_len.into(), bp], "fwfb")
+                    .build_call(self.runtime(RuntimeKey::FsWriteFileBuilder), &[p_ptr.into(), p_len.into(), bp], "fwfb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_write_file_builder returns i32")
             }
             Rvalue::FsExists { path } => {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 self.builder
-                    .build_call(self.funcs["fs_exists"], &[p_ptr.into(), p_len.into()], "fex")
+                    .build_call(self.runtime(RuntimeKey::FsExists), &[p_ptr.into(), p_len.into()], "fex")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_exists returns i32")
             }
             Rvalue::FsRemove { path } => {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 self.builder
-                    .build_call(self.funcs["fs_remove"], &[p_ptr.into(), p_len.into()], "frm")
+                    .build_call(self.runtime(RuntimeKey::FsRemove), &[p_ptr.into(), p_len.into()], "frm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
             }
@@ -9707,7 +7901,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (p_ptr, p_len) = self.split_str(path)?;
                 self.builder
-                    .build_call(self.funcs["fs_read_dir"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frd")
+                    .build_call(self.runtime(RuntimeKey::FsReadDir), &[p_ptr.into(), p_len.into(), out_ptr.into()], "frd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_dir returns i32")
             }
@@ -9717,7 +7911,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (h_ptr, h_len) = self.split_str(host)?;
                 self.builder
-                    .build_call(self.funcs["dns_resolve"], &[h_ptr.into(), h_len.into(), out_ptr.into()], "dnsr")
+                    .build_call(self.runtime(RuntimeKey::DnsResolve), &[h_ptr.into(), h_len.into(), out_ptr.into()], "dnsr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("dns_resolve returns i32")
             }
@@ -9729,7 +7923,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let port_v = self.operand(port)?.into();
                 let timeout_v = self.operand(timeout_ns)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_connect"], &[h_ptr.into(), h_len.into(), port_v, timeout_v, out_ptr.into()], "tconn")
+                    .build_call(self.runtime(RuntimeKey::TcpConnect), &[h_ptr.into(), h_len.into(), port_v, timeout_v, out_ptr.into()], "tconn")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_connect returns i32")
             }
@@ -9739,7 +7933,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(conn)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
-                    .build_call(self.funcs["tcp_read_timeout"], &[c.into(), n.into()], "")
+                    .build_call(self.runtime(RuntimeKey::TcpReadTimeout), &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9747,7 +7941,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(conn)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
-                    .build_call(self.funcs["tcp_write_timeout"], &[c.into(), n.into()], "")
+                    .build_call(self.runtime(RuntimeKey::TcpWriteTimeout), &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9755,14 +7949,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ConnReader(c) => {
                 let cp = self.operand(c)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_conn_reader"], &[cp], "creader")
+                    .build_call(self.runtime(RuntimeKey::TcpConnReader), &[cp], "creader")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_conn_reader returns a pointer")
             }
             Rvalue::ConnWriter(c) => {
                 let cp = self.operand(c)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_conn_writer"], &[cp], "cwriter")
+                    .build_call(self.runtime(RuntimeKey::TcpConnWriter), &[cp], "cwriter")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_conn_writer returns a pointer")
             }
@@ -9773,7 +7967,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (h_ptr, h_len) = self.split_str(host)?;
                 let port_v = self.operand(port)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_listen"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tlisten")
+                    .build_call(self.runtime(RuntimeKey::TcpListen), &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tlisten")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_listen returns i32")
             }
@@ -9783,7 +7977,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let lp = self.operand(listener)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_accept"], &[lp, out_ptr.into()], "taccept")
+                    .build_call(self.runtime(RuntimeKey::TcpAccept), &[lp, out_ptr.into()], "taccept")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_accept returns i32")
             }
@@ -9794,7 +7988,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (h_ptr, h_len) = self.split_str(host)?;
                 let port_v = self.operand(port)?.into();
                 self.builder
-                    .build_call(self.funcs["udp_bind"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "ubind")
+                    .build_call(self.runtime(RuntimeKey::UdpBind), &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "ubind")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("udp_bind returns i32")
             }
@@ -9806,7 +8000,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (h_ptr, h_len) = self.split_str(host)?;
                 let port_v = self.operand(port)?.into();
                 self.builder
-                    .build_call(self.funcs["udp_send_to"], &[sp, d_ptr.into(), d_len.into(), h_ptr.into(), h_len.into(), port_v], "usend")
+                    .build_call(self.runtime(RuntimeKey::UdpSendTo), &[sp, d_ptr.into(), d_len.into(), h_ptr.into(), h_len.into(), port_v], "usend")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("udp_send_to returns i64")
             }
@@ -9816,7 +8010,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sp = self.operand(sock)?.into();
                 let bp = self.operand(buffer)?.into();
                 self.builder
-                    .build_call(self.funcs["udp_recv_from"], &[sp, bp], "urecv")
+                    .build_call(self.runtime(RuntimeKey::UdpRecvFrom), &[sp, bp], "urecv")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("udp_recv_from returns i64")
             }
@@ -9831,7 +8025,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (c_ptr, c_len) = self.split_str(cmd)?;
                 let (a_ptr, a_len) = self.split_str(args)?;
                 self.builder
-                    .build_call(self.funcs["process_spawn"], &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into(), out_ptr.into()], "spawn")
+                    .build_call(self.runtime(RuntimeKey::ProcessSpawn), &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into(), out_ptr.into()], "spawn")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("process_spawn returns i32")
             }
@@ -9840,7 +8034,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ChildWait { child } => {
                 let cp = self.operand(child)?.into();
                 self.builder
-                    .build_call(self.funcs["child_wait"], &[cp], "cwait")
+                    .build_call(self.runtime(RuntimeKey::ChildWait), &[cp], "cwait")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("child_wait returns i64")
             }
@@ -9850,7 +8044,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let cp = self.operand(child)?.into();
                 let sv = self.operand(sig)?.into();
                 self.builder
-                    .build_call(self.funcs["child_kill"], &[cp, sv], "ckill")
+                    .build_call(self.runtime(RuntimeKey::ChildKill), &[cp, sv], "ckill")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("child_kill returns i32")
             }
@@ -9861,7 +8055,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (c_ptr, c_len) = self.split_str(cmd)?;
                 let (a_ptr, a_len) = self.split_str(args)?;
                 self.builder
-                    .build_call(self.funcs["process_exec"], &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into()], "pexec")
+                    .build_call(self.runtime(RuntimeKey::ProcessExec), &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into()], "pexec")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("process_exec returns i32")
             }
@@ -9873,7 +8067,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 let ah = self.operand(arena)?.into();
                 self.builder
-                    .build_call(self.funcs["fs_read_file_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
+                    .build_call(self.runtime(RuntimeKey::FsReadFileView), &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_file_view returns i32")
             }
@@ -9885,7 +8079,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (p_ptr, p_len) = self.split_str(path)?;
                 let ah = self.operand(arena)?.into();
                 self.builder
-                    .build_call(self.funcs["fs_read_bytes_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frbv")
+                    .build_call(self.runtime(RuntimeKey::FsReadBytesView), &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frbv")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_bytes_view returns i32")
             }
@@ -9894,53 +8088,53 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (ap, al) = self.split_str(a)?;
                 let (bp, bl) = self.split_str(b)?;
                 self.builder
-                    .build_call(self.funcs["path_join"], &[ap.into(), al.into(), bp.into(), bl.into()], "pjoin")
+                    .build_call(self.runtime(RuntimeKey::PathJoin), &[ap.into(), al.into(), bp.into(), bl.into()], "pjoin")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("path_join returns a {ptr,len}")
             }
             Rvalue::PathComponent { kind, path } => {
-                let fk = match kind {
-                    align_sema::hir::PathComponentKind::Base => "path_base",
-                    align_sema::hir::PathComponentKind::Dir => "path_dir",
-                    align_sema::hir::PathComponentKind::Ext => "path_ext",
+                let key = match kind {
+                    align_sema::hir::PathComponentKind::Base => RuntimeKey::PathBase,
+                    align_sema::hir::PathComponentKind::Dir => RuntimeKey::PathDir,
+                    align_sema::hir::PathComponentKind::Ext => RuntimeKey::PathExt,
                 };
                 let (pp, pl) = self.split_str(path)?;
                 self.builder
-                    .build_call(self.funcs[fk], &[pp.into(), pl.into()], "pcomp")
+                    .build_call(self.runtime(key), &[pp.into(), pl.into()], "pcomp")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("path component returns a {ptr,len}")
             }
             Rvalue::PathNormalize { path } => {
                 let (pp, pl) = self.split_str(path)?;
                 self.builder
-                    .build_call(self.funcs["path_normalize"], &[pp.into(), pl.into()], "pnorm")
+                    .build_call(self.runtime(RuntimeKey::PathNormalize), &[pp.into(), pl.into()], "pnorm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("path_normalize returns a {ptr,len}")
             }
             // std.encoding — encode returns an owned `{ptr,len}` string; decode writes a `buffer`
             // handle into `out` and returns an i32 status; utf8_valid returns an i32 (1/0).
             Rvalue::EncodingEncode { kind, data } => {
-                let fk = match kind {
-                    align_sema::hir::EncodingKind::Base64 => "base64_encode",
-                    align_sema::hir::EncodingKind::Base64Url => "base64url_encode",
-                    align_sema::hir::EncodingKind::Hex => "hex_encode",
-                    align_sema::hir::EncodingKind::Percent => "percent_encode",
-                    align_sema::hir::EncodingKind::Form => "form_encode",
-                    align_sema::hir::EncodingKind::Html => "html_escape",
+                let key = match kind {
+                    align_sema::hir::EncodingKind::Base64 => RuntimeKey::Base64Encode,
+                    align_sema::hir::EncodingKind::Base64Url => RuntimeKey::Base64urlEncode,
+                    align_sema::hir::EncodingKind::Hex => RuntimeKey::HexEncode,
+                    align_sema::hir::EncodingKind::Percent => RuntimeKey::PercentEncode,
+                    align_sema::hir::EncodingKind::Form => RuntimeKey::FormEncode,
+                    align_sema::hir::EncodingKind::Html => RuntimeKey::HtmlEscape,
                 };
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs[fk], &[dp.into(), dl.into()], "enc")
+                    .build_call(self.runtime(key), &[dp.into(), dl.into()], "enc")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("encode returns a {ptr,len}")
             }
             Rvalue::EncodingDecode { kind, input, out } => {
-                let fk = match kind {
-                    align_sema::hir::EncodingKind::Base64 => "base64_decode",
-                    align_sema::hir::EncodingKind::Base64Url => "base64url_decode",
-                    align_sema::hir::EncodingKind::Hex => "hex_decode",
-                    align_sema::hir::EncodingKind::Percent => "percent_decode",
-                    align_sema::hir::EncodingKind::Form => "form_decode",
+                let key = match kind {
+                    align_sema::hir::EncodingKind::Base64 => RuntimeKey::Base64Decode,
+                    align_sema::hir::EncodingKind::Base64Url => RuntimeKey::Base64urlDecode,
+                    align_sema::hir::EncodingKind::Hex => RuntimeKey::HexDecode,
+                    align_sema::hir::EncodingKind::Percent => RuntimeKey::PercentDecode,
+                    align_sema::hir::EncodingKind::Form => RuntimeKey::FormDecode,
                     // `html_escape` is encode-only — sema maps no `*_decode` method to `Html`, so an
                     // `EncodingDecode` node can never carry it.
                     align_sema::hir::EncodingKind::Html => unreachable!("html has no decode direction"),
@@ -9951,14 +8145,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let (ip, il) = self.split_str(input)?;
                 self.builder
-                    .build_call(self.funcs[fk], &[ip.into(), il.into(), out_ptr.into()], "dec")
+                    .build_call(self.runtime(key), &[ip.into(), il.into(), out_ptr.into()], "dec")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("decode returns i32 status")
             }
             Rvalue::Utf8Valid { data } => {
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["utf8_valid"], &[dp.into(), dl.into()], "u8v")
+                    .build_call(self.runtime(RuntimeKey::Utf8Valid), &[dp.into(), dl.into()], "u8v")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("utf8_valid returns i32")
             }
@@ -9968,14 +8162,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (ap, al) = self.split_str(a)?;
                 let (bp, bl) = self.split_str(b)?;
                 self.builder
-                    .build_call(self.funcs["crypto_ct_equal"], &[ap.into(), al.into(), bp.into(), bl.into()], "cteq")
+                    .build_call(self.runtime(RuntimeKey::CryptoCtEqual), &[ap.into(), al.into(), bp.into(), bl.into()], "cteq")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("crypto_ct_equal returns i32")
             }
             Rvalue::CryptoRandom { out } => {
                 let op = self.operand(out)?.into();
                 self.builder
-                    .build_call(self.funcs["crypto_random"], &[op], "")
+                    .build_call(self.runtime(RuntimeKey::CryptoRandom), &[op], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -9984,8 +8178,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CryptoHash { algo, data } => {
                 let (dp, dl) = self.split_str(data)?;
                 let f = match algo {
-                    align_sema::hir::HashAlgo::Sha256 => self.funcs["crypto_sha256"],
-                    align_sema::hir::HashAlgo::Sha512 => self.funcs["crypto_sha512"],
+                    align_sema::hir::HashAlgo::Sha256 => self.runtime(RuntimeKey::CryptoSha256),
+                    align_sema::hir::HashAlgo::Sha512 => self.runtime(RuntimeKey::CryptoSha512),
                 };
                 self.builder
                     .build_call(f, &[dp.into(), dl.into()], "digest")
@@ -9998,7 +8192,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (kp, kl) = self.split_str(key)?;
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["crypto_hmac_sha256"], &[kp.into(), kl.into(), dp.into(), dl.into()], "hmac")
+                    .build_call(self.runtime(RuntimeKey::CryptoHmacSha256), &[kp.into(), kl.into(), dp.into(), dl.into()], "hmac")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("crypto hmac returns a {ptr,len}")
             }
@@ -10016,7 +8210,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let lv = self.operand(len)?;
                 self.builder
                     .build_call(
-                        self.funcs["crypto_hkdf_sha256"],
+                        self.runtime(RuntimeKey::CryptoHkdfSha256),
                         &[sp.into(), sl.into(), ip.into(), il.into(), np.into(), nl.into(), lv.into(), out_ptr.into()],
                         "hkdf",
                     )
@@ -10028,11 +8222,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // runtime entry point is selected from the (cipher, dir) pair. Returns an i32 status.
             Rvalue::CryptoAead { cipher, dir, key, nonce, input, aad, out } => {
                 use align_sema::hir::{AeadCipher, AeadDir};
-                let fk = match (cipher, dir) {
-                    (AeadCipher::Aes256Gcm, AeadDir::Seal) => "crypto_aes_gcm_seal",
-                    (AeadCipher::Aes256Gcm, AeadDir::Open) => "crypto_aes_gcm_open",
-                    (AeadCipher::ChaCha20Poly1305, AeadDir::Seal) => "crypto_chacha20_poly1305_seal",
-                    (AeadCipher::ChaCha20Poly1305, AeadDir::Open) => "crypto_chacha20_poly1305_open",
+                let runtime_key = match (cipher, dir) {
+                    (AeadCipher::Aes256Gcm, AeadDir::Seal) => RuntimeKey::CryptoAesGcmSeal,
+                    (AeadCipher::Aes256Gcm, AeadDir::Open) => RuntimeKey::CryptoAesGcmOpen,
+                    (AeadCipher::ChaCha20Poly1305, AeadDir::Seal) => RuntimeKey::CryptoChacha20Poly1305Seal,
+                    (AeadCipher::ChaCha20Poly1305, AeadDir::Open) => RuntimeKey::CryptoChacha20Poly1305Open,
                 };
                 let out_ptr = self.slots[out];
                 self.builder
@@ -10044,7 +8238,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (ap, al) = self.split_str(aad)?;
                 self.builder
                     .build_call(
-                        self.funcs[fk],
+                        self.runtime(runtime_key),
                         &[kp.into(), kl.into(), np.into(), nl.into(), ip.into(), il.into(), ap.into(), al.into(), out_ptr.into()],
                         "aead",
                     )
@@ -10067,7 +8261,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let l = self.operand(&a.len)?;
                 self.builder
                     .build_call(
-                        self.funcs["crypto_argon2id"],
+                        self.runtime(RuntimeKey::CryptoArgon2id),
                         &[pp.into(), pl.into(), sp.into(), sl.into(), m.into(), t.into(), p.into(), l.into(), out_ptr.into()],
                         "argon2id",
                     )
@@ -10078,9 +8272,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime
             // returns an i32 status.
             Rvalue::CompressCompress { kind, data, level, out } => {
-                let fk = match kind {
-                    align_sema::hir::CompressKind::Gzip => "compress_gzip_compress",
-                    align_sema::hir::CompressKind::Zstd => "compress_zstd_compress",
+                let key = match kind {
+                    align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipCompress,
+                    align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdCompress,
                 };
                 let out_ptr = self.slots[out];
                 self.builder
@@ -10089,14 +8283,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (dp, dl) = self.split_str(data)?;
                 let lv = self.operand(level)?;
                 self.builder
-                    .build_call(self.funcs[fk], &[dp.into(), dl.into(), lv.into(), out_ptr.into()], "gzc")
+                    .build_call(self.runtime(key), &[dp.into(), dl.into(), lv.into(), out_ptr.into()], "gzc")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("gzip_compress returns i32 status")
             }
             Rvalue::CompressDecompress { kind, data, out } => {
-                let fk = match kind {
-                    align_sema::hir::CompressKind::Gzip => "compress_gzip_decompress",
-                    align_sema::hir::CompressKind::Zstd => "compress_zstd_decompress",
+                let key = match kind {
+                    align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipDecompress,
+                    align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdDecompress,
                 };
                 let out_ptr = self.slots[out];
                 self.builder
@@ -10104,7 +8298,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs[fk], &[dp.into(), dl.into(), out_ptr.into()], "gzd")
+                    .build_call(self.runtime(key), &[dp.into(), dl.into(), out_ptr.into()], "gzd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("gzip_decompress returns i32 status")
             }
@@ -10117,12 +8311,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Some(s) => {
                         let sv = self.operand(s)?;
                         self.builder
-                            .build_call(self.funcs["rng_seed_with"], &[out_ptr.into(), sv.into()], "")
+                            .build_call(self.runtime(RuntimeKey::RngSeedWith), &[out_ptr.into(), sv.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                     None => {
                         self.builder
-                            .build_call(self.funcs["rng_seed_os"], &[out_ptr.into()], "")
+                            .build_call(self.runtime(RuntimeKey::RngSeedOs), &[out_ptr.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                 }
@@ -10131,7 +8325,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::RandNext { rng } => {
                 let rng_ptr = self.slots[rng];
                 self.builder
-                    .build_call(self.funcs["rng_next"], &[rng_ptr.into()], "rnext")
+                    .build_call(self.runtime(RuntimeKey::RngNext), &[rng_ptr.into()], "rnext")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("rng_next returns i64")
             }
@@ -10140,7 +8334,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let lo = self.operand(lo)?;
                 let hi = self.operand(hi)?;
                 self.builder
-                    .build_call(self.funcs["rng_range"], &[rng_ptr.into(), lo.into(), hi.into()], "rrange")
+                    .build_call(self.runtime(RuntimeKey::RngRange), &[rng_ptr.into(), lo.into(), hi.into()], "rrange")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("rng_range returns i64")
             }
@@ -10150,7 +8344,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let esz = scalar_bytes(align_sema::ty_to_scalar(*elem).expect("shuffle element is a scalar"));
                 let esz = self.ctx.i64_type().const_int(esz, false);
                 self.builder
-                    .build_call(self.funcs["rng_shuffle"], &[rng_ptr.into(), xp.into(), xl.into(), esz.into()], "")
+                    .build_call(self.runtime(RuntimeKey::RngShuffle), &[rng_ptr.into(), xp.into(), xl.into(), esz.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10161,7 +8355,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let esz = scalar_bytes(align_sema::ty_to_scalar(*elem).expect("sample element is a scalar"));
                 let esz = self.ctx.i64_type().const_int(esz, false);
                 self.builder
-                    .build_call(self.funcs["rng_sample"], &[rng_ptr.into(), xp.into(), xl.into(), kv.into(), esz.into()], "rsample")
+                    .build_call(self.runtime(RuntimeKey::RngSample), &[rng_ptr.into(), xp.into(), xl.into(), kv.into(), esz.into()], "rsample")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("rng_sample returns a {ptr,len}")
             }
@@ -10171,7 +8365,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CliCommand { name } => {
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["cli_command"], &[np.into(), nl.into()], "clicmd")
+                    .build_call(self.runtime(RuntimeKey::CliCommand), &[np.into(), nl.into()], "clicmd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_command returns a handle pointer")
             }
@@ -10181,21 +8375,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 match kind {
                     align_sema::hir::CliFlagKind::Bool => {
                         self.builder
-                            .build_call(self.funcs["cli_flag_bool"], &[c.into(), np.into(), nl.into()], "")
+                            .build_call(self.runtime(RuntimeKey::CliFlagBool), &[c.into(), np.into(), nl.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                     align_sema::hir::CliFlagKind::Str => {
                         let d = default.as_ref().expect("flag_str carries a str default");
                         let (dp, dl) = self.split_str(d)?;
                         self.builder
-                            .build_call(self.funcs["cli_flag_str"], &[c.into(), np.into(), nl.into(), dp.into(), dl.into()], "")
+                            .build_call(self.runtime(RuntimeKey::CliFlagStr), &[c.into(), np.into(), nl.into(), dp.into(), dl.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                     align_sema::hir::CliFlagKind::I64 => {
                         let d = default.as_ref().expect("flag_i64 carries an i64 default");
                         let dv = self.operand(d)?;
                         self.builder
-                            .build_call(self.funcs["cli_flag_i64"], &[c.into(), np.into(), nl.into(), dv.into()], "")
+                            .build_call(self.runtime(RuntimeKey::CliFlagI64), &[c.into(), np.into(), nl.into(), dv.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
                 }
@@ -10209,7 +8403,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let (ap, al) = self.split_str(args)?;
                 self.builder
-                    .build_call(self.funcs["cli_parse"], &[c.into(), ap.into(), al.into(), out_ptr.into()], "cliparse")
+                    .build_call(self.runtime(RuntimeKey::CliParse), &[c.into(), ap.into(), al.into(), out_ptr.into()], "cliparse")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_parse returns i32 status")
             }
@@ -10217,7 +8411,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["cli_get_bool"], &[p.into(), np.into(), nl.into()], "cligetb")
+                    .build_call(self.runtime(RuntimeKey::CliGetBool), &[p.into(), np.into(), nl.into()], "cligetb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_get_bool returns i32")
             }
@@ -10225,7 +8419,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["cli_get_i64"], &[p.into(), np.into(), nl.into()], "cligeti")
+                    .build_call(self.runtime(RuntimeKey::CliGetI64), &[p.into(), np.into(), nl.into()], "cligeti")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_get_i64 returns i64")
             }
@@ -10233,14 +8427,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["cli_get_str"], &[p.into(), np.into(), nl.into()], "cligets")
+                    .build_call(self.runtime(RuntimeKey::CliGetStr), &[p.into(), np.into(), nl.into()], "cligets")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_get_str returns a {ptr,len}")
             }
             Rvalue::CliUsage { cmd } => {
                 let c = self.operand(cmd)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["cli_usage"], &[c.into()], "cliusage")
+                    .build_call(self.runtime(RuntimeKey::CliUsage), &[c.into()], "cliusage")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_usage returns a {ptr,len}")
             }
@@ -10249,7 +8443,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (mp, ml) = self.split_str(method)?;
                 let (up, ul) = self.split_str(url)?;
                 self.builder
-                    .build_call(self.funcs["http_request"], &[mp.into(), ml.into(), up.into(), ul.into()], "httpreq")
+                    .build_call(self.runtime(RuntimeKey::HttpRequest), &[mp.into(), ml.into(), up.into(), ul.into()], "httpreq")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_request returns a handle pointer")
             }
@@ -10258,7 +8452,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
-                    .build_call(self.funcs["http_header"], &[r.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpHeader), &[r.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10266,7 +8460,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let r = self.operand(req)?.into_pointer_value();
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["http_body"], &[r.into(), dp.into(), dl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpBody), &[r.into(), dp.into(), dl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10275,7 +8469,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let r = self.operand(req)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
-                    .build_call(self.funcs["http_timeout"], &[r.into(), n.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpTimeout), &[r.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10284,7 +8478,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(client)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
-                    .build_call(self.funcs["http_client_timeout"], &[c.into(), n.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpClientTimeout), &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10295,7 +8489,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (cp, cl) = self.split_str(cmd)?;
                 let (ap, al) = self.split_str(args)?;
                 self.builder
-                    .build_call(self.funcs["command_new"], &[cp.into(), cl.into(), ap.into(), al.into()], "cmdnew")
+                    .build_call(self.runtime(RuntimeKey::CommandNew), &[cp.into(), cl.into(), ap.into(), al.into()], "cmdnew")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("command_new returns a handle pointer")
             }
@@ -10304,7 +8498,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(command)?.into_pointer_value();
                 let (dp, dl) = self.split_str(dir)?;
                 self.builder
-                    .build_call(self.funcs["command_cwd"], &[c.into(), dp.into(), dl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::CommandCwd), &[c.into(), dp.into(), dl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10313,7 +8507,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(command)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
-                    .build_call(self.funcs["command_timeout"], &[c.into(), n.into()], "")
+                    .build_call(self.runtime(RuntimeKey::CommandTimeout), &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10323,7 +8517,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
-                    .build_call(self.funcs["command_env"], &[c.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::CommandEnv), &[c.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10331,7 +8525,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CommandEnvClear { command } => {
                 let c = self.operand(command)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["command_env_clear"], &[c.into()], "")
+                    .build_call(self.runtime(RuntimeKey::CommandEnvClear), &[c.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10345,7 +8539,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["command_run"], &[c.into(), out_ptr.into()], "cmdrun")
+                    .build_call(self.runtime(RuntimeKey::CommandRun), &[c.into(), out_ptr.into()], "cmdrun")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("command_run returns i32 status")
             }
@@ -10353,16 +8547,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::RunOutputCode { out } => {
                 let p = self.operand(out)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["run_output_code"], &[p.into()], "rocode")
+                    .build_call(self.runtime(RuntimeKey::RunOutputCode), &[p.into()], "rocode")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("run_output_code returns i64")
             }
             // `out.stdout()` / `out.stderr()` — a `str` view `{ptr,len}` into the run-output buffer.
             Rvalue::RunOutputView { out, err } => {
                 let p = self.operand(out)?.into_pointer_value();
-                let fname = if *err { "run_output_stderr" } else { "run_output_stdout" };
+                let key = if *err { RuntimeKey::RunOutputStderr } else { RuntimeKey::RunOutputStdout };
                 self.builder
-                    .build_call(self.funcs[fname], &[p.into()], "roview")
+                    .build_call(self.runtime(key), &[p.into()], "roview")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("run_output_stdout/stderr returns a {ptr,len}")
             }
@@ -10375,7 +8569,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["regex_compile"], &[pp.into(), pl.into(), out_ptr.into()], "recompile")
+                    .build_call(self.runtime(RuntimeKey::RegexCompile), &[pp.into(), pl.into(), out_ptr.into()], "recompile")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_compile returns i32 status")
             }
@@ -10383,7 +8577,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let re = self.operand(regex)?.into_pointer_value();
                 let (tp, tl) = self.split_str(text)?;
                 self.builder
-                    .build_call(self.funcs["regex_is_match"], &[re.into(), tp.into(), tl.into()], "rematch")
+                    .build_call(self.runtime(RuntimeKey::RegexIsMatch), &[re.into(), tp.into(), tl.into()], "rematch")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_is_match returns i32 flag")
             }
@@ -10394,7 +8588,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder
                     .build_call(
-                        self.funcs["regex_find"],
+                        self.runtime(RuntimeKey::RegexFind),
                         &[re.into(), tp.into(), tl.into(), sv.into(), out_ptr.into()],
                         "refind",
                     )
@@ -10410,9 +8604,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_store(out_ptr, slice_struct_type(self.ctx).const_zero())
                     .map_err(|e| self.err(e))?;
-                let fname = if matches!(rv, Rvalue::RegexSplit { .. }) { "regex_split" } else { "regex_find_all" };
+                let key = if matches!(rv, Rvalue::RegexSplit { .. }) {
+                    RuntimeKey::RegexSplit
+                } else {
+                    RuntimeKey::RegexFindAll
+                };
                 self.builder
-                    .build_call(self.funcs[fname], &[re.into(), tp.into(), tl.into(), out_ptr.into()], "refindall")
+                    .build_call(self.runtime(key), &[re.into(), tp.into(), tl.into(), out_ptr.into()], "refindall")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_find_all/split returns i32 status")
             }
@@ -10424,7 +8622,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let allv = self.ctx.i32_type().const_int(u64::from(*all), false);
                 self.builder
                     .build_call(
-                        self.funcs["regex_replace"],
+                        self.runtime(RuntimeKey::RegexReplace),
                         &[re.into(), tp.into(), tl.into(), rp.into(), rl.into(), allv.into()],
                         "rereplace",
                     )
@@ -10440,7 +8638,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["regex_captures"], &[re.into(), tp.into(), tl.into(), out_ptr.into()], "recaps")
+                    .build_call(self.runtime(RuntimeKey::RegexCaptures), &[re.into(), tp.into(), tl.into(), out_ptr.into()], "recaps")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_captures returns i32 flag")
             }
@@ -10449,14 +8647,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let iv = self.operand(index)?;
                 let out_ptr = self.slots[out];
                 self.builder
-                    .build_call(self.funcs["regex_captures_group"], &[c.into(), iv.into(), out_ptr.into()], "recapg")
+                    .build_call(self.runtime(RuntimeKey::RegexCapturesGroup), &[c.into(), iv.into(), out_ptr.into()], "recapg")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_captures_group returns i32 flag")
             }
             Rvalue::RegexGroupCount { regex } => {
                 let re = self.operand(regex)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["regex_group_count"], &[re.into()], "regcount")
+                    .build_call(self.runtime(RuntimeKey::RegexGroupCount), &[re.into()], "regcount")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_group_count returns i64")
             }
@@ -10464,7 +8662,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let re = self.operand(regex)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["regex_group_index"], &[re.into(), np.into(), nl.into()], "regidx")
+                    .build_call(self.runtime(RuntimeKey::RegexGroupIndex), &[re.into(), np.into(), nl.into()], "regidx")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_group_index returns i64")
             }
@@ -10475,14 +8673,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["http_parse"], &[dp.into(), dl.into(), out_ptr.into()], "httpparse")
+                    .build_call(self.runtime(RuntimeKey::HttpParse), &[dp.into(), dl.into(), out_ptr.into()], "httpparse")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_parse returns i32 status")
             }
             Rvalue::HttpRespStatus { resp } => {
                 let p = self.operand(resp)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_resp_status"], &[p.into()], "httpstatus")
+                    .build_call(self.runtime(RuntimeKey::HttpRespStatus), &[p.into()], "httpstatus")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_resp_status returns i64")
             }
@@ -10492,14 +8690,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["http_resp_header"], &[p.into(), np.into(), nl.into(), out_ptr.into()], "httphdr")
+                    .build_call(self.runtime(RuntimeKey::HttpRespHeader), &[p.into(), np.into(), nl.into(), out_ptr.into()], "httphdr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_resp_header returns i32 present flag")
             }
             Rvalue::HttpRespBody { resp } => {
                 let p = self.operand(resp)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_resp_body"], &[p.into()], "httpbody")
+                    .build_call(self.runtime(RuntimeKey::HttpRespBody), &[p.into()], "httpbody")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_resp_body returns a {ptr,len}")
             }
@@ -10508,7 +8706,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // free), matching `http_parse`.
             Rvalue::HttpClient => self
                 .builder
-                .build_call(self.funcs["http_client_new"], &[], "httpclient")
+                .build_call(self.runtime(RuntimeKey::HttpClientNew), &[], "httpclient")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("http_client_new returns a handle pointer"),
             Rvalue::HttpClientGet { client, url, out } => {
@@ -10517,7 +8715,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (up, ul) = self.split_str(url)?;
                 self.builder
-                    .build_call(self.funcs["http_client_get"], &[c.into(), up.into(), ul.into(), out_ptr.into()], "httpget")
+                    .build_call(self.runtime(RuntimeKey::HttpClientGet), &[c.into(), up.into(), ul.into(), out_ptr.into()], "httpget")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_client_get returns i32 status")
             }
@@ -10528,7 +8726,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (up, ul) = self.split_str(url)?;
                 let (bp, bl) = self.split_str(body)?;
                 self.builder
-                    .build_call(self.funcs["http_client_post"], &[c.into(), up.into(), ul.into(), bp.into(), bl.into(), out_ptr.into()], "httppost")
+                    .build_call(self.runtime(RuntimeKey::HttpClientPost), &[c.into(), up.into(), ul.into(), bp.into(), bl.into(), out_ptr.into()], "httppost")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_client_post returns i32 status")
             }
@@ -10538,7 +8736,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["http_client_request"], &[c.into(), r.into(), out_ptr.into()], "httpreqcall")
+                    .build_call(self.runtime(RuntimeKey::HttpClientRequest), &[c.into(), r.into(), out_ptr.into()], "httpreqcall")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_client_request returns i32 status")
             }
@@ -10553,7 +8751,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (up, ul) = self.split_str(urls)?;
                 let mc = self.operand(max_concurrency)?.into();
                 self.builder
-                    .build_call(self.funcs["http_get_many"], &[c.into(), up.into(), ul.into(), mc, out_ptr.into()], "httpgetmany")
+                    .build_call(self.runtime(RuntimeKey::HttpGetMany), &[c.into(), up.into(), ul.into(), mc, out_ptr.into()], "httpgetmany")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_get_many returns i32 status")
             }
@@ -10566,7 +8764,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let port_v = self.operand(port)?;
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
-                let callee = if *shared { self.funcs["http_serve_shared"] } else { self.funcs["http_serve"] };
+                let callee = if *shared { self.runtime(RuntimeKey::HttpServeShared) } else { self.runtime(RuntimeKey::HttpServe) };
                 self.builder
                     .build_call(callee, &[hp.into(), hl.into(), port_v.into(), out_ptr.into()], "httpserve")
                     .map_err(|e| self.err(e))?
@@ -10577,21 +8775,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["http_accept"], &[s.into(), out_ptr.into()], "httpaccept")
+                    .build_call(self.runtime(RuntimeKey::HttpAccept), &[s.into(), out_ptr.into()], "httpaccept")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_accept returns i32 status")
             }
             Rvalue::HttpCtxMethod { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_ctx_method"], &[p.into()], "httpmethod")
+                    .build_call(self.runtime(RuntimeKey::HttpCtxMethod), &[p.into()], "httpmethod")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_method returns a {ptr,len}")
             }
             Rvalue::HttpCtxPath { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_ctx_path"], &[p.into()], "httppath")
+                    .build_call(self.runtime(RuntimeKey::HttpCtxPath), &[p.into()], "httppath")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_path returns a {ptr,len}")
             }
@@ -10601,21 +8799,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["http_ctx_header"], &[p.into(), np.into(), nl.into(), out_ptr.into()], "httpctxhdr")
+                    .build_call(self.runtime(RuntimeKey::HttpCtxHeader), &[p.into(), np.into(), nl.into(), out_ptr.into()], "httpctxhdr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_header returns i32 present flag")
             }
             Rvalue::HttpCtxBody { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_ctx_body"], &[p.into()], "httpctxbody")
+                    .build_call(self.runtime(RuntimeKey::HttpCtxBody), &[p.into()], "httpctxbody")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_body returns a {ptr,len}")
             }
             Rvalue::HttpResponseBuilder { status } => {
                 let status_v = self.operand(status)?;
                 self.builder
-                    .build_call(self.funcs["http_response_new"], &[status_v.into()], "httprb")
+                    .build_call(self.runtime(RuntimeKey::HttpResponseNew), &[status_v.into()], "httprb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_response_new returns a handle pointer")
             }
@@ -10624,7 +8822,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
-                    .build_call(self.funcs["http_rb_header"], &[r.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpRbHeader), &[r.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10632,7 +8830,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let r = self.operand(rb)?.into_pointer_value();
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["http_rb_body"], &[r.into(), dp.into(), dl.into()], "")
+                    .build_call(self.runtime(RuntimeKey::HttpRbBody), &[r.into(), dp.into(), dl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10640,7 +8838,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let c = self.operand(ctx)?.into_pointer_value();
                 let r = self.operand(rb)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_respond"], &[c.into(), r.into()], "httprespond")
+                    .build_call(self.runtime(RuntimeKey::HttpRespond), &[c.into(), r.into()], "httprespond")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond returns i32 status")
             }
@@ -10650,23 +8848,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["http_respond_stream"], &[c.into(), r.into(), out_ptr.into()], "httprespondstream")
+                    .build_call(self.runtime(RuntimeKey::HttpRespondStream), &[c.into(), r.into(), out_ptr.into()], "httprespondstream")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond_stream returns i32 status")
             }
             Rvalue::HttpStreamSend { stream, chunk, event } => {
                 let s = self.operand(stream)?.into_pointer_value();
                 let (dp, dl) = self.split_str(chunk)?;
-                let f = if *event { "http_stream_send_event" } else { "http_stream_send" };
+                let key = if *event { RuntimeKey::HttpStreamSendEvent } else { RuntimeKey::HttpStreamSend };
                 self.builder
-                    .build_call(self.funcs[f], &[s.into(), dp.into(), dl.into()], "httpstreamsend")
+                    .build_call(self.runtime(key), &[s.into(), dp.into(), dl.into()], "httpstreamsend")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_send returns i32 status")
             }
             Rvalue::HttpStreamFinish { stream } => {
                 let s = self.operand(stream)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_stream_finish"], &[s.into()], "httpstreamfinish")
+                    .build_call(self.runtime(RuntimeKey::HttpStreamFinish), &[s.into()], "httpstreamfinish")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_finish returns i32 status")
             }
@@ -10674,7 +8872,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let s = self.operand(stream)?.into_pointer_value();
                 let r = self.operand(rb)?.into_pointer_value();
                 self.builder
-                    .build_call(self.funcs["http_stream_reject"], &[s.into(), r.into()], "httpstreamreject")
+                    .build_call(self.runtime(RuntimeKey::HttpStreamReject), &[s.into(), r.into()], "httpstreamreject")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_reject returns i32 status")
             }
@@ -10684,7 +8882,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (np, nl) = self.split_str(name)?;
                 self.builder
-                    .build_call(self.funcs["env_get"], &[np.into(), nl.into(), out_ptr.into()], "envget")
+                    .build_call(self.runtime(RuntimeKey::EnvGet), &[np.into(), nl.into(), out_ptr.into()], "envget")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("env_get returns i32")
             }
@@ -10692,29 +8890,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
-                    .build_call(self.funcs["env_set"], &[np.into(), nl.into(), vp.into(), vl.into()], "envset")
+                    .build_call(self.runtime(RuntimeKey::EnvSet), &[np.into(), nl.into(), vp.into(), vl.into()], "envset")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("env_set returns i32")
             }
             Rvalue::TimeNow => self
                 .builder
-                .build_call(self.funcs["time_now"], &[], "now")
+                .build_call(self.runtime(RuntimeKey::TimeNow), &[], "now")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("time_now returns i64"),
             Rvalue::TimeInstant => self
                 .builder
-                .build_call(self.funcs["time_instant"], &[], "instant")
+                .build_call(self.runtime(RuntimeKey::TimeInstant), &[], "instant")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("time_instant returns i64"),
             Rvalue::ProcessCpuCount => self
                 .builder
-                .build_call(self.funcs["process_cpu_count"], &[], "cpucount")
+                .build_call(self.runtime(RuntimeKey::ProcessCpuCount), &[], "cpucount")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("process_cpu_count returns i64"),
             Rvalue::TimeSleep { ns } => {
                 let n = self.operand(ns)?.into();
                 self.builder
-                    .build_call(self.funcs["time_sleep"], &[n], "")
+                    .build_call(self.runtime(RuntimeKey::TimeSleep), &[n], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
@@ -10850,7 +9048,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let new_ptr = self
                     .builder
                     .build_call(
-                        self.funcs["arena_alloc"],
+                        self.runtime(RuntimeKey::ArenaAlloc),
                         &[self.operand(handle)?.into(), i64t.const_int(bytes, false).into(), i64t.const_int(bytes, false).into()],
                         "clone",
                     )
@@ -10868,7 +9066,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::Call(name, args) if name == "error" => self.operand(&args[0])?,
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) if name == "hash64" || name == "hash128" => {
-                return self.gen_hash(name, args);
+                let key = if name == "hash64" { RuntimeKey::Hash64 } else { RuntimeKey::Hash128 };
+                return self.gen_hash(key, args);
             }
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
@@ -11228,7 +9427,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?
                         .into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropfldptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
                 // A tagged field owns only its active payload. Reuse the canonical recursive
                 // destructor so `Option<MoveStruct>` and later nested owned shapes cannot diverge
@@ -11294,7 +9493,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?
                         .into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "droparrptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
                 // A nested Move-struct *array* field — drop each element (defensive: struct fields
                 // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
@@ -11319,18 +9518,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A Move **handle** field (F1②): a bare pointer handle — `http_request_ctx`, `file`,
                 // a reader/writer/buffer, a socket, an http request/response/client/server/stream, a
                 // cli command/parsed. Load the pointer and call its null-safe `*_free`, exactly like a
-                // standalone handle local's `Stmt::Drop` (shared `handle_free_fn` — one source of
+                // standalone handle local's `Stmt::Drop` (shared `handle_free_key` — one source of
                 // truth). A moved-out / zeroed field reads a null handle, so the free is a no-op —
                 // the resource is closed at most once. `is_field_ok` admits exactly this handle set,
                 // so no allowed field type reaches the `_` arm below and silently leaks.
-                ty if handle_free_fn(ty).is_some() => {
-                    let free_fn = handle_free_fn(ty).expect("guarded by the arm pattern");
+                ty if handle_free_key(ty).is_some() => {
+                    let free_key = handle_free_key(ty).expect("guarded by the arm pattern");
                     let fp = self.builder.build_struct_gep(st, base, pi, "drophandle").map_err(|e| self.err(e))?;
                     let p = self
                         .builder
                         .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "drophandlev")
                         .map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.funcs[free_fn], &[p.into()], "").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.runtime(free_key), &[p.into()], "").map_err(|e| self.err(e))?;
                 }
                 _ => {}
             }
@@ -11397,7 +9596,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
         // done: free the AoS buffer (null-safe for an empty array).
         self.builder.position_at_end(done);
-        self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+        self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -11484,13 +9683,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `hash64(data)` / `hash128(data)` — split the byte view `{ptr,len}` and call the runtime.
     /// `str`, `string`, and `slice<u8>` all lower to the same `{ptr, i64}` struct, so one path
     /// serves every input type. `hash64` returns an i64; `hash128` returns a `{i64,i64}` tuple value.
-    fn gen_hash(&mut self, name: &str, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+    fn gen_hash(&mut self, key: RuntimeKey, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let agg = self.operand(&args[0])?.into_struct_value();
         let ptr = self.builder.build_extract_value(agg, 0, "hptr").map_err(|e| self.err(e))?;
         let len = self.builder.build_extract_value(agg, 1, "hlen").map_err(|e| self.err(e))?;
         let cs = self
             .builder
-            .build_call(self.funcs[name], &[ptr.into(), len.into()], "hash")
+            .build_call(self.runtime(key), &[ptr.into(), len.into()], "hash")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic())
     }
@@ -11514,7 +9713,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             align_sema::PrintKind::Str => {
                 let (ptr, len) = self.display_view(arg, "'print' of a string")?;
                 self.builder
-                    .build_call(self.funcs["print_str"], &[ptr.into(), len.into()], "")
+                    .build_call(self.runtime(RuntimeKey::PrintStr), &[ptr.into(), len.into()], "")
                     .map_err(|e| self.err(e))?;
             }
             // print(bool): widen i1 to i32 and emit `true`/`false`.
@@ -11522,22 +9721,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let v = self.display_int(arg, "'print' of a bool")?;
                 let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["print_bool"], &[wide.into()], "")
+                    .build_call(self.runtime(RuntimeKey::PrintBool), &[wide.into()], "")
                     .map_err(|e| self.err(e))?;
             }
             // print(char): pass the u32 scalar; the runtime emits its UTF-8.
             align_sema::PrintKind::Char => {
                 let v = self.display_int(arg, "'print' of a char")?;
                 self.builder
-                    .build_call(self.funcs["print_char"], &[v.into()], "")
+                    .build_call(self.runtime(RuntimeKey::PrintChar), &[v.into()], "")
                     .map_err(|e| self.err(e))?;
             }
             // print(float): the runtime renders the shortest round-trip decimal.
             align_sema::PrintKind::Float => {
                 let v = self.display_float(arg, "'print' of a float")?;
-                let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "print_f32" } else { "print_f64" };
+                let key = if ty == Ty::Float(FloatTy { bits: 32 }) {
+                    RuntimeKey::PrintF32
+                } else {
+                    RuntimeKey::PrintF64
+                };
                 self.builder
-                    .build_call(self.funcs[callee], &[v.into()], "")
+                    .build_call(self.runtime(key), &[v.into()], "")
                     .map_err(|e| self.err(e))?;
             }
             align_sema::PrintKind::Int => {
@@ -11552,7 +9755,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } else {
                     v
                 };
-                let callee = self.funcs["print"];
+                let callee = self.runtime(RuntimeKey::Print);
                 self.builder
                     .build_call(callee, &[wide.into()], "")
                     .map_err(|e| self.err(e))?;
@@ -12042,7 +10245,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode_union"],
+                self.runtime(RuntimeKey::JsonDecodeUnion),
                 &[in_ptr.into(), in_len.into(), union_desc.into(), out_ptr.into()],
                 "jdecu",
             )
@@ -12069,7 +10272,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode"],
+                self.runtime(RuntimeKey::JsonDecode),
                 &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), out_ptr.into(), size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jdec",
             )
@@ -12086,7 +10289,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let ah = self.operand(arena)?;
         let cs = self
             .builder
-            .build_call(self.funcs["json_doc_parse"], &[in_ptr.into(), in_len.into(), ah.into(), out_ptr.into()], "jdoc")
+            .build_call(self.runtime(RuntimeKey::JsonDocParse), &[in_ptr.into(), in_len.into(), ah.into(), out_ptr.into()], "jdoc")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_doc_parse returns i32"))
     }
@@ -12103,7 +10306,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let (tape, node) = self.split_doc(doc)?;
         let tag = self
             .builder
-            .build_call(self.funcs["json_doc_kind"], &[tape.into(), node.into()], "jkind")
+            .build_call(self.runtime(RuntimeKey::JsonDocKind), &[tape.into(), node.into()], "jkind")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12126,7 +10329,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let (tape, node) = self.split_doc(doc)?;
         let (kp, kl) = self.split_str(key)?;
         self.builder
-            .build_call(self.funcs["json_doc_get"], &[tape.into(), node.into(), kp.into(), kl.into(), out_ptr.into()], "")
+            .build_call(self.runtime(RuntimeKey::JsonDocGet), &[tape.into(), node.into(), kp.into(), kl.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(())
     }
@@ -12140,7 +10343,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let idx = self.operand(index)?;
         Ok(self
             .builder
-            .build_call(self.funcs["json_doc_key"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "jkey")
+            .build_call(self.runtime(RuntimeKey::JsonDocKey), &[tape.into(), node.into(), idx.into(), out_ptr.into()], "jkey")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12155,7 +10358,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let (tape, node) = self.split_doc(doc)?;
         let ah = self.operand(arena)?;
         self.builder
-            .build_call(self.funcs["json_doc_elems"], &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
+            .build_call(self.runtime(RuntimeKey::JsonDocElems), &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(())
     }
@@ -12167,7 +10370,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let (tape, node) = self.split_doc(doc)?;
         let idx = self.operand(index)?;
         self.builder
-            .build_call(self.funcs["json_doc_at"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "")
+            .build_call(self.runtime(RuntimeKey::JsonDocAt), &[tape.into(), node.into(), idx.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(())
     }
@@ -12180,7 +10383,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let (tape, node) = self.split_doc(doc)?;
         Ok(self
             .builder
-            .build_call(self.funcs["json_doc_as_str"], &[tape.into(), node.into(), out_ptr.into()], "jasstr")
+            .build_call(self.runtime(RuntimeKey::JsonDocAsStr), &[tape.into(), node.into(), out_ptr.into()], "jasstr")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12195,15 +10398,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // `Drop`/consumers could otherwise see stale bytes).
         let out_ptr = self.slots[&out];
         let (tape, node) = self.split_doc(doc)?;
-        let sym = match scalar {
-            Ty::Int(_) => "json_doc_as_i64",
-            Ty::Float(_) => "json_doc_as_f64",
-            Ty::Bool => "json_doc_as_bool",
+        let key = match scalar {
+            Ty::Int(_) => RuntimeKey::JsonDocAsI64,
+            Ty::Float(_) => RuntimeKey::JsonDocAsF64,
+            Ty::Bool => RuntimeKey::JsonDocAsBool,
             _ => unreachable!("json.doc leaf accessor scalar is i64/f64/bool"),
         };
         Ok(self
             .builder
-            .build_call(self.funcs[sym], &[tape.into(), node.into(), out_ptr.into()], "jasscalar")
+            .build_call(self.runtime(key), &[tape.into(), node.into(), out_ptr.into()], "jasscalar")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12232,7 +10435,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode_struct_array"],
+                self.runtime(RuntimeKey::JsonDecodeStructArray),
                 &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), elem_size.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jdecsa",
             )
@@ -12259,7 +10462,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_scan_next"],
+                self.runtime(RuntimeKey::JsonScanNext),
                 &[in_ptr.into(), in_len.into(), cursor_ptr.into(), t.descs.into(), n.into(), row_ptr.into(), out_size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jscannext",
             )
@@ -12290,7 +10493,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode_soa"],
+                self.runtime(RuntimeKey::JsonDecodeSoa),
                 &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), arena_v.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jdecsoa",
             )
@@ -12321,7 +10524,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode_array"],
+                self.runtime(RuntimeKey::JsonDecodeArray),
                 &[in_ptr.into(), in_len.into(), tag_v.into(), out_ptr.into()],
                 "jdeca",
             )
@@ -12351,7 +10554,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cs = self
             .builder
             .build_call(
-                self.funcs["json_decode_scalar"],
+                self.runtime(RuntimeKey::JsonDecodeScalar),
                 &[in_ptr.into(), in_len.into(), tag_v.into(), out_ptr.into()],
                 "jdecs",
             )
@@ -12382,7 +10585,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
             .builder
-            .build_call(self.funcs["fs_read_file"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
+            .build_call(self.runtime(RuntimeKey::FsReadFile), &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
     }
@@ -12396,7 +10599,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ReaderBuffered(r) => {
                 let rp = self.operand(r)?.into();
                 self.builder
-                    .build_call(self.funcs["io_reader_buffered"], &[rp], "buffered")
+                    .build_call(self.runtime(RuntimeKey::IoReaderBuffered), &[rp], "buffered")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_reader_buffered returns a pointer")
             }
@@ -12405,7 +10608,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let rp = self.operand(r)?.into();
                 let bp = self.operand(buf)?.into();
                 self.builder
-                    .build_call(self.funcs["io_reader_read_line"], &[rp, bp], "readline")
+                    .build_call(self.runtime(RuntimeKey::IoReaderReadLine), &[rp, bp], "readline")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_reader_read_line returns i64")
             }
@@ -12415,7 +10618,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (b_ptr, b_len) = self.split_str(bytes)?;
                 self.builder
-                    .build_call(self.funcs["bytes_as_str"], &[b_ptr.into(), b_len.into(), out_ptr.into()], "asstr")
+                    .build_call(self.runtime(RuntimeKey::BytesAsStr), &[b_ptr.into(), b_len.into(), out_ptr.into()], "asstr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("bytes_as_str returns i32")
             }
@@ -12431,15 +10634,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
     #[inline(never)]
     fn gen_file_rvalue(&mut self, rv: &Rvalue) -> Result<BasicValueEnum<'c>, CodegenError> {
         Ok(match rv {
-            Rvalue::FileCreateRw { path, out } => self.gen_open_handle("io_file_create", path, *out)?,
-            Rvalue::FileOpenRw { path, out } => self.gen_open_handle("io_file_open", path, *out)?,
+            Rvalue::FileCreateRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreate, path, *out)?,
+            Rvalue::FileOpenRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpen, path, *out)?,
             // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
             Rvalue::FilePread { file, buffer, offset } => {
                 let fp = self.operand(file)?.into();
                 let bp = self.operand(buffer)?.into();
                 let off = self.operand(offset)?.into();
                 self.builder
-                    .build_call(self.funcs["io_file_pread"], &[fp, bp, off], "pread")
+                    .build_call(self.runtime(RuntimeKey::IoFilePread), &[fp, bp, off], "pread")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_pread returns i64")
             }
@@ -12451,7 +10654,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let len = self.builder.build_extract_value(agg, 1, "pwlen").map_err(|e| self.err(e))?;
                 let off = self.operand(offset)?.into();
                 self.builder
-                    .build_call(self.funcs["io_file_pwrite"], &[fp, ptr.into(), len.into(), off], "pwrite")
+                    .build_call(self.runtime(RuntimeKey::IoFilePwrite), &[fp, ptr.into(), len.into(), off], "pwrite")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_pwrite returns i64")
             }
@@ -12459,7 +10662,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::FileLen { file } => {
                 let fp = self.operand(file)?.into();
                 self.builder
-                    .build_call(self.funcs["io_file_len"], &[fp], "flen")
+                    .build_call(self.runtime(RuntimeKey::IoFileLen), &[fp], "flen")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_len returns i64")
             }
@@ -12470,7 +10673,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `fs.open` / `fs.create`: zero the out handle slot (so a failed open leaves null — its `Drop`
     /// is a null-safe no-op), then call the runtime opener (`func`) with the path `{ptr,len}` and the
     /// out slot. Returns the i32 errno-status (0 = ok).
-    fn gen_open_handle(&mut self, func: &str, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_open_handle(&mut self, key: RuntimeKey, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         self.builder
             .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
@@ -12480,7 +10683,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
             .builder
-            .build_call(self.funcs[func], &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
+            .build_call(self.runtime(key), &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
     }
@@ -12539,7 +10742,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let bptr = self
             .builder
             .build_call(
-                self.funcs["builder_init_stack"],
+                self.runtime(RuntimeKey::BuilderInitStack),
                 &[header.into(), arena_ptr.into(), zero.into()],
                 "b.stack",
             )
@@ -12553,7 +10756,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::Static(s) => {
                     let (ptr, len) = self.str_global(s);
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 // A `str` hole — an owned `string` reaches here already borrowed to one (sema's
@@ -12561,7 +10764,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::StrHole(op) => {
                     let (ptr, len) = self.display_view(op, "a str template hole")?;
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::IntHole(op) => {
@@ -12578,34 +10781,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         v
                     };
                     self.builder
-                        .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWriteInt), &[bptr.into(), wide.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::BoolHole(op) => {
                     let v = self.display_int(op, "a bool template hole")?;
                     let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                     self.builder
-                        .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWriteBool), &[bptr.into(), wide.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::CharHole(op) => {
                     let v = self.display_int(op, "a char template hole")?;
                     self.builder
-                        .build_call(self.funcs["builder_write_char"], &[bptr.into(), v.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWriteChar), &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::FloatHole(op) => {
                     let ty = self.f.operand_ty(op);
                     let v = self.display_float(op, "a float template hole")?;
-                    let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
+                    let key = if ty == Ty::Float(FloatTy { bits: 32 }) {
+                        RuntimeKey::BuilderWriteF32
+                    } else {
+                        RuntimeKey::BuilderWriteF64
+                    };
                     self.builder
-                        .build_call(self.funcs[callee], &[bptr.into(), v.into()], "")
+                        .build_call(self.runtime(key), &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::JsonStrHole(op) => {
                     let (ptr, len) = self.display_view(op, "a json.encode str field")?;
                     self.builder
-                        .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` `Option<T>` field: when `Some`, append `"name":<payload>,`; else
@@ -12635,7 +10842,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // `"name":` prefix.
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), pptr.into(), plen.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), pptr.into(), plen.into()], "")
                         .map_err(|e| self.err(e))?;
                     // Render the payload by its scalar kind (mirrors the holes above).
                     match scalar_to_ty(s) {
@@ -12646,7 +10853,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             let sptr = self.builder.build_extract_value(pa, 0, "osp").map_err(|e| self.err(e))?;
                             let slen = self.builder.build_extract_value(pa, 1, "osl").map_err(|e| self.err(e))?;
                             self.builder
-                                .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), sptr.into(), slen.into()], "")
+                                .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), sptr.into(), slen.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                         Ty::Bool => {
@@ -12655,15 +10862,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             };
                             let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                             self.builder
-                                .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
+                                .build_call(self.runtime(RuntimeKey::BuilderWriteBool), &[bptr.into(), wide.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                         fty @ Ty::Float(_) => {
                             let BasicValueEnum::FloatValue(v) = payload else {
                                 return Err(self.err(format!("json.encode Option field '{name}' payload is not a float")));
                             };
-                            let callee = if fty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
-                            self.builder.build_call(self.funcs[callee], &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
+                            let key = if fty == Ty::Float(FloatTy { bits: 32 }) {
+                                RuntimeKey::BuilderWriteF32
+                            } else {
+                                RuntimeKey::BuilderWriteF64
+                            };
+                            self.builder.build_call(self.runtime(key), &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
                         }
                         // Integers render through the int writer. Anything else is NOT an integer at
                         // the LLVM level, and blindly calling `into_int_value()` on it aborts the
@@ -12688,7 +10899,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 v
                             };
                             self.builder
-                                .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
+                                .build_call(self.runtime(RuntimeKey::BuilderWriteInt), &[bptr.into(), wide.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                         other => {
@@ -12700,7 +10911,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // Trailing comma (stripped by `PopComma` if this is the last present field).
                     let (cptr, clen) = self.str_global(",");
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), cptr.into(), clen.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), cptr.into(), clen.into()], "")
                         .map_err(|e| self.err(e))?;
                     self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(cont_bb);
@@ -12728,7 +10939,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.position_at_end(some_bb);
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), pptr.into(), plen.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), pptr.into(), plen.into()], "")
                         .map_err(|e| self.err(e))?;
                     // Store the payload struct to an entry alloca and hand its pointer + descriptor table
                     // to the runtime object encoder (a hoisted slot so an encode in a loop stays flat).
@@ -12738,18 +10949,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let t = self.emit_desc_table(*struct_id)?;
                     let n = i64t.const_int(t.n_fields, false);
                     self.builder
-                        .build_call(self.funcs["json_encode_object"], &[bptr.into(), slot.into(), t.descs.into(), n.into()], "")
+                        .build_call(self.runtime(RuntimeKey::JsonEncodeObject), &[bptr.into(), slot.into(), t.descs.into(), n.into()], "")
                         .map_err(|e| self.err(e))?;
                     let (cptr, clen) = self.str_global(",");
                     self.builder
-                        .build_call(self.funcs["builder_write"], &[bptr.into(), cptr.into(), clen.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), cptr.into(), clen.into()], "")
                         .map_err(|e| self.err(e))?;
                     self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(cont_bb);
                 }
                 align_mir::TemplatePiece::PopComma => {
                     self.builder
-                        .build_call(self.funcs["builder_pop_comma"], &[bptr.into()], "")
+                        .build_call(self.runtime(RuntimeKey::BuilderPopComma), &[bptr.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` of an `array<Struct>` field: hand the owned AoS `{ptr,len}` and the
@@ -12764,7 +10975,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let esz = i64t.const_int(self.element_allocation_size(self.struct_types[*struct_id as usize].into()), false);
                     self.builder
                         .build_call(
-                            self.funcs["json_encode_struct_array"],
+                            self.runtime(RuntimeKey::JsonEncodeStructArray),
                             &[bptr.into(), ptr.into(), len.into(), t.descs.into(), n.into(), esz.into()],
                             "",
                         )
@@ -12788,7 +10999,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null)?;
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
-                        .build_call(self.funcs["json_encode_scalar_array"], &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
+                        .build_call(self.runtime(RuntimeKey::JsonEncodeScalarArray), &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` of a shape-directed union: materialize the enum value in memory (the
@@ -12803,15 +11014,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_store(slot, v).map_err(|e| self.err(e))?;
                     let union_desc = self.emit_json_union(*enum_id)?;
                     self.builder
-                        .build_call(self.funcs["json_encode_union"], &[bptr.into(), slot.into(), union_desc.into()], "")
+                        .build_call(self.runtime(RuntimeKey::JsonEncodeUnion), &[bptr.into(), slot.into(), union_desc.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }
         }
-        let finish = if arena.is_some() { "builder_finish_stack" } else { "builder_into_string_stack" };
+        let finish = if arena.is_some() {
+            RuntimeKey::BuilderFinishStack
+        } else {
+            RuntimeKey::BuilderIntoStringStack
+        };
         Ok(self
             .builder
-            .build_call(self.funcs[finish], &[bptr.into()], "s")
+            .build_call(self.runtime(finish), &[bptr.into()], "s")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12836,7 +11051,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let v = self
                         .builder
                         .build_call(
-                            self.funcs["array_builder_init_stack"],
+                            self.runtime(RuntimeKey::ArrayBuilderInitStack),
                             &[header.into(), es.into()],
                             "ab.stack",
                         )
@@ -12848,7 +11063,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 let v = self
                     .builder
-                    .build_call(self.funcs["array_builder_new"], &[es.into()], "ab")
+                    .build_call(self.runtime(RuntimeKey::ArrayBuilderNew), &[es.into()], "ab")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("array_builder_new returns a pointer");
                 Ok(Some(v))
@@ -12869,7 +11084,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
                 };
                 self.builder
-                    .build_call(self.funcs["array_builder_push"], &[bp, bits.into()], "")
+                    .build_call(self.runtime(RuntimeKey::ArrayBuilderPush), &[bp, bits.into()], "")
                     .map_err(|e| self.err(e))?;
                 Ok(None)
             }
@@ -12881,7 +11096,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["array_builder_push_str"], &[bp, ptr.into(), len.into()], "")
+                    .build_call(self.runtime(RuntimeKey::ArrayBuilderPushStr), &[bp, ptr.into(), len.into()], "")
                     .map_err(|e| self.err(e))?;
                 Ok(None)
             }
@@ -12891,7 +11106,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bp = self.operand(builder)?.into();
                 let (ptr, count) = self.split_str(data)?;
                 self.builder
-                    .build_call(self.funcs["array_builder_append"], &[bp, ptr.into(), count.into()], "")
+                    .build_call(self.runtime(RuntimeKey::ArrayBuilderAppend), &[bp, ptr.into(), count.into()], "")
                     .map_err(|e| self.err(e))?;
                 Ok(None)
             }
@@ -12900,13 +11115,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ArrayBuilderBuild { builder } => {
                 let bp = self.operand(builder)?.into();
                 let build = if self.stack_header_slot_for_operand(builder).is_some() {
-                    "array_builder_build_stack"
+                    RuntimeKey::ArrayBuilderBuildStack
                 } else {
-                    "array_builder_build"
+                    RuntimeKey::ArrayBuilderBuild
                 };
                 let v = self
                     .builder
-                    .build_call(self.funcs[build], &[bp], "abbuild")
+                    .build_call(self.runtime(build), &[bp], "abbuild")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("array_builder_build returns a {ptr,len}");
                 Ok(Some(v))
@@ -12928,7 +11143,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let lb = ext(self.builder, sb, 1, "lb").map_err(|e| self.err(e))?;
         let r = self
             .builder
-            .build_call(self.funcs["str_eq"], &[pa.into(), la.into(), pb.into(), lb.into()], "streq")
+            .build_call(self.runtime(RuntimeKey::StrEq), &[pa.into(), la.into(), pb.into(), lb.into()], "streq")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -12964,7 +11179,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let lb = ext(self.builder, sb, 1, "lb").map_err(|e| self.err(e))?;
         let cmp = self
             .builder
-            .build_call(self.funcs["str_cmp"], &[pa.into(), la.into(), pb.into(), lb.into()], "strcmp")
+            .build_call(self.runtime(RuntimeKey::StrCmp), &[pa.into(), la.into(), pb.into(), lb.into()], "strcmp")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -13265,6 +11480,288 @@ mod tests {
 
     fn ir(src: &str) -> String {
         emit_llvm_ir(&mir(src), &BuildTarget::Baseline, false, &[], None).unwrap()
+    }
+
+    #[test]
+    fn runtime_abi_declaration_order_is_runtime_key_all_order() {
+        let text = ir("fn main() -> i32 = 0\n");
+        let expected: Vec<_> = runtime_abi::runtime_abis().map(|abi| abi.symbol).collect();
+        let expected_set: HashSet<_> = expected.iter().copied().collect();
+        let actual: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("declare "))
+            .filter_map(|line| line.split_once('@').map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split_once('(').map(|(symbol, _)| symbol))
+            .filter(|symbol| expected_set.contains(*symbol))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn runtime_abi_compatible_extern_reuses_one_declaration_and_mismatch_fails_closed() {
+        let keyed = ir(
+            "extern \"C\" fn align_rt_print_i64(x: i64)\n\
+             fn main() -> i32 { print(1)\n return 0 }\n",
+        );
+        assert_eq!(
+            keyed
+                .lines()
+                .filter(|line| line.starts_with("declare ") && line.contains("@align_rt_print_i64("))
+                .count(),
+            1,
+        );
+
+        let unkeyed = ir(
+            "extern \"C\" fn align_rt_report_error(code: i32) -> i32\n\
+             fn main() -> Result<(), Error> = Ok(())\n",
+        );
+        assert_eq!(
+            unkeyed
+                .lines()
+                .filter(|line| line.starts_with("declare ") && line.contains("@align_rt_report_error("))
+                .count(),
+            1,
+        );
+
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let ext = |name: &str, params: Vec<Ty>, ret: Ty| hir::ExternFn {
+            name: name.to_string(),
+            param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
+            params,
+            ret,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+        };
+        let mut args_program = mir(
+            "fn main(args: array<str>) -> Result<(), Error> = Ok(())\n",
+        );
+        args_program.externs.push(ext(
+            "align_rt_args_build",
+            vec![i32_ty, Ty::Raw],
+            Ty::Str,
+        ));
+        let args_ir = emit_llvm_ir(
+            &args_program,
+            &BuildTarget::Baseline,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            args_ir
+                .lines()
+                .filter(|line| line.starts_with("declare ") && line.contains("@align_rt_args_build("))
+                .count(),
+            1,
+        );
+
+        let mut internal_program = mir("fn main() -> i32 = 0\n");
+        internal_program.externs = vec![
+            ext("align_rt_arena_reset", vec![Ty::Raw], Ty::Unit),
+            ext("align_rt_realloc", vec![Ty::Raw, i64_ty], Ty::Raw),
+            ext("align_rt_http_serialize", vec![Ty::Raw, Ty::Raw], i32_ty),
+        ];
+        let internal_ir = emit_llvm_ir(
+            &internal_program,
+            &BuildTarget::Baseline,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        for symbol in [
+            "align_rt_arena_reset",
+            "align_rt_realloc",
+            "align_rt_http_serialize",
+        ] {
+            assert_eq!(
+                internal_ir
+                    .lines()
+                    .filter(|line| line.starts_with("declare ") && line.contains(&format!("@{symbol}(")))
+                    .count(),
+                1,
+            );
+        }
+
+        let program = mir(
+            "extern \"C\" fn align_rt_print_i64(x: i32)\n\
+             fn main() -> i32 = 0\n",
+        );
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("an incompatible fixed-native extern must fail before declaration emission");
+        assert_eq!(
+            error.to_string(),
+            "lowering failed: native extern ABI mismatch:616c69676e5f72745f7072696e745f693634"
+        );
+    }
+
+    #[test]
+    fn runtime_abi_program_symbol_collision_keeps_typed_attribute_ownership() {
+        let program = mir(
+            "fn align_rt_hash64(x: u64) -> u64 = x\n\
+             fn main() -> i32 { h := hash64(\"x\")\n return align_rt_hash64(h) as i32 }\n",
+        );
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        let runtime_symbol = &runtime.physical_names[&RuntimeKey::Hash64];
+        assert_ne!(runtime_symbol, "align_rt_hash64");
+        let text = module.print_to_string().to_string();
+        assert!(text.lines().any(|line| line.starts_with("define internal i64 @align_rt_hash64(")));
+        assert!(text.contains(&format!("call i64 @{runtime_symbol}(")));
+
+        let function_loc = inkwell::attributes::AttributeLoc::Function;
+        let memory = enum_kind_id("memory");
+        let willreturn = enum_kind_id("willreturn");
+        let program_function = module.get_function("align_rt_hash64").unwrap();
+        let runtime_function = module.get_function(runtime_symbol).unwrap();
+        assert!(program_function.get_enum_attribute(function_loc, memory).is_none());
+        assert!(program_function.get_enum_attribute(function_loc, willreturn).is_none());
+        assert!(runtime_function.get_enum_attribute(function_loc, memory).is_some());
+        assert!(runtime_function.get_enum_attribute(function_loc, willreturn).is_some());
+    }
+
+    #[test]
+    fn runtime_abi_guarded_program_collision_links_into_the_typed_physical_handle() {
+        let program = mir(
+            "fn align_rt_str_eq(a: str, b: str) -> bool = true\n\
+             fn main() -> i32 = if align_rt_str_eq(\"a\", \"b\") { 0 } else { 1 }\n",
+        );
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+        let physical = runtime.physical_names[&RuntimeKey::StrEq].clone();
+        assert_ne!(physical, "align_rt_str_eq");
+
+        let rt = ctx.create_module("align_rt_collision_fixture");
+        let layout = module.get_data_layout();
+        rt.set_data_layout(&layout);
+        for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+            let incoming = abi.declare(&ctx, &rt);
+            let builder = ctx.create_builder();
+            let entry = ctx.append_basic_block(incoming, "entry");
+            builder.position_at_end(entry);
+            builder
+                .build_return(Some(&ctx.i32_type().const_int(1, false)))
+                .unwrap();
+        }
+
+        link_in_rt_lto(&ctx, &module, rt, &runtime).unwrap();
+        let program_function = module.get_function("align_rt_str_eq").unwrap();
+        let runtime_function = module.get_function(&physical).unwrap();
+        assert_ne!(program_function.get_type(), runtime_function.get_type());
+        assert!(program_function.count_basic_blocks() > 0);
+        assert!(runtime_function.count_basic_blocks() > 0);
+        assert_eq!(
+            runtime_function.get_type(),
+            runtime_abi::runtime_abi(RuntimeKey::StrEq).function_type(&ctx),
+        );
+    }
+
+    #[test]
+    fn runtime_abi_rt_lto_incomplete_or_wrong_type_guarded_artifact_falls_back() {
+        for malformed in ["missing", "declaration", "wrong-type"] {
+            let program = mir("fn main() -> i32 = 0\n");
+            let ctx = Context::create();
+            let module = ctx.create_module("align");
+            let tm =
+                create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+
+            let rt = ctx.create_module("align_rt_malformed_fixture");
+            let layout = module.get_data_layout();
+            rt.set_data_layout(&layout);
+            if malformed == "declaration" {
+                runtime_abi::runtime_abi(RuntimeKey::StrEndsWith).declare(&ctx, &rt);
+            } else if malformed == "wrong-type" {
+                let function = rt.add_function(
+                    runtime_abi::runtime_abi(RuntimeKey::StrEndsWith).symbol,
+                    ctx.i64_type().fn_type(&[], false),
+                    None,
+                );
+                let builder = ctx.create_builder();
+                let entry = ctx.append_basic_block(function, "entry");
+                builder.position_at_end(entry);
+                builder
+                    .build_return(Some(&ctx.i64_type().const_zero()))
+                    .unwrap();
+            }
+
+            link_in_rt_lto(&ctx, &module, rt, &runtime).unwrap();
+            for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+                let function = module
+                    .get_function(&runtime.physical_names[&abi.key])
+                    .unwrap();
+                assert_eq!(function.count_basic_blocks(), 0, "{malformed}: merged a body");
+                assert!(
+                    function
+                        .get_enum_attribute(
+                            inkwell::attributes::AttributeLoc::Function,
+                            enum_kind_id("willreturn"),
+                        )
+                        .is_some(),
+                    "{malformed}: guarded declaration remained un-curated",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_abi_dedicated_consumers_leave_only_the_deferred_string_seams() {
+        let source = include_str!("lib.rs");
+        let implementation = source
+            .split_once("#[cfg(test)]")
+            .expect("test module boundary exists")
+            .0;
+        let string_lookups: Vec<_> = implementation.match_indices("self.funcs[").collect();
+        assert_eq!(string_lookups.len(), 2, "unexpected dedicated string lookup: {string_lookups:?}");
+        assert!(implementation.contains("self.funcs[&format!(\"tramp${}\""));
+        assert!(implementation.contains("let callee = self.funcs[name];"));
+        assert!(!include_str!("drop_codegen.rs").contains("self.funcs["));
+
+        let wrapper = source
+            .split_once("fn emit_main_wrapper")
+            .expect("main wrapper exists")
+            .1
+            .split_once("fn validate_tagged_program")
+            .expect("main wrapper boundary exists")
+            .0;
+        assert_eq!(wrapper.matches("UnkeyedRuntimeKey::ReportError").count(), 1);
+        assert_eq!(wrapper.matches("UnkeyedRuntimeKey::ArgsBuild").count(), 1);
+        for unused in ["ArenaReset", "Realloc", "HttpSerialize"] {
+            assert!(!wrapper.contains(unused));
+        }
+    }
+
+    #[test]
+    fn runtime_abi_legacy_direct_parity_inventory_is_exact() {
+        let specialized = [
+            RuntimeKey::Print,
+            RuntimeKey::PrintStr,
+            RuntimeKey::PrintBool,
+            RuntimeKey::PrintChar,
+            RuntimeKey::PrintF32,
+            RuntimeKey::PrintF64,
+            RuntimeKey::Hash64,
+            RuntimeKey::Hash128,
+        ];
+        let deferred = [
+            RuntimeKey::ProcessExit,
+            RuntimeKey::ProcessAbort,
+            RuntimeKey::DivFail,
+            RuntimeKey::BoundsFail,
+            RuntimeKey::RangeFail,
+            RuntimeKey::Utf8BoundaryFail,
+            RuntimeKey::LenMismatchFail,
+        ];
+        assert_eq!(specialized.len(), 8);
+        assert_eq!(deferred.len(), 7);
+        assert!(specialized.into_iter().all(|key| runtime_abi::runtime_abi(key).key == key));
+        assert!(deferred.into_iter().all(|key| runtime_abi::runtime_abi(key).key == key));
     }
 
     fn unary_hir_at_body_depth(depth: usize) -> hir::Program {
