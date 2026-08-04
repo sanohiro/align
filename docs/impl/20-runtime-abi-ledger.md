@@ -190,9 +190,10 @@ them. The other three yield no unconditional compiler handle. An exact
 compatible source extern may declare or reuse `ReportError`, `ArenaReset`,
 `Realloc`, or `HttpSerialize` through the ordinary extern path. `ArgsBuild`
 returns the native `{ptr, i64}` argv view, which no source-valid extern return
-can express: `str`/slice view returns are rejected and `layout(C) { raw, i64 }`
-lowers as `{i64, i64}`. It is therefore wrapper-only, not a fifth compatible
-source-extern row. The legacy mixed string map remains as a handle-only alias seam
+can express: `str`/slice view returns are rejected, `raw` is not a valid
+`layout(C)` field, and the closest source-valid `layout(C) { u64, i64 }` return
+lowers as `{i64, i64}` rather than `{ptr, i64}`. It is therefore wrapper-only,
+not a fifth compatible source-extern row. The legacy mixed string map remains as a handle-only alias seam
 for unchanged `Rvalue::Call(String)` resolution through c1: it is populated in
 post-c1 class order from stored definitions, non-shadowed imports, externs,
 alphabetical `RuntimeKey::ALL` aliases, then existing generated aliases. The
@@ -249,10 +250,12 @@ Tests compare:
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 286 exact registry function types through the production compatibility
+- all 286 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  286 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the four
-  source-reachable unkeyed rows; exact `ArgsBuild` source rejection; and
+  source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
+  source-valid `layout(C) { u64, i64 }` aggregate mismatch; and
   compatible reuse representatives for each of the five checked-in attribute
   classes (`#0`–`#4`), with the native row supplying its curated attributes;
 - one mutation of each registry attribute class, symbol, and key through the

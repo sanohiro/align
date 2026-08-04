@@ -8,7 +8,8 @@ per-PR journal is preserved in
 _Last updated: 2026-08-04._ The current local branch is `agent/pkg-db-am-c`, stacked on the clean
 unpushed am-b4 activation checkpoint `22e5ba3`; no PR exists. The user authorized the c1 commit,
 SHA-bound preflight, base-branch publication, push, and draft PR on 2026-08-04. The c1 implementation
-commit is `cc9da75`; one coherent pre-PR finding-closure follow-up is in the working tree. Four
+commit is `cc9da75`; the first coherent pre-PR finding-closure commit is `3b6041f`, and the latest
+finding closure is the current HEAD. Four
 mandatory am-c matrix reviews repaired the public contracts and PR boundaries; the final fresh
 pre-implementation matrix review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
 now splits am-c into c1 (fixed typed runtime ABI registry), c2a (private canonical graph/encoder),
@@ -37,26 +38,31 @@ fresh `cc9da75` final-SHA review then found three valid P2 closure gaps and one 
 linkage/calling convention were not preflighted and a declaration-only post-link handle could still
 continue; `ArgsBuild` was incorrectly claimed as a source-compatible extern despite the settled
 view-return rejection; and the machine gates compared all names but not all 286 compiled Rust
-signatures or every return/parameter ordinal. The working follow-up requires external+C guarded
+signatures or every return/parameter ordinal. Commit `3b6041f` requires external+C guarded
 definitions before link and a body-bearing external+C typed handle after link, adds seven exact
 malformed artifact cells plus a post-link error owner, records `ArgsBuild` as wrapper-only, compares
 all 286 compiled Rust LLVM signatures independently, and runs the production extern predicate over
 all 286 returns and every parameter ordinal. It also covers the five attribute classes, all eight
-ordinary probe spellings, and whole/per-unit-shaped declaration parity.
-Focused c1 owners pass 14/14; `align_codegen_llvm` passes 65/65 with 5 intentional PGO ignores;
+ordinary probe spellings, and whole/per-unit-shaped declaration parity. The next exact-diff review
+found that the five unkeyed identities still kept symbol/type facts outside the 281 keyed rows,
+that the `ArgsBuild` unreachability owner omitted the closest source-valid aggregate, and that this
+handoff was stale. The current HEAD closes the class with one 286-identity `RuntimeAbiId` row
+iterator, makes the keyed-only iterator explicit for declaration order and typed MIR lookup, and
+passes a source-valid `layout(C) { u64, i64 }` return through x86-64 SysV extern ABI formation to
+prove it mismatches the native `{ptr, i64}` view. (`raw` itself is not a valid `layout(C)` field.)
+Focused c1 owners pass 14/14; `align_codegen_llvm` passes 70/70 with 5 intentional PGO ignores;
 `align_mir` passes 95/95; the runtime source/registry owner passes; compiled
 base Rust signatures match 286/286 and base, `alloc-count`, `par-map-probe`, task-only, and
 all-feature runtime export sets are exactly 286/290/290/286/294; and all nine rt-LTO integration
 owners pass. Changed-crate all-target Clippy
-passes with `-D warnings`. The ordinary `scripts/test-pr.sh` invocation completed the workspace
+passes with `-D warnings` through the current HEAD. The ordinary `scripts/test-pr.sh` invocation completed the workspace
 build and codegen owners, then its combined driver binary remained at 0% CPU in `_dyld_start` and
 was stopped as INCOMPLETE; the exact driver binary and every not-yet-run library/integration target
 then passed without source changes, so the gate was closed by checkpointed continuation rather than
-a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s) on `cc9da75`; the
-finding follow-up's affected-crate Clippy passes. The next action is to commit the coherent finding
-closure, run the required fresh high-risk review for the rt-LTO/ABI change, then run the final-SHA
-preflight and open the authorized stacked draft PR, not c2 implementation. No public `pkg.db`
-surface exists yet.
+a broad rerun. Workspace all-target Clippy passes with `-D warnings` (14m00s) on `cc9da75`; both
+finding-closure affected-crate Clippy runs pass. The next action is to obtain a bounded exact-SHA
+review of the final finding-closure slice, then run the final-SHA preflight and open the authorized
+stacked draft PR, not c2 implementation. No public `pkg.db` surface exists yet.
 
 Prior am-b4 operational record: `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h

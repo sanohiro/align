@@ -119,6 +119,11 @@ enum RuntimeAbiShape {
     A88,
     A89,
     A90,
+    A91,
+    A92,
+    A93,
+    A94,
+    A95,
 }
 
 #[derive(Clone, Copy)]
@@ -133,7 +138,7 @@ struct RuntimeAbiShapeSpec {
 
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeAbi {
-    pub(super) key: RuntimeKey,
+    pub(super) key: RuntimeAbiId,
     pub(super) symbol: &'static str,
     shape: RuntimeAbiShape,
 }
@@ -155,7 +160,7 @@ pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 5] = [
     UnkeyedRuntimeKey::HttpSerialize,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum RuntimeAbiId {
     Keyed(RuntimeKey),
     Unkeyed(UnkeyedRuntimeKey),
@@ -250,16 +255,27 @@ impl RuntimeAbi {
     pub(super) fn is_rt_lto_guarded(self) -> bool {
         matches!(
             self.key,
-            RuntimeKey::StrEq
-                | RuntimeKey::StrStartsWith
-                | RuntimeKey::StrEndsWith
-                | RuntimeKey::StrEqIgnoreCase
+            RuntimeAbiId::Keyed(
+                RuntimeKey::StrEq
+                    | RuntimeKey::StrStartsWith
+                    | RuntimeKey::StrEndsWith
+                    | RuntimeKey::StrEqIgnoreCase
+            )
         )
+    }
+
+    pub(super) fn runtime_key(self) -> Option<RuntimeKey> {
+        match self.key {
+            RuntimeAbiId::Keyed(key) => Some(key),
+            RuntimeAbiId::Unkeyed(_) => None,
+        }
     }
 }
 
 pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
-    match key {
+    let runtime_key = key;
+    let key = RuntimeAbiId::Keyed(key);
+    match runtime_key {
         RuntimeKey::Alloc => RuntimeAbi {
             key,
             symbol: "align_rt_alloc",
@@ -1668,25 +1684,32 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
     }
 }
 
-pub(super) fn runtime_abis() -> impl ExactSizeIterator<Item = RuntimeAbi> {
+pub(super) fn keyed_runtime_abis() -> impl ExactSizeIterator<Item = RuntimeAbi> {
     RuntimeKey::ALL.into_iter().map(runtime_abi)
 }
 
+pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
+    keyed_runtime_abis().chain(UNKEYED_RUNTIME_KEYS.into_iter().map(unkeyed_runtime_abi))
+}
+
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 281 || runtime_abis().len() != 281 {
+    if RuntimeKey::ALL.len() != 281 || keyed_runtime_abis().len() != 281 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().len() + UNKEYED_RUNTIME_KEYS.len() != 286 {
+    if runtime_abis().count() != 286 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
     let mut symbols = HashSet::with_capacity(286);
-    for abi in runtime_abis() {
-        if !keys.insert(abi.key) {
+    for abi in keyed_runtime_abis() {
+        let key = abi
+            .runtime_key()
+            .expect("keyed runtime iterator yielded an unkeyed row");
+        if !keys.insert(key) {
             return Err(format!(
                 "runtime ABI registry invariant: duplicate-key:{}",
-                super::lowercase_hex(abi.key.logical_name().as_bytes()),
+                super::lowercase_hex(key.logical_name().as_bytes()),
             ));
         }
         if !symbols.insert(abi.symbol) {
@@ -1696,12 +1719,11 @@ pub(super) fn validate_registry() -> Result<(), String> {
             ));
         }
     }
-    for key in UNKEYED_RUNTIME_KEYS {
-        let symbol = unkeyed_symbol(key);
-        if !symbols.insert(symbol) {
+    for abi in UNKEYED_RUNTIME_KEYS.into_iter().map(unkeyed_runtime_abi) {
+        if !symbols.insert(abi.symbol) {
             return Err(format!(
                 "runtime ABI registry invariant: duplicate-symbol:{}",
-                super::lowercase_hex(symbol.as_bytes()),
+                super::lowercase_hex(abi.symbol.as_bytes()),
             ));
         }
     }
@@ -1724,46 +1746,58 @@ pub(super) fn unkeyed_function_type<'c>(
     key: UnkeyedRuntimeKey,
     ctx: &'c Context,
 ) -> FunctionType<'c> {
-    let ptr = ctx.ptr_type(inkwell::AddressSpace::default());
+    unkeyed_runtime_abi(key).function_type(ctx)
+}
+
+pub(super) fn unkeyed_runtime_abi(key: UnkeyedRuntimeKey) -> RuntimeAbi {
+    let id = RuntimeAbiId::Unkeyed(key);
     match key {
-        UnkeyedRuntimeKey::ReportError => ctx.i32_type().fn_type(&[ctx.i32_type().into()], false),
-        UnkeyedRuntimeKey::ArgsBuild => {
-            super::slice_struct_type(ctx).fn_type(&[ctx.i32_type().into(), ptr.into()], false)
-        }
-        UnkeyedRuntimeKey::ArenaReset => ctx.void_type().fn_type(&[ptr.into()], false),
-        UnkeyedRuntimeKey::Realloc => ptr.fn_type(&[ptr.into(), ctx.i64_type().into()], false),
-        UnkeyedRuntimeKey::HttpSerialize => {
-            ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false)
-        }
+        UnkeyedRuntimeKey::ReportError => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_report_error",
+            shape: RuntimeAbiShape::A91,
+        },
+        UnkeyedRuntimeKey::ArgsBuild => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_args_build",
+            shape: RuntimeAbiShape::A92,
+        },
+        UnkeyedRuntimeKey::ArenaReset => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_arena_reset",
+            shape: RuntimeAbiShape::A93,
+        },
+        UnkeyedRuntimeKey::Realloc => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_realloc",
+            shape: RuntimeAbiShape::A94,
+        },
+        UnkeyedRuntimeKey::HttpSerialize => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_http_serialize",
+            shape: RuntimeAbiShape::A95,
+        },
     }
 }
 
 pub(super) fn unkeyed_symbol(key: UnkeyedRuntimeKey) -> &'static str {
-    match key {
-        UnkeyedRuntimeKey::ReportError => "align_rt_report_error",
-        UnkeyedRuntimeKey::ArgsBuild => "align_rt_args_build",
-        UnkeyedRuntimeKey::ArenaReset => "align_rt_arena_reset",
-        UnkeyedRuntimeKey::Realloc => "align_rt_realloc",
-        UnkeyedRuntimeKey::HttpSerialize => "align_rt_http_serialize",
-    }
+    unkeyed_runtime_abi(key).symbol
 }
 
 pub(super) fn runtime_abi_for_symbol(symbol: &str) -> Option<RuntimeAbiId> {
     runtime_abis()
         .find(|abi| abi.symbol == symbol)
-        .map(|abi| RuntimeAbiId::Keyed(abi.key))
-        .or_else(|| {
-            UNKEYED_RUNTIME_KEYS
-                .into_iter()
-                .find(|key| unkeyed_symbol(*key) == symbol)
-                .map(RuntimeAbiId::Unkeyed)
-        })
+        .map(|abi| abi.key)
 }
 
 pub(super) fn function_type<'c>(id: RuntimeAbiId, ctx: &'c Context) -> FunctionType<'c> {
+    runtime_abi_by_id(id).function_type(ctx)
+}
+
+pub(super) fn runtime_abi_by_id(id: RuntimeAbiId) -> RuntimeAbi {
     match id {
-        RuntimeAbiId::Keyed(key) => runtime_abi(key).function_type(ctx),
-        RuntimeAbiId::Unkeyed(key) => unkeyed_function_type(key, ctx),
+        RuntimeAbiId::Keyed(key) => runtime_abi(key),
+        RuntimeAbiId::Unkeyed(key) => unkeyed_runtime_abi(key),
     }
 }
 
@@ -2851,14 +2885,54 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             memory_argmem_read: false,
             read_ptr_params: &[],
         },
+        RuntimeAbiShape::A91 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::I32],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A92 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::PtrLen,
+            params: &[NativeType::I32, NativeType::Ptr],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A93 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Void,
+            params: &[NativeType::Ptr],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A94 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Ptr,
+            params: &[NativeType::Ptr, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A95 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::Ptr, NativeType::Ptr],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, function_type, native_extern_abi_matches, runtime_abi,
-        runtime_abi_for_symbol, runtime_abis, unkeyed_function_type, unkeyed_symbol,
+        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, keyed_runtime_abis, native_extern_abi_matches,
+        runtime_abi, runtime_abi_by_id, runtime_abi_for_symbol, runtime_abis, unkeyed_symbol,
         validate_registry,
     };
     use align_mir::RuntimeKey;
@@ -2881,20 +2955,20 @@ mod tests {
     fn runtime_abi_registry_is_complete_and_unique() {
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 281);
+        assert_eq!(rows.len(), 286);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            281
+            286
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            281
+            286
         );
-        for (key, row) in RuntimeKey::ALL.into_iter().zip(&rows) {
-            assert_eq!(row.key, key);
+        for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
+            assert_eq!(row.key, RuntimeAbiId::Keyed(key));
             assert_eq!(runtime_abi(key).symbol, row.symbol);
         }
         assert_eq!(runtime_abi(RuntimeKey::Print).symbol, "align_rt_print_i64");
@@ -2907,38 +2981,25 @@ mod tests {
             "align_rt_http_request_new"
         );
 
-        let mut base_symbols = rows.iter().map(|row| row.symbol).collect::<HashSet<_>>();
         for key in UNKEYED_RUNTIME_KEYS {
             let symbol = unkeyed_symbol(key);
-            assert!(
-                base_symbols.insert(symbol),
-                "duplicate fixed native symbol {symbol}"
-            );
-            assert!(runtime_abi_for_symbol(symbol).is_some());
+            let id = RuntimeAbiId::Unkeyed(key);
+            assert_eq!(runtime_abi_by_id(id).key, id);
+            assert_eq!(runtime_abi_by_id(id).symbol, symbol);
+            assert_eq!(runtime_abi_for_symbol(symbol), Some(id));
         }
-        assert_eq!(base_symbols.len(), 286);
         assert!(runtime_abi_for_symbol("align_rt_not_a_fixed_row").is_none());
     }
 
     #[test]
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
-        let mut rows: Vec<_> = RuntimeKey::ALL
-            .into_iter()
-            .map(|key| {
-                let abi = runtime_abi(key);
-                (abi.symbol, RuntimeAbiId::Keyed(key))
-            })
-            .collect();
-        rows.extend(
-            UNKEYED_RUNTIME_KEYS
-                .into_iter()
-                .map(|key| (unkeyed_symbol(key), RuntimeAbiId::Unkeyed(key))),
-        );
+        let rows: Vec<_> = runtime_abis().collect();
         assert_eq!(rows.len(), 286);
 
-        for (symbol, id) in rows {
-            let expected = function_type(id, &ctx);
+        for row in rows {
+            let symbol = row.symbol;
+            let expected = row.function_type(&ctx);
             assert!(
                 native_extern_abi_matches(symbol, expected, &ctx),
                 "rejected exact native extern type for {symbol}",
@@ -2985,9 +3046,6 @@ mod tests {
         for abi in runtime_abis() {
             let function = abi.declare(&ctx, &module);
             abi.apply_attributes(&ctx, function);
-        }
-        for key in UNKEYED_RUNTIME_KEYS {
-            module.add_function(unkeyed_symbol(key), unkeyed_function_type(key, &ctx), None);
         }
 
         let ir = module.print_to_string().to_string();

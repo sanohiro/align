@@ -1065,7 +1065,10 @@ fn build_module<'c>(
         HashMap::with_capacity(RuntimeKey::ALL.len());
     let mut runtime_physical_names: HashMap<RuntimeKey, String> =
         HashMap::with_capacity(RuntimeKey::ALL.len());
-    for abi in runtime_abi::runtime_abis() {
+    for abi in runtime_abi::keyed_runtime_abis() {
+        let key = abi
+            .runtime_key()
+            .expect("keyed runtime iterator yielded an unkeyed row");
         let compatible_extern = program.externs.iter().any(|ext| ext.name == abi.symbol);
         let function = if compatible_extern {
             let existing = module
@@ -1084,10 +1087,10 @@ fn build_module<'c>(
         if !(rt_lto_skip_guarded && abi.is_rt_lto_guarded()) {
             abi.apply_attributes(ctx, function);
         }
-        funcs.insert(abi.key.logical_name().to_string(), function);
-        runtime_funcs.insert(abi.key, function);
+        funcs.insert(key.logical_name().to_string(), function);
+        runtime_funcs.insert(key, function);
         runtime_physical_names.insert(
-            abi.key,
+            key,
             function.get_name().to_string_lossy().into_owned(),
         );
     }
@@ -3538,8 +3541,9 @@ fn restore_rt_lto_guarded_attributes<'c>(
     module: &Module<'c>,
     runtime: &RuntimeDeclarations,
 ) -> Result<(), CodegenError> {
-    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
-        let physical = runtime.physical_names.get(&abi.key).ok_or_else(|| {
+    for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let key = abi.runtime_key().expect("guarded runtime row must be keyed");
+        let physical = runtime.physical_names.get(&key).ok_or_else(|| {
             CodegenError::Target(format!(
                 "--rt-lto: missing captured physical name for {}",
                 abi.symbol,
@@ -3561,8 +3565,9 @@ fn normalize_linked_rt_lto_guarded_definitions(
     module: &Module<'_>,
     runtime: &RuntimeDeclarations,
 ) -> Result<(), CodegenError> {
-    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
-        let physical = runtime.physical_names.get(&abi.key).ok_or_else(|| {
+    for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        let key = abi.runtime_key().expect("guarded runtime row must be keyed");
+        let physical = runtime.physical_names.get(&key).ok_or_else(|| {
             CodegenError::Target(format!(
                 "--rt-lto: missing captured physical name for {}",
                 abi.symbol,
@@ -3646,7 +3651,7 @@ fn link_in_rt_lto<'c>(
     // (2) Require the baked artifact to provide the complete guarded surface before mutating or
     // linking either module. A parseable but incomplete, wrong-type, non-external, or non-C artifact
     // is still a compiler build defect; fall back as one unit so no declaration remains un-curated.
-    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+    for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
         let defect = match rt.get_function(abi.symbol) {
             None => Some("is missing"),
             Some(function) if function.get_type() != abi.function_type(ctx) => {
@@ -3677,11 +3682,12 @@ fn link_in_rt_lto<'c>(
     // A same-spelled program/import claimant precedes native declarations until c3, so LLVM may
     // have named the typed native handle `align_rt_*.N`. Linking the bitcode's unsuffixed definition
     // unchanged would collide with the program claimant instead of filling that typed handle.
-    for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+    for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
         let Some(incoming) = rt.get_function(abi.symbol) else {
             continue;
         };
-        let physical = &runtime.physical_names[&abi.key];
+        let key = abi.runtime_key().expect("guarded runtime row must be keyed");
+        let physical = &runtime.physical_names[&key];
         if incoming.get_name().to_bytes() != physical.as_bytes() {
             incoming.as_global_value().set_name(physical);
             if incoming.get_name().to_bytes() != physical.as_bytes() {
@@ -11535,7 +11541,7 @@ mod tests {
 
     #[test]
     fn runtime_abi_declaration_order_is_runtime_key_all_order() {
-        let expected: Vec<_> = runtime_abi::runtime_abis()
+        let expected: Vec<_> = runtime_abi::keyed_runtime_abis()
             .map(|abi| abi.symbol.to_string())
             .collect();
         let expected_set: HashSet<_> = expected.iter().cloned().collect();
@@ -11661,6 +11667,36 @@ mod tests {
                 .iter()
                 .map(|diagnostic| &diagnostic.message)
                 .collect::<Vec<_>>(),
+        );
+
+        // The closest source-valid result is a two-word `layout(C)` value. Its `u64, i64`
+        // fields cross the SysV boundary as `{ i64, i64 }`, never as ArgsBuild's native
+        // `{ ptr, i64 }` view, so the production fixed-row predicate must reject it.
+        let layout_c = mir("layout(C) ArgsWords { data: u64, len: i64 }\n\
+             extern \"C\" fn align_rt_args_build(argc: i32, argv: raw) -> ArgsWords\n\
+             fn main() -> i32 = 0\n");
+        Target::initialize_x86(&InitializationConfig::default());
+        let triple = inkwell::targets::TargetTriple::create("x86_64-unknown-linux-gnu");
+        let target = Target::from_triple(&triple).unwrap();
+        let tm = target
+            .create_target_machine(
+                &triple,
+                "x86-64-v2",
+                "",
+                OptimizationLevel::Default,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .unwrap();
+        let ctx = Context::create();
+        let module = ctx.create_module("args_build_layout_c");
+        let error = match build_module(&ctx, &module, &layout_c, &tm, None, &[], false) {
+            Ok(_) => panic!("the closest source-valid aggregate matched ArgsBuild's view ABI"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "lowering failed: native extern ABI mismatch:616c69676e5f72745f617267735f6275696c64",
         );
     }
 
@@ -11824,7 +11860,7 @@ mod tests {
         let rt = ctx.create_module("align_rt_collision_fixture");
         let layout = module.get_data_layout();
         rt.set_data_layout(&layout);
-        for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+        for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
             let incoming = abi.declare(&ctx, &rt);
             let builder = ctx.create_builder();
             let entry = ctx.append_basic_block(incoming, "entry");
@@ -11867,8 +11903,8 @@ mod tests {
             let rt = ctx.create_module("align_rt_malformed_fixture");
             let layout = module.get_data_layout();
             rt.set_data_layout(&layout);
-            for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
-                let target = abi.key == RuntimeKey::StrEndsWith;
+            for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+                let target = abi.runtime_key() == Some(RuntimeKey::StrEndsWith);
                 if target && malformed == "missing" {
                     continue;
                 }
@@ -11906,9 +11942,10 @@ mod tests {
             }
 
             link_in_rt_lto(&ctx, &module, rt, &runtime).unwrap();
-            for abi in runtime_abi::runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+            for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+                let key = abi.runtime_key().expect("guarded runtime row must be keyed");
                 let function = module
-                    .get_function(&runtime.physical_names[&abi.key])
+                    .get_function(&runtime.physical_names[&key])
                     .unwrap();
                 assert_eq!(function.count_basic_blocks(), 0, "{malformed}: merged a body");
                 assert!(
@@ -12009,8 +12046,12 @@ mod tests {
         ];
         assert_eq!(specialized.len(), 8);
         assert_eq!(deferred.len(), 7);
-        assert!(specialized.into_iter().all(|key| runtime_abi::runtime_abi(key).key == key));
-        assert!(deferred.into_iter().all(|key| runtime_abi::runtime_abi(key).key == key));
+        assert!(specialized.into_iter().all(|key| {
+            runtime_abi::runtime_abi(key).runtime_key() == Some(key)
+        }));
+        assert!(deferred.into_iter().all(|key| {
+            runtime_abi::runtime_abi(key).runtime_key() == Some(key)
+        }));
     }
 
     fn unary_hir_at_body_depth(depth: usize) -> hir::Program {
