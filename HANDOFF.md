@@ -5,47 +5,29 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04. `main` includes the shipped wave through #688 plus the merged am-p
-placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
-declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
-implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
-group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no general public validator activation yet; Request 6's design specifies the
-narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
-repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
-restores ordinary Move-option JSON encode plus the interface-reconstruction ordering; no compiler
-implementation or release pin exists. The fresh preflight review of `def2fe6` found one valid
-documentation-only P2: the Request 6 source-of-truth map used a stale Japanese path and omitted the
-two changed implementation ledgers. The current follow-up repair corrects both mirrors and names
-the exact ledger paths; it does not change the scanner contract or implementation scope. The repair
-is committed as `4832d8b`. The implementation preflight reopened this design after finding that
-the active scanner replay did not validate the full HIR envelope, and that the implementation gate
-needed explicit generic return-context, per-unit reconstruction, cross-compiler identity, and
-composite runtime/allocation owners. The focused independent review of that follow-up found six
-additional P2/P3 contract gaps: validation-order precedence, generic unresolved/ambiguous rules,
-the active-gate/ledger owner mapping, reproducible identity inputs, composite Some/None/union/string
-coverage, and one omitted envelope-test anchor. The consolidated repair updates the English and
-Japanese JSON mirrors plus the HIR validation ledger for all six and is committed as `decb2a0`. Its
-conditional final design review found a new P1: the current Align resolver cannot instantiate an
-unresolved `json.scanner<Row<T>>` generic row argument. Under the repository review rule, the design
-is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
-calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
-Span, identity, composite, and implementation-matrix findings. The re-scoped design checkpoint is
-`a66248f` on `agent/align-llm-request6-design`; the consolidated repair was committed as `28e28c3`
-and reviewed at `36fd7b2`. The redesigned contract is committed as `be89026` on the same branch;
-the current reviewed design checkpoint and handoff state is `0319712`; no compiler implementation
-or release pin exists. The final independent
-review of `36fd7b2` found two P1 and three P2 findings: cross-compiler cache identity must treat
-`compiler_build_id` as an intentional difference, generic expected-return propagation must name its
-new resolver owner and numeric-default boundary, HIR precedence needs a reason-valued test seam,
-scanner coverage must distinguish five HIR variants from seven public terminals, and this handoff
-must bind the current head. The closure matrix was reopened and redesigned; the fresh independent
-review of `0319712` by Lorentz found only the handoff-binding P2, which is fixed in `f270d43`.
-The design gate is now clean; implementation remains paused until the design PR merges, while
-publication may proceed. At `0319712`, `git diff --check` and the targeted `rg` contract/source-of-truth
-checks passed; no repository Markdown linter is available, so that check is N/A. The handoff metadata
-for the reviewed checkpoint is recorded in the branch; no intentional uncommitted files remain.
+_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; the
+implementation code head is `aa5bb7d`, with the expected-seed, return-spelling, and
+diagnostic-order repairs implemented. The current branch also contains this continuity-only
+handoff commit; its exact branch-head SHA is bound by the final review and preflight records rather
+than self-referenced here. The earlier
+implementation commit `43211ec` is followed by consolidated review repair `2688681` and the
+baseline-compatible identity-harness repair `50912db`. The branch is based on implementation
+checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
+`0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete, but PR #704 is not
+yet merged. The PR branch contains the pushed implementation through `aa5bb7d` plus the
+continuity-only Handoff update. Focused verification and the identity probe pass at the
+implementation head. Fresh final review, preflight attestation, hosted CI, and merge are pending.
+No `.align-revision` adoption pin or align-llm `make ci` verification exists yet.
+
+## Active Request 6 implementation checkpoint
+
+- Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script; explicit rejection of partially substituted generic composites before argument checking.
+- Complete: the independent review finding at `2858d63` is closed by `1ac708d` and `5663c23`. Inferred scanner-typed locals now retain initializer spelling, generic-call results propagate spelling through their scanner arguments, and lambda captures inherit the repaired local map; no HIR field was added.
+- Complete: the final-review P2s at `2f0c7b5` are closed by design commit `a8719cf` and implementation commit `c241beb`. Expected-return seeding now validates concrete leaves before arguments, and generic call expressions carry producer-owned annotated return spelling even without a scanner argument. The repair adds m5 and cache no-publication owners; no HIR field was added.
+- Verification at `aa5bb7d`: generic m5 owners pass 11/11, imported-module owners pass 4/4, and the cache generic no-publication owner passes 1/1. `cargo +1.96.1 test -p align_sema --lib function_return_completeness_matrix -- --nocapture`, `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, the matching clippy command, `scripts/test-pr.sh`, and `git diff --check` pass. The full m5 aggregate is 193/198; the same five known pre-existing link/diagnostic failures remain outside Request 6. `scripts/compare-json-scan-identity.sh HEAD` passes with interface, MIR, raw LLVM, object bytes, and non-build-id CodegenKey fields matching the fixed baseline while compiler-isolated identity fields differ as required.
+- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. A later independent final pass found one additional P1: a partially substituted `Result<T, U>` expected argument could reach constructor checking without a sound partial-type contract. The closure matrix was reopened; `b5b3f4d` narrows the contract and `7b88b97` rejects the state before checking or publishing the argument. The redesigned independent pass at `2858d63` found the alias/call-result spelling gap; `1ac708d` updated the contract and `5663c23` closed its first root-cause class. Final reviews at `2f0c7b5` found the concrete expected-seed and no-scanner-argument return-spelling gaps; `a8719cf` updated the contract and `c241beb` closes both with exact owners. Final HOST and INDEPENDENT reviews at `f467ddb` and `e6bf75f` found only stale Handoff continuity metadata; this final continuity-only update removes the obsolete Handoff action and distinguishes the implementation head from the externally SHA-bound branch head. Fresh final review evidence must bind the final pushed repair head.
+- Next, in order: obtain fresh SHA-bound clean review evidence for the final continuity-only branch head, run preflight and hosted CI, merge, refresh `.align-revision`, and run `make ci` as the real-client adoption gate. This is the terminal PR for the current user goal; do not start another PR or roadmap item after it.
+- Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -94,9 +76,10 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **align-llm requests:** Requests 4–14 remain proposed in
-  `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is being
-  prepared on the separate `agent/align-llm-request6-design` worktree and has no compiler
-  implementation or release pin yet. Request 9 remains the later C7 blocker.
+  `../align-llm/docs/align-requests.md`; Request 6 is accepted with its reviewed design merged in
+  Align PR #703. Its implementation/adoption is the active work on the branch named above. No
+  release pin or align-llm adoption verification exists yet. Request 9 remains the later C7
+  blocker.
 
 ## Latest shipped wave
 
@@ -677,19 +660,32 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Publish the clean Request 6 redesign and record its review envelope, then merge the design before
-implementing its scanner gate. Ordinary JSON
-decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
-scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
-imported/per-unit consumers, interface/import reconstruction precedes active
-`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The redesign must preserve
-the concrete-row-only generic boundary, universal-Span precedence, complete active-HIR envelope,
-expanded composite/per-unit owners, and canonical cross-compiler identity probe. The required
-design review is clean at `f270d43`; rerun `git diff --check` after any base-tip integration change.
-After the design gate merges, implement the
-scanner-only recursive Copy check in a separate slice; do not update the align-llm compiler pin
-until that implementation is merged and its adoption gate passes. Compiler tests, builds, and
-`make ci` remain N/A while this worktree is documentation-only.
+Request 6 implementation and its consolidated review repairs are complete in this worktree but are
+not yet merged. Ordinary JSON decode, encode, and scope Drop retain the currently admitted
+`Option<Move-struct>` shape; only the scanner path is Copy-gated, while partial-error cleanup remains
+a separate ownership request. For imported/per-unit consumers, interface/import reconstruction
+precedes active `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source
+sema gate uses the canonical recursive `DropPlan`; the active HIR replay walks direct expression
+children iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and
+malformed-row definitions without activating the dormant body validator. The repair also preserves
+outer scanner source spelling through bare generic calls, stops at the first generic argument error,
+snapshots all cache-owned files on rejected walks, closes valid-Span precedence pairs, and exercises
+the production CodegenKey classifier and non-build-id digest.
+
+Latest verification on `aa5bb7d`: `scripts/test-pr.sh` passes (workspace build, all bounded library
+tests, interface/formatter integration tests, and m0); `cargo +1.96.1 test -p align_sema --lib
+function_return_completeness_matrix -- --nocapture` passes; generic m5 owners pass 11/11; imported
+module owners pass 4/4; the cache generic no-publication owner passes 1/1; the full m5 aggregate is
+193 passed / 5 known pre-existing failures; and `scripts/compare-json-scan-identity.sh HEAD` passes
+with the required baseline parity and compiler-isolated identity. `cargo +1.96.1 check -p align_sema
+-p align_mir -p align_driver --tests --locked`, the matching clippy command, and `git diff --check`
+are clean. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
+workspace-wide rustfmt drift; the changed sema file shares that pre-existing file-wide drift.
+Fresh final review and preflight evidence must bind the final pushed head.
+Do not update `.align-revision` or the align-llm Request 6 verification status until this
+implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
+gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
+references, ordinary Move-option boundary checks, and hosted checks all passed.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

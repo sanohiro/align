@@ -177,6 +177,21 @@ impl CodegenKey {
         w.str(&self.unit);
         Hash128::of(&w.buf)
     }
+
+    /// Classify the first cache-key component that differs from `current` using the same ordered
+    /// classifier as a cache lookup. Exposed for identity owners that compare keys produced by
+    /// independent compiler worktrees; callers must not infer a cache hit from this result alone.
+    pub fn first_diff(&self, current: &Self) -> FirstDiff {
+        first_diff(self, current)
+    }
+
+    /// Digest every full-key input except the compiler build id. Identity owners use this to
+    /// compare independently built keys without maintaining a second hand-written serializer.
+    pub fn non_compiler_build_digest(&self) -> Hash128 {
+        let mut key = self.clone();
+        key.compiler_build_id = Hash128 { lo: 0, hi: 0 };
+        key.full_digest()
+    }
 }
 
 /// The first key component (in a fixed priority order) that differs between a decoded prior manifest

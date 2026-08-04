@@ -14,13 +14,15 @@
 //! build graph; (12) a killed producer's private staging remnant is never a hit; (13) resolved CPU
 //! identity separates baseline/native artifacts.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_per_unit, emit_object_cached, link_objects, BuildTarget, CacheContext, CacheOutcome,
-    FirstDiff, Hash128, Profile,
+    build_codegen_key, build_per_unit, emit_llvm_ir, emit_object_cached, link_objects, BuildTarget,
+    CacheContext, CacheOutcome, FirstDiff, Hash128, PgoKey, Profile,
 };
+use align_mir::print::program_to_string;
 use align_span::SourceMap;
 
 // ---- harness ------------------------------------------------------------------------------------
@@ -402,6 +404,250 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
     );
 }
 
+#[test]
+fn json_scan_row_schema_rejection() {
+    if !backend() {
+        return;
+    }
+    let valid = "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let rejected = "import core.json\nRow { score: array<i64> }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-schema-rejection", &[("main.align", valid)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit, "the accepted Copy row must publish a cold artifact");
+    let published = action_manifest_count(&proj.cache_root());
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
+
+    let mut sm = SourceMap::new();
+    let bad = build_per_unit(&mut sm, "main.align", rejected);
+    assert!(bad.units.is_empty(), "a rejected scanner row must publish no per-unit artifact");
+    assert!(bad.diags.has_errors(), "the Move row must be rejected before codegen");
+    assert!(
+        align_driver::format_diagnostics(&sm, &bad.diags).contains(
+            "`json.scan` row type 'Row' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected rejection diagnostics: {}",
+        align_driver::format_diagnostics(&sm, &bad.diags)
+    );
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected source must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "rejected source must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", valid);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "restoring the accepted Copy row must hit its prior artifact");
+    assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));
+}
+
+#[test]
+fn json_scan_per_unit_interface_row_ownership() {
+    if !backend() {
+        return;
+    }
+    let geom_copy = "module geom\npub Row { score: i64, label: Option<str> }\n";
+    let geom_move = "module geom\npub Row { values: array<i64> }\n";
+    let main = "module main\nimport core.json\nimport geom\nfn main() -> Result<(), Error> {\n  rows: json.scanner<geom.Row> := json.scan(\"[]\")\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-per-unit-row-ownership", &[("geom.align", geom_copy), ("main.align", main)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert_eq!(cold.outcomes.len(), 2, "the imported Copy row must produce both per-unit artifacts");
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+    let published = action_manifest_count(&proj.cache_root());
+    assert_eq!(published, 2, "the cold imported-row build publishes one artifact per unit");
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
+
+    proj.write("geom.align", geom_move);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(
+        rejected.units.iter().all(|unit| unit.unit != "main"),
+        "a Move row must not produce the dependent artifact; units={:?}, diagnostics:\n{}",
+        rejected.units.iter().map(|unit| unit.unit.as_str()).collect::<Vec<_>>(),
+        diagnostics
+    );
+    assert!(diagnostics.contains("must be Copy"), "unexpected imported-row rejection:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected per-unit input must not publish cache actions");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "rejected imported row must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("geom.align", geom_copy);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "restoring the imported Copy row must hit both prior artifacts");
+}
+
+#[test]
+fn json_scan_generic_return_context_no_publication() {
+    if !backend() {
+        return;
+    }
+    let valid = "module main\nimport core.json\nRow { score: i64 }\nfn identity<T>(value: T) -> T = value\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := identity(json.scan(\"[]\"))\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let conflicting = "module main\nimport core.json\nRow { score: i64 }\nfn choose<T>(first: T, second: T) -> T = first\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := choose(json.scan(\"[]\"), 1)\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let expected_conflict = "module main\nimport core.json\nRow { score: i64 }\nfn choose<T>(first: T, second: T) -> Result<T, T> {\n  loop {}\n}\nfn main() -> Result<(), Error> {\n  bad: Result<i64, bool> := choose(json.scan(\"[]\"), 1)\n  return Ok(())\n}\n";
+    let expected_concrete_conflict = "module main\nimport core.json\nRow { score: i64 }\nfn choose<T>(first: T) -> Result<T, Error> {\n  loop {}\n}\nfn main() -> Result<(), Error> {\n  bad: Result<i64, bool> := choose(json.scan(\"[]\"))\n  return Ok(())\n}\n";
+    let partial = "module main\nimport core.json\nRow { score: i64 }\nfn keep<T, U>(value: Result<T, U>, scan: json.scanner<Row>) -> T {\n  loop {}\n}\nfn main() -> Result<(), Error> {\n  value: i64 := keep(Ok(1), json.scan(\"[]\"))\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-generic-no-publication", &[("main.align", valid)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit, "the accepted generic scanner must publish a cold artifact");
+    let published = action_manifest_count(&proj.cache_root());
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
+
+    proj.write("main.align", conflicting);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "failed generic inference must produce no per-unit artifact");
+    assert!(diagnostics.contains("type mismatch"), "unexpected generic rejection:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "failed generic inference must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "failed generic inference must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", expected_conflict);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "expected-return conflict must produce no per-unit artifact");
+    assert_eq!(diagnostics.matches("type mismatch").count(), 1, "unexpected expected-return diagnostics:\n{diagnostics}");
+    assert!(!diagnostics.contains("cannot infer the scan row type"), "expected-return conflict must stop before scanner arguments:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "expected-return conflict must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "expected-return conflict must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", expected_concrete_conflict);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "concrete expected-return conflict must produce no per-unit artifact");
+    assert_eq!(diagnostics.matches("type mismatch").count(), 1, "unexpected concrete expected-return diagnostics:\n{diagnostics}");
+    assert!(!diagnostics.contains("cannot infer the scan row type"), "concrete expected-return conflict must stop before scanner arguments:\n{diagnostics}");
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "concrete expected-return conflict must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "concrete expected-return conflict must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", partial);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "partial generic inference must produce no per-unit artifact");
+    assert!(
+        diagnostics.contains("generic argument 1 of 'keep' has a partially inferred type; annotate the argument or use a bare generic parameter"),
+        "unexpected partial generic rejection:\n{diagnostics}"
+    );
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "partial generic inference must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "partial generic inference must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", valid);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.outcome("main").hit, "restoring the accepted generic scanner must hit the prior artifact");
+}
+
+#[test]
+fn json_scan_copy_row_mir_and_raw_llvm_identity() {
+    if !backend() {
+        return;
+    }
+    let source = "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let commented = format!("// accepted Copy-row identity twin\n{source}");
+    let proj = Project::new("json-scan-copy-row-identity", &[("main.align", source)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    let mut cold_sm = SourceMap::new();
+    let cold_walk = build_per_unit(&mut cold_sm, "main.align", source);
+    assert!(!cold_walk.diags.has_errors(), "accepted identity fixture failed to check");
+    let cold_mir = program_to_string(&cold_walk.units[0].mir);
+    let cold_llvm = emit_llvm_ir(&cold_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("cold raw LLVM");
+
+    proj.write("main.align", &commented);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "a comment-only accepted-row twin must hit");
+    let mut hot_sm = SourceMap::new();
+    let hot_walk = build_per_unit(&mut hot_sm, "main.align", &commented);
+    assert!(!hot_walk.diags.has_errors(), "commented identity fixture failed to check");
+    let hot_mir = program_to_string(&hot_walk.units[0].mir);
+    let hot_llvm = emit_llvm_ir(&hot_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("hot raw LLVM");
+    assert_eq!(hot_mir, cold_mir, "accepted Copy-row MIR changed across an irrelevant source edit");
+    assert_eq!(hot_llvm, cold_llvm, "accepted Copy-row raw LLVM changed across an irrelevant source edit");
+    assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));
+}
+
+#[test]
+fn json_scan_copy_row_codegen_key_identity_owner() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/json_scan_copy_identity.align");
+    let source = std::fs::read_to_string(&fixture).expect("read scanner identity fixture");
+    let mut source_map = SourceMap::new();
+    let walk = build_per_unit(&mut source_map, &fixture.display().to_string(), &source);
+    assert!(
+        !walk.diags.has_errors(),
+        "identity fixture must check cleanly:\n{}",
+        align_driver::format_diagnostics(&source_map, &walk.diags)
+    );
+    let unit = walk
+        .units
+        .iter()
+        .find(|unit| unit.unit == "main")
+        .expect("identity fixture must produce the main unit");
+    let key = build_codegen_key(
+        &unit.unit,
+        unit.summary.impl_hash,
+        &unit.dep_interface_hashes,
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+        PgoKey::Off,
+    )
+    .expect("build codegen key");
+
+    let mut compiler_variant = key.clone();
+    compiler_variant.compiler_build_id = Hash128::of(b"request-6-different-compiler");
+    assert_eq!(
+        key.first_diff(&compiler_variant),
+        FirstDiff::CompilerBuildId,
+        "the identity owner must exercise the production classifier"
+    );
+    assert_eq!(
+        key.non_compiler_build_digest(),
+        compiler_variant.non_compiler_build_digest(),
+        "compiler build identity is the only intentionally ignored full-key input"
+    );
+    assert_ne!(
+        key.full_digest(),
+        compiler_variant.full_digest(),
+        "full cache actions must remain isolated by compiler build identity"
+    );
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]
@@ -657,6 +903,43 @@ fn action_manifest_count(root: &Path) -> usize {
         Ok(entries) => entries.filter(|e| e.as_ref().map(|e| e.path().is_file()).unwrap_or(false)).count(),
         Err(_) => 0,
     }
+}
+
+/// Snapshot every cache-owned file, not just action manifests. A rejected semantic/per-unit walk
+/// must leave the CAS blobs and index pointers untouched as well as the visible action manifest.
+fn cache_tree_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            let relative = child
+                .strip_prefix(root)
+                .expect("cache child under root")
+                .to_string_lossy()
+                .into_owned();
+            let metadata = std::fs::symlink_metadata(&child).expect("cache metadata");
+            if metadata.is_dir() {
+                visit(root, &child, files);
+            } else if metadata.is_file() {
+                files.insert(relative, std::fs::read(&child).expect("cache file"));
+            } else if metadata.file_type().is_symlink() {
+                files.insert(
+                    relative,
+                    std::fs::read_link(&child)
+                        .expect("cache symlink")
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
 }
 
 #[test]

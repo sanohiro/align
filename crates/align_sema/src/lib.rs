@@ -1756,6 +1756,20 @@ pub fn struct_is_move(
     drop_plan(Ty::Struct(id), structs, enums, tagged_types).needs_drop()
 }
 
+/// Whether a JSON scanner row is safe to reuse as one per-step slot. The complete recursive
+/// [`DropPlan`] is the ownership authority: malformed graphs fail closed, and only a valid plan
+/// with no owned leaf is admitted. This pure predicate is shared by source sema and the active HIR
+/// pre-lowering gate so checked-HIR consumers cannot drift from the producer rule.
+pub fn json_scan_row_is_copy(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let plan = drop_plan(Ty::Struct(id), structs, enums, tagged_types);
+    plan.is_valid() && !plan.needs_drop()
+}
+
 /// Whether sum type `id` is a **Move** type — any variant carries an owned (Move) payload, so its
 /// `Drop` must recursively free the live payload. The `Drop` switches on the tag and visits exactly
 /// the active variant (`drop_enum` in codegen). An enum whose every payload has an empty DropPlan
@@ -2106,7 +2120,12 @@ struct FnSig {
     params: Vec<Ty>,
     /// Parameter access modes, parallel to `params`.
     param_modes: Vec<ast::ParamMode>,
+    /// Producer-owned source spellings for scanner-typed parameters, parallel to `params`.
+    /// `None` is intentional for every other parameter and for bodyless foreign signatures.
+    json_scan_param_spellings: Vec<Option<String>>,
     ret: Ty,
+    /// Producer-owned source spelling for a scanner-typed return annotation, if present.
+    json_scan_return_spelling: Option<String>,
     return_borrow: hir::ReturnBorrowSummary,
     return_region: hir::ReturnRegionSummary,
     /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
@@ -3622,6 +3641,30 @@ pub fn check_program_with_interface_facts(
         });
     }
 
+    // Keep public source identity in a producer-owned side table. HIR stores only nominal ids and
+    // backend names; diagnostics for a later generic specialization must still be able to render
+    // `geom.Row<Owned>` without consulting those internal identities.
+    let mut struct_source_spellings: HashMap<u32, String> = struct_ids
+        .iter()
+        .filter_map(|(canonical, id)| {
+            source_path_for_canonical(canonical, &type_table).map(|spelling| (*id, spelling))
+        })
+        .collect();
+    struct_source_spellings.extend([
+        (*struct_ids.get("argon2_params").expect("builtin argon2_params id"), "argon2_params".to_string()),
+        (*struct_ids.get("regex_match").expect("builtin regex_match id"), "regex_match".to_string()),
+    ]);
+    let mut enum_source_spellings: HashMap<u32, String> = enum_ids
+        .iter()
+        .filter_map(|(canonical, id)| {
+            source_path_for_canonical(canonical, &type_table).map(|spelling| (*id, spelling))
+        })
+        .collect();
+    enum_source_spellings.extend([
+        (*enum_ids.get("Error").expect("builtin Error id"), "Error".to_string()),
+        (*enum_ids.get("json.kind").expect("builtin json.kind id"), "json.kind".to_string()),
+    ]);
+
     // Build the generic templates: resolve each template's fields / payloads with its type
     // parameters in scope (so `T` becomes `Ty::Param`). A template may not (yet) reference another
     // generic def, so empty template maps suffice while building them.
@@ -3638,6 +3681,8 @@ pub fn check_program_with_interface_facts(
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
+                    struct_source_spellings: &mut struct_source_spellings,
+                    enum_source_spellings: &mut enum_source_spellings,
                     struct_templates: &est,
                     structs: &mut structs,
                     struct_mono: &mut struct_mono,
@@ -3709,6 +3754,8 @@ pub fn check_program_with_interface_facts(
                 type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
+                struct_source_spellings: &mut struct_source_spellings,
+                enum_source_spellings: &mut enum_source_spellings,
                 struct_templates: &struct_templates,
                 structs: &mut structs,
                 struct_mono: &mut struct_mono,
@@ -4277,7 +4324,13 @@ pub fn check_program_with_interface_facts(
             FnSig {
                 params,
                 param_modes,
+                json_scan_param_spellings: f
+                    .params
+                    .iter()
+                    .map(|p| json_scan_row_source_spelling(&p.ty))
+                    .collect(),
                 ret,
+                json_scan_return_spelling: f.ret.as_ref().and_then(json_scan_row_source_spelling),
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 type_params: tparams,
@@ -4413,7 +4466,9 @@ pub fn check_program_with_interface_facts(
                         FnSig {
                             param_modes: vec![ast::ParamMode::ByValue; params.len()],
                             params: params.clone(),
+                            json_scan_param_spellings: vec![None; params.len()],
                             ret,
+                            json_scan_return_spelling: None,
                             return_borrow: hir::ReturnBorrowSummary::None,
                             return_region: hir::ReturnRegionSummary::None,
                             type_params: Vec::new(),
@@ -4509,6 +4564,8 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &mut struct_source_spellings,
+            &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
@@ -4594,6 +4651,8 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &mut struct_source_spellings,
+            &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
@@ -18510,11 +18569,21 @@ struct LoopCtx {
     region_depth: u32,
 }
 
+#[derive(Clone, Copy)]
+enum GenericMatchContext {
+    Argument,
+    ExpectedReturn,
+}
+
 struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    /// Producer-owned public spellings for concrete nominal ids. This is deliberately separate
+    /// from `StructDef`/`EnumDef` names so diagnostics never depend on HIR or mangled identities.
+    struct_source_spellings: &'t mut HashMap<u32, String>,
+    enum_source_spellings: &'t mut HashMap<u32, String>,
     /// The concrete enum table, grown with monomorph instances of generic sum types (mutable, like
     /// `structs`). `match` / variant construction read it.
     enums: &'t mut Vec<hir::EnumDef>,
@@ -18555,6 +18624,13 @@ struct Checker<'a, 't> {
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
     ret_hint: Ty,
+    /// Public source spelling of the scanner row type supplied by the active return or binding
+    /// annotation. The AST spelling is captured before type resolution erases it into `Ty`; it is
+    /// used only for the producer-owned `json.scan` diagnostic and never enters HIR.
+    json_scan_source_spelling: Option<String>,
+    /// Source spellings for scanner-typed locals and parameters. This remains checker-only state;
+    /// source identity must not be serialized into HIR or reconstructed from nominal identities.
+    json_scan_local_spellings: HashMap<LocalId, String>,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
     /// True while checking a pipeline terminal that supports a `json.scanner<Row>` streaming source
@@ -18659,6 +18735,9 @@ struct Checker<'a, 't> {
 struct CaptureScope {
     /// The enclosing function's visible names → (enclosing LocalId, type), snapshot at lambda entry.
     enclosing: Vec<(String, LocalId, Ty)>,
+    /// Producer-owned scanner spellings for the enclosing locals. This snapshot remains available
+    /// while the lambda's ordinary local spelling map is swapped out.
+    json_scan_local_spellings: HashMap<LocalId, String>,
     /// Captured enclosing locals, in capture order: (name, lifted-fn param LocalId, enclosing LocalId).
     captured: Vec<(String, LocalId, LocalId)>,
 }
@@ -18673,6 +18752,8 @@ impl<'a, 't> Checker<'a, 't> {
         sigs: &'a HashMap<String, FnSig>,
         struct_ids: &'a HashMap<String, u32>,
         enum_ids: &'a HashMap<String, u32>,
+        struct_source_spellings: &'t mut HashMap<u32, String>,
+        enum_source_spellings: &'t mut HashMap<u32, String>,
         enums: &'t mut Vec<hir::EnumDef>,
         enum_templates: &'a HashMap<String, EnumTemplate>,
         enum_mono: &'t mut HashMap<String, u32>,
@@ -18704,6 +18785,8 @@ impl<'a, 't> Checker<'a, 't> {
             consts,
             struct_ids,
             enum_ids,
+            struct_source_spellings,
+            enum_source_spellings,
             enums,
             enum_templates,
             enum_mono,
@@ -18724,6 +18807,8 @@ impl<'a, 't> Checker<'a, 't> {
             locals: Vec::new(),
             scope: Vec::new(),
             ret_hint: Ty::Unit,
+            json_scan_source_spelling: None,
+            json_scan_local_spellings: HashMap::new(),
             arena_depth: 0,
             scan_terminal: false,
             unsafe_depth: 0,
@@ -19191,16 +19276,29 @@ impl<'a, 't> Checker<'a, 't> {
         if let Some(id) = self.lookup(name) {
             return Some(id);
         }
-        let cap = self.capture.as_mut()?;
-        if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
-            return Some(param_id);
-        }
-        let (enc_id, ty) = cap.enclosing.iter().rev().find(|(n, _, _)| n == name).map(|(_, id, t)| (*id, *t))?;
-        // A captured value becomes a synthetic parameter local (tracked in `captured`, *not* pushed
-        // into the visible scope so a nested-block exit can't truncate it).
+        let (enc_id, ty, spelling) = {
+            let cap = self.capture.as_ref()?;
+            if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
+                return Some(param_id);
+            }
+            cap.enclosing
+                .iter()
+                .rev()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, id, ty)| (*id, *ty, cap.json_scan_local_spellings.get(id).cloned()))?
+        };
+        // A captured value becomes a synthetic parameter local (tracked in `captured`, *not*
+        // pushed into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
         self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false, align: None, is_param: false });
-        cap.captured.push((name.to_string(), param_id, enc_id));
+        if let Some(spelling) = spelling {
+            self.json_scan_local_spellings.insert(param_id, spelling);
+        }
+        self.capture
+            .as_mut()
+            .expect("capture scope remains active")
+            .captured
+            .push((name.to_string(), param_id, enc_id));
         Some(param_id)
     }
 
@@ -19210,6 +19308,10 @@ impl<'a, 't> Checker<'a, 't> {
         // modules (two modules may each have `fn run` with a lambda).
         let mangled = self.resolve_local_fn(&f.name.name).unwrap_or_else(|| f.name.name.clone());
         self.cur_fn = mangled.clone();
+        // A Checker is currently created per function, but keep this boundary explicit so future
+        // reuse cannot carry producer-owned scanner identity across LocalId reuse.
+        self.json_scan_source_spelling = None;
+        self.json_scan_local_spellings.clear();
         // The permission sentinel is function-local compiler state. A rejected extern in an
         // earlier top-level body must not become the saved enclosing state for this function's
         // otherwise independent lambdas.
@@ -19282,6 +19384,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.ret_hint = ret;
+        self.json_scan_source_spelling = f
+            .ret
+            .as_ref()
+            .and_then(|ty| self.json_scan_row_source_spelling(ty))
+            .or_else(|| sig.json_scan_return_spelling.clone());
 
         // "huge struct copy" lint (`draft.md` §16): a struct passed or returned **by value** is
         // copied in full at every call boundary; above `HUGE_STRUCT_BYTES` that is a data-oriented
@@ -19334,6 +19441,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(&p.name.name, ty, p.mode.is_out());
+            if let Some(spelling) = self.json_scan_row_source_spelling(&p.ty) {
+                self.json_scan_local_spellings.insert(id, spelling);
+            }
             self.locals[id as usize].is_param = true;
             params.push(id);
         }
@@ -19409,6 +19519,13 @@ impl<'a, 't> Checker<'a, 't> {
             match s {
                 ast::Stmt::Let { is_mut, name, ty, init, align } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
+                    let annotation_spelling = ty
+                        .as_ref()
+                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation));
+                    let saved_json_scan_source_spelling = self.json_scan_source_spelling.clone();
+                    if let Some(spelling) = annotation_spelling.clone() {
+                        self.json_scan_source_spelling = Some(spelling);
+                    }
                     // A struct literal is only legal here, as a `let` initializer.
                     let init = match &init.kind {
                         ast::ExprKind::StructLit { name: sname, fields } => {
@@ -19422,9 +19539,14 @@ impl<'a, 't> Checker<'a, 't> {
                             _ => self.check_expr(init, ann),
                         },
                     };
+                    let initializer_spelling = self.json_scan_source_spelling_of_expr(&init);
+                    self.json_scan_source_spelling = saved_json_scan_source_spelling;
                     let local_ty = ann.unwrap_or(init.ty);
                     self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
+                    if let Some(spelling) = annotation_spelling.or(initializer_spelling) {
+                        self.json_scan_local_spellings.insert(local, spelling);
+                    }
                     // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
                     // fixed-array binding (the aligned-vector-load enabler). `N` is already a
                     // validated power of two (parser). A struct's over-alignment is declared on the
@@ -19611,10 +19733,15 @@ impl<'a, 't> Checker<'a, 't> {
                             let _ = self.check_expr(value, Some(ty)); // surface RHS errors; emit no store
                         } else {
                             // Mirror the `let` path: a slice/str place borrows its source.
+                            let json_scan_spelling = self.json_scan_local_spellings.get(&id).cloned();
                             let v = match ty {
                                 Ty::Slice(ps) => self.check_slice_init(value, ps),
                                 Ty::Str => self.check_str_init(value),
-                                _ => self.check_expr(value, Some(ty)),
+                                _ => self.check_expr_with_json_scan_source_spelling(
+                                    value,
+                                    Some(ty),
+                                    json_scan_spelling,
+                                ),
                             };
                             // Reassigning a read-only view (`s = TABLE`) taints the slice local
                             // read-only too. Insert-only: a later `s = writable` cannot clear it, so a
@@ -19718,6 +19845,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -19735,6 +19864,85 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             subst_param_ty(ty, &self.mono_args, self.tagged_types)
         }
+    }
+
+    /// Render an annotation with concrete generic arguments substituted from the active function
+    /// monomorph. Written paths remain the authoritative spelling; only a type-parameter token is
+    /// replaced, and its concrete value is rendered through the producer-owned type tables.
+    fn source_type_spelling_with_mono(&self, ty: &ast::Type) -> String {
+        match ty {
+            ast::Type::Named { path, args, .. } => {
+                if args.is_empty()
+                    && path.segments.len() == 1
+                    && let Some(index) = self
+                        .type_params
+                        .iter()
+                        .position(|parameter| parameter == &path.segments[0].name)
+                    && let Some(concrete) = self.mono_args.get(index)
+                {
+                    return resolved_type_source_spelling(
+                        *concrete,
+                        self.type_table,
+                        self.struct_ids,
+                        self.enum_ids,
+                        self.struct_source_spellings,
+                        self.enum_source_spellings,
+                        self.tagged_types,
+                        self.tuples,
+                        self.fn_types,
+                    );
+                }
+                let mut output = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !args.is_empty() {
+                    output.push('<');
+                    for (index, arg) in args.iter().enumerate() {
+                        if index > 0 {
+                            output.push_str(", ");
+                        }
+                        output.push_str(&self.source_type_spelling_with_mono(arg));
+                    }
+                    output.push('>');
+                }
+                output
+            }
+            ast::Type::Tuple { elems, .. } => {
+                let values = elems
+                    .iter()
+                    .map(|elem| self.source_type_spelling_with_mono(elem))
+                    .collect::<Vec<_>>();
+                format!("({})", values.join(", "))
+            }
+            ast::Type::Fn { params, ret, .. } => {
+                let params = params
+                    .iter()
+                    .map(|param| self.source_type_spelling_with_mono(&param.ty))
+                    .collect::<Vec<_>>();
+                format!(
+                    "fn({}) -> {}",
+                    params.join(", "),
+                    self.source_type_spelling_with_mono(ret)
+                )
+            }
+        }
+    }
+
+    /// Extract a scanner row spelling from a written annotation before resolution erases it into
+    /// `Ty`. The method is the only Checker path that may substitute a generic row argument.
+    fn json_scan_row_source_spelling(&self, ty: &ast::Type) -> Option<String> {
+        let ast::Type::Named { path, args, .. } = ty else {
+            return None;
+        };
+        let [module, name] = path.segments.as_slice() else {
+            return None;
+        };
+        (module.name == "json" && name.name == "scanner")
+            .then(|| args.first().map(|arg| self.source_type_spelling_with_mono(arg)))
+            .flatten()
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -20040,6 +20248,104 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(result.ty, expected, e.span);
         }
         result
+    }
+
+    /// Check a value while replacing the producer-owned scanner spelling context. Context must be
+    /// scoped to the exact expected annotation: a function return spelling must never leak into an
+    /// unrelated local reassignment or lambda body.
+    fn check_expr_with_json_scan_source_spelling(
+        &mut self,
+        e: &ast::Expr,
+        expected: Option<Ty>,
+        spelling: Option<String>,
+    ) -> Expr {
+        // A bare generic boundary has no producer-owned parameter spelling of its own. Preserve
+        // the enclosing expected scanner annotation in that case so `identity<T>(json.scan(...))`
+        // cannot erase the exact row identity before `check_json_scan` reports its Copy error.
+        let spelling = spelling.or_else(|| self.json_scan_source_spelling.clone());
+        let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
+        let result = self.check_expr(e, expected);
+        self.json_scan_source_spelling = saved;
+        result
+    }
+
+    /// The argument analogue of [`Self::check_expr_with_json_scan_source_spelling`], preserving
+    /// the existing slice/str coercion path while carrying an annotated scanner parameter's source
+    /// identity into a nested `json.scan`.
+    fn check_arg_with_json_scan_source_spelling(
+        &mut self,
+        a: &ast::Expr,
+        param: Option<Ty>,
+        spelling: Option<String>,
+    ) -> Expr {
+        // A bare generic parameter inherits the active outer scanner context. A concrete
+        // producer-owned scanner parameter still wins through `spelling`.
+        let spelling = spelling.or_else(|| self.json_scan_source_spelling.clone());
+        let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
+        let result = self.check_arg(a, param);
+        self.json_scan_source_spelling = saved;
+        result
+    }
+
+    /// Recover checker-only scanner spelling from a checked expression whose value is a scanner.
+    /// Transparent wrappers are included so inference does not lose producer identity merely
+    /// because an expression was checked through a block, borrow, or generic-call boundary.
+    fn json_scan_source_spelling_of_expr(&self, e: &Expr) -> Option<String> {
+        if !matches!(self.resolve(e.ty), Ty::JsonScanner(_)) {
+            return None;
+        }
+        match &e.kind {
+            ExprKind::Local(id) => self.json_scan_local_spellings.get(id).cloned(),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .and_then(|value| self.json_scan_source_spelling_of_expr(value)),
+            ExprKind::StrBorrow(inner) => self.json_scan_source_spelling_of_expr(inner),
+            ExprKind::Call { func, args, .. } => self
+                .sigs
+                .get(func)
+                .and_then(|sig| sig.json_scan_return_spelling.clone())
+                .or_else(|| args.iter().find_map(|arg| self.json_scan_source_spelling_of_expr(arg))),
+            _ => None,
+        }
+    }
+
+    /// Return the spelling carried by a fully bound generic scanner slot for a bare argument
+    /// position. The declared position is owned by the callee, so its slot index is interpreted
+    /// against this call's substitution vector rather than against the enclosing function's
+    /// symbolic parameters.
+    fn json_scan_spelling_for_generic_argument(
+        &self,
+        declared: Ty,
+        subst: &[Option<Ty>],
+        subst_spellings: &[Option<String>],
+    ) -> Option<String> {
+        let Ty::Param(p) = declared else { return None };
+        let Some(Some(bound)) = subst.get(p as usize) else { return None };
+        if !matches!(self.resolve(*bound), Ty::JsonScanner(_)) {
+            return None;
+        }
+        subst_spellings.get(p as usize).cloned().flatten()
+    }
+
+    /// Store the producer-owned spelling when a generic slot is inferred from a scanner value.
+    /// Request 6 currently admits scanner values only as a bare generic argument; keeping the
+    /// declared/actual pair explicit makes that boundary fail closed if a composite scanner shape
+    /// is added later without a corresponding spelling owner.
+    fn record_json_scan_slot_spelling(
+        &self,
+        declared: Ty,
+        actual: Ty,
+        spelling: Option<String>,
+        subst_spellings: &mut [Option<String>],
+    ) {
+        let Some(spelling) = spelling else { return };
+        let Ty::Param(p) = declared else { return };
+        if matches!(self.resolve(actual), Ty::JsonScanner(_))
+            && let Some(slot) = subst_spellings.get_mut(p as usize)
+        {
+            *slot = Some(spelling);
+        }
     }
 
     /// Check a function, block, or match-arm completion expression. Process termination has an
@@ -20769,6 +21075,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -20925,7 +21233,7 @@ impl<'a, 't> Checker<'a, 't> {
                     } else {
                         self.check_expr(&fi.value, Some(declared))
                     };
-                    self.match_param(declared, ce.ty, &mut subst, fi.span, false);
+                    self.match_param(declared, ce.ty, &mut subst, fi.span);
                     values[idx] = Some(ce);
                 }
                 None => {
@@ -21752,13 +22060,26 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_extern_without_unsafe(sig.is_extern, &display, span) {
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let (param_tys, ret, param_modes) =
-            (sig.params.clone(), sig.ret, sig.param_modes.clone());
+        let (param_tys, ret, param_modes, json_scan_param_spellings) = (
+            sig.params.clone(),
+            sig.ret,
+            sig.param_modes.clone(),
+            sig.json_scan_param_spellings.clone(),
+        );
         // A generic function: infer the concrete type arguments from the call, then take its own
         // dedicated path (the result type and `type_args` come from the substitution).
         if !sig.type_params.is_empty() {
             let type_params = sig.type_params.clone();
-            return self.check_generic_call(&name, &type_params, &param_tys, ret, args, expected, span);
+            return self.check_generic_call(
+                &name,
+                &type_params,
+                &param_tys,
+                ret,
+                &json_scan_param_spellings,
+                args,
+                expected,
+                span,
+            );
         }
         if args.len() != param_tys.len() {
             self.diags.error(
@@ -21824,7 +22145,13 @@ impl<'a, 't> Checker<'a, 't> {
         let checked: Vec<Expr> = args
             .iter()
             .enumerate()
-            .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
+            .map(|(i, a)| {
+                self.check_arg_with_json_scan_source_spelling(
+                    a,
+                    param_tys.get(i).copied(),
+                    json_scan_param_spellings.get(i).cloned().flatten(),
+                )
+            })
             .collect();
         // An `out slice<T>` parameter is written by the callee, so its argument must be writable
         // storage. A read-only view of a constant table (or a string literal's bytes) points at the
@@ -21850,12 +22177,24 @@ impl<'a, 't> Checker<'a, 't> {
     /// written at the call site (no turbofish; settled). Each declared parameter typed `Ty::Param(p)`
     /// binds `p` from the corresponding argument's type (all occurrences of `p` are unified
     /// together); a `Param` appearing only in the return type is taken from the expected type. Every
-    /// parameter must be inferable. The skeleton restricts a type parameter to a **bare** position
-    /// (a whole parameter / return), so `T` is passed/returned by value with no operations — the
-    /// constraint model (`Num`/`Ord`/`Eq`) is a later slice. `type_args` is recorded for
-    /// monomorphization, which generates the concrete instance and rewrites the call target.
+    /// parameter must be inferable. A parameter position may be bare or a scalar-payload composite,
+    /// but a position that mixes bound and unbound callee slots is rejected before its argument is
+    /// checked; an enclosing function's symbolic parameter is valid forwarding, and `Ty::Param` is
+    /// not a wildcard for the ordinary expression checker.
+    /// `type_args` is recorded for monomorphization, which generates the concrete instance and
+    /// rewrites the call target.
     #[allow(clippy::too_many_arguments)]
-    fn check_generic_call(&mut self, name: &str, type_params: &[String], param_tys: &[Ty], ret: Ty, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_generic_call(
+        &mut self,
+        name: &str,
+        type_params: &[String],
+        param_tys: &[Ty],
+        ret: Ty,
+        json_scan_param_spellings: &[Option<String>],
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != param_tys.len() {
             self.diags.error(
@@ -21864,29 +22203,90 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // One inference slot per type parameter. Each argument's type is matched structurally
-        // against its declared parameter type, binding any `Param` it carries (bare `T`, or nested
-        // in `Option<T>` / `Result<T, E>` / `slice<T>` / `box<T>` / a fixed `array<T>`).
+        // One inference slot per type parameter. Seed a concrete expected return before checking
+        // any argument: a nested `json.scan(view)` must see the concrete scanner annotation at its
+        // own source-check boundary rather than failing with the direct missing-context diagnostic.
+        let error_checkpoint = self.diags.error_count();
         let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
+        let mut subst_json_scan_spellings: Vec<Option<String>> = vec![None; type_params.len()];
+        if let Some(exp) = expected {
+            // Seed and validate the complete expected return before touching any argument. Generic
+            // slots bind here, while concrete leaves still use the normal mismatch diagnostic so
+            // a scanner argument cannot produce a secondary error for a bad return context.
+            self.match_expected_return_param(ret, self.resolve(exp), &mut subst, span);
+            // Expected-return seeding is the first source-order inference phase. Its conflict owns
+            // the call diagnostic and must prevent argument checking from producing unrelated
+            // scanner or constructor errors.
+            if self.diags.error_count() > error_checkpoint {
+                return err;
+            }
+        }
+
+        // Each argument's type is then matched structurally against its declared parameter type,
+        // binding any `Param` it carries (bare `T`, or nested in `Option<T>` / `Result<T, E>` /
+        // `slice<T>` / `box<T>` / a fixed `array<T>`). Every parameter already bound by the return
+        // context is substituted into the argument's expected type before the argument is checked.
+        // A position that mixes bound and unbound callee slots is rejected here: passing a partial
+        // expected composite into the ordinary expression checker would either lose constructor
+        // context or leak a callee inference variable into HIR.
         let mut checked = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let declared = param_tys[i];
-            // A position mentioning a type parameter applies no coercion (the type is unknown), so
-            // check the argument unconstrained; a fully concrete parameter checks against it.
-            let ce = if ty_mentions_param(declared, self.tagged_types) {
+            let known_args: Vec<Ty> = subst
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value.unwrap_or(Ty::Param(index as u32)))
+                .collect();
+            let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
+            let slot_state = generic_param_state(declared, &subst, self.tagged_types);
+            if slot_state.bound && slot_state.unbound {
+                self.diags.error(
+                    format!(
+                        "generic argument {} of '{name}' has a partially inferred type; annotate the argument or use a bare generic parameter",
+                        i + 1
+                    ),
+                    a.span,
+                );
+                return err;
+            }
+            let expected_param = (!slot_state.unbound).then_some(substituted);
+            let argument_spelling = json_scan_param_spellings
+                .get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| self.json_scan_spelling_for_generic_argument(declared, &subst, &subst_json_scan_spellings));
+            let inherited_spelling = self.json_scan_source_spelling.clone();
+            let ce = if slot_state.unbound {
+                // A position whose parameter is still unknown applies no coercion, so check the
+                // argument unconstrained. A later argument or the final expected-result boundary
+                // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
-                self.check_expr(a, None)
+                self.check_expr_with_json_scan_source_spelling(a, None, argument_spelling.clone())
             } else {
-                self.check_arg(a, Some(declared))
+                self.check_arg_with_json_scan_source_spelling(
+                    a,
+                    expected_param,
+                    argument_spelling.clone(),
+                )
             };
-            self.match_param(declared, ce.ty, &mut subst, a.span, false);
+            let spelling = self
+                .json_scan_source_spelling_of_expr(&ce)
+                .or(argument_spelling)
+                .or(inherited_spelling);
+            self.record_json_scan_slot_spelling(declared, ce.ty, spelling, &mut subst_json_scan_spellings);
+            // When the substituted parameter is concrete, `check_arg` already owns the exact
+            // reconciliation and diagnostic. Re-unifying the same bound slot would emit a
+            // reversed duplicate mismatch. Only an unresolved parameter needs inference here.
+            if slot_state.unbound {
+                self.match_param(declared, ce.ty, &mut subst, a.span);
+            }
+            // Generic argument checking is a source-order publication boundary. Do not inspect a
+            // later argument after the first conflict: its diagnostics are not actionable and a
+            // nested scanner must not survive as a partially checked call.
+            if self.diags.error_count() > error_checkpoint {
+                return err;
+            }
             checked.push(ce);
-        }
-        // Seed the remaining parameters from the expected type (the binding annotation), structurally
-        // — `o: Option<i32> := wrap(x)` gives `T = i32` from the return position. Bind-only: do not
-        // unify concrete leaves against `expected` (that constraint comes later via `result_ty`).
-        if let Some(exp) = expected {
-            self.match_param(ret, exp, &mut subst, span, true);
         }
         // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a
         // concrete scalar now — a `Scalar` cannot hold an inference variable, so leaving it deferred
@@ -21923,6 +22323,13 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let result_ty = subst_param_ty(ret, &type_args, self.tagged_types);
         self.constrain(result_ty, expected, span);
+        // A generic call is an inference boundary: if any argument or the result constraint failed,
+        // return the error sentinel instead of attaching the partially checked arguments to a HIR
+        // `Call`. In particular, a scanner argument checked with a concrete expected type must not
+        // become a published scanner artifact when a later argument conflicts with that type.
+        if self.diags.error_count() > error_checkpoint {
+            return err;
+        }
         // The type arguments are kept (still possibly inference variables) and finalized in
         // `finalize_expr`, which then records the instantiation and rewrites `func` to the
         // monomorph's mangled name — by then a literal argument's type has flowed from context.
@@ -21930,62 +22337,127 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Match an `actual` type against a `declared` parameter/return type, binding each `Ty::Param`
-    /// it carries into `subst` (unifying repeated occurrences). `bind_only` skips unifying concrete
-    /// leaves (used when seeding from the expected type). Handles `Param` bare or nested one level
+    /// it carries into `subst` (unifying repeated occurrences) and validating concrete leaves.
+    /// Handles `Param` bare or nested one level
     /// in a scalar-payload composite (`Option`/`Result`/`slice`/`box`/`array`/`Task`).
-    fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
+    fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span) {
+        self.match_param_in_context(
+            declared,
+            actual,
+            subst,
+            span,
+            GenericMatchContext::Argument,
+        );
+    }
+
+    /// Match a generic return against its expected type before checking arguments. Keep the
+    /// diagnostic orientation identical to the ordinary result constraint (`return vs expected`)
+    /// while still binding callee inference slots and validating every concrete return leaf.
+    fn match_expected_return_param(
+        &mut self,
+        declared: Ty,
+        expected: Ty,
+        subst: &mut [Option<Ty>],
+        span: Span,
+    ) {
+        self.match_param_in_context(
+            declared,
+            expected,
+            subst,
+            span,
+            GenericMatchContext::ExpectedReturn,
+        );
+    }
+
+    fn match_param_in_context(
+        &mut self,
+        declared: Ty,
+        actual: Ty,
+        subst: &mut [Option<Ty>],
+        span: Span,
+        context: GenericMatchContext,
+    ) {
         let a = self.resolve(actual);
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
-            (Ty::Tagged(_), _) => self.match_param(
+            (Ty::Tagged(_), _) => self.match_param_in_context(
                 expand_tagged_ty(declared, self.tagged_types),
                 a,
                 subst,
                 span,
-                bind_only,
+                context,
             ),
-            (_, Ty::Tagged(_)) => self.match_param(
+            (_, Ty::Tagged(_)) => self.match_param_in_context(
                 declared,
                 expand_tagged_ty(a, self.tagged_types),
                 subst,
                 span,
-                bind_only,
+                context,
             ),
-            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
+            (Ty::Option(ds), Ty::Option(asc)) => {
+                self.match_scalar_param_in_context(ds, asc, subst, span, context)
+            }
             (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
-                self.match_scalar_param(dok, aok, subst, span, bind_only);
-                self.match_scalar_param(derr, aerr, subst, span, bind_only);
+                self.match_scalar_param_in_context(dok, aok, subst, span, context);
+                self.match_scalar_param_in_context(derr, aerr, subst, span, context);
             }
             (Ty::Slice(ds), Ty::Slice(asc))
             | (Ty::Box(ds), Ty::Box(asc))
             | (Ty::Array(ds, _), Ty::Array(asc, _))
-            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
+            | (Ty::Task(ds), Ty::Task(asc)) => {
+                self.match_scalar_param_in_context(ds, asc, subst, span, context)
+            }
             _ => {
-                if !bind_only {
-                    self.unify(a, declared, span);
-                }
+                match context {
+                    GenericMatchContext::Argument => self.unify(a, declared, span),
+                    GenericMatchContext::ExpectedReturn => self.unify(declared, a, span),
+                };
             }
         }
     }
 
     /// The scalar-level companion of [`match_param`]: bind a `Scalar::Param` from the actual scalar,
-    /// or (when not seeding) unify a concrete declared scalar against the actual so a mismatch in a
-    /// concrete nested position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
-    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
+    /// or unify a concrete declared scalar against the actual so a mismatch in a concrete nested
+    /// position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
+    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span) {
+        self.match_scalar_param_in_context(
+            declared,
+            actual,
+            subst,
+            span,
+            GenericMatchContext::Argument,
+        );
+    }
+
+    fn match_scalar_param_in_context(
+        &mut self,
+        declared: Scalar,
+        actual: Scalar,
+        subst: &mut [Option<Ty>],
+        span: Span,
+        context: GenericMatchContext,
+    ) {
         if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
             || matches!(actual, Scalar::Tagged(_))
         {
-            self.match_param(
+            self.match_param_in_context(
                 scalar_to_ty(declared),
                 scalar_to_ty(actual),
                 subst,
                 span,
-                bind_only,
+                context,
             );
-        } else if !bind_only {
-            self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+        } else {
+            match context {
+                GenericMatchContext::Argument => {
+                    self.unify(scalar_to_ty(actual), scalar_to_ty(declared), span);
+                }
+                GenericMatchContext::ExpectedReturn => {
+                    self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+                }
+            }
         }
     }
 
@@ -23717,6 +24189,7 @@ impl<'a, 't> Checker<'a, 't> {
             .iter()
             .map(|(n, id)| (n.clone(), *id, self.finalize(self.locals[*id as usize].ty)))
             .collect();
+        let enclosing_json_scan_local_spellings = self.json_scan_local_spellings.clone();
 
         // Swap in fresh per-function state; the lambda is a separate function body.
         let saved_lifted_len = self.lifted.len();
@@ -23727,6 +24200,8 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_vars = std::mem::take(&mut self.float_vars);
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_ret = self.ret_hint;
+        let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
+        let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
         let saved_arena = self.arena_depth;
         // A lambda body is a separate function: an enclosing `unsafe {}` does not lexically
         // contain the lifted function body. Extern permission must be re-established by an unsafe
@@ -23746,22 +24221,32 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_buffered_readers = std::mem::take(&mut self.buffered_readers);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
+        self.json_scan_source_spelling = None;
         self.arena_depth = 0;
         self.unsafe_depth = 0;
         self.extern_boundary_error = false;
         self.task_group_depth = 0;
-        self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
+        self.capture = Some(CaptureScope {
+            enclosing,
+            json_scan_local_spellings: enclosing_json_scan_local_spellings,
+            captured: Vec::new(),
+        });
 
-        let mut param_ids: Vec<LocalId> = params
-            .iter()
-            .zip(&param_tys)
-            .map(|(p, ty)| {
-                // A lambda parameter shadows if it collides with another parameter of this lambda or
-                // with an enclosing (capturable) binding of the surrounding function.
-                self.check_shadow(&p.name.name, p.name.span, self.scope.len());
-                self.declare(&p.name.name, *ty, false)
-            })
-            .collect();
+        let mut param_ids = Vec::with_capacity(params.len());
+        for (p, ty) in params.iter().zip(&param_tys) {
+            // A lambda parameter shadows if it collides with another parameter of this lambda or
+            // with an enclosing (capturable) binding of the surrounding function.
+            self.check_shadow(&p.name.name, p.name.span, self.scope.len());
+            let id = self.declare(&p.name.name, *ty, false);
+            if let Some(spelling) = p
+                .ty
+                .as_ref()
+                .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
+            {
+                self.json_scan_local_spellings.insert(id, spelling);
+            }
+            param_ids.push(id);
+        }
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
             Some(t) => t,
@@ -23797,6 +24282,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.float_vars = saved_float_vars;
                 self.float_parent = saved_float_parent;
                 self.ret_hint = saved_ret;
+                self.json_scan_source_spelling = saved_json_scan_source_spelling;
+                self.json_scan_local_spellings = saved_json_scan_local_spellings;
                 self.arena_depth = saved_arena;
                 self.unsafe_depth = saved_unsafe_depth;
                 self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
@@ -23857,6 +24344,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_vars = saved_float_vars;
         self.float_parent = saved_float_parent;
         self.ret_hint = saved_ret;
+        self.json_scan_source_spelling = saved_json_scan_source_spelling;
+        self.json_scan_local_spellings = saved_json_scan_local_spellings;
         self.arena_depth = saved_arena;
         self.unsafe_depth = saved_unsafe_depth;
         self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
@@ -26341,6 +26830,23 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // Each row decodes like a single struct target; reuse the decode eligibility gate.
         if !self.json_struct_fields_ok(sid, span, JsonDir::Decode) {
+            return err;
+        }
+        if !json_scan_row_is_copy(sid, self.structs, self.enums, self.tagged_types) {
+            let Some(row_type_spelling) = self.json_scan_source_spelling.as_deref() else {
+                self.diags.error(
+                    "cannot determine the scan row type spelling; annotate the binding with `json.scanner<Row>`".to_string(),
+                    span,
+                );
+                return err;
+            };
+            self.diags.error(
+                format!(
+                    "`json.scan` row type '{}' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot",
+                    row_type_spelling
+                ),
+                span,
+            );
             return err;
         }
         // The rows' `str` fields are zero-copy views into the input, so the input's region bounds the
@@ -30642,6 +31148,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -30696,7 +31204,6 @@ impl<'a, 't> Checker<'a, 't> {
                     actual,
                     &mut subst,
                     a.span,
-                    false,
                 );
             }
             checked.push(ce);
@@ -32658,6 +33165,565 @@ fn ty_name(ty: Ty) -> String {
     }
 }
 
+/// Resolve a canonical type-table entry back to its public source path. This is a producer-owned
+/// lookup: unlike HIR nominal names, it retains the module qualifier that an importer wrote.
+fn source_path_for_canonical(canonical: &str, type_table: &ModTypes) -> Option<String> {
+    type_table.iter().find_map(|(module, entries)| {
+        entries.iter().find_map(|(bare, entry)| {
+            if entry.canonical != canonical {
+                return None;
+            }
+            if module == "main" {
+                Some(bare.clone())
+            } else {
+                Some(format!("{module}.{bare}"))
+            }
+        })
+    })
+}
+
+/// Render a resolved type through producer-owned source tables. The formatter is used only to
+/// substitute concrete arguments into a generic source annotation; it deliberately never reads
+/// `ty_name`, `StructDef::name`, `StructDef::source_name`, or an internal monomorph identity.
+#[allow(clippy::too_many_arguments)]
+fn resolved_type_source_spelling(
+    ty: Ty,
+    type_table: &ModTypes,
+    struct_ids: &HashMap<String, u32>,
+    enum_ids: &HashMap<String, u32>,
+    struct_source_spellings: &HashMap<u32, String>,
+    enum_source_spellings: &HashMap<u32, String>,
+    tagged_types: &[hir::TaggedType],
+    tuples: &[hir::TupleDef],
+    fn_types: &[hir::FnTy],
+) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn scalar(
+        value: Scalar,
+        type_table: &ModTypes,
+        struct_ids: &HashMap<String, u32>,
+        enum_ids: &HashMap<String, u32>,
+        struct_source_spellings: &HashMap<u32, String>,
+        enum_source_spellings: &HashMap<u32, String>,
+        tagged_types: &[hir::TaggedType],
+        tuples: &[hir::TupleDef],
+        fn_types: &[hir::FnTy],
+        depth: usize,
+    ) -> String {
+        resolved(
+            scalar_to_ty(value),
+            type_table,
+            struct_ids,
+            enum_ids,
+            struct_source_spellings,
+            enum_source_spellings,
+            tagged_types,
+            tuples,
+            fn_types,
+            depth,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolved(
+        ty: Ty,
+        type_table: &ModTypes,
+        struct_ids: &HashMap<String, u32>,
+        enum_ids: &HashMap<String, u32>,
+        struct_source_spellings: &HashMap<u32, String>,
+        enum_source_spellings: &HashMap<u32, String>,
+        tagged_types: &[hir::TaggedType],
+        tuples: &[hir::TupleDef],
+        fn_types: &[hir::FnTy],
+        depth: usize,
+    ) -> String {
+        if depth > 64 {
+            return "<type>".to_string();
+        }
+        let next = depth + 1;
+        match ty {
+            Ty::Int(it) => format!("{}{}", if it.signed { 'i' } else { 'u' }, it.bits),
+            Ty::Float(ft) => format!("f{}", ft.bits),
+            Ty::Bool => "bool".to_string(),
+            Ty::Char => "char".to_string(),
+            Ty::Str => "str".to_string(),
+            Ty::String => "string".to_string(),
+            Ty::Unit => "()".to_string(),
+            Ty::Param(i) => format!("T{i}"),
+            Ty::Struct(id) => struct_source_spellings
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    struct_ids.iter().find_map(|(canonical, candidate)| {
+                        (*candidate == id).then(|| source_path_for_canonical(canonical, type_table)).flatten()
+                    })
+                })
+                .unwrap_or_else(|| "<struct>".to_string()),
+            Ty::Soa(id) => format!(
+                "soa<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Enum(id) => enum_source_spellings
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    enum_ids.iter().find_map(|(canonical, candidate)| {
+                        (*candidate == id).then(|| source_path_for_canonical(canonical, type_table)).flatten()
+                    })
+                })
+                .unwrap_or_else(|| "<enum>".to_string()),
+            Ty::Option(payload) => format!(
+                "Option<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Result(ok, err) => format!(
+                "Result<{}, {}>",
+                scalar(
+                    ok,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                ),
+                scalar(
+                    err,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Tagged(id) => tagged_types
+                .get(id as usize)
+                .map(|tagged| match *tagged {
+                    hir::TaggedType::Option(payload) => resolved(
+                        Ty::Option(payload),
+                        type_table,
+                        struct_ids,
+                        enum_ids,
+                        struct_source_spellings,
+                        enum_source_spellings,
+                        tagged_types,
+                        tuples,
+                        fn_types,
+                        next,
+                    ),
+                    hir::TaggedType::Result(ok, err) => resolved(
+                        Ty::Result(ok, err),
+                        type_table,
+                        struct_ids,
+                        enum_ids,
+                        struct_source_spellings,
+                        enum_source_spellings,
+                        tagged_types,
+                        tuples,
+                        fn_types,
+                        next,
+                    ),
+                })
+                .unwrap_or_else(|| "<tagged>".to_string()),
+            Ty::Array(elem, len) => format!(
+                "array<{}>[{len}]",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::StructArray(id, len) => format!(
+                "array<{}>[{len}]",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynStructArray(id, _) => format!(
+                "array<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynSliceArray(elem) => format!(
+                "array<slice<{}>>",
+                scalar(
+                    prim_to_scalar(elem),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynArray(elem) => format!(
+                "array<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynResponseArray => "array<response>".to_string(),
+            Ty::Box(payload) => format!(
+                "box<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Vec(elem, width) => format!(
+                "vec{width}<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Mask(elem, width) => format!(
+                "mask{width}<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Slice(elem) => format!(
+                "slice<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::ArenaHandle => "arena".to_string(),
+            Ty::Raw => "raw".to_string(),
+            Ty::Builder => "builder".to_string(),
+            Ty::Writer => "writer".to_string(),
+            Ty::Reader => "reader".to_string(),
+            Ty::Buffer => "buffer".to_string(),
+            Ty::ArrayBuilder(elem) => format!(
+                "array_builder<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::StrFinder => "str_finder".to_string(),
+            Ty::File => "file".to_string(),
+            Ty::Rng => "rng".to_string(),
+            Ty::Regex => "regex".to_string(),
+            Ty::Captures => "captures".to_string(),
+            Ty::CliCommand => "cli command".to_string(),
+            Ty::CliParsed => "cli parsed".to_string(),
+            Ty::TcpConn => "tcp_conn".to_string(),
+            Ty::TcpListener => "tcp_listener".to_string(),
+            Ty::UdpSocket => "udp_socket".to_string(),
+            Ty::Child => "child".to_string(),
+            Ty::Command => "command".to_string(),
+            Ty::RunOutput => "run_output".to_string(),
+            Ty::HttpRequest => "http request".to_string(),
+            Ty::HttpResponse => "http response".to_string(),
+            Ty::HttpClient => "http client".to_string(),
+            Ty::HttpServer => "http_server".to_string(),
+            Ty::HttpRequestCtx => "http_request_ctx".to_string(),
+            Ty::HttpHeaders => "http_headers".to_string(),
+            Ty::ResponseBuilder => "response_builder".to_string(),
+            Ty::HttpStream => "http_stream".to_string(),
+            Ty::JsonDoc => "json.doc".to_string(),
+            Ty::JsonScanner(id) => format!(
+                "json.scanner<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Tuple(id) => tuples
+                .get(id as usize)
+                .map(|tuple| {
+                    let elems = tuple
+                        .elems
+                        .iter()
+                        .map(|elem| {
+                            scalar(
+                                *elem,
+                                type_table,
+                                struct_ids,
+                                enum_ids,
+                                struct_source_spellings,
+                                enum_source_spellings,
+                                tagged_types,
+                                tuples,
+                                fn_types,
+                                next,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!("({})", elems.join(", "))
+                })
+                .unwrap_or_else(|| "<tuple>".to_string()),
+            Ty::Fn(id) => fn_types
+                .get(id as usize)
+                .map(|function| {
+                    let params = function
+                        .params
+                        .iter()
+                        .map(|(_, param)| {
+                            scalar(
+                                *param,
+                                type_table,
+                                struct_ids,
+                                enum_ids,
+                                struct_source_spellings,
+                                enum_source_spellings,
+                                tagged_types,
+                                tuples,
+                                fn_types,
+                                next,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        "fn({}) -> {}",
+                        params.join(", "),
+                        resolved(
+                            function.ret,
+                            type_table,
+                            struct_ids,
+                            enum_ids,
+                            struct_source_spellings,
+                            enum_source_spellings,
+                            tagged_types,
+                            tuples,
+                            fn_types,
+                            next,
+                        )
+                    )
+                })
+                .unwrap_or_else(|| "<fn>".to_string()),
+            Ty::Task(payload) => format!(
+                "Task<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DictEncoded(id, _) => format!(
+                "dict_encoded<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => "<type>".to_string(),
+        }
+    }
+
+    resolved(
+        ty,
+        type_table,
+        struct_ids,
+        enum_ids,
+        struct_source_spellings,
+        enum_source_spellings,
+        tagged_types,
+        tuples,
+        fn_types,
+        0,
+    )
+}
+
+/// Render a source-level type annotation without consulting HIR nominal names or mangled
+/// monomorph identities. This is intentionally limited to the syntax needed by the producer-owned
+/// `json.scan` row diagnostic; the row itself must resolve to a named struct, while its concrete
+/// generic arguments may contain any ordinary source type.
+fn source_type_spelling(ty: &ast::Type) -> String {
+    match ty {
+        ast::Type::Named { path, args, .. } => {
+            let mut output = path
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !args.is_empty() {
+                output.push('<');
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str(", ");
+                    }
+                    output.push_str(&source_type_spelling(arg));
+                }
+                output.push('>');
+            }
+            output
+        }
+        ast::Type::Tuple { elems, .. } => {
+            let mut output = String::from("(");
+            for (index, elem) in elems.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&source_type_spelling(elem));
+            }
+            output.push(')');
+            output
+        }
+        ast::Type::Fn { params, ret, .. } => {
+            let mut output = String::from("fn(");
+            for (index, param) in params.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&source_type_spelling(&param.ty));
+            }
+            output.push_str(") -> ");
+            output.push_str(&source_type_spelling(ret));
+            output
+        }
+    }
+}
+
+/// Extract the producer-owned row spelling from a written scanner annotation before resolution
+/// turns `json.scanner<Row>` into `Ty::JsonScanner(struct_id)`.
+fn json_scan_row_source_spelling(ty: &ast::Type) -> Option<String> {
+    let ast::Type::Named { path, args, .. } = ty else {
+        return None;
+    };
+    let [module, name] = path.segments.as_slice() else {
+        return None;
+    };
+    (module.name == "json" && name.name == "scanner")
+        .then(|| args.first().map(source_type_spelling))
+        .flatten()
+}
+
 /// Classify an `as` conversion for the **lossy-conversion** lint (`draft.md` §16, "Numeric
 /// conversion — as"). Returns a short reason when the conversion *may* lose information — a
 /// defined, non-error conversion the programmer should be aware of — or `None` when it is
@@ -32722,10 +33788,11 @@ fn is_numeric_literal(e: &Expr) -> bool {
     }
 }
 
-/// Substitute a generic function's type parameters: `Ty::Param(i)` → `args[i]`. The skeleton keeps
-/// a type parameter in a **bare** position (never nested inside `Option`/`array`/a tuple — `Scalar`
-/// can't hold a `Param`), so this is a single top-level replacement. Used by both call-result typing
-/// and monomorphization.
+/// Substitute a generic function's type parameters: `Ty::Param(i)` → `args[i]`. Scalar-payload
+/// composites are substituted recursively so call checking can distinguish a wholly unresolved
+/// position from a partially substituted one; unresolved `Param` values are temporary and must be
+/// rejected before they reach ordinary expression checking or HIR. Used by call-result typing and
+/// monomorphization.
 fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Ty {
     // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
     // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their
@@ -32896,6 +33963,61 @@ fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         }
     }
     false
+}
+
+/// The state of the callee's own inference slots in one declared argument position. An enclosing
+/// generic function may contribute a symbolic `Ty::Param` as a bound value; that value is not an
+/// unresolved slot of this call and must not be mistaken for a partial substitution.
+#[derive(Clone, Copy, Default)]
+struct GenericParamState {
+    bound: bool,
+    unbound: bool,
+}
+
+fn generic_param_state(ty: Ty, subst: &[Option<Ty>], tagged_types: &[hir::TaggedType]) -> GenericParamState {
+    let mut state = GenericParamState::default();
+    let mut work = Vec::new();
+    match ty {
+        Ty::Param(p) => {
+            if subst.get(p as usize).is_some_and(Option::is_some) {
+                state.bound = true;
+            } else {
+                state.unbound = true;
+            }
+        }
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => work.push(s),
+        Ty::Result(ok, err) => {
+            work.push(err);
+            work.push(ok);
+        }
+        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
+        _ => {}
+    }
+    let mut visited = HashSet::new();
+    while let Some(scalar) = work.pop() {
+        match scalar {
+            Scalar::Param(p) => {
+                if subst.get(p as usize).is_some_and(Option::is_some) {
+                    state.bound = true;
+                } else {
+                    state.unbound = true;
+                }
+            }
+            Scalar::Tagged(id) if visited.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(payload),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(err);
+                            work.push(ok);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    state
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
@@ -33417,6 +34539,11 @@ struct TyCx<'a> {
     type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    /// Producer-owned public spellings for resolved nominal ids. These maps are checker state;
+    /// they are never serialized into HIR and are used only when a later generic specialization
+    /// must render a concrete source annotation.
+    struct_source_spellings: &'a mut HashMap<u32, String>,
+    enum_source_spellings: &'a mut HashMap<u32, String>,
     /// Generic struct templates, by name (not in `structs` — they carry `Param` fields).
     struct_templates: &'a HashMap<String, StructTemplate>,
     /// Concrete struct table; monomorph instances of generic structs are appended here.
@@ -34502,6 +35629,30 @@ fn instantiate_struct(
         align: tmpl.align,
         c_repr: tmpl.c_repr,
     });
+    let base_spelling = source_path_for_canonical(name, cx.type_table)
+        .unwrap_or_else(|| "<struct>".to_string());
+    let args_spelling = args
+        .iter()
+        .map(|arg| {
+            resolved_type_source_spelling(
+                *arg,
+                cx.type_table,
+                cx.struct_ids,
+                cx.enum_ids,
+                cx.struct_source_spellings,
+                cx.enum_source_spellings,
+                cx.tagged_types,
+                cx.tuples,
+                cx.fn_types,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spelling = if args_spelling.is_empty() {
+        base_spelling
+    } else {
+        format!("{base_spelling}<{}>", args_spelling.join(", "))
+    };
+    cx.struct_source_spellings.insert(id, spelling);
     cx.struct_mono.insert(mangled, id);
     id
 }
@@ -34599,6 +35750,30 @@ fn instantiate_enum(
         source_name,
         variants,
     });
+    let base_spelling = source_path_for_canonical(name, cx.type_table)
+        .unwrap_or_else(|| "<enum>".to_string());
+    let args_spelling = args
+        .iter()
+        .map(|arg| {
+            resolved_type_source_spelling(
+                *arg,
+                cx.type_table,
+                cx.struct_ids,
+                cx.enum_ids,
+                cx.struct_source_spellings,
+                cx.enum_source_spellings,
+                cx.tagged_types,
+                cx.tuples,
+                cx.fn_types,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spelling = if args_spelling.is_empty() {
+        base_spelling
+    } else {
+        format!("{base_spelling}<{}>", args_spelling.join(", "))
+    };
+    cx.enum_source_spellings.insert(id, spelling);
     cx.enum_mono.insert(mangled, id);
     id
 }
