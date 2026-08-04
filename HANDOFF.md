@@ -16,10 +16,18 @@ PR-boundary review found five P2 contract gaps; all five repairs are applied, an
 finding-closure check returned CLEAN before the measured cap failure; a fresh independent review of
 the new 440/150 and 80/150 boundaries then found three P2 documentation gaps. Those gaps are fixed,
 and bounded closure reviews of the exact projection contract, focused gates, and normative split
-returned CLEAN. C2a2a is implemented at 425 production lines plus 149 compact parity-test lines.
-All 109 `align_mir` tests and `align_mir` all-target Clippy with `-D warnings` pass. Neither slice
-may add `CanonicalTypeView`, `ValidatedGraph`, canonical bytes, a stored MIR field, or a
-public/package consumer.
+returned CLEAN. The first exact-diff implementation preflight found four valid owner gaps: the
+matcher was not compile-closed over every current type, function parameter mode/type comparisons
+were not reached independently, missing/cross-kind nodes were incomplete, and the source inventory
+was manual only. Closing those rows measures 437 production lines plus 209 test lines. Coding
+stopped again at the recorded 150-test cap. The cap is amended to 440/210 because these parity and
+inventory owners cannot be split from the atomic comparator extraction without publishing an
+unclosed matcher; the measured total is 646 and the cap is 650, both below 1,000. The fresh
+independent boundary review found one P3 counting ambiguity, then returned CLEAN after the measured
+646 and capped 650 conventions were made exact. The four implementation findings are now closed;
+the focused comparator/field-codec owners, all 109 `align_mir` tests, and `align_mir` all-target
+Clippy with `-D warnings` pass. Neither slice may add `CanonicalTypeView`, `ValidatedGraph`,
+canonical bytes, a stored MIR field, or a public/package consumer.
 
 The plan of record splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed
 field codec), c2a2a (shared private source-shape comparator), c2a2b (complexity observation), c2a3 (private `ValidatedGraph`

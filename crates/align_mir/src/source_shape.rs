@@ -285,135 +285,147 @@ impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
     }
 
     fn scalars_equal(&mut self, left: Scalar, right: Scalar) -> bool {
-        match (left, right) {
-            (Scalar::Struct(left), Scalar::Struct(right))
-            | (Scalar::DynStructArray(left), Scalar::DynStructArray(right))
-            | (Scalar::Soa(left), Scalar::Soa(right)) => {
-                self.queue_equal(Node::Struct(left), Node::Struct(right))
-            }
-            (Scalar::Enum(left), Scalar::Enum(right)) => {
-                self.queue_equal(Node::Enum(left), Node::Enum(right))
-            }
-            (Scalar::Tagged(left), Scalar::Tagged(right)) => {
-                self.queue_equal(Node::Tagged(left), Node::Tagged(right))
-            }
-            (Scalar::Fn(left), Scalar::Fn(right)) => {
-                self.queue_equal(Node::Fn(left), Node::Fn(right))
-            }
-            (Scalar::Int(left), Scalar::Int(right)) => left == right,
-            (Scalar::Float(left), Scalar::Float(right)) => left == right,
-            (Scalar::DynArray(left), Scalar::DynArray(right))
-            | (Scalar::Slice(left), Scalar::Slice(right)) => left == right,
-            (Scalar::Param(left), Scalar::Param(right)) => left == right,
-            (Scalar::Bool, Scalar::Bool)
-            | (Scalar::Char, Scalar::Char)
-            | (Scalar::Unit, Scalar::Unit)
-            | (Scalar::String, Scalar::String)
-            | (Scalar::DynResponseArray, Scalar::DynResponseArray)
-            | (Scalar::Str, Scalar::Str)
-            | (Scalar::JsonDoc, Scalar::JsonDoc)
-            | (Scalar::Reader, Scalar::Reader)
-            | (Scalar::Writer, Scalar::Writer)
-            | (Scalar::Buffer, Scalar::Buffer)
-            | (Scalar::Regex, Scalar::Regex)
-            | (Scalar::Captures, Scalar::Captures)
-            | (Scalar::CliParsed, Scalar::CliParsed)
-            | (Scalar::TcpConn, Scalar::TcpConn)
-            | (Scalar::TcpListener, Scalar::TcpListener)
-            | (Scalar::UdpSocket, Scalar::UdpSocket)
-            | (Scalar::Child, Scalar::Child)
-            | (Scalar::File, Scalar::File)
-            | (Scalar::HttpResponse, Scalar::HttpResponse)
-            | (Scalar::HttpServer, Scalar::HttpServer)
-            | (Scalar::HttpRequestCtx, Scalar::HttpRequestCtx)
-            | (Scalar::ResponseBuilder, Scalar::ResponseBuilder)
-            | (Scalar::HttpStream, Scalar::HttpStream)
-            | (Scalar::RunOutput, Scalar::RunOutput) => true,
-            _ => false,
+        macro_rules! node {
+            ($variant:ident, $kind:ident, $left:expr) => {
+                match right {
+                    Scalar::$variant(right) => {
+                        self.queue_equal(Node::$kind($left), Node::$kind(right))
+                    }
+                    _ => false,
+                }
+            };
+        }
+        match left {
+            Scalar::Struct(left) => node!(Struct, Struct, left),
+            Scalar::DynStructArray(left) => node!(DynStructArray, Struct, left),
+            Scalar::Soa(left) => node!(Soa, Struct, left),
+            Scalar::Enum(left) => node!(Enum, Enum, left),
+            Scalar::Tagged(left) => node!(Tagged, Tagged, left),
+            Scalar::Fn(left) => node!(Fn, Fn, left),
+            Scalar::Int(_)
+            | Scalar::Float(_)
+            | Scalar::DynArray(_)
+            | Scalar::Slice(_)
+            | Scalar::Param(_)
+            | Scalar::Bool
+            | Scalar::Char
+            | Scalar::Unit
+            | Scalar::String
+            | Scalar::DynResponseArray
+            | Scalar::Str
+            | Scalar::JsonDoc
+            | Scalar::Reader
+            | Scalar::Writer
+            | Scalar::Buffer
+            | Scalar::Regex
+            | Scalar::Captures
+            | Scalar::CliParsed
+            | Scalar::TcpConn
+            | Scalar::TcpListener
+            | Scalar::UdpSocket
+            | Scalar::Child
+            | Scalar::File
+            | Scalar::HttpResponse
+            | Scalar::HttpServer
+            | Scalar::HttpRequestCtx
+            | Scalar::ResponseBuilder
+            | Scalar::HttpStream
+            | Scalar::RunOutput => left == right,
         }
     }
 
     fn types_equal(&mut self, left: Ty, right: Ty) -> bool {
-        match (left, right) {
-            (Ty::Option(left), Ty::Option(right))
-            | (Ty::Box(left), Ty::Box(right))
-            | (Ty::Slice(left), Ty::Slice(right))
-            | (Ty::DynArray(left), Ty::DynArray(right))
-            | (Ty::ArrayBuilder(left), Ty::ArrayBuilder(right))
-            | (Ty::Task(left), Ty::Task(right)) => self.scalars_equal(left, right),
-            (Ty::Result(a, b), Ty::Result(c, d)) => {
-                self.scalars_equal(a, c) && self.scalars_equal(b, d)
+        macro_rules! same {
+            ($pattern:pat => $body:expr) => {
+                match right {
+                    $pattern => $body,
+                    _ => false,
+                }
+            };
+        }
+        macro_rules! node {
+            ($variant:ident, $kind:ident, $left:expr) => {
+                same!(Ty::$variant(right) => self.queue_equal(Node::$kind($left), Node::$kind(right)))
+            };
+        }
+        match left {
+            Ty::Option(left) => same!(Ty::Option(right) => self.scalars_equal(left, right)),
+            Ty::Result(a, b) => {
+                same!(Ty::Result(c, d) => self.scalars_equal(a, c) && self.scalars_equal(b, d))
             }
-            (Ty::Tagged(left), Ty::Tagged(right)) => {
-                self.queue_equal(Node::Tagged(left), Node::Tagged(right))
+            Ty::Box(left) => same!(Ty::Box(right) => self.scalars_equal(left, right)),
+            Ty::Array(left, a) => {
+                same!(Ty::Array(right, b) => a == b && self.scalars_equal(left, right))
             }
-            (Ty::Array(left, a), Ty::Array(right, b)) => a == b && self.scalars_equal(left, right),
-            (Ty::Vec(left, a), Ty::Vec(right, b)) | (Ty::Mask(left, a), Ty::Mask(right, b)) => {
-                a == b && self.scalars_equal(left, right)
+            Ty::Vec(left, a) => {
+                same!(Ty::Vec(right, b) => a == b && self.scalars_equal(left, right))
             }
-            (Ty::StructArray(left, a), Ty::StructArray(right, b)) => {
-                a == b && self.queue_equal(Node::Struct(left), Node::Struct(right))
+            Ty::Mask(left, a) => {
+                same!(Ty::Mask(right, b) => a == b && self.scalars_equal(left, right))
             }
-            (Ty::DynStructArray(left, a), Ty::DynStructArray(right, b)) => {
-                a == b && self.queue_equal(Node::Struct(left), Node::Struct(right))
+            Ty::Slice(left) => same!(Ty::Slice(right) => self.scalars_equal(left, right)),
+            Ty::DynArray(left) => same!(Ty::DynArray(right) => self.scalars_equal(left, right)),
+            Ty::ArrayBuilder(left) => {
+                same!(Ty::ArrayBuilder(right) => self.scalars_equal(left, right))
             }
-            (Ty::Soa(left), Ty::Soa(right))
-            | (Ty::JsonScanner(left), Ty::JsonScanner(right))
-            | (Ty::Struct(left), Ty::Struct(right)) => {
-                self.queue_equal(Node::Struct(left), Node::Struct(right))
+            Ty::Task(left) => same!(Ty::Task(right) => self.scalars_equal(left, right)),
+            Ty::Tagged(left) => node!(Tagged, Tagged, left),
+            Ty::StructArray(left, a) => {
+                same!(Ty::StructArray(right, b) => a == b && self.queue_equal(Node::Struct(left), Node::Struct(right)))
             }
-            (Ty::DictEncoded(left, a), Ty::DictEncoded(right, b)) => {
-                a == b && self.queue_equal(Node::Struct(left), Node::Struct(right))
+            Ty::DynStructArray(left, a) => {
+                same!(Ty::DynStructArray(right, b) => a == b && self.queue_equal(Node::Struct(left), Node::Struct(right)))
             }
-            (Ty::Tuple(left), Ty::Tuple(right)) => {
-                self.queue_equal(Node::Tuple(left), Node::Tuple(right))
+            Ty::Soa(left) => node!(Soa, Struct, left),
+            Ty::JsonScanner(left) => node!(JsonScanner, Struct, left),
+            Ty::DictEncoded(left, a) => {
+                same!(Ty::DictEncoded(right, b) => a == b && self.queue_equal(Node::Struct(left), Node::Struct(right)))
             }
-            (Ty::Fn(left), Ty::Fn(right)) => self.queue_equal(Node::Fn(left), Node::Fn(right)),
-            (Ty::Enum(left), Ty::Enum(right)) => {
-                self.queue_equal(Node::Enum(left), Node::Enum(right))
-            }
-            (Ty::Int(left), Ty::Int(right)) => left == right,
-            (Ty::Float(left), Ty::Float(right)) => left == right,
-            (Ty::Param(left), Ty::Param(right))
-            | (Ty::IntVar(left), Ty::IntVar(right))
-            | (Ty::FloatVar(left), Ty::FloatVar(right)) => left == right,
-            (Ty::DynSliceArray(left), Ty::DynSliceArray(right)) => left == right,
-            (Ty::Bool, Ty::Bool)
-            | (Ty::Char, Ty::Char)
-            | (Ty::DynResponseArray, Ty::DynResponseArray)
-            | (Ty::Str, Ty::Str)
-            | (Ty::String, Ty::String)
-            | (Ty::ArenaHandle, Ty::ArenaHandle)
-            | (Ty::Raw, Ty::Raw)
-            | (Ty::Builder, Ty::Builder)
-            | (Ty::Writer, Ty::Writer)
-            | (Ty::Reader, Ty::Reader)
-            | (Ty::Buffer, Ty::Buffer)
-            | (Ty::StrFinder, Ty::StrFinder)
-            | (Ty::File, Ty::File)
-            | (Ty::Rng, Ty::Rng)
-            | (Ty::Regex, Ty::Regex)
-            | (Ty::Captures, Ty::Captures)
-            | (Ty::CliCommand, Ty::CliCommand)
-            | (Ty::CliParsed, Ty::CliParsed)
-            | (Ty::TcpConn, Ty::TcpConn)
-            | (Ty::TcpListener, Ty::TcpListener)
-            | (Ty::UdpSocket, Ty::UdpSocket)
-            | (Ty::Child, Ty::Child)
-            | (Ty::Command, Ty::Command)
-            | (Ty::RunOutput, Ty::RunOutput)
-            | (Ty::HttpRequest, Ty::HttpRequest)
-            | (Ty::HttpResponse, Ty::HttpResponse)
-            | (Ty::HttpClient, Ty::HttpClient)
-            | (Ty::HttpServer, Ty::HttpServer)
-            | (Ty::HttpRequestCtx, Ty::HttpRequestCtx)
-            | (Ty::ResponseBuilder, Ty::ResponseBuilder)
-            | (Ty::HttpStream, Ty::HttpStream)
-            | (Ty::HttpHeaders, Ty::HttpHeaders)
-            | (Ty::JsonDoc, Ty::JsonDoc)
-            | (Ty::Unit, Ty::Unit)
-            | (Ty::Error, Ty::Error) => true,
-            _ => false,
+            Ty::Struct(left) => node!(Struct, Struct, left),
+            Ty::Tuple(left) => node!(Tuple, Tuple, left),
+            Ty::Fn(left) => node!(Fn, Fn, left),
+            Ty::Enum(left) => node!(Enum, Enum, left),
+            Ty::Int(_)
+            | Ty::Float(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::FloatVar(_)
+            | Ty::DynSliceArray(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::DynResponseArray
+            | Ty::Str
+            | Ty::String
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Builder
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::StrFinder
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::Unit
+            | Ty::Error => left == right,
         }
     }
 
@@ -434,6 +446,7 @@ pub(super) mod tests {
     }
     fn twin_program() -> hir::Program {
         let mut program = baseline_program();
+        program.fn_types[0].params = vec![(ParamMode::ByValue, Scalar::Bool)];
         program.structs.push(program.structs[0].clone());
         program.enums.push(program.enums[0].clone());
         program.tuples.push(program.tuples[0].clone());
@@ -518,6 +531,24 @@ pub(super) mod tests {
             Ty::DictEncoded(0, 1) => Ty::DictEncoded(0, 2),
             Ty::Option(Scalar::Int(i(8))) => Ty::Option(Scalar::Int(i(16))),
         );
+        assert_ty_matrix(&[Ty::Param(0), Ty::IntVar(0), Ty::FloatVar(0), Ty::Error]);
+        assert!(ty_equal(
+            Ty::Option(Scalar::Param(0)),
+            Ty::Option(Scalar::Param(0))
+        ));
+        unequal!(
+            Ty::Tagged(0) => Ty::Tagged(99), Ty::StructArray(0, 1) => Ty::StructArray(99, 1),
+            Ty::DynStructArray(0, Layout::Aos) => Ty::DynStructArray(99, Layout::Aos),
+            Ty::Soa(0) => Ty::Soa(99), Ty::JsonScanner(0) => Ty::JsonScanner(99),
+            Ty::DictEncoded(0, 0) => Ty::DictEncoded(99, 0), Ty::Struct(0) => Ty::Struct(99),
+            Ty::Tuple(0) => Ty::Tuple(99), Ty::Fn(0) => Ty::Fn(99), Ty::Enum(0) => Ty::Enum(99),
+            Ty::Option(Scalar::Struct(0)) => Ty::Option(Scalar::Struct(99)),
+            Ty::Option(Scalar::DynStructArray(0)) => Ty::Option(Scalar::DynStructArray(99)),
+            Ty::Option(Scalar::Soa(0)) => Ty::Option(Scalar::Soa(99)),
+            Ty::Option(Scalar::Enum(0)) => Ty::Option(Scalar::Enum(99)),
+            Ty::Option(Scalar::Tagged(0)) => Ty::Option(Scalar::Tagged(99)),
+            Ty::Option(Scalar::Fn(0)) => Ty::Option(Scalar::Fn(99)),
+        );
         rejects!(Node::Struct(0), Node::Struct(1);
             |p: &mut hir::Program| p.structs[1].source_name.push('x'),
             |p: &mut hir::Program| p.structs[1].align = Some(8),
@@ -537,7 +568,9 @@ pub(super) mod tests {
             |p: &mut hir::Program| p.tagged_types[1] = hir::TaggedType::Option(Scalar::Bool),
         );
         rejects!(Node::Fn(0), Node::Fn(1);
-            |p: &mut hir::Program| p.fn_types[1].params.push((ParamMode::Out, Scalar::Bool)),
+            |p: &mut hir::Program| p.fn_types[1].params.push((ParamMode::ByValue, Scalar::Bool)),
+            |p: &mut hir::Program| p.fn_types[1].params[0].0 = ParamMode::Out,
+            |p: &mut hir::Program| p.fn_types[1].params[0].1 = Scalar::Char,
             |p: &mut hir::Program| p.fn_types[1].ret = Ty::Bool,
             |p: &mut hir::Program| p.fn_types[1].return_borrow = hir::ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] },
             |p: &mut hir::Program| p.fn_types[1].return_region = hir::ReturnRegionSummary::Roots { params: vec![0], captures: vec![] },
@@ -566,6 +599,45 @@ pub(super) mod tests {
             &mut known
         ));
         assert!(known.is_empty());
-        assert!(!equal(&program, Node::Struct(99), Node::Struct(99)));
+        for node in [
+            Node::Struct(99),
+            Node::Enum(99),
+            Node::Tuple(99),
+            Node::Tagged(99),
+            Node::Fn(99),
+        ] {
+            assert!(!equal(&program, node, node));
+        }
+        for node in [Node::Enum(0), Node::Tuple(0), Node::Tagged(0), Node::Fn(0)] {
+            assert!(!equal(&program, Node::Struct(0), node));
+        }
+        let production = include_str!("source_shape.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for (needle, count) in [
+            ("HashSet<", 3),
+            ("HashMap<", 2),
+            ("VecDeque<", 1),
+            ("HashSet::new", 1),
+            ("HashMap::new", 2),
+            ("VecDeque::from", 1),
+        ] {
+            assert_eq!(production.matches(needle).count(), count, "{needle}");
+        }
+        for absent in [
+            "Observer",
+            "CanonicalTypeView",
+            "ValidatedGraph",
+            "canonical_type_bytes",
+        ] {
+            assert!(!production.contains(absent), "{absent}");
+        }
+        assert_eq!(
+            include_str!("validate_hir.rs")
+                .matches("source_shape_equal(")
+                .count(),
+            1
+        );
     }
 }
