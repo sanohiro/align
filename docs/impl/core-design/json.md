@@ -439,10 +439,13 @@ the few boundaries that remain:
   between the baseline and implementation-head compilers, so the full cache-key digest is also
   expected to differ and no cache object may be shared across those compiler builds. The owner
   compares every other listed `CodegenKey` field for exact equality and fails if any additional
-  difference appears; it also compares the production `CodegenKey::non_compiler_build_digest()` so
-  the complete full-key input is checked without a second hand-written digest, exercises the real
-  cache `CodegenKey::first_diff()` classifier with a compiler-build variant, and records the resulting
-  `FirstDiff::CompilerBuildId`, rather than merely echoing an expected label. That expected build-id
+  difference appears. The implementation-side
+  `cache_codegen::json_scan_copy_row_codegen_key_identity_owner` test separately exercises the
+  production `CodegenKey::non_compiler_build_digest()` and `CodegenKey::first_diff()` classifier
+  with a compiler-build variant, recording `FirstDiff::CompilerBuildId` rather than merely echoing
+  an expected label. The cross-worktree shell owner remains baseline-compatible by comparing the
+  explicit serialized fields and the production full/slot digests exposed by the identity test; it
+  does not copy newer cache APIs into the historical compiler checkout. That expected build-id
   difference is not treated as a scanner identity failure. The existing
   `cache_codegen::json_scan_row_schema_rejection` and
   `cache_codegen::json_scan_per_unit_interface_row_ownership` separately own cold/hot, schema

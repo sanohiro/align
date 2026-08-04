@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Compare the exact Request 6 Copy-row codegen inputs between the fixed baseline and an
-# implementation head. The Rust owner is copied into the baseline worktree because that commit
-# predates this checked-in integration test.
+# implementation head. The cross-worktree Rust owner is copied into the baseline worktree because
+# that commit predates this checked-in integration test. The production CodegenKey classifier is
+# owned by the implementation-side cache_codegen test, which cannot be copied into the older
+# baseline without changing the compiler under test.
 set -euo pipefail
 
 BASELINE_SHA="576e57307fe4ef34e74566f5e389a2f0e2a04acd"
@@ -81,12 +83,6 @@ compare_exact interface-hash
 compare_exact mir.txt
 compare_exact llvm.ll
 compare_exact object.o
-compare_exact key-non-build-id-digest
-compare_exact first-diff-compiler-build-id
-if [[ "$(cat "$IMPLEMENTATION_OUT/first-diff-compiler-build-id")" != "CompilerBuildId" ]]; then
-    echo "json-scan identity expected the production classifier to report CompilerBuildId" >&2
-    exit 1
-fi
 
 KEY_FIELDS=(
     cache_format_version
@@ -127,8 +123,9 @@ if cmp -s "$BASELINE_OUT/key-slot-digest" "$IMPLEMENTATION_OUT/key-slot-digest";
     exit 1
 fi
 
-# Only compiler_build_id differs in the ordered CodegenKey comparison, and the checked-in Rust owner
-# has exercised the production classifier for that exact difference. The object is identical, but
-# the distinct full/slot digests prove that no cache object can be shared across the builds.
+# Only compiler_build_id differs in the ordered CodegenKey comparison. The object is identical, but
+# the distinct full/slot digests prove that no cache object can be shared across the builds. The
+# implementation-side cache_codegen owner separately exercises the production classifier and its
+# compiler-independent full-key digest.
 echo "json-scan identity: interface/MIR/LLVM/object and all non-build-id CodegenKey fields match"
-echo "json-scan identity: FirstDiff::CompilerBuildId; full and slot cache digests are isolated"
+echo "json-scan identity: compiler build id, full digest, and slot digest are isolated"

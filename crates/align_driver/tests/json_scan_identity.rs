@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use align_driver::{
-    BuildTarget, Hash128, PgoKey, Profile, build_codegen_key, build_per_unit, emit_object_file,
+    BuildTarget, PgoKey, Profile, build_codegen_key, build_per_unit, emit_object_file,
 };
 use align_interface::serialize;
 use align_mir::print::codegen_input_to_string;
@@ -128,20 +128,4 @@ fn json_scan_cross_compiler_identity() {
     )
     .expect("build codegen key");
     write_key_fields(&dir, &key);
-    write_text(
-        &dir,
-        "key-non-build-id-digest",
-        key.non_compiler_build_digest().to_hex(),
-    );
-
-    // Exercise the production cache classifier rather than letting the cross-worktree shell
-    // harness merely echo the expected label. Every key component except compiler_build_id stays
-    // byte-identical, so this must reach the real FirstDiff::CompilerBuildId branch.
-    let mut compiler_variant = key.clone();
-    compiler_variant.compiler_build_id = Hash128::of(b"request-6-different-compiler");
-    write_text(
-        &dir,
-        "first-diff-compiler-build-id",
-        format!("{:?}", key.first_diff(&compiler_variant)),
-    );
 }

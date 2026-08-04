@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_per_unit, emit_llvm_ir, emit_object_cached, link_objects, BuildTarget, CacheContext,
-    CacheOutcome, FirstDiff, Hash128, Profile,
+    build_codegen_key, build_per_unit, emit_llvm_ir, emit_object_cached, link_objects, BuildTarget,
+    CacheContext, CacheOutcome, FirstDiff, Hash128, PgoKey, Profile,
 };
 use align_mir::print::program_to_string;
 use align_span::SourceMap;
@@ -545,6 +545,54 @@ fn json_scan_copy_row_mir_and_raw_llvm_identity() {
     assert_eq!(hot_mir, cold_mir, "accepted Copy-row MIR changed across an irrelevant source edit");
     assert_eq!(hot_llvm, cold_llvm, "accepted Copy-row raw LLVM changed across an irrelevant source edit");
     assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));
+}
+
+#[test]
+fn json_scan_copy_row_codegen_key_identity_owner() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/json_scan_copy_identity.align");
+    let source = std::fs::read_to_string(&fixture).expect("read scanner identity fixture");
+    let mut source_map = SourceMap::new();
+    let walk = build_per_unit(&mut source_map, &fixture.display().to_string(), &source);
+    assert!(
+        !walk.diags.has_errors(),
+        "identity fixture must check cleanly:\n{}",
+        align_driver::format_diagnostics(&source_map, &walk.diags)
+    );
+    let unit = walk
+        .units
+        .iter()
+        .find(|unit| unit.unit == "main")
+        .expect("identity fixture must produce the main unit");
+    let key = build_codegen_key(
+        &unit.unit,
+        unit.summary.impl_hash,
+        &unit.dep_interface_hashes,
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+        PgoKey::Off,
+    )
+    .expect("build codegen key");
+
+    let mut compiler_variant = key.clone();
+    compiler_variant.compiler_build_id = Hash128::of(b"request-6-different-compiler");
+    assert_eq!(
+        key.first_diff(&compiler_variant),
+        FirstDiff::CompilerBuildId,
+        "the identity owner must exercise the production classifier"
+    );
+    assert_eq!(
+        key.non_compiler_build_digest(),
+        compiler_variant.non_compiler_build_digest(),
+        "compiler build identity is the only intentionally ignored full-key input"
+    );
+    assert_ne!(
+        key.full_digest(),
+        compiler_variant.full_digest(),
+        "full cache actions must remain isolated by compiler build identity"
+    );
 }
 
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
