@@ -22110,10 +22110,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// written at the call site (no turbofish; settled). Each declared parameter typed `Ty::Param(p)`
     /// binds `p` from the corresponding argument's type (all occurrences of `p` are unified
     /// together); a `Param` appearing only in the return type is taken from the expected type. Every
-    /// parameter must be inferable. The skeleton restricts a type parameter to a **bare** position
-    /// (a whole parameter / return), so `T` is passed/returned by value with no operations — the
-    /// constraint model (`Num`/`Ord`/`Eq`) is a later slice. `type_args` is recorded for
-    /// monomorphization, which generates the concrete instance and rewrites the call target.
+    /// parameter must be inferable. A parameter position may be bare or a scalar-payload composite,
+    /// but a composite that is only partially substituted by the expected return is rejected before
+    /// its argument is checked; `Ty::Param` is not a wildcard for the ordinary expression checker.
+    /// `type_args` is recorded for monomorphization, which generates the concrete instance and
+    /// rewrites the call target.
     #[allow(clippy::too_many_arguments)]
     fn check_generic_call(
         &mut self,
@@ -22147,6 +22148,9 @@ impl<'a, 't> Checker<'a, 't> {
         // binding any `Param` it carries (bare `T`, or nested in `Option<T>` / `Result<T, E>` /
         // `slice<T>` / `box<T>` / a fixed `array<T>`). Every parameter already bound by the return
         // context is substituted into the argument's expected type before the argument is checked.
+        // A partially substituted composite is rejected here: passing its remaining `Ty::Param` into
+        // the ordinary expression checker would either lose constructor context or leak an inference
+        // variable into HIR.
         let mut checked = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let declared = param_tys[i];
@@ -22155,10 +22159,18 @@ impl<'a, 't> Checker<'a, 't> {
                 .enumerate()
                 .map(|(index, value)| value.unwrap_or(Ty::Param(index as u32)))
                 .collect();
-            let expected_param = {
-                let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
-                (!ty_mentions_param(substituted, self.tagged_types)).then_some(substituted)
-            };
+            let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
+            if ty_mentions_param(substituted, self.tagged_types) && substituted != declared {
+                self.diags.error(
+                    format!(
+                        "generic argument {} of '{name}' has a partially inferred type; annotate the argument or use a bare generic parameter",
+                        i + 1
+                    ),
+                    a.span,
+                );
+                return err;
+            }
+            let expected_param = (!ty_mentions_param(substituted, self.tagged_types)).then_some(substituted);
             let ce = if expected_param.is_none() && ty_mentions_param(declared, self.tagged_types) {
                 // A position whose parameter is still unknown applies no coercion, so check the
                 // argument unconstrained. A later argument or the final expected-result boundary
@@ -33617,10 +33629,11 @@ fn is_numeric_literal(e: &Expr) -> bool {
     }
 }
 
-/// Substitute a generic function's type parameters: `Ty::Param(i)` → `args[i]`. The skeleton keeps
-/// a type parameter in a **bare** position (never nested inside `Option`/`array`/a tuple — `Scalar`
-/// can't hold a `Param`), so this is a single top-level replacement. Used by both call-result typing
-/// and monomorphization.
+/// Substitute a generic function's type parameters: `Ty::Param(i)` → `args[i]`. Scalar-payload
+/// composites are substituted recursively so call checking can distinguish a wholly unresolved
+/// position from a partially substituted one; unresolved `Param` values are temporary and must be
+/// rejected before they reach ordinary expression checking or HIR. Used by call-result typing and
+/// monomorphization.
 fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Ty {
     // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
     // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their

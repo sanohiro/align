@@ -491,6 +491,7 @@ fn json_scan_generic_return_context_no_publication() {
     }
     let valid = "module main\nimport core.json\nRow { score: i64 }\nfn identity<T>(value: T) -> T = value\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := identity(json.scan(\"[]\"))\n  print(rows.count()?)\n  return Ok(())\n}\n";
     let conflicting = "module main\nimport core.json\nRow { score: i64 }\nfn choose<T>(first: T, second: T) -> T = first\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := choose(json.scan(\"[]\"), 1)\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let partial = "module main\nimport core.json\nRow { score: i64 }\nfn keep<T, U>(value: Result<T, U>, scan: json.scanner<Row>) -> T {\n  loop {}\n}\nfn main() -> Result<(), Error> {\n  value: i64 := keep(Ok(1), json.scan(\"[]\"))\n  return Ok(())\n}\n";
     let proj = Project::new("json-scan-generic-no-publication", &[("main.align", valid)], "main.align");
     let cache = proj.cache();
     let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
@@ -511,6 +512,24 @@ fn json_scan_generic_return_context_no_publication() {
         cache_tree_snapshot(&proj.cache_root()),
         cache_before_reject,
         "failed generic inference must not create or mutate any cache-owned CAS, action, or index file"
+    );
+
+    proj.write("main.align", partial);
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let rejected = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &rejected.diags);
+    assert!(rejected.units.is_empty(), "partial generic inference must produce no per-unit artifact");
+    assert!(
+        diagnostics.contains("generic argument 1 of 'keep' has a partially inferred type; annotate the argument or use a bare generic parameter"),
+        "unexpected partial generic rejection:\n{diagnostics}"
+    );
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "partial generic inference must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "partial generic inference must not create or mutate any cache-owned CAS, action, or index file"
     );
 
     proj.write("main.align", valid);

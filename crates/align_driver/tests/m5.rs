@@ -1488,6 +1488,31 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn json_scan_generic_return_context_partial_composite_rejection() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn keep<T, U>(value: Result<T, U>, scan: json.scanner<Row>) -> T {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  value: i64 := keep(Ok(1), json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-partial-composite", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    let expected = "generic argument 1 of 'keep' has a partially inferred type; annotate the argument or use a bare generic parameter";
+    assert!(checked.diags.has_errors(), "a partially substituted composite must fail");
+    assert!(diagnostics.contains(expected), "unexpected partial-inference diagnostic:\n{diagnostics}");
+    assert!(!diagnostics.contains("cannot infer the scan row type"), "the rejected argument must not be checked:\n{diagnostics}");
+
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(!mir.contains("json_scan_new") && !mir.contains("json_scan_next"), "partial generic inference must not publish scanner HIR/MIR:\n{mir}");
+}
+
+#[test]
 fn json_scan_generic_return_context_ownership() {
     let source = r#"
 import core.json
