@@ -18569,6 +18569,12 @@ struct LoopCtx {
     region_depth: u32,
 }
 
+#[derive(Clone, Copy)]
+enum GenericMatchContext {
+    Argument,
+    ExpectedReturn,
+}
+
 struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
@@ -22207,7 +22213,7 @@ impl<'a, 't> Checker<'a, 't> {
             // Seed and validate the complete expected return before touching any argument. Generic
             // slots bind here, while concrete leaves still use the normal mismatch diagnostic so
             // a scanner argument cannot produce a secondary error for a bad return context.
-            self.match_param(ret, self.resolve(exp), &mut subst, span);
+            self.match_expected_return_param(ret, self.resolve(exp), &mut subst, span);
             // Expected-return seeding is the first source-order inference phase. Its conflict owns
             // the call diagnostic and must prevent argument checking from producing unrelated
             // scanner or constructor errors.
@@ -22335,32 +22341,77 @@ impl<'a, 't> Checker<'a, 't> {
     /// Handles `Param` bare or nested one level
     /// in a scalar-payload composite (`Option`/`Result`/`slice`/`box`/`array`/`Task`).
     fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span) {
+        self.match_param_in_context(
+            declared,
+            actual,
+            subst,
+            span,
+            GenericMatchContext::Argument,
+        );
+    }
+
+    /// Match a generic return against its expected type before checking arguments. Keep the
+    /// diagnostic orientation identical to the ordinary result constraint (`return vs expected`)
+    /// while still binding callee inference slots and validating every concrete return leaf.
+    fn match_expected_return_param(
+        &mut self,
+        declared: Ty,
+        expected: Ty,
+        subst: &mut [Option<Ty>],
+        span: Span,
+    ) {
+        self.match_param_in_context(
+            declared,
+            expected,
+            subst,
+            span,
+            GenericMatchContext::ExpectedReturn,
+        );
+    }
+
+    fn match_param_in_context(
+        &mut self,
+        declared: Ty,
+        actual: Ty,
+        subst: &mut [Option<Ty>],
+        span: Span,
+        context: GenericMatchContext,
+    ) {
         let a = self.resolve(actual);
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
-            (Ty::Tagged(_), _) => self.match_param(
+            (Ty::Tagged(_), _) => self.match_param_in_context(
                 expand_tagged_ty(declared, self.tagged_types),
                 a,
                 subst,
                 span,
+                context,
             ),
-            (_, Ty::Tagged(_)) => self.match_param(
+            (_, Ty::Tagged(_)) => self.match_param_in_context(
                 declared,
                 expand_tagged_ty(a, self.tagged_types),
                 subst,
                 span,
+                context,
             ),
-            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            (Ty::Option(ds), Ty::Option(asc)) => {
+                self.match_scalar_param_in_context(ds, asc, subst, span, context)
+            }
             (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
-                self.match_scalar_param(dok, aok, subst, span);
-                self.match_scalar_param(derr, aerr, subst, span);
+                self.match_scalar_param_in_context(dok, aok, subst, span, context);
+                self.match_scalar_param_in_context(derr, aerr, subst, span, context);
             }
             (Ty::Slice(ds), Ty::Slice(asc))
             | (Ty::Box(ds), Ty::Box(asc))
             | (Ty::Array(ds, _), Ty::Array(asc, _))
-            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            | (Ty::Task(ds), Ty::Task(asc)) => {
+                self.match_scalar_param_in_context(ds, asc, subst, span, context)
+            }
             _ => {
-                self.unify(a, declared, span);
+                match context {
+                    GenericMatchContext::Argument => self.unify(a, declared, span),
+                    GenericMatchContext::ExpectedReturn => self.unify(declared, a, span),
+                };
             }
         }
     }
@@ -22369,19 +22420,44 @@ impl<'a, 't> Checker<'a, 't> {
     /// or unify a concrete declared scalar against the actual so a mismatch in a concrete nested
     /// position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
     fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span) {
+        self.match_scalar_param_in_context(
+            declared,
+            actual,
+            subst,
+            span,
+            GenericMatchContext::Argument,
+        );
+    }
+
+    fn match_scalar_param_in_context(
+        &mut self,
+        declared: Scalar,
+        actual: Scalar,
+        subst: &mut [Option<Ty>],
+        span: Span,
+        context: GenericMatchContext,
+    ) {
         if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
             || matches!(actual, Scalar::Tagged(_))
         {
-            self.match_param(
+            self.match_param_in_context(
                 scalar_to_ty(declared),
                 scalar_to_ty(actual),
                 subst,
                 span,
+                context,
             );
         } else {
-            self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+            match context {
+                GenericMatchContext::Argument => {
+                    self.unify(scalar_to_ty(actual), scalar_to_ty(declared), span);
+                }
+                GenericMatchContext::ExpectedReturn => {
+                    self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+                }
+            }
         }
     }
 
