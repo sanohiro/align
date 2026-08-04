@@ -300,7 +300,8 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 
   **Generic inference の境界。** Request 6 が扱うのは、call checking 前に scanner row が concrete
   になっている通常の generic call だけである。checker は全 argument の検査前に concrete な expected return を
-  bind-only で bare substitution に seed し、各 declared argument type へ bound parameter を substitute する。
+  substitution に seed し、generic slot を bind しながら concrete return leaf を全て検証する。concrete return leaf の
+  mismatch は seed が所有し、argument 検査前に停止する。その後各 declared argument type へ bound parameter を substitute する。
   argument は source order で substituted expected type を使って検査するため、nested な `json.scan(view)` にも
   concrete な `json.scanner<Row>` context が自身の source check 前に伝播する。expected-return の seed 自体も
   inference boundary であり、structural match が error を出した場合は argument を一つも検査せず既存の error
@@ -316,7 +317,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   `generic argument {ordinal} of '<function>' has a partially inferred type; annotate the argument or use a bare generic parameter`。
   argument は最初の新しい error で source order のまま停止し、partial call/scanner を publish しない。scanner の
   producer-owned spelling は checker-only の inference slot と一緒に、annotation 付きまたは推論された scanner local、
-  透過的な generic-call result、parameter、lambda capture を越えて運ぶ。annotated parameter の spelling、slot の
+ annotated な generic-call return result（scanner argument を持たない producer を含む）、透過的な generic-call result、parameter、lambda capture を越えて運ぶ。annotated parameter の spelling、slot の
   spelling、active な外側の expected spelling の順で優先する。checker は producer-owned な local/block/borrow/call
   境界だけを辿って spelling を導出し、HIR には保存しない。これにより alias や bare wrapper が正確な diagnostic identity
   を消去しない。その後 actual type を元の declared
@@ -336,7 +337,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   `instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet`
   を使う。`m5::json_scan_generic_return_context_wrapper_matrix` が wrapper propagation（異なる外側 generic slot 番号を跨ぐ forwarding を含む）を、
   `m5::json_scan_generic_return_context_argument_order_matrix` が 2 つ以上の argument の source order を所有し、
-  `m5::json_scan_generic_return_context_expected_conflict_no_cascade` が expected-return seed の conflict 境界を、
+  `m5::json_scan_generic_return_context_expected_conflict_no_cascade` と `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade` が expected-return seed の conflict 境界を、
   `m5::json_scan_generic_argument_source_spelling` が annotation 付きまたは推論された local alias、generic-call result、
   lambda capture の spelling 伝播を、
   `m5::json_scan_generic_return_context_partial_composite_rejection` が上記の partial composite rejection を所有する。
@@ -345,6 +346,11 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   first-conflict、no-cascade、bare wrapper の Copy diagnostic identity も検査し、対応する driver/cache owner は `cas`、
   `actions`、`index` の全 cache-owned file を snapshot して `PerUnitArtifact`、cache manifest、cache blob が publish
   されないことを検査する。
+
+  generic inference の closure には追加の owner を置く。concrete return-leaf mismatch は expected-return seed が
+  scanner argument の検査前に拒否し、annotated な scanner return spelling は scanner argument を持たない generic call
+  でも保持する。これらは `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade` と、
+  `m5::json_scan_generic_argument_source_spelling` の return-producer case が所有する。
 
   **Ownership closure matrix（implementation gate）。** 次の cell は implementation PR の開始前に閉じる。
   `N/A` は recursively Copy precondition の結果であり、決定の省略ではない。

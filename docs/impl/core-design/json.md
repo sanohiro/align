@@ -337,8 +337,10 @@ the few boundaries that remain:
 
   **Generic inference boundary.** Request 6 covers only an ordinary generic call whose scanner row
   is concrete before call checking. The checker must seed a concrete expected return before checking
-  any argument: it structurally matches the declared return against the expected type in bind-only
-  mode, then substitutes every bound parameter into the corresponding declared argument type. Each
+  any argument: it structurally matches the declared return against the expected type, binding
+  generic slots while validating every concrete return leaf, then substitutes every bound parameter
+  into the corresponding declared argument type. A concrete return-leaf mismatch is owned by the
+  seed and stops argument checking. Each
   argument is checked with that substituted expected type in source order, so a nested
   `json.scan(view)` receives its concrete `json.scanner<Row>` context before its own source check.
   The expected-return seed is itself an inference boundary: if structural matching emits an error,
@@ -360,7 +362,8 @@ the few boundaries that remain:
   call returns the existing error sentinel and never publishes a partial call or scanner. Scanner
   spelling is producer-owned checker state: an annotated parameter wins first, then a spelling
   carried by an inferred scanner slot, then the active outer expected spelling. The slot spelling
-  travels through inferred scanner-typed locals, transparent generic-call results, parameters, and
+  travels through inferred scanner-typed locals, annotated generic-call return results (including a
+  producer with no scanner argument), transparent generic-call results, parameters, and
   lambda captures, so aliases and generic wrappers cannot erase the exact diagnostic identity. The
   checker derives it only across producer-owned local/block/borrow/call expression boundaries; it
   never enters HIR. After all arguments, the checker finalizes every bound
@@ -384,12 +387,20 @@ the few boundaries that remain:
   `m5::json_scan_generic_return_context_argument_order_matrix` owns two-or-more argument source
   order, exact first-conflict publication, and the no-cascade rule.
   `m5::json_scan_generic_return_context_expected_conflict_no_cascade` owns the expected-return seed
-  conflict boundary, and `m5::json_scan_generic_argument_source_spelling` owns annotated and
-  inferred local aliases, generic-call result propagation, and lambda capture spelling. The matrix also owns the exact Copy diagnostic through a bare
+  conflict boundary, `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade`
+  owns concrete return-leaf validation before arguments, and `m5::json_scan_generic_argument_source_spelling`
+  owns annotated and inferred local aliases, annotated or inferred generic-call result propagation,
+  and lambda capture spelling. The matrix also owns the exact Copy diagnostic through a bare
   generic wrapper, the partial-composite rejection above, and asserts
   that every failed state produces no `ExprKind::JsonScan` HIR node; the corresponding driver/cache
   owner snapshots the complete cache-owned tree (manifest, index, and CAS blobs) and asserts that no
   `PerUnitArtifact`, cache manifest, or cache blob is published.
+
+  The generic inference closure has two additional explicit owners: concrete return-leaf mismatch
+  is rejected by the expected-return seed before any scanner argument is checked, and an annotated
+  scanner return spelling is retained through a generic call even when the call has no scanner
+  argument. These are owned by `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade`
+  and the return-producer cases in `m5::json_scan_generic_argument_source_spelling`.
 
   **Ownership closure matrix (implementation gate).** The following cells are closed before the
   implementation PR starts; `N/A` is a consequence of the recursively Copy precondition, not an
