@@ -15,7 +15,7 @@ history. There is no general public validator activation; Request 6's design spe
 scanner Copy predicate as an exception through the active pre-lowering gate. The design repair is
 `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and restores
 ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701 merged
-the design at `576e573`; the implementation is now in progress on
+the design at `576e573`; the implementation is complete in commit `f52eb6d` on
 `agent/align-llm-request6-implementation`, with the post-merge checkpoint `6e48b46`. Its final
 documentation-only source-map repair is `4832d8b`, with the design handoff checkpoint in `3a05c87`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
@@ -664,7 +664,8 @@ concern, fixed by an explicit ordinary-function reset. Latest verification passe
 m5 json_scan_ -- --nocapture` (19 passed), the ordinary Move-option compatibility owner, the
 imported-row owner, `scripts/test-pr.sh`, and `cargo clippy --workspace --all-targets --locked --
 -D warnings`. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
-workspace-wide rustfmt drift outside this slice. Next steps are commit/push/PR review and merge.
+workspace-wide rustfmt drift outside this slice. The implementation commit is `f52eb6d`; next
+steps are the handoff update commit, push, PR review, and merge.
 Do not update `.align-revision` or the align-llm Request 6 verification status until this
 implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
 gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
