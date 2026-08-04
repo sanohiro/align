@@ -401,7 +401,10 @@ position is re-checked against the declared set and rejected). A struct field ma
 round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
-`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). A field may also
+`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field
+contract also admits the current Decode schema's `Option<Move-struct>` nested-record shape; its
+decoded-owner cleanup remains a separate request. The shipped nested-struct Option Encode path
+requires a non-Move payload, so `Option<Move-struct>` is outside that encoding path. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;

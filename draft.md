@@ -2283,8 +2283,11 @@ scalar / `str` / nested struct): decode maps a missing key or JSON `null` to
 `None`, a type mismatch to `Err`, and a present value to `Some`; encode **omits**
 a `None` field entirely (never `"k": null`), so `decode(encode(x))` round-trips.
 A non-`Option` field still errors when its key is missing — optionality is
-declared in the type, never inferred. An Option payload must be non-owned in v1;
-`Option<struct>` decode and encode are implemented for non-Move payload structs.
+declared in the type, never inferred. The Decode schema admits scalar, borrowed-
+`str`, and nested-struct Option payloads, including the currently admitted
+`Option<Move-struct>` shape whose decoded-owner cleanup remains a separate
+request. The shipped nested-struct Option Encode path requires a non-Move
+payload; `Option<Move-struct>` remains outside that encoding path.
 A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),

@@ -544,13 +544,15 @@ The result formula in every row is followed by the universal
 
 ## Expression ledger: am-b2
 
-The am-b2 implementation is delivered in contiguous dormant-validator slices. Am-b2a owns
+The am-b2 implementation is delivered in contiguous dormant-validator slices, except for the
+narrow Request 6 scanner Copy predicate, which is consumed by the active pre-lowering gate.
+Am-b2a owns
 `ExprKind::ArrayLit` through `ExprKind::VecLit`; am-b2b1 owns `ExprKind::ArraySum` through
 `ExprKind::ElemField` plus all `StageKind`; am-b2b2 owns `ExprKind::Template` through
 `ExprKind::ArrayDictEncode` plus all nested `TemplatePart`, `GroupSource`, `GroupAgg1`, and
-`GroupOp` records. Neither slice activates public HIR validation; am-b4 owns the assembled
-activation and body-derived ownership/effect correlation. The b2b1 checkpoint leaves b2b2
-records fail-closed.
+`GroupOp` records. Neither slice activates public HIR validation generally; the scanner predicate
+is the named Request 6 exception, while am-b4 owns the assembled body activation and body-derived
+ownership/effect correlation. The b2b1 checkpoint leaves b2b2 records fail-closed.
 
 For this range, `ERR(T)` means `Result(payload(T), Scalar::Enum(error_enum_id))`
 using the already validated builtin Error definition. `PIPE(source,stages)`
@@ -616,7 +618,7 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id]`: scanner row struct satisfies the Decode-direction JSON descriptor and the complete reachable row graph is recursively Copy under the canonical `DropPlan` (valid and needs no Drop). The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic; this checked-HIR boundary rechecks the graph fail-closed for imported, per-unit, or handcrafted HIR and never reconstructs source spelling. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
+| `JsonScan` | `env[struct_id]`: scanner row struct satisfies the Decode-direction JSON descriptor and the complete reachable row graph is recursively Copy under the canonical `DropPlan` (valid and needs no Drop). The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. The active `align_mir::hir_program_is_valid` pre-lowering gate rechecks the graph fail-closed for imported, per-unit, or handcrafted HIR and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |

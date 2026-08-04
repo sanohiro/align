@@ -242,7 +242,9 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   下記の Copy 診断は schema-admitted な Move row の ownership error に限定する。
 
   意味解析は既存の JSON decode スキーマ検査の後、入力型検査、MIR 構築、descriptor 構築、
-  runtime 呼び出しより前に行う。schema-admitted な row の拒否時の診断は次の exact な
+  runtime 呼び出しより前に行う。その後、active な `align_mir::hir_program_is_valid`
+  pre-lowering gate が imported/per-unit/handcrafted HIR に同じ pure row predicate を適用する。
+  dormant な body validator は代替にならない。schema-admitted な row の拒否時の診断は次の exact な
   source-level 形式とする。
 
   ```text
@@ -267,7 +269,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | --- | --- |
   | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`。row type は call-site の型引数ではなく expected scanner annotation から得る。scanner は pipeline source のみ。 |
   | Input と result | `view` は既存の `str` input（または既存の `string` からの明示的 borrow）。region は scanner を束縛する。対応する fused terminal は既存の `Result<T, Error>` scalar result を返し、malformed-row と exhaustion の挙動を保つ。 |
-  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` が validation と source spelling を所有する。checked-HIR boundary は imported/per-unit/handcrafted HIR に対して canonical Copy predicate で row graph を fail-closed に再検査し、source spelling を再構築しない。既存の MIR `JsonScan` lowering、LLVM emission、`align_rt_json_scan_next` が受理時の実行を所有し、gate は runtime owner を追加しない。 |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` が validation と source spelling を所有する。active な `align_mir::hir_program_is_valid` の pre-lowering gate が imported/per-unit/handcrafted HIR に対して canonical Copy predicate で完全な row graph を再検査しなければならない。dormant な `body_core_metadata_is_valid` helper だけでは不十分で、pure predicate helper の共有だけを許可する。既存の MIR `JsonScan` lowering、LLVM emission、`align_rt_json_scan_next` が受理時の実行を所有し、gate は runtime owner を追加しない。 |
   | 行の受理条件 | canonical `DropPlan` が有効で drop 不要な再帰的 non-owning row のみ `json.scan` が受理する。 |
   | 検査順序 | capability import、arity、scanner annotation/inference、既存 JSON schema、再帰 Copy 検査、最後に入力 `str` 型と region。 |
   | Ownership | 拒否行では scanner、descriptor、行スロット、allocation、runtime side effect を構築しない。受理行は既存の入力 borrow と Copy 行スロットを保持する。 |
@@ -288,7 +290,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | Type formation、row validation、scanner construction | `align_sema::Checker::check_json_scan`。schema と Copy check を通るまで scanner node を生成しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_rejects_owned_row_fields` |
   | Move-in、move-out、source nulling、replacement、returned row ownership | accepted row では N/A。`DropPlan` が Move field なしを証明し、拒否経路は construction 前に戻る。 | `m5::json_scan_copy_row_error_matrix`、`json_scan_copy_row_no_owned_alloc` |
   | `if`、`match`、`else`、`?`、`map_err`、branch/loop join、early terminal return、malformed input | 既存 scanner MIR/runtime control flow。新しい ownership edge は Copy row invariant を越えて導入しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_copy_row_error_matrix` |
-  | Direct、nested、optional、union、invalid/cyclic schema graph | canonical recursive `DropPlan` と JSON schema の producer table。missing/invalid graph node では fail closed。checked-HIR boundary も同じ graph を再検査する。 | `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_row_schema_matrix`、`hir_body_validator_json_scan_copy_row` |
+  | Direct、nested、optional、union、invalid/cyclic schema graph | canonical recursive `DropPlan` と JSON schema の producer table。missing/invalid graph node では fail closed。interface/import reconstruction 後も active pre-lowering gate が同じ pure predicate を適用する。 | `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_row_schema_matrix`、`hir_body_validator_json_scan_copy_row`、`hir_program_json_scan_copy_row` |
   | Generic monomorphization と imported source spelling | type-resolution producer が concrete public spelling を所有し、Copy predicate は fully resolved graph を消費する。 | `m5::json_scan_generic_row_ownership`、`modules::json_scan_imported_row_ownership` |
   | Whole-program、per-unit、cold/hot cache、schema edit/revert | 既存 structural MIR/cache identity が owner。拒否 row は artifact を publish しない。 | `cache_codegen::json_scan_row_schema_rejection`、accepted Copy-row MIR/raw-LLVM identity comparison |
   | Interface serialization と persisted/wire identity | N/A。gate は interface/runtime construction 前で、accepted source identity は不変。 | `cargo test -p align_interface --test summary` と `cache_codegen::json_scan_row_schema_rejection` |
