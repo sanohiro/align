@@ -31,8 +31,9 @@ conditional final design review found a new P1: the current Align resolver canno
 unresolved `json.scanner<Row<T>>` generic row argument. Under the repository review rule, the design
 is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
 calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
-Span, identity, composite, and implementation-matrix findings. The re-scoped design is currently
-in the working tree; no compiler implementation or release pin exists.
+Span, identity, composite, and implementation-matrix findings. The re-scoped design is committed
+as `a47e213` on `agent/align-llm-request6-design`; the worktree is clean and no compiler
+implementation or release pin exists.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -664,7 +665,7 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Publish the re-scoped Request 6 design slice before implementing its compiler gate. Ordinary JSON
+Publish and independently review the re-scoped Request 6 design slice before implementing its compiler gate. Ordinary JSON
 decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
 scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
