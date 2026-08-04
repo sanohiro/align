@@ -20253,6 +20253,10 @@ impl<'a, 't> Checker<'a, 't> {
         expected: Option<Ty>,
         spelling: Option<String>,
     ) -> Expr {
+        // A bare generic boundary has no producer-owned parameter spelling of its own. Preserve
+        // the enclosing expected scanner annotation in that case so `identity<T>(json.scan(...))`
+        // cannot erase the exact row identity before `check_json_scan` reports its Copy error.
+        let spelling = spelling.or_else(|| self.json_scan_source_spelling.clone());
         let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
         let result = self.check_expr(e, expected);
         self.json_scan_source_spelling = saved;
@@ -20268,6 +20272,9 @@ impl<'a, 't> Checker<'a, 't> {
         param: Option<Ty>,
         spelling: Option<String>,
     ) -> Expr {
+        // A bare generic parameter inherits the active outer scanner context. A concrete
+        // producer-owned scanner parameter still wins through `spelling`.
+        let spelling = spelling.or_else(|| self.json_scan_source_spelling.clone());
         let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
         let result = self.check_arg(a, param);
         self.json_scan_source_spelling = saved;
@@ -22165,7 +22172,18 @@ impl<'a, 't> Checker<'a, 't> {
                     json_scan_param_spellings.get(i).cloned().flatten(),
                 )
             };
-            self.match_param(declared, ce.ty, &mut subst, a.span, false);
+            // When the substituted parameter is concrete, `check_arg` already owns the exact
+            // reconciliation and diagnostic. Re-unifying the same bound slot would emit a
+            // reversed duplicate mismatch. Only an unresolved parameter needs inference here.
+            if expected_param.is_none() {
+                self.match_param(declared, ce.ty, &mut subst, a.span, false);
+            }
+            // Generic argument checking is a source-order publication boundary. Do not inspect a
+            // later argument after the first conflict: its diagnostics are not actionable and a
+            // nested scanner must not survive as a partially checked call.
+            if self.diags.error_count() > error_checkpoint {
+                return err;
+            }
             checked.push(ce);
         }
         // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a

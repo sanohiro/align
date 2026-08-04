@@ -998,14 +998,55 @@ fn hir_program_json_scan_envelope_precedence_matrix() {
     );
     let mut program = baseline_program();
     program.fns.push(body_unit_case("json_scan_envelope_precedence", scanner));
-    if let hir::Stmt::Expr(expression) = &mut program.fns[0].body.stmts[0] {
-        expression.span = align_span::Span::new(0, 2, 1);
-        expression.ty = Ty::JsonScanner(99);
+
+    let set_fault = |candidate: &mut hir::Program, fault: usize| {
+        match fault {
+            0 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                    expression.ty = Ty::JsonScanner(1);
+                }
+            }
+            1 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                    if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+                        *struct_id = 99;
+                    }
+                    expression.ty = Ty::JsonScanner(99);
+                }
+            }
+            2 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0]
+                    && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+                {
+                    input.ty = Ty::String;
+                }
+            }
+            3 => candidate.structs[0].fields[1].ty = Ty::Char,
+            4 => candidate.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64)),
+            _ => unreachable!("five scanner-envelope fault classes"),
+        }
+    };
+    let reasons = [
+        validate_hir::JsonScanValidationReason::StoredType,
+        validate_hir::JsonScanValidationReason::UnknownRow,
+        validate_hir::JsonScanValidationReason::InputType,
+        validate_hir::JsonScanValidationReason::Schema,
+        validate_hir::JsonScanValidationReason::Copy,
+    ];
+    for first in 0..reasons.len() {
+        for second in (first + 1)..reasons.len() {
+            let mut candidate = program.clone();
+            set_fault(&mut candidate, second);
+            // Apply the lower-priority mutation first: the stored-type and unknown-row cases share
+            // the expression's type field, and the higher-priority fault must remain observable.
+            set_fault(&mut candidate, first);
+            assert_eq!(
+                validate_hir::json_scan_validation_reason(&candidate),
+                Err(reasons[first]),
+                "valid-Span scanner envelope precedence must choose fault {first} over {second}"
+            );
+        }
     }
-    assert_eq!(
-        validate_hir::json_scan_validation_reason(&program),
-        Err(validate_hir::JsonScanValidationReason::InvalidSpan)
-    );
 }
 
 #[test]

@@ -14,6 +14,7 @@
 //! build graph; (12) a killed producer's private staging remnant is never a hit; (13) resolved CPU
 //! identity separates baseline/native artifacts.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -415,6 +416,7 @@ fn json_scan_row_schema_rejection() {
     let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
     assert!(!cold.outcome("main").hit, "the accepted Copy row must publish a cold artifact");
     let published = action_manifest_count(&proj.cache_root());
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
 
     let mut sm = SourceMap::new();
     let bad = build_per_unit(&mut sm, "main.align", rejected);
@@ -428,6 +430,11 @@ fn json_scan_row_schema_rejection() {
         align_driver::format_diagnostics(&sm, &bad.diags)
     );
     assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected source must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "rejected source must not create or mutate any cache-owned CAS, action, or index file"
+    );
 
     proj.write("main.align", valid);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
@@ -450,6 +457,7 @@ fn json_scan_per_unit_interface_row_ownership() {
     assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
     let published = action_manifest_count(&proj.cache_root());
     assert_eq!(published, 2, "the cold imported-row build publishes one artifact per unit");
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
 
     proj.write("geom.align", geom_move);
     let entry = proj.entry_path();
@@ -465,6 +473,11 @@ fn json_scan_per_unit_interface_row_ownership() {
     );
     assert!(diagnostics.contains("must be Copy"), "unexpected imported-row rejection:\n{diagnostics}");
     assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected per-unit input must not publish cache actions");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "rejected imported row must not create or mutate any cache-owned CAS, action, or index file"
+    );
 
     proj.write("geom.align", geom_copy);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
@@ -483,6 +496,7 @@ fn json_scan_generic_return_context_no_publication() {
     let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
     assert!(!cold.outcome("main").hit, "the accepted generic scanner must publish a cold artifact");
     let published = action_manifest_count(&proj.cache_root());
+    let cache_before_reject = cache_tree_snapshot(&proj.cache_root());
 
     proj.write("main.align", conflicting);
     let entry = proj.entry_path();
@@ -493,6 +507,11 @@ fn json_scan_generic_return_context_no_publication() {
     assert!(rejected.units.is_empty(), "failed generic inference must produce no per-unit artifact");
     assert!(diagnostics.contains("type mismatch"), "unexpected generic rejection:\n{diagnostics}");
     assert_eq!(action_manifest_count(&proj.cache_root()), published, "failed generic inference must not publish a cache action");
+    assert_eq!(
+        cache_tree_snapshot(&proj.cache_root()),
+        cache_before_reject,
+        "failed generic inference must not create or mutate any cache-owned CAS, action, or index file"
+    );
 
     proj.write("main.align", valid);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
@@ -783,6 +802,43 @@ fn action_manifest_count(root: &Path) -> usize {
         Ok(entries) => entries.filter(|e| e.as_ref().map(|e| e.path().is_file()).unwrap_or(false)).count(),
         Err(_) => 0,
     }
+}
+
+/// Snapshot every cache-owned file, not just action manifests. A rejected semantic/per-unit walk
+/// must leave the CAS blobs and index pointers untouched as well as the visible action manifest.
+fn cache_tree_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            let relative = child
+                .strip_prefix(root)
+                .expect("cache child under root")
+                .to_string_lossy()
+                .into_owned();
+            let metadata = std::fs::symlink_metadata(&child).expect("cache metadata");
+            if metadata.is_dir() {
+                visit(root, &child, files);
+            } else if metadata.is_file() {
+                files.insert(relative, std::fs::read(&child).expect("cache file"));
+            } else if metadata.file_type().is_symlink() {
+                files.insert(
+                    relative,
+                    std::fs::read_link(&child)
+                        .expect("cache symlink")
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
 }
 
 #[test]

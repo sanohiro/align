@@ -1454,9 +1454,37 @@ fn main() -> Result<(), Error> {
     let checked = check(&mut source_map, "json-scan-generic-argument-order", conflicting);
     let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
     assert!(checked.diags.has_errors(), "a later conflicting argument must fail");
-    assert!(diagnostics.contains("type mismatch"), "expected the existing mismatch diagnostic:\n{diagnostics}");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the concrete argument check must own exactly one first-conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "a later scanner must not be checked after the first conflict:\n{diagnostics}"
+    );
     let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
     assert!(!mir.contains("json_scan_new"), "failed argument inference must not publish the scanner source:\n{mir}");
+
+    let reversed = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> T = first
+fn main() -> Result<(), Error> {
+  bad: json.scanner<Row> := choose(1, json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let reversed_diags = check_diagnostics("json-scan-generic-first-conflict", reversed);
+    assert_eq!(
+        reversed_diags.matches("type mismatch").count(),
+        1,
+        "the first source-order conflict must not be reported again in reverse order:\n{reversed_diags}"
+    );
+    assert!(
+        !reversed_diags.contains("cannot infer the scan row type"),
+        "the later scanner argument must not be checked after the first conflict:\n{reversed_diags}"
+    );
 }
 
 #[test]
@@ -1516,6 +1544,35 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn json_scan_generic_return_context_preserves_copy_diagnostic() {
+    let source = r#"
+import core.json
+Owned { values: array<i64> }
+fn identity<T>(value: T) -> T = value
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Owned> := identity(json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let diagnostics = check_diagnostics("json-scan-generic-copy-diagnostic", source);
+    assert_eq!(
+        diagnostics.matches("must be Copy").count(),
+        1,
+        "the bare generic wrapper must preserve one exact Copy diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the outer scanner annotation must survive the generic boundary:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot determine the scan row type spelling"),
+        "the generic boundary must not erase producer-owned scanner spelling:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn json_scan_generic_return_context_numeric_default() {
     let source = r#"
 fn identity<T>(value: T) -> T = value
@@ -1552,11 +1609,25 @@ fn json_scan_generic_return_context_inference_matrix() {
 
     let unresolved_scanner = check_diagnostics(
         "json-scan-generic-unresolved-scanner",
-        "import core.json\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+        "import core.json\nRow<T> { value: T }\nfn make<T>() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  return make()\n}\n",
     );
     assert!(
-        unresolved_scanner.contains("cannot resolve") || unresolved_scanner.contains("generic") || unresolved_scanner.contains("type"),
-        "an unresolved scanner row parameter must use a resolver diagnostic rather than panic:\n{unresolved_scanner}"
+        unresolved_scanner.contains(
+            "instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet"
+        ),
+        "an unresolved scanner row parameter must use the exact resolver diagnostic rather than panic:\n{unresolved_scanner}"
+    );
+
+    let mut source_map = SourceMap::new();
+    let unresolved = check(
+        &mut source_map,
+        "json-scan-generic-unresolved-scanner-hir",
+        "import core.json\nRow<T> { value: T }\nfn make<T>() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  return make()\n}\n",
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&unresolved.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "the deferred unresolved row-type state must not publish scanner HIR/MIR:\n{mir}"
     );
 }
 

@@ -81,6 +81,12 @@ compare_exact interface-hash
 compare_exact mir.txt
 compare_exact llvm.ll
 compare_exact object.o
+compare_exact key-non-build-id-digest
+compare_exact first-diff-compiler-build-id
+if [[ "$(cat "$IMPLEMENTATION_OUT/first-diff-compiler-build-id")" != "CompilerBuildId" ]]; then
+    echo "json-scan identity expected the production classifier to report CompilerBuildId" >&2
+    exit 1
+fi
 
 KEY_FIELDS=(
     cache_format_version
@@ -121,8 +127,8 @@ if cmp -s "$BASELINE_OUT/key-slot-digest" "$IMPLEMENTATION_OUT/key-slot-digest";
     exit 1
 fi
 
-# Only compiler_build_id differs in the ordered CodegenKey comparison, so the cache's structured
-# miss classification is the reviewed FirstDiff::CompilerBuildId case. The object is identical,
-# but the distinct full/slot digests prove that no cache object can be shared across the builds.
+# Only compiler_build_id differs in the ordered CodegenKey comparison, and the checked-in Rust owner
+# has exercised the production classifier for that exact difference. The object is identical, but
+# the distinct full/slot digests prove that no cache object can be shared across the builds.
 echo "json-scan identity: interface/MIR/LLVM/object and all non-build-id CodegenKey fields match"
 echo "json-scan identity: FirstDiff::CompilerBuildId; full and slot cache digests are isolated"
