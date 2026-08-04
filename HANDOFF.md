@@ -11,8 +11,9 @@ implementation commit `43211ec` is followed by consolidated review repair `26886
 baseline-compatible identity-harness repair `50912db`. The branch is based on implementation
 checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
 `0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is not yet complete or merged.
-Align PR #704 is pushed through `2f0c7b5`; the repair commit `c241beb` is local and must be pushed before final review. Preflight and final attestations are still
-pending. No `.align-revision` adoption pin or align-llm `make ci` verification exists yet.
+Align PR #704 is pushed through `66dfeb6`; focused verification and the identity probe pass at
+that head. Preflight and final attestations are still pending. No `.align-revision` adoption pin or
+align-llm `make ci` verification exists yet.
 
 ## Active Request 6 implementation checkpoint
 
