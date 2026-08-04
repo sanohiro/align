@@ -2275,6 +2275,16 @@ The placeholder is the declared public local/imported spelling with concrete gen
 internal `$`-mangled and monomorph-interner names never appear. The check is semantic and precedes
 input validation, MIR, descriptor construction, and runtime side effects.
 
+The scanner generic boundary is concrete-row-only. Concrete generic monomorphs
+such as `Wrap<i64>` remain eligible after row resolution, and ordinary generic
+calls use the expected-return propagation rule owned by
+`align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain
+their deterministic `i64`/`f64` defaults. An unresolved `Wrap<T>` /
+`json.scanner<Wrap<T>>` type argument inside a generic function retains the exact
+resolver diagnostic `instantiating a generic struct with a type parameter
+('Row<…>' inside a generic function) is not supported yet`. That unresolved-row
+capability is a separate compiler prerequisite, not an implied scanner surface.
+
 A struct field may itself be a `Struct`: `decode` recurses into the nested object
 and `encode` renders it back, so a nested record round-trips in declaration order
 (unknown keys are still skipped at every level, and nested `str` fields stay

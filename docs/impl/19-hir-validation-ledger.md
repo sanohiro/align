@@ -130,7 +130,6 @@ universal stored-field-before-`Span` rule. Its complete deterministic order is:
 
 ```text
 variant tag
-raw struct_id representation/range
 Expr.span
 Expr.ty == Ty::JsonScanner(struct_id)
 existing struct_id
@@ -139,14 +138,19 @@ Decode schema
 canonical recursive Copy predicate
 ```
 
-`struct_id` is a typed `u32` in ordinary HIR, so the raw representation/range
-step is principally a malformed-HIR preflight guard; it precedes `Span` when a
-raw fixture can violate it. The logical existing-row check is the later step
-shown above. Reclassifying `Expr.ty` and the logical row-id relation after
-`Span` is intentional: a malformed span wins over a wrong stored expression
-type, an unknown row id, a wrong input type, a schema error, or a Copy error.
-Once the span is valid, those five scanner steps are the sole scanner
-precedence order. This exception belongs to
+`struct_id` is a typed `u32` in ordinary HIR; its semantic existing-row lookup
+is the later step shown above, not a separate raw-representation state.
+Reclassifying `Expr.ty` and the logical row-id relation after `Span` is
+intentional: a malformed span wins over a wrong stored expression type, an
+unknown row id, a wrong input type, a schema error, or a Copy error. Once the
+span is valid, those five scanner steps are the sole scanner precedence order.
+The active gate retains `hir_program_is_valid(&hir::Program) -> bool`, but its
+crate-private owner seam is
+`validate_hir::json_scan_validation_reason(&hir::Program) ->
+Result<(), JsonScanValidationReason>`. The reason variants are `InvalidSpan`,
+`StoredType`, `UnknownRow`, `InputType`, `Schema`, and `Copy`, in the order
+above; production lowering consumes `.is_ok()`. This seam is test-only
+observability, not a new user-facing diagnostic. The exception belongs to
 `align_mir::hir_program_is_valid` and
 `validate_hir::json_scan_copy_rows_are_valid`; it is not activation of the
 general body-fact replay below.
@@ -657,7 +661,7 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is raw `struct_id` representation/range, enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; the precedence matrix owns those pairs. Unresolved `json.scanner<Row<T>>` row arguments remain outside this row and retain the existing generic-type diagnostic. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
+| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; `validate_hir::json_scan_validation_reason` returns the exact first reason for the precedence matrix while production lowering keeps the boolean gate. Unresolved `json.scanner<Row<T>>` row arguments remain outside this row and retain the existing generic-type diagnostic. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; five accepted HIR terminal variants expose seven public methods Sum/Count/Reduce/Any/All/Min/Max, each with exact Result(scalar,builtin Error)]`. |
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |

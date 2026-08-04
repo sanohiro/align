@@ -32,16 +32,15 @@ unresolved `json.scanner<Row<T>>` generic row argument. Under the repository rev
 is being redesigned rather than patched in place: Request 6 now covers only concrete-row generic
 calls, explicitly defers that separate Align prerequisite, and incorporates the final review's
 Span, identity, composite, and implementation-matrix findings. The re-scoped design checkpoint is
-`a66248f` on `agent/align-llm-request6-design`; the consolidated design repair is committed as
-`28e28c3`, and no compiler implementation or release pin exists. The fresh independent review of
-`a66248f` found eight actionable design gaps: the explicit `JsonScan` Span precedence exception,
-generic return-context propagation and wrapper/multi-argument order, no-HIR/no-artifact failure
-ownership, nested optional/object-union composite coverage, the stale implementation execution
-row, the distinction between `InterfaceSummary.interface_hash` and actual `CodegenKey` fields,
-authoritative Align source synchronization, and this checkpoint record. All valid findings are
-were applied in that one consolidated repair; the required final independent review is pending.
-`git diff --check` passed before and after the repair commit; no executable or compiler checks apply
-to this documentation-only slice. Targeted Markdown/source-of-truth checks remain pending.
+`a66248f` on `agent/align-llm-request6-design`; the consolidated repair was committed as `28e28c3`
+and reviewed at `36fd7b2`; no compiler implementation or release pin exists. The final independent
+review of `36fd7b2` found two P1 and three P2 findings: cross-compiler cache identity must treat
+`compiler_build_id` as an intentional difference, generic expected-return propagation must name its
+new resolver owner and numeric-default boundary, HIR precedence needs a reason-valued test seam,
+scanner coverage must distinguish five HIR variants from seven public terminals, and this handoff
+must bind the current head. The closure matrix is reopened for a redesign; implementation and
+publication remain paused. `git diff --check` passed before the redesign; targeted
+Markdown/source-of-truth checks remain pending.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -673,8 +672,8 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Apply and verify the consolidated Request 6 design repair, then publish and independently review the repaired design slice
-before implementing its compiler gate. Ordinary JSON
+Reopen and verify the Request 6 closure matrix, then publish and independently review the redesigned slice before implementing
+its compiler gate. Ordinary JSON
 decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
 scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
@@ -682,7 +681,7 @@ imported/per-unit consumers, interface/import reconstruction precedes active
 the concrete-row-only generic boundary, universal-Span precedence, complete active-HIR envelope,
 expanded composite/per-unit owners, and canonical cross-compiler identity probe. Run
 `git diff --check`, targeted Markdown/source-of-truth checks, and one fresh SHA-bound independent
-final design review for this repaired slice. After that design gate is clean, implement the
+final design review for this redesigned slice. After that design gate is clean, implement the
 scanner-only recursive Copy check in a separate slice; do not update the align-llm compiler pin
 until that implementation is merged and its adoption gate passes. Compiler tests, builds, and
 `make ci` remain N/A while this worktree is documentation-only.

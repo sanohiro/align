@@ -245,19 +245,22 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   runtime 呼び出しより前に行う。universal な expression `Span` 検査は non-expression envelope field の後に行う。
   whole-program では active な `align_mir::hir_program_is_valid` pre-lowering gate が scanner の HIR envelope 全体を
   再検査し、同じ pure row predicate を適用する。`JsonScan` は一般の stored-field-before-`Span` 規則に対する唯一の
-  明示的な順序例外である。active HIR の決定的な順序は、(0) malformed な raw `struct_id` representation/range の拒否、
-  (1) `Expr.span`、(2) `Expr.ty == Ty::JsonScanner(struct_id)`、(3) `struct_id` が既存 row 定義を指すこと、
-  (4) `input.ty == Ty::Str`、(5) Decode schema、(6) canonical な再帰 Copy 検査である。typed な通常 HIR は (0) に
-  到達しないが、malformed-HIR fixture がこの preflight precedence を所有する。従って malformed span は wrong stored
-  type、unknown row id、wrong input type、schema error、Copy error より優先する。envelope の各段階で失敗したら row graph
+  明示的な順序例外である。active HIR の決定的な順序は、(1) `Expr.span`、(2) `Expr.ty == Ty::JsonScanner(struct_id)`、
+  (3) `struct_id` が既存 row 定義を指すこと、(4) `input.ty == Ty::Str`、(5) Decode schema、(6) canonical な再帰 Copy
+  検査である。stored `struct_id` は typed な `u32` なので、semantic row lookup は step (3) であり raw representation
+  state は別に設けない。従って malformed span は wrong stored type、unknown row id、wrong input type、schema error、Copy
+  error より優先する。envelope の各段階で失敗したら row graph
   の descriptor walker より前に拒否する。imported/per-unit では、まず interface/import reconstruction が checked HIR を
   構築し、その後 active gate が同じ順序と row predicate を MIR lowering、descriptor 構築、runtime 呼び出しの前に再検査する。
   gate は source spelling を復元せず、dormant な `align_sema::checked_hir_body_facts_are_valid` の body replay は代替に
-  ならない。active-envelope の precedence owner は `hir_program_json_scan_envelope_precedence_matrix` とする。
+  ならない。active-envelope の precedence owner は `hir_program_json_scan_envelope_precedence_matrix` とし、
+  crate-private な reason-valued seam `align_mir::validate_hir::json_scan_validation_reason(&hir::Program) ->
+  Result<(), JsonScanValidationReason>` を呼ぶ。production の `hir_program_is_valid(&hir::Program) -> bool` は boolean
+  caller のまま `reason.is_ok()` を返す。この enum は user-facing diagnostic ではなく test seam である。
   paired-invalid case は normative であり、malformed `Span` と wrong stored type、unknown row id、non-`str` input、
   schema-invalid row、Move/Copy failure の各組み合わせでは `Span` が報告される。valid な `Span` の後は wrong stored
-  type、unknown row id、non-`str` input、schema、Copy の順に先のエラーが選ばれる。raw `struct_id` representation/range
-  guard は malformed-HIR fixture に限り全てに先行し、typed な通常 HIR には存在しない。schema-admitted な row の拒否時の
+  type、unknown row id、non-`str` input、schema、Copy の順に先のエラーが選ばれる。reason variant は `InvalidSpan`、
+  `StoredType`、`UnknownRow`、`InputType`、`Schema`、`Copy` とし、この順序を反映する。schema-admitted な row の拒否時の
   診断は次の exact な source-level 形式とする。
 
   ```text
@@ -281,10 +284,10 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | Surface | 契約 |
   | --- | --- |
   | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`。row type は call-site の型引数ではなく expected scanner annotation から得る。scanner は pipeline source のみ。 |
-  | Input と result | `view` は既存の `str` input（または既存の `string` からの明示的 borrow）。region は scanner を束縛する。対応する fused terminal は既存の `Result<T, Error>` scalar result を返し、malformed-row と exhaustion の挙動を保つ。 |
-  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` が source validation と source spelling を所有する。imported/per-unit では interface/import reconstruction が先に checked HIR を構築し、4 つの MIR lowerer が private な `align_mir::hir_program_is_valid(&hir::Program) -> bool` を呼ぶ。その active Request 6 exception は `validate_hir::json_scan_copy_rows_are_valid` を raw-id、`Span`、type、row-id、input、schema、Copy の順序で MIR/runtime 構築より前に実行する。これは dormant な `align_sema::checked_hir_body_facts_are_valid` とは別であり、共有できるのは pure row-predicate helper だけである。既存の MIR `JsonScan` lowering、LLVM emission、`align_rt_json_scan_next` が受理時の実行を所有し、gate は runtime owner を追加しない。 |
+  | Input と result | `view` は既存の `str` input（または既存の `string` からの明示的 borrow）。region は scanner を束縛する。5 つの accepted HIR terminal variant（`ArraySum`、`ArrayCount`、`ArrayReduce`、`ArrayAnyAll`、`ArrayMinMax`）が 7 つの public method（`sum`、`count`、`reduce`、`any`、`all`、`min`、`max`）を提供し、各 terminal は既存の `Result<T, Error>` scalar result を返して malformed-row と exhaustion の挙動を保つ。 |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` が source validation と source spelling を所有し、`align_sema::Checker::check_generic_call` が下記の expected-return propagation enabling rule を所有する。numeric finalization の既存 `IntVar -> i64`、`FloatVar -> f64` default は維持する。imported/per-unit では interface/import reconstruction が先に checked HIR を構築し、4 つの MIR lowerer が private な `align_mir::hir_program_is_valid(&hir::Program) -> bool` を呼ぶ。その active Request 6 exception は reason-valued `align_mir::validate_hir::json_scan_validation_reason` を `Span`、type、row-id、input、schema、Copy の順序で実行し、`.is_ok()` を MIR/runtime 構築より前に使う。これは dormant な `align_sema::checked_hir_body_facts_are_valid` とは別であり、共有できるのは pure row-predicate helper だけである。既存の MIR `JsonScan` lowering、LLVM emission、`align_rt_json_scan_next` が受理時の実行を所有し、gate は runtime owner を追加しない。 |
   | 行の受理条件 | canonical `DropPlan` が有効で drop 不要な再帰的 non-owning row のみ `json.scan` が受理する。 |
-  | 検査順序 | Source は capability import、arity、scanner annotation/inference、既存 JSON schema、再帰 Copy 検査、最後に入力 `str` 型と region。active HIR replay は explicit な `JsonScan` exception として raw `struct_id` representation/range、`Expr.span`、`Expr.ty == Ty::JsonScanner(struct_id)`、既存 row id、`input.ty == Ty::Str`、Decode schema、再帰 Copy 検査の順で、descriptor/MIR consumer より前に拒否する。 |
+  | 検査順序 | Source は capability import、arity、scanner annotation/inference、既存 JSON schema、再帰 Copy 検査、最後に入力 `str` 型と region。active HIR replay は explicit な `JsonScan` exception として `Expr.span`、`Expr.ty == Ty::JsonScanner(struct_id)`、既存 row id、`input.ty == Ty::Str`、Decode schema、再帰 Copy 検査の順で、descriptor/MIR consumer より前に拒否する。reason-valued seam が winner を testable にし、production lowering は boolean を消費する。 |
   | Ownership | 拒否行では scanner、descriptor、行スロット、allocation、runtime side effect を構築しない。受理行は既存の入力 borrow と Copy 行スロットを保持する。 |
   | 診断の identity | producer-owned な公開 local/imported/generic source spelling を使い、HIR mangling から復元しない。 |
   | ABI と永続化 | N/A。accepted program の source syntax、HIR/MIR node、descriptor、runtime ABI、wire format、cache identity は変更しない。 |
@@ -301,23 +304,23 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   argument は source order で substituted expected type を使って検査するため、nested な `json.scan(view)` にも
   concrete な `json.scanner<Row>` context が自身の source check 前に伝播する。その後 actual type を元の declared
   parameter と unify し、未束縛の bare parameter を bind するか、最初の conflicting な
-  `type mismatch: <actual> vs <declared>` を出す。全 argument 後に bound parameter を finalize し、unresolved または
-  ambiguous な inference variable が残れば既存の
+  `type mismatch: <actual> vs <declared>` を出す。全 argument 後に bound parameter を finalize し、unresolved な bare
+  parameter が残れば既存の
   `cannot infer type parameter '<name>' of '<function>'; annotate the call's context` を出し、concrete instantiation
   を構築して既存 schema と Copy 検査を再実行する。wrapper call と multi-argument call も同じ規則で、expected context
   は bare return/argument boundary を越えて伝播し、最初の source-order conflict が勝つ。
 
   inference state は明示的に次のとおりである。direct `json.scan` の scanner context 欠落は
   `cannot infer the scan row type; annotate the binding, e.g. \`rows: json.scanner<Row> := json.scan(d)\``、expected または
-  argument binding がない bare slot は unresolved として generic inference diagnostic、`IntVar`/`FloatVar` が finalize
-  後も残るか候補経路が両立しない slot は ambiguous として同じ generic inference diagnostic、異なる候補が衝突する
-  slot は最初の source-order type mismatch とする。未解決の `json.scanner<Row<T>>` type argument は Request 6 が追加する
+  argument binding がない bare slot は unresolved として generic inference diagnostic、numeric `IntVar`/`FloatVar` は
+  ambiguous ではなく既存 finalizer の deterministic な `i64`/`f64` default を使い、異なる候補が衝突する slot は最初の
+  source-order type mismatch とする。新しい ambiguous diagnostic は設けない。未解決の `json.scanner<Row<T>>` type argument は Request 6 が追加する
   inference state ではない。別の Align prerequisite として残し、既存の正確な resolver 診断
   `instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet`
   を使う。`m5::json_scan_generic_return_context_wrapper_matrix` が wrapper propagation を、
   `m5::json_scan_generic_return_context_argument_order_matrix` が 2 つ以上の argument の source order を所有する。
-  `m5::json_scan_generic_return_context_inference_matrix` は missing、unresolved、ambiguous、conflicting の失敗で
-  `ExprKind::JsonScan` HIR node が生成されないことを検査し、対応する driver/cache owner は `PerUnitArtifact`、cache
+  `m5::json_scan_generic_return_context_inference_matrix` は missing、unresolved、numeric-defaulted、conflicting state と
+  failed state で `ExprKind::JsonScan` HIR node が生成されないことを検査し、対応する driver/cache owner は `PerUnitArtifact`、cache
   manifest、cache blob が publish されないことを検査する。
 
   **Ownership closure matrix（implementation gate）。** 次の cell は implementation PR の開始前に閉じる。
@@ -329,7 +332,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   | Move-in、move-out、source nulling、replacement、returned row ownership | accepted row では N/A。`DropPlan` が Move field なしを証明し、拒否経路は construction 前に戻る。 | `m5::json_scan_copy_row_error_matrix`、`json_scan_copy_row_no_owned_alloc` |
   | `if`、`match`、`else`、`?`、`map_err`、branch/loop join、early terminal return、malformed input | 既存 scanner MIR/runtime control flow。新しい ownership edge は Copy row invariant を越えて導入しない。 | `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_copy_row_error_matrix` |
   | Direct、nested、optional、union、invalid/cyclic schema graph | canonical recursive `DropPlan` と JSON schema の producer table。missing/invalid graph node では fail closed。active gate は interface/import reconstruction 後も同じ pure predicate を適用し、scanner envelope の type/id mismatch と non-`str` input も fail closed にする。 | `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_row_schema_matrix`、`hir_body_validator_json_scan_copy_row`、`hir_program_json_scan_copy_row`、`hir_program_json_scan_envelope_mismatch` |
-  | Generic monomorphization、return-context inference、imported source spelling | Request 6 が扱うのは、scanner row が call checking 前に concrete である通常の generic function call だけである。例えば `identity<T>(value: T) -> T` を expected `json.scanner<Owned>` context で呼ぶ場合、全 argument の検査前に expected return を bare substitution に seed し、bound parameter を declared argument type へ substitute して source order で検査し、各 concrete instantiation が既存 Decode schema と canonical `DropPlan` を再検査する。wrapper propagation と 2 つ以上の argument の source order は別 fixture とする。未解決 row parameter を含む `json.scanner<Row<T>>` は追加しない。current resolver の exact な「generic type parameter inside a generic type argument is not supported yet」diagnostic を明示的な Align prerequisite として deferred にする。context 欠落は既存 scan-inference diagnostic、unresolved/ambiguous な bare inference は既存 generic inference diagnostic、conflicting な inference は expected-context/argument order で最初の既存 type-mismatch diagnostic を使う。失敗状態では `ExprKind::JsonScan` HIR node と artifact を生成しない。 | `m5::json_scan_generic_row_ownership`、`m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、`m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_inference_matrix`、`modules::json_scan_imported_row_ownership`、`modules::json_scan_imported_generic_return_context_ownership` |
+  | Generic monomorphization、return-context inference、imported source spelling | Request 6 が扱うのは、scanner row が call checking 前に concrete である通常の generic function call だけである。`align_sema::Checker::check_generic_call` が新しい enabling rule を所有し、全 argument の検査前に expected return を bare substitution に seed し、bound parameter を declared argument type へ substitute して source order で検査し、各 concrete instantiation が既存 Decode schema と canonical `DropPlan` を再検査する。numeric `IntVar`/`FloatVar` は既存 finalizer の `i64`/`f64` default を使い、unresolved bare parameter は既存 generic inference diagnostic、conflicting な inference は expected-context/argument order で最初の既存 type-mismatch diagnostic を使う。wrapper propagation と 2 つ以上の argument の source order は別 fixture とする。未解決 row parameter を含む `json.scanner<Row<T>>` は追加しない。current resolver の exact な「generic type parameter inside a generic type argument is not supported yet」diagnostic を明示的な Align prerequisite として deferred にする。失敗状態では `ExprKind::JsonScan` HIR node と artifact を生成しない。 | `m5::json_scan_generic_row_ownership`、`m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、`m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_numeric_default`、`m5::json_scan_generic_return_context_inference_matrix`、`modules::json_scan_imported_row_ownership`、`modules::json_scan_imported_generic_return_context_ownership` |
   | Whole-program、per-unit、cold/hot cache、schema edit/revert | 既存 structural MIR/cache identity が owner。拒否 row は artifact を publish しない。per-unit fixture は interface reconstruction、accepted Copy row、rejected Move row、全ての failed generic inference state を網羅する。 | `cache_codegen::json_scan_row_schema_rejection`、`cache_codegen::json_scan_per_unit_interface_row_ownership`、`cache_codegen::json_scan_generic_return_context_no_publication`、accepted Copy-row MIR/raw-LLVM identity comparison |
   | Interface serialization と persisted/wire identity | imported/per-unit の checked HIR には interface/import reconstruction が入力される。その reconstructed HIR の scanner envelope と row graph を active gate が MIR/runtime construction 前に検証し、accepted source identity は不変。 | `cargo test -p align_interface --test summary`、`modules::json_scan_imported_row_ownership`、`cache_codegen::json_scan_per_unit_interface_row_ownership` |
   | Runtime ownership provenance と allocation parity | 既存 scanner input/accumulator owner。exact な composite fixture は `Leaf { score: i64, name: str }`、`CopyContent { Text(str), Count(i64), Flag(bool), Object(Leaf) }`、`CopyRow { maybe_i64: Option<i64>, maybe_f64: Option<f64>, maybe_bool: Option<bool>, maybe_text: Option<str>, maybe_leaf: Option<Leaf>, leaf: Leaf, content: CopyContent, label: str }` とする。nonempty stream は全 optional field（`maybe_leaf` を含む）の Some、明示的 `null`、欠落 optional field、`Text`/`Count`/`Flag`/`Object` の全 arm、nested `Leaf`、borrowed `label` を含み、別 stream は valid first row の後に malformed input を置く。LLVM allocation oracle は `align_rt_json_scan_next` を要求し、`align_rt_alloc` と `align_rt_arena_alloc` の call を禁止する。 | `json_scan_copy_row_no_owned_alloc`、`json_scan_copy_row_copy_composites_no_owned_alloc`、`m5::json_scan_copy_composite_runtime_matrix` |
@@ -339,14 +342,15 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 
   設計受入マトリクスは、直接・推移的な owned field、nested/optional struct（`Option<Leaf>` の
   Some/null/omitted を含む）、JSON の全 scalar width、borrowed `str`、Copy option/union（object-payload arm を含む）、
-  local/imported 型、concrete row generic call における resolved/unresolved/ambiguous/conflicting bare return-context
+  local/imported 型、concrete row generic call における resolved/numeric-defaulted/unresolved-bare/conflicting return-context
   inference、wrapper propagation、multi-argument source order、未解決 row-type generic argument の明示的 deferred
   境界、MIR より前の semantic rejection、active scanner envelope の各 precedence pair、whole-program/per-unit interface reconstruction、cache の cold/hot/edit/revert、
   malformed/exhausted stream、通常の `json.decode` 互換性を網羅する。主な owner test は
   `m5::json_scan_copy_row_terminal_matrix`、`m5::json_scan_rejects_owned_row_fields`、
   `m5::json_scan_rejects_transitive_owned_row_fields`、`m5::json_scan_generic_row_ownership`、
   `m5::json_scan_generic_return_context_ownership`、`m5::json_scan_generic_return_context_wrapper_matrix`、
-  `m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_inference_matrix`、
+  `m5::json_scan_generic_return_context_argument_order_matrix`、`m5::json_scan_generic_return_context_numeric_default`、
+  `m5::json_scan_generic_return_context_inference_matrix`、
   `m5::json_scan_copy_composite_runtime_matrix`、
   `m5::json_scan_rejects_owned_composite_rows`、`hir_program_json_scan_envelope_mismatch`、
   `hir_program_json_scan_envelope_precedence_matrix`、
@@ -360,7 +364,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   `crates/align_driver/tests/json_scan_identity.rs::json_scan_cross_compiler_identity` を fixture
   `crates/align_driver/tests/fixtures/json_scan_copy_identity.align` に対して実行する。2 つの明示的な入力は baseline Align commit
   `576e57307fe4ef34e74566f5e389a2f0e2a04acd` と、実装 PR と `HANDOFF.md` に記録した exact な implementation-head SHA である。
-  2 つの clean release worktree で `cargo test --release --locked --target x86_64-unknown-linux-gnu -p align_driver --test json_scan_identity -- --exact json_scan_cross_compiler_identity` を実行し、`rustc 1.96.1`、`llvm-config-22 22.1.8`、`cc`、`LC_ALL=C`、`ALIGNC_CACHE=off`、custom `RUSTFLAGS` なしを固定する。test は worktree ごとの明示的 output directory に exact file を書く。owner は `cmp` と normalization なしで canonical serialized interface bytes（`align_interface::serialize`）、complete structural codegen-input MIR（`align_mir::print::codegen_input_to_string`）、raw LLVM、`BuildTarget::Baseline` / `Profile::Release` の `emit_object_file` object bytes、`InterfaceSummary.interface_hash` と実際の `CodegenKey` fields（`cache_format_version`、`compiler_build_id`、`frontend_schema`、`located`、`impl_hash`、`dep_interface_hashes`、`exports`、`target_triple`、`object_format`、`resolved_cpu`、`resolved_features`、`profile_name`、`pipeline`、`codegen_opt`、`reloc_model`、`code_model`、`llvm_version`、`rt_lto`、`rt_lto_digest`、`pgo_mode`、`unit`）を比較する。`interface_hash` は `CodegenKey` field ではないため、interface artifact と codegen action key は別々に比較する。既存の `cache_codegen::json_scan_row_schema_rejection` と `cache_codegen::json_scan_per_unit_interface_row_ownership` が cold/hot、schema edit/revert、cache-hit/miss、no-publication を別に所有する。required Linux object comparison が unavailable なら gate は fail とし、optional な主張にはしない。align-llm Request 6 の adoption fixture が後の pin 変更を所有する。
+  2 つの clean release worktree で `cargo test --release --locked --target x86_64-unknown-linux-gnu -p align_driver --test json_scan_identity -- --exact json_scan_cross_compiler_identity` を実行し、`rustc 1.96.1`、`llvm-config-22 22.1.8`、`cc`、`LC_ALL=C`、`ALIGNC_CACHE=off`、custom `RUSTFLAGS` なしを固定する。test は worktree ごとの明示的 output directory に exact file を書く。owner は `cmp` と normalization なしで canonical serialized interface bytes（`align_interface::serialize`）、complete structural codegen-input MIR（`align_mir::print::codegen_input_to_string`）、raw LLVM、`BuildTarget::Baseline` / `Profile::Release` の `emit_object_file` object bytes、`InterfaceSummary.interface_hash` と実際の `CodegenKey` fields（`cache_format_version`、`compiler_build_id`、`frontend_schema`、`located`、`impl_hash`、`dep_interface_hashes`、`exports`、`target_triple`、`object_format`、`resolved_cpu`、`resolved_features`、`profile_name`、`pipeline`、`codegen_opt`、`reloc_model`、`code_model`、`llvm_version`、`rt_lto`、`rt_lto_digest`、`pgo_mode`、`unit`）を比較する。`interface_hash` は `CodegenKey` field ではないため、interface artifact と codegen action key は別々に比較する。baseline と implementation-head の `compiler_build_id` は compiler binary hash なので意図的に異なり、full cache-key digest も異なる。cache object を compiler build 間で共有してはならず、この差は `FirstDiff::CompilerBuildId` として記録する。他の listed field に差があれば gate は fail とする。既存の `cache_codegen::json_scan_row_schema_rejection` と `cache_codegen::json_scan_per_unit_interface_row_ownership` が cold/hot、schema edit/revert、cache-hit/miss、no-publication を別に所有する。required Linux object comparison が unavailable なら gate は fail とし、optional な主張にはしない。align-llm Request 6 の adoption fixture が後の pin 変更を所有する。
 
   現在の compiler は一部の owning row をまだ受理する。この記述は reviewed target contract で
   あり、実装済みという主張ではない。実装 PR はこの設計ゲート後にのみ作成し、通常の decode、encode、
