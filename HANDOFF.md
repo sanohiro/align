@@ -15,9 +15,10 @@ history. There is no general public validator activation; Request 6's design spe
 scanner Copy predicate as an exception through the active pre-lowering gate. The design repair is
 `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and restores
 ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701 merged
-the design at `576e573`; the implementation is complete in commit `f52eb6d` on
-`agent/align-llm-request6-implementation`, with the post-merge checkpoint `6e48b46`. Its final
-documentation-only source-map repair is `4832d8b`, with the design handoff checkpoint in `3a05c87`.
+the design at `576e573`; the implementation branch is
+`agent/align-llm-request6-implementation`, based on the post-merge checkpoint `6e48b46` and the
+implementation commit `f52eb6d`. The consolidated closure-matrix and generic source-spelling
+repair is `3d7b118`; the design handoff checkpoint remains `3a05c87`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -67,9 +68,9 @@ facts must live in this repository.
   an LLM-gateway-specific subset.
 - **align-llm requests:** Requests 4–14 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is merged in
-  Align PR #701 and its compiler implementation is in progress on the separate
-  `agent/align-llm-request6-implementation` worktree. No release pin or align-llm adoption
-  verification exists yet. Request 9 remains the later C7 blocker.
+  Align PR #701 and its reviewed implementation is complete on the separate
+  `agent/align-llm-request6-implementation` worktree, pending publication and merge. No release
+  pin or align-llm adoption verification exists yet. Request 9 remains the later C7 blocker.
 
 ## Latest shipped wave
 
@@ -656,16 +657,18 @@ path is Copy-gated, while partial-error cleanup remains a separate ownership req
 imported/per-unit consumers, interface/import reconstruction precedes active
 `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source sema gate uses
 the canonical recursive `DropPlan`; the active HIR replay walks direct expression children
-iteratively and rejects direct, transitive, and missing-row definitions without activating the
-dormant body validator. The comprehensive independent review found and the repair closed the
-canonical-predicate and contextual-spelling gaps; its conditional follow-up found one state-boundary
-concern, fixed by an explicit ordinary-function reset. Latest verification passes:
-`cargo test -p align_mir --lib hir_ -- --nocapture` (53 passed), `cargo test -p align_driver --test
-m5 json_scan_ -- --nocapture` (19 passed), the ordinary Move-option compatibility owner, the
-imported-row owner, `scripts/test-pr.sh`, and `cargo clippy --workspace --all-targets --locked --
--D warnings`. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
-workspace-wide rustfmt drift outside this slice. The implementation commit is `f52eb6d`; next
-steps are the handoff update commit, push, PR review, and merge.
+iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and malformed-row
+definitions without activating the dormant body validator. The consolidated repair also closes the
+producer-owned generic source-spelling boundary and adds schema, terminal/error, cache rejection,
+and accepted MIR/raw-LLVM identity owners. Latest verification passes:
+`cargo check -p align_sema -p align_mir -p align_driver --tests --locked`; `cargo test -p align_mir
+--lib hir_ -- --nocapture` (53 passed); `cargo test -p align_driver --test m5 json_scan_ --
+--nocapture` (23 passed); imported modules (2 passed); cache owners (2 passed);
+`scripts/test-pr.sh`; and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+`git diff --check` is clean. `cargo fmt --all -- --check` remains N/A because the checkout has
+pre-existing workspace-wide rustfmt drift outside this slice. The implementation commit is
+`3d7b118`; next steps are the fresh independent review, pre-PR attestation, push, PR review, and
+merge.
 Do not update `.align-revision` or the align-llm Request 6 verification status until this
 implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
 gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
