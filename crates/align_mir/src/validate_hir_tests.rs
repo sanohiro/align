@@ -667,6 +667,100 @@ fn valid_header_does_not_consume_body_facts() {
 }
 
 #[test]
+fn hir_body_validator_json_scan_copy_row() {
+    let input = body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str);
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(input),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program
+        .fns
+        .push(body_unit_case("json_scan_copy_row", scanner.clone()));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&program));
+
+    program.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&program));
+
+    let nested_scanner = body_test_expr(
+        hir::ExprKind::Block(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(scanner)),
+        }),
+        Ty::JsonScanner(0),
+    );
+    let mut nested_program = baseline_program();
+    nested_program
+        .fns
+        .push(body_unit_case("json_scan_nested_copy_row", nested_scanner));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&nested_program));
+    nested_program.structs[0].fields[0].ty = Ty::Char;
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&nested_program));
+}
+
+#[test]
+fn hir_program_json_scan_copy_row() {
+    let input = body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str);
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(input),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_copy_row", scanner));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&program));
+    assert!(align_sema::checked_hir_body_depth_is_valid(&program));
+    assert!(validate_hir::global_type_metadata_is_valid(&program));
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+
+    let source_map = SourceMap::new();
+    let mut invalid_schema = program.clone();
+    invalid_schema.structs[0].fields[1].ty = Ty::Char;
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&invalid_schema));
+    for lowered in [
+        lower_program(&invalid_schema),
+        lower_program_located(&invalid_schema, &source_map),
+        lower_program_per_unit(&invalid_schema),
+        lower_program_per_unit_located(&invalid_schema, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "invalid scanner schema published MIR");
+    }
+
+    let mut direct_owned = program.clone();
+    direct_owned.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    let mut transitive_owned = program.clone();
+    transitive_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    transitive_owned.structs[0].fields[0].ty = Ty::Struct(1);
+    for owned in [direct_owned, transitive_owned] {
+        assert!(!validate_hir::json_scan_copy_rows_are_valid(&owned));
+        for lowered in [
+            lower_program(&owned),
+            lower_program_located(&owned, &source_map),
+            lower_program_per_unit(&owned),
+            lower_program_per_unit_located(&owned, &source_map),
+        ] {
+            assert!(is_empty(&lowered), "owned scanner row published MIR");
+        }
+    }
+}
+
+#[test]
 fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
     let base = declaration_header_program();
     // The baseline function-type entry is annotation-only in this fixture; its producer value is

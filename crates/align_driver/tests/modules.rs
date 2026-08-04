@@ -220,6 +220,23 @@ fn an_imported_type_must_be_qualified() {
 }
 
 #[test]
+fn json_scan_imported_row_ownership() {
+    let geom = "module geom\npub Row { xs: array<i64> }\n";
+    let main = "module main\nimport core.json\nimport geom\nfn main() -> Result<(), Error> {\n  rows: json.scanner<geom.Row> := json.scan(\"[]\")\n  return Ok(())\n}\n";
+    let diagnostics = check_multi_diagnostics(
+        "mod-json-scan-owned-row",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'geom.Row' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn same_struct_name_in_two_modules_does_not_collide() {
     if !backend_available() {
         return;

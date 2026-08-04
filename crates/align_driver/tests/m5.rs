@@ -549,18 +549,29 @@ fn json_option_struct_field_last_and_nested_compose() {
 }
 
 #[test]
-fn json_option_move_struct_payload_still_rejected() {
-    // The Slice-B boundary is unchanged: an `Option<Move-struct>` payload (a struct owning an
-    // `array`/`string`) is rejected at declaration — an owned Option-payload drop-as-a-field has no
-    // consumer yet. Only NON-Move payload structs get the new encode.
-    assert!(check_errs(
-        "json-option-move-struct",
-        "import core.json\n\
+fn json_option_move_struct_payload_remains_admitted() {
+    if !backend_available() {
+        return;
+    }
+    // Ordinary JSON keeps its existing ownership contract: an `Option<Move-struct>` payload is
+    // admitted by the Decode schema and remains eligible for ordinary encode and scope Drop. The
+    // scanner-only Copy boundary is a separate contract and must not narrow this path.
+    let src = "import core.json\n\
          Owned { xs: array<i64> }\n\
          Doc { id: i64, meta: Option<Owned> }\n\
-         fn f(s: str) -> Result<Doc, Error> = json.decode(s)\n\
-         fn main() -> i32 = 0\n"
-    ));
+         fn main() -> Result<(), Error> {\n  \
+           a: Doc := json.decode(\"{\\\"id\\\":1,\\\"meta\\\":{\\\"xs\\\":[2,3]}}\")?\n  \
+           print(json.encode(a))\n  \
+           b: Doc := json.decode(\"{\\\"id\\\":2}\")?\n  \
+           print(json.encode(b))\n  \
+           return Ok(())\n\
+         }\n";
+    let out = build_and_run("json-option-move-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"id\":1,\"meta\":{\"xs\":[2,3]}}\n{\"id\":2}\n"
+    );
 }
 
 #[test]
@@ -1231,6 +1242,52 @@ fn json_scan_reduce_fold() {
 }
 
 #[test]
+fn json_scan_copy_row_terminal_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let src = "import core.json\n\
+         Row { score: i64 }\n\
+         fn add(a: i64, b: i64) -> i64 = a + b\n\
+         fn positive(n: i64) -> bool = n > 0\n\
+         fn above_five(n: i64) -> bool = n > 5\n\
+         fn main() -> Result<(), Error> {\n  \
+           a: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(a.score.sum()?)\n  \
+           b: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(b.count()?)\n  \
+           c: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(c.score.reduce(0, add)?)\n  \
+           d: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(d.score.any(above_five)?)\n  \
+           e: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(e.score.all(positive)?)\n  \
+           f: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(f.score.min()?)\n  \
+           g: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(g.score.max()?)\n  \
+           return Ok(())\n\
+         }\n";
+    let out = build_and_run("json-scan-copy-terminal-matrix", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n3\n15\ntrue\ntrue\n1\n9\n");
+}
+
+#[test]
+fn json_scan_copy_row_no_owned_alloc() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(
+        "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n",
+    );
+    let runtime_call = |needle: &str| ir.lines().any(|line| line.contains("call") && line.contains(needle));
+    assert!(ir.contains("align_rt_json_scan_next"), "scanner codegen lost its row-step call:\n{ir}");
+    assert!(!runtime_call("align_rt_alloc"), "a Copy scanner row must not allocate an owned row field:\n{ir}");
+    assert!(!runtime_call("align_rt_arena_alloc"), "a Copy scanner row must not allocate an arena row field:\n{ir}");
+}
+
+#[test]
 fn json_scan_reduce_nonscalar_accumulator_rejected() {
     // A `json.scanner` reduce terminal is `Result<T, Error>`, so its accumulator must be a scalar. A
     // non-scalar accumulator (a `vec4<i64>`) has no `Result` form — reject cleanly, don't panic.
@@ -1270,6 +1327,63 @@ fn json_scan_requires_binding_annotation() {
         "import core.json\nfn main() -> Result<(), Error> {\n  rows := json.scan(\"[]\")\n  return Ok(())\n}\n",
     );
     assert!(errs.contains("cannot infer the scan row type"), "unexpected diagnostics:\n{errs}");
+}
+
+#[test]
+fn json_scan_rejects_owned_row_fields() {
+    for (name, row, expected) in [
+        (
+            "json-scan-owned-row",
+            "Owned { xs: array<i64> }",
+            "Owned",
+        ),
+        (
+            "json-scan-transitive-owned-row",
+            "Owned { xs: array<i64> }\nNested { owned: Owned }",
+            "Nested",
+        ),
+        (
+            "json-scan-generic-owned-row",
+            "Owned { xs: array<i64> }\nRow<T> { owned: T }",
+            "Row<Owned>",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(
+            name,
+            &format!(
+                "import core.json\n{row}\nfn main() -> Result<(), Error> {{\n  rows: json.scanner<{expected}> := json.scan(\"[]\")\n  return Ok(())\n}}\n"
+            ),
+        );
+        assert!(
+            diagnostics.contains(&format!(
+                "`json.scan` row type '{expected}' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+            )),
+            "unexpected diagnostics for {name}:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn json_scan_reassignment_uses_parameter_spelling() {
+    let diagnostics = check_diagnostics(
+        "json-scan-reassignment-spelling",
+        r#"import core.json
+Owned { xs: array<i64> }
+fn replace(rows: json.scanner<Owned>) -> Result<(), Error> {
+  rows = json.scan("[]")
+  return Ok(())
+}
+fn main() -> Result<(), Error> {
+  return replace(json.scan("[]"))
+}
+"#,
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
 }
 
 #[test]

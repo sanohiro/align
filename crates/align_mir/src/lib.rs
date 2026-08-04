@@ -1580,6 +1580,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
         && validate_hir::type_placement_metadata_is_valid(program)
         && validate_hir::nominal_link_metadata_is_valid(program)
         && validate_hir::declaration_header_metadata_is_valid(program)
+        && validate_hir::json_scan_copy_rows_are_valid(program)
 }
 
 fn empty_program() -> Program {

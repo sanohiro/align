@@ -8,15 +8,16 @@ per-PR journal is preserved in
 _Last updated: 2026-08-04. `main` includes the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), and am-b1 dormant body validation PR #694
-(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The current
+(`b4b2d19`) and am-b2a storage/vector/array body validation PR #695 (`96b16cc`). The historical
 implementation slice is am-b2b2: templates, JSON descriptors/document/scanner records, and
 group/dictionary records on `feat/am-b2b-pipeline-validator`; am-b2b1 is already in the branch
-history. There is no general public validator activation yet; Request 6's design specifies the
-narrow scanner Copy predicate as an exception through the active pre-lowering gate. The design
-repair is `bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and
-restores ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701
-merged the design at `576e573`; no scanner compiler implementation or release pin exists yet. Its
-final documentation-only source-map repair is `4832d8b`, with the handoff checkpoint in `3a05c87`.
+history. There is no general public validator activation; Request 6's design specifies the narrow
+scanner Copy predicate as an exception through the active pre-lowering gate. The design repair is
+`bd93f7b` after base design `1cb666f`; the conditional-review redesign is `c1ded08` and restores
+ordinary Move-option JSON encode plus the interface-reconstruction ordering. Align PR #701 merged
+the design at `576e573`; the implementation is now in progress on
+`agent/align-llm-request6-implementation`, with the post-merge checkpoint `6e48b46`. Its final
+documentation-only source-map repair is `4832d8b`, with the design handoff checkpoint in `3a05c87`.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -65,9 +66,10 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **align-llm requests:** Requests 4–14 remain proposed in
-  `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is being
-  prepared on the separate `agent/align-llm-request6-design` worktree and has no compiler
-  implementation or release pin yet. Request 9 remains the later C7 blocker.
+  `../align-llm/docs/align-requests.md`; Request 6's scanner-row Copy safety design is merged in
+  Align PR #701 and its compiler implementation is in progress on the separate
+  `agent/align-llm-request6-implementation` worktree. No release pin or align-llm adoption
+  verification exists yet. Request 9 remains the later C7 blocker.
 
 ## Latest shipped wave
 
@@ -648,23 +650,25 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Implement the merged Request 6 compiler gate. Ordinary JSON
-decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
-scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
+Request 6 implementation is complete in this worktree but not yet published. Ordinary JSON decode,
+encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the scanner
+path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
-`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
-on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
-wording. The conditional final review found two further valid contract findings; the current
-redesign incorporates both and reopens the closure matrix. The fresh preflight review then found
-one documentation-only P2 in the source-of-truth map; `4832d8b` fixes the stale path and adds the
-changed implementation ledgers. The next owner slice is the canonical recursive Copy/DropPlan
-predicate in `align_sema::Checker::check_json_scan`, the active checked-HIR call in
-`align_mir::hir_program_is_valid`, and whole/per-unit regression coverage. Keep the dormant body
-validator separate; it is not the safety gate. Do not update `.align-revision` or the align-llm
-Request 6 verification status until this implementation is merged, the sibling release compiler is
-rebuilt, and the real-client adoption gate passes. The design PR's `git diff --check`, exact
-diagnostic consistency, active-gate references, ordinary Move-option boundary checks, and hosted
-checks all passed; implementation verification is not started on this branch.
+`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source sema gate uses
+the canonical recursive `DropPlan`; the active HIR replay walks direct expression children
+iteratively and rejects direct, transitive, and missing-row definitions without activating the
+dormant body validator. The comprehensive independent review found and the repair closed the
+canonical-predicate and contextual-spelling gaps; its conditional follow-up found one state-boundary
+concern, fixed by an explicit ordinary-function reset. Latest verification passes:
+`cargo test -p align_mir --lib hir_ -- --nocapture` (53 passed), `cargo test -p align_driver --test
+m5 json_scan_ -- --nocapture` (19 passed), the ordinary Move-option compatibility owner, the
+imported-row owner, `scripts/test-pr.sh`, and `cargo clippy --workspace --all-targets --locked --
+-D warnings`. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
+workspace-wide rustfmt drift outside this slice. Next steps are commit/push/PR review and merge.
+Do not update `.align-revision` or the align-llm Request 6 verification status until this
+implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
+gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
+references, ordinary Move-option boundary checks, and hosted checks all passed.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

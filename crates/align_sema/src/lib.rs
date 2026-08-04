@@ -1756,6 +1756,20 @@ pub fn struct_is_move(
     drop_plan(Ty::Struct(id), structs, enums, tagged_types).needs_drop()
 }
 
+/// Whether a JSON scanner row is safe to reuse as one per-step slot. The complete recursive
+/// [`DropPlan`] is the ownership authority: malformed graphs fail closed, and only a valid plan
+/// with no owned leaf is admitted. This pure predicate is shared by source sema and the active HIR
+/// pre-lowering gate so checked-HIR consumers cannot drift from the producer rule.
+pub fn json_scan_row_is_copy(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let plan = drop_plan(Ty::Struct(id), structs, enums, tagged_types);
+    plan.is_valid() && !plan.needs_drop()
+}
+
 /// Whether sum type `id` is a **Move** type — any variant carries an owned (Move) payload, so its
 /// `Drop` must recursively free the live payload. The `Drop` switches on the tag and visits exactly
 /// the active variant (`drop_enum` in codegen). An enum whose every payload has an empty DropPlan
@@ -2106,7 +2120,12 @@ struct FnSig {
     params: Vec<Ty>,
     /// Parameter access modes, parallel to `params`.
     param_modes: Vec<ast::ParamMode>,
+    /// Producer-owned source spellings for scanner-typed parameters, parallel to `params`.
+    /// `None` is intentional for every other parameter and for bodyless foreign signatures.
+    json_scan_param_spellings: Vec<Option<String>>,
     ret: Ty,
+    /// Producer-owned source spelling for a scanner-typed return annotation, if present.
+    json_scan_return_spelling: Option<String>,
     return_borrow: hir::ReturnBorrowSummary,
     return_region: hir::ReturnRegionSummary,
     /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
@@ -4277,7 +4296,13 @@ pub fn check_program_with_interface_facts(
             FnSig {
                 params,
                 param_modes,
+                json_scan_param_spellings: f
+                    .params
+                    .iter()
+                    .map(|p| json_scan_row_source_spelling(&p.ty))
+                    .collect(),
                 ret,
+                json_scan_return_spelling: f.ret.as_ref().and_then(json_scan_row_source_spelling),
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 type_params: tparams,
@@ -4413,7 +4438,9 @@ pub fn check_program_with_interface_facts(
                         FnSig {
                             param_modes: vec![ast::ParamMode::ByValue; params.len()],
                             params: params.clone(),
+                            json_scan_param_spellings: vec![None; params.len()],
                             ret,
+                            json_scan_return_spelling: None,
                             return_borrow: hir::ReturnBorrowSummary::None,
                             return_region: hir::ReturnRegionSummary::None,
                             type_params: Vec::new(),
@@ -18555,6 +18582,13 @@ struct Checker<'a, 't> {
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
     ret_hint: Ty,
+    /// Public source spelling of the scanner row type supplied by the active return or binding
+    /// annotation. The AST spelling is captured before type resolution erases it into `Ty`; it is
+    /// used only for the producer-owned `json.scan` diagnostic and never enters HIR.
+    json_scan_source_spelling: Option<String>,
+    /// Source spellings for scanner-typed locals and parameters. This remains checker-only state;
+    /// source identity must not be serialized into HIR or reconstructed from nominal identities.
+    json_scan_local_spellings: HashMap<LocalId, String>,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
     /// True while checking a pipeline terminal that supports a `json.scanner<Row>` streaming source
@@ -18724,6 +18758,8 @@ impl<'a, 't> Checker<'a, 't> {
             locals: Vec::new(),
             scope: Vec::new(),
             ret_hint: Ty::Unit,
+            json_scan_source_spelling: None,
+            json_scan_local_spellings: HashMap::new(),
             arena_depth: 0,
             scan_terminal: false,
             unsafe_depth: 0,
@@ -19191,16 +19227,30 @@ impl<'a, 't> Checker<'a, 't> {
         if let Some(id) = self.lookup(name) {
             return Some(id);
         }
-        let cap = self.capture.as_mut()?;
-        if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
-            return Some(param_id);
-        }
-        let (enc_id, ty) = cap.enclosing.iter().rev().find(|(n, _, _)| n == name).map(|(_, id, t)| (*id, *t))?;
-        // A captured value becomes a synthetic parameter local (tracked in `captured`, *not* pushed
-        // into the visible scope so a nested-block exit can't truncate it).
+        let (enc_id, ty) = {
+            let cap = self.capture.as_ref()?;
+            if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
+                return Some(param_id);
+            }
+            cap.enclosing
+                .iter()
+                .rev()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, id, ty)| (*id, *ty))?
+        };
+        let spelling = self.json_scan_local_spellings.get(&enc_id).cloned();
+        // A captured value becomes a synthetic parameter local (tracked in `captured`, *not*
+        // pushed into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
         self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false, align: None, is_param: false });
-        cap.captured.push((name.to_string(), param_id, enc_id));
+        if let Some(spelling) = spelling {
+            self.json_scan_local_spellings.insert(param_id, spelling);
+        }
+        self.capture
+            .as_mut()
+            .expect("capture scope remains active")
+            .captured
+            .push((name.to_string(), param_id, enc_id));
         Some(param_id)
     }
 
@@ -19210,6 +19260,10 @@ impl<'a, 't> Checker<'a, 't> {
         // modules (two modules may each have `fn run` with a lambda).
         let mangled = self.resolve_local_fn(&f.name.name).unwrap_or_else(|| f.name.name.clone());
         self.cur_fn = mangled.clone();
+        // A Checker is currently created per function, but keep this boundary explicit so future
+        // reuse cannot carry producer-owned scanner identity across LocalId reuse.
+        self.json_scan_source_spelling = None;
+        self.json_scan_local_spellings.clear();
         // The permission sentinel is function-local compiler state. A rejected extern in an
         // earlier top-level body must not become the saved enclosing state for this function's
         // otherwise independent lambdas.
@@ -19282,6 +19336,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.ret_hint = ret;
+        self.json_scan_source_spelling = sig.json_scan_return_spelling.clone();
 
         // "huge struct copy" lint (`draft.md` §16): a struct passed or returned **by value** is
         // copied in full at every call boundary; above `HUGE_STRUCT_BYTES` that is a data-oriented
@@ -19334,6 +19389,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(&p.name.name, ty, p.mode.is_out());
+            if let Some(spelling) = json_scan_row_source_spelling(&p.ty) {
+                self.json_scan_local_spellings.insert(id, spelling);
+            }
             self.locals[id as usize].is_param = true;
             params.push(id);
         }
@@ -19409,6 +19467,10 @@ impl<'a, 't> Checker<'a, 't> {
             match s {
                 ast::Stmt::Let { is_mut, name, ty, init, align } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
+                    let saved_json_scan_source_spelling = self.json_scan_source_spelling.clone();
+                    if let Some(spelling) = ty.as_ref().and_then(json_scan_row_source_spelling) {
+                        self.json_scan_source_spelling = Some(spelling);
+                    }
                     // A struct literal is only legal here, as a `let` initializer.
                     let init = match &init.kind {
                         ast::ExprKind::StructLit { name: sname, fields } => {
@@ -19422,9 +19484,13 @@ impl<'a, 't> Checker<'a, 't> {
                             _ => self.check_expr(init, ann),
                         },
                     };
+                    self.json_scan_source_spelling = saved_json_scan_source_spelling;
                     let local_ty = ann.unwrap_or(init.ty);
                     self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
+                    if let Some(spelling) = ty.as_ref().and_then(json_scan_row_source_spelling) {
+                        self.json_scan_local_spellings.insert(local, spelling);
+                    }
                     // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
                     // fixed-array binding (the aligned-vector-load enabler). `N` is already a
                     // validated power of two (parser). A struct's over-alignment is declared on the
@@ -19611,10 +19677,15 @@ impl<'a, 't> Checker<'a, 't> {
                             let _ = self.check_expr(value, Some(ty)); // surface RHS errors; emit no store
                         } else {
                             // Mirror the `let` path: a slice/str place borrows its source.
+                            let json_scan_spelling = self.json_scan_local_spellings.get(&id).cloned();
                             let v = match ty {
                                 Ty::Slice(ps) => self.check_slice_init(value, ps),
                                 Ty::Str => self.check_str_init(value),
-                                _ => self.check_expr(value, Some(ty)),
+                                _ => self.check_expr_with_json_scan_source_spelling(
+                                    value,
+                                    Some(ty),
+                                    json_scan_spelling,
+                                ),
                             };
                             // Reassigning a read-only view (`s = TABLE`) taints the slice local
                             // read-only too. Insert-only: a later `s = writable` cannot clear it, so a
@@ -20039,6 +20110,36 @@ impl<'a, 't> Checker<'a, 't> {
         if self.diags.error_count() == errors_before && expected.is_some() {
             self.constrain(result.ty, expected, e.span);
         }
+        result
+    }
+
+    /// Check a value while replacing the producer-owned scanner spelling context. Context must be
+    /// scoped to the exact expected annotation: a function return spelling must never leak into an
+    /// unrelated local reassignment or lambda body.
+    fn check_expr_with_json_scan_source_spelling(
+        &mut self,
+        e: &ast::Expr,
+        expected: Option<Ty>,
+        spelling: Option<String>,
+    ) -> Expr {
+        let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
+        let result = self.check_expr(e, expected);
+        self.json_scan_source_spelling = saved;
+        result
+    }
+
+    /// The argument analogue of [`Self::check_expr_with_json_scan_source_spelling`], preserving
+    /// the existing slice/str coercion path while carrying an annotated scanner parameter's source
+    /// identity into a nested `json.scan`.
+    fn check_arg_with_json_scan_source_spelling(
+        &mut self,
+        a: &ast::Expr,
+        param: Option<Ty>,
+        spelling: Option<String>,
+    ) -> Expr {
+        let saved = std::mem::replace(&mut self.json_scan_source_spelling, spelling);
+        let result = self.check_arg(a, param);
+        self.json_scan_source_spelling = saved;
         result
     }
 
@@ -21752,8 +21853,12 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_extern_without_unsafe(sig.is_extern, &display, span) {
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let (param_tys, ret, param_modes) =
-            (sig.params.clone(), sig.ret, sig.param_modes.clone());
+        let (param_tys, ret, param_modes, json_scan_param_spellings) = (
+            sig.params.clone(),
+            sig.ret,
+            sig.param_modes.clone(),
+            sig.json_scan_param_spellings.clone(),
+        );
         // A generic function: infer the concrete type arguments from the call, then take its own
         // dedicated path (the result type and `type_args` come from the substitution).
         if !sig.type_params.is_empty() {
@@ -21824,7 +21929,13 @@ impl<'a, 't> Checker<'a, 't> {
         let checked: Vec<Expr> = args
             .iter()
             .enumerate()
-            .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
+            .map(|(i, a)| {
+                self.check_arg_with_json_scan_source_spelling(
+                    a,
+                    param_tys.get(i).copied(),
+                    json_scan_param_spellings.get(i).cloned().flatten(),
+                )
+            })
             .collect();
         // An `out slice<T>` parameter is written by the callee, so its argument must be writable
         // storage. A read-only view of a constant table (or a string literal's bytes) points at the
@@ -23727,6 +23838,8 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_vars = std::mem::take(&mut self.float_vars);
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_ret = self.ret_hint;
+        let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
+        let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
         let saved_arena = self.arena_depth;
         // A lambda body is a separate function: an enclosing `unsafe {}` does not lexically
         // contain the lifted function body. Extern permission must be re-established by an unsafe
@@ -23746,22 +23859,24 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_buffered_readers = std::mem::take(&mut self.buffered_readers);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
+        self.json_scan_source_spelling = None;
         self.arena_depth = 0;
         self.unsafe_depth = 0;
         self.extern_boundary_error = false;
         self.task_group_depth = 0;
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
-        let mut param_ids: Vec<LocalId> = params
-            .iter()
-            .zip(&param_tys)
-            .map(|(p, ty)| {
-                // A lambda parameter shadows if it collides with another parameter of this lambda or
-                // with an enclosing (capturable) binding of the surrounding function.
-                self.check_shadow(&p.name.name, p.name.span, self.scope.len());
-                self.declare(&p.name.name, *ty, false)
-            })
-            .collect();
+        let mut param_ids = Vec::with_capacity(params.len());
+        for (p, ty) in params.iter().zip(&param_tys) {
+            // A lambda parameter shadows if it collides with another parameter of this lambda or
+            // with an enclosing (capturable) binding of the surrounding function.
+            self.check_shadow(&p.name.name, p.name.span, self.scope.len());
+            let id = self.declare(&p.name.name, *ty, false);
+            if let Some(spelling) = p.ty.as_ref().and_then(json_scan_row_source_spelling) {
+                self.json_scan_local_spellings.insert(id, spelling);
+            }
+            param_ids.push(id);
+        }
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
             Some(t) => t,
@@ -23797,6 +23912,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.float_vars = saved_float_vars;
                 self.float_parent = saved_float_parent;
                 self.ret_hint = saved_ret;
+                self.json_scan_source_spelling = saved_json_scan_source_spelling;
+                self.json_scan_local_spellings = saved_json_scan_local_spellings;
                 self.arena_depth = saved_arena;
                 self.unsafe_depth = saved_unsafe_depth;
                 self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
@@ -23857,6 +23974,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_vars = saved_float_vars;
         self.float_parent = saved_float_parent;
         self.ret_hint = saved_ret;
+        self.json_scan_source_spelling = saved_json_scan_source_spelling;
+        self.json_scan_local_spellings = saved_json_scan_local_spellings;
         self.arena_depth = saved_arena;
         self.unsafe_depth = saved_unsafe_depth;
         self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
@@ -26341,6 +26460,23 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // Each row decodes like a single struct target; reuse the decode eligibility gate.
         if !self.json_struct_fields_ok(sid, span, JsonDir::Decode) {
+            return err;
+        }
+        if !json_scan_row_is_copy(sid, self.structs, self.enums, self.tagged_types) {
+            let Some(row_type_spelling) = self.json_scan_source_spelling.as_deref() else {
+                self.diags.error(
+                    "cannot determine the scan row type spelling; annotate the binding with `json.scanner<Row>`".to_string(),
+                    span,
+                );
+                return err;
+            };
+            self.diags.error(
+                format!(
+                    "`json.scan` row type '{}' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot",
+                    row_type_spelling
+                ),
+                span,
+            );
             return err;
         }
         // The rows' `str` fields are zero-copy views into the input, so the input's region bounds the
@@ -32656,6 +32792,71 @@ fn ty_name(ty: Ty) -> String {
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
+}
+
+/// Render a source-level type annotation without consulting HIR nominal names or mangled
+/// monomorph identities. This is intentionally limited to the syntax needed by the producer-owned
+/// `json.scan` row diagnostic; the row itself must resolve to a named struct, while its concrete
+/// generic arguments may contain any ordinary source type.
+fn source_type_spelling(ty: &ast::Type) -> String {
+    match ty {
+        ast::Type::Named { path, args, .. } => {
+            let mut output = path
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !args.is_empty() {
+                output.push('<');
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str(", ");
+                    }
+                    output.push_str(&source_type_spelling(arg));
+                }
+                output.push('>');
+            }
+            output
+        }
+        ast::Type::Tuple { elems, .. } => {
+            let mut output = String::from("(");
+            for (index, elem) in elems.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&source_type_spelling(elem));
+            }
+            output.push(')');
+            output
+        }
+        ast::Type::Fn { params, ret, .. } => {
+            let mut output = String::from("fn(");
+            for (index, param) in params.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&source_type_spelling(&param.ty));
+            }
+            output.push_str(") -> ");
+            output.push_str(&source_type_spelling(ret));
+            output
+        }
+    }
+}
+
+/// Extract the producer-owned row spelling from a written scanner annotation before resolution
+/// turns `json.scanner<Row>` into `Ty::JsonScanner(struct_id)`.
+fn json_scan_row_source_spelling(ty: &ast::Type) -> Option<String> {
+    let ast::Type::Named { path, args, .. } = ty else {
+        return None;
+    };
+    let [module, name] = path.segments.as_slice() else {
+        return None;
+    };
+    (module.name == "json" && name.name == "scanner")
+        .then(|| args.first().map(source_type_spelling))
+        .flatten()
 }
 
 /// Classify an `as` conversion for the **lossy-conversion** lint (`draft.md` §16, "Numeric
