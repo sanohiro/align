@@ -3641,6 +3641,30 @@ pub fn check_program_with_interface_facts(
         });
     }
 
+    // Keep public source identity in a producer-owned side table. HIR stores only nominal ids and
+    // backend names; diagnostics for a later generic specialization must still be able to render
+    // `geom.Row<Owned>` without consulting those internal identities.
+    let mut struct_source_spellings: HashMap<u32, String> = struct_ids
+        .iter()
+        .filter_map(|(canonical, id)| {
+            source_path_for_canonical(canonical, &type_table).map(|spelling| (*id, spelling))
+        })
+        .collect();
+    struct_source_spellings.extend([
+        (*struct_ids.get("argon2_params").expect("builtin argon2_params id"), "argon2_params".to_string()),
+        (*struct_ids.get("regex_match").expect("builtin regex_match id"), "regex_match".to_string()),
+    ]);
+    let mut enum_source_spellings: HashMap<u32, String> = enum_ids
+        .iter()
+        .filter_map(|(canonical, id)| {
+            source_path_for_canonical(canonical, &type_table).map(|spelling| (*id, spelling))
+        })
+        .collect();
+    enum_source_spellings.extend([
+        (*enum_ids.get("Error").expect("builtin Error id"), "Error".to_string()),
+        (*enum_ids.get("json.kind").expect("builtin json.kind id"), "json.kind".to_string()),
+    ]);
+
     // Build the generic templates: resolve each template's fields / payloads with its type
     // parameters in scope (so `T` becomes `Ty::Param`). A template may not (yet) reference another
     // generic def, so empty template maps suffice while building them.
@@ -3657,6 +3681,8 @@ pub fn check_program_with_interface_facts(
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
+                    struct_source_spellings: &mut struct_source_spellings,
+                    enum_source_spellings: &mut enum_source_spellings,
                     struct_templates: &est,
                     structs: &mut structs,
                     struct_mono: &mut struct_mono,
@@ -3728,6 +3754,8 @@ pub fn check_program_with_interface_facts(
                 type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
+                struct_source_spellings: &mut struct_source_spellings,
+                enum_source_spellings: &mut enum_source_spellings,
                 struct_templates: &struct_templates,
                 structs: &mut structs,
                 struct_mono: &mut struct_mono,
@@ -4536,6 +4564,8 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &mut struct_source_spellings,
+            &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
@@ -4621,6 +4651,8 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &mut struct_source_spellings,
+            &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
@@ -18542,6 +18574,10 @@ struct Checker<'a, 't> {
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    /// Producer-owned public spellings for concrete nominal ids. This is deliberately separate
+    /// from `StructDef`/`EnumDef` names so diagnostics never depend on HIR or mangled identities.
+    struct_source_spellings: &'t mut HashMap<u32, String>,
+    enum_source_spellings: &'t mut HashMap<u32, String>,
     /// The concrete enum table, grown with monomorph instances of generic sum types (mutable, like
     /// `structs`). `match` / variant construction read it.
     enums: &'t mut Vec<hir::EnumDef>,
@@ -18707,6 +18743,8 @@ impl<'a, 't> Checker<'a, 't> {
         sigs: &'a HashMap<String, FnSig>,
         struct_ids: &'a HashMap<String, u32>,
         enum_ids: &'a HashMap<String, u32>,
+        struct_source_spellings: &'t mut HashMap<u32, String>,
+        enum_source_spellings: &'t mut HashMap<u32, String>,
         enums: &'t mut Vec<hir::EnumDef>,
         enum_templates: &'a HashMap<String, EnumTemplate>,
         enum_mono: &'t mut HashMap<String, u32>,
@@ -18738,6 +18776,8 @@ impl<'a, 't> Checker<'a, 't> {
             consts,
             struct_ids,
             enum_ids,
+            struct_source_spellings,
+            enum_source_spellings,
             enums,
             enum_templates,
             enum_mono,
@@ -19336,7 +19376,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.ret_hint = ret;
-        self.json_scan_source_spelling = sig.json_scan_return_spelling.clone();
+        self.json_scan_source_spelling = f
+            .ret
+            .as_ref()
+            .and_then(|ty| self.json_scan_row_source_spelling(ty))
+            .or_else(|| sig.json_scan_return_spelling.clone());
 
         // "huge struct copy" lint (`draft.md` §16): a struct passed or returned **by value** is
         // copied in full at every call boundary; above `HUGE_STRUCT_BYTES` that is a data-oriented
@@ -19389,7 +19433,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(&p.name.name, ty, p.mode.is_out());
-            if let Some(spelling) = json_scan_row_source_spelling(&p.ty) {
+            if let Some(spelling) = self.json_scan_row_source_spelling(&p.ty) {
                 self.json_scan_local_spellings.insert(id, spelling);
             }
             self.locals[id as usize].is_param = true;
@@ -19468,7 +19512,10 @@ impl<'a, 't> Checker<'a, 't> {
                 ast::Stmt::Let { is_mut, name, ty, init, align } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
                     let saved_json_scan_source_spelling = self.json_scan_source_spelling.clone();
-                    if let Some(spelling) = ty.as_ref().and_then(json_scan_row_source_spelling) {
+                    if let Some(spelling) = ty
+                        .as_ref()
+                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
+                    {
                         self.json_scan_source_spelling = Some(spelling);
                     }
                     // A struct literal is only legal here, as a `let` initializer.
@@ -19488,7 +19535,10 @@ impl<'a, 't> Checker<'a, 't> {
                     let local_ty = ann.unwrap_or(init.ty);
                     self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
-                    if let Some(spelling) = ty.as_ref().and_then(json_scan_row_source_spelling) {
+                    if let Some(spelling) = ty
+                        .as_ref()
+                        .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
+                    {
                         self.json_scan_local_spellings.insert(local, spelling);
                     }
                     // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
@@ -19789,6 +19839,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -19806,6 +19858,85 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             subst_param_ty(ty, &self.mono_args, self.tagged_types)
         }
+    }
+
+    /// Render an annotation with concrete generic arguments substituted from the active function
+    /// monomorph. Written paths remain the authoritative spelling; only a type-parameter token is
+    /// replaced, and its concrete value is rendered through the producer-owned type tables.
+    fn source_type_spelling_with_mono(&self, ty: &ast::Type) -> String {
+        match ty {
+            ast::Type::Named { path, args, .. } => {
+                if args.is_empty()
+                    && path.segments.len() == 1
+                    && let Some(index) = self
+                        .type_params
+                        .iter()
+                        .position(|parameter| parameter == &path.segments[0].name)
+                    && let Some(concrete) = self.mono_args.get(index)
+                {
+                    return resolved_type_source_spelling(
+                        *concrete,
+                        self.type_table,
+                        self.struct_ids,
+                        self.enum_ids,
+                        self.struct_source_spellings,
+                        self.enum_source_spellings,
+                        self.tagged_types,
+                        self.tuples,
+                        self.fn_types,
+                    );
+                }
+                let mut output = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !args.is_empty() {
+                    output.push('<');
+                    for (index, arg) in args.iter().enumerate() {
+                        if index > 0 {
+                            output.push_str(", ");
+                        }
+                        output.push_str(&self.source_type_spelling_with_mono(arg));
+                    }
+                    output.push('>');
+                }
+                output
+            }
+            ast::Type::Tuple { elems, .. } => {
+                let values = elems
+                    .iter()
+                    .map(|elem| self.source_type_spelling_with_mono(elem))
+                    .collect::<Vec<_>>();
+                format!("({})", values.join(", "))
+            }
+            ast::Type::Fn { params, ret, .. } => {
+                let params = params
+                    .iter()
+                    .map(|param| self.source_type_spelling_with_mono(&param.ty))
+                    .collect::<Vec<_>>();
+                format!(
+                    "fn({}) -> {}",
+                    params.join(", "),
+                    self.source_type_spelling_with_mono(ret)
+                )
+            }
+        }
+    }
+
+    /// Extract a scanner row spelling from a written annotation before resolution erases it into
+    /// `Ty`. The method is the only Checker path that may substitute a generic row argument.
+    fn json_scan_row_source_spelling(&self, ty: &ast::Type) -> Option<String> {
+        let ast::Type::Named { path, args, .. } = ty else {
+            return None;
+        };
+        let [module, name] = path.segments.as_slice() else {
+            return None;
+        };
+        (module.name == "json" && name.name == "scanner")
+            .then(|| args.first().map(|arg| self.source_type_spelling_with_mono(arg)))
+            .flatten()
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -20870,6 +21001,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -21863,7 +21996,16 @@ impl<'a, 't> Checker<'a, 't> {
         // dedicated path (the result type and `type_args` come from the substitution).
         if !sig.type_params.is_empty() {
             let type_params = sig.type_params.clone();
-            return self.check_generic_call(&name, &type_params, &param_tys, ret, args, expected, span);
+            return self.check_generic_call(
+                &name,
+                &type_params,
+                &param_tys,
+                ret,
+                &json_scan_param_spellings,
+                args,
+                expected,
+                span,
+            );
         }
         if args.len() != param_tys.len() {
             self.diags.error(
@@ -21966,7 +22108,17 @@ impl<'a, 't> Checker<'a, 't> {
     /// constraint model (`Num`/`Ord`/`Eq`) is a later slice. `type_args` is recorded for
     /// monomorphization, which generates the concrete instance and rewrites the call target.
     #[allow(clippy::too_many_arguments)]
-    fn check_generic_call(&mut self, name: &str, type_params: &[String], param_tys: &[Ty], ret: Ty, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_generic_call(
+        &mut self,
+        name: &str,
+        type_params: &[String],
+        param_tys: &[Ty],
+        ret: Ty,
+        json_scan_param_spellings: &[Option<String>],
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != param_tys.len() {
             self.diags.error(
@@ -21988,7 +22140,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.reject_bare_array_value(a, None, "a generic argument");
                 self.check_expr(a, None)
             } else {
-                self.check_arg(a, Some(declared))
+                self.check_arg_with_json_scan_source_spelling(
+                    a,
+                    Some(declared),
+                    json_scan_param_spellings.get(i).cloned().flatten(),
+                )
             };
             self.match_param(declared, ce.ty, &mut subst, a.span, false);
             checked.push(ce);
@@ -23872,7 +24028,11 @@ impl<'a, 't> Checker<'a, 't> {
             // with an enclosing (capturable) binding of the surrounding function.
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(&p.name.name, *ty, false);
-            if let Some(spelling) = p.ty.as_ref().and_then(json_scan_row_source_spelling) {
+            if let Some(spelling) = p
+                .ty
+                .as_ref()
+                .and_then(|annotation| self.json_scan_row_source_spelling(annotation))
+            {
                 self.json_scan_local_spellings.insert(id, spelling);
             }
             param_ids.push(id);
@@ -30778,6 +30938,8 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
@@ -32794,6 +32956,500 @@ fn ty_name(ty: Ty) -> String {
     }
 }
 
+/// Resolve a canonical type-table entry back to its public source path. This is a producer-owned
+/// lookup: unlike HIR nominal names, it retains the module qualifier that an importer wrote.
+fn source_path_for_canonical(canonical: &str, type_table: &ModTypes) -> Option<String> {
+    type_table.iter().find_map(|(module, entries)| {
+        entries.iter().find_map(|(bare, entry)| {
+            if entry.canonical != canonical {
+                return None;
+            }
+            if module == "main" {
+                Some(bare.clone())
+            } else {
+                Some(format!("{module}.{bare}"))
+            }
+        })
+    })
+}
+
+/// Render a resolved type through producer-owned source tables. The formatter is used only to
+/// substitute concrete arguments into a generic source annotation; it deliberately never reads
+/// `ty_name`, `StructDef::name`, `StructDef::source_name`, or an internal monomorph identity.
+#[allow(clippy::too_many_arguments)]
+fn resolved_type_source_spelling(
+    ty: Ty,
+    type_table: &ModTypes,
+    struct_ids: &HashMap<String, u32>,
+    enum_ids: &HashMap<String, u32>,
+    struct_source_spellings: &HashMap<u32, String>,
+    enum_source_spellings: &HashMap<u32, String>,
+    tagged_types: &[hir::TaggedType],
+    tuples: &[hir::TupleDef],
+    fn_types: &[hir::FnTy],
+) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn scalar(
+        value: Scalar,
+        type_table: &ModTypes,
+        struct_ids: &HashMap<String, u32>,
+        enum_ids: &HashMap<String, u32>,
+        struct_source_spellings: &HashMap<u32, String>,
+        enum_source_spellings: &HashMap<u32, String>,
+        tagged_types: &[hir::TaggedType],
+        tuples: &[hir::TupleDef],
+        fn_types: &[hir::FnTy],
+        depth: usize,
+    ) -> String {
+        resolved(
+            scalar_to_ty(value),
+            type_table,
+            struct_ids,
+            enum_ids,
+            struct_source_spellings,
+            enum_source_spellings,
+            tagged_types,
+            tuples,
+            fn_types,
+            depth,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolved(
+        ty: Ty,
+        type_table: &ModTypes,
+        struct_ids: &HashMap<String, u32>,
+        enum_ids: &HashMap<String, u32>,
+        struct_source_spellings: &HashMap<u32, String>,
+        enum_source_spellings: &HashMap<u32, String>,
+        tagged_types: &[hir::TaggedType],
+        tuples: &[hir::TupleDef],
+        fn_types: &[hir::FnTy],
+        depth: usize,
+    ) -> String {
+        if depth > 64 {
+            return "<type>".to_string();
+        }
+        let next = depth + 1;
+        match ty {
+            Ty::Int(it) => format!("{}{}", if it.signed { 'i' } else { 'u' }, it.bits),
+            Ty::Float(ft) => format!("f{}", ft.bits),
+            Ty::Bool => "bool".to_string(),
+            Ty::Char => "char".to_string(),
+            Ty::Str => "str".to_string(),
+            Ty::String => "string".to_string(),
+            Ty::Unit => "()".to_string(),
+            Ty::Param(i) => format!("T{i}"),
+            Ty::Struct(id) => struct_source_spellings
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    struct_ids.iter().find_map(|(canonical, candidate)| {
+                        (*candidate == id).then(|| source_path_for_canonical(canonical, type_table)).flatten()
+                    })
+                })
+                .unwrap_or_else(|| "<struct>".to_string()),
+            Ty::Soa(id) => format!(
+                "soa<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Enum(id) => enum_source_spellings
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    enum_ids.iter().find_map(|(canonical, candidate)| {
+                        (*candidate == id).then(|| source_path_for_canonical(canonical, type_table)).flatten()
+                    })
+                })
+                .unwrap_or_else(|| "<enum>".to_string()),
+            Ty::Option(payload) => format!(
+                "Option<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Result(ok, err) => format!(
+                "Result<{}, {}>",
+                scalar(
+                    ok,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                ),
+                scalar(
+                    err,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Tagged(id) => tagged_types
+                .get(id as usize)
+                .map(|tagged| match *tagged {
+                    hir::TaggedType::Option(payload) => resolved(
+                        Ty::Option(payload),
+                        type_table,
+                        struct_ids,
+                        enum_ids,
+                        struct_source_spellings,
+                        enum_source_spellings,
+                        tagged_types,
+                        tuples,
+                        fn_types,
+                        next,
+                    ),
+                    hir::TaggedType::Result(ok, err) => resolved(
+                        Ty::Result(ok, err),
+                        type_table,
+                        struct_ids,
+                        enum_ids,
+                        struct_source_spellings,
+                        enum_source_spellings,
+                        tagged_types,
+                        tuples,
+                        fn_types,
+                        next,
+                    ),
+                })
+                .unwrap_or_else(|| "<tagged>".to_string()),
+            Ty::Array(elem, len) => format!(
+                "array<{}>[{len}]",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::StructArray(id, len) => format!(
+                "array<{}>[{len}]",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynStructArray(id, _) => format!(
+                "array<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynSliceArray(elem) => format!(
+                "array<slice<{}>>",
+                scalar(
+                    prim_to_scalar(elem),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynArray(elem) => format!(
+                "array<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DynResponseArray => "array<response>".to_string(),
+            Ty::Box(payload) => format!(
+                "box<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Vec(elem, width) => format!(
+                "vec{width}<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Mask(elem, width) => format!(
+                "mask{width}<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Slice(elem) => format!(
+                "slice<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::ArenaHandle => "arena".to_string(),
+            Ty::Raw => "raw".to_string(),
+            Ty::Builder => "builder".to_string(),
+            Ty::Writer => "writer".to_string(),
+            Ty::Reader => "reader".to_string(),
+            Ty::Buffer => "buffer".to_string(),
+            Ty::ArrayBuilder(elem) => format!(
+                "array_builder<{}>",
+                scalar(
+                    elem,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::StrFinder => "str_finder".to_string(),
+            Ty::File => "file".to_string(),
+            Ty::Rng => "rng".to_string(),
+            Ty::Regex => "regex".to_string(),
+            Ty::Captures => "captures".to_string(),
+            Ty::CliCommand => "cli command".to_string(),
+            Ty::CliParsed => "cli parsed".to_string(),
+            Ty::TcpConn => "tcp_conn".to_string(),
+            Ty::TcpListener => "tcp_listener".to_string(),
+            Ty::UdpSocket => "udp_socket".to_string(),
+            Ty::Child => "child".to_string(),
+            Ty::Command => "command".to_string(),
+            Ty::RunOutput => "run_output".to_string(),
+            Ty::HttpRequest => "http request".to_string(),
+            Ty::HttpResponse => "http response".to_string(),
+            Ty::HttpClient => "http client".to_string(),
+            Ty::HttpServer => "http_server".to_string(),
+            Ty::HttpRequestCtx => "http_request_ctx".to_string(),
+            Ty::HttpHeaders => "http_headers".to_string(),
+            Ty::ResponseBuilder => "response_builder".to_string(),
+            Ty::HttpStream => "http_stream".to_string(),
+            Ty::JsonDoc => "json.doc".to_string(),
+            Ty::JsonScanner(id) => format!(
+                "json.scanner<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::Tuple(id) => tuples
+                .get(id as usize)
+                .map(|tuple| {
+                    let elems = tuple
+                        .elems
+                        .iter()
+                        .map(|elem| {
+                            scalar(
+                                *elem,
+                                type_table,
+                                struct_ids,
+                                enum_ids,
+                                struct_source_spellings,
+                                enum_source_spellings,
+                                tagged_types,
+                                tuples,
+                                fn_types,
+                                next,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!("({})", elems.join(", "))
+                })
+                .unwrap_or_else(|| "<tuple>".to_string()),
+            Ty::Fn(id) => fn_types
+                .get(id as usize)
+                .map(|function| {
+                    let params = function
+                        .params
+                        .iter()
+                        .map(|(_, param)| {
+                            scalar(
+                                *param,
+                                type_table,
+                                struct_ids,
+                                enum_ids,
+                                struct_source_spellings,
+                                enum_source_spellings,
+                                tagged_types,
+                                tuples,
+                                fn_types,
+                                next,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        "fn({}) -> {}",
+                        params.join(", "),
+                        resolved(
+                            function.ret,
+                            type_table,
+                            struct_ids,
+                            enum_ids,
+                            struct_source_spellings,
+                            enum_source_spellings,
+                            tagged_types,
+                            tuples,
+                            fn_types,
+                            next,
+                        )
+                    )
+                })
+                .unwrap_or_else(|| "<fn>".to_string()),
+            Ty::Task(payload) => format!(
+                "Task<{}>",
+                scalar(
+                    payload,
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::DictEncoded(id, _) => format!(
+                "dict_encoded<{}>",
+                resolved(
+                    Ty::Struct(id),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
+            Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => "<type>".to_string(),
+        }
+    }
+
+    resolved(
+        ty,
+        type_table,
+        struct_ids,
+        enum_ids,
+        struct_source_spellings,
+        enum_source_spellings,
+        tagged_types,
+        tuples,
+        fn_types,
+        0,
+    )
+}
+
 /// Render a source-level type annotation without consulting HIR nominal names or mangled
 /// monomorph identities. This is intentionally limited to the syntax needed by the producer-owned
 /// `json.scan` row diagnostic; the row itself must resolve to a named struct, while its concrete
@@ -33618,6 +34274,11 @@ struct TyCx<'a> {
     type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    /// Producer-owned public spellings for resolved nominal ids. These maps are checker state;
+    /// they are never serialized into HIR and are used only when a later generic specialization
+    /// must render a concrete source annotation.
+    struct_source_spellings: &'a mut HashMap<u32, String>,
+    enum_source_spellings: &'a mut HashMap<u32, String>,
     /// Generic struct templates, by name (not in `structs` — they carry `Param` fields).
     struct_templates: &'a HashMap<String, StructTemplate>,
     /// Concrete struct table; monomorph instances of generic structs are appended here.
@@ -34703,6 +35364,30 @@ fn instantiate_struct(
         align: tmpl.align,
         c_repr: tmpl.c_repr,
     });
+    let base_spelling = source_path_for_canonical(name, cx.type_table)
+        .unwrap_or_else(|| "<struct>".to_string());
+    let args_spelling = args
+        .iter()
+        .map(|arg| {
+            resolved_type_source_spelling(
+                *arg,
+                cx.type_table,
+                cx.struct_ids,
+                cx.enum_ids,
+                cx.struct_source_spellings,
+                cx.enum_source_spellings,
+                cx.tagged_types,
+                cx.tuples,
+                cx.fn_types,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spelling = if args_spelling.is_empty() {
+        base_spelling
+    } else {
+        format!("{base_spelling}<{}>", args_spelling.join(", "))
+    };
+    cx.struct_source_spellings.insert(id, spelling);
     cx.struct_mono.insert(mangled, id);
     id
 }
@@ -34800,6 +35485,30 @@ fn instantiate_enum(
         source_name,
         variants,
     });
+    let base_spelling = source_path_for_canonical(name, cx.type_table)
+        .unwrap_or_else(|| "<enum>".to_string());
+    let args_spelling = args
+        .iter()
+        .map(|arg| {
+            resolved_type_source_spelling(
+                *arg,
+                cx.type_table,
+                cx.struct_ids,
+                cx.enum_ids,
+                cx.struct_source_spellings,
+                cx.enum_source_spellings,
+                cx.tagged_types,
+                cx.tuples,
+                cx.fn_types,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spelling = if args_spelling.is_empty() {
+        base_spelling
+    } else {
+        format!("{base_spelling}<{}>", args_spelling.join(", "))
+    };
+    cx.enum_source_spellings.insert(id, spelling);
     cx.enum_mono.insert(mangled, id);
     id
 }

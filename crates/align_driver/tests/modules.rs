@@ -237,6 +237,23 @@ fn json_scan_imported_row_ownership() {
 }
 
 #[test]
+fn json_scan_imported_generic_row_ownership() {
+    let geom = "module geom\nimport core.json\npub Row { xs: array<i64> }\npub fn consume<T>(rows: json.scanner<Row>, value: T) -> Result<(), Error> = Ok(())\n";
+    let main = "module main\nimport core.json\nimport geom\nfn main() -> Result<(), Error> {\n  geom.consume(json.scan(\"[]\"), 1)?\n  return Ok(())\n}\n";
+    let diagnostics = check_multi_diagnostics(
+        "mod-json-scan-generic-owned-row",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Row' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn same_struct_name_in_two_modules_does_not_collide() {
     if !backend_available() {
         return;

@@ -688,7 +688,7 @@ fn hir_body_validator_json_scan_copy_row() {
     let nested_scanner = body_test_expr(
         hir::ExprKind::Block(hir::Block {
             stmts: Vec::new(),
-            value: Some(Box::new(scanner)),
+            value: Some(Box::new(scanner.clone())),
         }),
         Ty::JsonScanner(0),
     );
@@ -699,6 +699,69 @@ fn hir_body_validator_json_scan_copy_row() {
     assert!(validate_hir::json_scan_copy_rows_are_valid(&nested_program));
     nested_program.structs[0].fields[0].ty = Ty::Char;
     assert!(!validate_hir::json_scan_copy_rows_are_valid(&nested_program));
+
+    let mut missing_struct = baseline_program();
+    missing_struct.fns.push(body_unit_case(
+        "json_scan_missing_row",
+        body_test_expr(
+            hir::ExprKind::JsonScan {
+                struct_id: 99,
+                input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+            },
+            Ty::JsonScanner(99),
+        ),
+    ));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&missing_struct));
+
+    let mut cyclic_struct = baseline_program();
+    cyclic_struct.structs[0].fields[0].ty = Ty::Struct(0);
+    cyclic_struct
+        .fns
+        .push(body_unit_case("json_scan_cyclic_row", scanner.clone()));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&cyclic_struct));
+
+    let mut optional_owned = baseline_program();
+    optional_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    optional_owned.structs[0].fields[0].ty = Ty::Option(Scalar::Struct(1));
+    optional_owned
+        .fns
+        .push(body_unit_case("json_scan_optional_owned_row", scanner.clone()));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&optional_owned));
+
+    let mut union_owned = baseline_program();
+    union_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    union_owned.enums.push(EnumDef {
+        name: "OwnedChoice".to_string(),
+        source_name: "OwnedChoice".to_string(),
+        variants: vec![EnumVariant {
+            name: "Value".to_string(),
+            payload: vec![Scalar::Struct(1)],
+            field_base: 1,
+        }],
+    });
+    union_owned.structs[0].fields[0].ty = Ty::Enum(1);
+    union_owned
+        .fns
+        .push(body_unit_case("json_scan_union_owned_row", scanner));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&union_owned));
 }
 
 #[test]
@@ -758,6 +821,23 @@ fn hir_program_json_scan_copy_row() {
             assert!(is_empty(&lowered), "owned scanner row published MIR");
         }
     }
+
+    let mut missing_row = program.clone();
+    missing_row.fns[0].body = hir::Block {
+        stmts: vec![hir::Stmt::Expr(body_test_expr(
+            hir::ExprKind::JsonScan {
+                struct_id: 99,
+                input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+            },
+            Ty::JsonScanner(99),
+        ))],
+        value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+    };
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&missing_row));
+
+    let mut cyclic_row = program.clone();
+    cyclic_row.structs[0].fields[0].ty = Ty::Struct(0);
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&cyclic_row));
 }
 
 #[test]

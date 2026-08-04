@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_per_unit, emit_object_cached, link_objects, BuildTarget, CacheContext, CacheOutcome,
-    FirstDiff, Hash128, Profile,
+    build_per_unit, emit_llvm_ir, emit_object_cached, link_objects, BuildTarget, CacheContext,
+    CacheOutcome, FirstDiff, Hash128, Profile,
 };
+use align_mir::print::program_to_string;
 use align_span::SourceMap;
 
 // ---- harness ------------------------------------------------------------------------------------
@@ -400,6 +401,67 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
         Some(FirstDiff::MirDigest),
         "the structural MIR fingerprint includes the Option payload's type table"
     );
+}
+
+#[test]
+fn json_scan_row_schema_rejection() {
+    if !backend() {
+        return;
+    }
+    let valid = "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let rejected = "import core.json\nRow { score: array<i64> }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-schema-rejection", &[("main.align", valid)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit, "the accepted Copy row must publish a cold artifact");
+    let published = action_manifest_count(&proj.cache_root());
+
+    let mut sm = SourceMap::new();
+    let bad = build_per_unit(&mut sm, "main.align", rejected);
+    assert!(bad.units.is_empty(), "a rejected scanner row must publish no per-unit artifact");
+    assert!(bad.diags.has_errors(), "the Move row must be rejected before codegen");
+    assert!(
+        align_driver::format_diagnostics(&sm, &bad.diags).contains(
+            "`json.scan` row type 'Row' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected rejection diagnostics: {}",
+        align_driver::format_diagnostics(&sm, &bad.diags)
+    );
+    assert_eq!(action_manifest_count(&proj.cache_root()), published, "rejected source must not publish a cache action");
+
+    proj.write("main.align", valid);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "restoring the accepted Copy row must hit its prior artifact");
+    assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));
+}
+
+#[test]
+fn json_scan_copy_row_mir_and_raw_llvm_identity() {
+    if !backend() {
+        return;
+    }
+    let source = "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let commented = format!("// accepted Copy-row identity twin\n{source}");
+    let proj = Project::new("json-scan-copy-row-identity", &[("main.align", source)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    let mut cold_sm = SourceMap::new();
+    let cold_walk = build_per_unit(&mut cold_sm, "main.align", source);
+    assert!(!cold_walk.diags.has_errors(), "accepted identity fixture failed to check");
+    let cold_mir = program_to_string(&cold_walk.units[0].mir);
+    let cold_llvm = emit_llvm_ir(&cold_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("cold raw LLVM");
+
+    proj.write("main.align", &commented);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "a comment-only accepted-row twin must hit");
+    let mut hot_sm = SourceMap::new();
+    let hot_walk = build_per_unit(&mut hot_sm, "main.align", &commented);
+    assert!(!hot_walk.diags.has_errors(), "commented identity fixture failed to check");
+    let hot_mir = program_to_string(&hot_walk.units[0].mir);
+    let hot_llvm = emit_llvm_ir(&hot_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("hot raw LLVM");
+    assert_eq!(hot_mir, cold_mir, "accepted Copy-row MIR changed across an irrelevant source edit");
+    assert_eq!(hot_llvm, cold_llvm, "accepted Copy-row raw LLVM changed across an irrelevant source edit");
+    assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));
 }
 
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------

@@ -1166,6 +1166,31 @@ fn json_scan_malformed_row_errors() {
 }
 
 #[test]
+fn json_scan_copy_row_error_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        ("empty-array", "[]", 0),
+        ("empty-input", "", 0),
+        ("malformed-first", "[oops]", 21),
+        ("malformed-later", "[{\"score\":1},oops]", 21),
+        ("single-ndjson-row", "{\"score\":2}\n", 2),
+    ];
+    for (name, input, expected) in cases {
+        let escaped = input
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let src = format!(
+            "import core.json\nRow {{ score: i64 }}\nfn describe(r: Result<i64, Error>) -> i32 = match r {{\n  Ok(value) => value as i32,\n  Err(e) => match e {{\n    NotFound => 10,\n    Invalid => 11,\n    Denied => 12,\n    Timeout => 13,\n    Code(c) => 20 + c,\n  }},\n}}\nfn main() -> i32 {{\n  rows: json.scanner<Row> := json.scan(\"{escaped}\")\n  return describe(rows.score.sum())\n}}\n"
+        );
+        let out = build_and_run(&format!("json-scan-copy-row-error-{name}"), &src);
+        assert_eq!(out.status.code(), Some(expected), "unexpected result for {name}");
+    }
+}
+
+#[test]
 fn json_scan_map_over_rows() {
     if !backend_available() {
         return;
@@ -1331,36 +1356,91 @@ fn json_scan_requires_binding_annotation() {
 
 #[test]
 fn json_scan_rejects_owned_row_fields() {
-    for (name, row, expected) in [
-        (
-            "json-scan-owned-row",
-            "Owned { xs: array<i64> }",
-            "Owned",
+    let diagnostics = check_diagnostics(
+        "json-scan-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Owned> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
         ),
-        (
-            "json-scan-transitive-owned-row",
-            "Owned { xs: array<i64> }\nNested { owned: Owned }",
-            "Nested",
-        ),
-        (
-            "json-scan-generic-owned-row",
-            "Owned { xs: array<i64> }\nRow<T> { owned: T }",
-            "Row<Owned>",
-        ),
-    ] {
-        let diagnostics = check_diagnostics(
-            name,
-            &format!(
-                "import core.json\n{row}\nfn main() -> Result<(), Error> {{\n  rows: json.scanner<{expected}> := json.scan(\"[]\")\n  return Ok(())\n}}\n"
-            ),
-        );
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn json_scan_rejects_transitive_owned_row_fields() {
+    let diagnostics = check_diagnostics(
+        "json-scan-transitive-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nNested { owned: Owned }\nOptional { owned: Option<Owned> }\nfn main() -> Result<(), Error> {\n  a: json.scanner<Nested> := json.scan(\"[]\")\n  b: json.scanner<Optional> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    for expected in ["Nested", "Optional"] {
         assert!(
             diagnostics.contains(&format!(
                 "`json.scan` row type '{expected}' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
             )),
-            "unexpected diagnostics for {name}:\n{diagnostics}"
+            "missing transitive diagnostic for {expected}:\n{diagnostics}"
         );
     }
+}
+
+#[test]
+fn json_scan_generic_row_ownership() {
+    let diagnostics = check_diagnostics(
+        "json-scan-generic-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nRow<T> { owned: T }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row<Owned>> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Row<Owned>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+
+    let array_argument = check_diagnostics(
+        "json-scan-generic-owned-array-row",
+        "import core.json\nOwned { xs: array<i64> }\nRow<T> { owned: T }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row<array<Owned>>> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        array_argument.contains(
+            "`json.scan` row type 'Row<array<Owned>>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "generic array diagnostics lost the producer spelling:\n{array_argument}"
+    );
+
+    // A generic call is a separate source-to-monomorph boundary. Its scanner parameter carries the
+    // producer-owned spelling through argument checking so a rejected `json.scan` cannot fall back
+    // to a HIR nominal or interner name.
+    let monomorph = check_diagnostics(
+        "json-scan-generic-call-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nfn consume<T>(rows: json.scanner<Owned>, value: T) -> Result<(), Error> = Ok(())\nfn main() -> Result<(), Error> {\n  consume(json.scan(\"[]\"), 1)?\n  return Ok(())\n}\n",
+    );
+    assert!(
+        monomorph.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "generic-call diagnostics lost the producer spelling:\n{monomorph}"
+    );
+}
+
+#[test]
+fn json_scan_row_schema_matrix() {
+    let accepted = [
+        "Row { i8v: i8, u8v: u8, i16v: i16, u16v: u16, i32v: i32, u32v: u32, i64v: i64, u64v: u64, f32v: f32, f64v: f64, flag: bool, text: str }",
+        "Leaf { value: i64 }\nRow { leaf: Leaf, maybe: Option<i64> }",
+        "Content { Text(str), Count(i64), Flag(bool) }\nRow { content: Content }",
+    ];
+    for (index, row) in accepted.iter().enumerate() {
+        let src = format!(
+            "import core.json\n{row}\nfn main() -> Result<(), Error> {{\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  rows.count()?\n  return Ok(())\n}}\n"
+        );
+        assert!(!check_errs(&format!("json-scan-schema-accepted-{index}"), &src), "unexpected diagnostics for accepted schema {index}:\n{}", check_diagnostics("json-scan-schema-accepted", &src));
+    }
+    let invalid = check_diagnostics(
+        "json-scan-schema-invalid-char",
+        "import core.json\nRow { value: char }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(invalid.contains("json.decode"), "char schema must retain the existing decode diagnostic:\n{invalid}");
 }
 
 #[test]
