@@ -5,23 +5,49 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ The current local branch is `agent/pkg-db-am-c2a1`, rebased onto
-current `main` `ca26c68e` after C1 merged as PR #702. Draft PR #705 carries pushed C2a1
-implementation head `54185e5`; its final document-only review closure is pending. The rebased C1 implementation commit is
-`b25a65e`; its first coherent pre-PR finding closure is `c04378d`; its row-authority closure is
-`1877ccd`; and C1 head `e466be4` is the coherent
-post-open finding closure. Four
-mandatory am-c matrix reviews repaired the public contracts and PR boundaries; the final fresh
-pre-implementation matrix review returned CLEAN. `docs/impl/17-library-boundary-prerequisites.md`
-now splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed field codec), c2a2
-(shared private source-shape comparator), c2a3 (private `ValidatedGraph` traversal/am-n validation),
-c2a4 (private equivalence/canonical bytes), c2b (effect-free MIR function-table retention/remap),
-c2c (dormant public canonical decoder), c2d (dormant generated-identity codecs), and c3 (typed
-program/generated activation). These are nine am-c implementation PRs; the amended prerequisite
-plan has twenty-two verticals, L2b 31 PRs, and L2 35.
+_Last updated: 2026-08-05._ Current `main` is `bf14ee34`, including merged C1 PR #702
+(`ca26c68e`) and C2a1 PR #705 (`bf14ee34`). The active branch is
+`agent/pkg-db-am-c2a2`, created directly from that main. The original C2a2 implementation reached
+457 production lines before its benchmark and 243 required owner lines, exceeding its reviewed
+460/180 cap. Coding stopped and the checkpoint is now split into c2a2a (atomic typed comparator
+extraction/parity) and c2a2b (observer/complexity/topology/benchmark). Their author-side closure is recorded beside the am-c matrix
+in `docs/impl/17-library-boundary-prerequisites.md`. The required fresh independent matrix and
+PR-boundary review found five P2 contract gaps; all five repairs are applied, and the final bounded
+finding-closure check returned CLEAN before the measured cap failure; a fresh independent review of
+the new 440/150 and 80/150 boundaries then found three P2 documentation gaps. Those gaps are fixed,
+and bounded closure reviews of the exact projection contract, focused gates, and normative split
+returned CLEAN. The first exact-diff implementation preflight found four valid owner gaps: the
+matcher was not compile-closed over every current type, function parameter mode/type comparisons
+were not reached independently, missing/cross-kind nodes were incomplete, and the source inventory
+was manual only. Closing those rows, including the bounded final-SHA `Scalar::Param` ID finding,
+measures 437 production lines plus 210 test lines. Coding
+stopped again at the recorded 150-test cap. The cap is amended to 440/210 because these parity and
+inventory owners cannot be split from the atomic comparator extraction without publishing an
+unclosed matcher; the measured total is 647 and the cap is 650, both below 1,000. The fresh
+independent boundary review found one P3 counting ambiguity, then returned CLEAN after the measured
+647 and capped 650 conventions were made exact. The implementation findings are now closed;
+the focused comparator/field-codec owners, all 109 `align_mir` tests, and `align_mir` all-target
+Clippy with `-D warnings` pass. Neither slice may add `CanonicalTypeView`, `ValidatedGraph`,
+canonical bytes, a stored MIR field, or a public/package consumer.
+
+Draft PR #707 is open from pushed reviewed head `2ec3228b`. Its final-SHA preflight passed
+`scripts/test-pr.sh`, workspace all-target locked Clippy with `-D warnings`, and eight canonical
+owners. The bounded host-native post-open review found no implementation issue; Codex CLI 0.146
+duplicated its identical CLEAN result, so the raw log is preserved and normalized without rerunning
+the unchanged diff. The independent post-open review also found no implementation issue and one P3:
+this handoff had not recorded PR #707 or pushed head `2ec3228b`. This documentation-only follow-up
+closes that operational-state finding; the comparator code and its successful gates are unchanged.
+
+The plan of record splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed
+field codec), c2a2a (shared private source-shape comparator), c2a2b (complexity observation), c2a3 (private `ValidatedGraph`
+traversal/am-n validation), c2a4 (private equivalence/canonical bytes), c2b (effect-free MIR
+function-table retention/remap), c2c (dormant public canonical decoder), c2d (dormant
+generated-identity codecs), and c3 (typed program/generated activation).
 `docs/impl/20-runtime-abi-ledger.md` owns c1.
 
-The local tree now implements c1. `align_mir::RuntimeKey` supplies the exact 281 semantic keys and
+## Historical detail
+
+The merged c1 checkpoint made `align_mir::RuntimeKey` supply the exact 281 semantic keys and
 alphabetical `ALL`; the backend-private 286-row typed ABI registry is the sole fixed-native
 declaration/type/attribute/rt-LTO authority. Extern compatibility rejects before function
 declaration construction, exact keyed and unkeyed externs reuse one handle, same-spelled program
@@ -98,7 +124,7 @@ seam and duplicate DFS/raw-byte authorities, found later-sibling precedence/comp
 found stale project-truth paragraphs below. The rejected three-way plan still bundled the existing
 372-line formatted comparator with graph validation, misstated its worst-case pair complexity and
 fixed-point refinement cost, and left the source-size estimate implausible. The plan now splits
-c2a1 field codec, c2a2 typed source-shape comparator extraction, c2a3's sole `ValidatedGraph`
+c2a1 field codec, c2a2a typed source-shape comparator extraction, c2a2b observation/complexity closure, c2a3's sole `ValidatedGraph`
 traversal, and c2a4 equivalence/canonical bytes, with explicit compiler-only complexity owners. A
 fresh independent four-way split review found only variable-length signature-sort complexity and
 measured-versus-projected wording gaps. Both were closed in the ledger, and the bounded follow-up
@@ -960,11 +986,11 @@ execution, and cold/hot object-cache parity. The reviewed order is am-w
 outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mutability (#686),
 #688 completes am-u lexical extern invocation, #690 am-p placement, #691 am-n nominal/link, and
 #692 am-h declarations/headers, #694 am-b1, #695 am-b2a, #696 am-b2b, commit `af5e17a` am-b3,
-#699 task-wait replay, #700 body-fact replay, am-b4 activation PR #706, merged #702 am-c1, and
-draft #705 am-c2a1. The next implementation slice after #705 is
-am-c2a2, followed by c2a3/c2a4/c2b/c2c/c2d/c3 and then af/ar/ap/t.
+#699 task-wait replay, #700 body-fact replay, merged am-b4 activation PR #706, merged #702 am-c1,
+and merged #705 am-c2a1. The active implementation slice is am-c2a2a, followed by c2a2b, then
+c2a3/c2a4/c2b/c2c/c2d/c3 and then af/ar/ap/t.
 Am-c follows am-b4 because it consumes body-validated callable facts. The amended current project
-truth is thirty-one L2b and thirty-five L2 implementation PRs; the older #678 counts below are historical.
+truth is thirty-two L2b and thirty-six L2 implementation PRs; the older #678 counts below are historical.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
 checked HIR, so a later handcrafted-HIR preflight could not replay parallel purity independently.
@@ -1221,7 +1247,7 @@ canonical all-empty program as a global failure. Concrete MIR call-target types,
 generated-identity bytes, and semantic/byte goldens are now recorded in the am-r ledger. Body
 construction remains scheduled as three dormant exhaustive validator PRs and one atomic activation
 PR so no partial malformed-HIR claim is exposed. Historically, #678 fixed the then-current
-twenty-three/twenty-seven counts and strategy; the current amended totals are thirty-one/thirty-five.
+twenty-three/twenty-seven counts and strategy; the current amended totals are thirty-two/thirty-six.
 
 Am-g-t's type-domain implementation is preserved separately. The split applies the existing
 review-size and closure-matrix rules; it does not justify a new process rule.
@@ -1235,13 +1261,13 @@ Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface by
 Do not begin a SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7 are
 complete. The reviewed part of the L2 sequence is L2a
 parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate through am-b4 and c1. The remaining
-sequence is a2-am-c2a1/a2-am-c2a2/a2-am-c2a3/a2-am-c2a4/a2-am-c2b/a2-am-c2c/a2-am-c2d/a2-am-c3/
+L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate through am-b4, c1, and c2a1. The
+remaining sequence begins with a2-am-c2a2a/a2-am-c2a2b, then a2-am-c2a3/a2-am-c2a4/a2-am-c2b/a2-am-c2c/a2-am-c2d/a2-am-c3/
 a2-af/a2-ar/a2-ap/a2-t/b
 return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
 then L2e
 mutable borrow/out and all-peer
-exclusivity, for thirty-one L2b and thirty-five L2 implementation PRs. The required milestone order
+exclusivity, for thirty-two L2b and thirty-six L2 implementation PRs. The required milestone order
 is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
