@@ -1160,6 +1160,320 @@ fn malformed_hir_unused_local_record_fails_closed() {
 }
 
 #[test]
+fn malformed_hir_visible_local_name_collisions_fail_closed() {
+    let program = checked_source_program(
+        "Choice { Pair(i64, i64), Single(i64) }\n\
+         fn scope_names(left: i64, right: i64, flag: bool) -> i64 {\n\
+           first := left\n\
+           second := right\n\
+           (tuple_left, tuple_right) := (first, second)\n\
+           if flag { inner := tuple_left; return inner }\n\
+           return tuple_right\n\
+         }\n\
+         fn match_names(choice: Choice) -> i64 = match choice {\n\
+           Pair(item_left, item_right) => item_left + item_right\n\
+           Single(item) => item\n\
+         }\n\
+         fn sibling_blocks(flag: bool) -> i64 {\n\
+           if flag { value := 1; return value }\n\
+           if !flag { value := 2; return value }\n\
+           return 0\n\
+         }\n\
+         fn sibling_arms(choice: Choice) -> i64 = match choice {\n\
+           Pair(value, _) => value\n\
+           Single(value) => value\n\
+         }\n\
+         fn owned_pair() -> (string, string) {\n\
+           return (\"owned\".clone(), \"value\".clone())\n\
+         }\n\
+         fn hidden_tuple_discards() -> i64 {\n\
+           _drop0 := \"user\".clone()\n\
+           (_, first) := owned_pair()\n\
+           (_, second) := owned_pair()\n\
+           return _drop0.len() + first.len() + second.len()\n\
+         }\n\
+         fn hidden_scope() -> i64 {\n\
+           result := {\n\
+             (_, kept) := owned_pair()\n\
+             kept.len()\n\
+           }\n\
+           return result\n\
+         }\n\
+         fn main() -> i32 = 0\n",
+    );
+    assert_accepted("disjoint sibling local names", &program);
+
+    let hidden_name = align_sema::tuple_drop_local_name(0);
+    let hidden_function = program
+        .fns
+        .iter()
+        .find(|function| function.name == "hidden_tuple_discards")
+        .expect("hidden tuple fixture");
+    let hidden_ids = hidden_function
+        .locals
+        .iter()
+        .filter(|local| local.name == hidden_name)
+        .map(|local| local.id)
+        .collect::<Vec<_>>();
+    assert_eq!(hidden_ids.len(), 2, "both owned discards need hidden locals");
+    for &hidden in &hidden_ids {
+        assert_eq!(hidden_function.drop_locals.iter().filter(|&&id| id == hidden).count(), 1);
+        assert_eq!(
+            hidden_function
+                .drop_individual_locals
+                .iter()
+                .filter(|&&id| id == hidden)
+                .count(),
+            1
+        );
+    }
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&program),
+        lower_program_located(&program, &source_map),
+        lower_program_per_unit(&program),
+        lower_program_per_unit_located(&program, &source_map),
+    ] {
+        let function = lowered
+            .fns
+            .iter()
+            .find(|function| function.name == "hidden_tuple_discards")
+            .expect("hidden tuple MIR function");
+        for &hidden in &hidden_ids {
+            assert_eq!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .filter(|statement| matches!(statement, Stmt::Drop(slot) if *slot == hidden))
+                    .count(),
+                1,
+                "hidden tuple local {hidden} must drop exactly once"
+            );
+        }
+    }
+
+    let rename = |program: &mut hir::Program, function: &str, from: &str, to: &str| {
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|candidate| candidate.name == function)
+            .expect("scope fixture function");
+        let local = function
+            .locals
+            .iter_mut()
+            .find(|local| local.name == from)
+            .expect("scope fixture local");
+        local.name = to.to_string();
+    };
+    for (label, function, from, to) in [
+        ("duplicate parameters", "scope_names", "right", "left"),
+        ("parameter shadow", "scope_names", "first", "left"),
+        ("same-block rebind", "scope_names", "second", "first"),
+        (
+            "tuple-pattern duplicate",
+            "scope_names",
+            "tuple_right",
+            "tuple_left",
+        ),
+        ("inner-block shadow", "scope_names", "inner", "first"),
+        (
+            "match-pattern duplicate",
+            "match_names",
+            "item_right",
+            "item_left",
+        ),
+        ("match binding shadow", "match_names", "item_left", "choice"),
+    ] {
+        let mut malformed = program.clone();
+        rename(&mut malformed, function, from, to);
+        assert_body_entrypoints_empty(label, &malformed);
+    }
+
+    let accept_visible_rename = |label: &str, function_name: &str, from: &str, spelling: &str| {
+        let mut accepted = program.clone();
+        accepted
+            .fns
+            .iter_mut()
+            .find(|function| function.name == function_name)
+            .expect("visible-name acceptance function")
+            .locals
+            .iter_mut()
+            .find(|local| local.name == from)
+            .expect("visible-name acceptance local")
+            .name = spelling.to_string();
+        assert_accepted(label, &accepted);
+    };
+    for spelling in ["_drop0", "$tuple_drop00", "$tuple_drop1"] {
+        accept_visible_rename(spelling, "hidden_scope", &hidden_name, spelling);
+    }
+    for spelling in [hidden_name.as_str(), "_drop0", "$tuple_drop00", "$tuple_drop1"] {
+        accept_visible_rename(spelling, "scope_names", "tuple_left", spelling);
+    }
+    for spelling in [hidden_name.as_str(), "_drop0", "$tuple_drop00"] {
+        accept_visible_rename(spelling, "scope_names", "first", spelling);
+    }
+    accept_visible_rename(
+        "owned Let near spelling without collision",
+        "hidden_tuple_discards",
+        "_drop0",
+        "$tuple_drop00",
+    );
+    accept_visible_rename(
+        "visible canonical name before hidden tuple locals",
+        "hidden_tuple_discards",
+        "_drop0",
+        &hidden_name,
+    );
+
+    let reject_hidden_spelling = |label: &str, spelling: &str| {
+        let mut malformed = program.clone();
+        let function = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "hidden_tuple_discards")
+            .expect("hidden tuple fixture");
+        for &hidden in &hidden_ids {
+            function.locals[hidden as usize].name = spelling.to_string();
+        }
+        assert_body_entrypoints_empty(label, &malformed);
+    };
+    reject_hidden_spelling("source-visible _drop spelling", "_drop0");
+    reject_hidden_spelling("leading-zero hidden spelling", "$tuple_drop00");
+    reject_hidden_spelling("wrong-ordinal hidden spelling", "$tuple_drop1");
+
+    let reject_visible_pair = |label: &str,
+                               function_name: &str,
+                               first: &str,
+                               second: &str,
+                               spelling: &str| {
+        let mut malformed = program.clone();
+        let function = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name == function_name)
+            .expect("visible-name matrix function");
+        for original in [first, second] {
+            function
+                .locals
+                .iter_mut()
+                .find(|local| local.name == original)
+                .expect("visible-name matrix local")
+                .name = spelling.to_string();
+        }
+        assert_body_entrypoints_empty(label, &malformed);
+    };
+    reject_visible_pair(
+        "Copy tuple canonical spelling",
+        "scope_names",
+        "second",
+        "tuple_left",
+        &hidden_name,
+    );
+    reject_visible_pair(
+        "Copy tuple source spelling",
+        "scope_names",
+        "second",
+        "tuple_left",
+        "_drop0",
+    );
+    reject_visible_pair(
+        "Copy tuple leading-zero spelling",
+        "scope_names",
+        "second",
+        "tuple_left",
+        "$tuple_drop00",
+    );
+    reject_visible_pair(
+        "Copy tuple wrong-ordinal spelling",
+        "scope_names",
+        "second",
+        "tuple_left",
+        "$tuple_drop1",
+    );
+    reject_visible_pair(
+        "ordinary owned Let canonical spelling",
+        "hidden_tuple_discards",
+        "_drop0",
+        "first",
+        &hidden_name,
+    );
+    reject_visible_pair(
+        "ordinary owned Let near spelling",
+        "hidden_tuple_discards",
+        "_drop0",
+        "first",
+        "$tuple_drop00",
+    );
+
+    let hidden_len = |local| {
+        body_test_expr(
+            hir::ExprKind::Len(Box::new(body_test_expr(
+                hir::ExprKind::Local(local),
+                Ty::String,
+            ))),
+            int(64),
+        )
+    };
+    let insert_hidden_read = |program: &mut hir::Program, position: usize| {
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "hidden_scope")
+            .expect("hidden scope fixture");
+        let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
+            panic!("hidden scope outer binding")
+        };
+        let hir::ExprKind::Block(block) = &mut init.kind else {
+            panic!("hidden scope block")
+        };
+        let hir::Stmt::LetTuple { locals, .. } = &block.stmts[0] else {
+            panic!("hidden scope tuple binding")
+        };
+        let hidden = locals[0].expect("owned discard hidden local");
+        block.stmts.insert(position, hir::Stmt::Expr(hidden_len(hidden)));
+        hidden
+    };
+    let mut initialized = program.clone();
+    insert_hidden_read(&mut initialized, 1);
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&initialized),
+        "hidden local id must initialize after its tuple binding"
+    );
+    let mut before_binding = program.clone();
+    insert_hidden_read(&mut before_binding, 0);
+    assert_body_entrypoints_empty("hidden local before tuple binding", &before_binding);
+
+    let mut after_scope = program.clone();
+    let hidden = {
+        let function = after_scope
+            .fns
+            .iter()
+            .find(|function| function.name == "hidden_scope")
+            .expect("hidden scope fixture");
+        let hir::Stmt::Let { init, .. } = &function.body.stmts[0] else {
+            panic!("hidden scope outer binding")
+        };
+        let hir::ExprKind::Block(block) = &init.kind else {
+            panic!("hidden scope block")
+        };
+        let hir::Stmt::LetTuple { locals, .. } = &block.stmts[0] else {
+            panic!("hidden scope tuple binding")
+        };
+        locals[0].expect("owned discard hidden local")
+    };
+    after_scope
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "hidden_scope")
+        .expect("hidden scope fixture")
+        .body
+        .stmts
+        .insert(1, hir::Stmt::Expr(hidden_len(hidden)));
+    assert_body_entrypoints_empty("hidden local after block exit", &after_scope);
+}
+
+#[test]
 fn capturing_partition_and_par_map_reach_all_lowerers() {
     let program = checked_source_program(
         "fn captured() -> i64 {\n\

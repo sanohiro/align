@@ -20,7 +20,21 @@ capture flows that the structural child worklist had not visited, rejecting prod
 closures at all four lowerers. The current follow-up passes those captures through the shared
 pipeline child walk; the new four-entrypoint owner, the existing four lambda-capture driver owners,
 the MIR library owner (100/100), and focused MIR Clippy all pass. Fresh independent review, refreshed
-preflight/push, bounded finding closure, and CI are pending. The cross-worktree Request 6 identity
+preflight, and push then completed at `69c56b2`; the exact pushed-pair independent review is CLEAN.
+The final host review found one P2: lexical replay tracked local ids but not visible names, so
+handcrafted checked HIR could encode duplicate parameters, same-scope rebinding, or inner shadowing.
+The bounded follow-up tracks non-discard visible names and closes parameter, `Let`, `LetTuple`,
+nested-block, match-payload, and sibling scope cells. Two required reviews found P1 ambiguity in the
+old source-spellable `_dropN` cleanup names and drift between producer/validator Drop predicates; the
+patch loop stopped and the closure matrix was redesigned and reviewed CLEAN before implementation.
+Sema and MIR now share exact source-impossible `$tuple_drop<ordinal>` spelling and one owned-discard
+predicate while retaining hidden-id scope and cleanup. The Cartesian four-entrypoint owner covers
+canonical/near names, Drop/Copy, binding kind, collision state, lifecycle, Drop sets, and once-only
+cleanup. The complete MIR suite passes 101/101, tuple driver 29/29, and focused sema/MIR Clippy is
+clean. The required implementation review confirmed the design and found only missing acceptance
+halves; the owner-only closure adds them, and its focused test plus all-test-target MIR Clippy pass.
+Revised follow-up commit/push, final
+attestation, bounded finding closure, and CI are pending. The cross-worktree Request 6 identity
 rerun remains INCOMPLETE on this macOS host because the Linux C cross-compiler is absent and the
 temporary Linux container stalled while fetching its base image; the previously merged Request 6
 identity evidence remains intact. Stacked AM-C1 draft #702 and AM-C2a1 draft #705 remain open behind

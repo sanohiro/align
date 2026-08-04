@@ -2375,6 +2375,58 @@ parity, and cost evidence. Its final body pass also replays lexical local visibi
 initialization: parameters enter at function entry, initializers precede `Let`/`LetTuple` bindings,
 match payloads are arm-local, and block/arm exit removes bindings. Every local read and mutable
 place root must therefore be visible on that source path; a function-wide local table is not enough.
+The same replay tracks non-discard visible names: duplicate parameters, same-scope rebinding, and
+inner-scope shadowing reject, while a block or match-arm exit releases its names so disjoint siblings
+may reuse them. Sema and the validator share these exact pure classification seams:
+
+```text
+tuple_drop_local_name(ordinal: usize) -> String
+tuple_discard_needs_hidden_local(
+  ty: Ty,
+  structs: &[StructDef],
+  enums: &[hir::EnumDef],
+  tagged_types: &[hir::TaggedType],
+) -> bool
+```
+
+The first returns the canonical compiler-reserved `$tuple_drop<ordinal>` bytes; `$` is outside the
+source identifier grammar. The second is the exact producer predicate currently named
+`is_owned_droppable`; producer and validator call it directly, rather than relying on
+`needs_drop_flag` or an unstated scalar-domain equivalence. Only both shared predicates succeeding
+at the matching `LetTuple` ordinal excludes a local from source-visible names. The local remains
+id-visible and initialized until scope exit so the existing Drop analysis and lowering own cleanup.
+Repeated owned discards and a preceding user `_drop0` are producer-valid positives. This is one
+shared spelling/classification seam, not a new HIR field or discriminator, so the bounded fix remains
+inside sema production and MIR validation without changing HIR/MIR shape, serialized schema, ABI,
+generated-program/runtime allocation, or runtime cleanup. The helper's owned `String` result is one
+compiler-owned temporary allocation per formation/comparison, and hidden-name HIR debug/value bytes
+intentionally change from `_dropN` to `$tuple_dropN`. The existing
+AM-B4 follow-up remains the smallest independently correct vertical because changing the producer
+spelling without the validator would reject producer-valid HIR, while changing the validator alone
+would preserve the ambiguity. `malformed_hir_visible_local_name_collisions_fail_closed` crosses parameter,
+`Let`, `LetTuple`, nested-block, and match-payload collisions against sibling-block/arm positives in
+all four lowering entrypoints, exact hidden-discard positives, and every near-spelling negative.
+
+The hidden-name classification owner is the following closed product. For every name-visible cell,
+no prior visible collision accepts and an otherwise identical prior collision rejects. A hidden cell
+accepts either collision state for name purposes, while duplicate ids/bindings still reject through
+their existing owners.
+
+| Binding kind | Spelling at ordinal `i` | hidden-type predicate | Name classification |
+|---|---|---:|---|
+| `LetTuple` | exact `$tuple_drop<i>` | true | hidden |
+| `LetTuple` | exact `$tuple_drop<i>` | false | visible |
+| `LetTuple` | source `_drop<i>` | false/true | visible |
+| `LetTuple` | leading-zero `$tuple_drop0<i>` | false/true | visible |
+| `LetTuple` | canonical spelling for any wrong ordinal | false/true | visible |
+| ordinary `Let` | canonical or any near spelling | false/true | visible |
+
+The same owner separately proves the hidden-id lifecycle: a hidden local read in its initializer
+rejects before activation; a direct validator fixture observes it initialized after binding; a read
+after block exit rejects; producer HIR lists each hidden id exactly once in sorted `drop_locals` and
+`drop_individual_locals`; and whole/per-unit plus located/non-located MIR each emit one scope-exit
+`Drop` for each hidden string slot in the straight-line fixture. These cells prevent an implementation
+from satisfying name tests by skipping hidden-local activation or cleanup.
 Value joins use the structural body-type relation, including recursively matching fresh `FnTy`
 cells rather than requiring ordinal identity. The checker-owned `Break.accepted` fact is replayed in
 both directions: it is true exactly for an innermost loop target at the same arena/task depth, while

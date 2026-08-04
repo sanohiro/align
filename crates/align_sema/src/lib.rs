@@ -1965,6 +1965,24 @@ fn is_owned_droppable(
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
 }
 
+/// Canonical source-impossible local name for an owned `_` in tuple destructuring.
+pub fn tuple_drop_local_name(ordinal: usize) -> String {
+    format!("$tuple_drop{ordinal}")
+}
+
+/// Whether an ignored tuple element needs the hidden local named by [`tuple_drop_local_name`].
+///
+/// Sema formation and checked-HIR validation share this exact predicate; it deliberately excludes
+/// the wider Move-tuple branch in [`needs_drop_flag`].
+pub fn tuple_discard_needs_hidden_local(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    is_owned_droppable(ty, structs, enums, tagged_types)
+}
+
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
 /// sema/MIR boundary predicate: free-standing owned values and Move tuples get path-local cleanup;
 /// arena-only `box`/`Task` values do not.
@@ -19244,7 +19262,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// sibling's binding is never visible here. `_` (discard) never shadows.
     ///
     /// Every user-named binding site must call this before [`Checker::declare`]; synthetic names
-    /// (the `_drop{i}` tuple-drop placeholders, error-recovery declares) skip it deliberately.
+    /// (the `$tuple_drop{i}` tuple-drop placeholders, error-recovery declares) skip it deliberately.
     fn check_shadow(&mut self, name: &str, span: Span, floor: usize) {
         if name == "_" {
             return;
@@ -19655,7 +19673,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bind it to a fresh hidden local so it joins the normal drop path
                                 // (freed once at scope exit, or bulk-freed if arena-regioned). A
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
-                                None if is_owned_droppable(
+                                None if tuple_discard_needs_hidden_local(
                                     ety,
                                     self.structs,
                                     self.enums,
@@ -19663,7 +19681,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 ) =>
                                 {
                                     locals.push(Some(self.declare(
-                                        &format!("_drop{i}"),
+                                        &tuple_drop_local_name(i),
                                         ety,
                                         false,
                                     )));

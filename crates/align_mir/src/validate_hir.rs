@@ -2267,7 +2267,10 @@ enum LocalScopeWork<'a> {
     EnterBlock(&'a hir::Block),
     ExitBlock,
     EnterStmt(&'a hir::Stmt),
-    Bind(hir::LocalId),
+    Bind {
+        local: hir::LocalId,
+        check_name: bool,
+    },
     EnterExpr(&'a hir::Expr),
     EnterArm(&'a hir::MatchArm),
     ExitArm,
@@ -2282,23 +2285,28 @@ enum LocalScopeWork<'a> {
 /// with an initializer (or a match payload), so `initialized` is deliberately advanced at the same
 /// event as `visible` and restored at the matching lexical boundary.
 struct LocalScopeValidator<'a> {
+    program: &'a hir::Program,
     function: &'a hir::Fn,
     implicit_params: Option<HashSet<hir::LocalId>>,
     visible: Vec<bool>,
     initialized: Vec<bool>,
-    scopes: Vec<Vec<hir::LocalId>>,
+    visible_names: HashSet<&'a str>,
+    scopes: Vec<Vec<(hir::LocalId, bool)>>,
 }
 
 impl<'a> LocalScopeValidator<'a> {
     fn new(
+        program: &'a hir::Program,
         function: &'a hir::Fn,
         implicit_params: Option<HashSet<hir::LocalId>>,
     ) -> Self {
         Self {
+            program,
             function,
             implicit_params,
             visible: vec![false; function.locals.len()],
             initialized: vec![false; function.locals.len()],
+            visible_names: HashSet::new(),
             scopes: Vec::new(),
         }
     }
@@ -2354,12 +2362,21 @@ impl<'a> LocalScopeValidator<'a> {
                     }
                     match statement {
                         hir::Stmt::Let { local, init } => {
-                            work.push(LocalScopeWork::Bind(*local));
+                            work.push(LocalScopeWork::Bind {
+                                local: *local,
+                                check_name: true,
+                            });
                             work.push(LocalScopeWork::EnterExpr(init));
                         }
                         hir::Stmt::LetTuple { locals, init, .. } => {
-                            for local in locals.iter().rev().flatten() {
-                                work.push(LocalScopeWork::Bind(*local));
+                            for (ordinal, local) in locals.iter().enumerate().rev() {
+                                let Some(local) = local else {
+                                    continue;
+                                };
+                                work.push(LocalScopeWork::Bind {
+                                    local: *local,
+                                    check_name: !self.hidden_tuple_drop(*local, ordinal),
+                                });
                             }
                             work.push(LocalScopeWork::EnterExpr(init));
                         }
@@ -2370,8 +2387,8 @@ impl<'a> LocalScopeValidator<'a> {
                         }
                     }
                 }
-                LocalScopeWork::Bind(local) => {
-                    if !self.activate_binding(local) {
+                LocalScopeWork::Bind { local, check_name } => {
+                    if !self.activate_binding(local, check_name) {
                         return false;
                     }
                 }
@@ -2411,7 +2428,7 @@ impl<'a> LocalScopeValidator<'a> {
                 LocalScopeWork::EnterArm(arm) => {
                     self.scopes.push(Vec::new());
                     for &binding in &arm.bindings {
-                        if !self.activate_binding(binding) {
+                        if !self.activate_binding(binding, true) {
                             return false;
                         }
                     }
@@ -2432,13 +2449,16 @@ impl<'a> LocalScopeValidator<'a> {
         let Some(index) = usize::try_from(local).ok() else {
             return false;
         };
+        let Some(name) = self.function.locals.get(index).map(|local| local.name.as_str()) else {
+            return false;
+        };
         let Some(visible) = self.visible.get_mut(index) else {
             return false;
         };
         let Some(initialized) = self.initialized.get_mut(index) else {
             return false;
         };
-        if *visible {
+        if *visible || (name != "_" && !self.visible_names.insert(name)) {
             return false;
         }
         *visible = true;
@@ -2446,8 +2466,11 @@ impl<'a> LocalScopeValidator<'a> {
         true
     }
 
-    fn activate_binding(&mut self, local: hir::LocalId) -> bool {
+    fn activate_binding(&mut self, local: hir::LocalId, check_name: bool) -> bool {
         let Some(index) = usize::try_from(local).ok() else {
+            return false;
+        };
+        let Some(name) = self.function.locals.get(index).map(|local| local.name.as_str()) else {
             return false;
         };
         let Some(scope) = self.scopes.last_mut() else {
@@ -2459,21 +2482,41 @@ impl<'a> LocalScopeValidator<'a> {
         let Some(initialized) = self.initialized.get_mut(index) else {
             return false;
         };
-        if *visible {
+        let tracks_name = check_name && name != "_";
+        if *visible || (tracks_name && !self.visible_names.insert(name)) {
             return false;
         }
         *visible = true;
         *initialized = true;
-        scope.push(local);
+        scope.push((local, tracks_name));
         true
+    }
+
+    fn hidden_tuple_drop(&self, local: hir::LocalId, ordinal: usize) -> bool {
+        let Some(local) = usize::try_from(local)
+            .ok()
+            .and_then(|index| self.function.locals.get(index))
+        else {
+            return false;
+        };
+        local.name == align_sema::tuple_drop_local_name(ordinal)
+            && align_sema::tuple_discard_needs_hidden_local(
+                local.ty,
+                &self.program.structs,
+                &self.program.enums,
+                &self.program.tagged_types,
+            )
     }
 
     fn restore_scope(&mut self) -> bool {
         let Some(locals) = self.scopes.pop() else {
             return false;
         };
-        for local in locals {
+        for (local, tracks_name) in locals {
             let Some(index) = usize::try_from(local).ok() else {
+                return false;
+            };
+            let Some(name) = self.function.locals.get(index).map(|local| local.name.as_str()) else {
                 return false;
             };
             let Some(visible) = self.visible.get_mut(index) else {
@@ -2483,6 +2526,9 @@ impl<'a> LocalScopeValidator<'a> {
                 return false;
             };
             if !*visible || !*initialized {
+                return false;
+            }
+            if tracks_name && !self.visible_names.remove(name) {
                 return false;
             }
             *visible = false;
@@ -2630,7 +2676,7 @@ impl<'a> BodyValidator<'a> {
                     .map(|local| local.id)
                     .collect::<HashSet<_>>()
             });
-            if !LocalScopeValidator::new(function, implicit_params).validate() {
+            if !LocalScopeValidator::new(self.program, function, implicit_params).validate() {
                 return false;
             }
             if !self.bindings_valid(function_index, function) {

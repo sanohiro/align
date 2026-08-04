@@ -49,6 +49,20 @@ The following notation is closed and exact:
   removes its bindings, and sibling branches do not share them. Every local
   place root and every direct local/projection/aggregate-base read uses `LV`,
   while a declaration record itself uses `L` and the binding-order rule above.
+  Every non-discard local name is unique among the parameters and bindings
+  visible at its activation point. Same-scope rebinding and inner shadowing
+  reject; disjoint sibling blocks and match arms may reuse a name after their
+  prior lexical scope exits. `_` remains a non-binding discard spelling. An
+  owned tuple discard is stored with the exact compiler-reserved
+  `$tuple_drop<ordinal>` name returned by
+  `tuple_drop_local_name(ordinal: usize) -> String`; `$` cannot occur in a
+  source identifier. At that exact `LetTuple` ordinal and only when the shared
+  `tuple_discard_needs_hidden_local(Ty, structs, enums, tagged_types) -> bool`
+  producer predicate succeeds, the source-hidden local does not enter the
+  visible-name set. Its id still activates after the initializer, remains
+  initialized until block exit, and retains its exact Drop membership/cleanup.
+  Source-visible `_drop0`, `$tuple_drop00`, a wrong ordinal, and every other
+  near spelling do not satisfy the hidden-record predicate.
 - `MV(id)` means `M(id)` and `LV(id)` for an assignment or other mutable place
   root. The structural local table alone is not a definite-initialization or
   lexical-scope proof.
