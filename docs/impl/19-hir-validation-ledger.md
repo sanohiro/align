@@ -278,21 +278,15 @@ metadata/cell rows; `finish_children_rejects_missing_and_extra_children` closes 
 child-cardinality row; `checked_hir_body_fact_replay_covers_cleanup_and_function_effects` closes
 the integration replay and fact-equality row.
 
-The shared am-b4 MIR activation gate calls the structural body validator and this
-predicate only after depth, global type, placement, nominal/link, and
-declaration-header validation, and before any MIR construction or downstream
-identity is published. A structural body failure therefore wins over replay and
-all four lowering entrypoints return the canonical empty program.
-
-The narrow Request 6 scanner exception is a separate active pre-lowering gate:
-the four MIR lowerers call the private
-`align_mir::hir_program_is_valid(&hir::Program) -> bool`, after the structural
-preflight and before MIR construction. Its
-`validate_hir::json_scan_copy_rows_are_valid` walk rechecks only the scanner
-envelope and canonical row Copy predicate, including imported/per-unit
-reconstructed HIR. It does not call
-`align_sema::checked_hir_body_facts_are_valid`; the latter remains the dormant
-general body replay until am-b4.
+The shared am-b4 MIR activation gate runs depth, global type, placement,
+nominal/link, and declaration-header validation first. It then runs the active
+Request 6 `validate_hir::json_scan_validation_reason` envelope/Copy validator,
+the structural body validator, and this replay predicate, in that exact order,
+before any MIR construction or downstream identity is published. The scanner
+walk rechecks only the scanner envelope and canonical row Copy predicate,
+including imported/per-unit reconstructed HIR. A scanner or structural body
+failure therefore wins over replay, and all four lowering entrypoints return
+the canonical empty program.
 
 Am-b4 independently recomputes the existing producer facts rather than
 trusting the stored bits:
@@ -702,7 +696,7 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; `validate_hir::json_scan_validation_reason` returns the exact first reason for the precedence matrix while production lowering keeps the boolean gate. Unresolved `json.scanner<Row<T>>` row arguments and partially substituted composite generic arguments remain outside this row: sema rejects them before constructing a scanner expression and retains the exact producer diagnostics. Generic call checking classifies only the callee's own inference slots, so an enclosing generic parameter carried by a bound slot is valid forwarding; an expected-return seed error stops before any argument is checked. Producer-owned scanner spelling travels through checker-only inference slots, annotated or inferred locals, transparent generic-call results, parameters, and lambda captures; the checker derives it only across producer-owned local/block/borrow/call boundaries, with no HIR field or artifact/source reconstruction. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; five accepted HIR terminal variants expose seven public methods Sum/Count/Reduce/Any/All/Min/Max, each with exact Result(scalar,builtin Error)]`. |
+| `JsonScan` | `env[struct_id,stored_ty]`: the active Request 6 exception order is enclosing `Expr.span`, exact `stored_ty == JsonScanner(struct_id)`, existing row id, `input.ty == Str`, Decode-direction JSON descriptor, and the complete reachable row graph's canonical recursive Copy/`DropPlan` predicate. A malformed span therefore beats wrong stored type, unknown row id, wrong input type, schema, and Copy errors; `validate_hir::json_scan_validation_reason` returns the exact first reason for the precedence matrix while production lowering keeps the boolean gate. Unresolved `json.scanner<Row<T>>` row arguments and partially substituted composite generic arguments remain outside this row: sema rejects them before constructing a scanner expression and retains the exact producer diagnostics. Generic call checking classifies only the callee's own inference slots, so an enclosing generic parameter carried by a bound slot is valid forwarding; an expected-return seed error stops before any argument is checked. Producer-owned scanner spelling travels through checker-only inference slots, annotated or inferred locals, transparent generic-call results, parameters, and lambda captures; the checker derives it only across producer-owned local/block/borrow/call boundaries, with no HIR field or artifact/source reconstruction. The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the structural body validator alone is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; five accepted HIR terminal variants expose seven public methods Sum/Count/Reduce/Any/All/Min/Max, each with exact Result(scalar,builtin Error)]`. |
 | `JsonScanGenericCall` | `env[callee_slots,expected]`: expected-return seeding binds generic slots while validating concrete return leaves, so a concrete mismatch stops before any argument; annotated scanner return spelling is retained even when the call has no scanner argument. `child[args]`; `post[callee-local slot classification, source-order argument checking, checker-only spelling through signature/local/block/borrow/call boundaries, no partial HIR or cache publication on failure]`. Owner tests are `m5::json_scan_generic_return_context_expected_concrete_conflict_no_cascade` and `m5::json_scan_generic_argument_source_spelling`. |
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
