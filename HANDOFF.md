@@ -40,10 +40,12 @@ review of `36fd7b2` found two P1 and three P2 findings: cross-compiler cache ide
 `compiler_build_id` as an intentional difference, generic expected-return propagation must name its
 new resolver owner and numeric-default boundary, HIR precedence needs a reason-valued test seam,
 scanner coverage must distinguish five HIR variants from seven public terminals, and this handoff
-must bind the current head. The closure matrix is reopened for a redesign; implementation and
-publication remain paused. At `0319712`, `git diff --check` and the targeted `rg` contract/source-of-truth
+must bind the current head. The closure matrix was reopened and redesigned; the fresh independent
+review of `0319712` by Lorentz found only the handoff-binding P2, which is fixed in `f270d43`.
+The design gate is now clean; implementation remains paused until the design PR merges, while
+publication may proceed. At `0319712`, `git diff --check` and the targeted `rg` contract/source-of-truth
 checks passed; no repository Markdown linter is available, so that check is N/A. The handoff metadata
-for this reviewed checkpoint is recorded in the branch; no intentional uncommitted files remain.
+for the reviewed checkpoint is recorded in the branch; no intentional uncommitted files remain.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -675,16 +677,16 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Reopen and verify the Request 6 closure matrix, then publish and independently review the redesigned slice before implementing
-its compiler gate. Ordinary JSON
+Publish the clean Request 6 redesign and record its review envelope, then merge the design before
+implementing its scanner gate. Ordinary JSON
 decode, encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the
 scanner path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
 imported/per-unit consumers, interface/import reconstruction precedes active
 `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The redesign must preserve
 the concrete-row-only generic boundary, universal-Span precedence, complete active-HIR envelope,
-expanded composite/per-unit owners, and canonical cross-compiler identity probe. Run
-`git diff --check`, targeted Markdown/source-of-truth checks, and one fresh SHA-bound independent
-final design review for this redesigned slice. After that design gate is clean, implement the
+expanded composite/per-unit owners, and canonical cross-compiler identity probe. The required
+design review is clean at `f270d43`; rerun `git diff --check` after any base-tip integration change.
+After the design gate merges, implement the
 scanner-only recursive Copy check in a separate slice; do not update the align-llm compiler pin
 until that implementation is merged and its adoption gate passes. Compiler tests, builds, and
 `make ci` remain N/A while this worktree is documentation-only.
