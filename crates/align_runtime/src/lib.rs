@@ -18658,9 +18658,86 @@ pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
     }
 }
 
+// Compile-time pins for the eight feature-only verification exports. The compiled-symbol gate in
+// `scripts/test-runtime-abi-exports.sh` owns their presence/absence; these assignments make every
+// promised parameter and return type part of the feature build itself.
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_alloc_count;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_free_count;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_str_finder_new_count;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_str_finder_free_count;
+#[cfg(feature = "par-map-probe")]
+const _: extern "C" fn(i32) = align_rt_test_par_map_force_caller;
+#[cfg(feature = "par-map-probe")]
+const _: extern "C" fn() -> i64 = align_rt_test_par_map_min_chunk;
+#[cfg(feature = "par-map-probe")]
+const _: extern "C" fn(i64, i64, i64) -> i64 = align_rt_test_par_map_min_chunk_for;
+#[cfg(feature = "par-map-probe")]
+const _: extern "C" fn() -> i64 = align_rt_test_par_map_workers;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_export_source_inventory_matches_registry() {
+        fn function_symbols(source: &str) -> std::collections::BTreeSet<String> {
+            source
+                .match_indices("fn align_rt_")
+                .filter_map(|(start, _)| {
+                    let symbol: String = source[start + 3..]
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                        .collect();
+                    (symbol.len() > "align_rt_".len()).then_some(symbol)
+                })
+                .collect()
+        }
+
+        let mut runtime = function_symbols(include_str!("lib.rs"));
+        runtime.extend(function_symbols(include_str!("str_prims.rs")));
+        for non_base in [
+            "align_rt_alloc_count",
+            "align_rt_free_count",
+            "align_rt_str_finder_new_count",
+            "align_rt_str_finder_free_count",
+            "align_rt_test_par_map_force_caller",
+            "align_rt_test_par_map_min_chunk",
+            "align_rt_test_par_map_min_chunk_for",
+            "align_rt_test_par_map_workers",
+            "align_rt_test_par_pool_initialized",
+            "align_rt_test_par_pool_wait_idle",
+            "align_rt_hash64_boundaries_and_determinism",
+        ] {
+            assert!(runtime.remove(non_base), "missing feature/test-only runtime function {non_base}");
+        }
+
+        let registry_source = include_str!("../../align_codegen_llvm/src/runtime_abi.rs");
+        let registry: std::collections::BTreeSet<String> = registry_source
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("symbol: \"align_rt_") {
+                    return rest
+                        .split_once('"')
+                        .map(|(tail, _)| format!("align_rt_{tail}"));
+                }
+                if line.starts_with("UnkeyedRuntimeKey::") {
+                    return line
+                        .split_once("=> \"")
+                        .and_then(|(_, rest)| rest.split_once('"'))
+                        .map(|(symbol, _)| symbol.to_string());
+                }
+                None
+            })
+            .collect();
+        assert_eq!(runtime.len(), 286);
+        assert_eq!(registry.len(), 286);
+        assert_eq!(runtime, registry);
+    }
 
     /// Matches the opaque storage envelope reserved by codegen for nonescaping builder headers.
     #[repr(C, align(16))]

@@ -21,6 +21,9 @@ use std::rc::Rc;
 
 pub mod print;
 mod validate_hir;
+mod runtime_key;
+
+pub use runtime_key::RuntimeKey;
 
 #[cfg(test)]
 mod validate_hir_tests;

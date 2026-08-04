@@ -399,7 +399,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?;
                         self.builder
                             .build_call(
-                                self.funcs["free_string_array"],
+                                self.runtime(RuntimeKey::FreeStringArray),
                                 &[ptr.into(), len.into()],
                                 "",
                             )
@@ -421,7 +421,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?;
                         self.builder
                             .build_call(
-                                self.funcs["free_response_array"],
+                                self.runtime(RuntimeKey::FreeResponseArray),
                                 &[ptr.into(), len.into()],
                                 "",
                             )
@@ -437,7 +437,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             next: 0,
                         });
                     }
-                    ty if let Some(free_fn) = handle_free_fn(ty) => {
+                    ty if let Some(free_key) = handle_free_key(ty) => {
                         let ptr = self
                             .builder
                             .build_load(
@@ -447,7 +447,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             )
                             .map_err(|error| self.err(error))?;
                         self.builder
-                            .build_call(self.funcs[free_fn], &[ptr.into()], "")
+                            .build_call(self.runtime(free_key), &[ptr.into()], "")
                             .map_err(|error| self.err(error))?;
                     }
                     Ty::String
@@ -464,7 +464,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_extract_value(aggregate, 0, "dropsliceptr")
                             .map_err(|error| self.err(error))?;
                         self.builder
-                            .build_call(self.funcs["free"], &[ptr.into()], "")
+                            .build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "")
                             .map_err(|error| self.err(error))?;
                     }
                     _ => {}
@@ -621,7 +621,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|error| self.err(error))?;
                     self.builder.position_at_end(done);
                     self.builder
-                        .build_call(self.funcs["free"], &[ptr.into()], "")
+                        .build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "")
                         .map_err(|error| self.err(error))?;
                 }
             }
