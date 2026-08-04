@@ -654,11 +654,12 @@ imported/per-unit consumers, interface/import reconstruction precedes active
 `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The first independent review
 on `1cb666f` found one P1 and one P2; `bd93f7b` applied both and corrected the b2b2 roadmap/closure
 wording. The conditional final review found two further valid contract findings; the current
-redesign incorporates both and reopens the closure matrix. Per policy, do not start another local
-review/repair loop. After this design is accepted, implement the scanner-only recursive Copy check
-in a separate slice; do not update the align-llm compiler pin until that implementation is merged
-and its adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-gate
-references pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
+redesign incorporates both and reopens the closure matrix. Run one fresh independent review on this
+re-scoped coherent design slice before publication; do not begin another repair/review loop after
+that review. After this design is accepted, implement the scanner-only recursive Copy check in a
+separate slice; do not update the align-llm compiler pin until that implementation is merged and its
+adoption gate passes. `git diff --check`, exact-diagnostic consistency, and active-gate references
+pass; compiler tests, builds, and `make ci` are N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
