@@ -5,18 +5,20 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; relevant
-implementation commit `43211ec` is based on implementation checkpoint `8b55352` plus the reviewed
-Align Request 6 design head `712317b`, merged in Align at
+_Last updated: 2026-08-04. Current branch: `agent/align-llm-request6-implementation-v2`; the
+review-repair commit `2688681` follows implementation `43211ec`, which is based on implementation
+checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
 `0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete locally but is not yet
-published or merged. No `.align-revision` adoption pin or align-llm `make ci` verification exists
-yet.
+merged. Align PR #704 is the publication checkpoint; its pre-repair head was `dc281d4` and must be
+updated to the repair branch before preflight. No `.align-revision` adoption pin or align-llm
+`make ci` verification exists yet.
 
 ## Active Request 6 implementation checkpoint
 
 - Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script.
-- Verification: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, scanner-focused m5 (32/32), modules (41/41), cache_codegen (26/26), MIR validator (85/85), sema (202/202), and targeted clippy pass. `scripts/compare-json-scan-identity.sh 43211ec` passed in the required release Linux environment: interface/MIR/raw LLVM/object and every non-build-id CodegenKey field matched; only `FirstDiff::CompilerBuildId` differed. The m5 aggregate has 188/193 passing; five failures reproduce on the pre-change checkpoint as existing link/diagnostic failures and are not Request 6 failures.
-- Next, in order: perform the one comprehensive adversarial review; publish the implementation PR; apply any valid findings in one repair; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
+- Verification: the repair's focused owner tests pass: generic scanner m5 (6/6), active HIR scanner envelope (3/3), modules (41/41), cache_codegen (26/26), MIR (85/85), sema (202/202), targeted check, and targeted clippy. The full m5 aggregate is 189/194; the same five existing link/diagnostic failures reproduce on the pre-change checkpoint and are outside Request 6. The cross-compiler identity script must be rerun against `2688681` after publication because the repair extends its production cache-classifier owner.
+- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`. The repair preserves the scanner-only scope and updates the English/Japanese design closure matrix before implementation repair.
+- Next, in order: push `2688681`; rerun the exact identity script; obtain final host and independent clean attestations; run preflight and update PR #704 markers; wait for required CI; merge; refresh `.align-revision`; run `make ci` and record real-client adoption evidence.
 - Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
@@ -650,24 +652,26 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Request 6 implementation is complete in this worktree but not yet published. Ordinary JSON decode,
-encode, and scope Drop retain the currently admitted `Option<Move-struct>` shape; only the scanner
-path is Copy-gated, while partial-error cleanup remains a separate ownership request. For
-imported/per-unit consumers, interface/import reconstruction precedes active
-`align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source sema gate uses
-the canonical recursive `DropPlan`; the active HIR replay walks direct expression children
-iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and malformed-row
-definitions without activating the dormant body validator. The consolidated repair also closes the
-producer-owned generic source-spelling boundary and adds schema, terminal/error, cache rejection,
-and accepted MIR/raw-LLVM identity owners. Latest verification passes:
-`cargo check -p align_sema -p align_mir -p align_driver --tests --locked`; `cargo test -p align_mir
---lib hir_ -- --nocapture` (53 passed); `cargo test -p align_driver --test m5 json_scan_ --
---nocapture` (23 passed); imported modules (2 passed); cache owners (2 passed);
-`scripts/test-pr.sh`; and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
-`git diff --check` is clean. `cargo fmt --all -- --check` remains N/A because the checkout has
-pre-existing workspace-wide rustfmt drift outside this slice. The implementation commit is
-`3d7b118`; next steps are the fresh independent review, pre-PR attestation, push, PR review, and
-merge.
+Request 6 implementation and the consolidated review repair are complete in this worktree but are
+not yet merged. Ordinary JSON decode, encode, and scope Drop retain the currently admitted
+`Option<Move-struct>` shape; only the scanner path is Copy-gated, while partial-error cleanup remains
+a separate ownership request. For imported/per-unit consumers, interface/import reconstruction
+precedes active `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source
+sema gate uses the canonical recursive `DropPlan`; the active HIR replay walks direct expression
+children iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and
+malformed-row definitions without activating the dormant body validator. The repair also preserves
+outer scanner source spelling through bare generic calls, stops at the first generic argument error,
+snapshots all cache-owned files on rejected walks, closes valid-Span precedence pairs, and exercises
+the production CodegenKey classifier and non-build-id digest.
+
+Latest verification on `2688681`: `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests
+--locked`; targeted clippy; `cargo +1.96.1 test -p align_sema --lib` (202 passed); `cargo +1.96.1
+test -p align_mir --lib` (85 passed); `cargo +1.96.1 test -p align_driver --test modules` (41
+passed); `cargo +1.96.1 test -p align_driver --test cache_codegen` (26 passed); generic m5 owners
+(6 passed); and full m5 (189 passed / 5 pre-existing failures). `git diff --check` and
+`bash -n scripts/compare-json-scan-identity.sh` are clean. `cargo fmt --all -- --check` remains N/A
+because the checkout has pre-existing workspace-wide rustfmt drift; the new identity test passes
+the pinned rustfmt check. The exact identity script is the next required verification.
 Do not update `.align-revision` or the align-llm Request 6 verification status until this
 implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
 gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
