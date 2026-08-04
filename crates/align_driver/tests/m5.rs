@@ -549,18 +549,29 @@ fn json_option_struct_field_last_and_nested_compose() {
 }
 
 #[test]
-fn json_option_move_struct_payload_still_rejected() {
-    // The Slice-B boundary is unchanged: an `Option<Move-struct>` payload (a struct owning an
-    // `array`/`string`) is rejected at declaration — an owned Option-payload drop-as-a-field has no
-    // consumer yet. Only NON-Move payload structs get the new encode.
-    assert!(check_errs(
-        "json-option-move-struct",
-        "import core.json\n\
+fn json_option_move_struct_payload_remains_admitted() {
+    if !backend_available() {
+        return;
+    }
+    // Ordinary JSON keeps its existing ownership contract: an `Option<Move-struct>` payload is
+    // admitted by the Decode schema and remains eligible for ordinary encode and scope Drop. The
+    // scanner-only Copy boundary is a separate contract and must not narrow this path.
+    let src = "import core.json\n\
          Owned { xs: array<i64> }\n\
          Doc { id: i64, meta: Option<Owned> }\n\
-         fn f(s: str) -> Result<Doc, Error> = json.decode(s)\n\
-         fn main() -> i32 = 0\n"
-    ));
+         fn main() -> Result<(), Error> {\n  \
+           a: Doc := json.decode(\"{\\\"id\\\":1,\\\"meta\\\":{\\\"xs\\\":[2,3]}}\")?\n  \
+           print(json.encode(a))\n  \
+           b: Doc := json.decode(\"{\\\"id\\\":2}\")?\n  \
+           print(json.encode(b))\n  \
+           return Ok(())\n\
+         }\n";
+    let out = build_and_run("json-option-move-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"id\":1,\"meta\":{\"xs\":[2,3]}}\n{\"id\":2}\n"
+    );
 }
 
 #[test]
@@ -1155,6 +1166,31 @@ fn json_scan_malformed_row_errors() {
 }
 
 #[test]
+fn json_scan_copy_row_error_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        ("empty-array", "[]", 0),
+        ("empty-input", "", 0),
+        ("malformed-first", "[oops]", 21),
+        ("malformed-later", "[{\"score\":1},oops]", 21),
+        ("single-ndjson-row", "{\"score\":2}\n", 2),
+    ];
+    for (name, input, expected) in cases {
+        let escaped = input
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let src = format!(
+            "import core.json\nRow {{ score: i64 }}\nfn describe(r: Result<i64, Error>) -> i32 = match r {{\n  Ok(value) => value as i32,\n  Err(e) => match e {{\n    NotFound => 10,\n    Invalid => 11,\n    Denied => 12,\n    Timeout => 13,\n    Code(c) => 20 + c,\n  }},\n}}\nfn main() -> i32 {{\n  rows: json.scanner<Row> := json.scan(\"{escaped}\")\n  return describe(rows.score.sum())\n}}\n"
+        );
+        let out = build_and_run(&format!("json-scan-copy-row-error-{name}"), &src);
+        assert_eq!(out.status.code(), Some(expected), "unexpected result for {name}");
+    }
+}
+
+#[test]
 fn json_scan_map_over_rows() {
     if !backend_available() {
         return;
@@ -1231,6 +1267,52 @@ fn json_scan_reduce_fold() {
 }
 
 #[test]
+fn json_scan_copy_row_terminal_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let src = "import core.json\n\
+         Row { score: i64 }\n\
+         fn add(a: i64, b: i64) -> i64 = a + b\n\
+         fn positive(n: i64) -> bool = n > 0\n\
+         fn above_five(n: i64) -> bool = n > 5\n\
+         fn main() -> Result<(), Error> {\n  \
+           a: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(a.score.sum()?)\n  \
+           b: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(b.count()?)\n  \
+           c: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(c.score.reduce(0, add)?)\n  \
+           d: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(d.score.any(above_five)?)\n  \
+           e: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(e.score.all(positive)?)\n  \
+           f: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(f.score.min()?)\n  \
+           g: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1},{\\\"score\\\":5},{\\\"score\\\":9}]\")\n  \
+           print(g.score.max()?)\n  \
+           return Ok(())\n\
+         }\n";
+    let out = build_and_run("json-scan-copy-terminal-matrix", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n3\n15\ntrue\ntrue\n1\n9\n");
+}
+
+#[test]
+fn json_scan_copy_row_no_owned_alloc() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(
+        "import core.json\nRow { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n",
+    );
+    let runtime_call = |needle: &str| ir.lines().any(|line| line.contains("call") && line.contains(needle));
+    assert!(ir.contains("align_rt_json_scan_next"), "scanner codegen lost its row-step call:\n{ir}");
+    assert!(!runtime_call("align_rt_alloc"), "a Copy scanner row must not allocate an owned row field:\n{ir}");
+    assert!(!runtime_call("align_rt_arena_alloc"), "a Copy scanner row must not allocate an arena row field:\n{ir}");
+}
+
+#[test]
 fn json_scan_reduce_nonscalar_accumulator_rejected() {
     // A `json.scanner` reduce terminal is `Result<T, Error>`, so its accumulator must be a scalar. A
     // non-scalar accumulator (a `vec4<i64>`) has no `Result` form — reject cleanly, don't panic.
@@ -1270,6 +1352,637 @@ fn json_scan_requires_binding_annotation() {
         "import core.json\nfn main() -> Result<(), Error> {\n  rows := json.scan(\"[]\")\n  return Ok(())\n}\n",
     );
     assert!(errs.contains("cannot infer the scan row type"), "unexpected diagnostics:\n{errs}");
+}
+
+#[test]
+fn json_scan_rejects_owned_row_fields() {
+    let diagnostics = check_diagnostics(
+        "json-scan-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Owned> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn json_scan_rejects_transitive_owned_row_fields() {
+    let diagnostics = check_diagnostics(
+        "json-scan-transitive-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nNested { owned: Owned }\nOptional { owned: Option<Owned> }\nfn main() -> Result<(), Error> {\n  a: json.scanner<Nested> := json.scan(\"[]\")\n  b: json.scanner<Optional> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    for expected in ["Nested", "Optional"] {
+        assert!(
+            diagnostics.contains(&format!(
+                "`json.scan` row type '{expected}' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+            )),
+            "missing transitive diagnostic for {expected}:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn json_scan_generic_row_ownership() {
+    let diagnostics = check_diagnostics(
+        "json-scan-generic-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nRow<T> { owned: T }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row<Owned>> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Row<Owned>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
+
+    let array_argument = check_diagnostics(
+        "json-scan-generic-owned-array-row",
+        "import core.json\nOwned { xs: array<i64> }\nRow<T> { owned: T }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row<array<Owned>>> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(
+        array_argument.contains(
+            "`json.scan` row type 'Row<array<Owned>>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "generic array diagnostics lost the producer spelling:\n{array_argument}"
+    );
+
+    // A generic call is a separate source-to-monomorph boundary. Its scanner parameter carries the
+    // producer-owned spelling through argument checking so a rejected `json.scan` cannot fall back
+    // to a HIR nominal or interner name.
+    let monomorph = check_diagnostics(
+        "json-scan-generic-call-owned-row",
+        "import core.json\nOwned { xs: array<i64> }\nfn consume<T>(rows: json.scanner<Owned>, value: T) -> Result<(), Error> = Ok(())\nfn main() -> Result<(), Error> {\n  consume(json.scan(\"[]\"), 1)?\n  return Ok(())\n}\n",
+    );
+    assert!(
+        monomorph.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "generic-call diagnostics lost the producer spelling:\n{monomorph}"
+    );
+}
+
+#[test]
+fn json_scan_generic_return_context_argument_order_matrix() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn identity<T>(value: T) -> T = value
+fn choose<T>(first: T, second: T) -> T = first
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Row> := identity(json.scan("[]"))
+  pair: json.scanner<Row> := choose(json.scan("[]"), json.scan("[]"))
+  rows.count()?
+  pair.count()?
+  return Ok(())
+}
+"#;
+    let diagnostics = check_diagnostics("json-scan-generic-return-context", source);
+    assert!(diagnostics.is_empty(), "expected concrete scanner context to reach nested calls:\n{diagnostics}");
+
+    let conflicting = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> T = first
+fn main() -> Result<(), Error> {
+  bad: json.scanner<Row> := choose(json.scan("[]"), 1)
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-argument-order", conflicting);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "a later conflicting argument must fail");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the concrete argument check must own exactly one first-conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "a later scanner must not be checked after the first conflict:\n{diagnostics}"
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(!mir.contains("json_scan_new"), "failed argument inference must not publish the scanner source:\n{mir}");
+
+    let reversed = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> T = first
+fn main() -> Result<(), Error> {
+  bad: json.scanner<Row> := choose(1, json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let reversed_diags = check_diagnostics("json-scan-generic-first-conflict", reversed);
+    assert_eq!(
+        reversed_diags.matches("type mismatch").count(),
+        1,
+        "the first source-order conflict must not be reported again in reverse order:\n{reversed_diags}"
+    );
+    assert!(
+        !reversed_diags.contains("cannot infer the scan row type"),
+        "the later scanner argument must not be checked after the first conflict:\n{reversed_diags}"
+    );
+}
+
+#[test]
+fn json_scan_generic_return_context_partial_composite_rejection() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn keep<T, U>(value: Result<T, U>, scan: json.scanner<Row>) -> T {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  value: i64 := keep(Ok(1), json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-partial-composite", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    let expected = "generic argument 1 of 'keep' has a partially inferred type; annotate the argument or use a bare generic parameter";
+    assert!(checked.diags.has_errors(), "a partially substituted composite must fail");
+    assert!(diagnostics.contains(expected), "unexpected partial-inference diagnostic:\n{diagnostics}");
+    assert!(!diagnostics.contains("cannot infer the scan row type"), "the rejected argument must not be checked:\n{diagnostics}");
+
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(!mir.contains("json_scan_new") && !mir.contains("json_scan_next"), "partial generic inference must not publish scanner HIR/MIR:\n{mir}");
+}
+
+#[test]
+fn json_scan_generic_return_context_expected_conflict_no_cascade() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> Result<T, T> {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  bad: Result<i64, bool> := choose(json.scan("[]"), 1)
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-expected-conflict", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "the expected return conflict must fail");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the expected-return seed must own the only conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "argument checking must stop after an expected-return conflict:\n{diagnostics}"
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "an expected-return conflict must not publish a scanner HIR/MIR source:\n{mir}"
+    );
+}
+
+#[test]
+fn json_scan_generic_return_context_expected_concrete_conflict_no_cascade() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T) -> Result<T, Error> {
+  loop {}
+}
+fn main() -> Result<(), Error> {
+  bad: Result<i64, bool> := choose(json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-expected-concrete-conflict", source);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "the concrete expected-return conflict must fail");
+    assert_eq!(
+        diagnostics.matches("type mismatch").count(),
+        1,
+        "the concrete return leaf must own the only conflict diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot infer the scan row type"),
+        "argument checking must stop after a concrete expected-return conflict:\n{diagnostics}"
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "a concrete expected-return conflict must not publish a scanner HIR/MIR source:\n{mir}"
+    );
+}
+
+#[test]
+fn json_scan_generic_argument_source_spelling() {
+    let local = r#"
+import core.json
+Owned { values: array<i64> }
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  bad := choose(rows, json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let local_diags = check_diagnostics("json-scan-generic-local-spelling", local);
+    assert_eq!(local_diags.matches("must be Copy").count(), 1, "local scanner spelling was lost:\n{local_diags}");
+    assert!(
+        local_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the local producer spelling must own the Copy diagnostic:\n{local_diags}"
+    );
+    assert!(!local_diags.contains("cannot determine the scan row type spelling"), "local spelling fallback leaked:\n{local_diags}");
+
+    let call_result = r#"
+import core.json
+Owned { values: array<i64> }
+fn identity<T>(value: T) -> T = value
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  forwarded := identity(rows)
+  bad := choose(forwarded, json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let call_result_diags = check_diagnostics("json-scan-generic-call-result-spelling", call_result);
+    assert_eq!(call_result_diags.matches("must be Copy").count(), 1, "generic call result spelling was lost:\n{call_result_diags}");
+    assert!(
+        call_result_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the generic call result's producer spelling must own the Copy diagnostic:\n{call_result_diags}"
+    );
+    assert!(!call_result_diags.contains("cannot determine the scan row type spelling"), "generic call result spelling fallback leaked:\n{call_result_diags}");
+
+    let return_producer = r#"
+import core.json
+Owned { values: array<i64> }
+fn make<T>(value: T) -> json.scanner<Owned> {
+  loop {}
+}
+fn choose<T>(first: T, second: T) -> T = first
+fn outer() -> Result<(), Error> {
+  bad := choose(make(1), json.scan("[]"))
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let return_producer_diags = check_diagnostics("json-scan-generic-return-producer-spelling", return_producer);
+    assert_eq!(return_producer_diags.matches("must be Copy").count(), 1, "generic scanner return spelling was lost:\n{return_producer_diags}");
+    assert!(
+        return_producer_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the annotated generic return spelling must own the Copy diagnostic:\n{return_producer_diags}"
+    );
+    assert!(!return_producer_diags.contains("cannot determine the scan row type spelling"), "generic return spelling fallback leaked:\n{return_producer_diags}");
+
+    let lambda = r#"
+import core.json
+Owned { values: array<i64> }
+fn choose<T>(first: T, second: T) -> T = first
+fn outer(rows: json.scanner<Owned>) -> Result<(), Error> {
+  alias := rows
+  values := [1].map(fn n { choose(alias, json.scan("[]")); n }).sum()
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let lambda_diags = check_diagnostics("json-scan-generic-lambda-spelling", lambda);
+    assert_eq!(lambda_diags.matches("must be Copy").count(), 1, "lambda scanner spelling was lost:\n{lambda_diags}");
+    assert!(
+        lambda_diags.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the captured producer spelling must own the Copy diagnostic:\n{lambda_diags}"
+    );
+    assert!(!lambda_diags.contains("cannot determine the scan row type spelling"), "lambda spelling fallback leaked:\n{lambda_diags}");
+}
+
+#[test]
+fn json_scan_generic_return_context_ownership() {
+    let source = r#"
+import core.json
+Row { score: i64 }
+fn identity<T>(value: T) -> T = value
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Row> := identity(json.scan("[]"))
+  rows.count()?
+  return Ok(())
+}
+"#;
+    let diagnostics = check_diagnostics("json-scan-generic-return-context-ownership", source);
+    assert!(diagnostics.is_empty(), "expected a concrete scanner row to survive generic return inference:\n{diagnostics}");
+}
+
+#[test]
+fn json_scan_generic_return_context_wrapper_matrix() {
+    let accepted = r#"
+import core.json
+Row { score: i64 }
+fn identity<T>(value: T) -> T = value
+fn wrapper<A, B>(first: A, value: B) -> B = identity(value)
+fn forward<T, U>(value: Result<T, U>) -> Result<T, U> = value
+fn forward_wrapper<A, B>(value: Result<A, B>) -> Result<A, B> = forward(value)
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Row> := wrapper(0, json.scan("[]"))
+  rows.count()?
+  value := identity(1)
+  print(value)
+  return Ok(())
+}
+"#;
+    let diagnostics = check_diagnostics("json-scan-generic-wrapper", accepted);
+    assert!(diagnostics.is_empty(), "expected wrapper inference and numeric defaults to survive:\n{diagnostics}");
+
+    let conflicting = r#"
+import core.json
+Row { score: i64 }
+fn choose<T>(first: T, second: T) -> T = first
+fn main() -> Result<(), Error> {
+  bad: json.scanner<Row> := choose(json.scan("[]"), 1)
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-conflict", conflicting);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(checked.diags.has_errors(), "conflicting generic arguments must fail");
+    assert!(diagnostics.contains("type mismatch"), "expected the existing mismatch diagnostic:\n{diagnostics}");
+
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "failed generic inference must not publish a scanner source artifact:\n{mir}"
+    );
+}
+
+#[test]
+fn json_scan_generic_return_context_preserves_copy_diagnostic() {
+    let source = r#"
+import core.json
+Owned { values: array<i64> }
+fn identity<T>(value: T) -> T = value
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Owned> := identity(json.scan("[]"))
+  return Ok(())
+}
+"#;
+    let diagnostics = check_diagnostics("json-scan-generic-copy-diagnostic", source);
+    assert_eq!(
+        diagnostics.matches("must be Copy").count(),
+        1,
+        "the bare generic wrapper must preserve one exact Copy diagnostic:\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "the outer scanner annotation must survive the generic boundary:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("cannot determine the scan row type spelling"),
+        "the generic boundary must not erase producer-owned scanner spelling:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn json_scan_generic_return_context_numeric_default() {
+    let source = r#"
+fn identity<T>(value: T) -> T = value
+fn widen<T>(first: T, second: T) -> T = first
+fn main() -> i32 {
+  a := identity(1)
+  b := widen(1, 2)
+  return (a + b) as i32
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-generic-numeric-default", source);
+    assert!(!checked.diags.has_errors(), "integer generic defaults must remain accepted:\n{}", align_driver::format_diagnostics(&source_map, &checked.diags));
+    let out = build_and_run("json-scan-generic-numeric-default", source);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn json_scan_generic_return_context_inference_matrix() {
+    let missing_context = check_diagnostics(
+        "json-scan-generic-missing-context",
+        "import core.json\nfn identity<T>(value: T) -> T = value\nfn main() -> Result<(), Error> {\n  rows := identity(json.scan(\"[]\"))\n  return Ok(())\n}\n",
+    );
+    assert!(missing_context.contains("cannot infer the scan row type"), "unexpected missing-context diagnostic:\n{missing_context}");
+
+    let unresolved = check_diagnostics(
+        "json-scan-generic-unresolved",
+        "fn make<T>() -> T {\n  return 0\n}\nfn main() -> i32 {\n  return make()\n}\n",
+    );
+    assert!(
+        unresolved.contains("cannot infer") || unresolved.contains("generic"),
+        "the existing generic inference diagnostic must remain in use:\n{unresolved}"
+    );
+
+    let unresolved_scanner = check_diagnostics(
+        "json-scan-generic-unresolved-scanner",
+        "import core.json\nRow<T> { value: T }\nfn make<T>() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  return make()\n}\n",
+    );
+    assert!(
+        unresolved_scanner.contains(
+            "instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet"
+        ),
+        "an unresolved scanner row parameter must use the exact resolver diagnostic rather than panic:\n{unresolved_scanner}"
+    );
+
+    let mut source_map = SourceMap::new();
+    let unresolved = check(
+        &mut source_map,
+        "json-scan-generic-unresolved-scanner-hir",
+        "import core.json\nRow<T> { value: T }\nfn make<T>() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  return make()\n}\n",
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&unresolved.hir));
+    assert!(
+        !mir.contains("json_scan_new") && !mir.contains("json_scan_next"),
+        "the deferred unresolved row-type state must not publish scanner HIR/MIR:\n{mir}"
+    );
+}
+
+#[test]
+fn json_scan_rejects_owned_composite_rows() {
+    let diagnostics = check_diagnostics(
+        "json-scan-owned-composite-row",
+        r#"
+import core.json
+Owned { values: array<i64> }
+Content { Object(Owned) }
+Row { maybe_owned: Option<Owned>, content: Content }
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Row> := json.scan("[]")
+  return Ok(())
+}
+"#,
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Row' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "owned data hidden behind Option and a union payload must reject the row:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn json_scan_row_schema_matrix() {
+    let accepted = [
+        "Row { i8v: i8, u8v: u8, i16v: i16, u16v: u16, i32v: i32, u32v: u32, i64v: i64, u64v: u64, f32v: f32, f64v: f64, flag: bool, text: str }",
+        "Leaf { value: i64 }\nRow { leaf: Leaf, maybe: Option<i64> }",
+        "Content { Text(str), Count(i64), Flag(bool) }\nRow { content: Content }",
+    ];
+    for (index, row) in accepted.iter().enumerate() {
+        let src = format!(
+            "import core.json\n{row}\nfn main() -> Result<(), Error> {{\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  rows.count()?\n  return Ok(())\n}}\n"
+        );
+        assert!(!check_errs(&format!("json-scan-schema-accepted-{index}"), &src), "unexpected diagnostics for accepted schema {index}:\n{}", check_diagnostics("json-scan-schema-accepted", &src));
+    }
+    let invalid = check_diagnostics(
+        "json-scan-schema-invalid-char",
+        "import core.json\nRow { value: char }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(invalid.contains("json.decode"), "char schema must retain the existing decode diagnostic:\n{invalid}");
+}
+
+#[test]
+fn json_scan_copy_composite_runtime_matrix() {
+    if !backend_available() {
+        return;
+    }
+    // The scanner row stays Copy while its decode graph crosses every supported non-owning
+    // composite edge: nested struct, every supported Option payload (present, null, and omitted),
+    // and every shape-directed union arm. The map callback consumes the whole row, so the runtime
+    // must load the same reusable row slot for all fields without creating a per-row owned allocation.
+    let src = r#"
+import core.json
+Leaf { score: i64, name: str }
+CopyContent { Text(str), Count(i64), Flag(bool), Object(Leaf) }
+CopyRow { maybe_i64: Option<i64>, maybe_f64: Option<f64>, maybe_bool: Option<bool>, maybe_text: Option<str>, maybe_leaf: Option<Leaf>, leaf: Leaf, content: CopyContent, label: str }
+fn score(row: CopyRow) -> i64 =
+  (match row.maybe_i64 { Some(maybe_i64_value) => maybe_i64_value, None => 0 })
+    + (match row.maybe_f64 { Some(_) => 1, None => 0 })
+    + (match row.maybe_bool { Some(maybe_bool_value) => if maybe_bool_value { 1 } else { 0 }, None => 0 })
+    + (match row.maybe_text { Some(maybe_text_value) => maybe_text_value.len(), None => 0 })
+    + (match row.maybe_leaf { Some(maybe_leaf_value) => maybe_leaf_value.score + maybe_leaf_value.name.len(), None => 0 })
+    + row.leaf.score
+    + row.leaf.name.len()
+    + (match row.content {
+        Text(text_value) => text_value.len(),
+        Count(count_value) => count_value,
+        Flag(flag_value) => if flag_value { 100 } else { 0 },
+        Object(object_value) => object_value.score + object_value.name.len(),
+      })
+    + row.label.len()
+fn main() -> Result<(), Error> {
+  rows: json.scanner<CopyRow> := json.scan("[{\"maybe_i64\":10,\"maybe_f64\":1.5,\"maybe_bool\":true,\"maybe_text\":\"mt\",\"maybe_leaf\":{\"score\":6,\"name\":\"ml\"},\"leaf\":{\"score\":1,\"name\":\"a\"},\"content\":\"tx\",\"label\":\"x\"},{\"maybe_i64\":null,\"maybe_f64\":null,\"maybe_bool\":null,\"maybe_text\":null,\"maybe_leaf\":null,\"leaf\":{\"score\":2,\"name\":\"bb\"},\"content\":20,\"label\":\"long\"},{\"leaf\":{\"score\":3,\"name\":\"c\"},\"content\":true,\"label\":\"z\"},{\"maybe_text\":\"z\",\"maybe_leaf\":{\"score\":6,\"name\":\"ml\"},\"leaf\":{\"score\":4,\"name\":\"d\"},\"content\":{\"score\":5,\"name\":\"ef\"},\"label\":\"q\"}]")
+  print(rows.map(score).sum()?)
+  return Ok(())
+}
+"#;
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "json-scan-composite-copy-row", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "composite scanner source must type-check:\n{}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    assert!(
+        mir.fns.iter().any(|function| function.name == "main"),
+        "composite scanner must pass the pre-MIR validity gate:\n{}",
+        align_mir::print::program_to_string(&mir)
+    );
+    let out = build_and_run("json-scan-composite-copy-row", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "182\n");
+}
+
+#[test]
+fn json_scan_copy_composite_error_later() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+import core.json
+Leaf { score: i64, name: str }
+CopyContent { Text(str), Count(i64), Flag(bool), Object(Leaf) }
+CopyRow { maybe_i64: Option<i64>, maybe_f64: Option<f64>, maybe_bool: Option<bool>, maybe_text: Option<str>, maybe_leaf: Option<Leaf>, leaf: Leaf, content: CopyContent, label: str }
+fn describe(result: Result<i64, Error>) -> i32 = match result {
+  Ok(value) => value as i32,
+  Err(e) => match e {
+    NotFound => 10,
+    Invalid => 11,
+    Denied => 12,
+    Timeout => 13,
+    Code(c) => 20 + c,
+  },
+}
+fn main() -> i32 {
+  rows: json.scanner<CopyRow> := json.scan("[{\"leaf\":{\"score\":1,\"name\":\"a\"},\"content\":\"x\",\"label\":\"y\"},oops]")
+  return describe(rows.count())
+}
+"#;
+    let out = build_and_run("json-scan-composite-error-later", src);
+    assert_eq!(out.status.code(), Some(21));
+}
+
+#[test]
+fn json_scan_copy_row_copy_composites_no_owned_alloc() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(
+        r#"
+import core.json
+Leaf { score: i64, name: str }
+CopyContent { Text(str), Count(i64), Flag(bool), Object(Leaf) }
+CopyRow { maybe_i64: Option<i64>, maybe_f64: Option<f64>, maybe_bool: Option<bool>, maybe_text: Option<str>, maybe_leaf: Option<Leaf>, leaf: Leaf, content: CopyContent, label: str }
+fn main() -> Result<(), Error> {
+  rows: json.scanner<CopyRow> := json.scan("[]")
+  print(rows.count()?)
+  return Ok(())
+}
+"#,
+    );
+    let runtime_call = |needle: &str| ir.lines().any(|line| line.contains("call") && line.contains(needle));
+    assert!(ir.contains("align_rt_json_scan_next"), "scanner codegen lost its row-step call:\n{ir}");
+    assert!(!runtime_call("align_rt_alloc"), "a composite Copy scanner row must not allocate an owned row field:\n{ir}");
+    assert!(!runtime_call("align_rt_arena_alloc"), "a composite Copy scanner row must not allocate an arena row field:\n{ir}");
+}
+
+#[test]
+fn json_scan_reassignment_uses_parameter_spelling() {
+    let diagnostics = check_diagnostics(
+        "json-scan-reassignment-spelling",
+        r#"import core.json
+Owned { xs: array<i64> }
+fn replace(rows: json.scanner<Owned>) -> Result<(), Error> {
+  rows = json.scan("[]")
+  return Ok(())
+}
+fn main() -> Result<(), Error> {
+  return replace(json.scan("[]"))
+}
+"#,
+    );
+    assert!(
+        diagnostics.contains(
+            "`json.scan` row type 'Owned' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot"
+        ),
+        "unexpected diagnostics:\n{diagnostics}"
+    );
 }
 
 #[test]

@@ -1,0 +1,7 @@
+import core.json
+Row { score: i64 }
+fn main() -> Result<(), Error> {
+  rows: json.scanner<Row> := json.scan("[{\"score\":1},{\"score\":2}]")
+  print(rows.score.sum()?)
+  return Ok(())
+}

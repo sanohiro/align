@@ -1580,6 +1580,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
         && validate_hir::type_placement_metadata_is_valid(program)
         && validate_hir::nominal_link_metadata_is_valid(program)
         && validate_hir::declaration_header_metadata_is_valid(program)
+        && validate_hir::json_scan_validation_reason(program).is_ok()
         && validate_hir::body_only_metadata_is_valid(program)
         && align_sema::checked_hir_body_facts_are_valid(program)
 }

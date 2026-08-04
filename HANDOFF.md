@@ -5,7 +5,21 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-03. `main` includes the shipped wave through #688 plus the merged am-p
+_Last updated: 2026-08-05._ The current branch is `agent/pkg-db-am-b4-activate`, integrating
+AM-B4 activation head `22e5ba3` with current `main` `e65448b7`. The integration preserves both the
+complete checked-HIR body gate and Request 6's active `json.scan` envelope/Copy gate. Conflict
+closure is complete. The integrated MIR library owner passes 99/99 and the Request 6 generic-return
+context driver owner passes 9/9 after the dedicated target's explicit runtime build. The fresh
+review of the pre-integration AM-B4 range found one P2: an unused orphan nonparameter local record
+was not required to have a binding. Production validation now requires exactly one `Let`,
+`LetTuple`, or match-payload binding, and the four-entrypoint regression owner passes. A separate
+focused sema replay launch remained at 0% CPU in macOS `_dyld_start` and was stopped and preserved
+as INCOMPLETE; the MIR owner exercises the integrated replay path successfully. A fresh exact-SHA
+review, final preflight, and a PR to `main` are pending. The cross-worktree Request 6
+identity owner must bind the committed integration head. Stacked AM-C1 draft #702 and AM-C2a1 draft
+#705 remain open behind this prerequisite. No public `pkg.db` surface exists yet.
+
+Historical AM-B4 activation record: as of 2026-08-03, `main` included the shipped wave through #688 plus the merged am-p
 placement-validation PR #690 (`39f9c7d`), am-n nominal/link PR #691 (`755cb9c`), am-h
 declarations/headers PR #692 (`f7ebcb4`), am-b1 dormant body validation PR #694
 (`b4b2d19`), am-b2a storage/vector/array body validation PR #695 (`96b16cc`), bounded task-wait
@@ -76,6 +90,29 @@ incomplete host invocations.
 The narrow `align_sema` test binary was then launched directly with a dedicated `TMPDIR`, fixed
 `DEVELOPER_DIR`, and the prior dyld setting; it still produced no listing within 20 seconds and is
 recorded as INCOMPLETE in `.git/am-b4-followup-body-incomplete.log`.
+Historical Request 6 record: as of 2026-08-04, the current branch was `agent/align-llm-request6-implementation-v2`; the
+implementation code head is `aa5bb7d`, with the expected-seed, return-spelling, and
+diagnostic-order repairs implemented. The current branch also contains this continuity-only
+handoff commit; its exact branch-head SHA is bound by the final review and preflight records rather
+than self-referenced here. The earlier
+implementation commit `43211ec` is followed by consolidated review repair `2688681` and the
+baseline-compatible identity-harness repair `50912db`. The branch is based on implementation
+checkpoint `8b55352` plus the reviewed Align Request 6 design head `712317b`, merged in Align at
+`0ab7a30d6e7bfda56d4c8145b4672306634b9fea`. The implementation is complete, but PR #704 is not
+yet merged. The PR branch contains the pushed implementation through `aa5bb7d` plus the
+continuity-only Handoff update. Focused verification and the identity probe pass at the
+implementation head. Fresh final review, preflight attestation, hosted CI, and merge are pending.
+No `.align-revision` adoption pin or align-llm `make ci` verification exists yet.
+
+## Active Request 6 implementation checkpoint
+
+- Complete: reason-valued scanner envelope validation with Span-first precedence; generic return-context inference and failed-call non-publication; Copy composite runtime and allocation fixtures; imported whole/per-unit coverage; cache rejection/revert coverage; identity owner test and comparison script; explicit rejection of partially substituted generic composites before argument checking.
+- Complete: the independent review finding at `2858d63` is closed by `1ac708d` and `5663c23`. Inferred scanner-typed locals now retain initializer spelling, generic-call results propagate spelling through their scanner arguments, and lambda captures inherit the repaired local map; no HIR field was added.
+- Complete: the final-review P2s at `2f0c7b5` are closed by design commit `a8719cf` and implementation commit `c241beb`. Expected-return seeding now validates concrete leaves before arguments, and generic call expressions carry producer-owned annotated return spelling even without a scanner argument. The repair adds m5 and cache no-publication owners; no HIR field was added.
+- Verification at `aa5bb7d`: generic m5 owners pass 11/11, imported-module owners pass 4/4, and the cache generic no-publication owner passes 1/1. `cargo +1.96.1 test -p align_sema --lib function_return_completeness_matrix -- --nocapture`, `cargo +1.96.1 check -p align_sema -p align_mir -p align_driver --tests --locked`, the matching clippy command, `scripts/test-pr.sh`, and `git diff --check` pass. The full m5 aggregate is 193/198; the same five known pre-existing link/diagnostic failures remain outside Request 6. `scripts/compare-json-scan-identity.sh HEAD` passes with interface, MIR, raw LLVM, object bytes, and non-build-id CodegenKey fields matching the fixed baseline while compiler-isolated identity fields differ as required.
+- Review: the independent review found three valid P1 generic-inference findings and five P2 coverage/state findings; all were consolidated in `2688681`, with the identity-harness compatibility repair in `50912db`. A later independent final pass found one additional P1: a partially substituted `Result<T, U>` expected argument could reach constructor checking without a sound partial-type contract. The closure matrix was reopened; `b5b3f4d` narrows the contract and `7b88b97` rejects the state before checking or publishing the argument. The redesigned independent pass at `2858d63` found the alias/call-result spelling gap; `1ac708d` updated the contract and `5663c23` closed its first root-cause class. Final reviews at `2f0c7b5` found the concrete expected-seed and no-scanner-argument return-spelling gaps; `a8719cf` updated the contract and `c241beb` closes both with exact owners. Final HOST and INDEPENDENT reviews at `f467ddb` and `e6bf75f` found only stale Handoff continuity metadata; this final continuity-only update removes the obsolete Handoff action and distinguishes the implementation head from the externally SHA-bound branch head. Fresh final review evidence must bind the final pushed repair head.
+- Next, in order: obtain fresh SHA-bound clean review evidence for the final continuity-only branch head, run preflight and hosted CI, merge, refresh `.align-revision`, and run `make ci` as the real-client adoption gate. This is the terminal PR for the current user goal; do not start another PR or roadmap item after it.
+- Constraints: baseline identity is Align `576e57307fe4ef34e74566f5e389a2f0e2a04acd`; implementation must not consume hypothetical Align APIs; Request 7 remains blocked until this implementation is merged and verified by align-llm.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -123,8 +160,11 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **align-llm requests:** all filed requests are complete and answered in
-  `../align-llm/docs/align-requests.md`.
+- **align-llm requests:** Requests 4–14 remain proposed in
+  `../align-llm/docs/align-requests.md`; Request 6 is accepted with its reviewed design merged in
+  Align PR #703. Its implementation/adoption is the active work on the branch named above. No
+  release pin or align-llm adoption verification exists yet. Request 9 remains the later C7
+  blocker.
 
 ## Latest shipped wave
 
@@ -562,10 +602,11 @@ successful compile and benchmark evidence rather than treated as a test pass.
 
 PR #694 completes the dormant am-b1 body-core validator: statements, ordinary expressions,
 calls, aggregates, tagged values, and structured control are checked through an explicit
-child-first worklist without public activation. PR #695 adds the dormant am-b2a
+child-first worklist without general public activation. PR #695 adds the dormant am-b2a
 storage/vector/array records. The next slice is am-b2b1 for pipeline and array-view records;
-am-b2b2 then adds templates, JSON, groups, and dictionary records, followed by am-b3, am-b4,
-and am-c typed callable namespaces.
+am-b2b2 then adds templates, JSON, groups, and dictionary records. Request 6's scanner Copy
+predicate is the one narrow pre-lowering safety exception and must be routed through the active
+`hir_program_is_valid` gate; am-b3, am-b4, and am-c typed callable namespaces follow.
 
 ### am-b2b1 working checkpoint (2026-08-02)
 
@@ -705,6 +746,33 @@ and the macOS release-build CI path. A local `cargo build --release --workspace`
 was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
+
+Request 6 implementation and its consolidated review repairs are complete in this worktree but are
+not yet merged. Ordinary JSON decode, encode, and scope Drop retain the currently admitted
+`Option<Move-struct>` shape; only the scanner path is Copy-gated, while partial-error cleanup remains
+a separate ownership request. For imported/per-unit consumers, interface/import reconstruction
+precedes active `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source
+sema gate uses the canonical recursive `DropPlan`; the active HIR replay walks direct expression
+children iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and
+malformed-row definitions without activating the dormant body validator. The repair also preserves
+outer scanner source spelling through bare generic calls, stops at the first generic argument error,
+snapshots all cache-owned files on rejected walks, closes valid-Span precedence pairs, and exercises
+the production CodegenKey classifier and non-build-id digest.
+
+Latest verification on `aa5bb7d`: `scripts/test-pr.sh` passes (workspace build, all bounded library
+tests, interface/formatter integration tests, and m0); `cargo +1.96.1 test -p align_sema --lib
+function_return_completeness_matrix -- --nocapture` passes; generic m5 owners pass 11/11; imported
+module owners pass 4/4; the cache generic no-publication owner passes 1/1; the full m5 aggregate is
+193 passed / 5 known pre-existing failures; and `scripts/compare-json-scan-identity.sh HEAD` passes
+with the required baseline parity and compiler-isolated identity. `cargo +1.96.1 check -p align_sema
+-p align_mir -p align_driver --tests --locked`, the matching clippy command, and `git diff --check`
+are clean. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
+workspace-wide rustfmt drift; the changed sema file shares that pre-existing file-wide drift.
+Fresh final review and preflight evidence must bind the final pushed head.
+Do not update `.align-revision` or the align-llm Request 6 verification status until this
+implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
+gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
+references, ordinary Move-option boundary checks, and hosted checks all passed.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

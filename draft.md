@@ -2259,6 +2259,32 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 `scan` cover it), and no public `field_table<T>` (a compiler-internal artifact).
 `doc` is the schema-unknown tier — see §14.
 
+`json.scan` accepts only a recursively Copy row: the complete reachable row definition graph must
+require no `Drop` under Align's canonical ownership classification. Among rows admitted by the
+existing JSON decode schema, a direct or transitive owned `array<T>`, `array<Struct>`, owning option
+payload, or owning union payload is rejected at the scanner call with the exact diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape, such as an owned `string` or `array<string>` that fails the existing
+schema whitelist, retains that schema diagnostic instead. This is a scanner-only restriction; the
+same declaration remains an ordinary valid type and keeps its existing non-scanner JSON behavior.
+The placeholder is the declared public local/imported spelling with concrete generic arguments;
+internal `$`-mangled and monomorph-interner names never appear. The check is semantic and precedes
+input validation, MIR, descriptor construction, and runtime side effects.
+
+The scanner generic boundary is concrete-row-only. Concrete generic monomorphs
+such as `Wrap<i64>` remain eligible after row resolution, and ordinary generic
+calls use the expected-return propagation rule owned by
+`align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain
+their deterministic `i64`/`f64` defaults. An unresolved `Wrap<T>` /
+`json.scanner<Wrap<T>>` type argument inside a generic function retains the exact
+resolver diagnostic `instantiating a generic struct with a type parameter
+('Row<…>' inside a generic function) is not supported yet`. That unresolved-row
+capability is a separate compiler prerequisite, not an implied scanner surface.
+
 A struct field may itself be a `Struct`: `decode` recurses into the nested object
 and `encode` renders it back, so a nested record round-trips in declaration order
 (unknown keys are still skipped at every level, and nested `str` fields stay
@@ -2267,8 +2293,12 @@ scalar / `str` / nested struct): decode maps a missing key or JSON `null` to
 `None`, a type mismatch to `Err`, and a present value to `Some`; encode **omits**
 a `None` field entirely (never `"k": null`), so `decode(encode(x))` round-trips.
 A non-`Option` field still errors when its key is missing — optionality is
-declared in the type, never inferred. An Option payload must be non-owned in v1;
-`Option<struct>` decode and encode are implemented for non-Move payload structs.
+declared in the type, never inferred. The Decode schema admits scalar, borrowed-
+`str`, and nested-struct Option payloads, including the currently admitted
+`Option<Move-struct>` shape. Ordinary decode, encode, and scope Drop preserve
+that admitted shape; a known partial-error cleanup defect after a later required
+sibling fails is a separate ownership request. The scanner-only Copy restriction
+does not narrow ordinary JSON behavior.
 A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
@@ -2332,7 +2362,8 @@ arena, bulk-freed).
 `json.scan` streams NDJSON or a top-level array as typed rows without
 materializing the whole input; the row type comes from the binding annotation and
 the scanner is a pipeline source (row views borrow the current chunk and die with
-the stage):
+the stage). The row must be recursively Copy because the scanner reuses one row
+slot without per-row `Drop`:
 
 ```align
 rows: json.scanner<Event> := json.scan(view)

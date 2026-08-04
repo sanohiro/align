@@ -57,23 +57,33 @@ fn declaration_header_program() -> hir::Program {
             params: vec![0],
             captures: Vec::new(),
         },
-        locals: vec![hir::Local {
-            id: 0,
-            name: "value".to_string(),
-            ty: Ty::Str,
-            is_mut: false,
-            is_param: true,
-            align: None,
-        }, hir::Local {
-            id: 1,
-            name: "unused".to_string(),
-            ty: Ty::Str,
-            is_mut: false,
-            is_param: false,
-            align: None,
-        }],
+        locals: vec![
+            hir::Local {
+                id: 0,
+                name: "value".to_string(),
+                ty: Ty::Str,
+                is_mut: false,
+                is_param: true,
+                align: None,
+            },
+            hir::Local {
+                id: 1,
+                name: "copy".to_string(),
+                ty: Ty::Str,
+                is_mut: false,
+                is_param: false,
+                align: None,
+            },
+        ],
         body: hir::Block {
-            stmts: Vec::new(),
+            stmts: vec![hir::Stmt::Let {
+                local: 1,
+                init: hir::Expr {
+                    kind: hir::ExprKind::Local(0),
+                    ty: Ty::Str,
+                    span,
+                },
+            }],
             value: Some(Box::new(hir::Expr {
                 kind: hir::ExprKind::Local(0),
                 ty: Ty::Str,
@@ -212,6 +222,7 @@ fn summary_header_program() -> hir::Program {
     ];
     program.fns[0].locals[1].ty = Ty::Str;
     program.fns[0].locals[1].is_param = true;
+    program.fns[0].body.stmts.clear();
     program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
         params: vec![0, 1],
         captures: Vec::new(),
@@ -687,6 +698,390 @@ fn valid_header_does_not_consume_body_facts() {
 }
 
 #[test]
+fn hir_body_validator_json_scan_copy_row() {
+    let input = body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str);
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(input),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program
+        .fns
+        .push(body_unit_case("json_scan_copy_row", scanner.clone()));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&program));
+
+    program.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&program));
+
+    let nested_scanner = body_test_expr(
+        hir::ExprKind::Block(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(scanner.clone())),
+        }),
+        Ty::JsonScanner(0),
+    );
+    let mut nested_program = baseline_program();
+    nested_program
+        .fns
+        .push(body_unit_case("json_scan_nested_copy_row", nested_scanner));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&nested_program));
+    nested_program.structs[0].fields[0].ty = Ty::Char;
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&nested_program));
+
+    let mut missing_struct = baseline_program();
+    missing_struct.fns.push(body_unit_case(
+        "json_scan_missing_row",
+        body_test_expr(
+            hir::ExprKind::JsonScan {
+                struct_id: 99,
+                input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+            },
+            Ty::JsonScanner(99),
+        ),
+    ));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&missing_struct));
+
+    let mut cyclic_struct = baseline_program();
+    cyclic_struct.structs[0].fields[0].ty = Ty::Struct(0);
+    cyclic_struct
+        .fns
+        .push(body_unit_case("json_scan_cyclic_row", scanner.clone()));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&cyclic_struct));
+
+    let mut optional_owned = baseline_program();
+    optional_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    optional_owned.structs[0].fields[0].ty = Ty::Option(Scalar::Struct(1));
+    optional_owned
+        .fns
+        .push(body_unit_case("json_scan_optional_owned_row", scanner.clone()));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&optional_owned));
+
+    let mut union_owned = baseline_program();
+    union_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    union_owned.enums.push(EnumDef {
+        name: "OwnedChoice".to_string(),
+        source_name: "OwnedChoice".to_string(),
+        variants: vec![EnumVariant {
+            name: "Value".to_string(),
+            payload: vec![Scalar::Struct(1)],
+            field_base: 1,
+        }],
+    });
+    union_owned.structs[0].fields[0].ty = Ty::Enum(1);
+    union_owned
+        .fns
+        .push(body_unit_case("json_scan_union_owned_row", scanner));
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&union_owned));
+}
+
+#[test]
+fn hir_program_json_scan_copy_row() {
+    let input = body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str);
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(input),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_copy_row", scanner));
+    assert!(validate_hir::json_scan_copy_rows_are_valid(&program));
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&program),
+        Ok(()),
+        "the accepted scanner envelope must pass the reason seam"
+    );
+    assert!(align_sema::checked_hir_body_depth_is_valid(&program));
+    assert!(validate_hir::global_type_metadata_is_valid(&program));
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+
+    let source_map = SourceMap::new();
+    let mut invalid_schema = program.clone();
+    invalid_schema.structs[0].fields[1].ty = Ty::Char;
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&invalid_schema));
+    for lowered in [
+        lower_program(&invalid_schema),
+        lower_program_located(&invalid_schema, &source_map),
+        lower_program_per_unit(&invalid_schema),
+        lower_program_per_unit_located(&invalid_schema, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "invalid scanner schema published MIR");
+    }
+
+    let mut direct_owned = program.clone();
+    direct_owned.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    let mut transitive_owned = program.clone();
+    transitive_owned.structs.push(StructDef {
+        name: "OwnedRecord".to_string(),
+        source_name: "OwnedRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "xs".to_string(),
+            ty: Ty::DynArray(scalar_int(64)),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    transitive_owned.structs[0].fields[0].ty = Ty::Struct(1);
+    for owned in [direct_owned, transitive_owned] {
+        assert!(!validate_hir::json_scan_copy_rows_are_valid(&owned));
+        for lowered in [
+            lower_program(&owned),
+            lower_program_located(&owned, &source_map),
+            lower_program_per_unit(&owned),
+            lower_program_per_unit_located(&owned, &source_map),
+        ] {
+            assert!(is_empty(&lowered), "owned scanner row published MIR");
+        }
+    }
+
+    let mut missing_row = program.clone();
+    missing_row.fns[0].body = hir::Block {
+        stmts: vec![hir::Stmt::Expr(body_test_expr(
+            hir::ExprKind::JsonScan {
+                struct_id: 99,
+                input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+            },
+            Ty::JsonScanner(99),
+        ))],
+        value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+    };
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&missing_row));
+
+    let mut cyclic_row = program.clone();
+    cyclic_row.structs[0].fields[0].ty = Ty::Struct(0);
+    assert!(!validate_hir::json_scan_copy_rows_are_valid(&cyclic_row));
+
+    let mut invalid_span = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut invalid_span.fns[0].body.stmts[0] {
+        expression.span = align_span::Span::new(0, 2, 1);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_span),
+        Err(validate_hir::JsonScanValidationReason::InvalidSpan)
+    );
+
+    let mut wrong_stored_type = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut wrong_stored_type.fns[0].body.stmts[0] {
+        expression.ty = Ty::JsonScanner(99);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&wrong_stored_type),
+        Err(validate_hir::JsonScanValidationReason::StoredType)
+    );
+
+    let mut unknown_row = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut unknown_row.fns[0].body.stmts[0] {
+        if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+            *struct_id = 99;
+        }
+        expression.ty = Ty::JsonScanner(99);
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&unknown_row),
+        Err(validate_hir::JsonScanValidationReason::UnknownRow)
+    );
+
+    let mut wrong_input_type = program.clone();
+    if let hir::Stmt::Expr(expression) = &mut wrong_input_type.fns[0].body.stmts[0]
+        && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+    {
+        input.ty = Ty::String;
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&wrong_input_type),
+        Err(validate_hir::JsonScanValidationReason::InputType)
+    );
+
+    let mut invalid_schema_reason = program.clone();
+    invalid_schema_reason.structs[0].fields[1].ty = Ty::Char;
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_schema_reason),
+        Err(validate_hir::JsonScanValidationReason::Schema)
+    );
+
+    let mut invalid_copy = program.clone();
+    invalid_copy.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&invalid_copy),
+        Err(validate_hir::JsonScanValidationReason::Copy)
+    );
+
+    // The scanner envelope has one explicit exception to the universal span rule: its enclosing
+    // expression span wins even when a later field is independently malformed. Keep every pair in
+    // the precedence matrix so a future validator cannot accidentally reorder these checks while
+    // preserving the one-fault cases above.
+    let paired_reason = |mut candidate: hir::Program, expected| {
+        if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+            expression.span = align_span::Span::new(0, 2, 1);
+        }
+        assert_eq!(
+            validate_hir::json_scan_validation_reason(&candidate),
+            Err(expected)
+        );
+    };
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                expression.ty = Ty::JsonScanner(99);
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+                    *struct_id = 99;
+                }
+                expression.ty = Ty::JsonScanner(99);
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0]
+                && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+            {
+                input.ty = Ty::String;
+            }
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            candidate.structs[0].fields[1].ty = Ty::Char;
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+    paired_reason(
+        {
+            let mut candidate = program.clone();
+            candidate.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64));
+            candidate
+        },
+        validate_hir::JsonScanValidationReason::InvalidSpan,
+    );
+}
+
+#[test]
+fn hir_program_json_scan_envelope_mismatch() {
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_envelope_mismatch", scanner));
+    if let hir::Stmt::Expr(expression) = &mut program.fns[0].body.stmts[0]
+        && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+    {
+        input.ty = Ty::String;
+    }
+    assert_eq!(
+        validate_hir::json_scan_validation_reason(&program),
+        Err(validate_hir::JsonScanValidationReason::InputType)
+    );
+}
+
+#[test]
+fn hir_program_json_scan_envelope_precedence_matrix() {
+    let scanner = body_test_expr(
+        hir::ExprKind::JsonScan {
+            struct_id: 0,
+            input: Box::new(body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str)),
+        },
+        Ty::JsonScanner(0),
+    );
+    let mut program = baseline_program();
+    program.fns.push(body_unit_case("json_scan_envelope_precedence", scanner));
+
+    let set_fault = |candidate: &mut hir::Program, fault: usize| {
+        match fault {
+            0 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                    expression.ty = Ty::JsonScanner(1);
+                }
+            }
+            1 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0] {
+                    if let hir::ExprKind::JsonScan { struct_id, .. } = &mut expression.kind {
+                        *struct_id = 99;
+                    }
+                    expression.ty = Ty::JsonScanner(99);
+                }
+            }
+            2 => {
+                if let hir::Stmt::Expr(expression) = &mut candidate.fns[0].body.stmts[0]
+                    && let hir::ExprKind::JsonScan { input, .. } = &mut expression.kind
+                {
+                    input.ty = Ty::String;
+                }
+            }
+            3 => candidate.structs[0].fields[1].ty = Ty::Char,
+            4 => candidate.structs[0].fields[0].ty = Ty::DynArray(scalar_int(64)),
+            _ => unreachable!("five scanner-envelope fault classes"),
+        }
+    };
+    let reasons = [
+        validate_hir::JsonScanValidationReason::StoredType,
+        validate_hir::JsonScanValidationReason::UnknownRow,
+        validate_hir::JsonScanValidationReason::InputType,
+        validate_hir::JsonScanValidationReason::Schema,
+        validate_hir::JsonScanValidationReason::Copy,
+    ];
+    for first in 0..reasons.len() {
+        for second in (first + 1)..reasons.len() {
+            let mut candidate = program.clone();
+            set_fault(&mut candidate, second);
+            // Apply the lower-priority mutation first: the stored-type and unknown-row cases share
+            // the expression's type field, and the higher-priority fault must remain observable.
+            set_fault(&mut candidate, first);
+            assert_eq!(
+                validate_hir::json_scan_validation_reason(&candidate),
+                Err(reasons[first]),
+                "valid-Span scanner envelope precedence must choose fault {first} over {second}"
+            );
+        }
+    }
+}
+
+
+#[test]
 fn malformed_hir_body_metadata_fails_closed() {
     let mut program = declaration_header_program();
     program.fns[0].return_borrow = ReturnBorrowSummary::None;
@@ -733,6 +1128,34 @@ fn malformed_hir_body_structure_precedes_fact_replay() {
         lower_program_per_unit_located(&program, &source_map),
     ] {
         assert!(is_empty(&lowered), "malformed body structure published MIR");
+    }
+}
+
+#[test]
+fn malformed_hir_unused_local_record_fails_closed() {
+    let mut program = declaration_header_program();
+    program.fns[0].locals.push(hir::Local {
+        id: 2,
+        name: "orphan".to_string(),
+        ty: Ty::Str,
+        is_mut: false,
+        is_param: false,
+        align: None,
+    });
+    assert!(validate_hir::global_type_metadata_is_valid(&program));
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    assert!(validate_hir::nominal_link_metadata_is_valid(&program));
+    assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+    assert!(!validate_hir::body_only_metadata_is_valid(&program));
+
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&program),
+        lower_program_located(&program, &source_map),
+        lower_program_per_unit(&program),
+        lower_program_per_unit_located(&program, &source_map),
+    ] {
+        assert!(is_empty(&lowered), "unused orphan local published MIR");
     }
 }
 
@@ -875,6 +1298,7 @@ fn body_contract_function_root_completion() {
     ));
     assert!(body_core_metadata_is_valid(&non_unit_return));
 }
+
 
 #[test]
 fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {

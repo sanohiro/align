@@ -38,6 +38,101 @@ pub(crate) fn declaration_header_metadata_is_valid(program: &hir::Program) -> bo
     DeclarationValidator::new(program).validate()
 }
 
+/// The first active-HIR envelope or row-graph reason for rejecting a `JsonScan` expression.
+///
+/// This is deliberately compiler-internal observability for the precedence matrix. It is not a
+/// user-facing diagnostic and production lowering continues to consume the boolean gate below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsonScanValidationReason {
+    InvalidSpan,
+    StoredType,
+    UnknownRow,
+    InputType,
+    Schema,
+    Copy,
+}
+
+/// Validate the active scanner-only JSON envelope and ownership boundary before MIR can allocate
+/// a reusable row slot.
+///
+/// The scanner envelope is intentionally checked in its own order. `JsonScan` is the one active
+/// exception to the universal stored-field-before-span rule: the enclosing expression span is
+/// checked first, then the stored scanner type, row id, input type, Decode schema, and recursive
+/// Copy predicate. This producer-independent pass rechecks whole-program, imported, per-unit, or
+/// handcrafted checked HIR without activating the dormant body validator.
+pub(crate) fn json_scan_validation_reason(
+    program: &hir::Program,
+) -> Result<(), JsonScanValidationReason> {
+    let mut work = Vec::new();
+    for function in &program.fns {
+        for statement in &function.body.stmts {
+            push_statement_expressions(statement, &mut work);
+        }
+        if let Some(value) = function.body.value.as_deref() {
+            work.push(value);
+        }
+    }
+
+    while let Some(expression) = work.pop() {
+        if let hir::ExprKind::JsonScan { struct_id, input } = &expression.kind {
+            if !valid_span(expression.span) {
+                return Err(JsonScanValidationReason::InvalidSpan);
+            }
+            if expression.ty != Ty::JsonScanner(*struct_id) {
+                return Err(JsonScanValidationReason::StoredType);
+            }
+            if program.structs.get(*struct_id as usize).is_none() {
+                return Err(JsonScanValidationReason::UnknownRow);
+            }
+            if input.ty != Ty::Str {
+                return Err(JsonScanValidationReason::InputType);
+            }
+            if !body_core::json_struct_descriptor_is_valid(program, *struct_id, false) {
+                return Err(JsonScanValidationReason::Schema);
+            }
+            if !align_sema::json_scan_row_is_copy(
+                *struct_id,
+                &program.structs,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                return Err(JsonScanValidationReason::Copy);
+            }
+        }
+        work.extend(align_sema::direct_expr_children(expression));
+    }
+    Ok(())
+}
+
+/// Boolean production caller for the active scanner gate. Keep this wrapper stable so the four
+/// MIR lowerers have one unchanged fail-closed entrypoint while the reason-valued seam remains
+/// available to the crate's precedence tests.
+#[allow(dead_code)]
+pub(crate) fn json_scan_copy_rows_are_valid(program: &hir::Program) -> bool {
+    json_scan_validation_reason(program).is_ok()
+}
+
+fn push_statement_expressions<'a>(statement: &'a hir::Stmt, work: &mut Vec<&'a hir::Expr>) {
+    match statement {
+        hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => work.push(init),
+        hir::Stmt::Assign { value, .. }
+        | hir::Stmt::AssignVecLane { value, .. }
+        | hir::Stmt::AssignField { value, .. } => work.push(value),
+        hir::Stmt::AssignIndex { index, value, .. }
+        | hir::Stmt::AssignElemField { index, value, .. }
+        | hir::Stmt::AssignElem { index, value, .. } => {
+            work.push(index);
+            work.push(value);
+        }
+        hir::Stmt::Return(value) | hir::Stmt::Break { value, .. } => {
+            if let Some(value) = value.as_ref() {
+                work.push(value);
+            }
+        }
+        hir::Stmt::Expr(expression) => work.push(expression),
+    }
+}
+
 /// Validate the am-b1 through am-b3 structural and type envelope of stored HIR bodies.
 ///
 /// Am-b1 through am-b3 own this body range; am-b4 owns the single public activation and the
@@ -2074,6 +2169,14 @@ mod body_core {
         BodyValidator::new_for_body_fixtures(program).validate()
     }
 
+    pub(super) fn json_struct_descriptor_is_valid(
+        program: &hir::Program,
+        struct_id: u32,
+        encode: bool,
+    ) -> bool {
+        BodyValidator::new(program).json_struct_descriptor_ok(struct_id, encode)
+    }
+
 #[derive(Clone, Copy)]
 struct SpawnContext {
     fallible: bool,
@@ -2634,13 +2737,18 @@ impl<'a> BodyValidator<'a> {
                 .get(&(function_index, local.id))
                 .copied()
                 .unwrap_or(0);
-            // Whether a local is a signature parameter is an am-h header fact.  The dormant
-            // body-core pass must not infer that role from `Local::is_param`: a malformed header
-            // must be rejected by the declaration validator before this pass is activated.  Body
-            // validation only rejects a body declaration that tries to bind a declared parameter;
-            // locals introduced by later body slices may remain unbound until their producer slice
-            // supplies the corresponding declaration/initialization record.
-            !parameters.contains(&local.id) || count == 0
+            if parameters.contains(&local.id) {
+                count == 0
+            } else if self.allow_implicit_local_params {
+                // Dormant body fixtures predate the am-b4 activation contract and may model an
+                // otherwise unbound local as an implicit parameter. Production validation never
+                // enables this compatibility path.
+                count <= 1
+            } else {
+                // Every production nonparameter local is introduced exactly once by Let,
+                // LetTuple, or a match payload. Reject even an unused orphan table record.
+                count == 1
+            }
         })
     }
 

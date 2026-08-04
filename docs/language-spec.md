@@ -401,7 +401,11 @@ position is re-checked against the declared set and rejected). A struct field ma
 round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
-`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). A field may also
+`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field
+contract also admits the current Decode schema's `Option<Move-struct>` nested-record shape. Ordinary
+decode, encode, and scope Drop preserve that admitted shape; a known partial-error cleanup defect
+after a later required sibling fails is a separate ownership request. The scanner-only Copy
+restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;
@@ -465,8 +469,32 @@ json.scan
 `decode`/`encode` take no written type argument — the target type comes from
 context (`u: User := json.decode(d)?`) or the value argument; Align has no
 expression-position type-argument syntax (no turbofish); `scan`'s row type comes
-from the binding annotation the same way. This is the complete surface —
+from the binding annotation the same way. A scan row must be recursively Copy:
+its complete reachable definition graph must require no `Drop`; among rows admitted
+by the existing JSON decode schema, a direct or transitive owned `array<T>`,
+`array<Struct>`, owning option payload, or owning union payload is rejected before
+MIR or runtime construction with the exact diagnostic:
+
+```text
+`json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
+```
+
+An unsupported JSON field shape, such as an owned `string` or `array<string>` that
+fails the existing schema whitelist, retains that schema diagnostic instead. The
+diagnostic placeholder uses the declared public local/imported spelling with concrete
+generic arguments; internal `$`-mangled and monomorph-interner names never appear.
+This restriction is scanner-only; the declaration remains a valid ordinary type. This is the complete surface —
 `validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
+
+The scanner generic boundary is concrete-row-only. Concrete generic monomorphs
+such as `Wrap<i64>` remain eligible after row resolution, and ordinary generic
+calls use expected-return propagation owned by `align_sema::Checker::check_generic_call`;
+numeric `IntVar`/`FloatVar` retain deterministic `i64`/`f64` defaults. An
+unresolved `Wrap<T>` / `json.scanner<Wrap<T>>` type argument inside a generic
+function retains the exact resolver diagnostic `instantiating a generic struct
+with a type parameter ('Row<…>' inside a generic function) is not supported yet`.
+That unresolved-row capability is a separate compiler prerequisite, not an
+implicit extension of the scanner surface.
 
 ### Templates
 
