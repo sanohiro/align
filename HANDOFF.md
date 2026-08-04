@@ -19,7 +19,15 @@ implementation or release pin exists. The fresh preflight review of `def2fe6` fo
 documentation-only P2: the Request 6 source-of-truth map used a stale Japanese path and omitted the
 two changed implementation ledgers. The current follow-up repair corrects both mirrors and names
 the exact ledger paths; it does not change the scanner contract or implementation scope. The repair
-is committed as `4832d8b`.
+is committed as `4832d8b`. The implementation preflight reopened this design after finding that
+the active scanner replay did not validate the full HIR envelope, and that the implementation gate
+needed explicit generic return-context, per-unit reconstruction, cross-compiler identity, and
+composite runtime/allocation owners. The focused independent review of that follow-up found six
+additional P2/P3 contract gaps: validation-order precedence, generic unresolved/ambiguous rules,
+the active-gate/ledger owner mapping, reproducible identity inputs, composite Some/None/union/string
+coverage, and one omitted envelope-test anchor. The current uncommitted consolidated repair updates
+the English and Japanese JSON mirrors plus the HIR validation ledger for all six; its fresh focused
+review is still pending.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
@@ -666,8 +674,9 @@ expands. After this design is accepted, implement the scanner-only recursive Cop
 separate slice; do not update the align-llm compiler pin until that implementation is merged and its
 adoption gate passes. On `4832d8b`, `git diff --check`, exact-diagnostic consistency, active-gate
 references, ordinary Move-option boundary checks, and `scripts/pre-pr.sh --reviewer
-codex-final-redesign --owner-test docs-request6-contract` all passed. Compiler tests, builds, and
-`make ci` are N/A until executable code changes.
+codex-final-redesign --owner-test docs-request6-contract` all passed before the current six-finding
+repair. Rerun those static/design checks and the focused review after the consolidated repair;
+compiler tests, builds, and `make ci` remain N/A until executable code changes.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility

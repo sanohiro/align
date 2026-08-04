@@ -270,12 +270,17 @@ the few boundaries that remain:
 
   The source semantic check runs after the existing JSON decode-schema whitelist and before input-type
   checking, MIR construction, descriptor construction, or runtime calls. For a whole-program check,
-  the active `align_mir::hir_program_is_valid` pre-lowering gate then applies the same pure row
-  predicate to the checked HIR. For imported or per-unit consumers, interface/import reconstruction
-  first materializes the checked HIR; the active gate then applies the predicate to that reconstructed
-  HIR before MIR lowering, descriptor construction, or runtime calls. The gate never reconstructs
-  source spelling, and the dormant body validator is not a substitute. A schema-admitted rejected row
-  reports the exact source-level diagnostic:
+  the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete scanner
+  envelope and applies the same pure row predicate to the checked HIR. Its deterministic active-HIR
+  order is: (1) require `Expr.ty == Ty::JsonScanner(struct_id)`, (2) require the expression's
+  `struct_id` to resolve to an existing row definition, (3) require `input.ty == Ty::Str`, (4) run
+  the Decode-direction schema check, and (5) run the canonical recursive Copy check. The gate
+  rejects a failed envelope step before asking the descriptor walker to inspect the row graph. For
+  imported or per-unit consumers, interface/import reconstruction first materializes the checked HIR;
+  the active gate then applies this same five-step order and row predicate to that reconstructed HIR
+  before MIR lowering, descriptor construction, or runtime calls. The gate never reconstructs source
+  spelling, and the dormant `align_sema::checked_hir_body_facts_are_valid` body replay is not a
+  substitute. A schema-admitted rejected row reports the exact source-level diagnostic:
 
   ```text
   `json.scan` row type '<row-type-source-spelling>' must be Copy; Move rows need per-row Drop before the scanner can reuse its row slot
@@ -299,15 +304,15 @@ the few boundaries that remain:
   | --- | --- |
   | Public entrypoint | `rows: json.scanner<Row> := json.scan(view)`; the row type comes from the expected scanner annotation, not a written call-site type argument. The scanner is a pipeline source only. |
   | Input and result | `view` is the existing `str` input (or the existing explicit borrow from `string`); its region bounds the scanner. Supported fused terminals return the existing `Result<T, Error>` scalar result and preserve malformed-row and exhaustion behavior. |
-  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` owns source validation and source spelling. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate must then recheck the complete row graph with the canonical Copy predicate before MIR lowering, descriptor construction, or runtime calls. The dormant `body_core_metadata_is_valid` helper alone is insufficient and may share only pure predicate helpers. The existing MIR `JsonScan` lowering, LLVM emission, and `align_rt_json_scan_next` own accepted execution. The gate adds no runtime owner. |
+  | Compiler/runtime owner | `align_sema::Checker::check_json_scan` owns source validation and source spelling. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; all four MIR lowerers call the private `align_mir::hir_program_is_valid(&hir::Program) -> bool`, whose active Request 6 exception calls `validate_hir::json_scan_copy_rows_are_valid` in the five-step order above before MIR/runtime construction. This is distinct from dormant `align_sema::checked_hir_body_facts_are_valid`; only pure row-predicate helpers may be shared. The existing MIR `JsonScan` lowering, LLVM emission, and `align_rt_json_scan_next` own accepted execution. The gate adds no runtime owner. |
   | Row eligibility | `json.scan` accepts only a recursively non-owning row whose canonical `DropPlan` is valid and needs no drop. |
-  | Validation order | capability import, arity, scanner annotation/inference, existing JSON schema, recursive Copy check, then input `str` typing and region checks. |
+  | Validation order | Source: capability import, arity, scanner annotation/inference, existing JSON schema, recursive Copy check, then input `str` typing and region checks. Active HIR replay, in exact order: `Expr.ty == Ty::JsonScanner(struct_id)`, existing row id, `input.ty == Ty::Str`, Decode schema, recursive Copy check; reject before any descriptor or MIR consumer. |
   | Ownership | rejected rows construct no scanner, descriptor, row slot, allocation, or runtime side effect; accepted rows retain the existing borrowed input and Copy row slot. |
   | Diagnostic identity | use the producer-owned public local/imported/generic source spelling; never expose internal names or reconstruct spelling from HIR mangling. |
   | ABI and persistence | N/A: no source syntax, HIR/MIR node, descriptor, runtime ABI, wire format, or cache identity changes for accepted programs. |
   | Runtime cleanup | N/A for accepted rows because the complete row graph has no `Drop`; existing scanner input and scalar-accumulator cleanup remains authoritative. |
   | Compatibility prerequisite | The implementation PR is gated on this design and must retain the existing JSON schema and scanner terminal contracts. Request 6 align-llm adoption is a later consumer gate after the implementation release is pinned. |
-  | Acceptance and benchmark | The owner tests and the `json_scan_copy_row_no_owned_alloc` allocation probe below close the contract; performance is N/A and no benchmark improvement is claimed. |
+  | Acceptance and benchmark | The owner tests, `scripts/compare-json-scan-identity.sh` cross-compiler identity probe, and the `json_scan_copy_row_no_owned_alloc` allocation probe below close the contract; performance is N/A and no benchmark improvement is claimed. |
   | Source-of-truth map | This English design, `docs/impl/core-design/ja/json.md`, `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, `docs/open-questions.md`, `docs/impl/17-library-boundary-prerequisites.md`, `docs/impl/19-hir-validation-ledger.md`, and the align-llm Request 6 register must agree. |
   | Concurrent scanners | N/A to the compile-time gate; independent accepted scanners retain their existing independent handles and slots. |
   | Performance | N/A: no performance claim and no production MIR, codegen, or runtime change. |
@@ -321,26 +326,40 @@ the few boundaries that remain:
   | Type formation, row validation, and scanner construction | `align_sema::Checker::check_json_scan`; no scanner node is produced until schema and Copy checks pass | `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_rejects_owned_row_fields` |
   | Move-in, move-out, source nulling, replacement, and returned row ownership | N/A for an accepted row: `DropPlan` proves no Move field; the rejected path returns before construction | `m5::json_scan_copy_row_error_matrix`, `json_scan_copy_row_no_owned_alloc` |
   | `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, early terminal return, and malformed input | Existing scanner MIR/runtime control flow; no new ownership edge is admitted by this gate | `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_copy_row_error_matrix` |
-  | Direct, nested, optional, union, and invalid/cyclic schema graph | Canonical recursive `DropPlan`/JSON schema producer tables; fail closed on missing or invalid graph nodes. The active pre-lowering gate must apply the same pure predicate after interface/import reconstruction. | `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_row_schema_matrix`, `hir_body_validator_json_scan_copy_row`, `hir_program_json_scan_copy_row` |
-  | Generic monomorphization and imported source spelling | Type-resolution producer owns concrete public spelling; the Copy predicate consumes the fully resolved graph | `m5::json_scan_generic_row_ownership`, `modules::json_scan_imported_row_ownership` |
-  | Whole-program, per-unit, cold/hot cache, schema edit/revert | Existing structural MIR/cache identity remains owner; rejected rows publish no artifact | `cache_codegen::json_scan_row_schema_rejection`, accepted Copy-row MIR/raw-LLVM identity comparison |
-  | Interface serialization and persisted/wire identity | Interface/import reconstruction is an input to checked HIR for imported/per-unit consumers; the active gate validates that reconstructed HIR before MIR/runtime construction, while accepted source identity remains unchanged | `cargo test -p align_interface --test summary` plus `cache_codegen::json_scan_row_schema_rejection` |
-  | Runtime ownership provenance and allocation parity | Existing scanner input/accumulator owners; Copy rows allocate no owned row field | `json_scan_copy_row_no_owned_alloc` |
-  | Exhaustion, empty input, malformed first/later row, and `Result`/`?` cleanup | Existing scanner input and accumulator cleanup; row-slot cleanup is N/A by construction | `m5::json_scan_copy_row_error_matrix`, `m5::json_scan_copy_row_terminal_matrix` |
+  | Direct, nested, optional, union, and invalid/cyclic schema graph | Canonical recursive `DropPlan`/JSON schema producer tables; fail closed on missing or invalid graph nodes. The active pre-lowering gate must apply the same pure predicate after interface/import reconstruction. Its scanner envelope checks also fail closed on a mismatched expression type/id or non-`str` input. | `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_row_schema_matrix`, `hir_body_validator_json_scan_copy_row`, `hir_program_json_scan_copy_row`, `hir_program_json_scan_envelope_mismatch` |
+  | Generic monomorphization, return-context inference, and imported source spelling | Type-resolution producer owns concrete public spelling. Before generic arguments are checked, a concrete expected `json.scanner<Row>` return context seeds substitution; the substituted parameter/return types carry the concrete spelling into nested `json.scan`. Every resolved instantiation reruns the existing Decode schema and canonical `DropPlan` checks. Missing, ambiguous, or conflicting substitutions retain the existing deterministic inference diagnostic, produce no scanner HIR node, and publish no artifact. | `m5::json_scan_generic_row_ownership`, `m5::json_scan_generic_return_context_ownership`, `modules::json_scan_imported_row_ownership`, `modules::json_scan_imported_generic_return_context_ownership` |
+  | Whole-program, per-unit, cold/hot cache, schema edit/revert | Existing structural MIR/cache identity remains owner; rejected rows publish no artifact. Per-unit fixtures must cover interface reconstruction, accepted Copy rows, and rejected Move rows. | `cache_codegen::json_scan_row_schema_rejection`, `cache_codegen::json_scan_per_unit_interface_row_ownership`, accepted Copy-row MIR/raw-LLVM identity comparison |
+  | Interface serialization and persisted/wire identity | Interface/import reconstruction is an input to checked HIR for imported/per-unit consumers; the active gate validates the reconstructed scanner envelope and row graph before MIR/runtime construction, while accepted source identity remains unchanged | `cargo test -p align_interface --test summary`, `modules::json_scan_imported_row_ownership`, `cache_codegen::json_scan_per_unit_interface_row_ownership` |
+  | Runtime ownership provenance and allocation parity | Existing scanner input/accumulator owners; Copy rows allocate no owned row field. The composite fixture covers `Option<i64>` Some, explicit `None`, and missing fields; every non-owning union arm; and borrowed `str` fields on nonempty and malformed-later streams. The LLVM allocation oracle requires `align_rt_json_scan_next` and no calls to `align_rt_alloc` or `align_rt_arena_alloc`. | `json_scan_copy_row_no_owned_alloc`, `json_scan_copy_row_copy_composites_no_owned_alloc`, `m5::json_scan_copy_composite_runtime_matrix` |
+  | Exhaustion, empty input, malformed first/later row, and `Result`/`?` cleanup | Existing scanner input and accumulator cleanup; row-slot cleanup is N/A by construction. Non-scalar Copy option/union rows exercise nonempty and later-malformed streams. | `m5::json_scan_copy_row_error_matrix`, `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_copy_composite_runtime_matrix` |
   | Concurrent independent scanners | N/A to the new check; existing independent handles, immutable descriptors, and row slots remain separate | two accepted scanner terminals in one program plus the existing nested-scanner rejection |
   | Performance | N/A: no production performance claim | N/A; record the reason in the implementation PR |
 
   The design acceptance matrix must cover direct and transitive owned fields, nested and optional
   structs, every JSON scalar width, borrowed `str`, Copy options and unions, local/imported types,
-  generic monomorphs, semantic rejection before MIR, cold/hot/cache-edit/revert behavior, malformed
-  and exhausted streams, and ordinary `json.decode` compatibility. The focused owner tests are
+  generic monomorphs including resolved, unresolved, ambiguous, and conflicting return-context
+  inference, semantic rejection before MIR, malformed scanner envelopes, whole-program and per-unit
+  interface reconstruction, cold/hot/cache-edit/revert behavior, malformed and exhausted streams,
+  and ordinary `json.decode` compatibility. The focused owner tests are
   `m5::json_scan_copy_row_terminal_matrix`, `m5::json_scan_rejects_owned_row_fields`,
   `m5::json_scan_rejects_transitive_owned_row_fields`, `m5::json_scan_generic_row_ownership`,
-  `modules::json_scan_imported_row_ownership`, and
-  `cache_codegen::json_scan_row_schema_rejection`; the feature-gated runtime allocation probe is
-  `json_scan_copy_row_no_owned_alloc`. A release compiler built from the pre-change Align commit
-  and one built from the implementation head must emit byte-identical MIR and raw LLVM for an
-  accepted Copy-row fixture. The align-llm Request 6 adoption fixture owns the later pin change.
+  `m5::json_scan_generic_return_context_ownership`, `m5::json_scan_copy_composite_runtime_matrix`,
+  `m5::json_scan_rejects_owned_composite_rows`, `hir_program_json_scan_envelope_mismatch`,
+  `modules::json_scan_imported_row_ownership`, `modules::json_scan_imported_generic_return_context_ownership`,
+  `cache_codegen::json_scan_row_schema_rejection`, and
+  `cache_codegen::json_scan_per_unit_interface_row_ownership`; the feature-gated runtime allocation
+  probes are `json_scan_copy_row_no_owned_alloc` and
+  `json_scan_copy_row_copy_composites_no_owned_alloc`. The named identity probe
+  `scripts/compare-json-scan-identity.sh` uses the checked-in fixture
+  `crates/align_driver/tests/fixtures/json_scan_copy_identity.align`, baseline Align commit
+  `576e57307fe4ef34e74566f5e389a2f0e2a04acd`, and the exact implementation-head SHA recorded in
+  the implementation PR and `HANDOFF.md`. In two clean release worktrees, it runs
+  `cargo build --release --locked -p alignc` and, with `LC_ALL=C` on the required
+  `x86_64-unknown-linux-gnu` / LLVM 22 acceptance environment, compares `cmp`-identical output from
+  `alignc emit-interface`, `alignc emit-mir`, `alignc emit-llvm --stage raw`, and `alignc emit-obj`
+  for the fixture. The single-file fixture has no unit banner; no output normalization is allowed.
+  A failed or unavailable Linux object comparison fails the gate rather than becoming an optional
+  claim. The align-llm Request 6 adoption fixture owns the later pin change.
 
   The existing compiler currently admits some owning rows; this paragraph is the reviewed target
   contract, not a claim that the implementation has shipped. The implementation PR must land only

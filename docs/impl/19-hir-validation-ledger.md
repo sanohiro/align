@@ -122,6 +122,15 @@ child `i+1`, and every child error beats a relational or stored-result error.
 For a nested child the same rule applies recursively. This is the sole
 multi-invalid precedence rule.
 
+The active Request 6 `JsonScan` exception classifies its stored scanner type as
+part of the pre-lowering envelope, because MIR consumers must not inspect a
+row graph through a mismatched `Expr.ty`. Its deterministic active order is
+therefore: exact `Expr.ty == Ty::JsonScanner(struct_id)`, existing `struct_id`,
+`input.ty == Ty::Str`, Decode schema, and canonical recursive Copy predicate.
+This exception belongs to `align_mir::hir_program_is_valid` and
+`validate_hir::json_scan_copy_rows_are_valid`; it is not activation of the
+general body-fact replay below.
+
 ### Checked-HIR depth bound
 
 `MAX_CHECKED_HIR_DEPTH` is fixed at
@@ -209,6 +218,16 @@ The later am-b4 MIR activation gate will call this predicate only after depth,
 global type, placement, nominal/link, and declaration-header validation, and
 before any MIR construction or downstream identity is published. This
 sema-only checkpoint does not activate that gate.
+
+The narrow Request 6 scanner exception is a separate active pre-lowering gate:
+the four MIR lowerers call the private
+`align_mir::hir_program_is_valid(&hir::Program) -> bool`, after the structural
+preflight and before MIR construction. Its
+`validate_hir::json_scan_copy_rows_are_valid` walk rechecks only the scanner
+envelope and canonical row Copy predicate, including imported/per-unit
+reconstructed HIR. It does not call
+`align_sema::checked_hir_body_facts_are_valid`; the latter remains the dormant
+general body replay until am-b4.
 
 Am-b4 independently recomputes the existing producer facts rather than
 trusting the stored bits:
@@ -618,7 +637,7 @@ means:
 | `JsonDocLen` | `env[]`; `child[doc]`; `post[doc JsonDoc; result i64; copy]`. |
 | `JsonDocKey` | `env[]`; `child[doc,index]`; `post[doc JsonDoc,index i64; result Option<Str>; view payload inherits doc provenance]`. |
 | `JsonDocElems` | `env[]`; `child[doc]`; `post[doc JsonDoc; inside arena; result Slice(JsonDoc); handle slice and elements inherit doc+arena provenance]`. |
-| `JsonScan` | `env[struct_id]`: scanner row struct satisfies the Decode-direction JSON descriptor and the complete reachable row graph is recursively Copy under the canonical `DropPlan` (valid and needs no Drop). The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
+| `JsonScan` | `env[struct_id,stored_ty]`: in active Request 6 order, `stored_ty` is exactly `JsonScanner(struct_id)` and `struct_id` resolves to an existing row struct; the row satisfies the Decode-direction JSON descriptor and the complete reachable row graph is recursively Copy under the canonical `DropPlan` (valid and needs no Drop). The semantic source producer applies this Request 6 gate before constructing HIR and owns the exact public diagnostic. For imported/per-unit consumers, interface/import reconstruction first materializes checked HIR; the active `align_mir::hir_program_is_valid` pre-lowering gate then rechecks the complete envelope and graph fail-closed before MIR/runtime lowering and never reconstructs source spelling; the dormant body validator is not sufficient. `child[input]`; `post[input.ty == Str; result JsonScanner(struct_id); pipeline-source-only view rooted in input; only Sum/Count/Reduce/Any/All/Min/Max terminals may consume it, each with exact Result(scalar,builtin Error)]`. |
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
