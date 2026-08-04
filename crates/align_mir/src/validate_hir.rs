@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
 use align_span::Span;
 
+use super::canonical_graph::Node;
+
 /// Validate the program-global HIR type domain before MIR construction.
 pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
     Validator::new(program).validate()
@@ -1771,15 +1773,6 @@ fn abstract_nodes(program: &hir::Program) -> HashSet<Node> {
         }
     }
     abstract_nodes
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Node {
-    Struct(u32),
-    Enum(u32),
-    Tuple(u32),
-    Tagged(u32),
-    Fn(u32),
 }
 
 #[derive(Clone, Copy)]
