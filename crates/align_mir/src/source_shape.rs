@@ -32,6 +32,21 @@ pub(super) trait SourceShapeView {
     fn source_shape_node(&self, node: Node) -> Option<SourceShapeNode<'_>>;
 }
 
+trait SourceShapeObserver {
+    fn node(&mut self, node: Node, edges: usize);
+    fn pair(&mut self, pass: usize, left: Node, right: Node);
+    fn work(&mut self, units: usize);
+}
+
+impl SourceShapeObserver for () {
+    #[inline]
+    fn node(&mut self, _node: Node, _edges: usize) {}
+    #[inline]
+    fn pair(&mut self, _pass: usize, _left: Node, _right: Node) {}
+    #[inline]
+    fn work(&mut self, _units: usize) {}
+}
+
 impl SourceShapeView for hir::Program {
     fn source_shape_node(&self, node: Node) -> Option<SourceShapeNode<'_>> {
         match node {
@@ -83,10 +98,22 @@ pub(super) fn source_shape_equal<V: SourceShapeView + ?Sized>(
     right: Node,
     known_shapes: &mut HashSet<(Node, Node)>,
 ) -> bool {
+    source_shape_equal_observed(view, left, right, known_shapes, &mut ())
+}
+
+fn source_shape_equal_observed<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized>(
+    view: &V,
+    left: Node,
+    right: Node,
+    known_shapes: &mut HashSet<(Node, Node)>,
+    observer: &mut O,
+) -> bool {
     let mut comparator = SourceShapeComparator {
         view,
+        observer,
         known_shapes: &*known_shapes,
         root: (left, right),
+        pass: 0,
         cache_enabled: true,
         pending: VecDeque::from([(left, right)]),
         seen: HashSet::new(),
@@ -102,10 +129,12 @@ pub(super) fn source_shape_equal<V: SourceShapeView + ?Sized>(
     valid
 }
 
-struct SourceShapeComparator<'a, V: ?Sized> {
+struct SourceShapeComparator<'a, V: ?Sized, O: ?Sized> {
     view: &'a V,
+    observer: &'a mut O,
     known_shapes: &'a HashSet<(Node, Node)>,
     root: (Node, Node),
+    pass: usize,
     cache_enabled: bool,
     pending: VecDeque<(Node, Node)>,
     seen: HashSet<(Node, Node)>,
@@ -113,7 +142,7 @@ struct SourceShapeComparator<'a, V: ?Sized> {
     right_to_left: HashMap<Node, Node>,
 }
 
-impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
+impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeComparator<'_, V, O> {
     fn run(&mut self) -> bool {
         loop {
             let mut restart = false;
@@ -121,6 +150,7 @@ impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
                 if !self.map_pair(left, right) {
                     return false;
                 }
+                self.observer.pair(self.pass, left, right);
                 if self.cache_enabled && self.known_shapes.contains(&(left, right)) {
                     if !self.seen.is_empty() || !self.pending.is_empty() {
                         restart = true;
@@ -140,6 +170,7 @@ impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
                 return true;
             }
             self.cache_enabled = false;
+            self.pass += 1;
             self.pending.clear();
             self.pending.push_back(self.root);
             self.seen.clear();
@@ -173,6 +204,11 @@ impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
         let Some(right) = view.source_shape_node(right_node) else {
             return false;
         };
+        let (left_edges, work) = shape_cost(&left);
+        let (right_edges, _) = shape_cost(&right);
+        self.observer.node(left_node, left_edges);
+        self.observer.node(right_node, right_edges);
+        self.observer.work(work);
         match (left, right) {
             (
                 SourceShapeNode::Struct {
@@ -435,12 +471,164 @@ impl<V: SourceShapeView + ?Sized> SourceShapeComparator<'_, V> {
     }
 }
 
+#[inline]
+fn scalar_cost(value: Scalar) -> (usize, usize) {
+    match value {
+        Scalar::Struct(_)
+        | Scalar::DynStructArray(_)
+        | Scalar::Soa(_)
+        | Scalar::Enum(_)
+        | Scalar::Tagged(_)
+        | Scalar::Fn(_) => (1, 1),
+        _ => (0, 1),
+    }
+}
+
+#[inline]
+fn ty_cost(value: Ty) -> (usize, usize) {
+    let child = match value {
+        Ty::Option(value)
+        | Ty::Box(value)
+        | Ty::Slice(value)
+        | Ty::DynArray(value)
+        | Ty::ArrayBuilder(value)
+        | Ty::Task(value) => scalar_cost(value),
+        Ty::Result(left, right) => {
+            let left = scalar_cost(left);
+            let right = scalar_cost(right);
+            (left.0 + right.0, left.1 + right.1)
+        }
+        Ty::Array(value, _) | Ty::Vec(value, _) | Ty::Mask(value, _) => scalar_cost(value),
+        Ty::Tagged(_)
+        | Ty::StructArray(_, _)
+        | Ty::DynStructArray(_, _)
+        | Ty::Soa(_)
+        | Ty::JsonScanner(_)
+        | Ty::DictEncoded(_, _)
+        | Ty::Struct(_)
+        | Ty::Tuple(_)
+        | Ty::Fn(_)
+        | Ty::Enum(_) => (1, 1),
+        _ => (0, 0),
+    };
+    (child.0, child.1 + 1)
+}
+
+#[inline]
+fn shape_cost(node: &SourceShapeNode<'_>) -> (usize, usize) {
+    match node {
+        SourceShapeNode::Struct {
+            source_name,
+            fields,
+            ..
+        } => fields
+            .iter()
+            .fold((0, 3 + source_name.len()), |(edges, work), field| {
+                let cost = ty_cost(field.ty);
+                (edges + cost.0, work + 1 + field.name.len() + cost.1)
+            }),
+        SourceShapeNode::Enum {
+            source_name,
+            variants,
+        } => variants.iter().fold(
+            (0, 2 + source_name.len()),
+            |(mut edges, mut work), variant| {
+                work += 2 + variant.name.len();
+                for &value in &variant.payload {
+                    let cost = scalar_cost(value);
+                    edges += cost.0;
+                    work += 1 + cost.1;
+                }
+                (edges, work)
+            },
+        ),
+        SourceShapeNode::Tuple { elems } => elems.iter().fold((0, 1), |(edges, work), &value| {
+            let cost = scalar_cost(value);
+            (edges + cost.0, work + 1 + cost.1)
+        }),
+        SourceShapeNode::Tagged(value) => match value {
+            hir::TaggedType::Option(value) => {
+                let cost = scalar_cost(*value);
+                (cost.0, 2 + cost.1)
+            }
+            hir::TaggedType::Result(ok, err) => {
+                let ok = scalar_cost(*ok);
+                let err = scalar_cost(*err);
+                (ok.0 + err.0, 3 + ok.1 + err.1)
+            }
+        },
+        SourceShapeNode::Function {
+            params,
+            ret,
+            return_borrow,
+            return_region,
+        } => {
+            let mut cost = ty_cost(**ret);
+            cost.1 += 4 + borrow_summary_work(return_borrow) + region_summary_work(return_region);
+            for (_, value) in *params {
+                let value = scalar_cost(*value);
+                cost.0 += value.0;
+                cost.1 += 2 + value.1;
+            }
+            cost
+        }
+    }
+}
+
+#[inline]
+fn borrow_summary_work(summary: &hir::ReturnBorrowSummary) -> usize {
+    match summary {
+        hir::ReturnBorrowSummary::None => 1,
+        hir::ReturnBorrowSummary::Roots { params, captures } => 3 + params.len() + captures.len(),
+    }
+}
+
+#[inline]
+fn region_summary_work(summary: &hir::ReturnRegionSummary) -> usize {
+    match summary {
+        hir::ReturnRegionSummary::None => 1,
+        hir::ReturnRegionSummary::Roots { params, captures } => 3 + params.len() + captures.len(),
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::validate_hir_tests::baseline_program;
     use align_sema::{FloatTy, IntTy, Layout};
     use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct Metrics {
+        nodes: HashMap<Node, usize>,
+        pairs: HashSet<(usize, Node, Node)>,
+        work: usize,
+    }
+
+    impl SourceShapeObserver for Metrics {
+        fn node(&mut self, node: Node, edges: usize) {
+            self.nodes.entry(node).or_insert(edges);
+        }
+
+        fn pair(&mut self, pass: usize, left: Node, right: Node) {
+            self.pairs.insert((pass, left, right));
+        }
+
+        fn work(&mut self, units: usize) {
+            self.work += units;
+        }
+    }
+
+    impl Metrics {
+        fn counts(&self) -> (usize, usize, usize, usize) {
+            (
+                self.nodes.len(),
+                self.nodes.values().sum(),
+                self.pairs.len(),
+                self.work,
+            )
+        }
+    }
     fn i(bits: u8) -> IntTy {
         IntTy { bits, signed: true }
     }
@@ -617,7 +805,7 @@ pub(super) mod tests {
             .next()
             .unwrap();
         for (needle, count) in [
-            ("HashSet<", 3),
+            ("HashSet<", 4),
             ("HashMap<", 2),
             ("VecDeque<", 1),
             ("HashSet::new", 1),
@@ -626,8 +814,13 @@ pub(super) mod tests {
         ] {
             assert_eq!(production.matches(needle).count(), count, "{needle}");
         }
+        assert!(
+            production
+                .contains("source_shape_equal_observed(view, left, right, known_shapes, &mut ())")
+        );
         for absent in [
-            "Observer",
+            "dyn SourceShapeObserver",
+            "static mut",
             "CanonicalTypeView",
             "ValidatedGraph",
             "canonical_type_bytes",
@@ -640,5 +833,41 @@ pub(super) mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn canonical_source_shape_complexity() {
+        let program = twin_program();
+        let mut known = HashSet::new();
+        let mut metrics = Metrics::default();
+        let pairs = [
+            (Node::Struct(0), Node::Struct(1)),
+            (Node::Enum(0), Node::Enum(1)),
+            (Node::Tuple(0), Node::Tuple(1)),
+            (Node::Tagged(0), Node::Tagged(1)),
+            (Node::Fn(0), Node::Fn(1)),
+        ];
+        for (left, right) in pairs {
+            assert!(source_shape_equal_observed(
+                &program,
+                left,
+                right,
+                &mut known,
+                &mut metrics,
+            ));
+        }
+        let counts = metrics.counts();
+        eprintln!("V/E/P/Q = {counts:?}");
+        assert_eq!(counts, (10, 0, 5, 63));
+
+        let before = metrics.counts();
+        assert!(source_shape_equal_observed(
+            &program,
+            Node::Struct(0),
+            Node::Struct(1),
+            &mut known,
+            &mut metrics,
+        ));
+        assert_eq!(metrics.counts(), before, "a fresh cached root is free");
     }
 }
