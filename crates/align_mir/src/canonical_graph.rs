@@ -741,7 +741,7 @@ impl CanonicalTy {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError> {
-        let consumed = validate_canonical_type_bytes(bytes)?;
+        let consumed = canonical_type_record_len(bytes)?;
         if consumed != bytes.len() {
             return Err(CanonicalCodecError::TrailingBytes);
         }
@@ -789,7 +789,9 @@ impl CanonicalFnAbi {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError> {
-        validate_canonical_fn_abi_bytes(bytes)?;
+        if canonical_fn_abi_record_len(bytes)? != bytes.len() {
+            return Err(CanonicalCodecError::TrailingBytes);
+        }
         Ok(Self(bytes.into()))
     }
 
@@ -925,7 +927,7 @@ enum DecodedNode {
     Function(FunctionTypeDef),
 }
 
-fn validate_canonical_type_bytes(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
+pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
     let mut cursor = DecodeCursor::new(bytes);
     if cursor.byte()? != 1 {
         return Err(CanonicalCodecError::UnsupportedVersion);
@@ -1437,7 +1439,7 @@ fn remap_decoded_node(
 }
 
 fn decode_nested_canonical_type(cursor: &mut DecodeCursor<'_>) -> Result<(), CanonicalCodecError> {
-    let consumed = validate_canonical_type_bytes(
+    let consumed = canonical_type_record_len(
         cursor
             .bytes
             .get(cursor.offset..)
@@ -1450,7 +1452,7 @@ fn decode_nested_canonical_type(cursor: &mut DecodeCursor<'_>) -> Result<(), Can
     Ok(())
 }
 
-fn validate_canonical_fn_abi_bytes(bytes: &[u8]) -> Result<(), CanonicalCodecError> {
+pub(super) fn canonical_fn_abi_record_len(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
     let mut cursor = DecodeCursor::new(bytes);
     if cursor.byte()? != 1 {
         return Err(CanonicalCodecError::UnsupportedVersion);
@@ -1469,10 +1471,7 @@ fn validate_canonical_fn_abi_bytes(bytes: &[u8]) -> Result<(), CanonicalCodecErr
         return Err(CanonicalCodecError::InvalidGraph);
     }
     validate_function_summaries(&borrow, &region, count)?;
-    if cursor.offset != bytes.len() {
-        return Err(CanonicalCodecError::TrailingBytes);
-    }
-    Ok(())
+    Ok(cursor.offset)
 }
 
 fn stable_classes(graph: &ValidatedGraph<'_>) -> Result<HashMap<Node, u32>, CanonicalGraphError> {

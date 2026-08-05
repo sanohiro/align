@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 pub mod print;
 mod canonical_graph;
+mod generated_id;
 mod source_shape;
 mod validate_hir;
 mod runtime_key;
@@ -28,6 +29,9 @@ mod runtime_key;
 pub use canonical_graph::{
     CanonicalCodecError, CanonicalFnAbi, CanonicalTy, FunctionTypeDef, ProgramCall,
     ProgramCallError, function_types_are_canonical,
+};
+pub use generated_id::{
+    GeneratedId, ParallelGeneratedId, ParallelKernelMode, ParallelStageId,
 };
 pub use runtime_key::RuntimeKey;
 
