@@ -371,7 +371,11 @@ impl<'a> DeclarationValidator<'a> {
         parameter_types.len() == function.params.len()
             && parameter_types
                 .iter()
-                .all(|&ty| self.placement.source_function_type_ok(ty, true, false))
+                .enumerate()
+                .all(|(index, &ty)| {
+                    self.placement
+                        .stored_function_parameter_ok(function, index, ty)
+                })
             && self
                 .placement
                 .source_function_type_ok(function.ret, false, true)
@@ -837,11 +841,13 @@ impl<'a> PlacementValidator<'a> {
 
     fn source_functions_valid(&self) -> bool {
         for function in &self.program.fns {
-            if !function.params.iter().all(|&local| {
+            if !function.params.iter().enumerate().all(|(index, &local)| {
                 function
                     .locals
                     .get(local as usize)
-                    .is_some_and(|local| self.source_function_type_ok(local.ty, true, false))
+                    .is_some_and(|local| {
+                        self.stored_function_parameter_ok(function, index, local.ty)
+                    })
             }) || !self.source_function_type_ok(function.ret, false, true)
             {
                 return false;
@@ -1208,6 +1214,30 @@ impl<'a> PlacementValidator<'a> {
         self.resolve_type_ok(ty, false)
             && !(parameter && matches!(ty, Ty::Box(_)))
             && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_)))
+    }
+
+    fn stored_function_parameter_ok(&self, function: &hir::Fn, index: usize, ty: Ty) -> bool {
+        let hir::FnOrigin::Lifted { capture_count } = function.origin else {
+            return self.source_function_type_ok(ty, true, false);
+        };
+        let Some(capture_start) = usize::try_from(capture_count)
+            .ok()
+            .and_then(|count| function.params.len().checked_sub(count))
+        else {
+            return self.source_function_type_ok(ty, true, false);
+        };
+        if index < capture_start {
+            return self.source_function_type_ok(ty, true, false);
+        }
+        match ty {
+            Ty::Array(element, length) => {
+                length > 0 && self.scalar_ok(element, ScalarPlacement::Collection)
+            }
+            Ty::StructArray(id, length) => {
+                length > 0 && self.program.structs.get(id as usize).is_some()
+            }
+            _ => self.source_function_type_ok(ty, true, false),
+        }
     }
 
     fn box_payload_ok(&self, payload: Scalar) -> bool {
@@ -8508,6 +8538,17 @@ impl<'a> BodyValidator<'a> {
                 tuple.elems.iter().all(|scalar| self.scalar_copy_ok(*scalar))
             }),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
+            Ty::Array(scalar, length) => length > 0 && self.scalar_copy_ok(scalar),
+            Ty::StructArray(id, length) => {
+                length > 0
+                    && self.program.structs.get(id as usize).is_some()
+                    && !align_sema::struct_is_move(
+                        id,
+                        &self.program.structs,
+                        &self.program.enums,
+                        &self.program.tagged_types,
+                    )
+            }
             Ty::Box(_) | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) => false,
             other => align_sema::ty_to_scalar(other).is_some_and(|scalar| self.scalar_copy_ok(scalar)),
         }

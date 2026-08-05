@@ -1900,7 +1900,7 @@ fn main() -> Result<(), Error> {
     );
     let mir = lower_to_mir(&checked.hir);
     assert!(
-        mir.fns.iter().any(|function| function.name == "main"),
+        mir.fns.iter().any(|function| function.name.as_str() == "main"),
         "composite scanner must pass the pre-MIR validity gate:\n{}",
         align_mir::print::program_to_string(&mir)
     );

@@ -454,7 +454,12 @@ fn check_exports_entry(walk: &PerUnitWalk, exports: &[String], path: &str) -> Op
         if let Some(u) = walk
             .units
             .iter()
-            .find(|u| !u.is_entry && u.mir.fns.iter().any(|f| f.name == name || f.name.ends_with(&suffix)))
+            .find(|u| {
+                !u.is_entry
+                    && u.mir.fns.iter().any(|f| {
+                        f.name.as_str() == name || f.name.as_str().ends_with(&suffix)
+                    })
+            })
         {
             rejected = true;
             eprintln!(

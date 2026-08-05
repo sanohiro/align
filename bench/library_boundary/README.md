@@ -29,6 +29,12 @@ a 256-function, high-CFG fixture with three expression-valued branches per funct
 - `mir-nominal-link-validation`: whole-program MIR-lowering milliseconds per iteration for nominal
   structs/enums, repeated id-free source-shape twins, and one linked library, isolating the
   nominal/source-identity, enum-base, alignment, and link-name preflight.
+- `canonical-source-shape-comparison`: whole-program MIR-lowering milliseconds per iteration for
+  the deterministic repeated-source-shape workload used by the canonical comparator observer.
+- `canonical-type-graph`: milliseconds to construct canonical semantic records for every function
+  root in a 128-nominal graph.
+- `mir-callable-namespace-validation`: whole-program MIR-lowering milliseconds per iteration for
+  512 typed program declarations and 256 direct program targets.
 - `mir-header-validation`: paired valid and malformed whole-program MIR-lowering milliseconds per
   iteration for a large function-header/signature fixture, isolating declaration/header validation
   and its canonical-empty failure path.

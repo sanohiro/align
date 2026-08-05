@@ -1591,7 +1591,7 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bo
 pub fn unknown_exports<'a>(mir: &align_mir::Program, exports: &'a [String]) -> Vec<&'a str> {
     exports
         .iter()
-        .filter(|name| !mir.fns.iter().any(|f| &f.name == *name))
+        .filter(|name| !mir.fns.iter().any(|f| f.name.as_str() == name.as_str()))
         .map(String::as_str)
         .collect()
 }

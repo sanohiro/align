@@ -5,16 +5,18 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ Current `main` is `ddc3f393`, including merged C1
-PR #702, C2a1 PR #705, and C2a2a PR #707. C2a2a's typed source-shape comparator,
-parity owners, final-SHA preflight, post-open review, and three-platform CI are
-complete. No public `pkg.db` surface exists yet.
+_Last updated: 2026-08-05._ The C-A canonical callable capability is complete
+through am-c3. MIR now separates typed program and runtime direct targets, LLVM
+program identities are encoded consistently across whole-program, per-unit,
+export, main-wrapper, and ThinLTO paths, and every generated callable family uses
+canonical collected identity plus deterministic collision probing. No public
+`pkg.db` surface exists yet.
 
 The remaining compiler plan uses consumer-complete capability waves rather
 than one PR per dormant acceptance cell:
 
 ```text
-C-A canonical callable closure  c2a2b through c3
+C-A canonical callable closure  complete through c3
 C-B borrow/ownership closure    af/ar/ap/t/b + L2c/L2d/L2e
 
 after C-B, in parallel:
@@ -922,32 +924,12 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-Request 6 implementation and its consolidated review repairs are complete in this worktree but are
-not yet merged. Ordinary JSON decode, encode, and scope Drop retain the currently admitted
-`Option<Move-struct>` shape; only the scanner path is Copy-gated, while partial-error cleanup remains
-a separate ownership request. For imported/per-unit consumers, interface/import reconstruction
-precedes active `align_mir::hir_program_is_valid`, which precedes MIR/runtime lowering. The source
-sema gate uses the canonical recursive `DropPlan`; the active HIR replay walks direct expression
-children iteratively and rejects direct, transitive, generic, imported, missing, cyclic, and
-malformed-row definitions without activating the dormant body validator. The repair also preserves
-outer scanner source spelling through bare generic calls, stops at the first generic argument error,
-snapshots all cache-owned files on rejected walks, closes valid-Span precedence pairs, and exercises
-the production CodegenKey classifier and non-build-id digest.
-
-Latest verification on `aa5bb7d`: `scripts/test-pr.sh` passes (workspace build, all bounded library
-tests, interface/formatter integration tests, and m0); `cargo +1.96.1 test -p align_sema --lib
-function_return_completeness_matrix -- --nocapture` passes; generic m5 owners pass 11/11; imported
-module owners pass 4/4; the cache generic no-publication owner passes 1/1; the full m5 aggregate is
-193 passed / 5 known pre-existing failures; and `scripts/compare-json-scan-identity.sh HEAD` passes
-with the required baseline parity and compiler-isolated identity. `cargo +1.96.1 check -p align_sema
--p align_mir -p align_driver --tests --locked`, the matching clippy command, and `git diff --check`
-are clean. `cargo fmt --all -- --check` remains N/A because the checkout has pre-existing
-workspace-wide rustfmt drift; the changed sema file shares that pre-existing file-wide drift.
-Fresh final review and preflight evidence must bind the final pushed head.
-Do not update `.align-revision` or the align-llm Request 6 verification status until this
-implementation is merged, the sibling release compiler is rebuilt, and the real-client adoption
-gate passes. The design PR's `git diff --check`, exact diagnostic consistency, active-gate
-references, ordinary Move-option boundary checks, and hosted checks all passed.
+C-A closes the canonical callable plan from c2a2b through c3 as one consumer-complete wave. The
+next implementation is C-B: direct, captured, and imported return-provenance closure through
+L2b-b, followed in the same ownership capability by Move-return cleanup and shared/exclusive
+borrow consumers through L2e. Reopen the C-B closure matrix before coding and preserve the exact
+control-flow/type-reconciliation matrix in the repository instructions. F-A/F-B/F-C begin only
+after C-B.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
@@ -1023,9 +1005,9 @@ outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mu
 #688 completes am-u lexical extern invocation, #690 am-p placement, #691 am-n nominal/link, and
 #692 am-h declarations/headers, #694 am-b1, #695 am-b2a, #696 am-b2b, commit `af5e17a` am-b3,
 #699 task-wait replay, #700 body-fact replay, merged am-b4 activation PR #706, merged #702 am-c1,
-merged #705 am-c2a1, and merged #707 am-c2a2a. The remaining work is grouped by capability:
-canonical callable closure through c3, return-provenance closure through b, then cleanup and
-borrow closure through L2e. Am-c follows am-b4 because it consumes body-validated callable facts.
+merged #705 am-c2a1, and merged #707 am-c2a2a. C-A subsequently closes the canonical callable
+vertical through c3. The remaining L2 work is C-B: return-provenance closure through b, then cleanup
+and borrow closure through L2e. Am-c follows am-b4 because it consumes body-validated callable facts.
 The former thirty-two-L2b/thirty-six-L2 PR schedule is retired; the acceptance cells remain.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
@@ -1296,10 +1278,9 @@ an under-approximating or dangling fact.
 Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface bytes, and
 1.844 ms/import on Apple Silicon.
 Do not begin a safe SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7
-are complete. The completed L2 cells run through c2a2a. The remaining cells close in three
-capability waves: canonical callable closure through c3, direct/captured return-provenance closure,
-and cleanup plus shared/mutable-borrow closure. These are acceptance cells, not a thirty-six-PR
-schedule. After L2, L3 resources, L4 regions, and L5 static Query/command artifacts may proceed
+are complete. The completed L2 cells run through c3. The remaining cells close in the C-B
+direct/captured return-provenance, cleanup, and shared/mutable-borrow capability wave. These are
+acceptance cells, not a thirty-six-PR schedule. After L2, L3 resources, L4 regions, and L5 static Query/command artifacts may proceed
 concurrently; L6 follows L4 and L7 closes the integrated generic surface. No safe driver begins
 before the complete prerequisite gate. L2 includes contextual
 parameter parsing, all-peer mutable-borrow alias checking, drop-old replacement, target-relative

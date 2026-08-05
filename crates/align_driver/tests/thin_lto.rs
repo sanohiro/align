@@ -33,6 +33,15 @@ fn norm(sym: &str) -> &str {
     sym.strip_prefix('_').unwrap_or(sym)
 }
 
+fn encoded(sym: &str) -> String {
+    let hex = sym
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", sym.len())
+}
+
 /// Build a program's per-unit objects the ThinLTO way (all three phases) into `dir/thin<i>.o`. Uses a
 /// DISABLED cache + `-j 1` so these S1 symbol-shape gates see a fresh, deterministic build.
 fn thin_objects(per: &PerUnitBuilt) -> Vec<PathBuf> {
@@ -100,12 +109,14 @@ fn gate_cross_unit_inline_mutation_checked() {
 
     // Direction A (flag OFF): the cross-unit call is an undefined reference.
     assert!(
-        has_undef(&base_syms, "lib$add1") && has_undef(&base_syms, "lib$mul2"),
+        has_undef(&base_syms, &encoded("lib$add1"))
+            && has_undef(&base_syms, &encoded("lib$mul2")),
         "flag-off entry object must reference lib$add1 / lib$mul2 as undefined externs:\n{base_syms:?}"
     );
     // Direction B (flag ON): the reference is gone (imported + inlined).
     assert!(
-        !has_undef(&thin_syms, "lib$add1") && !has_undef(&thin_syms, "lib$mul2"),
+        !has_undef(&thin_syms, &encoded("lib$add1"))
+            && !has_undef(&thin_syms, &encoded("lib$mul2")),
         "under --thin-lto the cross-unit calls must inline (no undefined ref left):\n{thin_syms:?}"
     );
 
@@ -153,13 +164,15 @@ fn gate_wide_tuple_sret_vanishes_when_inlined() {
     // Without the flag: the 4-/8-i64 tuple returns cross the unit boundary — the producer stores
     // every field into the sret buffer and the consumer loads them, so the entry references the fns.
     assert!(
-        has_undef(&base_syms, "lib$quad") && has_undef(&base_syms, "lib$oct"),
+        has_undef(&base_syms, &encoded("lib$quad"))
+            && has_undef(&base_syms, &encoded("lib$oct")),
         "flag-off entry must reference the tuple-returning fns (the retained cross-unit sret ABI):\n{base_syms:?}"
     );
     // Under --thin-lto: the fns are imported + inlined, so the boundary — and the sret store/load
     // round trip with it — vanishes (no reference remains).
     assert!(
-        !has_undef(&thin_syms, "lib$quad") && !has_undef(&thin_syms, "lib$oct"),
+        !has_undef(&thin_syms, &encoded("lib$quad"))
+            && !has_undef(&thin_syms, &encoded("lib$oct")),
         "under --thin-lto the wide-tuple sret round trip must vanish (fns inlined, no undefined ref):\n{thin_syms:?}"
     );
 
@@ -330,11 +343,11 @@ fn gate_preserve_main_and_pub_survive() {
     assert!(has_ext_def(&entry_syms, "main"), "main must be an external define in the entry object:\n{entry_syms:?}");
     // Both pub fns stay external defines in lib.o (preserve set — even `unused`, which nothing calls).
     assert!(
-        has_ext_def(&lib_syms, "lib$used"),
+        has_ext_def(&lib_syms, &encoded("lib$used")),
         "the preserve set must keep lib$used an external define under --thin-lto:\n{lib_syms:?}"
     );
     assert!(
-        has_ext_def(&lib_syms, "lib$unused"),
+        has_ext_def(&lib_syms, &encoded("lib$unused")),
         "the fail-closed preserve set keeps EVERY pub fn (incl. the uncalled lib$unused) external:\n{lib_syms:?}"
     );
 

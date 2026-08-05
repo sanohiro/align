@@ -505,7 +505,7 @@ fn partition_capabilities(
         if caps.is_empty() {
             continue;
         }
-        let unit = owning_unit(&f.name).or(entry_unit.as_ref());
+        let unit = owning_unit(f.name.as_str()).or(entry_unit.as_ref());
         let Some(unit) = unit else { continue };
         let bucket = caps_by_unit.entry(unit.clone()).or_default();
         for cap in caps {
@@ -560,7 +560,7 @@ fn partition_impl_hashes(
     // Bucket each MIR function's index by owning unit.
     let mut fns_by_unit: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, f) in mir.fns.iter().enumerate() {
-        let Some(unit) = owning_unit(&f.name).or(entry_unit.as_ref()) else { continue };
+        let Some(unit) = owning_unit(f.name.as_str()).or(entry_unit.as_ref()) else { continue };
         fns_by_unit.entry(unit.clone()).or_default().push(i);
     }
 

@@ -150,7 +150,7 @@ fn arena_owned_field_replacement_does_not_drop_the_old_leaf_individually() {
         .hir
         .fns
         .iter_mut()
-        .find(|f| f.name == "main")
+        .find(|f| f.name.as_str() == "main")
         .expect("main function");
     main.drop_individual_locals.clear();
     for individual in main.drop_individual_exprs.values_mut() {
@@ -1487,7 +1487,7 @@ fn ignored_inner_tagged_binding_still_runs_recursive_drop() {
     let main = program
         .fns
         .iter()
-        .find(|function| function.name == "main")
+        .find(|function| function.name.as_str() == "main")
         .expect("main MIR");
     let inner_slot = main
         .slots

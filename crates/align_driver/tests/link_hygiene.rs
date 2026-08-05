@@ -8,7 +8,7 @@
 //! | symbol class                                    | linkage                  |
 //! |-------------------------------------------------|--------------------------|
 //! | C entry `main` (void/`i32` main, or the wrapper)| external (keep by name)  |
-//! | `align_main` (a `Result`-returning main's body) | internal                 |
+//! | encoded Align body for a wrapped `main`        | internal                 |
 //! | every other Align program fn (+ lifted lambdas) | internal                 |
 //! | fn-value / closure / spawn / par_map thunks     | private                  |
 //! | runtime `align_rt_*` + `extern "C"` declares     | external (undefined decl)|
@@ -56,12 +56,37 @@ fn assert_internal(ir: &str, sym: &str) {
     );
 }
 
-fn assert_private(ir: &str, sym: &str) {
-    let pfx = define_prefix(ir, sym);
-    assert!(
-        pfx.contains("private"),
-        "@{sym} should have `private` linkage, got `define {pfx}@{sym}(...`"
-    );
+fn assert_private_prefix(ir: &str, prefix: &str) {
+    let matches = ir
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("define ") && line.contains(&format!("@\"{prefix}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!matches.is_empty(), "no generated definition with prefix {prefix}:\n{ir}");
+    for line in matches {
+        let before_symbol = line
+            .split_once('@')
+            .expect("a define line always names a symbol")
+            .0;
+        assert!(
+            before_symbol.contains("private"),
+            "generated symbol with prefix {prefix} must be private: {line}"
+        );
+    }
+}
+
+fn lowercase_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn align_symbol(value: &str) -> String {
+    format!("align_fn${}${}", value.len(), lowercase_hex(value))
 }
 
 /// External linkage prints as *no* linkage word — LLVM omits it. So the `define` prefix must carry
@@ -84,8 +109,8 @@ fn global_line<'a>(ir: &'a str, sym: &str) -> &'a str {
 }
 
 /// A representative program touching most emitted symbol classes at once: an `extern "C"` decl, a
-/// non-exported helper, a `Result`-returning `main` (→ `align_main` + a generated C `main`), lifted
-/// pipeline/`par_map`/closure lambdas, a string constant, and thus a `$parkernel` + a `$clos` thunk.
+/// non-exported helper, a `Result`-returning `main` (encoded body + generated C `main`), lifted
+/// pipeline/`par_map`/closure lambdas, a string constant, and generated parallel/closure helpers.
 const REPRESENTATIVE: &str = concat!(
     "extern \"C\" fn cabs(x: i32) -> i32\n",
     "\n",
@@ -115,15 +140,18 @@ fn representative_program_linkage_map() {
     assert_external(&ir, "main");
 
     // A `Result`-main's body and every other Align program function (incl. lifted lambdas) → internal.
-    assert_internal(&ir, "align_main");
-    assert_internal(&ir, "helper");
-    assert_internal(&ir, "main$lambda0");
-    assert_internal(&ir, "main$lambda1");
-    assert_internal(&ir, "main$lambda2");
+    assert_internal(&ir, &align_symbol("main"));
+    assert_internal(&ir, &align_symbol("helper"));
+    assert_internal(&ir, &align_symbol("main$lambda0"));
+    assert_internal(&ir, &align_symbol("main$lambda1"));
+    assert_internal(&ir, &align_symbol("main$lambda2"));
 
     // Compiler-generated helper thunks, reached only via a function pointer → private.
-    assert_private(&ir, "main$lambda1$parkernel");
-    assert_private(&ir, "main$lambda2$clos");
+    assert_private_prefix(&ir, "align_gen$par$");
+    assert_private_prefix(
+        &ir,
+        &format!("align_gen$clos${}$", lowercase_hex("main$lambda2")),
+    );
 
     // The `extern "C"` symbol is an undefined declaration resolved by the linker → external, and it
     // must be a `declare` (never `define internal`, which would drop the reference to libc's `abs`).
@@ -146,13 +174,16 @@ fn plain_main_stays_external_no_wrapper() {
     if !backend_available() {
         return;
     }
-    // An `-> i32` `main` IS the C entry directly (no wrapper, no `align_main`) — its LLVM return
+    // An `-> i32` `main` IS the C entry directly (no wrapper or encoded body) — its LLVM return
     // type already matches the C ABI's `i32` — so it keeps the symbol name `main` and external
     // linkage; a sibling helper is still internalized.
     let ir = emit_llvm("fn helper(x: i64) -> i64 = x + 1\nfn main() -> i32 {\n  print(helper(41))\n  return 0\n}\n");
     assert_external(&ir, "main");
-    assert_internal(&ir, "helper");
-    assert!(!ir.contains("@align_main"), "an `-> i32` `main` needs no `align_main` body:\n{ir}");
+    assert_internal(&ir, &align_symbol("helper"));
+    assert!(
+        !ir.contains(&align_symbol("main")),
+        "an `-> i32` `main` needs no separate Align body:\n{ir}"
+    );
 }
 
 #[test]
@@ -163,13 +194,17 @@ fn unit_main_gets_the_c_entry_wrapper() {
     // A `Unit`-returning `main` is NOT the C entry directly (it lowers to `void`, and the C ABI's
     // `main` must return `i32` — leaving `main` void would leave the return register undefined,
     // `docs/open-questions.md` "Unit-returning `fn main()` yields a nondeterministic exit code").
-    // It is renamed `align_main` (internal) and gets a generated external `main` wrapper that
+    // Its encoded program identity stays internal and gets a generated external `main` wrapper that
     // always returns a defined `i32`, same shape as the `Result`-returning case.
     let ir = emit_llvm("fn helper(x: i64) -> i64 = x + 1\nfn main() {\n  print(helper(41))\n}\n");
     assert_external(&ir, "main");
-    assert_internal(&ir, "align_main");
-    assert_internal(&ir, "helper");
-    assert!(ir.contains("call void @align_main()"), "wrapper must call align_main:\n{ir}");
+    let body = align_symbol("main");
+    assert_internal(&ir, &body);
+    assert_internal(&ir, &align_symbol("helper"));
+    assert!(
+        ir.contains(&format!("call void @\"{body}\"()")),
+        "wrapper must call the encoded Align body:\n{ir}"
+    );
     assert!(ir.contains("ret i32 0"), "wrapper must return a defined 0:\n{ir}");
 }
 
@@ -178,13 +213,16 @@ fn fn_value_thunk_is_private() {
     if !backend_available() {
         return;
     }
-    // Using a function as a first-class value emits a `$fnval` adapter thunk (called through the
+    // Using a function as a first-class value emits a canonical adapter thunk (called through the
     // fn-value pointer) → private; the underlying function → internal.
     let ir = emit_llvm(
         "fn double(x: i32) -> i32 = x * 2\n\nfn main() -> Result<(), Error> {\n  f := double\n  print(f(5))\n  return Ok(())\n}\n",
     );
-    assert_internal(&ir, "double");
-    assert_private(&ir, "double$fnval");
+    assert_internal(&ir, &align_symbol("double"));
+    assert_private_prefix(
+        &ir,
+        &format!("align_gen$fnval${}$", lowercase_hex("double")),
+    );
     assert_external(&ir, "main");
 }
 
@@ -193,13 +231,16 @@ fn spawn_trampoline_is_private() {
     if !backend_available() {
         return;
     }
-    // A `spawn`ed closure emits a per-result-type `tramp$R` trampoline (invoked by the task runtime
-    // through a pointer) → private, plus its capturing `$clos` thunk → private.
+    // A `spawn`ed closure emits a canonical task trampoline (invoked by the task runtime through a
+    // pointer) → private, plus its canonical capturing-closure thunk → private.
     let ir = emit_llvm(
         "fn main() -> Result<(), Error> {\n  k: i64 := 100\n  task_group {\n    a := spawn(fn { k + 5 })\n    wait()\n    print(a.get())\n  }\n  return Ok(())\n}\n",
     );
-    assert_private(&ir, "tramp$i64");
-    assert_private(&ir, "main$lambda0$clos");
+    assert_private_prefix(&ir, "align_gen$tramp$");
+    assert_private_prefix(
+        &ir,
+        &format!("align_gen$clos${}$", lowercase_hex("main$lambda0")),
+    );
     assert_external(&ir, "main");
 }
 

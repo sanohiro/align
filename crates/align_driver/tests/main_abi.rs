@@ -22,9 +22,22 @@ fn whole_mir(name: &str, source: &str) -> align_driver::MirProgram {
 }
 
 fn definition_line<'a>(ir: &'a str, symbol: &str) -> &'a str {
+    let bare = format!("@{symbol}(");
+    let quoted = format!("@\"{symbol}\"(");
     ir.lines()
-        .find(|line| line.starts_with("define ") && line.contains(&format!("@{symbol}(")))
+        .find(|line| {
+            line.starts_with("define ") && (line.contains(&bare) || line.contains(&quoted))
+        })
         .unwrap_or_else(|| panic!("missing definition for @{symbol}:\n{ir}"))
+}
+
+fn align_symbol(value: &str) -> String {
+    let hex = value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", value.len())
 }
 
 #[test]
@@ -162,13 +175,14 @@ fn raw_and_optimized_whole_and_per_unit_c_signatures_are_exact() {
 
                 if !optimized {
                     if wrapped {
+                        let body = align_symbol("main");
                         assert!(
-                            definition_line(&ir, "align_main").starts_with("define internal "),
+                            definition_line(&ir, &body).starts_with("define internal "),
                             "{path} {name} Align body must be internal"
                         );
                     } else {
                         assert!(
-                            !ir.contains("@align_main("),
+                            !ir.contains(&align_symbol("main")),
                             "{path} exact i32 is the direct C entry"
                         );
                     }

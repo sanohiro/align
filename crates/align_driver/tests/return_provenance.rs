@@ -73,7 +73,7 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
         summary
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} signature"))
     };
     assert_eq!(find("second").return_borrow, roots(&[1], &[]));
@@ -313,7 +313,7 @@ pub fn deferred_pipeline_projection(first: str, second: str) -> str {
         summary
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} signature"))
     };
     for name in [
@@ -769,7 +769,7 @@ pub fn odd(first: str, second: str, depth: i64) -> str {
         let function = summary
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} signature"));
         assert_eq!(
             function.return_borrow,
@@ -845,7 +845,7 @@ fn main() -> i32 {
             .hir
             .fns
             .iter()
-            .find(|function| function.name == "bad")
+            .find(|function| function.name.as_str() == "bad")
             .expect("checked bad function");
         let loop_value = bad.body.value.as_deref().expect("loop body value");
         assert!(
@@ -913,7 +913,7 @@ fn main() -> i32 = 0
         .hir
         .fns
         .iter()
-        .find(|function| function.name == "bad")
+        .find(|function| function.name.as_str() == "bad")
         .expect("checked bad provenance function");
     assert_eq!(
         bad.return_borrow,
@@ -1280,7 +1280,7 @@ fn main() -> i32 {
         let function = dependency
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} signature"));
         assert_eq!(function.return_borrow, ReturnBorrowSummary::None);
         assert_eq!(function.return_region, ReturnRegionSummary::None);
@@ -1335,7 +1335,7 @@ fn main() -> i32 = 0
         let function = dependency
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} signature"));
         assert_eq!(function.return_borrow, roots(&[0], &[]));
         assert_eq!(
@@ -1386,7 +1386,7 @@ fn main() -> i32 {
     let function = dependency
         .fns
         .iter()
-        .find(|function| function.name == "lambda0")
+        .find(|function| function.name.as_str() == "lambda0")
         .expect("ordinary exported lambda0");
     assert_eq!(function.return_borrow, roots(&[0], &[]));
     assert_eq!(
@@ -1751,7 +1751,7 @@ fn main() -> i32 {
     let second = views
         .fns
         .iter()
-        .find(|function| function.name == "second")
+        .find(|function| function.name.as_str() == "second")
         .expect("second signature");
     assert_eq!(second.return_borrow, roots(&[1], &[]));
 }
@@ -1846,7 +1846,7 @@ pub fn identity(value: dep.Payload) -> dep.Payload = value
     let identity = wrapper
         .fns
         .iter()
-        .find(|function| function.name == "identity")
+        .find(|function| function.name.as_str() == "identity")
         .expect("identity signature");
     assert_eq!(identity.return_borrow, roots(&[0], &[]));
 }

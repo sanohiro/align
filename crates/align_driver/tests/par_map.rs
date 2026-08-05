@@ -12,6 +12,24 @@
 mod common;
 use common::*;
 
+fn lowercase_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn align_symbol(value: &str) -> String {
+    format!("align_fn${}${}", value.len(), lowercase_hex(value))
+}
+
+fn parallel_kernel<'a>(ir: &'a str, mode: u8) -> Option<&'a str> {
+    let prefix = format!("align_gen$par${mode}$");
+    ir.split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains(&prefix)))
+}
+
 #[test]
 fn par_map_pure_function() {
     if !backend_available() {
@@ -35,9 +53,7 @@ fn par_map_capturing_lambda_uses_parallel_range_kernel() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
 
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("no capturing par_map range kernel in IR:\n{ir}"));
     let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
     assert!(
@@ -49,7 +65,8 @@ fn par_map_capturing_lambda_uses_parallel_range_kernel() {
     );
     assert!(kernel.contains("load i64"), "the kernel must load the captured value from its context:\n{kernel}");
     assert!(
-        kernel.contains("call i64 @\"main$lambda") && kernel.contains(", i64 %parcapv"),
+        kernel.contains(&format!("call i64 @\"{}", align_symbol("main$lambda0")))
+            && kernel.contains(", i64 %parcapv"),
         "the direct body call must receive the capture value:\n{kernel}"
     );
 
@@ -75,7 +92,11 @@ fn par_map_copy_array_capture_uses_the_context_abi() {
     let out = build_and_run("pm-copy-array-capture", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n");
-    assert!(emit_llvm(src).contains("$parkernel"), "a Copy array capture should stay on the range-kernel path");
+    let ir = emit_llvm(src);
+    assert!(
+        parallel_kernel(&ir, 0).is_some(),
+        "a Copy array capture should stay on the range-kernel path"
+    );
 }
 
 #[test]
@@ -144,11 +165,12 @@ fn par_map_over_struct_field() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("an AoS struct source should use the parallel range kernel:\n{ir}"));
-    assert!(kernel.contains("call i32 @net") || kernel.contains("call i32 @\"net\""), "the kernel must call the struct-consuming body directly:\n{kernel}");
+    assert!(
+        kernel.contains(&format!("call i32 @\"{}\"", align_symbol("net"))),
+        "the kernel must call the struct-consuming body directly:\n{kernel}"
+    );
 }
 
 #[test]
@@ -162,7 +184,10 @@ fn par_map_over_dynamic_struct_array_uses_aos_stride_kernel() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n15\n27\n");
 
     let ir = emit_llvm(src);
-    assert!(ir.contains("$parkernel"), "a dynamic AoS struct source should use the parallel range kernel:\n{ir}");
+    assert!(
+        parallel_kernel(&ir, 0).is_some(),
+        "a dynamic AoS struct source should use the parallel range kernel:\n{ir}"
+    );
 }
 
 #[test]
@@ -247,7 +272,10 @@ fn par_map_after_struct_map_keeps_struct_abi_in_the_range_kernel() {
     assert!(text.contains("par_map[net -> twice]"), "a struct map stage should stay in the parallel node:\n{text}");
 
     let ir = emit_llvm(src);
-    assert!(ir.contains("call i32 @net") || ir.contains("call i32 @\"net\""), "the range kernel must call the aggregate map body directly:\n{ir}");
+    assert!(
+        ir.contains(&format!("call i32 @\"{}\"", align_symbol("net"))),
+        "the range kernel must call the aggregate map body directly:\n{ir}"
+    );
 }
 
 #[test]
@@ -266,12 +294,13 @@ fn par_map_after_struct_projection_uses_range_kernel() {
     assert!(text.contains("par_map[field#1 -> twice]"), "the projection and terminal should share one parallel MIR node:\n{text}");
 
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parmapchain$")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("no projected par_map range kernel in IR:\n{ir}"));
     assert!(kernel.contains("extractvalue"), "the projected kernel must extract the AoS field in the range loop:\n{kernel}");
-    assert!(kernel.contains("call i32 @twice") || kernel.contains("call i32 @\"twice\""), "the projected kernel must call the terminal body directly:\n{kernel}");
+    assert!(
+        kernel.contains(&format!("call i32 @\"{}\"", align_symbol("twice"))),
+        "the projected kernel must call the terminal body directly:\n{kernel}"
+    );
 }
 
 #[test]
@@ -290,8 +319,14 @@ fn par_map_after_struct_field_filter_uses_stable_compaction() {
     assert!(text.contains("par_map[where field#0 -> field#1 -> twice]"), "field filtering and projection should remain one ordered parallel node:\n{text}");
 
     let ir = emit_llvm(src);
-    assert!(ir.contains("$parfilter$count$wherefield$0$field$1"), "the field-filter count kernel must be generated:\n{ir}");
-    assert!(ir.contains("$parfilter$scatter$wherefield$0$field$1"), "the field-filter scatter kernel must be generated:\n{ir}");
+    assert!(
+        parallel_kernel(&ir, 2).is_some(),
+        "the field-filter count kernel must be generated:\n{ir}"
+    );
+    assert!(
+        parallel_kernel(&ir, 3).is_some(),
+        "the field-filter scatter kernel must be generated:\n{ir}"
+    );
 }
 
 #[test]
@@ -353,13 +388,14 @@ fn par_map_reduction_range_kernel_writes_partials() {
     }
     let src = "fn dbl(x: i64) -> i64 = x * 2\npub fn run(xs: slice<i64>) -> i64 = xs.par_map(dbl).sum()\nfn main() -> i32 = 0\n";
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parreducekernel")))
+    let kernel = parallel_kernel(&ir, 1)
         .unwrap_or_else(|| panic!("no par_map reduction range kernel in IR:\n{ir}"));
     let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
     assert!(kernel.contains("phi i64"), "the reduction kernel needs a counted loop and an accumulator:\n{kernel}");
-    assert!(kernel.contains("call i64 @dbl(i64"), "the reduction kernel must call the body directly:\n{kernel}");
+    assert!(
+        kernel.contains(&format!("call i64 @\"{}\"(i64", align_symbol("dbl"))),
+        "the reduction kernel must call the body directly:\n{kernel}"
+    );
     assert!(kernel.contains("add i64"), "the reduction kernel must use plain wrapping integer addition:\n{kernel}");
     assert!(kernel.contains("store i64"), "the reduction kernel must publish one partial:\n{kernel}");
 }
@@ -509,7 +545,7 @@ fn chunks_par_map_inside_arena_frees_chunk_buffer() {
         return;
     }
     // Inside an `arena {}`, the `chunks` header buffer is heap-allocated (not arena), so it must
-    // still be freed (`drop_value`) — the arena's bulk-free doesn't cover it. (1+2)+(3+4) = 10.
+    // still be dropped before `arena_end` — the arena's bulk-free doesn't cover it. (1+2)+(3+4) = 10.
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  arena {\n    total := [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n    print(total)\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("pm-chunks-arena", src);
     assert_eq!(out.status.code(), Some(0));
@@ -518,7 +554,13 @@ fn chunks_par_map_inside_arena_frees_chunk_buffer() {
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(text.contains("drop_value"), "the chunks buffer must be freed inside the arena:\n{text}");
+    let drop = text
+        .find("drop _1")
+        .unwrap_or_else(|| panic!("the chunks buffer must be dropped inside the arena:\n{text}"));
+    let arena_end = text
+        .find("arena_end")
+        .unwrap_or_else(|| panic!("the arena must have an explicit end marker:\n{text}"));
+    assert!(drop < arena_end, "the chunks buffer must be dropped before arena_end:\n{text}");
 }
 
 #[test]
@@ -579,9 +621,7 @@ fn par_map_range_kernel_owns_the_direct_element_loop() {
     }
     let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> i32 {\n  ys := [1, 2, 3].par_map(dbl)\n  return ys[0] as i32\n}\n";
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("no par_map range kernel in IR:\n{ir}"));
     let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
 
@@ -595,7 +635,10 @@ fn par_map_range_kernel_owns_the_direct_element_loop() {
     );
     assert!(kernel.contains("phi i64"), "range kernel needs one counted induction variable:\n{kernel}");
     assert!(kernel.contains("getelementptr inbounds i64"), "range kernel needs typed element GEPs:\n{kernel}");
-    assert!(kernel.contains("call i64 @dbl(i64"), "the element loop must call its known body directly:\n{kernel}");
+    assert!(
+        kernel.contains(&format!("call i64 @\"{}\"(i64", align_symbol("dbl"))),
+        "the element loop must call its known body directly:\n{kernel}"
+    );
     assert!(
         !kernel.lines().any(|line| line.trim_start().starts_with("call ") && line.contains(" %")),
         "the element loop must not retain an indirect per-element callback:\n{kernel}"
@@ -609,9 +652,7 @@ fn cheap_par_map_range_kernel_vectorizes_after_specialization() {
     }
     let src = "fn dbl(x: i64) -> i64 = x * 2\npub fn run(xs: slice<i64>) -> array<i64> = xs.par_map(dbl)\nfn main() -> i32 = 0\n";
     let ir = emit_llvm_optimized(src, &["run"]);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("no optimized par_map range kernel in IR:\n{ir}"));
     let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
 
@@ -620,7 +661,10 @@ fn cheap_par_map_range_kernel_vectorizes_after_specialization() {
         "a cheap arithmetic range kernel should expose a vectorized loop to LLVM:\n{kernel}"
     );
     assert!(
-        !kernel.contains("call i64 @dbl") && !kernel.lines().any(|line| line.trim_start().starts_with("call ") && line.contains(" %")),
+        !kernel.contains(&format!("call i64 @\"{}\"", align_symbol("dbl")))
+            && !kernel
+                .lines()
+                .any(|line| line.trim_start().starts_with("call ") && line.contains(" %")),
         "the optimized hot loop must inline the body and contain no per-element call:\n{kernel}"
     );
 }
@@ -641,13 +685,15 @@ fn par_map_after_length_preserving_maps_uses_one_range_kernel() {
     assert!(text.contains("par_map[add_one -> triple -> finish]"), "the map chain should be one parallel MIR node:\n{text}");
 
     let ir = emit_llvm(src);
-    let kernel = ir
-        .split("define ")
-        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parmapchain$")))
+    let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("no staged par_map range kernel in IR:\n{ir}"));
     let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
-    for func in ["@add_one", "@triple", "@finish"] {
-        assert!(kernel.contains(&format!("call i64 {func}")), "staged kernel must call {func} directly:\n{kernel}");
+    for func in ["add_one", "triple", "finish"] {
+        let symbol = align_symbol(func);
+        assert!(
+            kernel.contains(&format!("call i64 @\"{symbol}\"")),
+            "staged kernel must call {func} directly:\n{kernel}"
+        );
     }
 }
 
@@ -678,8 +724,14 @@ fn par_map_after_multiple_filters_uses_one_stable_parallel_node() {
     assert!(text.contains("par_map[where positive -> where even -> dec]"), "filters should use one parallel MIR node:\n{text}");
 
     let ir = emit_llvm(src);
-    assert!(ir.contains("$parfilter$count$"), "filter count kernel should be emitted:\n{ir}");
-    assert!(ir.contains("$parfilter$scatter$"), "filter scatter kernel should be emitted:\n{ir}");
+    assert!(
+        parallel_kernel(&ir, 2).is_some(),
+        "filter count kernel should be emitted:\n{ir}"
+    );
+    assert!(
+        parallel_kernel(&ir, 3).is_some(),
+        "filter scatter kernel should be emitted:\n{ir}"
+    );
 }
 
 #[test]
@@ -698,8 +750,14 @@ fn par_map_after_string_contains_filter_uses_stable_compaction() {
     assert!(text.contains("par_map[where str.contains -> main$lambda"), "string filter should be a generated staged parallel node:\n{text}");
 
     let ir = emit_llvm(src);
-    assert!(ir.contains("$parfilter$count$wherecontains"), "string filter count kernel should be emitted:\n{ir}");
-    assert!(ir.contains("$parfilter$scatter$wherecontains"), "string filter scatter kernel should be emitted:\n{ir}");
+    assert!(
+        parallel_kernel(&ir, 2).is_some(),
+        "string filter count kernel should be emitted:\n{ir}"
+    );
+    assert!(
+        parallel_kernel(&ir, 3).is_some(),
+        "string filter scatter kernel should be emitted:\n{ir}"
+    );
     assert!(ir.contains("call i32 @align_rt_str_contains"), "string filter kernel should use the existing str_contains ABI:\n{ir}");
 }
 

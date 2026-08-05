@@ -26,7 +26,11 @@ mod drop_codegen;
 mod runtime_abi;
 
 use align_ast::{BinOp, UnOp};
-use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId};
+use align_mir::{
+    Block, CanonicalFnAbi, CanonicalTy, Const, ConstElem, DirectCall, Function, GeneratedId,
+    Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode,
+    ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
+};
 use align_sema::{
     DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
@@ -353,8 +357,8 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
 
 /// Write the program as an object file.
 ///
-/// `exports` names the program functions (matched against `Function::name`, NOT the LLVM-symbol
-/// `main`/`align_main` split) that keep `external` linkage instead of the default whole-program
+/// `exports` names the program functions (matched against `Function::name`, not their encoded LLVM
+/// symbols) that keep `external` linkage instead of the default whole-program
 /// `internal` (M13 Slice 1) — the explicit export-roots mechanism (`emit-obj --export`,
 /// `docs/impl/07-roadmap.md` M13 Codex-audit item 1). Empty = every program function stays
 /// internal, today's default behavior.
@@ -674,6 +678,33 @@ struct RuntimeDeclarations {
     physical_names: HashMap<RuntimeKey, String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProgramSignature {
+    params: Vec<Ty>,
+    modes: Vec<align_ast::ParamMode>,
+    ret: Ty,
+    borrow: hir::ReturnBorrowSummary,
+    region: hir::ReturnRegionSummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgramDeclarationClass {
+    Stored,
+    Imported,
+    Extern,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramDeclaration {
+    signature: ProgramSignature,
+    classes: Vec<ProgramDeclarationClass>,
+}
+
+struct CallablePreflight {
+    declarations: HashMap<ProgramCall, ProgramDeclaration>,
+    generated_names: HashMap<GeneratedId, String>,
+}
+
 fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -685,6 +716,7 @@ fn build_module<'c>(
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
     validate_tagged_program(program)?;
+    let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
     let target_data = tm.get_target_data();
@@ -890,7 +922,7 @@ fn build_module<'c>(
             )));
         }
     }
-    let extern_abi: HashMap<String, ExternAbi> = program
+    let extern_abi: HashMap<ProgramCall, ExternAbi> = program
         .externs
         .iter()
         .map(|e| {
@@ -929,8 +961,10 @@ fn build_module<'c>(
     let mut extern_fn_types: HashMap<String, FunctionType<'c>> =
         HashMap::with_capacity(program.externs.len());
     for ext in &program.externs {
-        let abi = &extern_abi[&ext.name];
-        check_sysv_struct_args_fit(&ext.name, abi, &ext.params, &program.structs)?;
+        let abi = extern_abi
+            .get(&ext.name)
+            .ok_or_else(|| callable_target_error(&ext.name))?;
+        check_sysv_struct_args_fit(ext.name.as_str(), abi, &ext.params, &program.structs)?;
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
             match pa {
@@ -975,32 +1009,34 @@ fn build_module<'c>(
                 )));
             }
         };
-        if !runtime_abi::native_extern_abi_matches(&ext.name, fn_ty, ctx) {
+        if !runtime_abi::native_extern_abi_matches(ext.name.as_str(), fn_ty, ctx) {
             return Err(CodegenError::Lowering(format!(
                 "native extern ABI mismatch:{}",
                 lowercase_hex(ext.name.as_bytes()),
             )));
         }
-        extern_fn_types.insert(ext.name.clone(), fn_ty);
+        extern_fn_types.insert(ext.name.as_str().to_owned(), fn_ty);
     }
+    let callable_preflight = callable_preflight(program, exports, callable_declarations)?;
 
-    // Pass 1: declare all functions so calls resolve regardless of order. A `Result`- or
-    // `Unit`-returning `main` is emitted under `align_main`; a C `main` wrapper is
-    // generated after the bodies (see below).
-    let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
+    // Pass 1: declare all functions so calls resolve regardless of order. A wrapped `main` body
+    // uses its ordinary encoded Align identity; the external C `main` wrapper is emitted later.
+    let mut program_funcs: HashMap<ProgramCall, FunctionValue<'c>> = HashMap::new();
+    let mut generated_funcs: HashMap<GeneratedId, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
+        let symbol = symbol_name(f, exports);
         let fv = declare_fn(
             ctx,
             module,
             f,
-            symbol_name(f),
+            &symbol,
             &struct_types,
             &enum_types,
             &tagged_types,
             &tuple_types,
             exports,
         );
-        funcs.insert(f.name.clone(), fv);
+        program_funcs.insert(f.name.clone(), fv);
     }
     // M15 S2 (per-unit): non-generic `pub` functions declared by interface-only dependencies. Each is
     // an external, bodyless `declare` under the same Align ABI a defining unit emits
@@ -1011,7 +1047,7 @@ fn build_module<'c>(
     for imp in &program.imported_fns {
         // A name collision with a locally-defined function would be a driver bug (a unit must not both
         // define and import the same symbol); prefer the local definition and skip the declare.
-        if funcs.contains_key(&imp.name) {
+        if program_funcs.contains_key(&imp.name) {
             continue;
         }
         let fv = declare_imported_fn(
@@ -1023,12 +1059,12 @@ fn build_module<'c>(
             &tagged_types,
             &tuple_types,
         );
-        funcs.insert(imp.name.clone(), fv);
+        program_funcs.insert(imp.name.clone(), fv);
     }
     // Keep the semantic signatures alongside the LLVM declarations. The latter intentionally
     // erase integer signedness, while a fused range kernel must reject a malformed MIR call whose
     // physical `i64` happens to be compatible with the wrong declared `Ty`.
-    let mut fn_sigs: HashMap<String, ParMapFunctionSignature> = program
+    let mut fn_sigs: HashMap<ProgramCall, ParMapFunctionSignature> = program
         .fns
         .iter()
         .map(|f| {
@@ -1048,20 +1084,22 @@ fn build_module<'c>(
     // No `mark_nounwind`: unlike an Align function, foreign code is outside our control, so we do not
     // assert it never unwinds.
     for ext in &program.externs {
-        let fn_ty = extern_fn_types[&ext.name];
+        let fn_ty = extern_fn_types
+            .get(ext.name.as_str())
+            .copied()
+            .ok_or_else(|| callable_target_error(&ext.name))?;
         // Defensive: if the symbol is already in the module (e.g. it coincides with a symbol
         // declared earlier), reuse that declaration. A fresh `add_function` on a duplicate name
         // makes LLVM silently rename it (`@abs.1`), which then fails to link against the real
         // external symbol.
         let fv = module
-            .get_function(&ext.name)
-            .unwrap_or_else(|| module.add_function(&ext.name, fn_ty, None));
-        funcs.insert(ext.name.clone(), fv);
+            .get_function(ext.name.as_str())
+            .unwrap_or_else(|| module.add_function(ext.name.as_str(), fn_ty, None));
+        program_funcs.insert(ext.name.clone(), fv);
     }
     // The fixed native ABI table is the sole declaration/type/attribute authority. Program,
     // imported, and extern declarations intentionally remain earlier in the module. Keyed native
-    // rows are then emitted in alphabetical RuntimeKey::ALL order; the legacy mixed alias map is
-    // populated from the same handles until typed MIR direct calls land in am-c3.
+    // rows are then emitted in alphabetical RuntimeKey::ALL order into the typed runtime registry.
     let ptr = ctx.ptr_type(AddressSpace::default());
     let mut runtime_funcs: HashMap<RuntimeKey, FunctionValue<'c>> =
         HashMap::with_capacity(RuntimeKey::ALL.len());
@@ -1071,7 +1109,10 @@ fn build_module<'c>(
         let key = abi
             .runtime_key()
             .expect("keyed runtime iterator yielded an unkeyed row");
-        let compatible_extern = program.externs.iter().any(|ext| ext.name == abi.symbol);
+        let compatible_extern = program
+            .externs
+            .iter()
+            .any(|ext| ext.name.as_str() == abi.symbol);
         let function = if compatible_extern {
             let existing = module
                 .get_function(abi.symbol)
@@ -1089,7 +1130,6 @@ fn build_module<'c>(
         if !(rt_lto_skip_guarded && abi.is_rt_lto_guarded()) {
             abi.apply_attributes(ctx, function);
         }
-        funcs.insert(key.logical_name().to_string(), function);
         runtime_funcs.insert(key, function);
         runtime_physical_names.insert(
             key,
@@ -1098,21 +1138,34 @@ fn build_module<'c>(
     }
 
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
-    // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
-    // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
+    // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by a
+    // canonical function-value helper so all closure callees share that ABI (the env pointer
     // is null and ignored). Capturing closures (a later slice) instead point at an env-reading fn.
-    let mut thunk_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut thunk_names: std::collections::BTreeSet<ProgramCall> =
+        std::collections::BTreeSet::new();
     for f in &program.fns {
         for b in &f.blocks {
             for s in &b.stmts {
-                if let Stmt::Let(_, Rvalue::FnAddr { name, .. }) = s {
-                    thunk_names.insert(name.clone());
+                if let Stmt::Let(_, Rvalue::FnAddr { target, .. }) = s {
+                    thunk_names.insert(target.clone());
                 }
             }
         }
     }
     for name in &thunk_names {
-        let orig = *funcs
+        let declaration = callable_preflight
+            .declarations
+            .get(name)
+            .ok_or_else(|| callable_target_error(name))?;
+        let id = GeneratedId::FnValue {
+            target: name.clone(),
+            signature: canonical_signature(&declaration.signature, program)?,
+        };
+        let emitted_name = callable_preflight
+            .generated_names
+            .get(&id)
+            .ok_or_else(|| CodegenError::Lowering("function-value identity was not collected".into()))?;
+        let orig = *program_funcs
             .get(name)
             .ok_or_else(|| CodegenError::Lowering(format!("unknown function {name}")))?;
         let orig_ty = orig.get_type();
@@ -1122,7 +1175,7 @@ fn build_module<'c>(
             Some(rt) => rt.fn_type(&params, false),
             None => ctx.void_type().fn_type(&params, false),
         };
-        let thunk = module.add_function(&format!("{name}$fnval"), thunk_ty, None);
+        let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
@@ -1136,13 +1189,14 @@ fn build_module<'c>(
             None => tb.build_return(None),
         }
         .map_err(|e| CodegenError::Lowering(e.to_string()))?;
-        funcs.insert(format!("{name}$fnval"), thunk);
+        generated_funcs.insert(id, thunk);
     }
 
     // Pass 1c: a closure thunk per lifted function used as a *capturing* closure. The env-ABI
-    // thunk `lifted$clos(env, explicit…)` loads the captured values out of `env` and forwards them
+    // helper loads the captured values out of `env` and forwards them
     // as the lifted function's trailing capture parameters: `lifted(explicit…, env.0, env.1, …)`.
-    let mut closure_thunks: std::collections::BTreeMap<String, Vec<Ty>> = std::collections::BTreeMap::new();
+    let mut closure_thunks: std::collections::BTreeMap<ProgramCall, Vec<Ty>> =
+        std::collections::BTreeMap::new();
     for f in &program.fns {
         for b in &f.blocks {
             for s in &b.stmts {
@@ -1153,7 +1207,46 @@ fn build_module<'c>(
         }
     }
     for (lifted, capture_tys) in &closure_thunks {
-        let orig = *funcs
+        let declaration = callable_preflight
+            .declarations
+            .get(lifted)
+            .ok_or_else(|| callable_target_error(lifted))?;
+        let explicit = declaration
+            .signature
+            .params
+            .len()
+            .checked_sub(capture_tys.len())
+            .ok_or_else(|| callable_target_error(lifted))?;
+        let explicit_params = declaration
+            .signature
+            .params
+            .get(..explicit)
+            .ok_or_else(|| callable_target_error(lifted))?;
+        let explicit_modes = declaration
+            .signature
+            .modes
+            .get(..explicit)
+            .ok_or_else(|| callable_target_error(lifted))?;
+        let explicit_signature = ProgramSignature {
+            params: explicit_params.to_vec(),
+            modes: explicit_modes.to_vec(),
+            ret: declaration.signature.ret,
+            borrow: declaration.signature.borrow.clone(),
+            region: declaration.signature.region.clone(),
+        };
+        let id = GeneratedId::Closure {
+            lifted: lifted.clone(),
+            explicit_signature: canonical_signature(&explicit_signature, program)?,
+            captures: capture_tys
+                .iter()
+                .map(|ty| canonical_ty(*ty, program))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let emitted_name = callable_preflight
+            .generated_names
+            .get(&id)
+            .ok_or_else(|| CodegenError::Lowering("closure identity was not collected".into()))?;
+        let orig = *program_funcs
             .get(lifted)
             .ok_or_else(|| CodegenError::Lowering(format!("unknown lifted function {lifted}")))?;
         let orig_ty = orig.get_type();
@@ -1171,7 +1264,7 @@ fn build_module<'c>(
             Some(rt) => rt.fn_type(&tparams, false),
             None => ctx.void_type().fn_type(&tparams, false),
         };
-        let thunk = module.add_function(&format!("{lifted}$clos"), thunk_ty, None);
+        let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
@@ -1205,35 +1298,46 @@ fn build_module<'c>(
             None => tb.build_return(None),
         }
         .map_err(|e| CodegenError::Lowering(e.to_string()))?;
-        funcs.insert(format!("{lifted}$clos"), thunk);
+        generated_funcs.insert(id, thunk);
     }
 
-    // Pass 1d: a `spawn` trampoline per result type `R`. `tramp$R(thunk, env, slot)` runs the
-    // spawned closure (`thunk(env) -> R`) and stores the result into `slot` (the typed store is
-    // why it is generated, not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs
-    // it on a worker thread.
+    // Pass 1d: a canonical `spawn` trampoline per result type `R`. It runs the spawned closure
+    // (`thunk(env) -> R`) and stores the result into `slot` (the typed store is why it is generated,
+    // not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs it on a worker thread.
     // A trampoline per (result type `R`, fallibility): `tramp(thunk, env, slot) -> i32` runs the
     // spawned closure and writes its result into `slot`, returning an error code (`0` = ok). A
     // fallible closure returns `Result<R, Error>`; the trampoline stores the `Ok` payload and
     // returns `0`, or returns the `Err` code (which `tg_wait` surfaces to `wait()?`).
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
-    let mut tramp_keys: std::collections::BTreeMap<String, (Ty, bool)> = std::collections::BTreeMap::new();
+    let mut tramp_keys: std::collections::BTreeMap<Box<[u8]>, (GeneratedId, Ty, bool)> =
+        std::collections::BTreeMap::new();
     for f in &program.fns {
         for b in &f.blocks {
             for s in &b.stmts {
                 if let Stmt::Let(_, Rvalue::SpawnTask { r, fallible, .. }) = s {
-                    tramp_keys.insert(spawn_tramp_key(*r, *fallible), (*r, *fallible));
+                    let id = GeneratedId::Task {
+                        fallible: *fallible,
+                        result: canonical_ty(*r, program)?,
+                    };
+                    tramp_keys.insert(
+                        canonical_metadata(id.to_canonical_bytes())?,
+                        (id, *r, *fallible),
+                    );
                 }
             }
         }
     }
     // The builtin `Error` enum id (always registered), for fallible trampolines.
     let error_id = program.enums.iter().position(|e| e.name == "Error").map(|i| i as u32);
-    for (key, (r, fallible)) in &tramp_keys {
+    for (id, r, fallible) in tramp_keys.values() {
         // `tramp(thunk, env, slot, err_slot) -> i32` (0 = ok, 1 = errored).
         let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false);
-        let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
+        let emitted_name = callable_preflight
+            .generated_names
+            .get(id)
+            .ok_or_else(|| CodegenError::Lowering("task identity was not collected".into()))?;
+        let tramp = module.add_function(emitted_name, fn_ty, None);
         mark_nounwind(ctx, tramp);
         mark_private_helper(tramp);
         let bb = ctx.append_basic_block(tramp, "entry");
@@ -1294,20 +1398,24 @@ fn build_module<'c>(
             tb.build_store(slot, res).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         }
-        funcs.insert(format!("tramp${key}"), tramp);
+        generated_funcs.insert(id.clone(), tramp);
     }
 
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
         let stack_headers = stack_header_plan(f);
+        let func = program_funcs
+            .get(&f.name)
+            .copied()
+            .ok_or_else(|| callable_target_error(&f.name))?;
         // Under debug info, give each function a DISubprogram (anchored to its first source line)
         // and attach it to the LLVM function, so its instructions can carry DILocations.
         let fn_line = debug_ctx.as_ref().map_or(0, |_| first_fn_line(f));
         let subprogram = debug_ctx.as_ref().map(|dc| {
             let sp = dc.dib.create_function(
                 dc.scope,
-                symbol_name(f),
+                &symbol_name(f, exports),
                 None,
                 dc.file,
                 fn_line,
@@ -1318,14 +1426,17 @@ fn build_module<'c>(
                 DIFlags::ZERO,
                 /* is_optimized */ true,
             );
-            funcs[&f.name].set_subprogram(sp);
+            func.set_subprogram(sp);
             sp
         });
         FnGen {
             ctx,
             module,
             builder: &builder,
-            funcs: &funcs,
+            program_funcs: &program_funcs,
+            generated_funcs: &generated_funcs,
+            callable_preflight: &callable_preflight,
+            program,
             runtime_funcs: &runtime_funcs,
             fn_sigs: &fn_sigs,
             extern_abi: &extern_abi,
@@ -1340,7 +1451,7 @@ fn build_module<'c>(
             tuples: &program.tuples,
             target_data: &target_data,
             f,
-            func: funcs[&f.name],
+            func,
             slots: HashMap::new(),
             values: HashMap::new(),
             stack_header_slots: stack_headers.slots,
@@ -1365,17 +1476,23 @@ fn build_module<'c>(
     // A `Result`- or `Unit`-returning main needs a C `main` wrapper: `Result` maps Ok/Err to an
     // exit code (and, when `main(args: array<str>)`, marshals argv into the `array<str>`
     // argument — the argv form is Result-only, sema-enforced); `Unit` has no error to report, so
-    // the wrapper just calls `align_main` and always returns a defined `0` (the bug this fixes —
+    // the wrapper just calls the encoded Align body and always returns a defined `0` (the bug this fixes —
     // previously a `()`-returning `main` WAS the C entry directly, declared `void`, and `ret void`
     // left the C ABI's i32 return register undefined; see `docs/open-questions.md` "Unit-returning
     // `fn main()` yields a nondeterministic exit code").
     if let Some(f) =
-        program.fns.iter().find(|f| f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit))
+        program.fns.iter().find(|f| {
+            f.name.as_str() == "main"
+                && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit)
+        })
     {
         emit_main_wrapper(
             ctx,
             module,
-            funcs["main"],
+            program_funcs
+                .get(&f.name)
+                .copied()
+                .ok_or_else(|| callable_target_error(&f.name))?,
             f.ret,
             !f.params.is_empty(),
             &extern_fn_types,
@@ -1589,7 +1706,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         param_types: &[Ty],
         program: &Program,
     ) -> Result<(), CodegenError> {
-        if function.name != "main" {
+        if function.name.as_str() != "main" {
             return Ok(());
         }
         if function.exportable {
@@ -1624,9 +1741,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
 
     fn named_signature<'a>(
         program: &'a Program,
-        name: &str,
+        name: &ProgramCall,
     ) -> Option<(Vec<Ty>, Ty, &'a [align_ast::ParamMode])> {
-        if let Some(function) = program.fns.iter().find(|function| function.name == name) {
+        if let Some(function) = program.fns.iter().find(|function| &function.name == name) {
             return Some((
                 function
                     .params
@@ -1637,14 +1754,22 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 &function.param_modes,
             ));
         }
-        if let Some(function) = program.imported_fns.iter().find(|function| function.name == name) {
+        if let Some(function) = program
+            .imported_fns
+            .iter()
+            .find(|function| &function.name == name)
+        {
             return Some((
                 function.params.clone(),
                 function.ret,
                 &function.param_modes,
             ));
         }
-        program.externs.iter().find(|function| function.name == name).map(|function| {
+        program
+            .externs
+            .iter()
+            .find(|function| &function.name == name)
+            .map(|function| {
             (
                 function.params.clone(),
                 function.ret,
@@ -2240,13 +2365,11 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     continue;
                 };
                 match rvalue {
-                    Rvalue::FnAddr { name, signature } => {
+                    Rvalue::FnAddr { target, signature } => {
                         let Some((param_types, ret, modes)) =
-                            named_signature(program, name)
+                            named_signature(program, target)
                         else {
-                            return Err(CodegenError::Lowering(format!(
-                                "function address refers to unknown target `{name}`"
-                            )));
+                            return Err(callable_target_error(target));
                         };
                         check_signature_facts(
                             SignatureFacts {
@@ -2266,9 +2389,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         // indirect calls retain the all-compatible-input fallback. L2b-b attaches
                         // target-relative roots and restores exact summary equality here.
                         if signature.param_modes != modes {
-                            return Err(CodegenError::Lowering(format!(
-                                "function address signature facts disagree with target `{name}`"
-                            )));
+                            return Err(callable_target_error(target));
                         }
                     }
                     Rvalue::Closure {
@@ -2281,67 +2402,54 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         let Some(target) =
                             program.fns.iter().find(|function| function.name == *lifted)
                         else {
-                            return Err(CodegenError::Lowering(format!(
-                                "closure refers to unknown lifted target `{lifted}`"
-                            )));
+                            return Err(callable_target_error(lifted));
                         };
                         let explicit = target.params.len().checked_sub(capture_tys.len()).ok_or_else(
-                            || {
-                                CodegenError::Lowering(format!(
-                                    "closure `{lifted}` has more captures than target parameters"
-                                ))
-                            },
+                            || callable_target_error(lifted),
                         )?;
-                        let target_modes = target.param_modes.get(..explicit).ok_or_else(|| {
-                            CodegenError::Lowering(format!(
-                                "closure `{lifted}` target parameter modes are malformed"
-                            ))
-                        })?;
+                        let target_modes = target
+                            .param_modes
+                            .get(..explicit)
+                            .ok_or_else(|| callable_target_error(lifted))?;
                         let capture_modes =
-                            target.param_modes.get(explicit..).ok_or_else(|| {
-                                CodegenError::Lowering(format!(
-                                    "closure `{lifted}` target capture modes are malformed"
-                                ))
-                            })?;
+                            target.param_modes.get(explicit..).ok_or_else(|| callable_target_error(lifted))?;
                         if capture_modes
                             .iter()
                             .any(|mode| *mode != align_ast::ParamMode::ByValue)
                         {
-                            return Err(CodegenError::Lowering(format!(
-                                "closure `{lifted}` target capture parameters must be ByValue"
-                            )));
+                            return Err(callable_target_error(lifted));
                         }
                         if captures.len() != capture_tys.len() {
-                            return Err(CodegenError::Lowering(format!(
-                                "closure `{lifted}` has {} capture operands but {} capture types",
-                                captures.len(),
-                                capture_tys.len()
-                            )));
+                            return Err(callable_target_error(lifted));
                         }
-                        let target_capture_tys = target.params[explicit..]
+                        let target_capture_tys = target
+                            .params
+                            .get(explicit..)
+                            .ok_or_else(|| callable_target_error(lifted))?
                             .iter()
                             .map(|slot| {
-                                target.slots.get(*slot as usize).copied().ok_or_else(|| {
-                                    CodegenError::Lowering(format!(
-                                        "closure `{lifted}` target capture slot {slot} is missing"
-                                    ))
-                                })
+                                target
+                                    .slots
+                                    .get(*slot as usize)
+                                    .copied()
+                                    .ok_or_else(|| callable_target_error(lifted))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        let target_explicit_tys = target.params[..explicit]
+                        let target_explicit_tys = target
+                            .params
+                            .get(..explicit)
+                            .ok_or_else(|| callable_target_error(lifted))?
                             .iter()
                             .map(|slot| {
-                                target.slots.get(*slot as usize).copied().ok_or_else(|| {
-                                    CodegenError::Lowering(format!(
-                                        "closure `{lifted}` target parameter slot {slot} is missing"
-                                    ))
-                                })
+                                target
+                                    .slots
+                                    .get(*slot as usize)
+                                    .copied()
+                                    .ok_or_else(|| callable_target_error(lifted))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         if target_capture_tys != *capture_tys {
-                            return Err(CodegenError::Lowering(format!(
-                                "closure `{lifted}` capture types disagree with its target"
-                            )));
+                            return Err(callable_target_error(lifted));
                         }
                         check_signature_facts(
                             SignatureFacts {
@@ -2361,9 +2469,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                             || signature.return_borrow != target.return_borrow
                             || signature.return_region != target.return_region
                         {
-                            return Err(CodegenError::Lowering(format!(
-                                "closure signature facts disagree with lifted target `{lifted}`"
-                            )));
+                            return Err(callable_target_error(lifted));
                         }
                     }
                     Rvalue::CallIndirect {
@@ -2441,6 +2547,11 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             "nested tagged type table is not compact, unique, and canonical".to_string(),
         ));
     }
+    if !align_mir::function_types_are_canonical(program) {
+        return Err(CodegenError::Lowering(
+            "function type table is not compact, unique, and canonical".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -2455,29 +2566,958 @@ fn first_fn_line(f: &Function) -> u32 {
         .unwrap_or(1)
 }
 
-/// The LLVM symbol for a function: a `Result`- or `Unit`-returning `main` is emitted as
-/// `align_main` (the C `main` is a generated wrapper that always returns a defined `i32`);
-/// everything else keeps its name. (An `-> i32` `main` needs no wrapper — it already returns
-/// the C ABI's type directly — so it keeps the `main` symbol and IS the C entry.)
-fn symbol_name(f: &Function) -> &str {
-    if f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit) {
-        "align_main"
+/// Encode one logical Align program identity as a collision-free LLVM symbol. The direct i32 main
+/// and explicit exports deliberately use their external identities instead; a wrapped main body
+/// uses this encoding while its generated C entry keeps `main`.
+fn encoded_program_symbol(name: &ProgramCall) -> String {
+    let hex = lowercase_hex(name.as_bytes());
+    format!("align_fn${}${hex}", name.as_bytes().len())
+}
+
+fn symbol_name(f: &Function, exports: &[String]) -> String {
+    let direct_main = f.name.as_str() == "main"
+        && !matches!(f.ret, Ty::Result(..))
+        && f.ret != Ty::Unit;
+    let explicit_export = f.name.as_str() != "main"
+        && exports.iter().any(|export| export == f.name.as_str());
+    if direct_main || explicit_export {
+        f.name.as_str().to_owned()
     } else {
-        &f.name
+        encoded_program_symbol(&f.name)
     }
 }
 
-/// Emit the C `main` for a `Result<(), Error>`- or `Unit`-returning Align `main` (renamed
-/// `align_main`, see [`symbol_name`]): call it, then materialize a **defined** `i32` exit code —
+fn callable_hex(name: &ProgramCall) -> String {
+    lowercase_hex(name.as_bytes())
+}
+
+fn callable_target_error(name: &ProgramCall) -> CodegenError {
+    CodegenError::Lowering(format!("callable target invalid:{}", callable_hex(name)))
+}
+
+fn program_signature(function: &Function) -> Result<ProgramSignature, CodegenError> {
+    let params = function
+        .params
+        .iter()
+        .map(|slot| {
+            function
+                .slots
+                .get(*slot as usize)
+                .copied()
+                .ok_or_else(|| callable_target_error(&function.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProgramSignature {
+        params,
+        modes: function.param_modes.clone(),
+        ret: function.ret,
+        borrow: function.return_borrow.clone(),
+        region: function.return_region.clone(),
+    })
+}
+
+fn register_program_declaration(
+    declarations: &mut HashMap<ProgramCall, ProgramDeclaration>,
+    name: &ProgramCall,
+    class: ProgramDeclarationClass,
+    signature: ProgramSignature,
+) -> Result<(), CodegenError> {
+    let Some(existing) = declarations.get_mut(name) else {
+        declarations.insert(
+            name.clone(),
+            ProgramDeclaration {
+                signature,
+                classes: vec![class],
+            },
+        );
+        return Ok(());
+    };
+    let same_class = existing.classes.contains(&class);
+    let cross_class_allowed = matches!(class, ProgramDeclarationClass::Stored | ProgramDeclarationClass::Imported)
+        && existing
+            .classes
+            .iter()
+            .all(|existing| matches!(existing, ProgramDeclarationClass::Stored | ProgramDeclarationClass::Imported));
+    let repeated_class_allowed = same_class && class != ProgramDeclarationClass::Stored;
+    if existing.signature != signature || (!cross_class_allowed && !repeated_class_allowed) {
+        return Err(CodegenError::Lowering(format!(
+            "callable declaration conflict:{}",
+            callable_hex(name)
+        )));
+    }
+    if !same_class {
+        existing.classes.push(class);
+    }
+    Ok(())
+}
+
+fn canonical_metadata<T>(result: Result<T, align_mir::CanonicalCodecError>) -> Result<T, CodegenError> {
+    result.map_err(|error| CodegenError::Lowering(format!("callable metadata invalid:{error:?}")))
+}
+
+fn canonical_signature(
+    signature: &ProgramSignature,
+    program: &Program,
+) -> Result<CanonicalFnAbi, CodegenError> {
+    let params = signature
+        .modes
+        .iter()
+        .copied()
+        .zip(signature.params.iter().copied())
+        .collect::<Vec<_>>();
+    canonical_metadata(CanonicalFnAbi::from_parts(
+        &params,
+        signature.ret,
+        &signature.borrow,
+        &signature.region,
+        program,
+    ))
+}
+
+fn canonical_ty(ty: Ty, program: &Program) -> Result<CanonicalTy, CodegenError> {
+    canonical_metadata(CanonicalTy::from_program(ty, program))
+}
+
+fn callable_metadata_error() -> CodegenError {
+    CodegenError::Lowering("callable metadata invalid:InvalidGraph".to_owned())
+}
+
+fn validate_parallel_callable(
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+    name: &ProgramCall,
+    params: &[Ty],
+    ret: Ty,
+) -> Result<(), CodegenError> {
+    let declaration = declarations
+        .get(name)
+        .ok_or_else(|| callable_target_error(name))?;
+    if declaration.classes.contains(&ProgramDeclarationClass::Extern)
+        || declaration.signature.params != params
+        || declaration.signature.ret != ret
+    {
+        return Err(callable_target_error(name));
+    }
+    Ok(())
+}
+
+fn parallel_kernel_ty_is_valid(ty: Ty, program: &Program) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
+        || matches!(ty, Ty::Struct(id)
+            if program.structs.get(id as usize).is_some()
+                && !struct_is_move(id, &program.structs, &program.enums, &program.tagged_types))
+}
+
+fn parallel_input_ty_is_valid(ty: Ty, program: &Program) -> bool {
+    matches!(ty, Ty::Slice(_)) || parallel_kernel_ty_is_valid(ty, program)
+}
+
+fn parallel_capture_ty_is_valid(ty: Ty, program: &Program) -> bool {
+    if align_sema::ty_capture_is_move(
+        ty,
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
+    ) {
+        return false;
+    }
+    matches!(
+        ty,
+        Ty::Int(_)
+            | Ty::Float(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Unit
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Array(_, _)
+            | Ty::StructArray(_, _)
+            | Ty::Slice(_)
+            | Ty::Soa(_)
+            | Ty::Str
+            | Ty::Raw
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::JsonScanner(_)
+            | Ty::Option(_)
+            | Ty::Result(_, _)
+            | Ty::Tagged(_)
+            | Ty::Enum(_)
+            | Ty::Rng
+            | Ty::Fn(_)
+            | Ty::Vec(_, _)
+            | Ty::Mask(_, _)
+            | Ty::ArenaHandle
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_parallel_request(
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+    function: &Function,
+    result: Ty,
+    src: &Operand,
+    terminal: &ProgramCall,
+    stages: &[ParMapStage],
+    terminal_captures: &[Operand],
+    terminal_capture_tys: &[Ty],
+    elem_in: Ty,
+    elem_out: Ty,
+    work_weight: u8,
+    reduce: bool,
+) -> Result<(), CodegenError> {
+    if !matches!(work_weight, 1 | 2 | 4)
+        || !parallel_input_ty_is_valid(elem_in, program)
+        || !parallel_kernel_ty_is_valid(elem_out, program)
+        || terminal_captures.len() != terminal_capture_tys.len()
+        || terminal_captures
+            .iter()
+            .zip(terminal_capture_tys)
+            .any(|(operand, ty)| {
+                preflight_operand_ty(function, operand) != Some(*ty)
+                    || !parallel_capture_ty_is_valid(*ty, program)
+            })
+    {
+        return Err(callable_metadata_error());
+    }
+    let Some(source_ty) = preflight_operand_ty(function, src) else {
+        return Err(callable_metadata_error());
+    };
+    let source_elem = match source_ty {
+        Ty::Slice(scalar) | Ty::DynArray(scalar) => align_sema::scalar_to_ty(scalar),
+        Ty::DynSliceArray(primitive) => Ty::Slice(align_sema::prim_to_scalar(primitive)),
+        Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+        _ => return Err(callable_metadata_error()),
+    };
+    if source_elem != elem_in {
+        return Err(callable_metadata_error());
+    }
+
+    if reduce {
+        if !stages.is_empty() || !matches!(elem_out, Ty::Int(_)) || result != elem_out {
+            return Err(callable_metadata_error());
+        }
+    } else {
+        let Some(output) = ty_to_scalar(elem_out)
+            .filter(|scalar| matches!(scalar, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char))
+        else {
+            return Err(callable_metadata_error());
+        };
+        if result != Ty::DynArray(output) {
+            return Err(callable_metadata_error());
+        }
+    }
+
+    let mut stage_input = elem_in;
+    for stage in stages {
+        if stage.elem_in != stage_input
+            || stage.captures.len() != stage.capture_tys.len()
+            || stage
+                .captures
+                .iter()
+                .zip(&stage.capture_tys)
+                .any(|(operand, ty)| {
+                    preflight_operand_ty(function, operand) != Some(*ty)
+                        || !parallel_capture_ty_is_valid(*ty, program)
+                })
+        {
+            return Err(callable_metadata_error());
+        }
+        match stage.kind {
+            ParMapStageKind::Map | ParMapStageKind::Filter => {
+                let Some(target) = stage.func.as_ref() else {
+                    return Err(callable_metadata_error());
+                };
+                if !parallel_input_ty_is_valid(stage.elem_in, program)
+                    || (stage.kind == ParMapStageKind::Map
+                        && !parallel_kernel_ty_is_valid(stage.elem_out, program))
+                    || (stage.kind == ParMapStageKind::Filter && stage.elem_out != stage.elem_in)
+                {
+                    return Err(callable_metadata_error());
+                }
+                let mut params = Vec::with_capacity(stage.capture_tys.len() + 1);
+                params.push(stage.elem_in);
+                params.extend(stage.capture_tys.iter().copied());
+                let ret = if stage.kind == ParMapStageKind::Map {
+                    stage.elem_out
+                } else {
+                    Ty::Bool
+                };
+                validate_parallel_callable(declarations, target, &params, ret)?;
+            }
+            ParMapStageKind::FilterStrContains => {
+                if stage.func.is_some()
+                    || stage.elem_in != Ty::Str
+                    || stage.elem_out != Ty::Str
+                    || stage.capture_tys.as_slice() != [Ty::Str]
+                {
+                    return Err(callable_metadata_error());
+                }
+            }
+            ParMapStageKind::Project { field } | ParMapStageKind::FilterField { field } => {
+                if stage.func.is_some() || !stage.captures.is_empty() {
+                    return Err(callable_metadata_error());
+                }
+                let Ty::Struct(id) = stage.elem_in else {
+                    return Err(callable_metadata_error());
+                };
+                let Some(field_ty) = program
+                    .structs
+                    .get(id as usize)
+                    .and_then(|definition| definition.fields.get(field as usize))
+                    .map(|field| field.ty)
+                else {
+                    return Err(callable_metadata_error());
+                };
+                let valid = match stage.kind {
+                    ParMapStageKind::Project { .. } => field_ty == stage.elem_out,
+                    ParMapStageKind::FilterField { .. } => {
+                        field_ty == Ty::Bool && stage.elem_out == stage.elem_in
+                    }
+                    _ => unreachable!(),
+                };
+                if !valid {
+                    return Err(callable_metadata_error());
+                }
+            }
+        }
+        stage_input = match stage.kind {
+            ParMapStageKind::Map | ParMapStageKind::Project { .. } => stage.elem_out,
+            ParMapStageKind::Filter
+            | ParMapStageKind::FilterStrContains
+            | ParMapStageKind::FilterField { .. } => stage.elem_in,
+        };
+    }
+
+    let mut terminal_params = Vec::with_capacity(terminal_capture_tys.len() + 1);
+    terminal_params.push(stage_input);
+    terminal_params.extend(terminal_capture_tys.iter().copied());
+    validate_parallel_callable(declarations, terminal, &terminal_params, elem_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parallel_generated_ids(
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+    function: &Function,
+    src: &Operand,
+    terminal: &ProgramCall,
+    stages: &[ParMapStage],
+    terminal_capture_tys: &[Ty],
+    elem_in: Ty,
+    elem_out: Ty,
+    work_weight: u8,
+    reduce: bool,
+) -> Result<Vec<GeneratedId>, CodegenError> {
+    let Some(terminal_declaration) = declarations.get(terminal) else {
+        return Err(callable_target_error(terminal));
+    };
+    if terminal_declaration
+        .classes
+        .contains(&ProgramDeclarationClass::Extern)
+    {
+        return Err(callable_target_error(terminal));
+    }
+    let source = preflight_operand_ty(function, src)
+        .ok_or_else(|| callable_target_error(terminal))?;
+    let mut stage_ids = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let input = canonical_ty(stage.elem_in, program)?;
+        let output = canonical_ty(stage.elem_out, program)?;
+        let captures = stage
+            .capture_tys
+            .iter()
+            .map(|ty| canonical_ty(*ty, program))
+            .collect::<Result<Vec<_>, _>>()?;
+        stage_ids.push(match stage.kind {
+            ParMapStageKind::Map | ParMapStageKind::Filter => {
+                let target = stage
+                    .func
+                    .as_ref()
+                    .ok_or_else(|| callable_target_error(terminal))?;
+                let declaration = declarations
+                    .get(target)
+                    .ok_or_else(|| callable_target_error(target))?;
+                if declaration
+                    .classes
+                    .contains(&ProgramDeclarationClass::Extern)
+                {
+                    return Err(callable_target_error(target));
+                }
+                let abi = canonical_signature(&declaration.signature, program)?;
+                if stage.kind == ParMapStageKind::Map {
+                    ParallelStageId::Map {
+                        target: target.clone(),
+                        abi,
+                        input,
+                        output,
+                        captures,
+                    }
+                } else {
+                    ParallelStageId::Filter {
+                        target: target.clone(),
+                        abi,
+                        input,
+                        output,
+                        captures,
+                    }
+                }
+            }
+            ParMapStageKind::FilterStrContains => ParallelStageId::FilterStrContains {
+                input,
+                output,
+                needle: captures
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| callable_target_error(terminal))?,
+            },
+            ParMapStageKind::Project { field } => ParallelStageId::Project {
+                input,
+                output,
+                field,
+            },
+            ParMapStageKind::FilterField { field } => ParallelStageId::FilterField {
+                input,
+                output,
+                field,
+            },
+        });
+    }
+    let terminal_input = stages.last().map_or(elem_in, |stage| stage.elem_out);
+    let terminal_captures = terminal_capture_tys
+        .iter()
+        .map(|ty| canonical_ty(*ty, program))
+        .collect::<Result<Vec<_>, _>>()?;
+    let base = ParallelGeneratedId {
+        mode: if reduce {
+            ParallelKernelMode::Reduce
+        } else {
+            ParallelKernelMode::Materialize
+        },
+        source: canonical_ty(source, program)?,
+        terminal_input: canonical_ty(terminal_input, program)?,
+        terminal_output: canonical_ty(elem_out, program)?,
+        terminal: terminal.clone(),
+        terminal_abi: canonical_signature(&terminal_declaration.signature, program)?,
+        terminal_captures,
+        stages: stage_ids,
+        work_weight,
+    };
+    if reduce {
+        return Ok(vec![GeneratedId::Parallel(base)]);
+    }
+    let has_filter = stages.iter().any(|stage| {
+        matches!(
+            stage.kind,
+            ParMapStageKind::Filter
+                | ParMapStageKind::FilterStrContains
+                | ParMapStageKind::FilterField { .. }
+        )
+    });
+    if !has_filter {
+        return Ok(vec![GeneratedId::Parallel(base)]);
+    }
+    let mut count = base.clone();
+    count.mode = ParallelKernelMode::FilterCount;
+    let mut scatter = base;
+    scatter.mode = ParallelKernelMode::FilterScatter;
+    Ok(vec![GeneratedId::Parallel(count), GeneratedId::Parallel(scatter)])
+}
+
+fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
+    match operand {
+        Operand::Const(Const::Int(_, ty)) | Operand::Const(Const::Float(_, ty)) => Some(*ty),
+        Operand::Const(Const::Char(_)) => Some(Ty::Char),
+        Operand::Const(Const::Bool(_)) => Some(Ty::Bool),
+        Operand::Const(Const::Unit) => Some(Ty::Unit),
+        Operand::Value(value) => function.value_tys.get(*value as usize).copied(),
+        Operand::Arg(index) => function
+            .params
+            .get(*index as usize)
+            .and_then(|slot| function.slots.get(*slot as usize))
+            .copied(),
+    }
+}
+
+fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, program: &Program) -> bool {
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    match key {
+        RuntimeKey::Print => args.len() == 1 && matches!(args[0], Ty::Int(_)) && ret == Ty::Unit,
+        RuntimeKey::PrintStr => args == [Ty::Str] && ret == Ty::Unit,
+        RuntimeKey::PrintBool => args == [Ty::Bool] && ret == Ty::Unit,
+        RuntimeKey::PrintChar => args == [Ty::Char] && ret == Ty::Unit,
+        RuntimeKey::PrintF32 => {
+            args == [Ty::Float(FloatTy { bits: 32 })] && ret == Ty::Unit
+        }
+        RuntimeKey::PrintF64 => {
+            args == [Ty::Float(FloatTy { bits: 64 })] && ret == Ty::Unit
+        }
+        RuntimeKey::Hash64 => {
+            args.len() == 1
+                && matches!(args[0], Ty::Str | Ty::Slice(_))
+                && ret
+                    == Ty::Int(IntTy {
+                        bits: 64,
+                        signed: false,
+                    })
+        }
+        RuntimeKey::Hash128 => args.len() == 1
+            && matches!(args[0], Ty::Str | Ty::Slice(_))
+            && matches!(ret, Ty::Tuple(id)
+                if program.tuples.get(id as usize).is_some_and(|tuple| {
+                    let u64_scalar = Scalar::Int(IntTy { bits: 64, signed: false });
+                    tuple.elems.as_slice() == [u64_scalar, u64_scalar]
+                })),
+        RuntimeKey::ProcessExit => args == [i64_ty] && ret == Ty::Unit,
+        RuntimeKey::ProcessAbort | RuntimeKey::DivFail => args.is_empty() && ret == Ty::Unit,
+        RuntimeKey::BoundsFail | RuntimeKey::Utf8BoundaryFail | RuntimeKey::LenMismatchFail => {
+            args == [i64_ty, i64_ty] && ret == Ty::Unit
+        }
+        RuntimeKey::RangeFail => args == [i64_ty, i64_ty, i64_ty] && ret == Ty::Unit,
+        _ => false,
+    }
+}
+
+fn generated_stem(id: &GeneratedId) -> Result<String, CodegenError> {
+    Ok(match id {
+        GeneratedId::FnValue { target, .. } => {
+            format!("align_gen$fnval${}", callable_hex(target))
+        }
+        GeneratedId::Closure { lifted, .. } => {
+            format!("align_gen$clos${}", callable_hex(lifted))
+        }
+        GeneratedId::Task { fallible, result } => {
+            let fallible_byte = u8::from(*fallible);
+            let result_hex = lowercase_hex(result.as_bytes());
+            format!("align_gen$tramp${fallible_byte}${result_hex}")
+        }
+        GeneratedId::Parallel(parallel) => {
+            let bytes = canonical_metadata(id.to_canonical_bytes())?;
+            let mode = parallel.mode as u8;
+            let bytes_hex = lowercase_hex(&bytes);
+            format!("align_gen$par${mode}${bytes_hex}")
+        }
+    })
+}
+
+fn reserve_external_identity(
+    reserved: &mut HashMap<String, String>,
+    identity: String,
+    claimant: String,
+) -> Result<(), CodegenError> {
+    if let Some(existing) = reserved.get(&identity) {
+        if existing == &claimant {
+            return Ok(());
+        }
+        return Err(CodegenError::Lowering(format!(
+            "callable external identity collision:{}",
+            lowercase_hex(identity.as_bytes())
+        )));
+    }
+    reserved.insert(identity, claimant);
+    Ok(())
+}
+
+fn validate_generated_pairs(generated: &[GeneratedId]) -> Result<(), CodegenError> {
+    let set = generated.iter().cloned().collect::<HashSet<_>>();
+    for id in generated {
+        let GeneratedId::Parallel(parallel) = id else {
+            continue;
+        };
+        let partner_mode = match parallel.mode {
+            ParallelKernelMode::FilterCount => ParallelKernelMode::FilterScatter,
+            ParallelKernelMode::FilterScatter => ParallelKernelMode::FilterCount,
+            ParallelKernelMode::Materialize | ParallelKernelMode::Reduce => continue,
+        };
+        let mut partner = parallel.clone();
+        partner.mode = partner_mode;
+        if !set.contains(&GeneratedId::Parallel(partner)) {
+            let bytes = canonical_metadata(id.to_canonical_bytes())?;
+            return Err(CodegenError::Lowering(format!(
+                "generated count-scatter pair mismatch:{}",
+                lowercase_hex(&bytes)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn probe_generated_name(
+    stem: &str,
+    reserved: &mut HashMap<String, String>,
+    mut counter: u64,
+) -> Result<String, CodegenError> {
+    loop {
+        let candidate = format!("{stem}${counter}");
+        if !reserved.contains_key(&candidate) {
+            reserved.insert(candidate.clone(), "generated".to_owned());
+            return Ok(candidate);
+        }
+        let Some(next) = counter.checked_add(1) else {
+            return Err(CodegenError::Lowering(format!(
+                "generated name exhausted:{}",
+                lowercase_hex(candidate.as_bytes())
+            )));
+        };
+        counter = next;
+    }
+}
+
+fn callable_declarations(
+    program: &Program,
+) -> Result<HashMap<ProgramCall, ProgramDeclaration>, CodegenError> {
+    let mut declarations = HashMap::new();
+    for function in &program.fns {
+        register_program_declaration(
+            &mut declarations,
+            &function.name,
+            ProgramDeclarationClass::Stored,
+            program_signature(function)?,
+        )?;
+    }
+    for function in &program.imported_fns {
+        register_program_declaration(
+            &mut declarations,
+            &function.name,
+            ProgramDeclarationClass::Imported,
+            ProgramSignature {
+                params: function.params.clone(),
+                modes: function.param_modes.clone(),
+                ret: function.ret,
+                borrow: function.return_borrow.clone(),
+                region: function.return_region.clone(),
+            },
+        )?;
+    }
+    for function in &program.externs {
+        register_program_declaration(
+            &mut declarations,
+            &function.name,
+            ProgramDeclarationClass::Extern,
+            ProgramSignature {
+                params: function.params.clone(),
+                modes: function.param_modes.clone(),
+                ret: function.ret,
+                borrow: function.return_borrow.clone(),
+                region: function.return_region.clone(),
+            },
+        )?;
+    }
+    Ok(declarations)
+}
+
+fn callable_preflight(
+    program: &Program,
+    exports: &[String],
+    declarations: HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<CallablePreflight, CodegenError> {
+    let mut generated = Vec::new();
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let Stmt::Let(value, rvalue) = statement else {
+                    continue;
+                };
+                match rvalue {
+                    Rvalue::Call(DirectCall::Runtime(key), args) => {
+                        let argument_types = args
+                            .iter()
+                            .map(|operand| preflight_operand_ty(function, operand))
+                            .collect::<Option<Vec<_>>>();
+                        let result = function.value_tys.get(*value as usize).copied();
+                        if !argument_types
+                            .as_deref()
+                            .zip(result)
+                            .is_some_and(|(args, ret)| {
+                                direct_runtime_key_is_valid(*key, args, ret, program)
+                            })
+                        {
+                            return Err(CodegenError::Lowering(
+                                "callable metadata invalid:InvalidGraph".to_owned(),
+                            ));
+                        }
+                    }
+                    Rvalue::Call(DirectCall::Program(target), args) => {
+                        let Some(declaration) = declarations.get(target) else {
+                            return Err(callable_target_error(target));
+                        };
+                        let argument_types = args
+                            .iter()
+                            .map(|operand| preflight_operand_ty(function, operand))
+                            .collect::<Option<Vec<_>>>();
+                        let result = function.value_tys.get(*value as usize).copied();
+                        if argument_types.as_deref() != Some(declaration.signature.params.as_slice())
+                            || result != Some(declaration.signature.ret)
+                        {
+                            return Err(callable_target_error(target));
+                        }
+                    }
+                    Rvalue::FnAddr { target, signature } => {
+                        let Some(declaration) = declarations.get(target) else {
+                            return Err(callable_target_error(target));
+                        };
+                        if declaration.classes.contains(&ProgramDeclarationClass::Extern)
+                            || signature.param_modes != declaration.signature.modes
+                            || signature.return_borrow != declaration.signature.borrow
+                            || signature.return_region != declaration.signature.region
+                        {
+                            return Err(callable_target_error(target));
+                        }
+                        generated.push(GeneratedId::FnValue {
+                            target: target.clone(),
+                            signature: canonical_signature(&declaration.signature, program)?,
+                        });
+                    }
+                    Rvalue::Closure {
+                        lifted,
+                        captures,
+                        capture_tys,
+                        signature,
+                        ..
+                    } => {
+                        let Some(declaration) = declarations.get(lifted) else {
+                            return Err(callable_target_error(lifted));
+                        };
+                        if declaration.classes.as_slice() != [ProgramDeclarationClass::Stored]
+                            || capture_tys.len() > declaration.signature.params.len()
+                            || captures.len() != capture_tys.len()
+                        {
+                            return Err(callable_target_error(lifted));
+                        }
+                        let explicit = declaration
+                            .signature
+                            .params
+                            .len()
+                            .checked_sub(capture_tys.len())
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        let explicit_params = declaration
+                            .signature
+                            .params
+                            .get(..explicit)
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        let captured_params = declaration
+                            .signature
+                            .params
+                            .get(explicit..)
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        let explicit_modes = declaration
+                            .signature
+                            .modes
+                            .get(..explicit)
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        let captured_modes = declaration
+                            .signature
+                            .modes
+                            .get(explicit..)
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        if captured_params != capture_tys
+                            || captured_modes
+                                .iter()
+                                .any(|mode| *mode != align_ast::ParamMode::ByValue)
+                            || signature.param_modes != explicit_modes
+                            || signature.return_borrow != declaration.signature.borrow
+                            || signature.return_region != declaration.signature.region
+                            || captures
+                                .iter()
+                                .zip(capture_tys)
+                                .any(|(operand, ty)| preflight_operand_ty(function, operand) != Some(*ty))
+                        {
+                            return Err(callable_target_error(lifted));
+                        }
+                        let explicit_signature = ProgramSignature {
+                            params: explicit_params.to_vec(),
+                            modes: explicit_modes.to_vec(),
+                            ret: declaration.signature.ret,
+                            borrow: declaration.signature.borrow.clone(),
+                            region: declaration.signature.region.clone(),
+                        };
+                        generated.push(GeneratedId::Closure {
+                            lifted: lifted.clone(),
+                            explicit_signature: canonical_signature(&explicit_signature, program)?,
+                            captures: capture_tys
+                                .iter()
+                                .map(|ty| canonical_metadata(CanonicalTy::from_program(*ty, program)))
+                                .collect::<Result<Vec<_>, _>>()?,
+                        });
+                    }
+                    Rvalue::SpawnTask { r, fallible, .. } => {
+                        generated.push(GeneratedId::Task {
+                            fallible: *fallible,
+                            result: canonical_metadata(CanonicalTy::from_program(*r, program))?,
+                        });
+                    }
+                    Rvalue::ParMapParallel {
+                        src,
+                        func,
+                        stages,
+                        captures,
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        work_weight,
+                    } => {
+                        let result = function
+                            .value_tys
+                            .get(*value as usize)
+                            .copied()
+                            .ok_or_else(callable_metadata_error)?;
+                        validate_parallel_request(
+                            program,
+                            &declarations,
+                            function,
+                            result,
+                            src,
+                            func,
+                            stages,
+                            captures,
+                            capture_tys,
+                            *elem_in,
+                            *elem_out,
+                            *work_weight,
+                            false,
+                        )?;
+                        generated.extend(parallel_generated_ids(
+                            program,
+                            &declarations,
+                            function,
+                            src,
+                            func,
+                            stages,
+                            capture_tys,
+                            *elem_in,
+                            *elem_out,
+                            *work_weight,
+                            false,
+                        )?);
+                    }
+                    Rvalue::ParMapReduce {
+                        src,
+                        func,
+                        captures,
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        work_weight,
+                    } => {
+                        let result = function
+                            .value_tys
+                            .get(*value as usize)
+                            .copied()
+                            .ok_or_else(callable_metadata_error)?;
+                        validate_parallel_request(
+                            program,
+                            &declarations,
+                            function,
+                            result,
+                            src,
+                            func,
+                            &[],
+                            captures,
+                            capture_tys,
+                            *elem_in,
+                            *elem_out,
+                            *work_weight,
+                            true,
+                        )?;
+                        generated.extend(parallel_generated_ids(
+                            program,
+                            &declarations,
+                            function,
+                            src,
+                            func,
+                            &[],
+                            capture_tys,
+                            *elem_in,
+                            *elem_out,
+                            *work_weight,
+                            true,
+                        )?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut reserved = HashMap::new();
+    for abi in runtime_abi::runtime_abis() {
+        reserve_external_identity(
+            &mut reserved,
+            abi.symbol.to_owned(),
+            format!("runtime:{:?}", abi.key),
+        )?;
+    }
+    for function in &program.fns {
+        let identity = symbol_name(function, exports);
+        let claimant = if identity == "main" {
+            "entry:main".to_owned()
+        } else {
+            format!("program:{}", callable_hex(&function.name))
+        };
+        reserve_external_identity(
+            &mut reserved,
+            identity,
+            claimant,
+        )?;
+    }
+    for function in &program.imported_fns {
+        reserve_external_identity(
+            &mut reserved,
+            encoded_program_symbol(&function.name),
+            format!("program:{}", callable_hex(&function.name)),
+        )?;
+    }
+    for function in &program.externs {
+        if runtime_abi::runtime_abi_for_symbol(function.name.as_str()).is_some() {
+            continue;
+        }
+        reserve_external_identity(
+            &mut reserved,
+            function.name.as_str().to_owned(),
+            format!("extern:{}", callable_hex(&function.name)),
+        )?;
+    }
+    if program.fns.iter().any(|function| function.name.as_str() == "main") {
+        reserve_external_identity(&mut reserved, "main".to_owned(), "entry:main".to_owned())?;
+    }
+
+    let mut encountered = HashSet::new();
+    generated.retain(|id| encountered.insert(id.clone()));
+    validate_generated_pairs(&generated)?;
+    let mut unique = HashMap::<GeneratedId, Box<[u8]>>::new();
+    for id in generated {
+        let bytes = canonical_metadata(id.to_canonical_bytes())?;
+        unique.entry(id).or_insert(bytes);
+    }
+    let mut ordered = unique.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.1.cmp(&right.1));
+    let mut generated_names = HashMap::with_capacity(ordered.len());
+    for (id, _) in ordered {
+        let stem = generated_stem(&id)?;
+        let candidate = probe_generated_name(&stem, &mut reserved, 0)?;
+        generated_names.insert(id, candidate);
+    }
+    Ok(CallablePreflight {
+        declarations,
+        generated_names,
+    })
+}
+
+/// Emit the C `main` for a `Result<(), Error>`- or `Unit`-returning encoded Align main body: call
+/// it, then materialize a **defined** `i32` exit code —
 /// on `Err(code)` report the error and exit with `code`; on `Ok` or a plain `Unit` return, exit 0.
-/// A `Unit` `align_main` is `void`, so there is no tag/payload to inspect; the wrapper's only job
+/// A `Unit` Align body is `void`, so there is no tag/payload to inspect; the wrapper's only job
 /// for that case is to turn the void call into `ret i32 0` (never leave the ABI return register
 /// undefined — the bug this function exists to close for the `Unit` case, `has_args` always
 /// `false` there since sema restricts the `args: array<str>` form to a `Result`-returning `main`).
 fn emit_main_wrapper<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
-    align_main: FunctionValue<'c>,
+    align_body: FunctionValue<'c>,
     ret: Ty,
     has_args: bool,
     extern_fn_types: &HashMap<String, FunctionType<'c>>,
@@ -2529,9 +3569,9 @@ fn emit_main_wrapper<'c>(
         vec![]
     };
 
-    let call = builder.build_call(align_main, &call_args, "r").map_err(lower)?;
+    let call = builder.build_call(align_body, &call_args, "r").map_err(lower)?;
     if ret == Ty::Unit {
-        // `align_main` is `void(...)` — nothing to inspect, just materialize a defined `0`.
+        // The encoded Align body is `void(...)` — nothing to inspect, just materialize a defined `0`.
         builder.build_return(Some(&i32t.const_int(0, false))).map_err(lower)?;
         return Ok(());
     }
@@ -2963,24 +4003,6 @@ fn check_sysv_struct_args_fit(
     Ok(())
 }
 
-/// Size/alignment (bytes) of a scalar's in-memory representation.
-/// A symbol-safe key for a spawn trampoline, by result type `R` and fallibility (`tramp$<key>`).
-fn spawn_tramp_key(ty: Ty, fallible: bool) -> String {
-    format!("{}{}", task_tramp_key(ty), if fallible { "$f" } else { "" })
-}
-
-/// A symbol-safe key for a spawn result type `R`, naming its trampoline (`tramp$<key>`).
-fn task_tramp_key(ty: Ty) -> String {
-    match ty {
-        Ty::Int(it) => format!("{}{}", if it.signed { 'i' } else { 'u' }, it.bits),
-        Ty::Float(ft) => format!("f{}", ft.bits),
-        Ty::Bool => "bool".to_string(),
-        Ty::Char => "char".to_string(),
-        Ty::Unit => "unit".to_string(),
-        _ => "x".to_string(),
-    }
-}
-
 /// The natural ABI alignment (in bytes) of a struct field, used only to order fields for padding
 /// elimination. Sema owns the single iterative layout traversal so deep nominal/tagged graphs cannot
 /// overflow either compiler layer and field ordering cannot drift from the huge-copy lint's layout.
@@ -3319,32 +4341,27 @@ fn declare_fn<'c>(
     mark_nounwind(ctx, fv);
     // Every Align program function is module-private (internal) EXCEPT:
     //  - the C entry: an `-> i32` `main` keeps the symbol name `main` and IS the C entry (`crt0`
-    //    resolves it by name), so it must stay external — its LLVM return type is already the C
-    //    ABI's `i32`, so no wrapper is needed. A `Result`- or `Unit`-returning `main` is emitted as
-    //    `align_main` here (internal) instead, and its external C `main` wrapper — which always
-    //    returns a defined `i32` (`0`, an `Err` exit code, or `0` for a plain `Unit` return; see
-    //    `emit_main_wrapper`) — is generated separately. No other function is named `main`.
+    //    resolves it by name), so it must stay external. A `Result`- or `Unit`-returning main body
+    //    keeps its encoded Align identity and stays internal; its external C `main` wrapper always
+    //    returns a defined `i32` and is generated separately.
     //  - an explicit export root (`emit-obj`/`emit-llvm --export <name>`, M13 Codex-audit item
     //    1). Exporting a function makes it BOTH a linker-visible external symbol AND a DCE root in
     //    the same step (`external` linkage keeps LLVM's `globaldce`/`internalize`-style passes from
     //    ever considering it dead), so linkage and "what stays reachable" always agree.
     //
-    // BOTH checks are keyed on `symbol` (the LLVM name), never `f.name` (the source name): for a
-    // `Result`-returning `main`, `f.name == "main"` but `symbol == "align_main"` — if the export
-    // check compared `f.name`, `--export main` would match it and skip internalizing `align_main`,
-    // leaving it wrongly external (a real, one-line-fix regression caught in review). Keying on
-    // `symbol` makes `--export main` compare against `"align_main"`, which never matches, so
-    // `align_main` still internalizes and `--export main` stays the harmless no-op the CLI promises
-    // (the C `main` wrapper was already external via the first check, unconditionally). Every
-    // *other* function has `symbol == f.name` (only `main` is ever renamed), so this is
-    // observationally identical to keying on `f.name` for the entire non-`main` case — the export
-    // roots the driver validates (`align_driver::unknown_exports`, matched against `Function::name`)
-    // still name exactly what the caller wrote.
+    // Export matching stays on the logical `f.name`; `main` is excluded explicitly so `--export
+    // main` remains a harmless no-op and cannot expose the encoded wrapped body. `symbol` already
+    // contains the exact encoded or explicitly exported external identity selected by preflight.
     //  - a per-unit `pub` export (M15 S2): a non-entry `pub` user function keeps `external` linkage
     //    so a dependent unit's object can resolve the cross-unit call. `f.exportable` is set only by
     //    per-unit lowering; the whole-program path leaves it `false`, so the default object is
     //    byte-identical (every function but `main`/`--export` still internalizes).
-    if symbol != "main" && !exports.iter().any(|e| e == symbol) && !f.exportable {
+    let direct_main = f.name.as_str() == "main"
+        && !matches!(f.ret, Ty::Result(..))
+        && f.ret != Ty::Unit;
+    let explicit_export = f.name.as_str() != "main"
+        && exports.iter().any(|export| export == f.name.as_str());
+    if !direct_main && !explicit_export && !f.exportable {
         mark_internal(fv);
     }
     fv
@@ -3376,7 +4393,7 @@ fn declare_imported_fn<'c>(
     } else {
         map(imp.ret).fn_type(&param_types, false)
     };
-    let fv = module.add_function(&imp.name, fn_ty, None);
+    let fv = module.add_function(&encoded_program_symbol(&imp.name), fn_ty, None);
     mark_nounwind(ctx, fv);
     fv
 }
@@ -3681,9 +4698,8 @@ fn link_in_rt_lto<'c>(
     }
 
     // Retarget each incoming definition to the physical declaration selected before lowering.
-    // A same-spelled program/import claimant precedes native declarations until c3, so LLVM may
-    // have named the typed native handle `align_rt_*.N`. Linking the bitcode's unsuffixed definition
-    // unchanged would collide with the program claimant instead of filling that typed handle.
+    // Retarget explicitly from the captured typed declaration. This remains correct if a future
+    // declaration source causes LLVM to uniquify the physical runtime symbol.
     for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
         let Some(incoming) = rt.get_function(abi.symbol) else {
             continue;
@@ -3743,17 +4759,20 @@ struct FnGen<'c, 'a> {
     ctx: &'c Context,
     module: &'a Module<'c>,
     builder: &'a Builder<'c>,
-    funcs: &'a HashMap<String, FunctionValue<'c>>,
-    /// Typed handles for every fixed keyed native declaration. Dedicated native lowering must use
-    /// this table; `funcs` remains only for the explicitly deferred mixed program/direct seams.
+    program_funcs: &'a HashMap<ProgramCall, FunctionValue<'c>>,
+    generated_funcs: &'a HashMap<GeneratedId, FunctionValue<'c>>,
+    callable_preflight: &'a CallablePreflight,
+    program: &'a Program,
+    /// Typed handles for every fixed keyed native declaration. Runtime calls never share the
+    /// program-call namespace, even when their logical spellings happen to match.
     runtime_funcs: &'a HashMap<RuntimeKey, FunctionValue<'c>>,
     /// Semantic signatures for every direct callable. LLVM's physical integer types do not retain
     /// signedness, so the range-kernel boundary checks these `Ty`s as well as the generated LLVM
     /// function type before emitting a direct call.
-    fn_sigs: &'a HashMap<String, ParMapFunctionSignature>,
+    fn_sigs: &'a HashMap<ProgramCall, ParMapFunctionSignature>,
     /// The SysV ABI plan for each `extern "C"` symbol — to coerce call arguments (view→data
     /// pointer, `layout(C)` struct→register slots) and reconstruct a by-value struct return.
-    extern_abi: &'a HashMap<String, ExternAbi>,
+    extern_abi: &'a HashMap<ProgramCall, ExternAbi>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
     /// Logical→physical field-index map per struct id (`field_perm[sid][logical] = physical`).
@@ -4135,160 +5154,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok((physical, field_ty))
     }
 
-    /// Keep generated staged-kernel names distinct when the same callable chain projects fields
-    /// from different struct types. The visible chain remains readable; the layout suffix prevents
-    /// LLVM from reusing a kernel whose input aggregate type or field permutation belongs to another
-    /// AoS type.
-    fn par_map_field_layout_suffix(stages: &[ParMapStage]) -> String {
-        let ids: Vec<String> = stages
-            .iter()
-            .filter_map(|stage| match stage.kind {
-                ParMapStageKind::Project { .. } | ParMapStageKind::FilterField { .. } => Some(match stage.elem_in {
-                    Ty::Struct(id) => id.to_string(),
-                    _ => "invalid".to_string(),
-                }),
-                ParMapStageKind::Map | ParMapStageKind::Filter | ParMapStageKind::FilterStrContains => None,
-            })
-            .collect();
-        if ids.is_empty() { String::new() } else { format!("$struct{}", ids.join("_")) }
-    }
-
-    /// Encode the staged portion of a kernel's structural identity with only identifier-safe bytes.
-    /// The readable chain below intentionally keeps source names, but `$` is a legal part of lifted
-    /// names, so joining names with `$` alone is not injective (`a$b` versus `a`, `b`). Include the
-    /// stage kind, length-prefixed callable bytes, element types, field number, and stage capture
-    /// types so the complete kernel key cannot reuse a kernel built for a different chain.
-    fn par_map_stage_structural_key(stages: &[ParMapStage]) -> String {
-        stages
-            .iter()
-            .map(|stage| {
-                let (kind, field) = match stage.kind {
-                    ParMapStageKind::Map => ("m", "-".to_string()),
-                    ParMapStageKind::Filter => ("f", "-".to_string()),
-                    ParMapStageKind::FilterStrContains => ("s", "-".to_string()),
-                    ParMapStageKind::Project { field } => ("p", field.to_string()),
-                    ParMapStageKind::FilterField { field } => ("w", field.to_string()),
-                };
-                let func = stage.func.as_deref().unwrap_or("");
-                let captures = stage
-                    .capture_tys
-                    .iter()
-                    .map(|ty| Self::par_map_type_key(*ty))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "{kind}{field}{}{}:{}:{}:{}",
-                    func.len(),
-                    Self::par_map_hex(func),
-                    Self::par_map_type_key(stage.elem_in),
-                    Self::par_map_type_key(stage.elem_out),
-                    captures
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";")
-    }
-
-    /// Add the parts that are outside the staged chain to a range-kernel identity. Empty
-    /// materializers and reductions have no stage records at all, and the terminal callable's
-    /// captures are not represented by a stage, so neither may use a name keyed only by `func`.
-    /// Include the declared MIR element types, the LLVM element types, mode, terminal captures, and
-    /// the exact LLVM signatures of every callable. Every free-form component is hex encoded before
-    /// it enters the generated name, keeping the identifier safe and injective.
-    #[allow(clippy::too_many_arguments)] // Each argument is an independent cache/ABI identity dimension.
-    fn par_map_kernel_structural_key(
-        &self,
-        func: &str,
-        in_ty: BasicTypeEnum<'c>,
-        out_ty: BasicTypeEnum<'c>,
-        elem_in: Ty,
-        elem_out: Ty,
-        capture_tys: &[Ty],
-        terminal_capture_start: usize,
-        mode: ParMapKernelMode,
-        stages: &[ParMapStage],
-    ) -> Result<String, CodegenError> {
-        let mode_key = match mode {
-            ParMapKernelMode::Materialize => "materialize",
-            ParMapKernelMode::Reduce => "reduce",
-            ParMapKernelMode::FilterCount => "filter-count",
-            ParMapKernelMode::FilterScatter => "filter-scatter",
-        };
-        let callable_signature = |name: &str| {
-            self.funcs
-                .get(name)
-                .map(|f| f.get_type().print_to_string().to_string())
-                .ok_or_else(|| self.err(format!("par_map function `{name}` is missing from codegen")))
-        };
-        let stage_signatures = stages
-            .iter()
-            .filter_map(|stage| stage.func.as_deref())
-            .map(callable_signature)
-            .collect::<Result<Vec<_>, _>>()?;
-        let terminal_signature = callable_signature(func)?;
-        let terminal_captures = capture_tys
-            .get(terminal_capture_start..)
-            .ok_or_else(|| self.err("par_map terminal capture layout is shorter than its stages"))?
-            .to_vec();
-        Ok(Self::par_map_kernel_identity_key(
-            func,
-            &in_ty.print_to_string().to_string(),
-            &out_ty.print_to_string().to_string(),
-            elem_in,
-            elem_out,
-            &terminal_captures,
-            mode_key,
-            stages,
-            &terminal_signature,
-            &stage_signatures,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)] // Keep the testable key function aligned with its ABI dimensions.
-    fn par_map_kernel_identity_key(
-        func: &str,
-        in_llvm: &str,
-        out_llvm: &str,
-        elem_in: Ty,
-        elem_out: Ty,
-        terminal_captures: &[Ty],
-        mode: &str,
-        stages: &[ParMapStage],
-        terminal_signature: &str,
-        stage_signatures: &[String],
-    ) -> String {
-        let terminal_captures = terminal_captures
-            .iter()
-            .map(|ty| Self::par_map_type_key(*ty))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "mode={};elem_in={};elem_out={};in_llvm={};out_llvm={};terminal={}:{};terminal_captures={};stages={};stage_signatures={}",
-            mode,
-            Self::par_map_type_key(elem_in),
-            Self::par_map_type_key(elem_out),
-            Self::par_map_hex(in_llvm),
-            Self::par_map_hex(out_llvm),
-            Self::par_map_hex(func),
-            Self::par_map_hex(terminal_signature),
-            terminal_captures,
-            Self::par_map_stage_structural_key(stages),
-            stage_signatures
-                .iter()
-                .map(|signature| Self::par_map_hex(signature))
-                .collect::<Vec<_>>()
-                .join(","),
-        )
-    }
-
-    fn par_map_type_key(ty: Ty) -> String {
-        Self::par_map_hex(&format!("{ty:?}"))
-    }
-
-    fn par_map_hex(value: &str) -> String {
-        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
     /// Check every type-table id that the range-kernel path may hand to `llvm_type`. Normal MIR
     /// has already passed sema, but codegen also accepts compiler-generated MIR in tests and in
     /// future tooling; a bad id must be a lowering error rather than an index panic.
@@ -4396,7 +5261,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// contract before a cached/generated kernel is reused.
     fn validate_par_map_callable(
         &self,
-        name: &str,
+        name: &ProgramCall,
         params: &[Ty],
         ret: Ty,
         role: &str,
@@ -4412,7 +5277,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )));
         }
         let target = self
-            .funcs
+            .program_funcs
             .get(name)
             .copied()
             .ok_or_else(|| self.err(format!("{role} function `{name}` is missing from codegen")))?;
@@ -4688,7 +5553,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     #[allow(clippy::too_many_arguments)] // The kernel ABI and staged pipeline are separate dimensions.
     fn par_map_range_kernel(
         &self,
-        func: &str,
+        generated_id: &GeneratedId,
+        func: &ProgramCall,
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
         elem_in: Ty,
@@ -4745,7 +5611,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
             if stage.captures.len() != stage.capture_tys.len() {
                 return Err(self.err(format!(
                     "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                    stage.func.as_deref().unwrap_or("<field>"),
+                    stage
+                        .func
+                        .as_ref()
+                        .map(ProgramCall::as_str)
+                        .unwrap_or("<field>"),
                     stage.captures.len(),
                     stage.capture_tys.len()
                 )));
@@ -4763,7 +5633,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
                 ParMapStageKind::Map | ParMapStageKind::Filter => {
-                    let Some(stage_func) = stage.func.as_deref() else {
+                    let Some(stage_func) = stage.func.as_ref() else {
                         return Err(self.err("par_map callable stage is missing its function"));
                     };
                     let expected_ret = match stage.kind {
@@ -4804,57 +5674,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         for ty in capture_tys {
             self.validate_par_map_capture_type(*ty)?;
         }
-        let structural_key = self.par_map_kernel_structural_key(
-            func,
-            in_ty,
-            out_ty,
-            elem_in,
-            elem_out,
-            capture_tys,
-            terminal_capture_start,
-            mode,
-            stages,
-        )?;
-        let field_layout_suffix = Self::par_map_field_layout_suffix(stages);
-        let name = match mode {
-            ParMapKernelMode::Reduce => format!("{func}$parreducekernel$key${structural_key}"),
-            ParMapKernelMode::Materialize => {
-                let chain = stages
-                    .iter()
-                    .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
-                        ParMapStageKind::Filter => stage.func.clone().unwrap_or_else(|| "where".to_string()),
-                        ParMapStageKind::FilterStrContains => "wherecontains".to_string(),
-                        ParMapStageKind::Project { field } => format!("field${field}"),
-                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("$");
-                if stages.is_empty() {
-                    format!("{func}$parkernel$key${structural_key}")
-                } else {
-                    format!("{func}$parmapchain${chain}{field_layout_suffix}$key${structural_key}")
-                }
-            }
-            ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
-                let suffix = if filter_count { "count" } else { "scatter" };
-                let chain = stages
-                    .iter()
-                    .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
-                        ParMapStageKind::Filter => format!("where${}", stage.func.as_deref().unwrap_or("filter")),
-                        ParMapStageKind::FilterStrContains => "wherecontains".to_string(),
-                        ParMapStageKind::Project { field } => format!("field${field}"),
-                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("$");
-                format!("{func}$parfilter${suffix}${chain}{field_layout_suffix}$key${structural_key}")
-            }
-        };
+        let name = self
+            .callable_preflight
+            .generated_names
+            .get(generated_id)
+            .ok_or_else(|| self.err("parallel generated identity was not collected"))?;
         // Validate the complete staged shape before consulting the module cache. A malformed MIR
         // node must not silently reuse an earlier kernel merely because its readable name collides.
-        if let Some(f) = self.module.get_function(&name) {
+        if let Some(f) = self.module.get_function(name) {
             return Ok(f.as_global_value().as_pointer_value());
         }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
@@ -4862,7 +5689,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let capture_fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
         let capture_struct = self.ctx.struct_type(&capture_fields, false);
         let kernel = self.module.add_function(
-            &name,
+            name,
             self.ctx
                 .void_type()
                 .fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into(), i64t.into(), i64t.into()], false),
@@ -4988,11 +5815,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .ok_or_else(|| self.err("par_map staged capture count overflows"))?;
             match stage.kind {
                 ParMapStageKind::Map | ParMapStageKind::Filter => {
-                    let Some(stage_func) = stage.func.as_deref() else {
+                    let Some(stage_func) = stage.func.as_ref() else {
                         return Err(self.err("par_map callable stage is missing its function"));
                     };
                     let target = self
-                        .funcs
+                        .program_funcs
                         .get(stage_func)
                         .copied()
                         .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` is missing from codegen")))?;
@@ -6294,8 +7121,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A fallible task also gets an `err_slot` (sized for the `Error` enum) the trampoline
                 // writes its `Err` value into; a non-fallible task passes null.
                 let err_slot = if *fallible {
-                    let eid = self.enums.iter().position(|e| e.name == "Error").expect("Error enum registered");
-                    let ety = self.enum_types[eid];
+                    let eid = self
+                        .enums
+                        .iter()
+                        .position(|e| e.name == "Error")
+                        .ok_or_else(|| self.err("Error enum not registered"))?;
+                    let ety = self
+                        .enum_types
+                        .get(eid)
+                        .copied()
+                        .ok_or_else(|| self.err("Error enum type not registered"))?;
                     let ebytes = self.target_data.get_store_size(&ety);
                     let ealign = self.target_data.get_abi_alignment(&ety) as u64;
                     self.builder
@@ -6306,7 +7141,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 };
                 // The per-(R, fallibility) trampoline runs the closure and writes the slot at `wait`.
-                let tramp = self.funcs[&format!("tramp${}", spawn_tramp_key(*r, *fallible))].as_global_value().as_pointer_value();
+                let tramp_id = GeneratedId::Task {
+                    fallible: *fallible,
+                    result: canonical_ty(*r, self.program)?,
+                };
+                let tramp = self
+                    .generated_funcs
+                    .get(&tramp_id)
+                    .ok_or_else(|| self.err("task trampoline identity was not collected"))?
+                    .as_global_value()
+                    .as_pointer_value();
                 self.builder
                     .build_call(self.runtime(RuntimeKey::TgRegister), &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into()], "")
                     .map_err(|e| self.err(e))?;
@@ -7123,7 +7967,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     if stage.captures.len() != stage.capture_tys.len() {
                         return Err(self.err(format!(
                             "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                            stage.func.as_deref().unwrap_or("<field>"),
+                            stage
+                                .func
+                                .as_ref()
+                                .map(ProgramCall::as_str)
+                                .unwrap_or("<field>"),
                             stage.captures.len(),
                             stage.capture_tys.len()
                         )));
@@ -7172,7 +8020,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
                 let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
-                let work_weight = i64t.const_int(u64::from(*work_weight), false);
+                let work_weight_value = i64t.const_int(u64::from(*work_weight), false);
                 let context = if all_capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
@@ -7192,8 +8040,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .iter()
                     .any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }));
                 let sty = slice_struct_type(self.ctx);
+                let generated_ids = parallel_generated_ids(
+                    self.program,
+                    &self.callable_preflight.declarations,
+                    self.f,
+                    src,
+                    func,
+                    stages,
+                    capture_tys,
+                    *elem_in,
+                    *elem_out,
+                    *work_weight,
+                    false,
+                )?;
                 if has_filter {
+                    let count_id = generated_ids
+                        .iter()
+                        .find(|id| {
+                            matches!(
+                                id,
+                                GeneratedId::Parallel(parallel)
+                                    if parallel.mode == ParallelKernelMode::FilterCount
+                            )
+                        })
+                        .ok_or_else(|| self.err("parallel count identity was not collected"))?;
+                    let scatter_id = generated_ids
+                        .iter()
+                        .find(|id| {
+                            matches!(
+                                id,
+                                GeneratedId::Parallel(parallel)
+                                    if parallel.mode == ParallelKernelMode::FilterScatter
+                            )
+                        })
+                        .ok_or_else(|| self.err("parallel scatter identity was not collected"))?;
                     let count_kernel = self.par_map_range_kernel(
+                        count_id,
                         func,
                         in_ty,
                         out_ty,
@@ -7204,6 +8086,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         stages,
                     )?;
                     let scatter_kernel = self.par_map_range_kernel(
+                        scatter_id,
                         func,
                         in_ty,
                         out_ty,
@@ -7224,7 +8107,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 count.into(),
                                 in_stride.into(),
                                 out_stride.into(),
-                                work_weight.into(),
+                                work_weight_value.into(),
                                 count_kernel.into(),
                                 scatter_kernel.into(),
                             ],
@@ -7235,7 +8118,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .basic()
                         .expect("align_rt_par_map_filter returns a slice")
                 } else {
+                    let materialize_id = generated_ids
+                        .first()
+                        .ok_or_else(|| self.err("parallel materialize identity was not collected"))?;
                     let kernel = self.par_map_range_kernel(
+                        materialize_id,
                         func,
                         in_ty,
                         out_ty,
@@ -7251,7 +8138,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_call(
                             self.runtime(RuntimeKey::ParMap),
-                            &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
+                            &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight_value.into(), kernel.into()],
                             "obuf",
                         )
                         .map_err(|e| self.err(e))?
@@ -7335,7 +8222,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
                 let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
-                let work_weight = i64t.const_int(u64::from(*work_weight), false);
+                let work_weight_value = i64t.const_int(u64::from(*work_weight), false);
                 let context = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
@@ -7353,6 +8240,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     context
                 };
                 let kernel = self.par_map_range_kernel(
+                    &parallel_generated_ids(
+                        self.program,
+                        &self.callable_preflight.declarations,
+                        self.f,
+                        src,
+                        func,
+                        &[],
+                        capture_tys,
+                        *elem_in,
+                        *elem_out,
+                        *work_weight,
+                        true,
+                    )?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| self.err("parallel reduce identity was not collected"))?,
                     func,
                     in_ty,
                     out_ty,
@@ -7366,7 +8269,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(
                         self.runtime(RuntimeKey::ParMapReduce),
-                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
+                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight_value.into(), kernel.into()],
                         "parsum",
                     )
                     .map_err(|e| self.err(e))?
@@ -9113,15 +10016,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(new_ptr, val).map_err(|e| self.err(e))?;
                 new_ptr.into()
             }
-            // `error(code)` is identity on the i32 code (the M2 Error repr).
-            Rvalue::Call(name, args) if name == "error" => self.operand(&args[0])?,
-            Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
-            Rvalue::Call(name, args) if name == "hash64" || name == "hash128" => {
-                let key = if name == "hash64" { RuntimeKey::Hash64 } else { RuntimeKey::Hash128 };
-                return self.gen_hash(key, args);
+            Rvalue::Call(
+                DirectCall::Runtime(
+                    RuntimeKey::Print
+                    | RuntimeKey::PrintStr
+                    | RuntimeKey::PrintBool
+                    | RuntimeKey::PrintChar
+                    | RuntimeKey::PrintF32
+                    | RuntimeKey::PrintF64,
+                ),
+                args,
+            ) => {
+                return self.gen_print(args);
             }
-            Rvalue::Call(name, args) => {
-                let callee = self.funcs[name];
+            Rvalue::Call(DirectCall::Runtime(RuntimeKey::Hash64), args) => {
+                return self.gen_hash(RuntimeKey::Hash64, args);
+            }
+            Rvalue::Call(DirectCall::Runtime(RuntimeKey::Hash128), args) => {
+                return self.gen_hash(RuntimeKey::Hash128, args);
+            }
+            Rvalue::Call(DirectCall::Runtime(key), args) => {
+                let argv = args
+                    .iter()
+                    .map(|operand| self.operand(operand).map(Into::into))
+                    .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
+                let call = self
+                    .builder
+                    .build_call(self.runtime(*key), &argv, "call")
+                    .map_err(|error| self.err(error))?;
+                return Ok(call.try_as_basic_value().basic());
+            }
+            Rvalue::Call(DirectCall::Program(name), args) => {
+                let callee = self
+                    .program_funcs
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| callable_target_error(name))?;
                 // A foreign call coerces each argument to its SysV form: a `str`/`slice` view → its
                 // data pointer; a `layout(C)` struct → one `i64`/`double` per eightbyte; everything
                 // else passes as its value. A non-extern call passes every argument directly.
@@ -9183,12 +10113,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 return Ok(cs.try_as_basic_value().basic());
             }
-            Rvalue::FnAddr { name, .. } => {
+            Rvalue::FnAddr { target, .. } => {
                 // A non-capturing function value: `{ thunk_ptr, null_env }`.
+                let declaration = self
+                    .callable_preflight
+                    .declarations
+                    .get(target)
+                    .ok_or_else(|| callable_target_error(target))?;
+                let id = GeneratedId::FnValue {
+                    target: target.clone(),
+                    signature: canonical_signature(&declaration.signature, self.program)?,
+                };
                 let thunk = self
-                    .funcs
-                    .get(&format!("{name}$fnval"))
-                    .ok_or_else(|| self.err(format!("no function-value thunk for {name}")))?;
+                    .generated_funcs
+                    .get(&id)
+                    .ok_or_else(|| self.err(format!("no function-value thunk for {target}")))?;
                 let fn_ptr = thunk.as_global_value().as_pointer_value();
                 let null_env = self.ctx.ptr_type(AddressSpace::default()).const_null();
                 let cty = closure_struct_type(self.ctx);
@@ -9229,9 +10168,45 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     self.builder.build_store(fld, v).map_err(|e| self.err(e))?;
                 }
+                let declaration = self
+                    .callable_preflight
+                    .declarations
+                    .get(lifted)
+                    .ok_or_else(|| callable_target_error(lifted))?;
+                let explicit = declaration
+                    .signature
+                    .params
+                    .len()
+                    .checked_sub(capture_tys.len())
+                    .ok_or_else(|| callable_target_error(lifted))?;
+                let explicit_params = declaration
+                    .signature
+                    .params
+                    .get(..explicit)
+                    .ok_or_else(|| callable_target_error(lifted))?;
+                let explicit_modes = declaration
+                    .signature
+                    .modes
+                    .get(..explicit)
+                    .ok_or_else(|| callable_target_error(lifted))?;
+                let explicit_signature = ProgramSignature {
+                    params: explicit_params.to_vec(),
+                    modes: explicit_modes.to_vec(),
+                    ret: declaration.signature.ret,
+                    borrow: declaration.signature.borrow.clone(),
+                    region: declaration.signature.region.clone(),
+                };
+                let id = GeneratedId::Closure {
+                    lifted: lifted.clone(),
+                    explicit_signature: canonical_signature(&explicit_signature, self.program)?,
+                    captures: capture_tys
+                        .iter()
+                        .map(|ty| canonical_ty(*ty, self.program))
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
                 let thunk = self
-                    .funcs
-                    .get(&format!("{lifted}$clos"))
+                    .generated_funcs
+                    .get(&id)
                     .ok_or_else(|| self.err(format!("no closure thunk for {lifted}")))?;
                 let fn_ptr = thunk.as_global_value().as_pointer_value();
                 let cty = closure_struct_type(self.ctx);
@@ -11520,6 +12495,21 @@ mod tests {
     use align_parser::parse_file;
     use align_sema::check_file;
 
+    fn program_call(name: &str) -> ProgramCall {
+        ProgramCall::try_from_logical(name).expect("valid test program call")
+    }
+
+    fn direct_program(name: &str) -> DirectCall {
+        DirectCall::Program(program_call(name))
+    }
+
+    fn assert_lowering(error: CodegenError, expected: &str) {
+        match error {
+            CodegenError::Lowering(actual) => assert_eq!(actual, expected),
+            other => panic!("expected a lowering error, got {other}"),
+        }
+    }
+
     fn mir(src: &str) -> Program {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
@@ -11557,7 +12547,7 @@ mod tests {
 
         let mut per_unit = mir("fn main() -> i32 = 0\n");
         per_unit.imported_fns.push(align_mir::ImportedFn {
-            name: "dep$identity".to_string(),
+            name: program_call("dep$identity"),
             params: vec![Ty::Int(IntTy { bits: 64, signed: true })],
             param_modes: vec![align_ast::ParamMode::ByValue],
             ret: Ty::Int(IntTy { bits: 64, signed: true }),
@@ -11596,8 +12586,8 @@ mod tests {
 
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
-        let ext = |name: &str, params: Vec<Ty>, ret: Ty| hir::ExternFn {
-            name: name.to_string(),
+        let ext = |name: &str, params: Vec<Ty>, ret: Ty| align_mir::ProgramExtern {
+            name: program_call(name),
             param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
             params,
             ret,
@@ -11806,10 +12796,11 @@ mod tests {
              fn main() -> i32 = 0\n",
         );
         for symbol in symbols {
+            let encoded = encoded_program_symbol(&program_call(symbol));
             assert!(
                 program_ir
                     .lines()
-                    .any(|line| line.starts_with("define ") && line.contains(&format!("@{symbol}("))),
+                    .any(|line| line.starts_with("define ") && line.contains(&format!("@\"{encoded}\"("))),
                 "missing ordinary program definition for {symbol}",
             );
         }
@@ -11826,15 +12817,18 @@ mod tests {
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
         let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
         let runtime_symbol = &runtime.physical_names[&RuntimeKey::Hash64];
-        assert_ne!(runtime_symbol, "align_rt_hash64");
+        assert_eq!(runtime_symbol, "align_rt_hash64");
+        let program_symbol = encoded_program_symbol(&program_call("align_rt_hash64"));
         let text = module.print_to_string().to_string();
-        assert!(text.lines().any(|line| line.starts_with("define internal i64 @align_rt_hash64(")));
+        assert!(text.lines().any(|line| {
+            line.starts_with("define internal i64 ") && line.contains(&program_symbol)
+        }));
         assert!(text.contains(&format!("call i64 @{runtime_symbol}(")));
 
         let function_loc = inkwell::attributes::AttributeLoc::Function;
         let memory = enum_kind_id("memory");
         let willreturn = enum_kind_id("willreturn");
-        let program_function = module.get_function("align_rt_hash64").unwrap();
+        let program_function = module.get_function(&program_symbol).unwrap();
         let runtime_function = module.get_function(runtime_symbol).unwrap();
         assert!(program_function.get_enum_attribute(function_loc, memory).is_none());
         assert!(program_function.get_enum_attribute(function_loc, willreturn).is_none());
@@ -11853,7 +12847,8 @@ mod tests {
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
         let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
         let physical = runtime.physical_names[&RuntimeKey::StrEq].clone();
-        assert_ne!(physical, "align_rt_str_eq");
+        assert_eq!(physical, "align_rt_str_eq");
+        let program_symbol = encoded_program_symbol(&program_call("align_rt_str_eq"));
 
         let rt = ctx.create_module("align_rt_collision_fixture");
         let layout = module.get_data_layout();
@@ -11869,7 +12864,7 @@ mod tests {
         }
 
         link_in_rt_lto(&ctx, &module, rt, &runtime).unwrap();
-        let program_function = module.get_function("align_rt_str_eq").unwrap();
+        let program_function = module.get_function(&program_symbol).unwrap();
         let runtime_function = module.get_function(&physical).unwrap();
         assert_ne!(program_function.get_type(), runtime_function.get_type());
         assert!(program_function.count_basic_blocks() > 0);
@@ -12002,9 +12997,9 @@ mod tests {
             .expect("test module boundary exists")
             .0;
         let string_lookups: Vec<_> = implementation.match_indices("self.funcs[").collect();
-        assert_eq!(string_lookups.len(), 2, "unexpected dedicated string lookup: {string_lookups:?}");
-        assert!(implementation.contains("self.funcs[&format!(\"tramp${}\""));
-        assert!(implementation.contains("let callee = self.funcs[name];"));
+        assert!(string_lookups.is_empty(), "unexpected mixed string lookup: {string_lookups:?}");
+        assert!(source.contains(".program_funcs\n                    .get(name)"));
+        assert!(source.contains(".generated_funcs\n                    .get(&tramp_id)"));
         let compact: String = implementation.split_whitespace().collect();
         assert!(
             !compact.contains("self.funcs.get(\""),
@@ -12325,7 +13320,7 @@ mod tests {
         let n = stmts.len();
         let slot_align = vec![None; slots.len()];
         let mut fns = vec![Function {
-            name: "main".to_string(),
+            name: program_call("main"),
             params: vec![],
             param_modes: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -12352,6 +13347,7 @@ mod tests {
             structs,
             enums,
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12398,7 +13394,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12422,6 +13418,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12437,7 +13434,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12451,7 +13448,7 @@ mod tests {
                     stmts: vec![Stmt::Let(
                         0,
                         Rvalue::Closure {
-                            lifted: "unused".to_string(),
+                            lifted: program_call("unused"),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(7)],
                             signature: align_mir::FnSignatureFacts {
@@ -12473,6 +13470,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12489,7 +13487,7 @@ mod tests {
         let zero = Operand::Const(Const::Int(0, i32_ty));
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12520,6 +13518,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12535,7 +13534,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |payload| Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12559,6 +13558,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![hir::TaggedType::Option(payload)],
+            fn_types: vec![],
             tuples: vec![],
         };
         for (payload, expected) in [
@@ -12585,7 +13585,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |structs, enums, tagged_types| Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12609,6 +13609,7 @@ mod tests {
             structs,
             enums,
             tagged_types,
+            fn_types: vec![],
             tuples: vec![],
         };
         let struct_cycle = program(
@@ -12660,7 +13661,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let base = || Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12684,6 +13685,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
 
@@ -12908,7 +13910,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12932,6 +13934,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![hir::TaggedType::Option(Scalar::String)],
+            fn_types: vec![],
             tuples: vec![],
         };
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12947,7 +13950,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -12971,6 +13974,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![TupleDef {
                 elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
             }],
@@ -12984,7 +13988,7 @@ mod tests {
 
         let program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -13017,6 +14021,7 @@ mod tests {
             }],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![TupleDef {
                 elems: vec![Scalar::DynStructArray(0)],
             }],
@@ -13039,7 +14044,7 @@ mod tests {
         let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
         let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -13063,6 +14068,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types,
+            fn_types: vec![],
             tuples: vec![],
         };
         let cases = [
@@ -13134,7 +14140,7 @@ mod tests {
             let err = codegen_program(
                 vec![
                     Stmt::Let(0, Rvalue::Load(0)),
-                    Stmt::Let(1, Rvalue::Call("print".to_string(), vec![Operand::Value(0)])),
+                    Stmt::Let(1, Rvalue::Call(DirectCall::Runtime(RuntimeKey::Print), vec![Operand::Value(0)])),
                 ],
                 vec![*ty, Ty::Unit],
                 vec![*ty],
@@ -13144,9 +14150,10 @@ mod tests {
             )
             .expect_err(&format!("print of a `{name}` must not reach the runtime call"));
             let text = err.to_string();
-            assert!(
-                text.contains("'print' expects an int, float, str, bool, or char"),
-                "`print({name})` must name the display contract, got: {text}"
+            assert_eq!(
+                text,
+                "lowering failed: callable metadata invalid:InvalidGraph",
+                "`print({name})` must fail in callable preflight"
             );
         }
     }
@@ -13157,7 +14164,7 @@ mod tests {
     #[test]
     fn a_malformed_unit_value_id_is_an_error_not_a_panic() {
         let unit_fn = Function {
-            name: "u".to_string(),
+            name: program_call("u"),
             params: vec![],
             param_modes: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13172,7 +14179,7 @@ mod tests {
         };
         let err = codegen_program(
             vec![
-                Stmt::Let(0, Rvalue::Call("u".to_string(), vec![])),
+                Stmt::Let(0, Rvalue::Call(direct_program("u"), vec![])),
                 Stmt::Let(1, Rvalue::Use(Operand::Value(0))),
             ],
             vec![Ty::Unit, Ty::Unit],
@@ -13193,7 +14200,7 @@ mod tests {
     fn a_malformed_par_map_region_result_is_an_error_not_a_panic() {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let return_str = Function {
-            name: "return_str".to_string(),
+            name: program_call("return_str"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13218,7 +14225,7 @@ mod tests {
                     1,
                     Rvalue::ParMapParallel {
                         src: Operand::Value(0),
-                        func: "return_str".to_string(),
+                        func: program_call("return_str"),
                         stages: vec![],
                         captures: vec![],
                         capture_tys: vec![],
@@ -13235,17 +14242,14 @@ mod tests {
             vec![return_str],
         )
         .expect_err("a range par_map must reject a region-bearing result before LLVM lowering");
-        assert!(
-            err.to_string().contains("non-owning primitive scalar"),
-            "the codegen guard should name the result contract, got: {err}"
-        );
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
     fn malformed_par_map_result_container_is_checked_against_element_output() {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13273,7 +14277,7 @@ mod tests {
                         1,
                         Rvalue::ParMapParallel {
                             src: Operand::Value(0),
-                            func: "return_i64".to_string(),
+                            func: program_call("return_i64"),
                             stages: vec![],
                             captures: vec![],
                             capture_tys: vec![],
@@ -13290,10 +14294,7 @@ mod tests {
                 vec![return_i64.clone()],
             )
             .expect_err("a range par_map result container must match its primitive element output");
-            assert!(
-                err.to_string().contains("does not match declared output"),
-                "the codegen guard should name the result/container mismatch, got: {err}"
-            );
+            assert_lowering(err, "callable metadata invalid:InvalidGraph");
         }
     }
 
@@ -13302,7 +14303,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let string_ty = Ty::String;
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13328,7 +14329,7 @@ mod tests {
                     1,
                     Rvalue::ParMapParallel {
                         src: Operand::Value(0),
-                        func: "return_i64".to_string(),
+                        func: program_call("return_i64"),
                         stages: vec![],
                         captures: vec![],
                         capture_tys: vec![],
@@ -13345,10 +14346,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("a range kernel must reject an owning source element before loading it");
-        assert!(
-            err.to_string().contains("primitive, str, or a Copy struct"),
-            "the codegen ownership guard should reject Move kernel values, got: {err}"
-        );
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13356,7 +14354,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let chunk_ty = Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true }));
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13376,7 +14374,7 @@ mod tests {
                     1,
                     Rvalue::ParMapParallel {
                         src: Operand::Value(0),
-                        func: "return_i64".to_string(),
+                        func: program_call("return_i64"),
                         stages: vec![],
                         captures: vec![],
                         capture_tys: vec![],
@@ -13393,7 +14391,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("a chunk par_map with a scalar element declaration must fail before kernel lowering");
-        assert!(err.to_string().contains("source element type"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13401,7 +14399,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let chunk_ty = Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true }));
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13421,7 +14419,7 @@ mod tests {
                     1,
                     Rvalue::ParMapReduce {
                         src: Operand::Value(0),
-                        func: "return_i64".to_string(),
+                        func: program_call("return_i64"),
                         captures: vec![],
                         capture_tys: vec![],
                         elem_in: i64_ty,
@@ -13437,7 +14435,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("a chunk reduction with a scalar element declaration must fail before kernel lowering");
-        assert!(err.to_string().contains("reduction source element type"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13447,7 +14445,7 @@ mod tests {
         let input_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
         let wrong_output_ty = Ty::Slice(Scalar::Int(IntTy { bits: 32, signed: true }));
         let keep = Function {
-            name: "keep".to_string(),
+            name: program_call("keep"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13461,7 +14459,7 @@ mod tests {
             exportable: false,
         };
         let finish = Function {
-            name: "finish".to_string(),
+            name: program_call("finish"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13481,10 +14479,10 @@ mod tests {
                     1,
                     Rvalue::ParMapParallel {
                         src: Operand::Value(0),
-                        func: "finish".to_string(),
+                        func: program_call("finish"),
                         stages: vec![ParMapStage {
                             kind: ParMapStageKind::Filter,
-                            func: Some("keep".to_string()),
+                            func: Some(program_call("keep")),
                             captures: vec![],
                             capture_tys: vec![],
                             elem_in: input_ty,
@@ -13505,7 +14503,7 @@ mod tests {
             vec![keep, finish],
         )
         .expect_err("a chunk filter that changes its slice type must fail before kernel lowering");
-        assert!(err.to_string().contains("filter stage must preserve"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13514,7 +14512,7 @@ mod tests {
         let str_ty = Ty::Str;
         let source_ty = Ty::Slice(Scalar::Str);
         let finish = Function {
-            name: "finish".to_string(),
+            name: program_call("finish"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13540,10 +14538,10 @@ mod tests {
                     2,
                     Rvalue::ParMapParallel {
                         src: Operand::Value(0),
-                        func: "finish".to_string(),
+                        func: program_call("finish"),
                         stages: vec![ParMapStage {
                             kind: ParMapStageKind::FilterStrContains,
-                            func: Some("not-compiler-generated".to_string()),
+                            func: Some(program_call("not-compiler-generated")),
                             captures: vec![Operand::Value(1)],
                             capture_tys: vec![str_ty],
                             elem_in: str_ty,
@@ -13564,14 +14562,14 @@ mod tests {
             vec![finish],
         )
         .expect_err("a compiler-generated string filter must not accept a callable name");
-        assert!(err.to_string().contains("string filter"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
     fn malformed_par_map_reduce_source_is_an_error_not_a_panic() {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13589,7 +14587,7 @@ mod tests {
                 0,
                 Rvalue::ParMapReduce {
                     src: Operand::Const(Const::Int(0, i64_ty)),
-                    func: "return_i64".to_string(),
+                    func: program_call("return_i64"),
                     captures: vec![],
                     capture_tys: vec![],
                     elem_in: i64_ty,
@@ -13604,7 +14602,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("a reduction source that is not a slice must fail before aggregate extraction");
-        assert!(err.to_string().contains("reduction source must be a slice"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13612,7 +14610,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let f64_ty = Ty::Float(FloatTy { bits: 64 });
         let return_i64 = Function {
-            name: "return_i64".to_string(),
+            name: program_call("return_i64"),
             params: vec![0, 1],
             param_modes: vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13633,7 +14631,7 @@ mod tests {
                     1,
                     Rvalue::ParMapReduce {
                         src: Operand::Value(0),
-                        func: "return_i64".to_string(),
+                        func: program_call("return_i64"),
                         captures: vec![Operand::Const(Const::Float(0.0, f64_ty))],
                         capture_tys: vec![i64_ty],
                         elem_in: i64_ty,
@@ -13649,7 +14647,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("a reduction capture operand/type mismatch must fail before context lowering");
-        assert!(err.to_string().contains("reduction capture has type"), "got: {err}");
+        assert_lowering(err, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]
@@ -13657,7 +14655,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let u64_ty = Ty::Int(IntTy { bits: 64, signed: false });
         let return_i64 = Function {
-            name: "return_u64".to_string(),
+            name: program_call("return_u64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -13678,7 +14676,7 @@ mod tests {
                     1,
                     Rvalue::ParMapReduce {
                         src: Operand::Value(0),
-                        func: "return_u64".to_string(),
+                        func: program_call("return_u64"),
                         captures: vec![],
                         capture_tys: vec![],
                         elem_in: i64_ty,
@@ -13694,7 +14692,7 @@ mod tests {
             vec![return_i64],
         )
         .expect_err("signed and unsigned integer callable types must not share a range kernel");
-        assert!(err.to_string().contains("semantic signature"), "got: {err}");
+        assert_lowering(err, "callable target invalid:72657475726e5f753634");
     }
 
     /// The sibling lookup in the same accessor: an argument index past the LLVM parameter list (a
@@ -13795,7 +14793,7 @@ mod tests {
     ) -> String {
         let program = Program {
             fns: vec![Function {
-                name: if count_arg { "allocation_probe" } else { "main" }.to_string(),
+                name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
                 param_modes: if count_arg { vec![align_ast::ParamMode::ByValue] } else { vec![] },
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -13822,13 +14820,24 @@ mod tests {
             structs,
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
     }
 
     fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
-        ir.find(&format!(" @{name}("))
+        let encoded = ProgramCall::try_from_logical(name)
+            .ok()
+            .map(|name| encoded_program_symbol(&name));
+        [Some(name), encoded.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                let unquoted = format!(" @{candidate}(");
+                let quoted = format!(" @\"{candidate}\"(");
+                ir.find(&unquoted).or_else(|| ir.find(&quoted))
+            })
             .map(|start| &ir[start..])
             .and_then(|tail| tail.split_once("{\n").map(|(_, body)| body))
             .and_then(|body| body.split("\n}").next())
@@ -13839,7 +14848,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let program = Program {
             fns: vec![Function {
-                name: "arena_allocation_probe".to_string(),
+                name: program_call("arena_allocation_probe"),
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -13872,6 +14881,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
@@ -13882,7 +14892,7 @@ mod tests {
         let dynamic = matches!(len, Operand::Arg(0));
         let program = Program {
             fns: vec![Function {
-                name: if dynamic { "soa_allocation_probe" } else { "main" }.to_string(),
+                name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },
                 param_modes: if dynamic { vec![align_ast::ParamMode::ByValue] } else { vec![] },
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -13919,6 +14929,7 @@ mod tests {
             structs: vec![row],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
@@ -13939,7 +14950,8 @@ mod tests {
         assert!(dynamic.contains("@align_rt_alloc_size_fail"), "missing cold allocation failure:\n{dynamic}");
 
         let arena = arena_allocation_case_ir();
-        let arena_body = function_body(&arena, "arena_allocation_probe");
+        let arena_name = encoded_program_symbol(&program_call("arena_allocation_probe"));
+        let arena_body = function_body(&arena, &arena_name);
         assert!(arena_body.contains("@llvm.umul.with.overflow.i64"), "arena allocation lacks checked multiply:\n{arena_body}");
         assert!(arena_body.contains("@align_rt_alloc_size_fail"), "arena allocation lacks overflow failure:\n{arena_body}");
 
@@ -14357,20 +15369,21 @@ mod tests {
         assert!(!direct.contains("@align_main"));
 
         let unit = ir("fn main() {}\n");
-        assert!(unit.contains("define internal void @align_main()"));
+        let encoded_main = encoded_program_symbol(&program_call("main"));
+        assert!(unit.contains(&format!("define internal void @\"{encoded_main}\"()")));
         assert!(unit.contains("define i32 @main()"));
-        assert!(unit.contains("call void @align_main()"));
+        assert!(unit.contains(&format!("call void @\"{encoded_main}\"()")));
         assert!(unit.contains("ret i32 0"));
 
         let result = ir("fn main() -> Result<(), Error> { return Ok(()) }\n");
         assert!(result.contains("define internal"));
-        assert!(result.contains("@align_main()"));
+        assert!(result.contains(&format!("@\"{encoded_main}\"()")));
         assert!(result.contains("define i32 @main()"));
 
         let argv = ir(
             "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
         );
-        assert!(argv.contains("@align_main({ ptr, i64 }"));
+        assert!(argv.contains(&format!("@\"{encoded_main}\"({{ ptr, i64 }}")));
         assert!(argv.contains("define i32 @main(i32"));
         assert!(argv.contains("ptr %1"));
 
@@ -14562,7 +15575,8 @@ mod tests {
         let out = ir("fn sq(x: i64) -> i64 = x * x\nfn main() -> i32 = sq(7) as i32\n");
         // `sq` is a non-exported program fn → `internal` (M13 Slice 1); `main` is the C entry →
         // external (no linkage word). Both still carry the `#0` nounwind attribute group.
-        assert!(out.contains("define internal i64 @sq(i64 %0) #0"));
+        let sq = encoded_program_symbol(&program_call("sq"));
+        assert!(out.contains(&format!("define internal i64 @\"{sq}\"(i64 %0) #0")));
         assert!(out.contains("define i32 @main() #0"));
         assert!(out.contains("attributes #0 = { nounwind }"));
         // ...but the external runtime declarations (ordinary Rust fns) are NOT promised nounwind.
@@ -14679,7 +15693,7 @@ mod tests {
         // audited. This pins the safety property independently of today's surface type limits.
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let f = Function {
-            name: "future_wrapper".into(),
+            name: program_call("future_wrapper"),
             params: vec![],
             param_modes: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
@@ -15143,103 +16157,218 @@ mod tests {
     }
 
     #[test]
-    fn staged_kernel_structural_key_disambiguates_callable_boundaries() {
-        let stage = |func: &str| ParMapStage {
-            kind: ParMapStageKind::Map,
-            func: Some(func.to_string()),
-            captures: Vec::new(),
-            capture_tys: Vec::new(),
-            elem_in: Ty::Bool,
-            elem_out: Ty::Bool,
-        };
-        // The readable `$`-joined names would collide for one callable named `a$b` and two
-        // callables named `a` then `b`; the structural key must keep those kernels distinct.
-        let embedded = FnGen::par_map_stage_structural_key(&[stage("a$b")]);
-        let separated = FnGen::par_map_stage_structural_key(&[stage("a"), stage("b")]);
-        assert_ne!(embedded, separated);
-    }
-
-    #[test]
-    fn range_kernel_identity_includes_mode_types_and_callable_signatures() {
-        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
-        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let no_stages = Vec::new();
-        let no_stage_signatures = Vec::new();
-        let base = FnGen::par_map_kernel_identity_key(
-            "f",
-            "i64",
-            "i64",
-            i64_ty,
-            i64_ty,
-            &[i64_ty],
-            "materialize",
-            &no_stages,
-            "i64 (i64)",
-            &no_stage_signatures,
-        );
-        assert!(base.contains("mode=materialize"));
-        assert!(base.contains("terminal_captures="));
-        assert_ne!(
-            base,
-            FnGen::par_map_kernel_identity_key(
-                "f",
-                "i64",
-                "i64",
-                i64_ty,
-                i64_ty,
-                &[i32_ty],
-                "materialize",
-                &no_stages,
-                "i64 (i64)",
-                &no_stage_signatures,
-            ),
-            "terminal capture types must be part of the cache identity"
-        );
-        assert_ne!(
-            base,
-            FnGen::par_map_kernel_identity_key(
-                "f",
-                "i64",
-                "i64",
-                i32_ty,
-                i64_ty,
-                &[],
-                "materialize",
-                &no_stages,
-                "i64 (i32)",
-                &no_stage_signatures,
-            ),
-            "declared element types and callable signatures must be part of the cache identity"
-        );
-        assert_ne!(
-            base,
-            FnGen::par_map_kernel_identity_key(
-                "f",
-                "i64",
-                "i64",
-                i64_ty,
-                i64_ty,
-                &[i64_ty],
-                "reduce",
-                &no_stages,
-                "i64 (i64)",
-                &no_stage_signatures,
-            ),
-            "materialization and reduction kernels must never share a cache identity"
-        );
-    }
-
-    #[test]
     fn m0_emits_main_returning_i32() {
         let text = ir("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         assert!(text.contains("define i32 @main()"), "got:\n{text}");
     }
 
     #[test]
+    fn callable_namespace_symbols_classes_and_precedence() {
+        fn identity(name: &str) -> Function {
+            let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+            Function {
+                name: program_call(name),
+                params: vec![0],
+                param_modes: vec![align_ast::ParamMode::ByValue],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                ret: i64_ty,
+                slots: vec![i64_ty],
+                slot_align: vec![None],
+                value_tys: vec![i64_ty],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, Rvalue::Load(0))],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Return(Some(Operand::Value(0))),
+                }],
+                entry: 0,
+                exportable: false,
+            }
+        }
+
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let text = codegen_program(
+            vec![
+                Stmt::Let(
+                    0,
+                    Rvalue::Call(
+                        direct_program("print"),
+                        vec![Operand::Const(Const::Int(7, i64_ty))],
+                    ),
+                ),
+                Stmt::Let(
+                    1,
+                    Rvalue::Call(
+                        DirectCall::Runtime(RuntimeKey::Print),
+                        vec![Operand::Value(0)],
+                    ),
+                ),
+            ],
+            vec![i64_ty, Ty::Unit],
+            vec![],
+            vec![],
+            vec![],
+            vec![identity("print"), identity("pkg$é")],
+        )
+        .expect("typed program/runtime targets with equal logical spelling must coexist");
+        let program_print = encoded_program_symbol(&program_call("print"));
+        assert!(text.contains(&format!("@\"{program_print}\"")), "{text}");
+        assert!(text.contains("call void @align_rt_print_i64(i64"), "{text}");
+        assert!(
+            text.contains("@\"align_fn$6$706b6724c3a9\""),
+            "UTF-8 byte length and raw bytes must determine the encoded symbol:\n{text}"
+        );
+
+        let missing = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::Call(
+                    direct_program("missing"),
+                    vec![Operand::Const(Const::Int(0, i64_ty))],
+                ),
+            )],
+            vec![i64_ty],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("an absent typed program target must fail preflight");
+        assert_lowering(missing, "callable target invalid:6d697373696e67");
+
+        let mut conflict = mir("fn dup(value: i64) -> i64 = value\nfn main() -> i32 = 0\n");
+        conflict.externs.push(align_mir::ProgramExtern {
+            name: program_call("dup"),
+            params: vec![i64_ty],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+        });
+        let conflict = emit_llvm_ir(&conflict, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("stored and extern declarations cannot share one logical target");
+        assert_lowering(conflict, "callable declaration conflict:647570");
+
+        let exported = mir(
+            "fn align_rt_print_i64(value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
+        );
+        let collision = emit_llvm_ir(
+            &exported,
+            &BuildTarget::Baseline,
+            false,
+            &["align_rt_print_i64".to_owned()],
+            None,
+        )
+        .expect_err("an explicit export cannot claim a fixed native identity");
+        assert_lowering(
+            collision,
+            "callable external identity collision:616c69676e5f72745f7072696e745f693634",
+        );
+
+        let mut precedence = mir(
+            "extern \"C\" fn align_rt_print_i64(value: i32)\nfn main() -> i32 = 0\n",
+        );
+        precedence.fns[0].blocks[0].stmts.push(Stmt::Let(
+            0,
+            Rvalue::Call(direct_program("missing"), vec![]),
+        ));
+        precedence.fns[0].value_tys.push(i64_ty);
+        precedence.fns[0].blocks[0].stmt_lines.push((0, 0));
+        let precedence = emit_llvm_ir(&precedence, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("extern ABI validation must precede callable target validation");
+        assert_lowering(
+            precedence,
+            "native extern ABI mismatch:616c69676e5f72745f7072696e745f693634",
+        );
+    }
+
+    #[test]
+    fn generated_identity_collection_families_pairs_and_probes() {
+        let mut fn_value = mir(
+            "fn noop() {}\nfn main() -> i32 {\n  first := noop\n  second := noop\n  first()\n  second()\n  return 0\n}\n",
+        );
+        let occupied = "align_gen$fnval$6e6f6f70$0";
+        fn_value.externs.push(align_mir::ProgramExtern {
+            name: program_call(occupied),
+            params: vec![],
+            param_modes: vec![],
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+        });
+        let text = emit_llvm_ir(&fn_value, &BuildTarget::Baseline, false, &[], None)
+            .expect("an occupied generated candidate must probe deterministically");
+        assert!(text.contains("align_gen$fnval$6e6f6f70$1"), "{text}");
+        assert_eq!(
+            text.matches("define private void @\"align_gen$fnval$6e6f6f70$1\"")
+                .count(),
+            1,
+            "equal FnValue requests must deduplicate:\n{text}"
+        );
+
+        let closure = ir(
+            "fn main() -> i32 {\n  captured: i64 := 1\n  f := fn value: i64 { value + captured }\n  return f(1) as i32\n}\n",
+        );
+        assert!(closure.contains("align_gen$clos$"), "{closure}");
+
+        let task = ir(
+            "fn main() -> Result<(), Error> {\n  task_group {\n    task := spawn(fn { 1 })\n    wait()\n    print(task.get())\n  }\n  return Ok(())\n}\n",
+        );
+        assert!(task.contains("align_gen$tramp$"), "{task}");
+
+        let materialize = ir(
+            "fn twice(value: i64) -> i64 = value * 2\n\
+             fn main() -> i32 {\n  values := [1, 2].par_map(twice)\n  return values[0] as i32\n}\n",
+        );
+        assert!(materialize.contains("align_gen$par$0$"), "{materialize}");
+
+        let filtered_program = mir(
+            "fn keep(value: i64) -> bool = value > 0\n\
+             fn twice(value: i64) -> i64 = value * 2\n\
+             fn main() -> i32 {\n  values := [1, 2].where(keep).par_map(twice)\n  return values[0] as i32\n}\n",
+        );
+        let declarations = callable_declarations(&filtered_program).unwrap();
+        let preflight = callable_preflight(&filtered_program, &[], declarations).unwrap();
+        let mut filter_ids = preflight
+            .generated_names
+            .keys()
+            .filter(|id| {
+                matches!(id, GeneratedId::Parallel(parallel)
+                    if matches!(parallel.mode, ParallelKernelMode::FilterCount | ParallelKernelMode::FilterScatter))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        filter_ids.sort();
+        assert_eq!(filter_ids.len(), 2, "filter collection must retain one count/scatter pair");
+        let missing_partner = vec![filter_ids[0].clone()];
+        let missing_bytes = missing_partner[0].to_canonical_bytes().unwrap();
+        let error = validate_generated_pairs(&missing_partner)
+            .expect_err("one retained filter identity cannot omit its partner");
+        assert_lowering(
+            error,
+            &format!(
+                "generated count-scatter pair mismatch:{}",
+                lowercase_hex(&missing_bytes)
+            ),
+        );
+
+        let stem = "align_gen$probe";
+        let maximum = format!("{stem}${}", u64::MAX);
+        let mut reserved = HashMap::from([(maximum.clone(), "extern".to_owned())]);
+        let error = probe_generated_name(stem, &mut reserved, u64::MAX)
+            .expect_err("an occupied maximum probe must fail without wrapping");
+        assert_lowering(
+            error,
+            &format!("generated name exhausted:{}", lowercase_hex(maximum.as_bytes())),
+        );
+    }
+
+    #[test]
     fn unit_fn_value_uses_void_indirect_call_abi() {
         let text = ir("fn noop() {}\nfn main() -> i32 {\n  f := noop\n  f()\n  return 0\n}\n");
         assert!(
-            text.contains("define private void @\"noop$fnval\"(ptr"),
+            text.contains("define private void @\"align_gen$fnval$6e6f6f70$0\"(ptr"),
             "Unit thunk must return void:\n{text}"
         );
         assert!(
@@ -15256,8 +16385,9 @@ mod tests {
     fn fib_emits_calls_and_branch() {
         let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
         let text = ir(src);
-        assert!(text.contains("define internal i64 @fib(i64"), "got:\n{text}");
-        assert!(text.contains("call i64 @fib"), "expected recursive calls:\n{text}");
+        let fib = encoded_program_symbol(&program_call("fib"));
+        assert!(text.contains(&format!("define internal i64 @\"{fib}\"(i64")), "got:\n{text}");
+        assert!(text.contains(&format!("call i64 @\"{fib}\"")), "expected recursive calls:\n{text}");
         assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
 }
