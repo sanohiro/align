@@ -1179,7 +1179,7 @@ enum BuiltinCapability {
 
 fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
     let result = match path {
-        "str" | "reader" | "writer" | "http_headers" | "json.doc" => {
+        "str" | "region" | "reader" | "writer" | "http_headers" | "json.doc" => {
             (0, BuiltinCapability::BorrowLeaf)
         }
         "slice" | "soa" | "json.scanner" | "resource_ref" => {

@@ -761,6 +761,9 @@ pub enum Rvalue {
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
+    /// Copy a `str`/`bytes` view into the exact explicit arena handle, yielding a same-shaped view.
+    /// Codegen emits the arena allocation and byte copy directly; there is no ambient allocator.
+    CloneIn { value: Operand, handle: Operand },
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate,
     /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
     /// `memchr`-class scan. Pure read, no allocation.
@@ -959,11 +962,12 @@ pub enum Rvalue {
     /// `buf.append(data)` — append the raw `slice<u8>` operand `data` (copied) to the growable
     /// `buffer` operand, growing it.
     BufferAppend { buffer: Operand, data: Operand },
-    /// `array_builder<T>()` (M12 A6) — open an empty typed array builder, yielding an opaque handle.
-    /// `elem_size` is the element stride in bytes (16 for a `string` element).
-    ArrayBuilderNew { elem_size: i64 },
-    /// `b.push(v)` — append one Copy-scalar element (the `value` operand, passed as its raw bits in an
-    /// `i64`; `elem_size` sets how many low bytes) to the growable `array_builder` operand.
+    /// Open an empty typed array builder. `region` selects arena-backed chunk storage; `None`
+    /// preserves the existing individually-owned heap form. Physical element layout is computed by
+    /// the target backend from `elem`.
+    ArrayBuilderNew { elem: Ty, region: Option<Operand> },
+    /// `b.push(v)` — append one primitive scalar element (the `value` operand, passed as its raw
+    /// bits in an `i64`; `elem_size` sets how many low bytes) to the growable builder operand.
     ArrayBuilderPush { builder: Operand, value: Operand, scalar: Ty },
     /// `b.push(s)` — append one moved-in `string` element (the `value` operand, a `{ptr,len}`) to the
     /// growable `array_builder` operand. The source string is nulled at the move site.
@@ -972,8 +976,9 @@ pub enum Rvalue {
     /// elements) to the growable `array_builder` operand. `data`'s `len` is the element count; the
     /// element stride is stored in the builder header (set at construction), so no stride here.
     ArrayBuilderAppend { builder: Operand, data: Operand },
-    /// `b.build()` — freeze the `array_builder` operand into an owned `array<T>` `{ptr,len}` (a
-    /// zero-copy ptr+len retype), consuming the builder (its slot is nulled at the move site).
+    /// `b.build()` — freeze the builder into an `array<T>` `{ptr,len}`, consuming it (its slot is
+    /// nulled at the move site). Heap storage transfers zero-copy; region chunks compact once into
+    /// the same arena.
     ArrayBuilderBuild { builder: Operand },
     /// `fs.write_file(path, data)` — write all of the `str`/`bytes` operand `data` to `path`, then
     /// close. Yields an `i32` errno-status (0 = ok).
@@ -1915,6 +1920,7 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     | Rvalue::BytesRead { scalar: elem, .. }
                     | Rvalue::BufferPut { scalar: elem, .. }
                     | Rvalue::ArrayBuilderPush { scalar: elem, .. } => types.push(*elem),
+                    Rvalue::ArrayBuilderNew { elem, .. } => types.push(*elem),
                     Rvalue::ParMapParallel {
                         stages,
                         capture_tys,
@@ -2313,6 +2319,7 @@ fn remap_function_embedded_types(
                     | Rvalue::BytesRead { scalar, .. }
                     | Rvalue::BufferPut { scalar, .. }
                     | Rvalue::ArrayBuilderPush { scalar, .. } => remap_ty(scalar, remap),
+                    Rvalue::ArrayBuilderNew { elem, .. } => remap_ty(elem, remap),
                     Rvalue::ParMapParallel {
                         stages,
                         capture_tys,
@@ -3245,6 +3252,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         }
         hir::ExprKind::Block(blk)
         | hir::ExprKind::Arena(blk)
+        | hir::ExprKind::NamedArena { block: blk, .. }
         | hir::ExprKind::Unsafe(blk)
         | hir::ExprKind::TaskGroup(blk) => {
             if let Some(v) = &blk.value {
@@ -3330,6 +3338,7 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
         }
         hir::ExprKind::Block(blk)
         | hir::ExprKind::Arena(blk)
+        | hir::ExprKind::NamedArena { block: blk, .. }
         | hir::ExprKind::Unsafe(blk)
         | hir::ExprKind::TaskGroup(blk) => {
             blk.value.as_ref().and_then(|v| moved_drop_flag(b, v))
@@ -3370,7 +3379,10 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
         | hir::ExprKind::TupleIndex { .. }
         | hir::ExprKind::Index { .. }
         | hir::ExprKind::ElemField { .. } => Some(Operand::Const(Const::Bool(false))),
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
+        hir::ExprKind::Block(block)
+        | hir::ExprKind::Unsafe(block)
+        | hir::ExprKind::Arena(block)
+        | hir::ExprKind::NamedArena { block, .. } => {
             block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
         }
         // A TaskGroup reaches this arm only when its tail can be fresh: may_need_synthetic_owner
@@ -3396,6 +3408,20 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Arena(block) => {
             let handle = b.fresh_value(Ty::ArenaHandle);
             b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.arenas.push(handle);
+            let tail = lower_block_for_borrow(b, block);
+            b.arenas.pop();
+            if !lowering_continues(b) {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
+        hir::ExprKind::NamedArena { local, block } => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.push(Stmt::Store(*local, Operand::Value(handle)));
             b.arenas.push(handle);
             let tail = lower_block_for_borrow(b, block);
             b.arenas.pop();
@@ -4492,6 +4518,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
         | hir::ExprKind::Block(_)
         | hir::ExprKind::Unsafe(_)
         | hir::ExprKind::Arena(_)
+        | hir::ExprKind::NamedArena { .. }
         | hir::ExprKind::TaskGroup(_)
         | hir::ExprKind::Template(_)
         | hir::ExprKind::FileCreateRw { .. }
@@ -4613,6 +4640,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Loop { .. } => lower_loop(b, e),
         hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
+        hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
         hir::ExprKind::FileCreateRw { .. }
@@ -4686,6 +4714,22 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 fn lower_arena_block(b: &mut Builder, block: &hir::Block) -> Operand {
     let handle = b.fresh_value(Ty::ArenaHandle);
     b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+    b.arenas.push(handle);
+    let tail = lower_block(b, block);
+    b.arenas.pop();
+    if !lowering_continues(b) {
+        terminated_operand()
+    } else {
+        b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+        tail.unwrap_or(Operand::Const(Const::Unit))
+    }
+}
+
+#[inline(never)]
+fn lower_named_arena_block(b: &mut Builder, local: hir::LocalId, block: &hir::Block) -> Operand {
+    let handle = b.fresh_value(Ty::ArenaHandle);
+    b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+    b.push(Stmt::Store(local, Operand::Value(handle)));
     b.arenas.push(handle);
     let tail = lower_block(b, block);
     b.arenas.pop();
@@ -6184,6 +6228,20 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     tail.unwrap_or(Operand::Const(Const::Unit))
                 }
             }
+            hir::ExprKind::NamedArena { local, block } => {
+                let handle = b.fresh_value(Ty::ArenaHandle);
+                b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+                b.push(Stmt::Store(*local, Operand::Value(handle)));
+                b.arenas.push(handle);
+                let tail = lower_block(b, block);
+                b.arenas.pop();
+                if !lowering_continues(b) {
+                    Operand::Const(Const::Unit)
+                } else {
+                    b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                    tail.unwrap_or(Operand::Const(Const::Unit))
+                }
+            }
             hir::ExprKind::HeapNew(inner) => {
                 lower_required_binding!(
                     b,
@@ -6224,6 +6282,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required_binding!(b, src = lower_expr(b, inner), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::StrClone(src)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::CloneIn { value, region } => {
+                lower_required_binding!(b, src = lower_expr(b, value), Operand::Const(Const::Unit));
+                lower_required_binding!(b, handle = lower_expr(b, region), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::CloneIn { value: src, handle }));
                 Operand::Value(v)
             }
             hir::ExprKind::StrPredicate {
@@ -7880,32 +7945,23 @@ fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: 
 
 /// `buf.put_<scalar>_<le|be>(v)` → append `v`'s bytes to the growable buffer. A unit-valued
 /// side-effecting rvalue (the runtime grows the buffer); returns `()`.
-/// The element stride (bytes) an `array_builder<T>` stores per element — its
-/// `align_rt_alloc`/`align_rt_realloc` buffer is `len * elem_size` bytes. A `string` element is a
-/// 16-byte `{ptr,len}` (`AlignStr`); a Copy scalar is its machine width. Only the v1 element set
-/// (Copy scalar or `string`) reaches here — anything else was rejected at the type.
-fn array_builder_elem_size(elem: align_sema::Scalar) -> i64 {
-    use align_sema::Scalar;
-    match elem {
-        Scalar::Int(it) => (it.bits / 8).max(1) as i64,
-        Scalar::Float(ft) => (ft.bits / 8).max(1) as i64,
-        Scalar::Bool => 1,
-        Scalar::Char => 4,
-        Scalar::String => 16,
-        _ => 16,
-    }
-}
-
 /// Lower an `array_builder<T>` op (M12 A6): new opens a builder sized to the element stride;
 /// push/append grow it (`push` of a `string` element moves the value in — null its source slot);
-/// build freezes it into an owned `array<T>` (consuming — null the builder slot). Out-of-line
-/// (`#[inline(never)]`) so its arm locals stay off the recursive `lower_expr` frame (#296).
+/// build freezes it into `array<T>` (consuming — null the builder slot). The backend derives exact
+/// target layout for region-plain aggregate copies. Out-of-line (`#[inline(never)]`) so its arm
+/// locals stay off the recursive `lower_expr` frame (#296).
 #[inline(never)]
 fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
-        hir::ExprKind::ArrayBuilderNew { elem } => {
+        hir::ExprKind::ArrayBuilderNew { elem, region } => {
+            let region = region.as_deref().map(|region| {
+                lower_required!(b, lower_expr(b, region), Operand::Const(Const::Unit))
+            });
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ArrayBuilderNew { elem_size: array_builder_elem_size(*elem) }));
+            b.push(Stmt::Let(v, Rvalue::ArrayBuilderNew {
+                elem: align_sema::scalar_to_ty(*elem),
+                region,
+            }));
             Operand::Value(v)
         }
         hir::ExprKind::ArrayBuilderPush { builder, value, moves_value } => {
@@ -14092,7 +14148,10 @@ fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
         | hir::ExprKind::EnumValue { .. }
         | hir::ExprKind::TaskGet(_)
         | hir::ExprKind::TaskGroup(_) => true,
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
+        hir::ExprKind::Block(block)
+        | hir::ExprKind::Unsafe(block)
+        | hir::ExprKind::Arena(block)
+        | hir::ExprKind::NamedArena { block, .. } => {
             block
                 .value
                 .as_deref()
@@ -14654,7 +14713,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::DynResponseArray => "array<response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
-        Ty::ArenaHandle => "arena".to_string(),
+        Ty::ArenaHandle => "region".to_string(),
         Ty::Builder => "builder".to_string(),
         Ty::StrFinder => "str_finder".to_string(),
         Ty::Writer => "writer".to_string(),

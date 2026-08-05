@@ -1205,7 +1205,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
-            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw => true,
+            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw | Ty::ArenaHandle => true,
             Ty::Option(payload) => {
                 self.scalar_ok(payload, ScalarPlacement::Payload { allow_param })
             }
@@ -1276,7 +1276,6 @@ impl<'a> PlacementValidator<'a> {
             | Ty::DynSliceArray(_)
             | Ty::DynResponseArray
             | Ty::Task(_)
-            | Ty::ArenaHandle
             | Ty::Builder
             | Ty::StrFinder
             | Ty::DictEncoded(..)
@@ -1288,7 +1287,7 @@ impl<'a> PlacementValidator<'a> {
     fn source_function_type_ok(&self, ty: Ty, parameter: bool, return_position: bool) -> bool {
         self.resolve_type_ok(ty, false)
             && !(parameter && matches!(ty, Ty::Box(_)))
-            && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_)))
+            && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_) | Ty::ArenaHandle))
     }
 
     fn stored_function_parameter_ok(&self, function: &hir::Fn, index: usize, ty: Ty) -> bool {
@@ -2013,6 +2012,10 @@ enum BodyWork<'a> {
 
 enum LocalScopeWork<'a> {
     EnterBlock(&'a hir::Block),
+    EnterNamedBlock {
+        local: hir::LocalId,
+        block: &'a hir::Block,
+    },
     ExitBlock,
     EnterStmt(&'a hir::Stmt),
     Bind {
@@ -2099,6 +2102,19 @@ impl<'a> LocalScopeValidator<'a> {
                         work.push(LocalScopeWork::EnterStmt(statement));
                     }
                 }
+                LocalScopeWork::EnterNamedBlock { local, block } => {
+                    self.scopes.push(Vec::new());
+                    if !self.activate_binding(local, true) {
+                        return false;
+                    }
+                    work.push(LocalScopeWork::ExitBlock);
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(LocalScopeWork::EnterExpr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(LocalScopeWork::EnterStmt(statement));
+                    }
+                }
                 LocalScopeWork::ExitBlock => {
                     if !self.restore_scope() {
                         return false;
@@ -2151,6 +2167,12 @@ impl<'a> LocalScopeValidator<'a> {
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
                             work.push(LocalScopeWork::EnterBlock(block));
+                        }
+                        hir::ExprKind::NamedArena { local, block } => {
+                            work.push(LocalScopeWork::EnterNamedBlock {
+                                local: *local,
+                                block,
+                            });
                         }
                         hir::ExprKind::If { cond, then, els } => {
                             work.push(LocalScopeWork::EnterBlock(els));
@@ -3261,6 +3283,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ResultErr(_)
             | hir::ExprKind::Try(_)
             | hir::ExprKind::Arena(_)
+            | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::Unsafe(_)
             | hir::ExprKind::RawAlloc(_)
             | hir::ExprKind::RawFree(_)
@@ -3272,6 +3295,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BoxGet(_)
             | hir::ExprKind::BoxClone(_)
             | hir::ExprKind::StrClone(_)
+            | hir::ExprKind::CloneIn { .. }
             | hir::ExprKind::StrPredicate { .. }
             | hir::ExprKind::StrTrim { .. }
             | hir::ExprKind::StrBorrow(_)
@@ -3654,7 +3678,13 @@ impl<'a> BodyValidator<'a> {
     fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
         match &expression.kind {
             hir::ExprKind::WriterStd { fd, .. } => matches!(*fd, 1 | 2),
-            hir::ExprKind::ArrayBuilderNew { elem } => self.array_builder_elem_ok(*elem),
+            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+                if region.is_some() {
+                    self.array_builder_region_elem_ok(*elem)
+                } else {
+                    self.array_builder_elem_ok(*elem)
+                }
+            }
             hir::ExprKind::RandShuffle { elem, .. } | hir::ExprKind::RandSample { elem, .. } => {
                 self.rng_elem_ok(*elem)
             }
@@ -3799,6 +3829,46 @@ impl<'a> BodyValidator<'a> {
             && (elem == Scalar::String || self.scalar_copy_ok(elem))
     }
 
+    fn array_builder_region_elem_ok(&self, elem: Scalar) -> bool {
+        self.region_plain_ty_ok(align_sema::scalar_to_ty(elem))
+    }
+
+    fn region_plain_ty_ok(&self, ty: Ty) -> bool {
+        let mut work = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(ty) = work.pop() {
+            let ty = align_sema::expand_tagged_ty(ty, &self.program.tagged_types);
+            if !seen.insert(ty) {
+                continue;
+            }
+            match ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str
+                | Ty::Vec(..) | Ty::Mask(..) => {}
+                Ty::Slice(Scalar::Int(align_sema::IntTy {
+                    bits: 8,
+                    signed: false,
+                })) => {}
+                Ty::Option(payload) => work.push(align_sema::scalar_to_ty(payload)),
+                Ty::Struct(id) => {
+                    let Some(definition) = self.program.structs.get(id as usize) else { return false };
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+                Ty::Enum(id) => {
+                    let Some(definition) = self.program.enums.get(id as usize) else { return false };
+                    work.extend(
+                        definition.variants.iter().rev().flat_map(|variant| {
+                            variant.payload.iter().rev().copied().map(align_sema::scalar_to_ty)
+                        }),
+                    );
+                }
+                Ty::Array(payload, _) => work.push(align_sema::scalar_to_ty(payload)),
+                Ty::StructArray(id, _) => work.push(Ty::Struct(id)),
+                _ => return false,
+            }
+        }
+        true
+    }
+
     fn rng_elem_ok(&self, elem: Ty) -> bool {
         align_sema::ty_to_scalar(elem)
             .is_some_and(|scalar| align_sema::scalar_to_prim(scalar).is_some() && self.scalar_copy_ok(scalar))
@@ -3924,6 +3994,7 @@ impl<'a> BodyValidator<'a> {
                     match &expression.kind {
                         hir::ExprKind::TaskGroup(block)
                         | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
@@ -3994,6 +4065,7 @@ impl<'a> BodyValidator<'a> {
                 | hir::ExprKind::Try(recv) => work.push(recv),
                 hir::ExprKind::Block(block)
                 | hir::ExprKind::Arena(block)
+                | hir::ExprKind::NamedArena { block, .. }
                 | hir::ExprKind::Unsafe(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push(value);
@@ -4103,6 +4175,7 @@ impl<'a> BodyValidator<'a> {
                     match &expression.kind {
                         hir::ExprKind::TaskGroup(block)
                         | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
@@ -4135,6 +4208,7 @@ impl<'a> BodyValidator<'a> {
                 hir::ExprKind::ReaderBuffered { .. } => return true,
                 hir::ExprKind::Block(block)
                 | hir::ExprKind::Arena(block)
+                | hir::ExprKind::NamedArena { block, .. }
                 | hir::ExprKind::Unsafe(block) => {
                     let Some(value) = block.value.as_deref() else {
                         return false;
@@ -4614,6 +4688,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderToString(expr) => {
                 push_expr!(expr, context.clone());
             }
+            hir::ExprKind::CloneIn { value, region } => {
+                push_expr!(region, context.clone());
+                push_expr!(value, context.clone());
+            }
             hir::ExprKind::Binary { lhs, rhs, .. }
             | hir::ExprKind::IntArith { lhs, rhs, .. } => {
                 push_expr!(rhs, context.clone());
@@ -4690,10 +4768,14 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::TupleIndex { recv, .. } => push_expr!(recv, context.clone()),
             hir::ExprKind::Block(block)
             | hir::ExprKind::Arena(block)
+            | hir::ExprKind::NamedArena { block, .. }
             | hir::ExprKind::Unsafe(block) => {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
-                if matches!(&expression.kind, hir::ExprKind::Arena(_)) {
+                if matches!(
+                    &expression.kind,
+                    hir::ExprKind::Arena(_) | hir::ExprKind::NamedArena { .. }
+                ) {
                     child.arena_depth = child.arena_depth.saturating_add(1);
                 }
                 if matches!(&expression.kind, hir::ExprKind::Unsafe(_)) {
@@ -5039,6 +5121,22 @@ impl<'a> BodyValidator<'a> {
             || context_polymorphic_expression(&expression.kind, falls);
         if !self.body_ty_ok(expression.ty) || !stored_type_matches {
             return false;
+        }
+        if let hir::ExprKind::NamedArena { local, .. } = &expression.kind {
+            let Some(function) = self.program.fns.get(context.function) else {
+                return false;
+            };
+            let Some(binding) = function.locals.get(*local as usize) else {
+                return false;
+            };
+            if binding.id != *local
+                || binding.ty != Ty::ArenaHandle
+                || binding.is_param
+                || binding.is_mut
+                || !self.record_binding(context.function, *local)
+            {
+                return false;
+            }
         }
         let Some(producer_flow) = self.producer_expression_flow(expression) else {
             return false;
@@ -5789,6 +5887,10 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
             }
+            hir::ExprKind::NamedArena { block, .. } => {
+                let flow = self.block_flow(block)?;
+                Some((flow.ty, flow.falls, flow.breaks))
+            }
             hir::ExprKind::Unsafe(block) => {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
@@ -5973,6 +6075,20 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(value)?;
                 (flow.ty == Ty::Str).then_some((Ty::String, flow.falls, flow.breaks))
             }
+            hir::ExprKind::CloneIn { value, region } => {
+                let value = self.expr_flow(value)?;
+                let region = self.expr_flow(region)?;
+                let value_ty_ok = matches!(
+                    value.ty,
+                    Ty::Str | Ty::Slice(Scalar::Int(align_sema::IntTy { bits: 8, signed: false }))
+                ) || matches!(value.ty, Ty::Struct(_)) && self.region_plain_ty_ok(value.ty);
+                if !value_ty_ok || region.ty != Ty::ArenaHandle {
+                    return None;
+                }
+                let ty = value.ty;
+                let (falls, breaks) = strict_flow(&[value, region]);
+                Some((ty, falls, breaks))
+            }
             hir::ExprKind::StrPredicate { kind, haystack, needle } => {
                 let left = self.expr_flow(haystack)?;
                 let right = self.expr_flow(needle)?;
@@ -6103,6 +6219,7 @@ impl<'a> BodyValidator<'a> {
             }),
             hir::ExprKind::Block(block)
             | hir::ExprKind::Arena(block)
+            | hir::ExprKind::NamedArena { block, .. }
             | hir::ExprKind::TaskGroup(block)
             | hir::ExprKind::Unsafe(block) => self.producer_block_flow(block),
             hir::ExprKind::If { cond, then, els } => {
@@ -6339,9 +6456,23 @@ impl<'a> BodyValidator<'a> {
                 }
                 strict(Ty::Unit, &[buffer, data])
             }
-            hir::ExprKind::ArrayBuilderNew { elem } => {
-                (self.array_builder_elem_ok(*elem) && expression.ty == Ty::ArrayBuilder(*elem))
-                    .then_some((expression.ty, true, Vec::new()))
+            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+                let valid_elem = if region.is_some() {
+                    self.array_builder_region_elem_ok(*elem)
+                } else {
+                    self.array_builder_elem_ok(*elem)
+                };
+                if !valid_elem || expression.ty != Ty::ArrayBuilder(*elem) {
+                    return None;
+                }
+                if let Some(region) = region {
+                    if region.ty != Ty::ArenaHandle {
+                        return None;
+                    }
+                    strict(expression.ty, &[region])
+                } else {
+                    Some((expression.ty, true, Vec::new()))
+                }
             }
             hir::ExprKind::ArrayBuilderPush {
                 builder,
@@ -6351,9 +6482,9 @@ impl<'a> BodyValidator<'a> {
                 let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
                     return None;
                 };
-                if !self.array_builder_elem_ok(elem)
+                if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
                     || !mutable_local(builder, Ty::ArrayBuilder(elem))
-                    || value.ty != align_sema::scalar_to_ty(elem)
+                    || !self.body_ty_matches(value.ty, align_sema::scalar_to_ty(elem))
                     || *moves_value != (elem == Scalar::String)
                 {
                     return None;
@@ -6364,7 +6495,7 @@ impl<'a> BodyValidator<'a> {
                 let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
                     return None;
                 };
-                if !self.array_builder_elem_ok(elem)
+                if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
                     || elem == Scalar::String
                     || !self.scalar_copy_ok(elem)
                     || !mutable_local(builder, Ty::ArrayBuilder(elem))
@@ -6378,8 +6509,11 @@ impl<'a> BodyValidator<'a> {
                 let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
                     return None;
                 };
-                let primitive = align_sema::scalar_to_prim(elem)?;
-                strict(Ty::DynArray(align_sema::prim_to_scalar(primitive)), &[builder])
+                let result = match elem {
+                    Scalar::Struct(id) => Ty::DynStructArray(id, align_sema::Layout::Aos),
+                    _ => Ty::DynArray(elem),
+                };
+                strict(result, &[builder])
             }
             hir::ExprKind::FsWriteFile { path, data, builder } => {
                 if path.ty != Ty::Str
@@ -9068,6 +9202,7 @@ fn context_polymorphic_expression(kind: &hir::ExprKind, falls: bool) -> bool {
                 | hir::ExprKind::Block(_)
                 | hir::ExprKind::Loop { .. }
                 | hir::ExprKind::Arena(_)
+                | hir::ExprKind::NamedArena { .. }
                 | hir::ExprKind::Unsafe(_)
         )
 }
@@ -9524,7 +9659,7 @@ fn body_simple_ty_name(ty: Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::Unit => "()".to_string(),
-        Ty::ArenaHandle => "arena".to_string(),
+        Ty::ArenaHandle => "region".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Builder => "builder".to_string(),
         Ty::Writer => "writer".to_string(),

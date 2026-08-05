@@ -12687,12 +12687,11 @@ pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u
 // ── array_builder<T> (M12 Slice A6) ──────────────────────────────────────────────────────────────
 //
 // The typed grow-then-freeze member (`builder`->`string`, `buffer`->bytes, now `array_builder`->
-// `array<T>`). `push`/`append` grow amortized (doubling); `build` hands the raw storage off as an
-// owned `array<T>` (a zero-copy ptr+len retype). Storage is [`align_rt_alloc`]/[`align_rt_realloc`]
-// memory — the same C allocator that frees `array<T>` — so `build` never copies and the capacity
-// slack is freed whole by the size-less C-free. `elem_size` is the element stride in bytes (16 for a
-// `string` element: an `AlignStr` `{ptr,len}` moved in per element). The builder holds no views, so a
-// realloc can never invalidate a borrow (the soundness rationale for the whole type).
+// `array<T>`). The existing heap form grows with [`align_rt_realloc`] and transfers its storage
+// zero-copy at `build`. The explicit-region form grows geometric chunks in the selected arena and
+// compacts exactly once into a final contiguous arena allocation. `elem_size`/`elem_align` describe
+// the target element layout. Region builders may contain views, whose provenance is enforced by
+// sema; they never realloc a previously written chunk.
 
 /// Test-only live-count of pushed-but-not-yet-freed `string` entries stored in an `array_builder`
 /// (via [`align_rt_array_builder_push_str`]): incremented there, decremented wherever that entry's
@@ -12706,17 +12705,39 @@ pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u
 #[cfg(test)]
 static LIVE_ARRAY_BUILDER_STRINGS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
-/// A growable typed array builder (`array_builder<T>`). `data` is `align_rt_alloc`/`align_rt_realloc`
-/// storage (null while `cap == 0`); `len`/`cap` count elements; `elem_size` is the byte stride.
+/// Test-only count of completed region-builder compaction passes. One `build()` increments once,
+/// independent of whether the builder used zero, one, or many growth chunks.
+#[cfg(test)]
+static REGION_ARRAY_BUILDER_COMPACTIONS: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
+
+#[repr(C)]
+struct RegionArrayBuilderChunk {
+    next: *mut RegionArrayBuilderChunk,
+    data: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+/// A growable typed array builder (`array_builder<T>`). A null `arena` is the existing heap mode,
+/// where `data` is realloc-compatible storage. A non-null `arena` selects linked geometric chunks
+/// allocated in that arena; `head`/`tail` own no independent heap allocation.
 #[repr(C)]
 pub struct ArrayBuilder {
     data: *mut u8,
     len: usize,
     cap: usize,
     elem_size: usize,
+    arena: *mut Arena,
+    head: *mut RegionArrayBuilderChunk,
+    tail: *mut RegionArrayBuilderChunk,
+    elem_align: usize,
 }
 
-const _: () = assert!(core::mem::size_of::<ArrayBuilder>() <= 64 && core::mem::align_of::<ArrayBuilder>() <= 16);
+const _: () = assert!(
+    core::mem::size_of::<ArrayBuilder>() == 64
+        && core::mem::align_of::<ArrayBuilder>() <= 16
+);
 
 impl ArrayBuilder {
     /// Ensure room for `additional` more elements, growing by amortized doubling. Aborts on a
@@ -12728,6 +12749,18 @@ impl ArrayBuilder {
             None => panic_abort("array_builder capacity overflow"),
         };
         if needed <= self.cap {
+            if self.arena.is_null() {
+                return;
+            }
+            let tail_has_room = !self.tail.is_null()
+                && unsafe { (*self.tail).len.checked_add(additional) }
+                    .is_some_and(|length| length <= unsafe { (*self.tail).cap });
+            if tail_has_room {
+                return;
+            }
+        }
+        if !self.arena.is_null() {
+            unsafe { self.reserve_region(additional) };
             return;
         }
         // Amortized doubling with a small floor, so tiny builders don't realloc on every push.
@@ -12745,11 +12778,73 @@ impl ArrayBuilder {
         self.data = unsafe { align_rt_realloc(self.data, bytes as i64) };
         self.cap = new_cap;
     }
+
+    unsafe fn reserve_region(&mut self, additional: usize) {
+        let previous = if self.tail.is_null() { 0 } else { unsafe { (*self.tail).cap } };
+        let mut chunk_cap = previous.max(4);
+        while chunk_cap < additional {
+            chunk_cap = chunk_cap.checked_mul(2).unwrap_or(additional);
+        }
+        if previous != 0 {
+            chunk_cap = chunk_cap.checked_mul(2).unwrap_or_else(|| {
+                panic_abort("array_builder capacity overflow")
+            });
+        }
+        let bytes = chunk_cap
+            .checked_mul(self.elem_size)
+            .filter(|bytes| (*bytes as u64) <= isize::MAX as u64)
+            .unwrap_or_else(|| panic_abort("array_builder allocation too large"));
+        let arena = unsafe { &mut *self.arena };
+        let chunk_ptr = arena
+            .alloc_uninit(
+                core::mem::size_of::<RegionArrayBuilderChunk>(),
+                core::mem::align_of::<RegionArrayBuilderChunk>(),
+            )
+            .cast::<RegionArrayBuilderChunk>();
+        let data = arena.alloc_uninit(bytes, self.elem_align);
+        unsafe {
+            chunk_ptr.write(RegionArrayBuilderChunk {
+                next: core::ptr::null_mut(),
+                data,
+                len: 0,
+                cap: chunk_cap,
+            });
+            if self.tail.is_null() {
+                self.head = chunk_ptr;
+            } else {
+                (*self.tail).next = chunk_ptr;
+            }
+        }
+        self.tail = chunk_ptr;
+        self.cap = self.cap.checked_add(chunk_cap).unwrap_or_else(|| {
+            panic_abort("array_builder capacity overflow")
+        });
+    }
+
+    unsafe fn push_destination(&mut self) -> *mut u8 {
+        unsafe { self.reserve(1) };
+        if self.arena.is_null() {
+            return unsafe { self.data.add(self.len * self.elem_size) };
+        }
+        let tail = unsafe { &mut *self.tail };
+        let destination = unsafe { tail.data.add(tail.len * self.elem_size) };
+        tail.len += 1;
+        destination
+    }
 }
 
 fn array_builder_value(elem_size: i64) -> ArrayBuilder {
     let es = safe_len(elem_size).unwrap_or(0).max(1);
-    ArrayBuilder { data: core::ptr::null_mut(), len: 0, cap: 0, elem_size: es }
+    ArrayBuilder {
+        data: core::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+        elem_size: es,
+        arena: core::ptr::null_mut(),
+        head: core::ptr::null_mut(),
+        tail: core::ptr::null_mut(),
+        elem_align: 1,
+    }
 }
 
 /// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 1`;
@@ -12757,6 +12852,49 @@ fn array_builder_value(elem_size: i64) -> ArrayBuilder {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
     Box::into_raw(Box::new(array_builder_value(elem_size)))
+}
+
+/// `array_builder<T>(out)` — allocate the builder header in `out`; growth chunks and the final
+/// contiguous result are allocated from the same arena. No independently-owned heap vector exists.
+///
+/// # Safety
+/// `arena` must be null or a live arena handle. `elem_size` must be positive and `elem_align` a
+/// nonzero power of two.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_new_in(
+    arena: *mut Arena,
+    elem_size: i64,
+    elem_align: i64,
+) -> *mut ArrayBuilder {
+    let (Ok(elem_size), Some(elem_align)) = (
+        safe_len(elem_size),
+        safe_len(elem_align).ok().filter(|align| align.is_power_of_two()),
+    ) else {
+        return core::ptr::null_mut();
+    };
+    if arena.is_null() || elem_size == 0 {
+        return core::ptr::null_mut();
+    }
+    let storage = unsafe {
+        (&mut *arena).alloc_uninit(
+            core::mem::size_of::<ArrayBuilder>(),
+            core::mem::align_of::<ArrayBuilder>(),
+        )
+    }
+    .cast::<ArrayBuilder>();
+    unsafe {
+        storage.write(ArrayBuilder {
+            data: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            elem_size,
+            arena,
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+            elem_align,
+        });
+    }
+    storage
 }
 
 /// Initialize a compiler-provided nonescaping array-builder header. Its realloc-compatible payload
@@ -12792,11 +12930,10 @@ pub unsafe extern "C" fn align_rt_array_builder_push(b: *mut ArrayBuilder, bits:
     }
     let b = unsafe { &mut *b };
     debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar push");
-    unsafe { b.reserve(1) };
+    let dst = unsafe { b.push_destination() };
     let le = bits.to_le_bytes();
     let w = b.elem_size.min(8);
     unsafe {
-        let dst = b.data.add(b.len * b.elem_size);
         core::ptr::copy_nonoverlapping(le.as_ptr(), dst, w);
     }
     b.len += 1;
@@ -12816,23 +12953,43 @@ pub unsafe extern "C" fn align_rt_array_builder_push_str(b: *mut ArrayBuilder, p
     }
     let b = unsafe { &mut *b };
     debug_assert_eq!(b.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
-    unsafe { b.reserve(1) };
+    let dst = unsafe { b.push_destination() };
     let entry = AlignStr { ptr, len };
     unsafe {
-        let dst = b.data.add(b.len * b.elem_size) as *mut AlignStr;
-        core::ptr::write_unaligned(dst, entry);
+        core::ptr::write_unaligned(dst.cast::<AlignStr>(), entry);
     }
     b.len += 1;
     #[cfg(test)]
     LIVE_ARRAY_BUILDER_STRINGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// `b.append(xs)` — bulk-copy `count` Copy-scalar elements (`count * elem_size` bytes) from `src`
-/// onto the builder. A null `src` or non-positive `count` appends nothing. Grows amortized.
+/// Append one arbitrary Copy element by copying exactly `elem_size` initialized bytes from `src`.
+/// Used for RegionPlain views, Options, sums, and structs whose physical value does not fit in the
+/// scalar-bits entry point.
+///
+/// # Safety
+/// `b` must be a live builder and `src` must address one initialized element of its exact layout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_push_bytes(
+    b: *mut ArrayBuilder,
+    src: *const u8,
+) {
+    if b.is_null() || src.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let dst = unsafe { b.push_destination() };
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, b.elem_size) };
+    b.len += 1;
+}
+
+/// `b.append(xs)` — bulk-copy `count` Copy elements (`count * elem_size` bytes) from `src` onto the
+/// builder. Heap mode remains scalar-only; region mode also accepts validated RegionPlain layouts.
+/// A null `src` or non-positive `count` appends nothing. Grows amortized.
 /// Null-safe.
 ///
 /// # Safety
-/// `b` must be null or a valid scalar-element [`ArrayBuilder`]; `src`/`count` must describe a
+/// `b` must be null or a valid [`ArrayBuilder`]; `src`/`count` must describe a
 /// readable run of `count` elements of `elem_size` bytes each (or be null / `<= 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_append(b: *mut ArrayBuilder, src: *const u8, count: i64) {
@@ -12846,35 +13003,79 @@ pub unsafe extern "C" fn align_rt_array_builder_append(b: *mut ArrayBuilder, src
     if n == 0 || src.is_null() {
         return;
     }
-    debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar append");
-    unsafe { b.reserve(n) };
-    let bytes = match n.checked_mul(b.elem_size) {
-        Some(x) => x,
+    let bytes = match n
+        .checked_mul(b.elem_size)
+        .filter(|bytes| (*bytes as u64) <= isize::MAX as u64)
+    {
+        Some(bytes) => bytes,
         None => return,
     };
-    unsafe {
-        let dst = b.data.add(b.len * b.elem_size);
-        core::ptr::copy_nonoverlapping(src, dst, bytes);
+    debug_assert!(
+        !b.arena.is_null() || b.elem_size <= 8,
+        "heap append elements must fit the scalar ABI"
+    );
+    if b.arena.is_null() {
+        unsafe { b.reserve(n) };
+        unsafe {
+            let dst = b.data.add(b.len * b.elem_size);
+            core::ptr::copy_nonoverlapping(src, dst, bytes);
+        }
+        b.len += n;
+    } else {
+        for index in 0..n {
+            let source = unsafe { src.add(index * b.elem_size) };
+            let destination = unsafe { b.push_destination() };
+            unsafe { core::ptr::copy_nonoverlapping(source, destination, b.elem_size) };
+            b.len += 1;
+        }
     }
-    b.len += n;
 }
 
-/// `b.build()` — freeze into an owned `array<T>` `{ptr,len}` (a zero-copy ptr+len retype). Hands the
-/// raw storage off as the array buffer (the caller's `array<T>` `Drop` frees it — deep-free for a
-/// `string` element array via `align_rt_free_string_array`), then frees only the builder header. The
-/// capacity slack rides along and is freed whole by the size-less C-free. Null-safe (a moved-out
-/// builder yields `{null,0}`).
+/// `b.build()` — freeze into `array<T>` `{ptr,len}`. Heap mode hands the raw storage to the array;
+/// region mode allocates one exact contiguous buffer in the same arena and copies initialized chunk
+/// contents through one pass. Null-safe (a moved-out builder yields `{null,0}`).
 ///
 /// # Safety
-/// `b` must be null or a valid [`ArrayBuilder`] from [`align_rt_array_builder_new`], not yet frozen.
+/// `b` must be null or a valid [`ArrayBuilder`] from [`align_rt_array_builder_new`] or
+/// [`align_rt_array_builder_new_in`], not yet frozen.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_build(b: *mut ArrayBuilder) -> AlignStr {
     if b.is_null() {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
-    // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
-    let b = *unsafe { Box::from_raw(b) };
-    array_builder_build_value(b)
+    if unsafe { (*b).arena.is_null() } {
+        // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
+        let b = *unsafe { Box::from_raw(b) };
+        return array_builder_build_value(b);
+    }
+    let builder = unsafe { &mut *b };
+    #[cfg(test)]
+    REGION_ARRAY_BUILDER_COMPACTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if builder.len == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let bytes = builder
+        .len
+        .checked_mul(builder.elem_size)
+        .filter(|bytes| (*bytes as u64) <= isize::MAX as u64)
+        .unwrap_or_else(|| panic_abort("array_builder allocation too large"));
+    let destination = unsafe { (&mut *builder.arena).alloc_uninit(bytes, builder.elem_align) };
+    let mut written = 0usize;
+    let mut chunk = builder.head;
+    while !chunk.is_null() {
+        let current = unsafe { &*chunk };
+        let chunk_bytes = current
+            .len
+            .checked_mul(builder.elem_size)
+            .unwrap_or_else(|| panic_abort("array_builder allocation too large"));
+        unsafe {
+            core::ptr::copy_nonoverlapping(current.data, destination.add(written), chunk_bytes);
+        }
+        written += chunk_bytes;
+        chunk = current.next;
+    }
+    debug_assert_eq!(written, bytes);
+    AlignStr { ptr: destination, len: builder.len as i64 }
 }
 
 fn array_builder_build_value(b: ArrayBuilder) -> AlignStr {
@@ -12906,6 +13107,9 @@ unsafe fn array_builder_free_value(b: ArrayBuilder) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     if b.is_null() {
+        return;
+    }
+    if !unsafe { (*b).arena.is_null() } {
         return;
     }
     let b = *unsafe { Box::from_raw(b) };
@@ -12947,6 +13151,9 @@ unsafe fn array_builder_free_strings_value(b: ArrayBuilder) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilder) {
     if b.is_null() {
+        return;
+    }
+    if !unsafe { (*b).arena.is_null() } {
         return;
     }
     let b = *unsafe { Box::from_raw(b) };
@@ -18734,8 +18941,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 286);
-        assert_eq!(registry.len(), 286);
+        assert_eq!(runtime.len(), 288);
+        assert_eq!(registry.len(), 288);
         assert_eq!(runtime, registry);
     }
 
@@ -22052,6 +22259,96 @@ mod tests {
             align_rt_array_builder_push(b, 99);
             align_rt_array_builder_free_stack(b);
         }
+    }
+
+    #[test]
+    fn region_array_builder_compacts_empty_single_and_multi_chunk_values_once() {
+        use core::sync::atomic::Ordering;
+
+        for count in [0usize, 3, 17] {
+            let before = REGION_ARRAY_BUILDER_COMPACTIONS.load(Ordering::Relaxed);
+            let arena = align_rt_arena_begin();
+            let builder = unsafe { align_rt_array_builder_new_in(arena, 8, 8) };
+            assert!(!builder.is_null());
+            for value in 0..count {
+                unsafe { align_rt_array_builder_push(builder, value as u64) };
+            }
+            let frozen = unsafe { align_rt_array_builder_build(builder) };
+            assert_eq!(frozen.len, count as i64);
+            if count == 0 {
+                assert!(frozen.ptr.is_null());
+            } else {
+                let values = unsafe { core::slice::from_raw_parts(frozen.ptr.cast::<u64>(), count) };
+                assert_eq!(values, (0..count as u64).collect::<Vec<_>>());
+            }
+            assert_eq!(
+                REGION_ARRAY_BUILDER_COMPACTIONS.load(Ordering::Relaxed),
+                before + 1,
+                "one build must execute one compaction pass",
+            );
+            // An unfinished-region free owns nothing independently and must not release the header.
+            unsafe { align_rt_array_builder_free(builder) };
+            unsafe { align_rt_arena_end(arena) };
+        }
+    }
+
+    #[test]
+    fn region_array_builder_push_bytes_preserves_aggregate_layout() {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct Pair {
+            left: u64,
+            right: u64,
+        }
+
+        let arena = align_rt_arena_begin();
+        let builder = unsafe {
+            align_rt_array_builder_new_in(
+                arena,
+                core::mem::size_of::<Pair>() as i64,
+                core::mem::align_of::<Pair>() as i64,
+            )
+        };
+        let expected = [Pair { left: 1, right: 2 }, Pair { left: 3, right: 5 }];
+        for value in &expected {
+            unsafe {
+                align_rt_array_builder_push_bytes(
+                    builder,
+                    (value as *const Pair).cast::<u8>(),
+                )
+            };
+        }
+        let frozen = unsafe { align_rt_array_builder_build(builder) };
+        let actual = unsafe {
+            core::slice::from_raw_parts(frozen.ptr.cast::<Pair>(), frozen.len as usize)
+        };
+        assert_eq!(actual, expected);
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn region_array_builder_rejects_invalid_ffi_layout_before_allocation() {
+        assert!(unsafe {
+            align_rt_array_builder_new_in(core::ptr::null_mut(), 8, 8)
+        }
+        .is_null());
+
+        let arena = align_rt_arena_begin();
+        for (size, align) in [(0, 8), (-1, 8), (8, 0), (8, -1), (8, 3)] {
+            assert!(
+                unsafe { align_rt_array_builder_new_in(arena, size, align) }.is_null(),
+                "invalid layout ({size}, {align}) must fail before allocation",
+            );
+        }
+        let valid = unsafe { align_rt_array_builder_new_in(arena, 8, 8) };
+        assert!(!valid.is_null(), "an earlier invalid request must not poison the arena");
+        let byte = 0u8;
+        unsafe {
+            align_rt_array_builder_append(valid, &byte, i64::MAX);
+        }
+        let empty = unsafe { align_rt_array_builder_build(valid) };
+        assert_eq!(empty.len, 0, "overflowing append size must be rejected");
+        unsafe { align_rt_arena_end(arena) };
     }
 
     #[test]

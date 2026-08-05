@@ -1180,7 +1180,10 @@ impl<'a> Analyzer<'a> {
                             steps: 0,
                         });
                     }
-                    ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) => {
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
+                    | ExprKind::Unsafe(block) => {
                         work.push(ReplayWork::EvalBlock {
                             block,
                             state,

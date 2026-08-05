@@ -386,7 +386,8 @@ pub enum Ty {
     /// heap buffer freed by `Drop` (the same machinery as owned `array<T>`). A `string` is
     /// readable as a `str` (a borrow of itself).
     String,
-    /// An arena handle (internal; produced by `arena {}`, never written by the user).
+    /// A scope-limited region capability. Produced only by `arena name {}` and accepted as an
+    /// ordinary function parameter; it cannot be returned, stored in an aggregate, or constructed.
     ArenaHandle,
     /// `raw` — an opaque, untyped raw byte pointer, the unsafe escape hatch (`raw.alloc` yields one;
     /// `raw.free` consumes one). Copy, `Static` region (not arena/region-tracked), never auto-dropped
@@ -421,14 +422,12 @@ pub enum Ty {
     Buffer,
     /// `array_builder<T>` (`core`, M12 A6) — a growable typed array builder, the typed member of the
     /// grow-then-freeze family (`builder`->`string`, `buffer`->bytes, this->`array<T>`). An opaque
-    /// owned **Move** handle to a heap builder object; the payload [`Scalar`] is the element type
-    /// (a Copy scalar or `string` in v1). `array_builder()` opens it, `b.push(v)` / `b.append(xs)`
-    /// grow it (amortized doubling, in-place through the handle), `b.build()` **consumes** it into an
-    /// owned `array<T>` (a zero-copy ptr+len retype — the storage is `align_rt_alloc`-family memory
-    /// grown via `align_rt_realloc`, freed whole by the array's `Drop`). An unfrozen builder is
-    /// `Drop`-freed at scope exit (deep-free for a `string` element). Holds **no views**, so a
-    /// realloc can never invalidate a borrow. Never rides an aggregate (no `Scalar::ArrayBuilder`):
-    /// bound to one local, like `builder`/`buffer`.
+    /// owned **Move** handle; the payload [`Scalar`] is the element type. `array_builder()` selects
+    /// individually owned heap storage for the existing primitive/`string` surface.
+    /// `array_builder(out)` selects region-owned chunks for concrete `RegionPlain` elements and
+    /// retains view provenance through pushed values. `build()` consumes either form: heap storage
+    /// transfers zero-copy, while region chunks compact once in `out`. Never rides an aggregate
+    /// (no `Scalar::ArrayBuilder`): bound to one local, like `builder`/`buffer`.
     ArrayBuilder(Scalar),
     /// `str_finder` — a **compiler-internal** prepared substring-search plan (doc-13 §6.6 / §11 P3).
     /// It has **no surface syntax**: it is emitted only by MIR when it recognises the loop-invariant
@@ -1554,6 +1553,7 @@ pub fn ty_may_borrow(
         match ty {
             Ty::Str
             | Ty::Slice(_)
+            | Ty::ArenaHandle
             | Ty::Reader
             | Ty::Writer
             | Ty::Soa(_)
@@ -1580,7 +1580,8 @@ pub fn ty_may_borrow(
                     }
                 }
             }
-            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s) => {
+            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s)
+            | Ty::ArrayBuilder(s) => {
                 work.push(scalar_to_ty(s));
             }
             Ty::Result(ok, err) => {
@@ -2797,6 +2798,7 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
             ast::ExprKind::Try(inner) => self.walk_expr(inner),
             ast::ExprKind::Loop(b) => self.walk_block(b),
             ast::ExprKind::Arena(b) => self.walk_block(b),
+            ast::ExprKind::NamedArena { block, .. } => self.walk_block(block),
             ast::ExprKind::Unsafe(b) => self.walk_block(b),
             ast::ExprKind::TaskGroup(b) => self.walk_block(b),
             ast::ExprKind::ArrayLit(elems) => {
@@ -4558,6 +4560,12 @@ pub fn check_program_with_all_interface_facts(
                         t.span(),
                     );
                 }
+                if r == Ty::ArenaHandle {
+                    diags.error(
+                        "a region capability cannot be returned (it is scoped to its declaring arena)".to_string(),
+                        t.span(),
+                    );
+                }
                 // A returned function value would carry a frame-local closure environment out of
                 // the frame (use-after-free); deferred until closures can own a region-backed env.
                 if matches!(r, Ty::Fn(_)) {
@@ -5336,6 +5344,7 @@ fn run_body_analysis_passes(
                 f,
                 diags,
                 named_return_region: &named_return_region,
+                named_param_modes: &named_param_modes,
                 fn_types,
                 tuples,
                 structs,
@@ -5349,6 +5358,7 @@ fn run_body_analysis_passes(
                 task_group_regions: Vec::new(),
                 allocation_regions: Vec::new(),
                 allocation_region_by_expr: std::collections::HashMap::new(),
+                region_capabilities: std::collections::HashMap::new(),
                 flow: EscapeFlowCfg::new(),
                 flow_current: 0,
                 loop_exit_blocks: Vec::new(),
@@ -8040,6 +8050,7 @@ impl EffectScan<'_> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::Unsafe(block)
                     | ExprKind::TaskGroup(block) => {
                         if let Some(value) = block.value.as_deref().filter(|value| {
@@ -8371,6 +8382,7 @@ impl EffectScan<'_> {
                 (
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::Unsafe(block)
                     | ExprKind::TaskGroup(block),
                     _,
@@ -8866,11 +8878,22 @@ impl EffectScan<'_> {
                 walk!(buffer);
                 walk!(data);
             }
-            // `array_builder` new/push/append/build are all pure in-memory growth.
-            ExprKind::ArrayBuilderNew { .. }
-            | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. }
-            | ExprKind::ArrayBuilderBuild(_) => {}
+            // `array_builder` new/push/append/build are pure in-memory growth, but their operands
+            // may contain calls whose effects still contribute in source order.
+            ExprKind::ArrayBuilderNew { region, .. } => {
+                if let Some(region) = region {
+                    walk!(region);
+                }
+            }
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                walk!(builder);
+                walk!(value);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                walk!(builder);
+                walk!(data);
+            }
+            ExprKind::ArrayBuilderBuild(builder) => walk!(builder),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -9474,7 +9497,10 @@ impl EffectScan<'_> {
                 walk!(builder);
                 walk!(arg);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => {
+            ExprKind::Block(b)
+            | ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
+            | ExprKind::TaskGroup(b) => {
                 return !hir_block_diverges(b);
             }
             ExprKind::Loop { diverges, .. } => return !*diverges,
@@ -9604,6 +9630,10 @@ impl EffectScan<'_> {
             | ExprKind::HeapNew(i) | ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i)
             | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::Len(i)
             | ExprKind::ArrayToSlice(i) => walk!(i),
+            ExprKind::CloneIn { value, region } => {
+                walk!(value);
+                walk!(region);
+            }
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 walk!(haystack);
                 walk!(needle);
@@ -9814,6 +9844,19 @@ enum EscapeFlowOp<'a> {
         group: Region,
         depth: u32,
     },
+    /// A region builder stores a copy of `value` until its destination region ends. Any view
+    /// contained in the pushed value must therefore outlive that destination.
+    ArrayBuilderStore {
+        builder: &'a Expr,
+        value: &'a Expr,
+        depth: u32,
+    },
+    /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
+    /// mode cannot implement their one-owner shaping contract.
+    RegionBuilderNonMutBorrow {
+        builder: &'a Expr,
+        depth: u32,
+    },
     /// A by-value call transfers a Move value to the callee. Arena-owned storage cannot cross
     /// that function boundary because the callee has no caller-region provenance.
     CallTransfer(&'a Expr, u32),
@@ -9930,6 +9973,9 @@ struct EscapeCheck<'a> {
     diags: &'a mut Diagnostics,
     /// Settled same-program/imported return-region summaries for direct calls.
     named_return_region: &'a std::collections::HashMap<String, hir::ReturnRegionSummary>,
+    /// Parameter modes for same-program/imported direct calls. Mutable builder parameters may
+    /// retain view-bearing arguments, so call sites must validate the concrete caller regions.
+    named_param_modes: &'a std::collections::HashMap<String, Vec<ast::ParamMode>>,
     /// Settled function-value signatures. Parameter roots select call arguments; capture roots are
     /// resolved through `EscapeState::callable_capture_region`.
     fn_types: &'a [hir::FnTy],
@@ -9968,6 +10014,9 @@ struct EscapeCheck<'a> {
     /// Actual arena allocation region at each expression, keyed by HIR-node identity before the
     /// CFG is solved. Absence means the expression allocates free-standing heap/frame storage.
     allocation_region_by_expr: std::collections::HashMap<usize, Region>,
+    /// Exact semantic region represented by each explicit named-arena capability local. Local ids
+    /// are function-unique, so entries remain usable by later HIR queries after lexical exit.
+    region_capabilities: std::collections::HashMap<LocalId, Region>,
     /// Compact checked-HIR CFG built before solving escape state.
     flow: EscapeFlowCfg<'a>,
     /// Block currently receiving lowered escape operations.
@@ -10130,6 +10179,28 @@ impl<'a> EscapeCheck<'a> {
                 group,
                 depth,
             } => self.check_spawn_capture(closure, group, depth),
+            EscapeFlowOp::ArrayBuilderStore { builder, value, depth } => {
+                let destination = self.region_of(builder, depth);
+                if destination != Region::Static
+                    && self.region_bearing(value.ty)
+                    && !self.region_of(value, depth).outlives(destination)
+                {
+                    self.diags.error(
+                        "cannot retain a shorter-lived view in this region builder; copy it with `.clone_in(out)` first"
+                            .to_string(),
+                        value.span,
+                    );
+                }
+            }
+            EscapeFlowOp::RegionBuilderNonMutBorrow { builder, depth } => {
+                if !self.drop_is_individual(builder, depth) {
+                    self.diags.error(
+                        "a region-backed array_builder may be passed only as `borrow mut`; the caller must retain ownership and perform build()"
+                            .to_string(),
+                        builder.span,
+                    );
+                }
+            }
             EscapeFlowOp::CallTransfer(value, depth) => {
                 if self.call_transfer_contains_arena_owned(value, depth) {
                     self.diags.error(
@@ -10214,7 +10285,9 @@ impl<'a> EscapeCheck<'a> {
                         work.push((value, depth));
                     }
                 }
-                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
+                | ExprKind::TaskGroup(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth + 1));
                     }
@@ -10273,7 +10346,9 @@ impl<'a> EscapeCheck<'a> {
                         work.push((value, depth));
                     }
                 }
-                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
+                | ExprKind::TaskGroup(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth + 1));
                     }
@@ -10328,7 +10403,9 @@ impl<'a> EscapeCheck<'a> {
                         work.push((value, depth));
                     }
                 }
-                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
+                | ExprKind::TaskGroup(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth + 1));
                     }
@@ -10412,6 +10489,17 @@ impl<'a> EscapeCheck<'a> {
     /// `.clone()`) from an arena allocation.
     fn check_return_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
+        // The shared `array_builder<T>` type also has an individually owned heap constructor, which
+        // remains returnable. A region constructor does not transfer its arena ownership to the
+        // callee, so returning that builder would let later mutation/build outlive the caller's
+        // lexical owner. Path-dependent heap/region builders fail closed here as well.
+        if matches!(e.ty, Ty::ArrayBuilder(_)) && !self.drop_is_individual(e, depth) {
+            self.diags.error(
+                "cannot return a region-backed array_builder; pass the caller's builder as `borrow mut` and let the caller build it"
+                    .to_string(),
+                e.span,
+            );
+        }
         // A frame-local slice (a `slice` of a local `array`, `buffer.bytes()`, `resp.body()`) keeps
         // its dedicated message below; the region branch skips it so the diagnostic is unchanged and
         // not duplicated. An **arena-backed `bytes` view** (`fs.read_bytes_view`) is *not*
@@ -10568,7 +10656,7 @@ impl<'a> EscapeCheck<'a> {
             // arguments from tainting a direct `fs.open` result while still failing closed for an
             // unknown borrowing boundary. (A `tcp_conn` itself is always owned, never a borrow,
             // so it is deliberately NOT here.)
-            Ty::Reader | Ty::Writer | Ty::Fn(_) => return true,
+            Ty::Reader | Ty::Writer | Ty::Fn(_) | Ty::ArenaHandle | Ty::ArrayBuilder(_) => return true,
             Ty::Resource(_) | Ty::ResourceRef(_) => return true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
@@ -10581,11 +10669,9 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Char
             | Ty::Vec(..)
             | Ty::Mask(..)
-            | Ty::ArenaHandle
             | Ty::Raw
             | Ty::Builder
             | Ty::Buffer
-            | Ty::ArrayBuilder(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
             // bytes) — it borrows nothing, so it carries no inferred region.
             | Ty::StrFinder
@@ -10663,8 +10749,26 @@ impl<'a> EscapeCheck<'a> {
                         continue;
                     }
                     match &expression.kind {
+                        ExprKind::Local(local) => values.push(
+                            self.state
+                                .individual
+                                .get(local)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    !matches!(
+                                        self.region_of(expression, depth),
+                                        Region::Arena(_)
+                                    )
+                                }),
+                        ),
                         // A callee cannot return arena-owned storage across its function boundary,
                         // even when `region_of(Call)` is shortened by an arena-borrowing argument.
+                        ExprKind::ArrayBuilderNew { region, .. } => {
+                            values.push(region.is_none());
+                        }
+                        ExprKind::ArrayBuilderBuild(builder) => {
+                            work.push(Work::Eval(builder, depth));
+                        }
                         ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
@@ -10690,7 +10794,9 @@ impl<'a> EscapeCheck<'a> {
                                     .unwrap_or_default(),
                             );
                         }
-                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                        ExprKind::Arena(block)
+                        | ExprKind::NamedArena { block, .. }
+                        | ExprKind::TaskGroup(block) => {
                             push_all(
                                 &mut work,
                                 &mut values,
@@ -10863,6 +10969,12 @@ impl<'a> EscapeCheck<'a> {
                                     )
                                 }),
                         ),
+                        ExprKind::ArrayBuilderNew { region, .. } => {
+                            values.push(region.is_none());
+                        }
+                        ExprKind::ArrayBuilderBuild(builder) => {
+                            work.push(Work::Eval(builder, depth));
+                        }
                         ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
@@ -10892,7 +11004,9 @@ impl<'a> EscapeCheck<'a> {
                                 values.push(true);
                             }
                         }
-                        ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                        ExprKind::Arena(block)
+                        | ExprKind::NamedArena { block, .. }
+                        | ExprKind::TaskGroup(block) => {
                             if let Some(value) = block.value.as_deref() {
                                 work.push(Work::Eval(value, depth + 1));
                             } else {
@@ -11302,6 +11416,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Block(block)
             | ExprKind::Unsafe(block)
             | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block) => block.value.as_deref().map_or_else(
                 CallableRegionFact::new,
                 |value| self.callable_region_fact(value, depth),
@@ -11943,12 +12058,25 @@ impl<'a> EscapeCheck<'a> {
                 );
             }
             ExprKind::Local(p) => values.push(
-                self.state
-                    .region
+                self.region_capabilities
                     .get(p)
                     .copied()
+                    .or_else(|| self.state.region.get(p).copied())
                     .unwrap_or(Region::Static),
             ),
+            // A region builder and the array frozen from it are tied to the explicit destination
+            // capability. The heap form has no region operand and remains independently owned.
+            ExprKind::ArrayBuilderNew { region, .. } => {
+                if let Some(region) = region {
+                    work.push(Work::Eval(region, depth));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
+            ExprKind::ArrayBuilderBuild(builder) => work.push(Work::Eval(builder, depth)),
+            // An explicit copy severs the source-storage borrow and is tied only to the
+            // destination capability.
+            ExprKind::CloneIn { region, .. } => work.push(Work::Eval(region, depth)),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
             ExprKind::StructLit { fields, .. } => push_fold(
@@ -12009,6 +12137,13 @@ impl<'a> EscapeCheck<'a> {
             // nested arenas); the per-block walk only checks the immediate boundary, not a
             // later escape of the binding.
             ExprKind::Arena(block) => {
+                if let Some(value) = block.value.as_deref() {
+                    work.push(Work::Eval(value, depth + 1));
+                } else {
+                    values.push(Region::Static);
+                }
+            }
+            ExprKind::NamedArena { block, .. } => {
                 if let Some(value) = block.value.as_deref() {
                     work.push(Work::Eval(value, depth + 1));
                 } else {
@@ -12214,10 +12349,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BytesRead { .. }
             | ExprKind::BufferPut { .. }
             | ExprKind::BufferAppend { .. }
-            | ExprKind::ArrayBuilderNew { .. }
             | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. }
-            | ExprKind::ArrayBuilderBuild(..)
             | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
@@ -12430,7 +12563,10 @@ impl<'a> EscapeCheck<'a> {
             // An `arena` / `unsafe` / `task_group` block yields its block value, which is frame-local
             // if the inner value is (like the plain `Block` arm above). Without these a local-backed
             // slice returned through such a block escapes the function undetected (dangling slice).
-            ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
+            ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
+            | ExprKind::Unsafe(b)
+            | ExprKind::TaskGroup(b) => {
                 work.extend(b.value.as_deref());
             }
             // A closure may return a captured local-backed slice. Its callable value carries those
@@ -12482,6 +12618,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BoxGet(..)
             | ExprKind::BoxClone(..)
             | ExprKind::StrClone(..)
+            | ExprKind::CloneIn { .. }
             | ExprKind::StrPredicate { .. }
             | ExprKind::StrTrim { .. }
             | ExprKind::StrBorrow(..)
@@ -12705,6 +12842,19 @@ impl<'a> EscapeCheck<'a> {
                             });
                             work.push(EscapeWalkItem::Block(block, inner));
                         }
+                        ExprKind::NamedArena { local, block } => {
+                            let inner = depth + 1;
+                            let region = Region::arena(inner);
+                            self.region_capabilities.insert(*local, region);
+                            self.allocation_regions.push(region);
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            work.push(EscapeWalkItem::ArenaDone {
+                                block,
+                                inner,
+                                target: Region::arena(depth),
+                            });
+                            work.push(EscapeWalkItem::Block(block, inner));
+                        }
                         ExprKind::Block(block) | ExprKind::Unsafe(block) => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
                             work.push(EscapeWalkItem::Block(block, depth));
@@ -12784,8 +12934,13 @@ impl<'a> EscapeCheck<'a> {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
                             let borrows_args =
                                 matches!(func.as_str(), "print" | "hash64" | "hash128");
-                            for argument in args.iter().rev() {
-                                if !borrows_args {
+                            let modes = self.named_param_modes.get(func);
+                            for (index, argument) in args.iter().enumerate().rev() {
+                                let transfers = modes
+                                    .and_then(|modes| modes.get(index))
+                                    .is_some_and(|mode| *mode == ast::ParamMode::ByValue)
+                                    || (modes.is_none() && !borrows_args);
+                                if transfers {
                                     work.push(EscapeWalkItem::Op(
                                         EscapeFlowOp::CallTransfer(argument, depth),
                                     ));
@@ -12795,10 +12950,26 @@ impl<'a> EscapeCheck<'a> {
                         }
                         ExprKind::CallFnValue { callee, args } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
-                            for argument in args.iter().rev() {
-                                work.push(EscapeWalkItem::Op(
-                                    EscapeFlowOp::CallTransfer(argument, depth),
-                                ));
+                            let modes = match callee.ty {
+                                Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                                    function
+                                        .params
+                                        .iter()
+                                        .map(|(mode, _)| *mode)
+                                        .collect::<Vec<_>>()
+                                }),
+                                _ => None,
+                            };
+                            for (index, argument) in args.iter().enumerate().rev() {
+                                if modes
+                                    .as_ref()
+                                    .and_then(|modes| modes.get(index))
+                                    .is_none_or(|mode| *mode == ast::ParamMode::ByValue)
+                                {
+                                    work.push(EscapeWalkItem::Op(
+                                        EscapeFlowOp::CallTransfer(argument, depth),
+                                    ));
+                                }
                                 work.push(EscapeWalkItem::Expr(argument, depth));
                             }
                             work.push(EscapeWalkItem::Expr(callee, depth));
@@ -12838,6 +13009,41 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 EscapeWalkItem::ExprExit(expression, depth) => {
+                    match &expression.kind {
+                        ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                            self.push_flow_op(EscapeFlowOp::ArrayBuilderStore {
+                                builder,
+                                value,
+                                depth,
+                            });
+                        }
+                        ExprKind::ArrayBuilderAppend { builder, data } => {
+                            self.push_flow_op(EscapeFlowOp::ArrayBuilderStore {
+                                builder,
+                                value: data,
+                                depth,
+                            });
+                        }
+                        ExprKind::Call { func, args, .. } => {
+                            if let Some(modes) = self.named_param_modes.get(func).cloned() {
+                                self.record_builder_call_modes(args, &modes, depth);
+                            }
+                        }
+                        ExprKind::CallFnValue { callee, args } => {
+                            if let Ty::Fn(id) = callee.ty
+                                && let Some(modes) = self.fn_types.get(id as usize).map(|function| {
+                                    function
+                                        .params
+                                        .iter()
+                                        .map(|(mode, _)| *mode)
+                                        .collect::<Vec<_>>()
+                                })
+                            {
+                                self.record_builder_call_modes(args, &modes, depth);
+                            }
+                        }
+                        _ => {}
+                    }
                     if needs_drop_flag(
                         expression.ty,
                         self.structs,
@@ -13061,6 +13267,45 @@ impl<'a> EscapeCheck<'a> {
                     }
                     self.flow_current = join;
                 }
+            }
+        }
+    }
+
+    /// A helper receiving `borrow mut array_builder<T>` may retain any view-bearing argument in
+    /// that builder. Check the call at the caller's concrete regions; MoveCheck separately carries
+    /// the accepted roots forward so a later owner mutation remains visible.
+    fn record_builder_call_modes(
+        &mut self,
+        args: &'a [Expr],
+        modes: &[ast::ParamMode],
+        depth: u32,
+    ) {
+        for (index, mode) in modes.iter().copied().enumerate() {
+            let Some(builder) = args.get(index) else {
+                continue;
+            };
+            let Ty::ArrayBuilder(element) = builder.ty else {
+                continue;
+            };
+            if matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::Out) {
+                self.push_flow_op(EscapeFlowOp::RegionBuilderNonMutBorrow {
+                    builder,
+                    depth,
+                });
+                continue;
+            }
+            if mode != ast::ParamMode::BorrowMut {
+                continue;
+            }
+            if !self.region_bearing(scalar_to_ty(element)) {
+                continue;
+            }
+            for value in args {
+                self.push_flow_op(EscapeFlowOp::ArrayBuilderStore {
+                    builder,
+                    value,
+                    depth,
+                });
             }
         }
     }
@@ -13395,6 +13640,14 @@ impl<'a> EscapeCheck<'a> {
 
     fn check_spawn_capture(&mut self, closure: &Expr, group: Region, depth: u32) {
         let check = |this: &mut Self, capture: &Expr| {
+            if capture.ty == Ty::ArenaHandle {
+                this.diags.error(
+                    "a spawned task cannot capture a region capability (arena allocation is lexical and non-Send)"
+                        .to_string(),
+                    capture.span,
+                );
+                return;
+            }
             if ty_mentions_resource(
                 capture.ty,
                 this.structs,
@@ -13453,7 +13706,11 @@ impl<'a> EscapeCheck<'a> {
     #[inline(never)]
     fn walk_array_builder(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderNew { region, .. } => {
+                if let Some(region) = region {
+                    self.walk(region, depth);
+                }
+            }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 self.walk(builder, depth);
                 self.walk(value, depth);
@@ -13494,6 +13751,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
             ExprKind::Arena(_)
+            | ExprKind::NamedArena { .. }
             | ExprKind::Block(_)
             | ExprKind::Loop { .. }
             | ExprKind::Unsafe(_) => {
@@ -13556,6 +13814,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawIsNull(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::CloneIn { value, region } => {
+                self.walk(value, depth);
+                self.walk(region, depth);
+            }
             ExprKind::ResourceFromRaw { raw, parent, .. } => {
                 self.walk(raw, depth);
                 if let Some(parent) = parent {
@@ -14293,6 +14555,7 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block) => {
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(block)));
@@ -14900,6 +15163,7 @@ fn match_scrutinee_materializes_result(e: &Expr) -> bool {
         ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::ElseUnwrap { .. } => true,
         ExprKind::Block(block)
         | ExprKind::Arena(block)
+        | ExprKind::NamedArena { block, .. }
         | ExprKind::TaskGroup(block)
         | ExprKind::Unsafe(block) => block
             .value
@@ -15028,6 +15292,32 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// A `borrow mut array_builder<T>` call may retain any view-bearing argument as a new element.
+    /// The function type already exposes every parameter mode and concrete type, so conservatively
+    /// join those argument roots into the caller's builder without a body-specific effect summary.
+    /// Non-borrowing elements add no roots and keep the ordinary exclusive-borrow refresh.
+    fn refresh_borrow_mut_call(&mut self, argument: &Expr, args: &[Expr]) {
+        self.refresh_borrow_mut_place(argument);
+        let Ty::ArrayBuilder(element) = argument.ty else {
+            return;
+        };
+        if !ty_may_borrow(
+            scalar_to_ty(element),
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            return;
+        }
+        let ExprKind::Local(local) = argument.kind else {
+            return;
+        };
+        for value in args {
+            self.join_local_borrow_fallback(local, value);
+        }
+    }
+
     fn check_call_borrow_aliases(
         &mut self,
         display: &str,
@@ -15091,7 +15381,14 @@ impl<'a> MoveCheck<'a> {
 
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
-        if let Some(position) = self.borrowed_param_position(id) {
+        let region_param = self
+            .f
+            .params
+            .iter()
+            .position(|&param| param == id)
+            .filter(|_| self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle))
+            .map(|position| position as u32);
+        if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
             roots.insert(BorrowRoot::Param(position));
         } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
             roots.insert(BorrowRoot::Local(id));
@@ -15101,7 +15398,14 @@ impl<'a> MoveCheck<'a> {
 
     fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
         let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
-        if let Some(position) = self.borrowed_param_position(id) {
+        let region_param = self
+            .f
+            .params
+            .iter()
+            .position(|&param| param == id)
+            .filter(|_| self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle))
+            .map(|position| position as u32);
+        if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
             fact.direct.insert(BorrowRoot::Param(position));
         } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
             fact.direct.insert(BorrowRoot::Local(id));
@@ -15452,6 +15756,7 @@ impl<'a> MoveCheck<'a> {
             kind,
             ExprKind::Block(_)
                 | ExprKind::Arena(_)
+                | ExprKind::NamedArena { .. }
                 | ExprKind::TaskGroup(_)
                 | ExprKind::Unsafe(_)
                 | ExprKind::If { .. }
@@ -16058,6 +16363,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::FnValue(_) => BorrowFact::default(),
             ExprKind::Block(block)
             | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
             | ExprKind::Unsafe(block) => self.block_value_fact(block),
             ExprKind::If { .. } => self
@@ -16155,6 +16461,11 @@ impl<'a> MoveCheck<'a> {
         };
         match &e.kind {
             ExprKind::Local(id) => self.borrows.sources.get(id).cloned().unwrap_or_default(),
+            ExprKind::CloneIn { region, .. } => self.storage_roots(region),
+            ExprKind::ArrayBuilderNew { region: Some(region), .. } => {
+                self.storage_roots(region)
+            }
+            ExprKind::ArrayBuilderBuild(builder) => self.borrow_sources(builder),
             ExprKind::ResourceBorrow { owner, .. } => self.storage_roots(owner),
             ExprKind::ResourceFromRaw {
                 parent: Some(parent),
@@ -16356,6 +16667,7 @@ impl<'a> MoveCheck<'a> {
             // an arena: that direction is the unsound one.
             ExprKind::Block(b)
             | ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
             | ExprKind::TaskGroup(b)
             | ExprKind::Unsafe(b) => self.block_value_roots(b),
             ExprKind::If { then, els, .. } => {
@@ -16429,8 +16741,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
-            | ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
-            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(..) | ExprKind::FsWriteFile { .. }
+            | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. } | ExprKind::FsReadDir { .. }
             | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
@@ -16802,6 +17114,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Block(block)
             | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
             | ExprKind::Unsafe(block) => {
                 roots.extend(self.pipeline_block_source_roots(block));
@@ -17290,14 +17603,24 @@ impl<'a> MoveCheck<'a> {
     #[inline(never)]
     fn move_array_builder(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderNew { region, .. } => {
+                if let Some(region) = region {
+                    move_expr!(self, region, moved, false, false);
+                }
+            }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, value, moved, true, true);
+                if let ExprKind::Local(local) = builder.kind {
+                    self.join_local_borrow_fallback(local, value);
+                }
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, data, moved, false, false);
+                if let ExprKind::Local(local) = builder.kind {
+                    self.join_local_borrow_fallback(local, data);
+                }
             }
             ExprKind::ArrayBuilderBuild(i) => {
                 move_expr!(self, i, moved, true, true);
@@ -17372,6 +17695,7 @@ impl<'a> MoveCheck<'a> {
                 }
                 ExprKind::Block(block)
                 | ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
                 | ExprKind::TaskGroup(block)
                 | ExprKind::Unsafe(block) => {
                     let Some(value) = block.value.as_deref() else {
@@ -17489,6 +17813,7 @@ impl<'a> MoveCheck<'a> {
             expression.kind,
             ExprKind::Block(_)
                 | ExprKind::Arena(_)
+                | ExprKind::NamedArena { .. }
                 | ExprKind::TaskGroup(_)
                 | ExprKind::Unsafe(_)
                 | ExprKind::Loop { .. }
@@ -20018,7 +20343,7 @@ impl<'a> MoveCheck<'a> {
                                 argument.span,
                             );
                             self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
-                            self.refresh_borrow_mut_place(argument);
+                            self.refresh_borrow_mut_call(argument, args);
                         }
                     }
                 }
@@ -20064,18 +20389,18 @@ impl<'a> MoveCheck<'a> {
                         Ty::Fn(id) => self.fn_types[id as usize].params[index].0,
                         _ => ast::ParamMode::ByValue,
                     };
-                        if mode == ast::ParamMode::BorrowMut
-                            && let Some(argument) = args.get(index)
-                        {
-                            let roots = self.storage_roots(argument);
-                            self.reject_live_resource_dependents_of_roots(
-                                &roots,
-                                moved,
-                                argument.span,
-                            );
-                            self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
-                            self.refresh_borrow_mut_place(argument);
-                        }
+                    if mode == ast::ParamMode::BorrowMut
+                        && let Some(argument) = args.get(index)
+                    {
+                        let roots = self.storage_roots(argument);
+                        self.reject_live_resource_dependents_of_roots(
+                            &roots,
+                            moved,
+                            argument.span,
+                        );
+                        self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
+                        self.refresh_borrow_mut_call(argument, args);
+                    }
                 }
             }
             ExprKind::StructLit { fields, .. } => {
@@ -20206,6 +20531,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 move_expr!(self, i, moved, false, false)
+            }
+            ExprKind::CloneIn { value, region } => {
+                move_expr!(self, value, moved, false, false);
+                move_expr!(self, region, moved, false, false);
             }
             ExprKind::ArraySum { source, stages }
             | ExprKind::ArrayCount { source, stages }
@@ -20387,6 +20716,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Arena(b) => {
                 self.arena_depth += 1;
                 let falls_through = self.block(b, moved, consuming, direct);
+                self.arena_depth -= 1;
+                if !falls_through {
+                    return false;
+                }
+            }
+            ExprKind::NamedArena { block, .. } => {
+                self.arena_depth += 1;
+                let falls_through = self.block(block, moved, consuming, direct);
                 self.arena_depth -= 1;
                 if !falls_through {
                     return false;
@@ -22892,6 +23229,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Match { .. } => {}
             ExprKind::Block(block)
             | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
             | ExprKind::Unsafe(block)
             | ExprKind::TaskGroup(block) => {
                 self.reconcile_diverging_completion_block(block, expected);
@@ -23022,6 +23360,25 @@ impl<'a, 't> Checker<'a, 't> {
                     t
                 };
                 Expr { kind: ExprKind::Arena(block), ty, span: e.span }
+            }
+            ast::ExprKind::NamedArena { name, block: b } => {
+                let syntax_diverges = ast_block_diverges(b);
+                let scope_mark = self.scope.len();
+                self.check_shadow(&name.name, name.span, self.scope.len());
+                let local = self.declare(&name.name, Ty::ArenaHandle, false);
+                self.arena_depth += 1;
+                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                self.arena_depth -= 1;
+                self.scope.truncate(scope_mark);
+                let diverges = hir_block_diverges(&block);
+                let ty = if diverges {
+                    diverging_block_result_ty(&block, expected)
+                } else {
+                    let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                    self.constrain(t, expected, e.span);
+                    t
+                };
+                Expr { kind: ExprKind::NamedArena { local, block }, ty, span: e.span }
             }
             ast::ExprKind::Unsafe(b) => {
                 // A marker block — no region, no runtime effect. It only raises `unsafe_depth` so the
@@ -23506,7 +23863,10 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // A borrow / sub-slice of a read-only view is itself read-only.
             ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv) => self.hir_is_readonly_view(recv),
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::Unsafe(b) => {
+            ExprKind::Block(b)
+            | ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
+            | ExprKind::Unsafe(b) => {
                 b.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
             }
             ExprKind::If { then, els, .. } => {
@@ -26170,6 +26530,7 @@ impl<'a, 't> Checker<'a, 't> {
             // http-client arm below; `check_box_get` otherwise swallows it with a box-only error).
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
+            "clone_in" => self.check_clone_in(recv_expr, recv_ty, args, span),
             "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "eq_ignore_ascii_case"
                 if matches!(recv_ty, Ty::Str | Ty::String) =>
             {
@@ -28787,6 +29148,65 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Copy a text/byte view into the caller-selected region. The result borrows only `out`, so it
+    /// may outlive the source but never the arena that owns the explicit capability.
+    fn check_clone_in(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
+        let err = || Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'.clone_in()' takes exactly one region argument, got {}", args.len()),
+                span,
+            );
+            return err();
+        }
+        let region = self.check_expr(&args[0], Some(Ty::ArenaHandle));
+        let region_ty = self.resolve(region.ty);
+        if region_ty == Ty::Error {
+            return err();
+        }
+        if region_ty != Ty::ArenaHandle {
+            self.diags.error(
+                format!("'.clone_in()' expects a region, got {}", self.ty_display(region.ty)),
+                args[0].span,
+            );
+            return err();
+        }
+        let (value, ty) = match self.resolve(recv_ty) {
+            Ty::Str => (recv, Ty::Str),
+            Ty::String => {
+                let rspan = recv.span;
+                (
+                    Expr { kind: ExprKind::StrBorrow(Box::new(recv)), ty: Ty::Str, span: rspan },
+                    Ty::Str,
+                )
+            }
+            Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) => (recv, recv_ty),
+            ty @ Ty::Struct(_) => {
+                if let Some(reason) = self.region_plain_error(ty) {
+                    self.diags.error(
+                        format!("cannot clone {} into a region: {reason}", self.ty_display(ty)),
+                        span,
+                    );
+                    return err();
+                }
+                (recv, ty)
+            }
+            Ty::Error => return err(),
+            other => {
+                self.diags.error(
+                    format!("'.clone_in()' is available on str, string, bytes, and RegionPlain structs, got {}", self.ty_display(other)),
+                    span,
+                );
+                return err();
+            }
+        };
+        Expr {
+            kind: ExprKind::CloneIn { value: Box::new(value), region: Box::new(region) },
+            ty,
+            span,
+        }
+    }
+
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` / `s.find(n)` — byte-oriented `str`
     /// scans (`core.string`, draft.md §18). The receiver (`recv`, already a `str`/`string`) and the
     /// single argument are both treated as `str` views: an owned `string` is auto-borrowed
@@ -28902,15 +29322,27 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::BufferNew { capacity: Box::new(c) }, ty: Ty::Buffer, span }
     }
 
-    /// `array_builder()` (M12 A6) — open an empty growable typed array builder. Takes no value
-    /// arguments; the element type is inferred from the expected type (a binding/return annotation
-    /// `array_builder<T>`), mirroring `json.decode`'s context-driven target. Fail-closed: with no
-    /// inferable element type, a clean error (rather than a silent default).
+    /// Open an empty growable typed array builder. `array_builder()` preserves the individually
+    /// owned heap form; `array_builder(out)` selects an explicit region capability. The element
+    /// type is inferred from the expected `array_builder<T>` annotation.
     fn check_array_builder_new(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if !args.is_empty() {
-            self.diags.error(format!("'array_builder' takes no arguments (the element type is inferred from the binding), got {}", args.len()), span);
+        if args.len() > 1 {
+            self.diags.error(format!("'array_builder' takes zero arguments for heap storage or one `region` argument, got {}", args.len()), span);
             return err;
+        }
+        let region = args.first().map(|argument| self.check_expr(argument, Some(Ty::ArenaHandle)));
+        if let Some(region) = &region {
+            if region.ty == Ty::Error {
+                return err;
+            }
+            if region.ty != Ty::ArenaHandle {
+                self.diags.error(
+                    format!("region-backed 'array_builder' expects a `region`, got {}", ty_name(region.ty)),
+                    region.span,
+                );
+                return err;
+            }
         }
         let Some(Ty::ArrayBuilder(elem)) = expected.map(|t| self.resolve(t)) else {
             self.diags.error(
@@ -28919,13 +29351,96 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        Expr { kind: ExprKind::ArrayBuilderNew { elem }, ty: Ty::ArrayBuilder(elem), span }
+        if region.is_some() {
+            if let Some(reason) = self.region_plain_error(scalar_to_ty(elem)) {
+                self.diags.error(
+                    format!("array_builder<{}> cannot use region storage: {reason}", scalar_name(elem)),
+                    span,
+                );
+                return err;
+            }
+        } else if !matches!(elem, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String) {
+            self.diags.error(
+                format!(
+                    "heap array_builder<{}> requires a Copy scalar or `string`; use `array_builder(out)` for RegionPlain values",
+                    scalar_name(elem)
+                ),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArrayBuilderNew { elem, region: region.map(Box::new) },
+            ty: Ty::ArrayBuilder(elem),
+            span,
+        }
+    }
+
+    /// Return the deterministic first reason `ty` is not recursively RegionPlain. The traversal is
+    /// source-field/variant order and cycle-safe; unsupported ownership is rejected before MIR.
+    fn region_plain_error(&self, ty: Ty) -> Option<String> {
+        let mut work = vec![(ty, String::new())];
+        let mut seen = HashSet::new();
+        while let Some((ty, path)) = work.pop() {
+            let ty = expand_tagged_ty(ty, self.tagged_types);
+            if !seen.insert(ty) {
+                continue;
+            }
+            let at = |what: &str| {
+                if path.is_empty() { what.to_string() } else { format!("field '{path}' {what}") }
+            };
+            match ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str
+                | Ty::Vec(..) | Ty::Mask(..) => {}
+                Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) => {}
+                Ty::Option(payload) => work.push((scalar_to_ty(payload), path)),
+                Ty::Struct(id) => {
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        return Some(at("has an unknown struct definition"));
+                    };
+                    for field in definition.fields.iter().rev() {
+                        let child = if path.is_empty() {
+                            field.name.clone()
+                        } else {
+                            format!("{path}.{}", field.name)
+                        };
+                        work.push((field.ty, child));
+                    }
+                }
+                Ty::Enum(id) => {
+                    let Some(definition) = self.enums.get(id as usize) else {
+                        return Some(at("has an unknown sum definition"));
+                    };
+                    for variant in definition.variants.iter().rev() {
+                        for (index, payload) in variant.payload.iter().enumerate().rev() {
+                            let leaf = format!("{}[{index}]", variant.name);
+                            let child = if path.is_empty() { leaf } else { format!("{path}.{leaf}") };
+                            work.push((scalar_to_ty(*payload), child));
+                        }
+                    }
+                }
+                Ty::Array(payload, _) => work.push((scalar_to_ty(payload), path)),
+                Ty::StructArray(id, _) => work.push((Ty::Struct(id), path)),
+                Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_)
+                | Ty::Box(_) => return Some(at("owns independent heap storage")),
+                Ty::Resource(_) | Ty::ResourceRef(_) => return Some(at("is a native resource")),
+                Ty::Raw => return Some(at("is `raw`")),
+                Ty::Fn(_) => return Some(at("is a function value")),
+                Ty::Builder | Ty::Buffer | Ty::ArrayBuilder(_) => return Some(at("is a builder")),
+                other => return Some(at(&format!("has unsupported type {}", ty_name(other)))),
+            }
+        }
+        None
     }
 
     /// The `mut`-bound-`array_builder`-local check shared by `push`/`append` (they grow the builder in
     /// place through its handle). Returns the builder's element scalar on success. Mirrors the
     /// `buffer` `put_*`/`append` receiver rule.
-    fn array_builder_mut_receiver(&mut self, recv: &ast::Expr, method: &str) -> Option<(Scalar, Expr)> {
+    fn array_builder_mut_receiver(
+        &mut self,
+        recv: &ast::Expr,
+        method: &str,
+    ) -> Option<(Scalar, Expr)> {
         let recv_expr = self.check_expr(recv, None);
         let Ty::ArrayBuilder(elem) = self.resolve(recv_expr.ty) else {
             if recv_expr.ty != Ty::Error {
@@ -28953,11 +29468,15 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `b.push(v)` (M12 A6) — append one element to a growable `array_builder`, borrowing the builder
     /// (mutated through its handle, not consumed). The receiver must be a `mut`-bound `array_builder`
-    /// local. For a Copy-scalar element `v` is copied in; for a `string` element `v` is **moved** in
-    /// (its source nulled — the builder then owns the buffer, deep-freed on Drop). Pure (growth).
+    /// local. A RegionPlain value is copied with its borrow provenance; a heap-form `string` is
+    /// **moved** in (its source is nulled and the builder deep-frees it on Drop). Calls through a
+    /// `borrow mut` parameter conservatively retain the roots of all view-bearing arguments in the
+    /// caller's builder. Pure (growth).
     fn check_array_builder_push(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let Some((elem, recv_expr)) = self.array_builder_mut_receiver(recv, "push") else {
+        let Some((elem, recv_expr)) =
+            self.array_builder_mut_receiver(recv, "push")
+        else {
             return err;
         };
         let [v] = args else {
@@ -28969,7 +29488,9 @@ impl<'a, 't> Checker<'a, 't> {
         if value.ty == Ty::Error {
             return err;
         }
-        if self.resolve(value.ty) != elem_ty {
+        if expand_tagged_ty(self.resolve(value.ty), self.tagged_types)
+            != expand_tagged_ty(elem_ty, self.tagged_types)
+        {
             self.diags.error(format!("'.push()' expects a {} element, got {}", ty_name(elem_ty), ty_name(value.ty)), v.span);
             return err;
         }
@@ -28977,12 +29498,14 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `b.append(xs)` (M12 A6) — bulk-append a `slice<T>` of Copy-scalar elements to a growable
-    /// `array_builder`, borrowing the builder (mutated in place) and copying `xs` in. Only Copy-scalar
-    /// elements are appendable (a `string` element is added one at a time via `push`, which moves it
-    /// in — a borrowed `slice<string>` could not be bulk-moved). Pure (growth).
+    /// `array_builder`, borrowing the builder (mutated in place) and copying `xs` in. Every admitted
+    /// non-`string` element is Copy; a `string` is added one at a time via `push`, which moves it in.
+    /// Pure (growth).
     fn check_array_builder_append(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let Some((elem, recv_expr)) = self.array_builder_mut_receiver(recv, "append") else {
+        let Some((elem, recv_expr)) =
+            self.array_builder_mut_receiver(recv, "append")
+        else {
             return err;
         };
         if elem == Scalar::String {
@@ -29008,9 +29531,9 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ArrayBuilderAppend { builder: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
     }
 
-    /// `b.build()` (M12 A6) — freeze an `array_builder<T>` into an owned `array<T>`, **consuming**
-    /// (moving) the builder. A zero-copy ptr+len retype: the builder's storage becomes the array
-    /// buffer. The element `string` freezes into an `array<string>` (deep-drop owned by the array).
+    /// `b.build()` (M12 A6) — freeze an `array_builder<T>` into `array<T>`, **consuming** (moving)
+    /// the builder. Heap storage transfers zero-copy; region chunks compact once into the same
+    /// region. A heap `string` element freezes into an individually owned `array<string>`.
     fn check_array_builder_build(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let Ty::ArrayBuilder(elem) = self.resolve(recv_expr.ty) else {
@@ -29023,12 +29546,11 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.build()' takes no arguments, got {}", args.len()), span);
             return err;
         }
-        // Every valid element scalar is a `PrimScalar` (Copy scalar or `string`) — the array element.
-        let Some(prim) = scalar_to_prim(elem) else {
-            self.diags.error(format!("array_builder<{}> cannot be built into an array", scalar_name(elem)), span);
-            return err;
+        let result_ty = match elem {
+            Scalar::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+            _ => Ty::DynArray(elem),
         };
-        Expr { kind: ExprKind::ArrayBuilderBuild(Box::new(recv_expr)), ty: Ty::DynArray(prim_to_scalar(prim)), span }
+        Expr { kind: ExprKind::ArrayBuilderBuild(Box::new(recv_expr)), ty: result_ty, span }
     }
 
     /// `b.write(s)` / `b.write_int(n)` / `b.write_bool(v)` / `b.write_char(c)` /
@@ -34638,7 +35160,11 @@ impl<'a, 't> Checker<'a, 't> {
     #[inline(never)]
     fn finalize_array_builder(&mut self, kind: &mut ExprKind) {
         match kind {
-            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderNew { region, .. } => {
+                if let Some(region) = region {
+                    self.finalize_expr(region);
+                }
+            }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 self.finalize_expr(builder);
                 self.finalize_expr(value);
@@ -34863,7 +35389,12 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) | ExprKind::Loop { body: b, .. } => self.finalize_block(b),
+            ExprKind::Block(b)
+            | ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
+            | ExprKind::TaskGroup(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Loop { body: b, .. } => self.finalize_block(b),
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
                 self.finalize_expr(e)
             }
@@ -34931,6 +35462,10 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
+            }
+            ExprKind::CloneIn { value, region } => {
+                self.finalize_expr(value);
+                self.finalize_expr(region);
             }
             ExprKind::ArraySum { source, stages }
             | ExprKind::ArrayCount { source, stages }
@@ -35598,7 +36133,11 @@ fn ast_loop_expr_flow(
                     || else_flow.reaches_break,
             }
         }
-        K::Block(block) | K::Arena(block) | K::Unsafe(block) | K::TaskGroup(block) => {
+        K::Block(block)
+        | K::Arena(block)
+        | K::NamedArena { block, .. }
+        | K::Unsafe(block)
+        | K::TaskGroup(block) => {
             ast_loop_block_flow(block, accepted_breaks, loop_fallthrough)
         }
         K::StructLit { fields, .. } => {
@@ -35896,7 +36435,12 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
                 walk_expr(e, out);
             }
         }
-        K::Block(b) | K::Arena(b) | K::TaskGroup(b) | K::Unsafe(b) | K::Loop(b) => walk_block(b, out),
+        K::Block(b)
+        | K::Arena(b)
+        | K::NamedArena { block: b, .. }
+        | K::TaskGroup(b)
+        | K::Unsafe(b)
+        | K::Loop(b) => walk_block(b, out),
         K::StructLit { name, fields } => {
             if let Some(prefix) = path_module_prefix(name) {
                 out.insert(prefix);
@@ -36048,7 +36592,10 @@ pub fn print_kind(ty: Ty) -> Option<PrintKind> {
 fn init_is_buffered_reader(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::ReaderBuffered { .. } => true,
-        hir::ExprKind::Block(b) | hir::ExprKind::Arena(b) | hir::ExprKind::Unsafe(b) => {
+        hir::ExprKind::Block(b)
+        | hir::ExprKind::Arena(b)
+        | hir::ExprKind::NamedArena { block: b, .. }
+        | hir::ExprKind::Unsafe(b) => {
             b.value.as_ref().is_some_and(|v| init_is_buffered_reader(v))
         }
         _ => false,
@@ -36133,7 +36680,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::DynResponseArray => "array<response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
-        Ty::ArenaHandle => "arena".to_string(),
+        Ty::ArenaHandle => "region".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Resource(id) => format!("resource#{id}"),
         Ty::ResourceRef(id) => format!("resource_ref<resource#{id}>"),
@@ -36506,7 +37053,7 @@ fn resolved_type_source_spelling(
                     next,
                 )
             ),
-            Ty::ArenaHandle => "arena".to_string(),
+            Ty::ArenaHandle => "region".to_string(),
             Ty::Raw => "raw".to_string(),
             Ty::Builder => "builder".to_string(),
             Ty::Writer => "writer".to_string(),
@@ -37770,6 +38317,13 @@ fn resolve_type(
         // `raw` — an opaque raw byte pointer (`raw.alloc` yields one). Nameable so it can be a `let`
         // annotation / function parameter (holding a `raw` is safe; only `raw.*` ops need `unsafe`).
         "raw" => Ty::Raw,
+        "region" => {
+            if !args.is_empty() {
+                diags.error("region takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::ArenaHandle
+        }
         "resource_ref" => {
             let [owner] = args else {
                 diags.error("resource_ref takes exactly one resource type argument".to_string(), span);
@@ -37813,10 +38367,9 @@ fn resolve_type(
             }
             Ty::Buffer
         }
-        // `array_builder<T>` (M12 A6) — a growable typed array builder that freezes into `array<T>`.
-        // Element set v1 = **Copy scalars + `string`** (the settled set). A `str` view, struct, soa,
-        // or any Move handle is fail-closed rejected here (a clean sema error at the type argument),
-        // never type-checked then panicking downstream.
+        // `array_builder<T>` — one owner type for the heap and explicit-region constructors. Type
+        // formation admits the union of both concrete element sets; the constructor selects and
+        // validates the allocation mode (`array_builder()` vs `array_builder(out)`).
         "array_builder" => {
             let inner = match args {
                 [a] => resolve_type(a, cx, type_params, diags),
@@ -37825,23 +38378,33 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match inner {
-                Ty::Error => Ty::Error,
-                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {
-                    // ty_to_scalar is total on these — an Int/Float/Bool/Char/String all map.
-                    Ty::ArrayBuilder(ty_to_scalar(inner).expect("scalar element"))
-                }
-                other => {
-                    diags.error(
-                        format!(
-                            "array_builder<T> element must be a Copy scalar (int/float/bool/char) or `string`, got {} (str views, structs, and owned handles are not supported)",
-                            ty_name(other)
-                        ),
-                        span,
-                    );
-                    Ty::Error
-                }
-            }
+            let scalar = match inner {
+                Ty::Error => return Ty::Error,
+                Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                    cx.tagged_types,
+                    hir::TaggedType::Option(payload),
+                )),
+                Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                    cx.tagged_types,
+                    hir::TaggedType::Result(ok, err),
+                )),
+                other => match ty_to_scalar(other) {
+                    Some(scalar @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool
+                        | Scalar::Char | Scalar::String | Scalar::Str | Scalar::Slice(_)
+                        | Scalar::Struct(_) | Scalar::Enum(_) | Scalar::Tagged(_))) => scalar,
+                    _ => {
+                        diags.error(
+                            format!(
+                                "array_builder<T> element must be a heap scalar/string or a concrete RegionPlain scalar, view, Option, sum, or struct; got {}",
+                                ty_name(other)
+                            ),
+                            span,
+                        );
+                        return Ty::Error;
+                    }
+                },
+            };
+            Ty::ArrayBuilder(scalar)
         }
         // `file` (`std.fs`) — an offset-addressed file Move handle (`fs.create_rw` et al.). A surface
         // type name so it can be threaded through functions (a Move handle; passed by value).

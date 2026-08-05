@@ -12,7 +12,9 @@ key|ArrayBuilderFreeStrings|array_builder_free_strings|declare void @align_rt_ar
 key|ArrayBuilderFreeStringsStack|array_builder_free_strings_stack|declare void @align_rt_array_builder_free_strings_stack(ptr)
 key|ArrayBuilderInitStack|array_builder_init_stack|declare ptr @align_rt_array_builder_init_stack(ptr, i64)
 key|ArrayBuilderNew|array_builder_new|declare noalias ptr @align_rt_array_builder_new(i64) #0
+key|ArrayBuilderNewIn|array_builder_new_in|declare noalias ptr @align_rt_array_builder_new_in(ptr, i64, i64) #2
 key|ArrayBuilderPush|array_builder_push|declare void @align_rt_array_builder_push(ptr, i64)
+key|ArrayBuilderPushBytes|array_builder_push_bytes|declare void @align_rt_array_builder_push_bytes(ptr, ptr)
 key|ArrayBuilderPushStr|array_builder_push_str|declare void @align_rt_array_builder_push_str(ptr, ptr, i64)
 key|Base64Decode|base64_decode|declare i32 @align_rt_base64_decode(ptr, i64, ptr)
 key|Base64Encode|base64_encode|declare { ptr, i64 } @align_rt_base64_encode(ptr, i64)

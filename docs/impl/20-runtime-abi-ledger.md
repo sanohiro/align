@@ -9,14 +9,16 @@ visible runtime definitions that occupy link identities. The keyed surface is
 generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
-Am-c1 has 281 `RuntimeKey` variants and a one-to-one native-symbol record. Four
+The F-B region materialization capability has 283 `RuntimeKey` variants and a
+one-to-one native-symbol record. Relative to Am-c1, it adds
+`ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Five always-built
 runtime records have no `RuntimeKey` and instead use the five-variant
 `UnkeyedRuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
-`align_rt_http_serialize`. The base native registry therefore has 286 records.
+`align_rt_http_serialize`. The base native registry therefore has 288 records.
 The explicit `alloc-count` runtime feature may expose four
 test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `void @align_rt_test_par_map_force_caller(i32)`,
@@ -25,10 +27,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 286 base records.
+The compiler-visible native registry is always exactly the 288 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 294.
+records extend only the verification-time maximum runtime-export table to 296.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -111,7 +113,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A42 | `noalias ptr @SYM() {nofree nounwind}` | `align_rt_arena_begin`, `align_rt_tg_begin` |
 | A43 | `noalias ptr @SYM(i64) {nofree nounwind}` | `align_rt_alloc`, `align_rt_array_builder_new` |
 | A44 | `noalias ptr @SYM(ptr, i64) {nofree nounwind}` | `align_rt_str_finder_new`, `align_rt_builder_new` |
-| A45 | `noalias ptr @SYM(ptr, i64, i64) {nounwind}` | `align_rt_arena_alloc`, `align_rt_tg_alloc` |
+| A45 | `noalias ptr @SYM(ptr, i64, i64) {nounwind}` | `align_rt_arena_alloc`, `align_rt_array_builder_new_in`, `align_rt_tg_alloc` |
 | A46 | `noalias ptr @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map` |
 | A47 | `ptr @SYM()` | `align_rt_io_reader_stdin`, `align_rt_http_client_new` |
 | A48 | `ptr @SYM(i32, i32)` | `align_rt_io_writer_std` |
@@ -138,7 +140,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A69 | `void @SYM(ptr, i64, i64, ptr)` | `align_rt_json_doc_at` |
 | A70 | `void @SYM(ptr, i64, ptr, i64, ptr)` | `align_rt_json_doc_get`, `align_rt_dict_lookup` |
 | A71 | `void @SYM(ptr, i64, ptr, ptr)` | `align_rt_json_doc_elems` |
-| A72 | `void @SYM(ptr, ptr)` | `align_rt_buffer_bytes` |
+| A72 | `void @SYM(ptr, ptr)` | `align_rt_array_builder_push_bytes`, `align_rt_buffer_bytes` |
 | A73 | `void @SYM(ptr, ptr, i64)` | `align_rt_builder_write`, `align_rt_builder_write_json_str`, `align_rt_command_cwd`, `align_rt_buffer_append`, `align_rt_array_builder_push_str`, `align_rt_array_builder_append`, `align_rt_cli_flag_bool`, `align_rt_http_body`, `align_rt_http_rb_body` |
 | A74 | `void @SYM(ptr, ptr, i64, i32)` | `align_rt_json_encode_scalar_array` |
 | A75 | `void @SYM(ptr, ptr, i64, i64)` | `align_rt_rng_shuffle`, `align_rt_cli_flag_i64` |
@@ -234,24 +236,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 281 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 283 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 286 base native symbols against default-feature `align_runtime` exports,
+- the 288 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 290 `alloc-count` and 290 `par-map-probe` native symbols against
+- the 292 `alloc-count` and 292 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 294 maximum native symbols against `align_runtime` built with
+- the 296 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 286 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  286 exact registry function types through the production compatibility
+- all 288 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  288 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the four
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

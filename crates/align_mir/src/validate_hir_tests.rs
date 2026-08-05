@@ -9381,12 +9381,58 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::ArrayBuilderNew {
                 elem: Scalar::String,
+                region: None,
             },
             Ty::ArrayBuilder(Scalar::String),
         ),
         Vec::new(),
         Ty::ArrayBuilder(Scalar::String)
     );
+    program.fns.push(body_test_named_function(
+        "native_named_region_materialization",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::NamedArena {
+                    local: 0,
+                    block: hir::Block {
+                        stmts: vec![
+                            hir::Stmt::Expr(body_test_expr(
+                                hir::ExprKind::CloneIn {
+                                    value: Box::new(native_str()),
+                                    region: Box::new(native_local(0, Ty::ArenaHandle)),
+                                },
+                                Ty::Str,
+                            )),
+                            hir::Stmt::Expr(body_test_expr(
+                                hir::ExprKind::ArrayBuilderNew {
+                                    elem: scalar_int(64),
+                                    region: Some(Box::new(native_local(
+                                        0,
+                                        Ty::ArenaHandle,
+                                    ))),
+                                },
+                                Ty::ArrayBuilder(scalar_int(64)),
+                            )),
+                        ],
+                        value: Some(Box::new(body_test_expr(
+                            hir::ExprKind::Unit,
+                            Ty::Unit,
+                        ))),
+                    },
+                },
+                Ty::Unit,
+            ))),
+        },
+        vec![body_test_local(
+            0,
+            "out",
+            Ty::ArenaHandle,
+            false,
+            false,
+        )],
+        Ty::Unit,
+    ));
     add!(
         "native_array_builder_push",
         body_test_expr(
@@ -10744,6 +10790,52 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { local, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    *local = 99;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    let hir::Stmt::Expr(clone) = &mut block.stmts[0] else {
+        panic!("named region fixture lost clone_in")
+    };
+    let hir::ExprKind::CloneIn { region, .. } = &mut clone.kind else {
+        panic!("named region fixture lost clone_in")
+    };
+    region.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    let hir::Stmt::Expr(builder) = &mut block.stmts[1] else {
+        panic!("named region fixture lost its builder")
+    };
+    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut builder.kind else {
+        panic!("named region fixture lost its builder")
+    };
+    *elem = Scalar::String;
+    builder.ty = Ty::ArrayBuilder(Scalar::String);
+    assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
     reject.fns.push(body_test_named_function(

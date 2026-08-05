@@ -328,7 +328,6 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::ArrayDictEncode { .. }
         | ExprKind::ReaderStdin
         | ExprKind::WriterStd { .. }
-        | ExprKind::ArrayBuilderNew { .. }
         | ExprKind::TimeNow
         | ExprKind::TimeInstant
         | ExprKind::ProcessCpuCount
@@ -431,6 +430,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             body_locals: body_locals.clone(),
         },
         ExprKind::Arena(_) => ExprKind::Arena(clones.block()?),
+        ExprKind::NamedArena { local, .. } => {
+            ExprKind::NamedArena { local: *local, block: clones.block()? }
+        }
         ExprKind::Unsafe(_) => ExprKind::Unsafe(clones.block()?),
         ExprKind::RawAlloc(expr) => ExprKind::RawAlloc(boxed!(expr)),
         ExprKind::RawFree(expr) => ExprKind::RawFree(boxed!(expr)),
@@ -485,6 +487,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::BoxGet(expr) => ExprKind::BoxGet(boxed!(expr)),
         ExprKind::BoxClone(expr) => ExprKind::BoxClone(boxed!(expr)),
         ExprKind::StrClone(expr) => ExprKind::StrClone(boxed!(expr)),
+        ExprKind::CloneIn { value, region } => ExprKind::CloneIn {
+            value: boxed!(value),
+            region: boxed!(region),
+        },
         ExprKind::StrPredicate {
             kind,
             haystack,
@@ -499,6 +505,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             recv: boxed!(recv),
         },
         ExprKind::StrBorrow(expr) => ExprKind::StrBorrow(boxed!(expr)),
+        ExprKind::ArrayBuilderNew { elem, region } => ExprKind::ArrayBuilderNew {
+            elem: *elem,
+            region: take_optional_boxed_expr(clones, region.is_some())?,
+        },
         ExprKind::BuilderNew { capacity } => ExprKind::BuilderNew {
             capacity: take_optional_boxed_expr(clones, capacity.is_some())?,
         },
@@ -1720,7 +1730,6 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ArrayDictEncode { .. }
         | ExprKind::ReaderStdin
         | ExprKind::WriterStd { .. }
-        | ExprKind::ArrayBuilderNew { .. }
         | ExprKind::TimeNow
         | ExprKind::TimeInstant
         | ExprKind::ProcessCpuCount
@@ -1751,6 +1760,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ArrayToSlice(expr)
         | ExprKind::Len(expr)
         | ExprKind::ArrayBuilderBuild(expr) => one!(expr),
+        ExprKind::CloneIn { value, region } => {
+            one!(value);
+            one!(region);
+        }
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::IntArith { lhs, rhs, .. }
         | ExprKind::ResultMapErr {
@@ -2028,6 +2041,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::TaskGroup(block)
         | ExprKind::Block(block)
         | ExprKind::Arena(block)
+        | ExprKind::NamedArena { block, .. }
         | ExprKind::Unsafe(block) => block!(block),
         ExprKind::Loop { body, .. } => block!(body),
         ExprKind::Match { scrutinee, arms } => {
@@ -2118,6 +2132,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(recv);
             one!(index);
         }
+        ExprKind::ArrayBuilderNew { region, .. } => optional!(region),
         ExprKind::BuilderNew { capacity } => optional!(capacity),
         ExprKind::SliceRange { recv, start, end } => {
             one!(recv);

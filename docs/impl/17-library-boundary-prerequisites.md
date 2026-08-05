@@ -2468,7 +2468,8 @@ The exact `RuntimeKey` set is:
 alloc alloc_size_fail arena_alloc arena_begin arena_end
 array_builder_append array_builder_build array_builder_build_stack array_builder_free
 array_builder_free_stack array_builder_free_strings array_builder_free_strings_stack
-array_builder_init_stack array_builder_new array_builder_push array_builder_push_str
+array_builder_init_stack array_builder_new array_builder_new_in array_builder_push
+array_builder_push_bytes array_builder_push_str
 base64_decode base64_encode base64url_decode base64url_encode bounds_fail
 buffer_append buffer_bytes buffer_free buffer_len buffer_new buffer_put
 builder_finish builder_finish_stack builder_free builder_free_stack builder_init_stack
@@ -2526,10 +2527,10 @@ and four distinct `par-map-probe` exports are verification-only runtime-fixture 
 names remain ordinary program/extern/export spellings. `task-group-probe` adds no unmangled export. The
 four AEAD cross-product symbols are ordinary keys
 rather than a codegen-side string match.
-[`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 281 keyed symbol/type/attribute
+[`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 283 keyed symbol/type/attribute
 records, the five always-built unkeyed records, and the eight verification-only probe records.
-The compiler registry is fixed at 286 base records with no feature or ambient input. The eight
-probe rows extend only the verification-time maximum runtime-export table to 294; they are never a
+The compiler registry is fixed at 288 base records with no feature or ambient input. The eight
+probe rows extend only the verification-time maximum runtime-export table to 296; they are never a
 RuntimeKey, callable declaration, collision reservation, or compatible-extern reuse target.
 Probe-feature runtime builds never link user artifacts. Runtime feature selection affects only
 export-set verification and changes no source acceptance or MIR/interface/artifact/cache identity.
@@ -3303,9 +3304,9 @@ The am-c author-side construction/consumption inventory is exact for the current
 | Class | Producers that must change together | Consumers that must change together |
 |---|---|---|
 | program | validated stored functions, per-unit imports, extern declarations, HIR `Call`, `FnValue`, lifted `Closure`, every scalar/AoS pipeline stage, `reduce`/`any`/`all`, `scan`, `partition`, `sort_by_key`, and parallel terminal/stage callables | MIR print/debug, work-weight scan, tagged-type remap/embedded-type scan, LLVM definition/import/extern declaration registry, direct-call lowering, extern coercion, function-value and closure thunk discovery/lowering, parallel signature checks, whole/per-unit symbol/linkage, explicit exports, and main wrapping |
-| runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 281 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
+| runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 283 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
 | generated | every distinct `FnAddr`, capturing `Closure`, `SpawnTask` result/fallibility pair, `ParMapParallel` materialize/filter count/filter scatter request, and `ParMapReduce` request | pre-body collection/validation, canonical byte sorting/deduplication, global-name reservation/probing, helper declaration/body emission, call-site pointer selection, debug names, and malformed-before-publication rejection |
-| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 286 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
+| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 288 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
 
 The callable applicability matrix is exhaustive; “unavailable” is an invalid hand-built MIR cell,
 not a missing positive owner:
@@ -4256,6 +4257,33 @@ Acceptance:
 - no heap allocation occurs in the region form;
 - exactly one compacting element pass occurs;
 - resources/owned heap fields receive compile diagnostics.
+
+The F-B implementation closure matrix is authoritative while L4 and L6 are built. It implements
+the already settled region contract without introducing an ambient allocator or a database-named
+compiler path. Symbolic generic `RegionPlain` bounds remain owned by L7; F-B closes the concrete
+recursive classifier and every runtime/materialization path that L7 will later select after
+monomorphization.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| syntax, binding, and type formation | Parse both `arena {}` and `arena name {}`; bind `name` as the builtin Copy `region` type only for the block; reject construction, mutation, shadowing, storage, unsupported aggregates, FFI, task transfer, and return | parser/formatter round trips; named/anonymous scoping positives; formation and escape diagnostic matrix |
+| exact region identity | Give every named arena and `region` parameter a stable semantic identity; preserve returned and captured region ownership through direct/imported/indirect calls, function-value target joins, moved function values, captures, and monomorphization without collapsing distinct caller regions | sema provenance owners for direct, branch, loop, `?`, closure, imported, and function-value return paths; canonical interface and whole/per-unit parity |
+| explicit allocation and `clone_in` | Lower every region allocation with the exact capability operand; `clone_in` copies `str`/`bytes` backing storage and recursively copies view-bearing fields of a `RegionPlain` struct into that region, returns a value tied to `out`, validates each view size before allocation, and performs no heap allocation | exact HIR/MIR operand assertions; scalar/bytes/struct runtime content and lifetime positives; wrong-region, owned-field, and post-region escape negatives; LLVM call inspection |
+| cleanup and exits | Begin each arena once and end it once on every returning completion path, including normal completion, return, `?`, branch, and loop exit; allocation/overflow hard errors remain process-terminating; named and anonymous cleanup are byte-identical apart from storing the bound handle; a borrowed incoming region is never ended by its callee | named/anonymous LLVM cleanup-shape comparison plus the existing arena completion-path owners; whole/per-unit executable parity |
+| concrete `RegionPlain` classification | Recursively accept scalars, `Option`, fixed arrays, plain structs, and region-valid `str`/`bytes` views; reject resources, refs, raw, functions, builders, independently owned heap fields, and recursive unsupported shapes before execution | table-driven classifier tests for nested positive/negative shapes, deterministic first-invalid-field diagnostics, and malformed HIR fail-closed validation |
+| region builder formation and ownership | `array_builder<T>(out)` records its exact region and concrete element layout, is Move and bound to one mutable local, may be passed only as `borrow mut`, and cannot be stored, returned, captured, moved into a task, or built through an alias. A `borrow mut` call over a view-bearing builder conservatively retains every view-bearing argument root in the caller, so direct and imported helpers cannot erase newly stored provenance. Builder-parameter function values remain outside the existing scalar-only first-class signature surface. | constructor/receiver/mode diagnostic matrix; direct/imported Pure helper push positives; view-helper wrong-region negatives; move/alias/capture/store/build negatives |
+| chunked growth and push provenance | Builder headers and growth chunks allocate only from the selected arena; scalar/Option/plain-struct pushes copy exactly one initialized element; pushed views retain their source provenance, so a current-row view cannot survive `next`, while `clone_in(out)` can | runtime allocation counters and chunk-boundary data checks; sema current-row/clone provenance tests; exact element-layout MIR/LLVM assertions |
+| compacting build | `build` consumes the owned builder, allocates one final contiguous result in the same region, performs exactly one element compaction pass, invalidates the builder, and returns the correctly typed region-tied array | runtime pass counter and 0/1/multi-chunk result tests; move/use-after-build checks; MIR source-nulling and returned-region assertions |
+| failure and early cleanup | Invalid native layouts and overflow are rejected before allocation or copy; allocation exhaustion follows the existing hard-error arena contract; early return, `?`, branch, loop, and unfinished-builder exits leave no independently owned storage, never end a borrowed region, and let the enclosing arena reclaim all chunks | invalid-layout/overflow runtime owners plus the existing arena MIR cleanup-path suite; nested named arenas and helper-call coverage |
+| interfaces, ABI, and cache identity | Serialize `region` parameters, exact return-region summaries, region-builder forms, and concrete element/layout identity canonically; reject malformed metadata before MIR/codegen; keep whole-program and per-unit ABI byte-equivalent | interface codec/hash goldens and corruption tests; declaration-order determinism; whole/per-unit object/link/run parity |
+| end-to-end resource promises | Materialize scalar, Option, and plain-struct arrays through ordinary functions, including recursively plain fields and fixed-array append sources; prove no heap calls in the region form and one compacting element pass without weakening anonymous arena behavior | focused F-B driver suite, applicable runtime/interface/MIR owners, LLVM IR inspection, allocation/pass-count measurement, `scripts/test-pr.sh`, and applicable Clippy |
+
+F-B is intentionally one consumer-complete capability even when it exceeds roughly 1,000
+hand-written changed lines. Splitting named-region formation from its first allocator consumer would
+publish a dormant capability; splitting the builder runtime from provenance would allow accepted
+views to dangle; and splitting compacting build from cleanup would leave no safe, usable result.
+Intermediate commits therefore remain compiling owner-backed checkpoints on one branch rather than
+publishable partial region semantics.
 
 ### L7 — nested generic package APIs and `RegionPlain` bound
 

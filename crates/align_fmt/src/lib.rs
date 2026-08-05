@@ -273,7 +273,12 @@ impl Annotations {
                     self.visit_expr(e);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => self.visit_block(b),
+            ExprKind::Block(b)
+            | ExprKind::Arena(b)
+            | ExprKind::NamedArena { block: b, .. }
+            | ExprKind::TaskGroup(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Loop(b) => self.visit_block(b),
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.visit_expr(&f.value);
@@ -619,6 +624,15 @@ mod tests {
         assert_eq!(one, "fn f() -> i32 { return 1 }\n");
         let multi = fmt("fn f() -> i32 {\n  return 1\n}\n");
         assert_eq!(multi, "fn f() -> i32 {\n  return 1\n}\n");
+    }
+
+    #[test]
+    fn named_arena_round_trips_canonically() {
+        let source = "fn f()->i64{\n arena out{\n  b:array_builder<i64>:=array_builder(out)\n  return b.build().len()\n }\n}\n";
+        let once = fmt(source);
+        assert!(once.contains("arena out {"), "named arena spacing changed:\n{once}");
+        assert!(once.contains("array_builder(out)"), "region argument changed:\n{once}");
+        assert_eq!(fmt(&once), once);
     }
 
     #[test]

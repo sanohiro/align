@@ -1,0 +1,9 @@
+fn copy_text(out: region, value: str) -> str = value.clone_in(out)
+
+fn main() -> i32 {
+    arena out {
+        copied := copy_text(out, "region-copy")
+        print(copied)
+        return copied.len() as i32
+    }
+}

@@ -1,0 +1,15 @@
+Row { id: i64, name: str }
+
+fn main() -> i32 {
+    arena out {
+        mut opts: array_builder<Option<i64>> := array_builder(out)
+        opts.push(Some(9))
+        options := opts.build()
+        value := options[0] else 0
+
+        mut rows: array_builder<Row> := array_builder(out)
+        rows.push(Row { id: 33, name: "plain" })
+        built := rows.build()
+        return (value + built[0].id + built[0].name.len()) as i32
+    }
+}

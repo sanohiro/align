@@ -583,6 +583,9 @@ pub enum ExprKind {
     Loop { body: Block, diverges: bool, body_locals: std::ops::Range<LocalId> },
     /// `arena { ... }` — a region; allocations inside are bulk-freed at block end.
     Arena(Block),
+    /// `arena name { ... }` — an arena whose runtime handle is stored in `local` and may be
+    /// passed as the scope-limited builtin `region` capability.
+    NamedArena { local: LocalId, block: Block },
     /// `unsafe { ... }` — a marker block permitting `raw.*` ops. No runtime effect; lowers to its
     /// inner block. (Enforcement + impurity are handled in sema.)
     Unsafe(Block),
@@ -639,6 +642,10 @@ pub enum ExprKind {
     /// slice 7). The result owns its buffer (`Drop`-freed), so it can escape its source's
     /// region — the explicit escape hatch out of a zero-copy view.
     StrClone(Box<Expr>),
+    /// `value.clone_in(out)` — copy a `str`/`bytes` view or every view-bearing leaf of a
+    /// RegionPlain struct into the exact explicit `region` capability. The result is tied to `out`,
+    /// not to `value`'s source storage.
+    CloneIn { value: Box<Expr>, region: Box<Expr> },
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate
     /// (`core.string`), `ty` = `bool`. Both operands are `str` views (an owned `string` operand is
     /// auto-borrowed via [`ExprKind::StrBorrow`]); the comparison reads bytes only, so neither is
@@ -1013,21 +1020,29 @@ pub enum ExprKind {
     /// the bytes in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut
     /// buffer` local; `data` is borrowed (copied, not consumed). Pure (in-memory growth).
     BufferAppend { buffer: Box<Expr>, data: Box<Expr> },
-    /// `array_builder()` — open an empty growable typed array builder (M12 A6). The `ty` is
-    /// [`crate::Ty::ArrayBuilder`] (an owned Move handle, `Drop`-freed); the element type is carried
-    /// by that `ty`. Pure (allocation only), like `BuilderNew`/`BufferNew`.
-    ArrayBuilderNew { elem: crate::Scalar },
+    /// `array_builder()` / `array_builder(out)` — open an empty growable typed array builder. The
+    /// `ty` is [`crate::Ty::ArrayBuilder`] and carries the element type. The anonymous form owns
+    /// heap storage and is `Drop`-freed; the explicit-region form owns no independent allocation.
+    /// Pure (allocation only), like `BuilderNew`/`BufferNew`.
+    ArrayBuilderNew {
+        elem: crate::Scalar,
+        /// Explicit destination region for `array_builder(out)`. `None` preserves the existing
+        /// individually-owned heap form.
+        region: Option<Box<Expr>>,
+    },
     /// `b.push(v)` — append one element to a growable `array_builder`, growing it (amortized). The
     /// `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut array_builder` local (mutated in
     /// place). `moves_value` is set for a `string` element: `v` is **moved** into the builder (its
-    /// source is nulled), so MoveCheck consumes it; a Copy-scalar element borrows `v`. Pure (growth).
+    /// source is nulled), so MoveCheck consumes it; a Copy region-plain element is copied while its
+    /// borrowed storage provenance is retained. Pure (growth).
     ArrayBuilderPush { builder: Box<Expr>, value: Box<Expr>, moves_value: bool },
-    /// `b.append(xs)` — bulk-append a `slice<T>` of Copy-scalar elements to a growable
-    /// `array_builder`, copying them in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver
-    /// must be a `mut array_builder` local; `data` is borrowed (copied, not consumed). Pure (growth).
+    /// `b.append(xs)` — bulk-append a `slice<T>` of Copy elements to a growable `array_builder`,
+    /// copying them in and growing it. Heap mode remains scalar-only; region mode accepts validated
+    /// RegionPlain layouts. The receiver is mutable; `data` is borrowed. Pure (growth).
     ArrayBuilderAppend { builder: Box<Expr>, data: Box<Expr> },
-    /// `b.build()` — freeze an `array_builder` into an owned `array<T>`, **consuming** (moving) the
-    /// builder (a zero-copy ptr+len retype). The `ty` is [`crate::Ty::DynArray`] of the element.
+    /// `b.build()` — freeze an `array_builder` into `array<T>`, **consuming** (moving) the builder.
+    /// Heap storage transfers zero-copy; region chunks compact once into the same region. The `ty`
+    /// is [`crate::Ty::DynArray`] (or the AoS struct-array form) of the element.
     ArrayBuilderBuild(Box<Expr>),
     /// `fs.write_file(path, data)` — create/truncate `path` (a `str`) and write all of `data`, then
     /// close. `data` is a `str`/`bytes` (`slice<u8>`) view, or — when `builder` is set — a `builder`'s
