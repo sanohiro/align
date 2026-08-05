@@ -16,6 +16,7 @@ pub(super) enum SourceShapeNode<'a> {
         source_name: &'a str,
         variants: &'a [hir::EnumVariant],
     },
+    Resource(&'a hir::ResourceDef),
     Tuple {
         elems: &'a [Scalar],
     },
@@ -68,6 +69,7 @@ impl SourceShapeView for hir::Program {
                     source_name: &definition.source_name,
                     variants: &definition.variants,
                 }),
+            Node::Resource(id) => self.resources.get(id as usize).map(SourceShapeNode::Resource),
             Node::Tuple(id) => {
                 self.tuples
                     .get(id as usize)
@@ -237,6 +239,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
                     left.name == right.name && self.types_equal(left.ty, right.ty)
                 })
             }
+            (SourceShapeNode::Resource(left), SourceShapeNode::Resource(right)) => left == right,
             (
                 SourceShapeNode::Enum {
                     source_name: left_name,
@@ -345,6 +348,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             Scalar::Enum(left) => node!(Enum, Enum, left),
             Scalar::Tagged(left) => node!(Tagged, Tagged, left),
             Scalar::Fn(left) => node!(Fn, Fn, left),
+            Scalar::Resource(left) => node!(Resource, Resource, left),
+            Scalar::ResourceRef(left) => node!(ResourceRef, Resource, left),
             Scalar::Int(_)
             | Scalar::Float(_)
             | Scalar::DynArray(_)
@@ -428,6 +433,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             Ty::Tuple(left) => node!(Tuple, Tuple, left),
             Ty::Fn(left) => node!(Fn, Fn, left),
             Ty::Enum(left) => node!(Enum, Enum, left),
+            Ty::Resource(left) => node!(Resource, Resource, left),
+            Ty::ResourceRef(left) => node!(ResourceRef, Resource, left),
             Ty::Int(_)
             | Ty::Float(_)
             | Ty::Param(_)
@@ -486,7 +493,9 @@ fn scalar_cost(value: Scalar) -> (usize, usize) {
         | Scalar::Soa(_)
         | Scalar::Enum(_)
         | Scalar::Tagged(_)
-        | Scalar::Fn(_) => (1, 1),
+        | Scalar::Fn(_)
+        | Scalar::Resource(_)
+        | Scalar::ResourceRef(_) => (1, 1),
         _ => (0, 1),
     }
 }
@@ -515,7 +524,9 @@ fn ty_cost(value: Ty) -> (usize, usize) {
         | Ty::Struct(_)
         | Ty::Tuple(_)
         | Ty::Fn(_)
-        | Ty::Enum(_) => (1, 1),
+        | Ty::Enum(_)
+        | Ty::Resource(_)
+        | Ty::ResourceRef(_) => (1, 1),
         _ => (0, 0),
     };
     (child.0, child.1 + 1)
@@ -580,6 +591,13 @@ fn shape_cost(node: &SourceShapeNode<'_>) -> (usize, usize) {
             }
             cost
         }
+        SourceShapeNode::Resource(resource) => (
+            0,
+            7 + resource.name.len()
+                + resource.source_name.len()
+                + resource.drop_hook.len()
+                + resource.drop_thunk.len(),
+        ),
     }
 }
 

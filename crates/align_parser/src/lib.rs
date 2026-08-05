@@ -98,7 +98,7 @@ fn cap_expr_depths(file: &mut File, diags: &mut Diagnostics) {
             },
             Item::Const(c) => cap_expr_depth(&mut c.value, 1, diags),
             // Structs / enums / extern blocks carry no expression bodies.
-            Item::Struct(_) | Item::Enum(_) | Item::Extern(_) => {}
+            Item::Struct(_) | Item::Enum(_) | Item::Resource(_) | Item::Extern(_) => {}
         }
     }
 }
@@ -539,6 +539,10 @@ impl<'a> Parser<'a> {
             self.parse_extern().map(Item::Extern)
         } else if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
+        } else if matches!(self.peek(), TokKind::Ident(word) if word == "resource")
+            && matches!(self.peek_at(1), TokKind::Ident(_))
+        {
+            self.parse_resource(vis).map(Item::Resource)
         } else if self.at(&TokKind::Mut) {
             // A top-level constant is immutable; `mut` is only for local bindings.
             self.diags
@@ -566,6 +570,35 @@ impl<'a> Parser<'a> {
                 .error("expected `fn`, a type declaration, or a constant (`NAME := …`) at top level", self.span());
             None
         }
+    }
+
+    /// Contextual opaque resource declaration:
+    /// `pub resource conn = pkg.db.internal.resource.drop_conn`.
+    fn parse_resource(&mut self, vis: Vis) -> Option<ResourceDecl> {
+        let start = self.span();
+        self.bump(); // contextual `resource`
+        let name = self.parse_ident("resource name")?;
+        let mut type_params = Vec::new();
+        if self.eat(&TokKind::Lt) {
+            while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
+                let name = self.parse_ident("a type parameter name")?;
+                let bound = if self.eat(&TokKind::Colon) {
+                    Some(self.parse_ident("a bound (Eq, Ord, or Num)")?)
+                } else {
+                    None
+                };
+                type_params.push(TypeParam { name, bound });
+                if !self.eat(&TokKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokKind::Gt, "'>'");
+        }
+        self.expect(&TokKind::Eq, "'='");
+        let drop_hook = self.parse_path();
+        self.eat(&TokKind::End);
+        let span = start.merge(self.prev_span());
+        Some(ResourceDecl { vis, name, type_params, drop_hook, span })
     }
 
     /// A top-level constant `NAME := expr` / `NAME: Type := expr`. Mirrors a local `let` minus `mut`
@@ -2072,6 +2105,35 @@ mod tests {
         };
         assert_eq!(params[0].mode, ParamMode::Borrow);
         assert_eq!(params[1].mode, ParamMode::BorrowMut);
+    }
+
+    #[test]
+    fn resource_declarations_are_contextual_and_preserve_hook_identity() {
+        let (file, errors) = parse(
+            "pub resource conn = pkg.db.internal.resource.drop_conn\n\
+             pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt\n\
+             fn resource(resource: i64) -> i64 = resource\n\
+             fn borrow_resource(value: i64) -> i64 = resource.borrow(value)\n",
+        );
+        assert!(!errors);
+        let Item::Resource(conn) = &file.items[0] else { panic!("expected conn resource") };
+        assert_eq!(conn.name.name, "conn");
+        assert!(conn.type_params.is_empty());
+        assert_eq!(
+            conn.drop_hook
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pkg", "db", "internal", "resource", "drop_conn"]
+        );
+        let Item::Resource(stmt) = &file.items[1] else { panic!("expected stmt resource") };
+        assert_eq!(
+            stmt.type_params.iter().map(|parameter| parameter.name.name.as_str()).collect::<Vec<_>>(),
+            ["P", "R"]
+        );
+        assert!(matches!(&file.items[2], Item::Fn(function) if function.name.name == "resource"));
+        assert!(matches!(&file.items[3], Item::Fn(function) if function.name.name == "borrow_resource"));
     }
 
     #[test]

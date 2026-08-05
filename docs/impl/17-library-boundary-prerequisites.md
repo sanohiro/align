@@ -4144,6 +4144,32 @@ Acceptance:
   import graph; the internal hook module cannot import the root;
 - no resource enters `spawn`.
 
+The F-A implementation closure matrix is authoritative while L3 is built. It follows the already
+settled public contract above; it does not introduce a second resource strategy or a database-named
+compiler path.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| declaration and type formation | Parse contextual `resource Name[<P...>] = fully.qualified.hook`; resolve one nominal id and generic arity per canonical module path; represent owning resources and `resource_ref<R>` explicitly in HIR, MIR, source/interface types, canonical graphs, mangling, printing, layout, and LLVM pointer ABI | parser contextual-word matrix; `resource_ownership` declaration/type positives and duplicate, arity, unresolved-path, reserved-shape negatives; interface byte/hash golden |
+| hook validation and thunk identity | Resolve only a `pub fn(raw) -> ()` in the declaring package's canonical `internal` subtree; reject generic, capturing, result-returning, private, foreign-package, root-import-cycle, and non-unsafe-body hooks before codegen; synthesize one producer-owned support thunk with canonical symbol, representation version, and ABI fingerprint | `resource_ownership` hook diagnostic precedence; interface round trip/corruption; LLVM definition/import declaration and linker parity |
+| construction and privilege | `from_raw` requires an expected concrete resource, unsafe context, declaring-module descendant privilege, and a non-null contract; `from_raw_borrowed` additionally snapshots exactly one `resource_ref` generation; another package cannot construct even in unsafe | direct/imported privilege matrix, expected-type and null-precheck diagnostics, exact MIR `ResourceFromRaw`/`ResourceFromRawBorrowed` records |
+| ownership transfer | Move-in, move-out, return, assignment, branch/match/else/`?`/`map_err`, loop joins, and aggregate construction use the existing path-local cleanup bit; `into_raw` accepts only a standalone initialized owned local or by-value parameter, nulls its source, and suppresses Drop | MIR cleanup assertions and runtime drop counter across all completion kinds; projection/field/index/temporary/borrowed/out/uninitialized negatives |
+| exactly-once Drop and replacement | Every resource leaf contributes a thunk-backed DropPlan leaf; normal exit, early exit, discard, reassignment, aggregate recursion, and imported cleanup call the producer thunk once; replacement drops the old live value before installing the new pointer/bit | `resource_ownership` drop-count matrix; MIR order; whole/per-unit executable parity; malformed resource/thunk ids fail before LLVM emission |
+| resource reference provenance | `resource.borrow` is safe and public, produces one-pointer Copy `resource_ref<R>`, and records the exact owner generation recursively through struct/tuple/sum/Option/Result, function values, captures, joins, direct/imported/indirect calls, and monomorphization | reusable-ref positives; owner move/drop/replacement/mutable-borrow stale negatives; captured/joined/moved function-value and whole/per-unit parity |
+| dependent resource provenance | A child created by `from_raw_borrowed` is Move, carries its parent generation across move/return/aggregate/function-value paths, blocks parent move/Drop/`borrow mut` while live, and releases the dependency only after child Drop | child-before-parent runtime order, direct/indirect/imported identity, branch/loop/early-exit matrix, parent overlap negatives |
+| all-peer exclusivity | Extend the shipped `ByValue`/`Borrow`/`BorrowMut`/`Out` recursive provenance walker to resource refs and dependent children, including distinct aggregate holders; diagnostics remain order-independent between same-unit/imported calls | parameterized all-peer alias owners for direct and nested roots in both argument orders |
+| raw extraction and checked native views | `raw` accepts only `resource_ref<R>` under unsafe descendant privilege; `view_from_raw` emits typed MIR with resource id, owner generation, view kind, and exact null/length/alignment/UTF-8 plan, returning `Option<str>` or `Option<slice<FFIScalar>>` | exact MIR and LLVM shape; empty-null success plus negative/unrepresentable length, non-empty null, misalignment, invalid UTF-8; raw-owner escape negatives |
+| non-Send and excluded shapes | Resource/resource-ref types are rejected in `spawn`, Copy fixed-array elements, pipelines, FFI signatures, print/equality/order/hash, and unsupported dynamic collections; one-owner struct/sum fields remain legal and recursive | structural classifier owners and fail-closed malformed HIR/MIR tests; no catch-all classification |
+| interface, cache, and separate compilation | Serialize nominal identity, generic arity, representation version, thunk symbol, and ABI fingerprint; rebuild ids independent of declaration order; include producer object linkage for any consumer Drop; reject duplicate/noncanonical/malformed metadata before side effects | codec bytes/digest goldens, declaration-order determinism, corrupted metadata precedence, whole/per-unit object/link/run parity |
+| end-to-end and measurement | Whole-program and per-unit execution agree for construction, borrow, dependent child, transfer, and cleanup; emitted calls and native views add no hidden allocation or reflection | focused L3 owners, `scripts/test-pr.sh`, applicable Clippy, resource/ref/view microbenchmarks, and LLVM IR inspection |
+
+F-A is intentionally one consumer-complete capability even when it exceeds roughly 1,000
+hand-written changed lines. Splitting the type/interface producer from the linkable thunk leaves
+consumer Drop uncallable; splitting provenance from construction admits dangling refs or dependent
+children; splitting MIR cleanup from LLVM lowering leaks or double-drops an already accepted Move
+type. Intermediate commits therefore remain compiling owner-backed checkpoints on one branch, not
+publishable partial resource semantics.
+
 ### L4 — named region capability
 
 Scope:

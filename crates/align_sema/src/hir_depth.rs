@@ -371,6 +371,12 @@ fn walk_body_records<'a>(
                 | ExprKind::Try(expr)
                 | ExprKind::RawAlloc(expr)
                 | ExprKind::RawFree(expr)
+                | ExprKind::RawIsNull(expr)
+                | ExprKind::ResourceBorrow { owner: expr, .. }
+                | ExprKind::ResourceRaw {
+                    reference: expr, ..
+                }
+                | ExprKind::ResourceIntoRaw { owner: expr, .. }
                 | ExprKind::HeapNew(expr)
                 | ExprKind::BoxGet(expr)
                 | ExprKind::BoxClone(expr)
@@ -1024,6 +1030,19 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(salt), child_depth));
                     work.push((BodyRecord::Expr(params), child_depth));
                 }
+                ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                    work.push((BodyRecord::Expr(raw), child_depth));
+                    if let Some(parent) = parent {
+                        work.push((BodyRecord::Expr(parent), child_depth));
+                    }
+                }
+                ExprKind::ResourceViewFromRaw {
+                    owner, ptr, len, ..
+                } => {
+                    work.push((BodyRecord::Expr(owner), child_depth));
+                    work.push((BodyRecord::Expr(ptr), child_depth));
+                    work.push((BodyRecord::Expr(len), child_depth));
+                }
             },
             BodyRecord::BlockExit { .. }
             | BodyRecord::StmtExit { .. }
@@ -1359,6 +1378,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),
@@ -1425,6 +1445,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),
@@ -1494,6 +1515,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),
@@ -1569,6 +1591,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),
@@ -1997,6 +2020,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),

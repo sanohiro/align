@@ -2100,6 +2100,7 @@ pub(super) fn baseline_program() -> hir::Program {
                 },
             ],
         }],
+        resources: Vec::new(),
         tagged_types: vec![TaggedType::Option(scalar_int(64))],
         tuples: vec![TupleDef {
             elems: vec![scalar_int(64), Scalar::Bool],

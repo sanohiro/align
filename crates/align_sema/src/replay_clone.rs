@@ -434,6 +434,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::Unsafe(_) => ExprKind::Unsafe(clones.block()?),
         ExprKind::RawAlloc(expr) => ExprKind::RawAlloc(boxed!(expr)),
         ExprKind::RawFree(expr) => ExprKind::RawFree(boxed!(expr)),
+        ExprKind::RawIsNull(expr) => ExprKind::RawIsNull(boxed!(expr)),
         ExprKind::RawLoad {
             ptr,
             offset,
@@ -452,6 +453,34 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             ptr: boxed!(ptr),
             offset: boxed!(offset),
         },
+        ExprKind::ResourceFromRaw {
+            raw, resource, parent,
+        } => ExprKind::ResourceFromRaw {
+            raw: boxed!(raw),
+            resource: *resource,
+            parent: take_optional_boxed_expr(clones, parent.is_some())?,
+        },
+        ExprKind::ResourceBorrow { owner, resource } => ExprKind::ResourceBorrow {
+            owner: boxed!(owner),
+            resource: *resource,
+        },
+        ExprKind::ResourceRaw { reference, resource } => ExprKind::ResourceRaw {
+            reference: boxed!(reference),
+            resource: *resource,
+        },
+        ExprKind::ResourceIntoRaw { owner, resource } => ExprKind::ResourceIntoRaw {
+            owner: boxed!(owner),
+            resource: *resource,
+        },
+        ExprKind::ResourceViewFromRaw { owner, ptr, len, resource, view } => {
+            ExprKind::ResourceViewFromRaw {
+                owner: boxed!(owner),
+                ptr: boxed!(ptr),
+                len: boxed!(len),
+                resource: *resource,
+                view: *view,
+            }
+        }
         ExprKind::HeapNew(expr) => ExprKind::HeapNew(boxed!(expr)),
         ExprKind::BoxGet(expr) => ExprKind::BoxGet(boxed!(expr)),
         ExprKind::BoxClone(expr) => ExprKind::BoxClone(boxed!(expr)),
@@ -1413,6 +1442,7 @@ pub(crate) fn clone_program(program: &hir::Program) -> Option<hir::Program> {
         link_libs: program.link_libs.clone(),
         structs: program.structs.clone(),
         enums: program.enums.clone(),
+        resources: program.resources.clone(),
         tagged_types: program.tagged_types.clone(),
         tuples: program.tuples.clone(),
         fn_types: program.fn_types.clone(),
@@ -1443,6 +1473,7 @@ pub(crate) fn drop_program(program: hir::Program) {
         link_libs,
         structs,
         enums,
+        resources,
         tagged_types,
         tuples,
         fn_types,
@@ -1453,6 +1484,7 @@ pub(crate) fn drop_program(program: hir::Program) {
         link_libs,
         structs,
         enums,
+        resources,
         tagged_types,
         tuples,
         fn_types,
@@ -1704,6 +1736,12 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::Try(expr)
         | ExprKind::RawAlloc(expr)
         | ExprKind::RawFree(expr)
+        | ExprKind::RawIsNull(expr)
+        | ExprKind::ResourceBorrow { owner: expr, .. }
+        | ExprKind::ResourceRaw {
+            reference: expr, ..
+        }
+        | ExprKind::ResourceIntoRaw { owner: expr, .. }
         | ExprKind::HeapNew(expr)
         | ExprKind::BoxGet(expr)
         | ExprKind::BoxClone(expr)
@@ -2284,6 +2322,19 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(salt);
             one!(params);
         }
+        ExprKind::ResourceFromRaw { raw, parent, .. } => {
+            one!(raw);
+            if let Some(parent) = parent {
+                one!(parent);
+            }
+        }
+        ExprKind::ResourceViewFromRaw {
+            owner, ptr, len, ..
+        } => {
+            one!(owner);
+            one!(ptr);
+            one!(len);
+        }
     }
 }
 
@@ -2334,6 +2385,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),
+            resources: Vec::new(),
             tagged_types: Vec::new(),
             tuples: Vec::new(),
             fn_types: Vec::new(),

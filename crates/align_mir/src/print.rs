@@ -315,6 +315,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::RawAlloc(size) => format!("raw_alloc({})", operand_str(size)),
         Rvalue::RawLoad { ptr, offset, .. } => format!("raw_load({}[{}])", operand_str(ptr), operand_str(offset)),
         Rvalue::RawOffset { ptr, offset } => format!("raw_offset({}, {})", operand_str(ptr), operand_str(offset)),
+        Rvalue::RawIsNull(pointer) => format!("raw_is_null({})", operand_str(pointer)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
@@ -815,6 +816,36 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::HttpStreamFinish { stream } => format!("http_stream_finish({})", operand_str(stream)),
         Rvalue::HttpStreamReject { stream, rb } => format!("http_stream_reject({}, {})", operand_str(stream), operand_str(rb)),
+        Rvalue::ResourceFromRaw { raw, resource, parent, abort_on_null } => format!(
+            "resource_from_raw({}, resource#{resource}, parent={}, abort_on_null={abort_on_null})",
+            operand_str(raw),
+            parent.as_ref().map_or_else(|| "none".to_string(), operand_str)
+        ),
+        Rvalue::ResourceBorrow { owner, resource } => {
+            format!("resource_borrow({}, resource#{resource})", operand_str(owner))
+        }
+        Rvalue::ResourceRaw { reference, resource } => {
+            format!("resource_raw({}, resource#{resource})", operand_str(reference))
+        }
+        Rvalue::ResourceIntoRaw { owner, resource } => {
+            format!("resource_into_raw({}, resource#{resource})", operand_str(owner))
+        }
+        Rvalue::ResourceViewFromRaw {
+            owner,
+            ptr,
+            len,
+            resource,
+            view,
+            allow_null_if_empty,
+            check_nonnegative_len,
+            check_alignment,
+            check_utf8,
+        } => format!(
+            "resource_view_from_raw({}, {}, {}, resource#{resource}, {view:?}, empty_null={allow_null_if_empty}, nonnegative={check_nonnegative_len}, align={check_alignment}, utf8={check_utf8})",
+            operand_str(owner),
+            operand_str(ptr),
+            operand_str(len),
+        ),
     }
 }
 

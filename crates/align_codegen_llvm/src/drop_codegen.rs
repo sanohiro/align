@@ -450,6 +450,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_call(self.runtime(free_key), &[ptr.into()], "")
                             .map_err(|error| self.err(error))?;
                     }
+                    Ty::Resource(id) => {
+                        let resource = self.program.resources.get(id as usize).ok_or_else(|| {
+                            self.err(format!("resource type id {id} is missing"))
+                        })?;
+                        let drop_thunk = self.module.get_function(&resource.drop_thunk).ok_or_else(|| {
+                            self.err(format!("resource drop thunk '{}' is missing", resource.drop_thunk))
+                        })?;
+                        let pointer = self
+                            .builder
+                            .build_load(
+                                self.ctx.ptr_type(AddressSpace::default()),
+                                base,
+                                "dropresource",
+                            )
+                            .map_err(|error| self.err(error))?;
+                        self.builder
+                            .build_call(drop_thunk, &[pointer.into()], "")
+                            .map_err(|error| self.err(error))?;
+                    }
                     Ty::String
                     | Ty::DynArray(_)
                     | Ty::DynStructArray(..)

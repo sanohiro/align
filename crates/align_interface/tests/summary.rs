@@ -165,6 +165,22 @@ fn rehash(summary: &mut InterfaceSummary) {
     summary.interface_hash = Hash128::of(&encode_interface_surface(summary));
 }
 
+fn resource_summaries() -> Vec<InterfaceSummary> {
+    summaries(&[
+        unit(
+            "pkg.db.internal.resource",
+            false,
+            "module pkg.db.internal.resource\npub fn drop_conn(handle: raw) { unsafe { raw.free(handle) } }\n",
+        ),
+        unit(
+            "pkg.db",
+            false,
+            "module pkg.db\nimport pkg.db.internal.resource\npub resource conn = pkg.db.internal.resource.drop_conn\npub resource stmt<T> = pkg.db.internal.resource.drop_conn\n",
+        ),
+        unit("main", true, "module main\nimport pkg.db\nfn main() -> i32 = 0\n"),
+    ])
+}
+
 // ---- 1. determinism -----------------------------------------------------------------------------
 
 #[test]
@@ -655,6 +671,69 @@ fn round_trip_equality() {
     let bytes = serialize(s);
     let back = deserialize(&bytes).expect("round-trip should succeed");
     assert_eq!(*s, back);
+}
+
+#[test]
+fn resource_metadata_round_trips_and_rejects_each_corruption_class() {
+    let sums = resource_summaries();
+    let summary = find(&sums, "pkg.db");
+    assert_eq!(summary.resources.len(), 2);
+    assert_eq!(summary.resources[0].name, "conn");
+    assert_eq!(summary.resources[0].generic_arity, 0);
+    assert_eq!(summary.resources[0].representation_version, 1);
+    assert_eq!(
+        summary.resources[0].drop_thunk,
+        "__align_resource_drop$pkg.db$conn"
+    );
+    assert_eq!(summary.resources[0].drop_abi_fingerprint, *b"align-res-drop-1");
+    assert_eq!(summary.resources[1].name, "stmt");
+    assert_eq!(summary.resources[1].generic_arity, 1);
+    assert_eq!(deserialize(&serialize(summary)).unwrap(), *summary);
+    let source = summary_to_source(summary, &[]).unwrap();
+    assert!(source.contains("pub resource conn = pkg.db.internal.resource.__align_interface_drop_conn"));
+
+    let rejected = |mut candidate: InterfaceSummary, expected| {
+        rehash(&mut candidate);
+        assert_eq!(validate_for_import(&candidate), Err(expected));
+    };
+
+    let mut arity = summary.clone();
+    arity.resources[0].generic_arity = 1;
+    rejected(
+        arity,
+        ImportCompatibilityError::ResourceArityMismatch("conn".into()),
+    );
+
+    let mut version = summary.clone();
+    version.resources[0].representation_version = 2;
+    rejected(
+        version,
+        ImportCompatibilityError::ResourceRepresentationVersion {
+            name: "conn".into(),
+            version: 2,
+        },
+    );
+
+    let mut thunk = summary.clone();
+    thunk.resources[0].drop_thunk = "redirected".into();
+    rejected(
+        thunk,
+        ImportCompatibilityError::ResourceDropThunk("conn".into()),
+    );
+
+    let mut fingerprint = summary.clone();
+    fingerprint.resources[0].drop_abi_fingerprint = [0; 16];
+    rejected(
+        fingerprint,
+        ImportCompatibilityError::ResourceDropAbi("conn".into()),
+    );
+
+    let mut duplicate = summary.clone();
+    duplicate.resources.push(duplicate.resources[0].clone());
+    rejected(
+        duplicate,
+        ImportCompatibilityError::DuplicateLocalType("conn".into()),
+    );
 }
 
 #[test]
@@ -2177,7 +2256,7 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "03000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000000000000000000000000000000"
+        "05000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2194,21 +2273,22 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     );
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
-    // effect, generic body option, then the empty top-level type/const sequences.
+    // effect, resource-hook-body bit, generic body option, then the empty top-level
+    // struct/enum/resource/const sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 17] = 0xff;
+    bad_borrow[surface.len() - 22] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 16] = 0xff;
+    bad_region[surface.len() - 21] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 15] = 0xff;
+    bad_cleanup[surface.len() - 20] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {

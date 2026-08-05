@@ -124,6 +124,7 @@ pub struct Program {
     /// Sum-type layouts, indexed by the id in [`Ty::Enum`]; codegen builds the tagged struct
     /// `{ i32 tag, … }` from each (variant payloads + `field_base`).
     pub enums: Vec<hir::EnumDef>,
+    pub resources: Vec<hir::ResourceDef>,
     /// Concrete nested `Option` / `Result` layouts, indexed by [`Ty::Tagged`] /
     /// [`Scalar::Tagged`]. Lowering canonicalizes this to the reachable, id-independent closure.
     pub tagged_types: Vec<hir::TaggedType>,
@@ -532,6 +533,30 @@ pub enum Rvalue {
     RawLoad { ptr: Operand, offset: Operand, scalar: align_sema::Scalar },
     /// `raw.offset(p, n)` (unsafe): a new `raw` pointer `ptr + offset` bytes (pointer arithmetic).
     RawOffset { ptr: Operand, offset: Operand },
+    /// Safe null test used before transferring a native handle into a resource.
+    RawIsNull(Operand),
+    /// Opaque resource-pointer operations. The resource id is retained for validation and thunk
+    /// selection even though all four pointer-bearing forms share the LLVM `ptr` representation.
+    ResourceFromRaw {
+        raw: Operand,
+        resource: u32,
+        parent: Option<Operand>,
+        abort_on_null: bool,
+    },
+    ResourceBorrow { owner: Operand, resource: u32 },
+    ResourceRaw { reference: Operand, resource: u32 },
+    ResourceIntoRaw { owner: Operand, resource: u32 },
+    ResourceViewFromRaw {
+        owner: Operand,
+        ptr: Operand,
+        len: Operand,
+        resource: u32,
+        view: hir::ResourceViewKind,
+        allow_null_if_empty: bool,
+        check_nonnegative_len: bool,
+        check_alignment: u32,
+        check_utf8: bool,
+    },
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
@@ -1675,6 +1700,7 @@ fn empty_program() -> Program {
         link_libs: Vec::new(),
         structs: Vec::new(),
         enums: Vec::new(),
+        resources: Vec::new(),
         tagged_types: Vec::new(),
         fn_types: Vec::new(),
         tuples: Vec::new(),
@@ -1796,6 +1822,7 @@ fn lower_program_unchecked(
         link_libs,
         structs: program.structs.clone(),
         enums: program.enums.clone(),
+        resources: program.resources.clone(),
         tagged_types: program.tagged_types.clone(),
         fn_types: program
             .fn_types
@@ -5912,6 +5939,140 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     },
                 ));
                 Operand::Value(v)
+            }
+            hir::ExprKind::RawIsNull(pointer) => {
+                lower_required_binding!(
+                    b,
+                    pointer = lower_expr(b, pointer),
+                    Operand::Const(Const::Unit)
+                );
+                let value = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(value, Rvalue::RawIsNull(pointer)));
+                Operand::Value(value)
+            }
+            hir::ExprKind::ResourceFromRaw {
+                raw,
+                resource,
+                parent,
+            } => {
+                lower_required_binding!(b, raw = lower_expr(b, raw), Operand::Const(Const::Unit));
+                let parent = if let Some(parent) = parent {
+                    let operand = lower_expr_for_borrow(b, parent);
+                    if !lowering_continues(b) {
+                        break 'lower_expr terminated_operand();
+                    }
+                    Some(operand)
+                } else {
+                    None
+                };
+                let value = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    value,
+                    Rvalue::ResourceFromRaw {
+                        raw,
+                        resource: *resource,
+                        parent: parent.clone(),
+                        abort_on_null: true,
+                    },
+                ));
+                if let Some(parent) = &parent {
+                    inherit_borrow_owners(b, value, [parent]);
+                }
+                Operand::Value(value)
+            }
+            hir::ExprKind::ResourceBorrow { owner, resource } => {
+                let owner = lower_expr_for_borrow(b, owner);
+                if !lowering_continues(b) {
+                    break 'lower_expr terminated_operand();
+                }
+                let value = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    value,
+                    Rvalue::ResourceBorrow {
+                        owner: owner.clone(),
+                        resource: *resource,
+                    },
+                ));
+                inherit_borrow_owners(b, value, [&owner]);
+                Operand::Value(value)
+            }
+            hir::ExprKind::ResourceRaw {
+                reference,
+                resource,
+            } => {
+                let reference = lower_expr_for_borrow(b, reference);
+                if !lowering_continues(b) {
+                    break 'lower_expr terminated_operand();
+                }
+                let value = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(
+                    value,
+                    Rvalue::ResourceRaw {
+                        reference: reference.clone(),
+                        resource: *resource,
+                    },
+                ));
+                inherit_borrow_owners(b, value, [&reference]);
+                Operand::Value(value)
+            }
+            hir::ExprKind::ResourceIntoRaw { owner, resource } => {
+                let operand = lower_expr(b, owner);
+                if !lowering_continues(b) {
+                    break 'lower_expr terminated_operand();
+                }
+                null_moved_source(b, owner);
+                let value = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(
+                    value,
+                    Rvalue::ResourceIntoRaw {
+                        owner: operand,
+                        resource: *resource,
+                    },
+                ));
+                Operand::Value(value)
+            }
+            hir::ExprKind::ResourceViewFromRaw {
+                owner,
+                ptr,
+                len,
+                resource,
+                view,
+            } => {
+                let owner = lower_expr_for_borrow(b, owner);
+                if !lowering_continues(b) {
+                    break 'lower_expr terminated_operand();
+                }
+                lower_required_binding!(b, ptr = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                lower_required_binding!(b, len = lower_expr(b, len), Operand::Const(Const::Unit));
+                let (alignment, check_utf8) = match view {
+                    hir::ResourceViewKind::StrUtf8 => (1, true),
+                    hir::ResourceViewKind::Slice(align_sema::Scalar::Int(integer)) => {
+                        (u32::from(integer.bits) / 8, false)
+                    }
+                    hir::ResourceViewKind::Slice(align_sema::Scalar::Float(float)) => {
+                        (u32::from(float.bits) / 8, false)
+                    }
+                    hir::ResourceViewKind::Slice(_) => {
+                        unreachable!("resource view scalar was validated by sema")
+                    }
+                };
+                let value = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    value,
+                    Rvalue::ResourceViewFromRaw {
+                        owner: owner.clone(),
+                        ptr,
+                        len,
+                        resource: *resource,
+                        view: *view,
+                        allow_null_if_empty: true,
+                        check_nonnegative_len: true,
+                        check_alignment: alignment,
+                        check_utf8,
+                    },
+                ));
+                inherit_borrow_owners(b, value, [&owner]);
+                Operand::Value(value)
             }
             // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
             // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
@@ -10823,6 +10984,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::HttpStream
         | Scalar::RunOutput
         | Scalar::Fn(_) => KeyOrder::PartialFloat,
+        Scalar::Resource(_) | Scalar::ResourceRef(_) => KeyOrder::PartialFloat,
     }
 }
 
@@ -14478,6 +14640,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Tagged(_) => "nested tagged type".to_string(),
         Ty::Box(_) => "box".to_string(),
         Ty::Raw => "raw".to_string(),
+        Ty::Resource(id) => format!("resource#{id}"),
+        Ty::ResourceRef(id) => format!("resource_ref<resource#{id}>"),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::Vec(_, n) => format!("vec{n}"),
@@ -15453,6 +15617,7 @@ fn main() -> i32 = 0
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![
                 // Simulate an unused generic-template entry left in sema's universe.
                 hir::TaggedType::Option(Scalar::Param(0)),

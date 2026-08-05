@@ -88,6 +88,10 @@ pub struct Program {
     pub structs: Vec<StructDef>,
     /// Sum-type definitions, indexed by the id carried in [`crate::Ty::Enum`].
     pub enums: Vec<EnumDef>,
+    /// Nominal native-resource definitions, indexed by the id carried in
+    /// [`crate::Ty::Resource`] / [`crate::Ty::ResourceRef`]. Every entry has the one-pointer
+    /// representation and names the compiler-emitted drop thunk for its declaring hook.
+    pub resources: Vec<ResourceDef>,
     /// Interned nested builtin tagged payloads (`Option` / `Result`). HIR may retain unreachable
     /// generic-template entries containing `Scalar::Param`; MIR lowering publishes only the
     /// reachable concrete canonical closure.
@@ -107,6 +111,26 @@ pub struct Program {
     /// default object stays byte-identical — populated only when checking a unit against
     /// interface-only dependencies.
     pub imported_fns: Vec<ImportedFn>,
+}
+
+/// One concrete nominal native-resource type. Generic declarations contribute one entry per
+/// concrete instantiation; `source_name` retains the public nominal spelling while `name` is the
+/// collision-free backend identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceDef {
+    pub name: String,
+    pub source_name: String,
+    /// Canonical source module that owns representation privilege for this resource.
+    pub declaring_module: String,
+    pub generic_arity: u32,
+    /// Canonical Align function name supplied by the declaration.
+    pub drop_hook: String,
+    /// Compiler-owned support symbol called by generated Drop paths.
+    pub drop_thunk: String,
+    /// Version of the one-non-null-pointer representation.
+    pub representation_version: u32,
+    /// Stable fingerprint of the support-thunk ABI, independent of the hook's source body.
+    pub drop_abi_fingerprint: [u8; 16],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,6 +598,37 @@ pub enum ExprKind {
     RawStore { ptr: Box<Expr>, offset: Box<Expr>, value: Box<Expr> },
     /// `raw.offset(p, n)` — advance a `raw` pointer by `n` bytes, yielding a new `raw`. `unsafe`-only.
     RawOffset { ptr: Box<Expr>, offset: Box<Expr> },
+    /// `p.is_null()` — safe null test for a raw pointer before native-resource construction.
+    RawIsNull(Box<Expr>),
+    /// Privileged unsafe conversion of one non-null native handle into an owning resource.
+    ResourceFromRaw {
+        raw: Box<Expr>,
+        resource: u32,
+        parent: Option<Box<Expr>>,
+    },
+    /// Safe, representation-opaque reference tied to the owner's current generation.
+    ResourceBorrow {
+        owner: Box<Expr>,
+        resource: u32,
+    },
+    /// Privileged unsafe extraction through a resource reference.
+    ResourceRaw {
+        reference: Box<Expr>,
+        resource: u32,
+    },
+    /// Privileged unsafe ownership transfer back to a raw handle.
+    ResourceIntoRaw {
+        owner: Box<Expr>,
+        resource: u32,
+    },
+    /// Privileged checked native `(ptr, len)` view construction tied to `owner`.
+    ResourceViewFromRaw {
+        owner: Box<Expr>,
+        ptr: Box<Expr>,
+        len: Box<Expr>,
+        resource: u32,
+        view: ResourceViewKind,
+    },
     /// `heap.new(x)` — allocate a `box<T>` in the enclosing arena.
     HeapNew(Box<Expr>),
     /// `b.get()` — read (copy) the value out of a `box<T>`.
@@ -1544,6 +1599,12 @@ pub enum ExprKind {
     /// — never `Pure`, so excluded from `par_map`). All three operands are borrowed, never consumed
     /// (`params` is a Copy struct).
     CryptoArgon2 { password: Box<Expr>, salt: Box<Expr>, params: Box<Expr> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceViewKind {
+    StrUtf8,
+    Slice(crate::Scalar),
 }
 
 /// Which AEAD cipher an [`ExprKind::CryptoAead`] uses (M11 Slice 4). Both are 256-bit (32-byte key)
