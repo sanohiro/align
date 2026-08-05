@@ -25,7 +25,10 @@ mod source_shape;
 mod validate_hir;
 mod runtime_key;
 
-pub use canonical_graph::{FunctionTypeDef, function_types_are_canonical};
+pub use canonical_graph::{
+    CanonicalCodecError, CanonicalFnAbi, CanonicalTy, FunctionTypeDef, ProgramCall,
+    ProgramCallError, function_types_are_canonical,
+};
 pub use runtime_key::RuntimeKey;
 
 #[cfg(test)]

@@ -14,6 +14,77 @@ pub struct FunctionTypeDef {
     pub return_region: hir::ReturnRegionSummary,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProgramCall(Box<str>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramCallError {
+    Empty,
+    EmbeddedNul,
+    TooLong,
+}
+
+impl ProgramCall {
+    pub fn try_from_logical(value: &str) -> Result<Self, ProgramCallError> {
+        if value.is_empty() {
+            return Err(ProgramCallError::Empty);
+        }
+        if value.as_bytes().contains(&0) {
+            return Err(ProgramCallError::EmbeddedNul);
+        }
+        if u32::try_from(value.len()).is_err() {
+            return Err(ProgramCallError::TooLong);
+        }
+        Ok(Self(value.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalTy(Box<[u8]>);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalFnAbi(Box<[u8]>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCodecError {
+    Truncated,
+    TrailingBytes,
+    UnsupportedVersion,
+    UnknownTag,
+    InvalidBool,
+    InvalidUtf8,
+    EmbeddedNul,
+    InvalidWidth,
+    InvalidCount,
+    MissingReference,
+    DuplicateMember,
+    NonCanonicalOrder,
+    InvalidSummary,
+    InvalidGraph,
+}
+
+impl From<CanonicalGraphError> for CanonicalCodecError {
+    fn from(value: CanonicalGraphError) -> Self {
+        match value {
+            CanonicalGraphError::EmbeddedNul => Self::EmbeddedNul,
+            CanonicalGraphError::InvalidWidth => Self::InvalidWidth,
+            CanonicalGraphError::InvalidCount => Self::InvalidCount,
+            CanonicalGraphError::MissingReference => Self::MissingReference,
+            CanonicalGraphError::DuplicateMember => Self::DuplicateMember,
+            CanonicalGraphError::InvalidSummary => Self::InvalidSummary,
+            CanonicalGraphError::InvalidGraph => Self::InvalidGraph,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(super) enum CanonicalGraphError {
@@ -399,9 +470,21 @@ impl<'a> GraphValidator<'a> {
                     self.candidate(lanes_ordinal, CanonicalGraphError::InvalidWidth);
                 }
             }
-            Ty::StructArray(id, _) | Ty::DictEncoded(id, _) => {
+            Ty::StructArray(id, _) => {
                 self.scan_reference(Node::Struct(id), ordinal, references);
                 self.field_ordinal();
+            }
+            Ty::DictEncoded(id, field) => {
+                self.scan_reference(Node::Struct(id), ordinal, references);
+                let field_ordinal = self.field_ordinal();
+                if self
+                    .view
+                    .structs
+                    .get(id as usize)
+                    .is_some_and(|definition| field as usize >= definition.fields.len())
+                {
+                    self.candidate(field_ordinal, CanonicalGraphError::InvalidGraph);
+                }
             }
             Ty::DynStructArray(id, _) => {
                 self.scan_reference(Node::Struct(id), ordinal, references);
@@ -649,6 +732,747 @@ fn canonical_type_bytes_with_classes(
     }
     ty(&mut out, root, &ordinal)?;
     Ok(out)
+}
+
+impl CanonicalTy {
+    pub fn from_program(root: Ty, program: &Program) -> Result<Self, CanonicalCodecError> {
+        let graph = ValidatedGraph::new(root, canonical_view(program))?;
+        Ok(Self(canonical_type_bytes(&graph)?.into_boxed_slice()))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError> {
+        let consumed = validate_canonical_type_bytes(bytes)?;
+        if consumed != bytes.len() {
+            return Err(CanonicalCodecError::TrailingBytes);
+        }
+        Ok(Self(bytes.into()))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl CanonicalFnAbi {
+    pub fn from_parts(
+        params: &[(ParamMode, Ty)],
+        ret: Ty,
+        borrow: &hir::ReturnBorrowSummary,
+        region: &hir::ReturnRegionSummary,
+        program: &Program,
+    ) -> Result<Self, CanonicalCodecError> {
+        let count = checked_count(params.len())?;
+        validate_function_summaries(borrow, region, params.len())?;
+        if params
+            .iter()
+            .any(|(mode, _)| !matches!(mode, ParamMode::ByValue | ParamMode::Out))
+        {
+            return Err(CanonicalCodecError::InvalidGraph);
+        }
+
+        let mut canonical_params = Vec::with_capacity(params.len());
+        for &(mode, ty) in params {
+            canonical_params.push((mode, CanonicalTy::from_program(ty, program)?));
+        }
+        let canonical_ret = CanonicalTy::from_program(ret, program)?;
+        let mut out = Vec::new();
+        out.push(1);
+        out.extend(count.to_le_bytes());
+        for (mode, ty) in canonical_params {
+            encode_param_mode(&mut out, mode)?;
+            out.extend(ty.as_bytes());
+        }
+        out.extend(canonical_ret.as_bytes());
+        encode_borrow_summary(&mut out, borrow)?;
+        encode_region_summary(&mut out, region)?;
+        Ok(Self(out.into_boxed_slice()))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError> {
+        validate_canonical_fn_abi_bytes(bytes)?;
+        Ok(Self(bytes.into()))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn canonical_view(program: &Program) -> CanonicalTypeView<'_> {
+    CanonicalTypeView {
+        structs: &program.structs,
+        enums: &program.enums,
+        tuples: &program.tuples,
+        tagged_types: &program.tagged_types,
+        fn_types: &program.fn_types,
+    }
+}
+
+fn validate_function_summaries(
+    borrow: &hir::ReturnBorrowSummary,
+    region: &hir::ReturnRegionSummary,
+    params: usize,
+) -> Result<(), CanonicalCodecError> {
+    fn valid(roots: &[u32], captures: &[u32], params: usize) -> bool {
+        u32::try_from(roots.len()).is_ok()
+            && u32::try_from(captures.len()).is_ok()
+            && !roots.is_empty()
+            && captures.is_empty()
+            && roots.windows(2).all(|pair| pair[0] < pair[1])
+            && roots.iter().all(|&root| (root as usize) < params)
+    }
+
+    let borrow_valid = match borrow {
+        hir::ReturnBorrowSummary::None => true,
+        hir::ReturnBorrowSummary::Roots {
+            params: roots,
+            captures,
+        } => valid(roots, captures, params),
+    };
+    let region_valid = match region {
+        hir::ReturnRegionSummary::None => true,
+        hir::ReturnRegionSummary::Roots {
+            params: roots,
+            captures,
+        } => valid(roots, captures, params),
+    };
+    if borrow_valid && region_valid && summaries_agree(borrow, region) {
+        Ok(())
+    } else {
+        Err(CanonicalCodecError::InvalidSummary)
+    }
+}
+
+struct DecodeCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DecodeCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn byte(&mut self) -> Result<u8, CanonicalCodecError> {
+        let value = self
+            .bytes
+            .get(self.offset)
+            .copied()
+            .ok_or(CanonicalCodecError::Truncated)?;
+        self.offset += 1;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, CanonicalCodecError> {
+        let end = self
+            .offset
+            .checked_add(4)
+            .ok_or(CanonicalCodecError::Truncated)?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CanonicalCodecError::Truncated)?;
+        self.offset = end;
+        Ok(u32::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| CanonicalCodecError::Truncated)?,
+        ))
+    }
+
+    fn boolean(&mut self) -> Result<bool, CanonicalCodecError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(CanonicalCodecError::InvalidBool),
+        }
+    }
+
+    fn count(&mut self, minimum_bytes: usize) -> Result<usize, CanonicalCodecError> {
+        let count = self.u32()? as usize;
+        if minimum_bytes != 0
+            && count > self.bytes.len().saturating_sub(self.offset) / minimum_bytes
+        {
+            return Err(CanonicalCodecError::Truncated);
+        }
+        Ok(count)
+    }
+
+    fn text(&mut self) -> Result<String, CanonicalCodecError> {
+        let len = self.count(1)?;
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(CanonicalCodecError::Truncated)?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CanonicalCodecError::Truncated)?;
+        self.offset = end;
+        let value = std::str::from_utf8(bytes).map_err(|_| CanonicalCodecError::InvalidUtf8)?;
+        if value.as_bytes().contains(&0) {
+            return Err(CanonicalCodecError::EmbeddedNul);
+        }
+        Ok(value.to_owned())
+    }
+}
+
+enum DecodedNode {
+    Struct(hir::StructDef),
+    Enum(hir::EnumDef),
+    Tuple(hir::TupleDef),
+    Tagged(hir::TaggedType),
+    Function(FunctionTypeDef),
+}
+
+fn validate_canonical_type_bytes(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
+    let mut cursor = DecodeCursor::new(bytes);
+    if cursor.byte()? != 1 {
+        return Err(CanonicalCodecError::UnsupportedVersion);
+    }
+    let node_count = cursor.count(1)?;
+    let mut nodes = Vec::with_capacity(node_count.min(1024));
+    for _ in 0..node_count {
+        nodes.push(decode_node(&mut cursor)?);
+    }
+    let mut root = decode_ty(&mut cursor)?;
+    let consumed = cursor.offset;
+
+    let mut struct_count = 0usize;
+    let mut enum_count = 0usize;
+    let mut tuple_count = 0usize;
+    let mut tagged_count = 0usize;
+    let mut function_count = 0usize;
+    let mut resolved = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        let (tag, local) = match node {
+            DecodedNode::Struct(_) => {
+                let local = struct_count;
+                struct_count += 1;
+                (0, local)
+            }
+            DecodedNode::Enum(_) => {
+                let local = enum_count;
+                enum_count += 1;
+                (1, local)
+            }
+            DecodedNode::Tuple(_) => {
+                let local = tuple_count;
+                tuple_count += 1;
+                (2, local)
+            }
+            DecodedNode::Tagged(_) => {
+                let local = tagged_count;
+                tagged_count += 1;
+                (3, local)
+            }
+            DecodedNode::Function(_) => {
+                let local = function_count;
+                function_count += 1;
+                (4, local)
+            }
+        };
+        resolved.push((
+            tag,
+            checked_count(local).map_err(CanonicalCodecError::from)?,
+        ));
+    }
+
+    let mut structs = Vec::with_capacity(struct_count);
+    let mut enums = Vec::with_capacity(enum_count);
+    let mut tuples = Vec::with_capacity(tuple_count);
+    let mut tagged_types = Vec::with_capacity(tagged_count);
+    let mut fn_types = Vec::with_capacity(function_count);
+    for mut node in nodes {
+        remap_decoded_node(&mut node, &resolved)?;
+        match node {
+            DecodedNode::Struct(value) => structs.push(value),
+            DecodedNode::Enum(value) => enums.push(value),
+            DecodedNode::Tuple(value) => tuples.push(value),
+            DecodedNode::Tagged(value) => tagged_types.push(value),
+            DecodedNode::Function(value) => fn_types.push(value),
+        }
+    }
+    remap_decoded_ty(&mut root, &resolved)?;
+
+    let view = CanonicalTypeView {
+        structs: &structs,
+        enums: &enums,
+        tuples: &tuples,
+        tagged_types: &tagged_types,
+        fn_types: &fn_types,
+    };
+    let mut roots = Vec::with_capacity(resolved.len() + 1);
+    for &(tag, local) in &resolved {
+        roots.push(node_root_ty(tag, local)?);
+    }
+    roots.push(root);
+    let graph = ValidatedGraph::new_many(root, &roots, view)?;
+    let classes = stable_classes(&graph)?;
+    let unique_classes: HashSet<u32> = classes.values().copied().collect();
+    if unique_classes.len() != graph.order.len() {
+        return Err(CanonicalCodecError::DuplicateMember);
+    }
+    let canonical = canonical_type_bytes_with_classes(&graph, root, &classes)?;
+    if canonical.as_slice() != &bytes[..consumed] {
+        return Err(CanonicalCodecError::NonCanonicalOrder);
+    }
+    Ok(consumed)
+}
+
+fn node_root_ty(tag: u8, id: u32) -> Result<Ty, CanonicalCodecError> {
+    match tag {
+        0 => Ok(Ty::Struct(id)),
+        1 => Ok(Ty::Enum(id)),
+        2 => Ok(Ty::Tuple(id)),
+        3 => Ok(Ty::Tagged(id)),
+        4 => Ok(Ty::Fn(id)),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_node(cursor: &mut DecodeCursor<'_>) -> Result<DecodedNode, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => {
+            let source_name = cursor.text()?;
+            let align = match cursor.byte()? {
+                0 => None,
+                1 => Some(cursor.u32()?),
+                _ => return Err(CanonicalCodecError::UnknownTag),
+            };
+            let c_repr = cursor.boolean()?;
+            let count = cursor.count(5)?;
+            let mut fields = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                fields.push(hir::FieldDef {
+                    name: cursor.text()?,
+                    ty: decode_ty(cursor)?,
+                });
+            }
+            Ok(DecodedNode::Struct(hir::StructDef {
+                name: source_name.clone(),
+                source_name,
+                fields,
+                align,
+                c_repr,
+            }))
+        }
+        1 => {
+            let source_name = cursor.text()?;
+            let count = cursor.count(12)?;
+            let mut variants = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let name = cursor.text()?;
+                let field_base = cursor.u32()?;
+                let payload_count = cursor.count(1)?;
+                let mut payload = Vec::with_capacity(payload_count.min(1024));
+                for _ in 0..payload_count {
+                    payload.push(decode_scalar(cursor)?);
+                }
+                variants.push(hir::EnumVariant {
+                    name,
+                    payload,
+                    field_base,
+                });
+            }
+            Ok(DecodedNode::Enum(hir::EnumDef {
+                name: source_name.clone(),
+                source_name,
+                variants,
+            }))
+        }
+        2 => {
+            let count = cursor.count(1)?;
+            let mut elems = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                elems.push(decode_scalar(cursor)?);
+            }
+            Ok(DecodedNode::Tuple(hir::TupleDef { elems }))
+        }
+        3 => match cursor.byte()? {
+            0 => Ok(DecodedNode::Tagged(hir::TaggedType::Option(decode_scalar(
+                cursor,
+            )?))),
+            1 => Ok(DecodedNode::Tagged(hir::TaggedType::Result(
+                decode_scalar(cursor)?,
+                decode_scalar(cursor)?,
+            ))),
+            _ => Err(CanonicalCodecError::UnknownTag),
+        },
+        4 => {
+            let count = cursor.count(2)?;
+            let mut params = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                params.push((decode_param_mode(cursor)?, decode_scalar(cursor)?));
+            }
+            Ok(DecodedNode::Function(FunctionTypeDef {
+                params,
+                ret: decode_ty(cursor)?,
+                return_borrow: decode_borrow_summary(cursor)?,
+                return_region: decode_region_summary(cursor)?,
+            }))
+        }
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_param_mode(cursor: &mut DecodeCursor<'_>) -> Result<ParamMode, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(ParamMode::ByValue),
+        1 => Ok(ParamMode::Out),
+        2 => Ok(ParamMode::Borrow),
+        3 => Ok(ParamMode::BorrowMut),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_int(cursor: &mut DecodeCursor<'_>) -> Result<align_sema::IntTy, CanonicalCodecError> {
+    let signed = cursor.boolean()?;
+    let bits = cursor.byte()?;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return Err(CanonicalCodecError::InvalidWidth);
+    }
+    Ok(align_sema::IntTy { signed, bits })
+}
+
+fn decode_float(cursor: &mut DecodeCursor<'_>) -> Result<align_sema::FloatTy, CanonicalCodecError> {
+    let bits = cursor.byte()?;
+    if !matches!(bits, 32 | 64) {
+        return Err(CanonicalCodecError::InvalidWidth);
+    }
+    Ok(align_sema::FloatTy { bits })
+}
+
+fn decode_prim(cursor: &mut DecodeCursor<'_>) -> Result<PrimScalar, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(PrimScalar::Int(decode_int(cursor)?)),
+        1 => Ok(PrimScalar::Float(decode_float(cursor)?)),
+        2 => Ok(PrimScalar::Bool),
+        3 => Ok(PrimScalar::Char),
+        4 => Ok(PrimScalar::Str),
+        5 => Ok(PrimScalar::String),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodecError> {
+    let node = |cursor: &mut DecodeCursor<'_>| cursor.u32();
+    match cursor.byte()? {
+        0 => Ok(Scalar::Int(decode_int(cursor)?)),
+        1 => Ok(Scalar::Float(decode_float(cursor)?)),
+        2 => Ok(Scalar::Bool),
+        3 => Ok(Scalar::Char),
+        4 => Ok(Scalar::Unit),
+        5 => Ok(Scalar::Struct(node(cursor)?)),
+        6 => Ok(Scalar::String),
+        7 => Ok(Scalar::DynArray(decode_prim(cursor)?)),
+        8 => Ok(Scalar::DynStructArray(node(cursor)?)),
+        9 => Ok(Scalar::DynResponseArray),
+        10 => Ok(Scalar::Str),
+        11 => Ok(Scalar::Slice(decode_prim(cursor)?)),
+        12 => Ok(Scalar::Enum(node(cursor)?)),
+        13 => Ok(Scalar::Tagged(node(cursor)?)),
+        14 => Ok(Scalar::Soa(node(cursor)?)),
+        15 => Ok(Scalar::JsonDoc),
+        16 => Ok(Scalar::Reader),
+        17 => Ok(Scalar::Writer),
+        18 => Ok(Scalar::Buffer),
+        19 => Ok(Scalar::Regex),
+        20 => Ok(Scalar::Captures),
+        21 => Ok(Scalar::CliParsed),
+        22 => Ok(Scalar::TcpConn),
+        23 => Ok(Scalar::TcpListener),
+        24 => Ok(Scalar::UdpSocket),
+        25 => Ok(Scalar::Child),
+        26 => Ok(Scalar::File),
+        27 => Ok(Scalar::HttpResponse),
+        28 => Ok(Scalar::HttpServer),
+        29 => Ok(Scalar::HttpRequestCtx),
+        30 => Ok(Scalar::ResponseBuilder),
+        31 => Ok(Scalar::HttpStream),
+        32 => Ok(Scalar::RunOutput),
+        33 => Ok(Scalar::Fn(node(cursor)?)),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
+    let node = |cursor: &mut DecodeCursor<'_>| cursor.u32();
+    let tag = cursor.byte()?;
+    match tag {
+        0 => Ok(Ty::Int(decode_int(cursor)?)),
+        1 => Ok(Ty::Float(decode_float(cursor)?)),
+        2 => Ok(Ty::Bool),
+        3 => Ok(Ty::Char),
+        4 => Ok(Ty::Option(decode_scalar(cursor)?)),
+        5 => Ok(Ty::Result(decode_scalar(cursor)?, decode_scalar(cursor)?)),
+        6 => Ok(Ty::Tagged(node(cursor)?)),
+        7 => Ok(Ty::Box(decode_scalar(cursor)?)),
+        8 => Ok(Ty::Array(decode_scalar(cursor)?, cursor.u32()?)),
+        9 | 10 => {
+            let scalar = decode_scalar(cursor)?;
+            let lanes = cursor.u32()?;
+            if !matches!(scalar, Scalar::Int(_) | Scalar::Float(_))
+                || !matches!(lanes, 2 | 4 | 8 | 16)
+            {
+                return Err(CanonicalCodecError::InvalidWidth);
+            }
+            if tag == 9 {
+                Ok(Ty::Vec(scalar, lanes))
+            } else {
+                Ok(Ty::Mask(scalar, lanes))
+            }
+        }
+        11 => Ok(Ty::StructArray(node(cursor)?, cursor.u32()?)),
+        12 => {
+            let id = node(cursor)?;
+            let layout = match cursor.byte()? {
+                0 => Layout::Aos,
+                1 => Layout::Soa,
+                _ => return Err(CanonicalCodecError::UnknownTag),
+            };
+            Ok(Ty::DynStructArray(id, layout))
+        }
+        13 => Ok(Ty::Slice(decode_scalar(cursor)?)),
+        14 => Ok(Ty::Soa(node(cursor)?)),
+        15 => Ok(Ty::DynSliceArray(decode_prim(cursor)?)),
+        16 => Ok(Ty::DynArray(decode_scalar(cursor)?)),
+        17 => Ok(Ty::DynResponseArray),
+        18 => Ok(Ty::Str),
+        19 => Ok(Ty::String),
+        20 => Ok(Ty::ArenaHandle),
+        21 => Ok(Ty::Raw),
+        22 => Ok(Ty::Builder),
+        23 => Ok(Ty::Writer),
+        24 => Ok(Ty::Reader),
+        25 => Ok(Ty::Buffer),
+        26 => Ok(Ty::ArrayBuilder(decode_scalar(cursor)?)),
+        27 => Ok(Ty::StrFinder),
+        28 => Ok(Ty::File),
+        29 => Ok(Ty::Rng),
+        30 => Ok(Ty::Regex),
+        31 => Ok(Ty::Captures),
+        32 => Ok(Ty::CliCommand),
+        33 => Ok(Ty::CliParsed),
+        34 => Ok(Ty::TcpConn),
+        35 => Ok(Ty::TcpListener),
+        36 => Ok(Ty::UdpSocket),
+        37 => Ok(Ty::Child),
+        38 => Ok(Ty::Command),
+        39 => Ok(Ty::RunOutput),
+        40 => Ok(Ty::HttpRequest),
+        41 => Ok(Ty::HttpResponse),
+        42 => Ok(Ty::HttpClient),
+        43 => Ok(Ty::HttpServer),
+        44 => Ok(Ty::HttpRequestCtx),
+        45 => Ok(Ty::ResponseBuilder),
+        46 => Ok(Ty::HttpStream),
+        47 => Ok(Ty::HttpHeaders),
+        48 => Ok(Ty::JsonDoc),
+        49 => Ok(Ty::JsonScanner(node(cursor)?)),
+        50 => Ok(Ty::Struct(node(cursor)?)),
+        51 => Ok(Ty::Tuple(node(cursor)?)),
+        52 => Ok(Ty::Fn(node(cursor)?)),
+        53 => Ok(Ty::Enum(node(cursor)?)),
+        54 => Ok(Ty::Task(decode_scalar(cursor)?)),
+        55 => Ok(Ty::DictEncoded(node(cursor)?, cursor.u32()?)),
+        56 => Ok(Ty::Unit),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_borrow_summary(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<hir::ReturnBorrowSummary, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(hir::ReturnBorrowSummary::None),
+        1 => {
+            let (params, captures) = decode_roots(cursor)?;
+            Ok(hir::ReturnBorrowSummary::Roots { params, captures })
+        }
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_region_summary(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<hir::ReturnRegionSummary, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(hir::ReturnRegionSummary::None),
+        1 => {
+            let (params, captures) = decode_roots(cursor)?;
+            Ok(hir::ReturnRegionSummary::Roots { params, captures })
+        }
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
+fn decode_roots(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<(Vec<u32>, Vec<u32>), CanonicalCodecError> {
+    let param_count = cursor.count(4)?;
+    let mut params = Vec::with_capacity(param_count.min(1024));
+    for _ in 0..param_count {
+        params.push(cursor.u32()?);
+    }
+    let capture_count = cursor.count(4)?;
+    let mut captures = Vec::with_capacity(capture_count.min(1024));
+    for _ in 0..capture_count {
+        captures.push(cursor.u32()?);
+    }
+    Ok((params, captures))
+}
+
+fn resolve_decoded_node(
+    global: u32,
+    expected_tag: u8,
+    resolved: &[(u8, u32)],
+) -> Result<u32, CanonicalCodecError> {
+    let &(tag, local) = resolved
+        .get(global as usize)
+        .ok_or(CanonicalCodecError::MissingReference)?;
+    if tag == expected_tag {
+        Ok(local)
+    } else {
+        Err(CanonicalCodecError::MissingReference)
+    }
+}
+
+fn remap_decoded_scalar(
+    value: &mut Scalar,
+    resolved: &[(u8, u32)],
+) -> Result<(), CanonicalCodecError> {
+    let (id, tag) = match value {
+        Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => (id, 0),
+        Scalar::Enum(id) => (id, 1),
+        Scalar::Tagged(id) => (id, 3),
+        Scalar::Fn(id) => (id, 4),
+        _ => return Ok(()),
+    };
+    *id = resolve_decoded_node(*id, tag, resolved)?;
+    Ok(())
+}
+
+fn remap_decoded_ty(value: &mut Ty, resolved: &[(u8, u32)]) -> Result<(), CanonicalCodecError> {
+    match value {
+        Ty::Option(value)
+        | Ty::Box(value)
+        | Ty::Slice(value)
+        | Ty::DynArray(value)
+        | Ty::ArrayBuilder(value)
+        | Ty::Task(value)
+        | Ty::Array(value, _)
+        | Ty::Vec(value, _)
+        | Ty::Mask(value, _) => remap_decoded_scalar(value, resolved),
+        Ty::Result(ok, err) => {
+            remap_decoded_scalar(ok, resolved)?;
+            remap_decoded_scalar(err, resolved)
+        }
+        Ty::Tagged(id) => {
+            *id = resolve_decoded_node(*id, 3, resolved)?;
+            Ok(())
+        }
+        Ty::StructArray(id, _)
+        | Ty::DynStructArray(id, _)
+        | Ty::Soa(id)
+        | Ty::JsonScanner(id)
+        | Ty::DictEncoded(id, _)
+        | Ty::Struct(id) => {
+            *id = resolve_decoded_node(*id, 0, resolved)?;
+            Ok(())
+        }
+        Ty::Tuple(id) => {
+            *id = resolve_decoded_node(*id, 2, resolved)?;
+            Ok(())
+        }
+        Ty::Fn(id) => {
+            *id = resolve_decoded_node(*id, 4, resolved)?;
+            Ok(())
+        }
+        Ty::Enum(id) => {
+            *id = resolve_decoded_node(*id, 1, resolved)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn remap_decoded_node(
+    node: &mut DecodedNode,
+    resolved: &[(u8, u32)],
+) -> Result<(), CanonicalCodecError> {
+    match node {
+        DecodedNode::Struct(definition) => {
+            for field in &mut definition.fields {
+                remap_decoded_ty(&mut field.ty, resolved)?;
+            }
+        }
+        DecodedNode::Enum(definition) => {
+            for variant in &mut definition.variants {
+                for scalar in &mut variant.payload {
+                    remap_decoded_scalar(scalar, resolved)?;
+                }
+            }
+        }
+        DecodedNode::Tuple(definition) => {
+            for scalar in &mut definition.elems {
+                remap_decoded_scalar(scalar, resolved)?;
+            }
+        }
+        DecodedNode::Tagged(definition) => match definition {
+            hir::TaggedType::Option(value) => remap_decoded_scalar(value, resolved)?,
+            hir::TaggedType::Result(ok, err) => {
+                remap_decoded_scalar(ok, resolved)?;
+                remap_decoded_scalar(err, resolved)?;
+            }
+        },
+        DecodedNode::Function(definition) => {
+            for (_, scalar) in &mut definition.params {
+                remap_decoded_scalar(scalar, resolved)?;
+            }
+            remap_decoded_ty(&mut definition.ret, resolved)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_nested_canonical_type(cursor: &mut DecodeCursor<'_>) -> Result<(), CanonicalCodecError> {
+    let consumed = validate_canonical_type_bytes(
+        cursor
+            .bytes
+            .get(cursor.offset..)
+            .ok_or(CanonicalCodecError::Truncated)?,
+    )?;
+    cursor.offset = cursor
+        .offset
+        .checked_add(consumed)
+        .ok_or(CanonicalCodecError::Truncated)?;
+    Ok(())
+}
+
+fn validate_canonical_fn_abi_bytes(bytes: &[u8]) -> Result<(), CanonicalCodecError> {
+    let mut cursor = DecodeCursor::new(bytes);
+    if cursor.byte()? != 1 {
+        return Err(CanonicalCodecError::UnsupportedVersion);
+    }
+    let count = cursor.count(7)?;
+    let mut invalid_mode = false;
+    for _ in 0..count {
+        let mode = decode_param_mode(&mut cursor)?;
+        invalid_mode |= matches!(mode, ParamMode::Borrow | ParamMode::BorrowMut);
+        decode_nested_canonical_type(&mut cursor)?;
+    }
+    decode_nested_canonical_type(&mut cursor)?;
+    let borrow = decode_borrow_summary(&mut cursor)?;
+    let region = decode_region_summary(&mut cursor)?;
+    if invalid_mode {
+        return Err(CanonicalCodecError::InvalidGraph);
+    }
+    validate_function_summaries(&borrow, &region, count)?;
+    if cursor.offset != bytes.len() {
+        return Err(CanonicalCodecError::TrailingBytes);
+    }
+    Ok(())
 }
 
 fn stable_classes(graph: &ValidatedGraph<'_>) -> Result<HashMap<Node, u32>, CanonicalGraphError> {
@@ -1607,6 +2431,20 @@ mod tests {
         canonical_type_bytes(&graph)
     }
 
+    fn mir_program(program: &hir::Program) -> Program {
+        Program {
+            fns: Vec::new(),
+            externs: Vec::new(),
+            imported_fns: Vec::new(),
+            link_libs: Vec::new(),
+            structs: program.structs.clone(),
+            enums: program.enums.clone(),
+            tagged_types: program.tagged_types.clone(),
+            fn_types: function_defs(program),
+            tuples: program.tuples.clone(),
+        }
+    }
+
     #[derive(Default)]
     struct RefinementMetrics {
         signature_bytes: usize,
@@ -1961,6 +2799,284 @@ mod tests {
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
         assert_eq!(&bytes[..5], [1, 1, 0, 0, 0]);
         assert_eq!(bytes.last(), Some(&0));
+    }
+
+    #[test]
+    fn canonical_type_codec() {
+        let program = mir_program(&baseline_program());
+        for (root, expected) in [
+            (Ty::Unit, vec![1, 0, 0, 0, 0, 56]),
+            (Ty::Bool, vec![1, 0, 0, 0, 0, 2]),
+            (Ty::Int(i(64)), vec![1, 0, 0, 0, 0, 0, 1, 64]),
+        ] {
+            let encoded = CanonicalTy::from_program(root, &program).unwrap();
+            assert_eq!(encoded.as_bytes(), expected);
+            assert_eq!(CanonicalTy::decode(&expected).unwrap(), encoded);
+        }
+        for root in [
+            Ty::Struct(0),
+            Ty::Enum(0),
+            Ty::Tuple(0),
+            Ty::Tagged(0),
+            Ty::Fn(0),
+        ] {
+            let encoded = CanonicalTy::from_program(root, &program).unwrap();
+            assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
+        }
+
+        assert_eq!(
+            ProgramCall::try_from_logical("pkg$run").unwrap().as_bytes(),
+            b"pkg$run"
+        );
+        assert_eq!(
+            ProgramCall::try_from_logical(""),
+            Err(ProgramCallError::Empty)
+        );
+        assert_eq!(
+            ProgramCall::try_from_logical("bad\0name"),
+            Err(ProgramCallError::EmbeddedNul)
+        );
+
+        let roots = [
+            Ty::Int(i(8)),
+            Ty::Float(f(32)),
+            Ty::Bool,
+            Ty::Char,
+            Ty::Option(Scalar::Bool),
+            Ty::Result(Scalar::Bool, Scalar::Char),
+            Ty::Tagged(0),
+            Ty::Box(Scalar::Bool),
+            Ty::Array(Scalar::Bool, 2),
+            Ty::Vec(Scalar::Int(i(8)), 2),
+            Ty::Mask(Scalar::Float(f(32)), 2),
+            Ty::StructArray(0, 2),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::Slice(Scalar::Bool),
+            Ty::Soa(0),
+            Ty::DynSliceArray(PrimScalar::Bool),
+            Ty::DynArray(Scalar::Bool),
+            Ty::DynResponseArray,
+            Ty::Str,
+            Ty::String,
+            Ty::ArenaHandle,
+            Ty::Raw,
+            Ty::Builder,
+            Ty::Writer,
+            Ty::Reader,
+            Ty::Buffer,
+            Ty::ArrayBuilder(Scalar::Bool),
+            Ty::StrFinder,
+            Ty::File,
+            Ty::Rng,
+            Ty::Regex,
+            Ty::Captures,
+            Ty::CliCommand,
+            Ty::CliParsed,
+            Ty::TcpConn,
+            Ty::TcpListener,
+            Ty::UdpSocket,
+            Ty::Child,
+            Ty::Command,
+            Ty::RunOutput,
+            Ty::HttpRequest,
+            Ty::HttpResponse,
+            Ty::HttpClient,
+            Ty::HttpServer,
+            Ty::HttpRequestCtx,
+            Ty::ResponseBuilder,
+            Ty::HttpStream,
+            Ty::HttpHeaders,
+            Ty::JsonDoc,
+            Ty::JsonScanner(0),
+            Ty::Struct(0),
+            Ty::Tuple(0),
+            Ty::Fn(0),
+            Ty::Enum(0),
+            Ty::Task(Scalar::Bool),
+            Ty::DictEncoded(0, 0),
+            Ty::Unit,
+        ];
+        crate::source_shape::tests::assert_ty_matrix(&roots);
+        for root in roots {
+            let encoded = CanonicalTy::from_program(root, &program).unwrap();
+            assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
+        }
+
+        let scalars = [
+            Scalar::Int(i(8)),
+            Scalar::Float(f(32)),
+            Scalar::Bool,
+            Scalar::Char,
+            Scalar::Unit,
+            Scalar::Struct(0),
+            Scalar::String,
+            Scalar::DynArray(PrimScalar::Bool),
+            Scalar::DynStructArray(0),
+            Scalar::DynResponseArray,
+            Scalar::Str,
+            Scalar::Slice(PrimScalar::Char),
+            Scalar::Enum(0),
+            Scalar::Tagged(0),
+            Scalar::Soa(0),
+            Scalar::JsonDoc,
+            Scalar::Reader,
+            Scalar::Writer,
+            Scalar::Buffer,
+            Scalar::Regex,
+            Scalar::Captures,
+            Scalar::CliParsed,
+            Scalar::TcpConn,
+            Scalar::TcpListener,
+            Scalar::UdpSocket,
+            Scalar::Child,
+            Scalar::File,
+            Scalar::HttpResponse,
+            Scalar::HttpServer,
+            Scalar::HttpRequestCtx,
+            Scalar::ResponseBuilder,
+            Scalar::HttpStream,
+            Scalar::RunOutput,
+            Scalar::Fn(0),
+        ];
+        crate::source_shape::tests::assert_scalar_matrix(&scalars);
+        for scalar in scalars {
+            let encoded = CanonicalTy::from_program(Ty::Option(scalar), &program).unwrap();
+            assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn canonical_type_codec_function_root() {
+        let mut hir = baseline_program();
+        hir.fn_types[0].params = vec![(ParamMode::ByValue, Scalar::Fn(0))];
+        hir.fn_types[0].ret = Ty::Unit;
+        let program = mir_program(&hir);
+        let ty = CanonicalTy::from_program(Ty::Fn(0), &program).unwrap();
+        assert_eq!(CanonicalTy::decode(ty.as_bytes()).unwrap(), ty);
+
+        let abi = CanonicalFnAbi::from_parts(
+            &[],
+            Ty::Unit,
+            &hir::ReturnBorrowSummary::None,
+            &hir::ReturnRegionSummary::None,
+            &program,
+        )
+        .unwrap();
+        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 56, 0, 0]);
+        assert_eq!(CanonicalFnAbi::decode(abi.as_bytes()).unwrap(), abi);
+
+        let params = [(ParamMode::ByValue, Ty::Fn(0))];
+        let recursive = CanonicalFnAbi::from_parts(
+            &params,
+            Ty::Fn(0),
+            &hir::ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            },
+            &hir::ReturnRegionSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            },
+            &program,
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalFnAbi::decode(recursive.as_bytes()).unwrap(),
+            recursive
+        );
+    }
+
+    #[test]
+    fn canonical_codec_error_precedence() {
+        let error = |bytes: &[u8], expected| {
+            assert_eq!(CanonicalTy::decode(bytes), Err(expected), "{bytes:02x?}");
+        };
+        error(&[], CanonicalCodecError::Truncated);
+        error(&[2], CanonicalCodecError::UnsupportedVersion);
+        error(&[1, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
+        error(&[1, 0, 0, 0, 0, 0, 2, 64], CanonicalCodecError::InvalidBool);
+        error(
+            &[1, 0, 0, 0, 0, 0, 1, 24],
+            CanonicalCodecError::InvalidWidth,
+        );
+        error(
+            &[1, 0, 0, 0, 0, 50, 0xff, 0xff, 0xff, 0xff],
+            CanonicalCodecError::MissingReference,
+        );
+
+        let mut trailing = vec![1, 0, 0, 0, 0, 56];
+        trailing.push(0);
+        error(&trailing, CanonicalCodecError::TrailingBytes);
+
+        let invalid_utf8 = [
+            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+        ];
+        error(&invalid_utf8, CanonicalCodecError::InvalidUtf8);
+        let embedded_nul = [
+            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+        ];
+        error(&embedded_nul, CanonicalCodecError::EmbeddedNul);
+
+        let invalid_align = [
+            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+        ];
+        error(&invalid_align, CanonicalCodecError::InvalidGraph);
+
+        let duplicate_function = [
+            1, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 52, 0, 0, 0, 0,
+        ];
+        error(&duplicate_function, CanonicalCodecError::DuplicateMember);
+
+        let unreachable_function = [1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 56];
+        error(
+            &unreachable_function,
+            CanonicalCodecError::NonCanonicalOrder,
+        );
+
+        let invalid_summary = [
+            1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
+        ];
+        error(&invalid_summary, CanonicalCodecError::InvalidSummary);
+
+        let unit = [1, 0, 0, 0, 0, 56];
+        let mut invalid_mode = vec![1, 1, 0, 0, 0, 2];
+        invalid_mode.extend(unit);
+        invalid_mode.extend(unit);
+        invalid_mode.extend([0, 0]);
+        assert_eq!(
+            CanonicalFnAbi::decode(&invalid_mode),
+            Err(CanonicalCodecError::InvalidGraph)
+        );
+        let mut abi_trailing = vec![1, 0, 0, 0, 0];
+        abi_trailing.extend(unit);
+        abi_trailing.extend([0, 0, 0xff]);
+        assert_eq!(
+            CanonicalFnAbi::decode(&abi_trailing),
+            Err(CanonicalCodecError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn deep_canonical_type_codec_is_stack_bounded() {
+        let mut hir = baseline_program();
+        hir.structs.clear();
+        for id in 0..4096u32 {
+            let mut definition = baseline_program().structs[0].clone();
+            definition.source_name = format!("Codec{id}");
+            definition.fields[0].ty = if id == 4095 {
+                Ty::Bool
+            } else {
+                Ty::Struct(id + 1)
+            };
+            hir.structs.push(definition);
+        }
+        let program = mir_program(&hir);
+        let encoded = CanonicalTy::from_program(Ty::Struct(0), &program).unwrap();
+        assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
+        assert_eq!(
+            CanonicalTy::decode(&encoded.as_bytes()[..encoded.as_bytes().len() - 1]),
+            Err(CanonicalCodecError::Truncated)
+        );
     }
 
     #[test]
