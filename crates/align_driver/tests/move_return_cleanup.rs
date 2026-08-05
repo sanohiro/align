@@ -44,6 +44,21 @@ fn main() -> i32 = option_len(owned(1))
   + copy()
 "#;
 
+const LOCAL_FUNCTION_VALUE_SOURCE: &str = r#"
+fn fallible(ok: bool) -> Result<string, string> =
+  if ok { Ok("ok".clone()) } else { Err("error".clone()) }
+
+fn result_len(value: Result<string, string>) -> i32 = match value {
+  Ok(text) => text.len() as i32
+  Err(text) => text.len() as i32
+}
+
+fn main() -> i32 {
+  handler := fallible
+  return result_len(handler(false))
+}
+"#;
+
 fn mir_text(source: &str) -> String {
     let mut source_map = SourceMap::new();
     let checked = check(&mut source_map, "move-return-cleanup.align", source);
@@ -77,6 +92,26 @@ fn move_return_cleanup_executes_none_some_try_and_map_err_paths() {
         return;
     }
     assert_eq!(build_and_run("move-return-cleanup", SOURCE).status.code(), Some(25));
+}
+
+#[test]
+fn local_named_function_value_preserves_move_return_cleanup_abi() {
+    let mir = mir_text(LOCAL_FUNCTION_VALUE_SOURCE);
+    assert!(
+        mir.contains("call_indirect_with_cleanup"),
+        "a local named function value must retain the target's DynamicBit return ABI:\n{mir}"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run(
+                "move-return-local-function-value",
+                LOCAL_FUNCTION_VALUE_SOURCE
+            )
+            .status
+            .code(),
+            Some(5),
+        );
+    }
 }
 
 #[test]

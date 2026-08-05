@@ -5986,15 +5986,17 @@ fn prepare_local_fn_types(program: &mut Program) {
             let Some(source) = fn_types.get(fid as usize) else {
                 continue;
             };
-            let (params, ret, return_borrow, return_region) = (
+            let (params, ret, return_borrow, return_region, return_cleanup) = (
                 source.params.clone(),
                 source.ret,
                 source.return_borrow.clone(),
                 source.return_region.clone(),
+                source.return_cleanup,
             );
             let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
             fn_types[fresh as usize].return_borrow = return_borrow;
             fn_types[fresh as usize].return_region = return_region;
+            fn_types[fresh as usize].return_cleanup = return_cleanup;
             local.ty = Ty::Fn(fresh);
         }
     }

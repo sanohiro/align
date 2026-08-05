@@ -1180,7 +1180,13 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
-        mark_borrow_param_contracts_at(ctx, thunk, &declaration.signature.modes, 1);
+        mark_borrow_param_contracts_at(
+            ctx,
+            thunk,
+            &declaration.signature.modes,
+            &declaration.signature.borrow,
+            1,
+        );
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
@@ -1271,7 +1277,7 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
-        mark_borrow_param_contracts_at(ctx, thunk, explicit_modes, 1);
+        mark_borrow_param_contracts_at(ctx, thunk, explicit_modes, &explicit_signature.borrow, 1);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
@@ -4661,7 +4667,7 @@ fn declare_fn<'c>(
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
-    mark_borrow_param_contracts(ctx, fv, &f.param_modes);
+    mark_borrow_param_contracts(ctx, fv, &f.param_modes, &f.return_borrow);
     // Every Align program function is module-private (internal) EXCEPT:
     //  - the C entry: an `-> i32` `main` keeps the symbol name `main` and IS the C entry (`crt0`
     //    resolves it by name), so it must stay external. A `Result`- or `Unit`-returning main body
@@ -4737,7 +4743,7 @@ fn declare_imported_fn<'c>(
     };
     let fv = module.add_function(&encoded_program_symbol(&imp.name), fn_ty, None);
     mark_nounwind(ctx, fv);
-    mark_borrow_param_contracts(ctx, fv, &imp.param_modes);
+    mark_borrow_param_contracts(ctx, fv, &imp.param_modes, &imp.return_borrow);
     fv
 }
 
@@ -4745,14 +4751,16 @@ fn mark_borrow_param_contracts(
     ctx: &Context,
     function: FunctionValue<'_>,
     modes: &[align_ast::ParamMode],
+    return_borrow: &hir::ReturnBorrowSummary,
 ) {
-    mark_borrow_param_contracts_at(ctx, function, modes, 0);
+    mark_borrow_param_contracts_at(ctx, function, modes, return_borrow, 0);
 }
 
 fn mark_borrow_param_contracts_at(
     ctx: &Context,
     function: FunctionValue<'_>,
     modes: &[align_ast::ParamMode],
+    return_borrow: &hir::ReturnBorrowSummary,
     offset: u32,
 ) {
     for (index, mode) in modes.iter().copied().enumerate() {
@@ -4761,7 +4769,14 @@ fn mark_borrow_param_contracts_at(
         }
         let location = inkwell::attributes::AttributeLoc::Param(index as u32 + offset);
         add_enum_attr(ctx, function, location, "nonnull");
-        add_valued_enum_attr(ctx, function, location, "captures", CAPTURES_NONE);
+        let returned = matches!(
+            return_borrow,
+            hir::ReturnBorrowSummary::Roots { params, .. }
+                if params.binary_search(&(index as u32)).is_ok()
+        );
+        if !returned {
+            add_valued_enum_attr(ctx, function, location, "captures", CAPTURES_NONE);
+        }
         add_enum_attr(ctx, function, location, "readonly");
     }
 }
@@ -13528,6 +13543,92 @@ mod tests {
         let error = emit_llvm_ir(&caller, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a Move BorrowMut call needs the caller cleanup slot");
         assert_lowering(error, "callable target invalid:7265706c616365");
+    }
+
+    #[test]
+    fn returned_borrow_roots_do_not_claim_captures_none() {
+        let source = "fn size(borrow value: string) -> i64 = value.len()\n\
+                      fn view(borrow value: string) -> slice<u8> = value.bytes()\n\
+                      fn main() -> i32 { value := \"align\".clone(); bytes := view(value); return (size(value) + bytes.len()) as i32 }\n";
+        let captures = enum_kind_id("captures");
+        let readonly = enum_kind_id("readonly");
+        let has = |function: FunctionValue<'_>, index: u32, kind| {
+            function
+                .get_enum_attribute(inkwell::attributes::AttributeLoc::Param(index), kind)
+                .is_some()
+        };
+        let assert_contracts = |module: &Module<'_>| {
+            let view = module
+                .get_function(&encoded_program_symbol(&program_call("view")))
+                .expect("view declaration");
+            let size = module
+                .get_function(&encoded_program_symbol(&program_call("size")))
+                .expect("size definition");
+            assert!(has(view, 0, readonly));
+            assert!(
+                !has(view, 0, captures),
+                "a returned borrow root is captured by the return value"
+            );
+            assert!(has(size, 0, readonly));
+            assert!(
+                has(size, 0, captures),
+                "a non-returned shared borrow remains captures(none)"
+            );
+        };
+
+        let direct = mir(source);
+        let ctx = Context::create();
+        let module = ctx.create_module("returned_borrow_direct");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        build_module(&ctx, &module, &direct, &tm, None, &[], false).unwrap();
+        assert_contracts(&module);
+        let ptr = ctx.ptr_type(AddressSpace::default());
+        let thunk = module.add_function(
+            "returned_borrow_thunk_probe",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false),
+            None,
+        );
+        mark_borrow_param_contracts_at(
+            &ctx,
+            thunk,
+            &[align_ast::ParamMode::Borrow],
+            &hir::ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            },
+            1,
+        );
+        assert!(has(thunk, 1, readonly));
+        assert!(
+            !has(thunk, 1, captures),
+            "a generated thunk must apply return roots before its environment offset"
+        );
+
+        let mut imported = mir(source);
+        let view_index = imported
+            .fns
+            .iter()
+            .position(|function| function.name.as_str() == "view")
+            .expect("view definition");
+        let view = imported.fns.remove(view_index);
+        imported.imported_fns.push(align_mir::ImportedFn {
+            name: view.name,
+            params: view
+                .params
+                .iter()
+                .map(|slot| view.slots[*slot as usize])
+                .collect(),
+            param_modes: view.param_modes,
+            ret: view.ret,
+            return_borrow: view.return_borrow,
+            return_region: view.return_region,
+            return_cleanup: view.return_cleanup,
+        });
+        let ctx = Context::create();
+        let module = ctx.create_module("returned_borrow_imported");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        build_module(&ctx, &module, &imported, &tm, None, &[], false).unwrap();
+        assert_contracts(&module);
     }
 
     #[test]
