@@ -1,9 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use align_ast::ParamMode;
-use align_sema::{hir, Layout, PrimScalar, Scalar, Ty};
+use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
 
-use super::source_shape::{source_shape_equal, SourceShapeNode, SourceShapeView};
+use super::source_shape::{SourceShapeNode, SourceShapeView, source_shape_equal};
+use super::{Program, function_embedded_types, remap_function_embedded_types};
 
 #[derive(Clone, Debug)]
 pub struct FunctionTypeDef {
@@ -15,7 +16,7 @@ pub struct FunctionTypeDef {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
-enum CanonicalGraphError {
+pub(super) enum CanonicalGraphError {
     EmbeddedNul,
     InvalidWidth,
     InvalidCount,
@@ -96,6 +97,14 @@ struct ValidatedGraph<'a> {
 
 impl<'a> ValidatedGraph<'a> {
     fn new(root: Ty, view: CanonicalTypeView<'a>) -> Result<Self, CanonicalGraphError> {
+        Self::new_many(root, std::slice::from_ref(&root), view)
+    }
+
+    fn new_many(
+        root: Ty,
+        roots: &[Ty],
+        view: CanonicalTypeView<'a>,
+    ) -> Result<Self, CanonicalGraphError> {
         let mut validator = GraphValidator {
             view,
             pending: Vec::new(),
@@ -105,10 +114,12 @@ impl<'a> ValidatedGraph<'a> {
             next_ordinal: 0,
             end_ordinals: HashMap::new(),
         };
-        let mut roots = Vec::new();
-        validator.scan_ty(root, &mut roots);
-        roots.reverse();
-        validator.pending.extend(roots);
+        let mut references = Vec::new();
+        for &root in roots {
+            validator.scan_ty(root, &mut references);
+        }
+        references.reverse();
+        validator.pending.extend(references);
         while let Some(node) = validator.pending.pop() {
             validator.visit_node(node);
         }
@@ -334,11 +345,7 @@ impl<'a> GraphValidator<'a> {
         };
         let same_kind = std::mem::discriminant(&first) == std::mem::discriminant(&node);
         let same_shape = same_kind && source_shape_equal(&view, first, node, known_shapes);
-        Some(if same_shape {
-            CanonicalGraphError::DuplicateMember
-        } else {
-            CanonicalGraphError::InvalidGraph
-        })
+        (!same_shape).then_some(CanonicalGraphError::InvalidGraph)
     }
 
     fn scan_scalar(&mut self, value: Scalar, references: &mut Vec<Node>) {
@@ -578,6 +585,14 @@ fn validate_prim(value: PrimScalar) -> Result<(), CanonicalGraphError> {
 
 fn canonical_type_bytes(graph: &ValidatedGraph<'_>) -> Result<Vec<u8>, CanonicalGraphError> {
     let classes = stable_classes(graph)?;
+    canonical_type_bytes_with_classes(graph, graph.root, &classes)
+}
+
+fn canonical_type_bytes_with_classes(
+    graph: &ValidatedGraph<'_>,
+    root: Ty,
+    classes: &HashMap<Node, u32>,
+) -> Result<Vec<u8>, CanonicalGraphError> {
     let mut representative = HashMap::new();
     for &node in &graph.order {
         let class = classes
@@ -589,7 +604,7 @@ fn canonical_type_bytes(graph: &ValidatedGraph<'_>) -> Result<Vec<u8>, Canonical
 
     let mut class_order = Vec::new();
     let mut class_ordinals = HashMap::new();
-    let mut pending = type_nodes(graph.root);
+    let mut pending = type_nodes(root);
     pending.reverse();
     while let Some(node) = pending.pop() {
         let class = classes
@@ -632,7 +647,7 @@ fn canonical_type_bytes(graph: &ValidatedGraph<'_>) -> Result<Vec<u8>, Canonical
             .ok_or(CanonicalGraphError::MissingReference)?;
         encode_node(&mut out, graph.view, node, &ordinal)?;
     }
-    ty(&mut out, graph.root, &ordinal)?;
+    ty(&mut out, root, &ordinal)?;
     Ok(out)
 }
 
@@ -1318,6 +1333,226 @@ fn ty(
     })
 }
 
+pub(super) fn canonicalize_function_types(
+    program: &mut Program,
+) -> Result<(), CanonicalGraphError> {
+    let roots = program_type_roots(program);
+    let view = CanonicalTypeView {
+        structs: &program.structs,
+        enums: &program.enums,
+        tuples: &program.tuples,
+        tagged_types: &program.tagged_types,
+        fn_types: &program.fn_types,
+    };
+    let graph = ValidatedGraph::new_many(Ty::Unit, &roots, view)?;
+    let reachable: BTreeSet<u32> = graph
+        .order
+        .iter()
+        .filter_map(|node| match node {
+            Node::Fn(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let classes = stable_classes(&graph)?;
+
+    let mut keyed = Vec::with_capacity(reachable.len());
+    for old in reachable {
+        keyed.push((
+            canonical_type_bytes_with_classes(&graph, Ty::Fn(old), &classes)?,
+            old,
+        ));
+    }
+    keyed.sort();
+
+    let mut remap = vec![None; program.fn_types.len()];
+    let mut representatives = Vec::new();
+    let mut previous: Option<Vec<u8>> = None;
+    for (bytes, old) in keyed {
+        let new_class = if previous.as_ref().is_some_and(|value| *value == bytes) {
+            representatives
+                .len()
+                .checked_sub(1)
+                .ok_or(CanonicalGraphError::InvalidGraph)?
+        } else {
+            previous = Some(bytes);
+            representatives.push(old);
+            representatives.len() - 1
+        };
+        let slot = remap
+            .get_mut(old as usize)
+            .ok_or(CanonicalGraphError::MissingReference)?;
+        *slot = Some(checked_count(new_class)?);
+    }
+
+    let mut canonical = Vec::with_capacity(representatives.len());
+    for old in representatives {
+        let mut definition = program
+            .fn_types
+            .get(old as usize)
+            .cloned()
+            .ok_or(CanonicalGraphError::MissingReference)?;
+        remap_ty_fn(&mut definition.ret, &remap);
+        for (_, scalar) in &mut definition.params {
+            remap_scalar_fn(scalar, &remap);
+        }
+        canonical.push(definition);
+    }
+    remap_program_function_types(program, &remap);
+    program.fn_types = canonical;
+    Ok(())
+}
+
+pub fn function_types_are_canonical(program: &Program) -> bool {
+    let roots = program_type_roots(program);
+    let definitions = function_type_facts(&program.fn_types);
+    let mut canonical = program.clone();
+    canonicalize_function_types(&mut canonical).is_ok()
+        && roots == program_type_roots(&canonical)
+        && definitions == function_type_facts(&canonical.fn_types)
+}
+
+fn function_type_facts(
+    definitions: &[FunctionTypeDef],
+) -> Vec<(
+    Vec<(ParamMode, Scalar)>,
+    Ty,
+    hir::ReturnBorrowSummary,
+    hir::ReturnRegionSummary,
+)> {
+    definitions
+        .iter()
+        .map(|definition| {
+            (
+                definition.params.clone(),
+                definition.ret,
+                definition.return_borrow.clone(),
+                definition.return_region.clone(),
+            )
+        })
+        .collect()
+}
+
+fn program_type_roots(program: &Program) -> Vec<Ty> {
+    let mut roots = Vec::new();
+    for definition in &program.structs {
+        roots.extend(definition.fields.iter().map(|field| field.ty));
+    }
+    for definition in &program.enums {
+        for variant in &definition.variants {
+            roots.extend(
+                variant
+                    .payload
+                    .iter()
+                    .copied()
+                    .map(align_sema::scalar_to_ty),
+            );
+        }
+    }
+    for definition in &program.tuples {
+        roots.extend(
+            definition
+                .elems
+                .iter()
+                .copied()
+                .map(align_sema::scalar_to_ty),
+        );
+    }
+    for function in &program.fns {
+        roots.push(function.ret);
+        roots.extend(function.slots.iter().chain(&function.value_tys).copied());
+        roots.extend(function_embedded_types(function));
+    }
+    for function in &program.externs {
+        roots.push(function.ret);
+        roots.extend(function.params.iter().copied());
+    }
+    for function in &program.imported_fns {
+        roots.push(function.ret);
+        roots.extend(function.params.iter().copied());
+    }
+    roots
+}
+
+fn remap_program_function_types(program: &mut Program, remap: &[Option<u32>]) {
+    for definition in &mut program.structs {
+        for field in &mut definition.fields {
+            remap_ty_fn(&mut field.ty, remap);
+        }
+    }
+    for definition in &mut program.enums {
+        for variant in &mut definition.variants {
+            for scalar in &mut variant.payload {
+                remap_scalar_fn(scalar, remap);
+            }
+        }
+    }
+    for definition in &mut program.tuples {
+        for scalar in &mut definition.elems {
+            remap_scalar_fn(scalar, remap);
+        }
+    }
+    for definition in &mut program.tagged_types {
+        match definition {
+            hir::TaggedType::Option(scalar) => remap_scalar_fn(scalar, remap),
+            hir::TaggedType::Result(ok, err) => {
+                remap_scalar_fn(ok, remap);
+                remap_scalar_fn(err, remap);
+            }
+        }
+    }
+    for function in &mut program.fns {
+        remap_ty_fn(&mut function.ret, remap);
+        for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+            remap_ty_fn(ty, remap);
+        }
+        remap_function_embedded_types(function, remap, remap_ty_fn);
+    }
+    for function in &mut program.externs {
+        remap_ty_fn(&mut function.ret, remap);
+        for ty in &mut function.params {
+            remap_ty_fn(ty, remap);
+        }
+    }
+    for function in &mut program.imported_fns {
+        remap_ty_fn(&mut function.ret, remap);
+        for ty in &mut function.params {
+            remap_ty_fn(ty, remap);
+        }
+    }
+}
+
+fn remap_scalar_fn(value: &mut Scalar, remap: &[Option<u32>]) {
+    if let Scalar::Fn(id) = value
+        && let Some(Some(new)) = remap.get(*id as usize)
+    {
+        *id = *new;
+    }
+}
+
+fn remap_ty_fn(value: &mut Ty, remap: &[Option<u32>]) {
+    match value {
+        Ty::Fn(id) => {
+            if let Some(Some(new)) = remap.get(*id as usize) {
+                *id = *new;
+            }
+        }
+        Ty::Option(value)
+        | Ty::Box(value)
+        | Ty::Slice(value)
+        | Ty::DynArray(value)
+        | Ty::ArrayBuilder(value)
+        | Ty::Task(value)
+        | Ty::Array(value, _)
+        | Ty::Vec(value, _)
+        | Ty::Mask(value, _) => remap_scalar_fn(value, remap),
+        Ty::Result(ok, err) => {
+            remap_scalar_fn(ok, remap);
+            remap_scalar_fn(err, remap);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -1630,8 +1865,8 @@ mod tests {
         root.fields.push(second);
         nominal.structs = vec![root, duplicate.clone(), duplicate];
         assert_eq!(
-            validate(Ty::Struct(0), &nominal),
-            Err(CanonicalGraphError::DuplicateMember)
+            validate(Ty::Struct(0), &nominal).unwrap(),
+            [Node::Struct(0), Node::Struct(1), Node::Struct(2)]
         );
 
         let mut tuple = baseline_program();
@@ -1857,6 +2092,61 @@ mod tests {
         assert_eq!(canonical(Ty::Fn(1), &program).unwrap(), first);
         program.fn_types[1].params[0].0 = ParamMode::Out;
         assert_ne!(canonical(Ty::Fn(1), &program).unwrap(), first);
+    }
+
+    #[test]
+    fn canonical_function_type_remap() {
+        let hir = baseline_program();
+        let mut first = function_defs(&hir)[0].clone();
+        first.params = vec![(ParamMode::ByValue, Scalar::Bool)];
+        let mut second = first.clone();
+        second.params[0].1 = Scalar::Char;
+        let duplicate = first.clone();
+        let mut unreachable = first.clone();
+        unreachable.params[0].1 = Scalar::Unit;
+
+        let mut structs = hir.structs.clone();
+        structs[0].fields[0].ty = Ty::Fn(2);
+        structs[0].fields[1].ty = Ty::Tagged(0);
+        let mut enums = hir.enums.clone();
+        enums[0].variants[0].payload = vec![Scalar::Fn(1)];
+        enums[0].variants[1].field_base = 2;
+        let mut tuples = hir.tuples.clone();
+        tuples[0].elems = vec![Scalar::Fn(2)];
+        let mut program = Program {
+            fns: Vec::new(),
+            externs: Vec::new(),
+            imported_fns: Vec::new(),
+            link_libs: Vec::new(),
+            structs,
+            enums,
+            tagged_types: vec![hir::TaggedType::Result(Scalar::Fn(0), Scalar::Fn(1))],
+            fn_types: vec![first, second, duplicate, unreachable],
+            tuples,
+        };
+
+        canonicalize_function_types(&mut program).unwrap();
+        assert_eq!(program.fn_types.len(), 2);
+        assert_eq!(program.structs[0].fields[0].ty, Ty::Fn(0));
+        let Ty::Tagged(0) = program.structs[0].fields[1].ty else {
+            panic!("tagged function root must remain reachable");
+        };
+        let hir::TaggedType::Result(Scalar::Fn(first), Scalar::Fn(second)) =
+            program.tagged_types[0]
+        else {
+            panic!("tagged function references must be remapped");
+        };
+        assert_ne!(first, second);
+        assert_eq!(program.tuples[0].elems, [Scalar::Fn(0)]);
+        assert!(function_types_are_canonical(&program));
+
+        let mut non_compact = program.clone();
+        non_compact.fn_types.push(non_compact.fn_types[0].clone());
+        assert!(!function_types_are_canonical(&non_compact));
+
+        let mut missing = program.clone();
+        missing.structs[0].fields[0].ty = Ty::Fn(u32::MAX);
+        assert!(!function_types_are_canonical(&missing));
     }
 
     #[test]

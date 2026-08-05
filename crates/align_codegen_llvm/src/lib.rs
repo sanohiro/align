@@ -2441,6 +2441,11 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             "nested tagged type table is not compact, unique, and canonical".to_string(),
         ));
     }
+    if !align_mir::function_types_are_canonical(program) {
+        return Err(CodegenError::Lowering(
+            "function type table is not compact, unique, and canonical".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -12352,6 +12357,7 @@ mod tests {
             structs,
             enums,
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12422,6 +12428,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12473,6 +12480,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12520,6 +12528,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12559,6 +12568,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![hir::TaggedType::Option(payload)],
+            fn_types: vec![],
             tuples: vec![],
         };
         for (payload, expected) in [
@@ -12609,6 +12619,7 @@ mod tests {
             structs,
             enums,
             tagged_types,
+            fn_types: vec![],
             tuples: vec![],
         };
         let struct_cycle = program(
@@ -12684,6 +12695,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
 
@@ -12932,6 +12944,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![hir::TaggedType::Option(Scalar::String)],
+            fn_types: vec![],
             tuples: vec![],
         };
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
@@ -12971,6 +12984,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![TupleDef {
                 elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
             }],
@@ -13017,6 +13031,7 @@ mod tests {
             }],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![TupleDef {
                 elems: vec![Scalar::DynStructArray(0)],
             }],
@@ -13063,6 +13078,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types,
+            fn_types: vec![],
             tuples: vec![],
         };
         let cases = [
@@ -13822,6 +13838,7 @@ mod tests {
             structs,
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
@@ -13872,6 +13889,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
@@ -13919,6 +13937,7 @@ mod tests {
             structs: vec![row],
             enums: vec![],
             tagged_types: vec![],
+            fn_types: vec![],
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()

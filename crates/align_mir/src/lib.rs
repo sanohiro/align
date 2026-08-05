@@ -25,7 +25,7 @@ mod source_shape;
 mod validate_hir;
 mod runtime_key;
 
-pub use canonical_graph::FunctionTypeDef;
+pub use canonical_graph::{FunctionTypeDef, function_types_are_canonical};
 pub use runtime_key::RuntimeKey;
 
 #[cfg(test)]
@@ -119,6 +119,10 @@ pub struct Program {
     /// Concrete nested `Option` / `Result` layouts, indexed by [`Ty::Tagged`] /
     /// [`Scalar::Tagged`]. Lowering canonicalizes this to the reachable, id-independent closure.
     pub tagged_types: Vec<hir::TaggedType>,
+    /// Compact effect-free function signatures, indexed by [`Ty::Fn`] / [`Scalar::Fn`]. Lowering
+    /// removes unreachable/equivalent entries, sorts by canonical graph bytes, and remaps every
+    /// retained reference before MIR can reach hashing or codegen.
+    pub fn_types: Vec<FunctionTypeDef>,
     /// Tuple layouts, indexed by the id in [`Ty::Tuple`]; codegen builds an anonymous LLVM
     /// struct type from each element list.
     pub tuples: Vec<hir::TupleDef>,
@@ -1600,6 +1604,7 @@ fn empty_program() -> Program {
         structs: Vec::new(),
         enums: Vec::new(),
         tagged_types: Vec::new(),
+        fn_types: Vec::new(),
         tuples: Vec::new(),
     }
 }
@@ -1667,8 +1672,22 @@ fn lower_program_unchecked(
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tagged_types: program.tagged_types.clone(),
+        fn_types: program
+            .fn_types
+            .iter()
+            .map(|definition| FunctionTypeDef {
+                params: definition.params.clone(),
+                ret: definition.ret,
+                return_borrow: definition.return_borrow.clone(),
+                return_region: definition.return_region.clone(),
+            })
+            .collect(),
         tuples: program.tuples.clone(),
     };
+    // Public lowering validates the complete HIR envelope before this point. The unchecked helper
+    // is also exercised directly by malformed-continuation owners, where an invalid function id
+    // must remain fail-closed inside its function rather than erase unrelated lowered bodies.
+    let _ = canonical_graph::canonicalize_function_types(&mut mir);
     canonicalize_tagged_types(&mut mir);
     mir
 }
@@ -1860,6 +1879,12 @@ fn canonicalize_tagged_types(program: &mut Program) {
             collect_ty(ty, &program.tagged_types, &mut reachable);
         }
     }
+    for definition in &program.fn_types {
+        collect_ty(definition.ret, &program.tagged_types, &mut reachable);
+        for &(_, scalar) in &definition.params {
+            collect_scalar(scalar, &program.tagged_types, &mut reachable);
+        }
+    }
 
     enum ScalarKeyWork {
         Scalar(Scalar),
@@ -1922,9 +1947,12 @@ fn canonicalize_tagged_types(program: &mut Program) {
                             }
                         }
                     }
-                    // Abstract entries and function-table ids are not a concrete, id-independent
-                    // ABI key.
-                    Scalar::Param(_) | Scalar::Fn(_) => return None,
+                    Scalar::Fn(id) => {
+                        key.push_str("fn:");
+                        key.push_str(&id.to_string());
+                    }
+                    // Abstract entries are not a concrete, id-independent ABI key.
+                    Scalar::Param(_) => return None,
                     other => key.push_str(&format!("{other:?}")),
                 },
             }
@@ -2027,6 +2055,12 @@ fn canonicalize_tagged_types(program: &mut Program) {
         remap_ty(&mut import.ret, &remap);
         for ty in &mut import.params {
             remap_ty(ty, &remap);
+        }
+    }
+    for definition in &mut program.fn_types {
+        remap_ty(&mut definition.ret, &remap);
+        for (_, scalar) in &mut definition.params {
+            remap_scalar(scalar, &remap);
         }
     }
     program.tagged_types = canonical;
@@ -14988,6 +15022,7 @@ fn main() -> i32 = 0
                     Scalar::Bool,
                 ),
             ],
+            fn_types: vec![],
             tuples: vec![],
         };
         canonicalize_tagged_types(&mut program);
