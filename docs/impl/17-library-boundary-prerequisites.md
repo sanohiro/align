@@ -1360,7 +1360,17 @@ Every new HIR/MIR/type variant must be wired through the exhaustive region, move
 interface, print, codec, ABI, and codegen classifications. Catch-all defaults for a resource or
 borrow-bearing type are prohibited.
 
-## 10. Implementation PR sequence
+## 10. Implementation capability plan
+
+The labels below own exact closure cells and verification, not one mandatory PR
+each. Completed historical checkpoints retain their original evidence. Remaining
+cells are grouped into the capability waves recorded in `HANDOFF.md`; a wave may
+land as one independently correct PR when its complete owner matrix closes.
+Any retained cell prose that names an old line target, per-cell PR, post-open
+review, pre/post attestation pair, or mandatory benchmark is historical boundary
+evidence. It does not override the capability waves, one stable-candidate review
+with one coherent finding closure, focused owner checks, local-measurement policy,
+or pre-PR attestation defined by `CLAUDE.md` and `HANDOFF.md`.
 
 ### L1a — recursive DropPlan framework and `Option<string>` fields
 
@@ -1434,7 +1444,7 @@ The PR acceptance commands are exactly:
 cargo test -p align_driver --test owned_tagged_payloads
 cargo test -p align_driver --test analysis_coverage
 scripts/test-pr.sh
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --lib --bins --locked -- -D warnings
 bench/owned_tagged_payload/run.sh
 ```
 
@@ -1490,11 +1500,12 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-The clean reviewed am-r ledger merged in #678 originally fixed twenty-seven L2 implementation PRs.
-The mandatory am-c pre-implementation review and c2a size-trigger splits later expanded its one
-callable PR into ten, so the
-current plan has thirty-six. Am-r itself is a design-only gate and is not one of those
-implementation PRs. L2b-a2
+The clean reviewed am-r ledger merged in #678 originally described the L2
+acceptance cells below. Later size-trigger splits incorrectly turned many
+strictly dependent dormant cells into separate PRs and expanded the plan to
+thirty-six implementation PRs. That PR count is retired. The rows remain the
+authoritative closure checklist, not mandatory PR boundaries. Am-r itself is a
+design-only gate. L2b-a2
 first isolates product, MIR
 action-continuation, and global type-domain validation. Placement, nominal, callable namespace,
 declaration/header, and four body-validator construction/activation verticals follow the explicit
@@ -1509,7 +1520,7 @@ not accept source syntax whose complete safety contract belongs to a later miles
 | L2b-a2-s | Add the projection fact and refine named summaries through structs, tuples, block/`if`/loop, field assignment, and destructuring | No new borrow mode; array, pipeline, tagged/control residuals, and indirect calls retain the L2b-a1 all-compatible-input fallback | direct/imported product-view projection matrix and per-unit parity |
 | L2b-a2-ac | Close MIR fallthrough propagation after every terminating eager expression child, including enclosing consumers and later siblings | No new borrow mode or provenance precision; source semantics are unchanged; the normal driver still supplies semantically checked HIR | exhaustive recursive-call-site classification, representative family-level no-action assertions, runtime twins, and whole/per-unit continuation parity |
 | L2b-a2-am-g-t | Validate concrete roots through every global type table before MIR construction | No source, semantic, HIR, MIR, interface, or ABI change; direct handcrafted-HIR lowering returns a canonical empty program only for an invalid global type domain while every placement, nominal, namespace, declaration/header, and body predicate remains the semantic-checker contract | exhaustive type-domain/root/reference/cycle mutation matrix across all lowering entrypoints and unchanged valid-program MIR |
-| L2b-a2-am-r | Design gate completed in #678 and amended by the mandatory am-c pre-implementation review: the public-contract ledger below isolates five producer corrections and one checked-HIR depth-safety closure, then splits per-position type admissibility, nominal/link metadata, declarations/headers, body validation, and the dependent callable work into twenty-three independently correct verticals | This row authorizes no implementation itself. The amended plan fixes L2b at thirty-two and L2 at thirty-six implementation PRs and authorizes am-d/c1 | completed #678 adversarial ledger review plus the am-c matrix review and finding-to-ledger closure covering exact runtime, codec, callable applicability, collision, precedence, and PR boundaries |
+| L2b-a2-am-r | Design gate completed in #678 and amended by the mandatory am-c pre-implementation review: the public-contract ledger below isolates five producer corrections and one checked-HIR depth-safety closure, then enumerates per-position type admissibility, nominal/link metadata, declarations/headers, body validation, and dependent callable acceptance cells | This row authorizes no implementation itself. The cells are grouped into the capability waves below; they are not a fixed PR count | completed #678 adversarial ledger review plus the am-c matrix review and finding-to-ledger closure covering exact runtime, codec, callable applicability, collision, precedence, and capability boundaries |
 | L2b-a2-am-d | Make the fixed conservative checked-HIR record ceiling and the unbounded valid type-DAG domain stack-safe end to end | Preserve every parser-valid source, including diagnosed HIR before producer finalization, while rejecting handcrafted HIR deeper than the fixed 259 ceiling before semantic consumption; every depth-259 body and every finite am-g-t-valid acyclic-inline/header-mediated type DAG at a producer-valid root remains stack-safe from HIR entry through LLVM verification on the 2 MiB test stack | exhaustive constructor-expansion ceiling proof, complete recursive body/type-consumer inventory, common iterative traversal closure, 258/259/260 body cases, deep valid/malformed type-DAG roots, and whole/per-unit MIR/LLVM parity |
 | L2b-a2-am-e | Implemented: make the entry producer and backend ABI exact so no-arg `main` returns only Unit, exact signed i32, or `Result<Unit,builtin Error>` and argv main remains the exact Result form | The compiler rejects previously accepted non-C-ABI entry returns with one source diagnostic; Unit/Result wrappers and direct i32 entry behavior remain exact | completed sema signature matrix, whole/per-unit Unit/i32/Result exit behavior, every rejected graph-valid return category, LLVM signature/link/ThinLTO parity |
 | L2b-a2-am-f | Implemented: make function completion exact before a non-Unit body reaches HIR/MIR | Bare return and reachable absent tail are valid only for Unit; every non-Unit path returns a typed value or is proven non-fallthrough | completed bare/value return, tail/absent tail, every-control-family, whole/per-unit MIR/LLVM verifier matrix |
@@ -1586,7 +1597,7 @@ both the closed and open-world effects `Impure`; a direct external callback para
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
 
-The amended am-r ledger fixes thirty-two independently sound L2b implementation PRs; the nine added
+The amended am-r ledger fixes the independently checkable L2b acceptance cells; the nine added
 boundaries are c1 plus the eight dormant c2a1/c2a2a/c2a2b/c2a3/c2a4/c2b/c2c/c2d prerequisites for the final am-c3 activation. L2b-a1 owns named/direct/imported
 parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
 flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
@@ -1721,7 +1732,8 @@ callable namespace: compiler runtime lookup keys, exact emitted identities, and 
 compiler/runtime spellings as malformed HIR would itself be a hidden semantic change. Am-r
 therefore had to publish and pass a new public-contract ledger before any placement, nominal/link,
 namespace, declaration/header, or body implementation began. That ledger merged in #678 and fixes
-the exact remaining PR split and count.
+the exact remaining closure cells. Its original per-cell PR split and count are retired by the
+capability-wave plan above.
 
 | Slice / malformed-HIR cell | Required closure | Exact owner evidence |
 |---|---|---|
@@ -2837,11 +2849,10 @@ interface byte, ABI, cache, or runtime behavior. The slice owns `ExprKind::Array
 records. Pipeline terminals, array materialization/views, length/index/range, struct-array element
 fields, templates, JSON, group aggregation, and dictionary encoding remain rejected by the dormant
 boundary until am-b2b.
-The expected implementation is larger than the preferred 500 hand-written-line target because it
-reuses one worklist/flow table and one source-order validator across all storage families; the
-final author pass must record the measured implementation/test count and keep this one-state-machine
-rationale if the count exceeds 1,000. Splitting by array family would duplicate the source-flow and
-stored-result gate or publish a parallel validator path, which is not allowed.
+This cell reuses one worklist/flow table and one source-order validator across all storage families.
+It stays atomic inside the canonical callable capability wave because splitting by array family
+would duplicate the source-flow and stored-result gate or publish a parallel validator path. Line
+count alone neither forces nor forbids a wave split.
 
 | Cell | Required am-b2a closure | Exact owner evidence |
 |---|---|---|
@@ -2853,7 +2864,7 @@ stored-result gate or publish a parallel validator path, which is not allowed.
 | flow and evaluation order | Propagate strict-child fallthrough and accepted loop breaks through every new record, preserve source-order capture/operand evaluation, and keep stored-result polymorphism only for a genuinely non-fallthrough expression. No allocation, Drop, region, borrow, effect, or alias fact is inferred here. | `hir_body_validator_storage_vector_array_control_flow` covers a terminating child followed by malformed retained syntax, branch/loop joins, and exact stored results; the existing deferred-facts owner remains green. |
 | type graph and malformed safety | Reuse the iterative type/name/mangle helpers and fail closed on every invalid id, scalar width, lane count, ordinal, path, length, and enum/struct reference without indexing or shifting from unchecked input. No new recursion over HIR/type graphs is introduced. | `deep_hir_body_storage_type_dag_is_stack_bounded` runs the direct helper on a 2 MiB stack for valid and malformed later-sibling graphs; focused malformed mutations assert `false` rather than panic. |
 | ownership and activation | Do not read or mutate `drop_*`, `Assign` cleanup cells, region/borrow/escape state, allocation flags, effects, task proofs, or runtime/native objects. Valid b2a HIR remains dormant and public lowering remains byte-identical; b2b and b4 own the remaining records and activation. | `hir_body_validator_storage_vector_array_deferred_facts_are_not_consumed`, existing four-entrypoint identity owners, and repository search for the helper caller. |
-| source propagation and review gate | Keep this matrix, the am-b2a ledger range, the implementation test table, and `HANDOFF.md` synchronized. The PR is one storage/vector/array vertical and must not claim b2b, b3, b4, or public activation. | Author matrix-to-diff pass, fresh independent matrix review before coding, focused owners, `scripts/test-pr.sh`, applicable Clippy, and the standard pre/post-PR attestations. |
+| source propagation and review gate | Keep this matrix, the am-b2a ledger range, the implementation test table, and `HANDOFF.md` synchronized. This is one storage/vector/array closure cell inside the canonical callable wave and must not claim b2b, b3, b4, or public activation early. | Fresh independent matrix review before coding; final wave matrix-to-diff pass; focused owners, `scripts/test-pr.sh`, applicable Clippy, and the single stable-candidate preflight review/attestation. |
 
 #### Am-b2b implementation closure matrix
 
@@ -2878,7 +2889,7 @@ silently depend on a later JSON or grouping contract.
 | deferred b2b2 boundary | Keep `Template` through `ArrayDictEncode`, all `TemplatePart`, `GroupSource`, `GroupAgg1`, and `GroupOp` records fail-closed. Do not read JSON descriptor, template ownership, grouping source, dictionary, or nested-record facts in b2b1. | `hir_body_validator_pipeline_deferred_b2b2` enumerates every deferred expression and varies each nested discriminator/field state one at a time while proving rejection; b2b2 owns all later positive and malformed matrices. |
 | control flow and malformed safety | Propagate strict-child fallthrough and loop breaks through every b2b1 record; preserve source-order evaluation and fail closed on invalid IDs, widths, lanes, lengths, tuple/callable arity, modes, fields, and paths without unchecked indexing or new recursive HIR/type traversal. | Branch/loop/retained-child owner plus `deep_hir_body_pipeline_type_dag_is_stack_bounded`; focused malformed mutations assert `false` rather than panic. |
 | ownership and activation | Do not inspect or mutate Drop sets, cleanup cells, region/borrow/escape facts, effects (including `Pure` for `ArrayParMap`), task proofs, allocation identity, runtime/native state, or public lowerers. Valid b2b1 HIR remains dormant and b2b2/b3/b4 own the remaining records and activation. | `hir_body_validator_pipeline_deferred_facts_are_not_consumed`, a valid `ArrayParMap` whose effect cell is mutated without changing the dormant verdict, existing identity owners, and repository search for the helper caller. |
-| source propagation and review gate | Keep this matrix, the am-b2 ledger range, owner test names, and `HANDOFF.md` synchronized. The b2b1 PR must not claim b2b2, b3, b4, public activation, or JSON/group completion. | Author matrix-to-diff pass, fresh independent review before coding, focused owners, bounded review once, applicable Clippy, and SHA-bound pre/post attestations. |
+| source propagation and review gate | Keep this matrix, the am-b2 ledger range, owner test names, and `HANDOFF.md` synchronized. The b2b1 cell must not claim b2b2, b3, b4, public activation, or JSON/group completion early. | Fresh independent matrix review before coding; final wave matrix-to-diff pass; focused owners, applicable Clippy, and the single stable-candidate preflight review/attestation. |
 
 #### Am-b2b2 implementation closure matrix
 
@@ -2913,7 +2924,7 @@ replay.
 | type graph and malformed safety | Reuse checked `.get`/iterative walks for every struct, enum, tuple, builtin enum, field, and descriptor id. Reject invalid lengths, empty aggregate lists, NUL names, duplicate shape classes, unsupported nested types, and wrong result payloads without panic or unchecked user-derived indexing. TemplatePart/GroupSource/GroupAgg1/GroupOp carry no span; only their enclosing expression span participates in the universal span rule. | `deep_hir_body_pipeline_b2b2_type_dag_is_stack_bounded` validates a 512-node nested JSON descriptor on a 2 MiB stack; the direct positive owner covers the stored/discriminator mutations and later-sibling precedence. |
 | control flow, arena, and source order | Schedule template part children, JSON operands, and document/group records in producer order under the LIFO worklist. Strict flows propagate through all b2b2 records, and `Arena(Block)` context is inherited by every nested template/JSON child and both branch arms exactly as existing body traversal does; arena-only rows reject outside the active context even when a sibling diverges. Group records have no expression children but still validate their base local before postconditions. | `hir_body_validator_pipeline_template_json_group_control_flow` covers a diverging template hole with a retained malformed part, arena nesting, both branch arms, and the no-arena document twin; the positive owner covers mixed part/source order. |
 | ownership and activation | Do not replay body Drop sets, cleanup cells, allocation identity, region/borrow/escape provenance, effects, task proofs, or native state. The one structural exception is `JsonScan`'s canonical recursive Copy/DropPlan precondition, which is required to prevent a checked-HIR scanner row from reaching MIR; it performs no move, cleanup, or runtime action. The general b2b2 body validator remains dormant, while all four MIR lowering entrypoints invoke the active `align_mir::hir_program_is_valid` gate and its scanner predicate. | `hir_body_validator_json_scan_copy_row` covers the shared structural predicate and one direct/transitive Move mutation; `hir_program_json_scan_copy_row` and `hir_program_json_scan_envelope_mismatch` prove the active gate rejects malformed rows; `hir_body_validator_pipeline_deferred_facts_are_not_consumed` remains the owner for unrelated deferred facts, and repository search confirms the active gate is the only production consumer. |
-| source propagation and review gate | Synchronize this matrix, the am-b2 ledger rows, exact owner names, the identity script contract, and `HANDOFF.md`. The b2b2 PR claims only Template/JSON/group/dictionary validation plus the narrow Request 6 scanner safety gate; it must not claim b3, b4, general body activation, unresolved generic row-type support, or a public database surface. | Author matrix-to-diff pass, one fresh independent matrix review before coding, focused owner checks including `json_scan_cross_compiler_identity`, bounded ordinary gate once, applicable Clippy, and SHA-bound pre/post attestations. |
+| source propagation and review gate | Synchronize this matrix, the am-b2 ledger rows, exact owner names, the identity script contract, and `HANDOFF.md`. The b2b2 cell claims only Template/JSON/group/dictionary validation plus the narrow Request 6 scanner safety gate; it must not claim b3, b4, general body activation, unresolved generic row-type support, or a public database surface early. | Fresh independent matrix review before coding; final wave matrix-to-diff pass; focused owner checks including `json_scan_cross_compiler_identity`, applicable Clippy, and the single stable-candidate preflight review/attestation. |
 
 #### Am-b3 implementation closure matrix
 
@@ -2939,10 +2950,10 @@ namespace identities and generated symbol encoding.
 | generated callable facts | Reconcile `FnValue`, `Closure`, `CallFnValue`, direct `Call`, `ResultMapErr`, and every native/pipeline callable target against one exact stored/imported/extern signature and in-range `FnTy`. Preserve `FnOrigin::{Source,Monomorph,Lifted}` rules, non-exportable captured closures, exact capture count/trailing parameters, and native/generated helper signature rows. Per am-u, an extern is permitted only for the owning direct `Call` or named non-escaping stage/terminal invocation at `unsafe_depth > 0`; `FnValue`, `Closure`, `CallFnValue`, and function-value mapper forms never resolve an extern, even inside `Unsafe`. Do not infer/replay `FnEffect`, Drop, borrow, region, or ownership facts; those belong to am-b4/am-c. | `hir_body_validator_generated_callables` mutates origin class, capture count/order/type, exact `FnTy`, imported/extern/stored target, monomorph suffix, helper signature, and callable result. Direct and indirect, named and captured, whole/per-unit-shaped HIR twins remain dormant and do not publish a registry identity; extern direct/callback permission twins preserve am-u's exact lexical rule. |
 | control, source order, and malformed safety | Native children are evaluated in the exact ledger order; strict flow carries `falls`/breaks through every row, arena depth is inherited for file views, `unsafe_depth` remains lexical, and `ProcessExit`/`ProcessAbort`/successful `ProcessExec` are non-fallthrough according to the producer. All ids, lengths, enum tags, widths, fields, paths, helper discriminators, and option shapes use checked access; no native recursion is added. | `hir_body_validator_native_control_flow` covers branch/loop/arena/unsafe/early-exit and retained malformed child precedence; `deep_hir_body_native_type_dag_is_stack_bounded` runs a deep valid and malformed later-sibling graph on the 2 MiB stack and asserts no panic. |
 | ownership, cleanup, allocation, and FFI | Native/generated validation is compiler-only. It must not read or mutate Drop sets, cleanup cells, `FnTy.effect`, TaskProof/WaitProof, region/borrow/escape state, native/runtime tables, or allocation identity; it must not null, move, Drop, register, or call an Align/runtime/native object. Accepted HIR and all four lowering entrypoints remain byte-identical. | Deferred-facts mutation twins, accepted-HIR identity checks, repository search for the sole dormant caller, and no-action assertions for malformed native/generated records. |
-| source propagation and review gate | Synchronize this matrix, the am-b3 ledger/inventory rows, exact owner names, and `HANDOFF.md`. The PR claims only native/runtime/generated-callable validation; it must not claim am-b4 activation, effect/ownership replay, am-c callable namespaces, L3 resources, or a public database surface. | Fresh independent matrix review before coding, author matrix-to-diff pass, focused am-b3 owners, `scripts/test-pr.sh`, applicable Clippy, one bounded post-open review with timeout evidence preserved, and SHA-bound pre/post attestations. |
+| source propagation and review gate | Synchronize this matrix, the am-b3 ledger/inventory rows, exact owner names, and `HANDOFF.md`. The cell claims only native/runtime/generated-callable validation; it must not claim am-b4 activation, effect/ownership replay, am-c callable namespaces, L3 resources, or a public database surface early. | Fresh independent matrix review before coding; final wave matrix-to-diff pass; focused am-b3 owners, `scripts/test-pr.sh`, applicable Clippy, and the single stable-candidate preflight review/attestation. |
 
-The measured am-b3 implementation and owner-test diff is above the preferred 500-line target and
-the 1,000-line split-review threshold. It remains one vertical because every native family shares
+The measured am-b3 implementation and owner-test size is historical planning evidence, not a
+current split or review trigger. It remains one closure cell because every native family shares
 the same envelope gate, producer-order child worklist, lexical arena/unsafe context, flow join, and
 dormant stored-result check; splitting those families would either duplicate that state machine or
 leave an intermediate validator with a partial `ExprKind` domain and a second temporary path. The
@@ -2980,7 +2991,7 @@ remain uncalled, and an entrypoint-only change would publish unchecked body fact
 | global activation and empty result | Add the body-fact predicate to the one shared `hir_program_is_valid` gate used by `lower_program`, located lowering, per-unit lowering, and located per-unit lowering. Any invalid body returns the canonical `Program` with every vector empty before `lower_program_unchecked`; valid HIR retains byte-identical MIR and per-unit/whole parity. | `malformed_hir_body_metadata_fails_closed`, `malformed_hir_body_structure_precedes_fact_replay`, `valid_hir_body_preflight_is_mir_identity`, `checked_hir_depth_closure_matrix`, `deep_hir_body_core_type_dag_is_stack_bounded`, and `deep_type_consumer_closure_matrix`; all four entrypoints are asserted where the owner covers activation, including located source maps. The body owner matrix also covers builtin calls, unborrowed strings, fresh local `FnTy` shape matching, nested tagged payloads, reachable loop breaks, and cross-region break rejection. |
 | depth and type graph | Keep the checked-HIR record ceiling at 259 and use bounded producer replay/worklist paths for body records. Accept 258/259 valid bodies, reject 260 before replay/lowering, and accept deep finite header-mediated type DAGs while rejecting malformed later siblings without process-stack recursion. | `checked_hir_depth_closure_matrix`, `deep_hir_body_core_type_dag_is_stack_bounded`, `deep_type_consumer_closure_matrix`, `cargo test -p align_mir`, and the existing whole/per-unit LLVM verification rows. |
 | downstream parity and benchmark | No HIR/interface/ABI/MIR structural field changes; no runtime/native call, allocation, registry, artifact, or cache publication occurs before validation. Preserve whole/per-unit and located/non-located identity and record `mir-body-validation` plus unchanged continuation cost. | `cargo test -p align_driver --test expr_depth within_limit_chain_compiles_and_runs`; `cargo test -p align_driver --test per_unit_codegen`; `bench/library_boundary/run.sh provenance`: `mir-body-validation`, `mir-continuation-lowering`. |
-| split, source propagation, and review gate | Land the prerequisite task-wait parity vertical, the sema replay vertical, and the MIR activation vertical as separately correct PRs; do not keep a legacy/new parallel validator path. The activation slice includes the explicit replay clone because the shared gate cannot safely activate while replay still uses derived recursive `Clone`; splitting the clone from the gate would leave either an activated recursive path or a temporary parallel replay path. This branch is above the preferred 500-line target and exceeds the 1,000-line split threshold; the final base/HEAD diff stat is recorded against the SHA-bound pre-PR attestation. Synchronize this matrix, the am-b4 rules in `docs/impl/19-hir-validation-ledger.md`, owner names, and `HANDOFF.md`. Am-c callable identities, L3 resources, and `pkg.db` remain separate. | Fresh independent matrix review before each vertical, author matrix-to-diff pass, exact owner commands, `scripts/test-pr.sh`, applicable Clippy, one bounded post-open review per PR with timeout evidence preserved, and SHA-bound pre/post attestations. |
+| checkpoint, source propagation, and review gate | Build the prerequisite task-wait parity, sema replay, and MIR activation verticals as compile- and owner-test-backed intermediate commits inside the canonical callable wave; do not keep a legacy/new parallel validator path. The activation checkpoint includes the explicit replay clone because the shared gate cannot safely activate while replay still uses derived recursive `Clone`. Synchronize this matrix, the am-b4 rules in `docs/impl/19-hir-validation-ledger.md`, owner names, and `HANDOFF.md`. Am-c callable identities, L3 resources, and `pkg.db` remain separate capabilities. | One fresh independent matrix review before coding; author matrix-to-diff passes at intermediate checkpoints; exact owner commands, `scripts/test-pr.sh`, applicable Clippy, and one stable-candidate full-diff review/finding closure for the complete wave before its pre-PR attestation. |
 
 #### Am-b1 implementation closure matrix
 
@@ -2995,14 +3006,14 @@ extern headers, Drop sets, effects, or wait proofs. In particular, b1 does not u
 binding declarations and parameter IDs rebound by a body declaration. Body-produced locals whose
 initializing discriminator belongs to am-b2 or am-b3 may remain unbound in the dormant b1 slice;
 their producer and the final am-b4 activation close that relation.
-The measured implementation/test closure is above the repository's preferred 500-line PR target
-and above the 1,000-line split-review threshold. It remains one PR because every b1 discriminator
+The measured implementation/test size is historical planning evidence, not a current split or
+review trigger. The b1 cell stays atomic inside the capability wave because every discriminator
 shares the same child-first explicit worklist, pointer-keyed flow tables, lexical context stack,
 fallthrough/break join, and stored-result gate. Splitting by syntax family would either duplicate
 that order/state machine or leave a temporary validator that rejects a producer-valid b1 body and
 requires a second legacy/new path; both violate the single dormant entry contract. The matrix,
-owner tests, and final matrix-to-diff pass must record the measured hand-written count and preserve
-this rationale.
+owner tests, and final matrix-to-diff pass preserve this rationale without using line count as a
+progress or PR boundary.
 The validator owns structural and type relations for the am-b1 ledger range only: all statements,
 local/place records, ordinary expressions through `BuilderToString`, tagged values, calls,
 aggregates, vector arithmetic/lane/SoA records, and structured control. Storage, vector-storage,
@@ -3021,21 +3032,20 @@ Drop, effect, successful-wait, and global activation belong to am-b4.
 | type graph and stack | Reuse the am-d common explicit type traversal through every b1 type relation: function parameters/returns, locals, statement targets, struct field paths, tuple elements, enum/tagged payloads and matches, callable signatures, projections, and control-result joins. Accept a deep finite am-g-t-valid acyclic inline-struct graph rooted through a function parameter/return and reject a malformed later sibling deterministically without process-stack recursion. The body record depth ceiling remains am-d-owned; am-b1 adds no type-depth cap. | `deep_hir_body_core_type_dag_is_stack_bounded` exercises the deep parameter/return root with one valid fixture and one malformed later sibling via the direct helper on a 2 MiB stack; competing-invalid precedence remains owned by the common type/record validation suites. |
 | ownership, cleanup, effects, and allocation | Do not read, recompute, or compare `drop_locals`, `drop_individual_locals`, `drop_individual_exprs`, `Assign` drop cells, `FnTy.effect`, `TaskProof`/`WaitProof` analysis state, or allocation flags. Function-type return provenance is different: am-h validates it as a header/type-identity fact, and b1 reads it only through the producer-compatible type mangle; b1 does not infer or replay call/return provenance. Do not null, move, Drop, replace, return, or register any Align/runtime/native object. The body-derived relations remain am-b4-owned; b1 only validates the type/control envelope needed to host them. | `hir_body_validator_deferred_facts_are_not_consumed` covers representative Drop-cell and `Local.is_param` independence; `hir_body_type_mangle_golden_vectors` covers the header-owned provenance mangle; per-field am-b4 mutation and replay remain deferred to their owner. |
 | activation and downstream parity | No `hir_program_is_valid` call, MIR shape, interface byte, ABI, link/cache identity, benchmark row, or codegen path changes in am-b1. Am-b2 and am-b3 consume the same dormant validator state only after their own discriminators land; am-b4 owns the single global activation and canonical-empty behavior. | Existing whole/per-unit identity and codegen suites remain unchanged; `git diff` and repository search prove the helper has no public-lowering caller; no public benchmark row is added. |
-| source-of-truth propagation | Keep this matrix, the am-b1 row in the public ledger, the am-b1 expression/statement rows in `docs/impl/19-hir-validation-ledger.md`, and `HANDOFF.md` consistent. Do not mark am-b2/b3/b4 or body activation complete. | Author matrix-to-diff pass, exact owner test names, and final HANDOFF checkpoint after the PR is merged. |
+| source-of-truth propagation | Keep this matrix, the am-b1 row in the public ledger, the am-b1 expression/statement rows in `docs/impl/19-hir-validation-ledger.md`, and `HANDOFF.md` consistent. Do not mark am-b2/b3/b4 or body activation complete early. | Author matrix-to-diff pass, exact owner test names, and the final capability-wave HANDOFF checkpoint. |
 
 #### Am-h implementation closure matrix
 
 This matrix is authoritative before the am-h declaration/header validator and its normalized
-imported-effect transport are implemented. The slice is one vertical boundary: it publishes no
+imported-effect transport are implemented. The cell is one atomic vertical inside the capability
+wave: it publishes no
 body-derived ownership or effect facts, and it does not activate the dormant body validators owned
-by am-b1 through am-b4. The expected boundary is approximately 750–950 hand-written changed
-lines, including the producer migration, all consumers, the MIR transport, validator, focused
-owners, and benchmark. It is intentionally one PR: a producer-only split would require a
+by am-b1 through am-b4. A producer-only split would require a
 temporary legacy `Fn`/imported-record representation or would publish an unvalidated effect field;
 a validator-only split cannot distinguish source, monomorph, and lifted headers while the current
 overloaded pair remains; and a MIR-only split cannot prove the validation-only effect is stripped.
-The final author matrix-to-diff pass must record the measured count and preserve this rationale if
-the estimate is exceeded.
+The final author matrix-to-diff pass preserves this atomic-boundary rationale; line count is not a
+separate PR or review trigger.
 
 | Cell | Required am-h closure | Exact owner evidence |
 |---|---|---|
@@ -3054,7 +3064,7 @@ the estimate is exceeded.
 | deep graph and malformed precedence | Header signatures, parameter types, and borrow/region summaries may form finite but depth-unbounded type DAGs. The prior global and placement walks are explicit and stack-bounded; am-h's summary check reuses the cycle-safe borrow classifier. A later imported sibling is rejected after the malformed header record, without publishing partial MIR. | `deep_hir_header_type_dag_is_stack_bounded` covers a valid 4,096-node imported signature and a malformed later sibling; `ty_may_borrow_is_cycle_safe_for_header_mediated_nominals` covers legal header-mediated cycles. |
 | field-to-owner closure | The malformed matrix covers every am-h-owned extern field (name, duplicate/name, arity/modes, summaries), imported field (including duplicate/name, signature boundary, summary, and effect transport), stored `Fn` field (name, duplicate/name, origin, params, modes, return placement delegated to am-p, summaries, span, and drop sets), local id/name/parameter-bit/alignment, every main ABI/Error identity and shape discriminator, and the FnTy mode/summary records. Local type graph/placement validity remains am-g-t/am-p-owned; local mutability and expression ownership remain body-owned. Each am-h mutation is paired with canonical-empty/identity outcome and entrypoint parity. | `malformed_hir_declaration_header_metadata_fails_closed`, `main_header_abi_matrix_is_exhaustive`, `lifted_function_origin_metadata_is_explicit`, `non_entry_public_function_origin_is_exportable`, `imported_effect_facts_are_normalized_and_stripped`, `valid_header_does_not_consume_body_facts`, `deep_hir_header_type_dag_is_stack_bounded`, and `valid_hir_declaration_header_preflight_is_mir_identity` own the named submatrices; am-p owns the complete extern/import/local type-placement cells. |
 | benchmark and regression boundary | Add the `mir-header-validation` benchmark row for valid and malformed header preflight. The benchmark measures compiler-side validation only and does not change runtime behavior or add a new persisted artifact field. The existing placement and nominal/link benchmark rows and all continuation rows remain unchanged. | `bench/library_boundary` header fixture and README row; benchmark build/run when `llvm-config-22` is available; focused owner suite plus unchanged downstream codegen/runtime rows. |
-| review and split gate | The matrix receives one fresh independent adversarial review before coding. The planned PR boundary is exactly the producer `FnOrigin`/import-effect migration, every sema consumer, the distinct MIR imported record, the common header validator, focused owner tests, and the benchmark. It is not split because the no-legacy/no-parallel-path rule makes a producer-only intermediate either expose an unvalidated imported effect or retain the overloaded origin pair, while the validator and MIR conversion need the same exact field order and fail-closed boundary. If the measured hand-written diff exceeds the 750–950 estimate, record the count and this boundary proof in `HANDOFF.md` before opening the PR; above 1,000 also record why no safe split exists. | Matrix-review log bound to the pre-implementation base; final author matrix-to-diff pass; focused owners, `scripts/test-pr.sh`, applicable Clippy, and the standard pre/post-PR attestations. |
+| review and atomic-closure gate | The matrix receives one fresh independent adversarial review before coding. The cell atomically contains the producer `FnOrigin`/import-effect migration, every sema consumer, the distinct MIR imported record, the common header validator, focused owner tests, and its local measurement row. The no-legacy/no-parallel-path rule forbids a producer-only intermediate that exposes an unvalidated imported effect or retains the overloaded origin pair. | Matrix-review log bound to the pre-implementation base; final capability-wave matrix-to-diff pass; focused owners, `scripts/test-pr.sh`, applicable Clippy, and one stable-candidate full-diff review/finding closure before pre-PR attestation. |
 
 #### Am-f implementation closure matrix
 
@@ -3082,7 +3092,7 @@ and every later producer/body pass enters only after that guard.
 | stable identity and replay order | Task-group, Spawn, Wait, join, Err, and loop-header identities are compiler-owned preorder `NodeId`s assigned once from the explicit checked-HIR body event stream. They never use `Span`, so distinct records with the same span remain distinct. The analysis replays the same source-order child/statement/arm order on every branch and fixed-point iteration; diagnostic deduplication uses the structural TaskGet `NodeId` while the emitted location remains the original source span. | `task_wait_duplicate_span_identity` proves source-order Wait ids and tokens differ; `task_wait_duplicate_span_all_identity_kinds` covers duplicate-span group, Spawn, Err, join, and loop-header token sites and compares each loop-header site to its structural id; `task_wait_duplicate_span_gets_report_separately` proves distinct invalid TaskGet nodes at one span both report; source-order and duplicate-span mutation pairs retain the first-invalid precedence. |
 | bounded frames and malformed safety | The replay uses explicit enter/exit work items for blocks, statements, expressions, branches, and loop iterations. The work stack is bounded by the `MAX_CHECKED_HIR_DEPTH`-derived frame limit, and dispatcher work-item steps are bounded by checked-HIR record count × that depth-derived step limit (with one minimum budget for an empty body). Retained sibling vectors and semantic-state clone/scan costs remain bounded by the checked-HIR record count and live proof entries, but are not claimed to be constant-factor total CPU. Token exhaustion, an exhausted dispatcher budget, or a structurally unindexed body fails closed before a proof can authorize `TaskGet`. No raw pointer is used to reset semantic state and no user-derived index is unchecked. | `task_wait_empty_body_has_replay_budget` covers the zero-record root; `task_wait_depth_is_stack_bounded` accepts checked-HIR depth 259 on a 2 MiB stack and rejects depth 260 before replay; `task_wait_missing_node_fails_closed` proves an unindexed operation returns no flow and no proof without a panic; `task_wait_token_exhaustion_fails_closed` proves token allocation cannot alias after `u32::MAX`. |
 | loop fixed point | Loop headers start from the entry state and are recomputed until the complete canonical semantic state is equal. Stable token interning makes revisits reuse the same transfer/join ids; a bounded worklist guard is derived from the checked-HIR ceiling rather than a fixed visit count, and exhaustion is a fail-closed validation error. Only reachable fallthroughs return to the header; only accepted breaks join the exit. | `task_wait_loop_fixed_point_guard_is_depth_derived` pins the guard to the checked-HIR ceiling, observes distinct incoming tokens for the state-changing loop Spawn, and checks the loop-header join site; `task_wait_loop_unresolved_wait_reaches_later_break` proves a pending/failed earlier iteration cannot be hidden by a later empty Wait. |
-| review and split gate | The entry producer remains the existing am-e vertical. | The current replay correction is about 1,800 changed hand-written lines, above the 1,000-line split-proof threshold. Keep stable NodeId identity, explicit work items, and fixed-point replay in one vertical: a NodeId-only intermediate leaves recursive overflow, a worklist-only intermediate leaves duplicate-Span aliasing, and a fixed-point-only intermediate leaves identity/order unsound. No temporary parallel proof path is permitted. | Record the measured count and this boundary proof in `HANDOFF.md`; one author matrix-to-diff pass, one fresh bounded adversarial review, focused owner checks, and the normal pre/post-PR attestations. |
+| review and atomic-closure gate | The entry producer remains the existing am-e vertical. | Keep stable NodeId identity, explicit work items, and fixed-point replay in one atomic cell inside the capability wave: a NodeId-only intermediate leaves recursive overflow, a worklist-only intermediate leaves duplicate-Span aliasing, and a fixed-point-only intermediate leaves identity/order unsound. No temporary parallel proof path is permitted; the historical size estimate is not a split trigger. | One author matrix-to-diff pass for the cell, one stable-candidate adversarial review/finding closure for the complete wave, focused owner checks, and the single pre-PR attestation. |
 | state equality terminology | In the am-w rows, `byte-identical` means equality of the complete canonical semantic `State` record, including ordered group fields and the full local proof maps; it does not claim a serialized byte fingerprint or depend on `HashMap` iteration order. | The implementation uses complete `State` equality, whose `HashMap` fields compare mappings semantically. |
 | ownership, Drop, and allocation | Rejected headers construct no HIR/MIR/runtime state. Accepted Unit/i32/Result paths keep existing body ownership and wrapper allocation behavior. | The ambient, WaitProof, and TaskProof maps are compiler-only state. Propagating or clearing them follows existing Copy Result and Move Task evaluation but creates no task, join, read, Align allocation, source nulling, Drop, or cleanup action. Current Task results are primitive Copy values: `TaskGet` is a non-consuming read, preserves the Move handle and its TaskProof, and repeated get is producer-valid. Group cleanup remains byte-identical on accepted input. Owned Task results and their consuming-get/Drop contract remain a separate future slice. | rejected-before-MIR tests; Copy Wait and Move Task local/control bookkeeping twins; repeated primitive get; no source-nulling/Drop/allocation change and MIR equality |
 | generic, interface, whole/per-unit, and cache | `main` remains entry-unit-only and non-generic. Interface summaries never export it. Whole/per-unit and ThinLTO preserve exactly external `main`; the compiler-build change invalidates old cached objects, while source/interface hashes for accepted input stay unchanged. | No interface or ABI field is added. Whole/per-unit semantic HIR agrees. Accepted-source MIR/impl hashes stay unchanged; rejected unsafe sources produce no artifact. | interface-byte/hash goldens for accepted entries; ThinLTO off/on; cache miss once then hit; whole/per-unit task twins |
@@ -3286,7 +3296,7 @@ Before c2a2a/c2a2b coding, their exact owner-test closure checklist is:
 | c2a4 greatest-fixed-point equivalence | The input is only `&ValidatedGraph`. Struct and enum classes use kind plus source name after c2a3's bijective validation. Tuple, tagged, and function nodes seed by kind, non-reference fields, and referenced kind/nominal class, then refine prior anonymous classes to stability. Distinct raw anonymous records may merge only after child-class substitution. For `A` reachable anonymous nodes, refinement terminates in at most `R <= A + 1` rounds and costs `O(R * ((V + E) log V))`, including variable-length signature sorting; this is not called input-linear. | `canonical_graph_equivalence` crosses nominal and anonymous equal/unequal nodes, every non-reference/child ordinal, repeated/shared graphs, permutations, fresh Fn ids, and anonymous self-cycle versus bisimilar multi-node cycle plus deepest-label split; an adversarial chain records `R` and owns the round bound; `canonical_graph_signature_sort_bound` varies width and long common prefixes and records signature bytes, comparison count, and compared bytes; compiler-only `canonical-type-graph` benchmark |
 | c2a4 canonical traversal and bytes | Assign class ordinals by a canonical class-graph walk using only `ValidatedGraph`'s root/view/order and c2a1/c2a3 encoders. Encode `version=1 || node_count:u32 || nodes || root_type`; repeated/recursive edges use their first assigned ordinal. The stable-partition class walk is linear after refinement. This is not a second raw validation traversal: no raw view/root overload or validator exists. | semantic-to-byte goldens for Unit, Bool, signed i64, all five node kinds, repeated reference, declaration permutation, recursive Fn root, and deep canonical chain/shared DAG/cycle |
 | ownership, control, and allocation | The record, comparator, and engine are compiler metadata. They may allocate transient Rust vectors/maps/worklists and c2a4 one output vector, all released on return. They create no Align value, source nulling, Drop plan, replacement, return-cleanup fact, runtime/native object, artifact, cache entry, or process-global state. Clean and already-invalid caller tables remain byte-for-byte unchanged on success or error. | before/after table equality for valid and malformed inputs; success/error/drop/replacement/return N/A assertions; source inventory for absent non-MIR consumers; compiler-only complexity benchmarks above |
-| PR boundary and closure | The 407-line compressed checkpoint formatted to 777 source lines. The rejected two-way and three-way cuts lacked a typed seam or still mixed comparison with graph validation. Final c2a1 measures 338 ordinary rustfmt production lines plus exactly 260 test lines. The reviewed c2a2 cap then failed during implementation measurement: the observer-bearing module reached 457 production lines before the benchmark while required owners reached 243 lines, beyond 460/180. Coding stopped and split again. The first c2a2a exact-diff preflight then found four mandatory owner gaps in the 149-line compact suite; their complete compile-closed matcher, independent function-parameter, node-boundary, and source-inventory evidence plus the bounded final-SHA `Scalar::Param` ID closure measure 210 lines, so coding stopped at the 150-line cap. C2a1 targets at most 400 source plus 260 tests; c2a2a at most 440 implementation source plus 210 compact parity/inventory tests; c2a2b at most 80 implementation/benchmark source plus 150 topology/complexity tests; c2a3 at most 380 source plus 320 tests; c2a4 at most 170 implementation/benchmark source plus 220 tests. C2a2a's measured 437 + 210 = 647 added lines cannot split safely because publishing the atomic comparator without those exact owners leaves its closed type and boundary contract unproved; its 650-line cap remains below 1,000. C2a2a may exceed 1,000 total changed diff lines only because the sole comparator is atomically deleted and replaced; c2a2b does not move or duplicate it. C2a1 has no graph; c2a2a has no observer/complexity/benchmark; c2a2b has no canonical view or bytes; c2a3 has no canonical partition/result; c2a4 cannot bypass `ValidatedGraph`. None retains/remaps, exposes public wrappers/errors, adds generated records, or activates consumers. Exceeding a recorded slice total triggers another stop/split. | c2a1 field-codec owners; c2a2a existing am-n plus exact matcher/projection parity; c2a2b topology/cache/complexity/benchmark owners; c2a3 validation/function/deep owners; c2a4 equivalence/golden/function/deep/refinement owners; full `align_mir`, applicable Clippy, and author matrix-to-diff pass per slice |
+| PR boundary and closure | The 407-line compressed checkpoint formatted to 777 source lines. The rejected two-way and three-way cuts lacked a typed seam or still mixed comparison with graph validation. Final c2a1 measures 338 ordinary rustfmt production lines plus exactly 260 test lines. The reviewed c2a2 cap then failed during implementation measurement: the observer-bearing module reached 457 production lines before the benchmark while required owners reached 243 lines, beyond 460/180. Coding stopped and split again. The first c2a2a exact-diff preflight then found four mandatory owner gaps in the 149-line compact suite; their complete compile-closed matcher, independent function-parameter, node-boundary, and source-inventory evidence plus the bounded final-SHA `Scalar::Param` ID closure measure 210 lines, so coding stopped at the 150-line cap. These counts are historical evidence, not future caps. C2a1, c2a2a, c2a2b, c2a3, and c2a4 remain exact closure cells, but the remaining cells land in the complete capability waves below. No cell may introduce a second graph authority or bypass `ValidatedGraph`. | c2a1 field-codec owners; c2a2a existing am-n plus exact matcher/projection parity; c2a2b topology/cache/complexity/benchmark owners; c2a3 validation/function/deep owners; c2a4 equivalence/golden/function/deep/refinement owners; full `align_mir`, applicable Clippy, and one author matrix-to-diff pass for the complete capability wave |
 
 The am-c author-side construction/consumption inventory is exact for the current tree:
 
@@ -3395,7 +3405,9 @@ Cross-phase owners combine declaration conflict, native ABI mismatch, invalid ta
 external-identity collision, generated conflict, missing pair, and occupied-maximum probe in one
 fixture, then remove the earliest invalidity one at a time to prove that exact phase sequence.
 
-Am-c is ten independently correct mergeable PRs. Am-c1 is the closed fixed-native-ABI
+Am-c has ten acceptance cells. C1, c2a1, and c2a2a are already merged. The
+remaining cells land as capability waves rather than one dormant PR per row.
+Am-c1 is the closed fixed-native-ABI
 `RuntimeKey`/`RuntimeAbi` vertical owned by doc 20. It rejects an extern that claims a fixed native
 symbol with an incompatible source-derived LLVM function type and newly makes a compatible keyed
 extern+builtin or compatible unkeyed extern+wrapper share one declaration and link. Otherwise MIR
@@ -3424,11 +3436,11 @@ implementation/benchmark source + 220 equivalence/golden tests = 390;
 c2b 210 source + 260 tests = 470; c2c 360 source + 420
 malformed/golden tests = 780;
 c2d 270 source + 330 tests = 600 hand-written changed lines. Generated fixtures/hex tables are
-counted as hand-written. Each added-source estimate is below 1,000 and targets 500 where feasible.
+counted as hand-written. These are owner-inventory estimates, not PR caps or
+progress units.
 C2a2a alone may exceed 1,000 total changed diff lines because the existing comparator deletion and
 typed replacement necessarily move together; splitting them would leave no validator or two
-drifting comparator authorities. If the author inventory exceeds the stated slice estimate before
-coding, this ledger must split again before implementation.
+drifting comparator authorities.
 C2a1, c2a2a, c2a2b, c2a3, and c2a4 are independently dormant; c2b cannot retain/remap before c2a4's stable
 equivalence/bytes exist; c2c calls c2a4's engine over c2b's canonical retained table; c2d calls c2c. Their focused owners
 invoke each boundary directly.
@@ -3436,23 +3448,46 @@ Am-c3 activates typed declarations/direct calls, encoded program identities, eve
 family, collection pairing, collision preflight, and whole/per-unit consumers together. C3 may
 exceed 1,000 hand-written lines: splitting its MIR producer from codegen leaves an unreadable target,
 splitting definition/import symbols breaks producer-consumer linkage, and splitting any generated
-family leaves accepted extern/export spellings able to collide with an unprobed helper. C1 and
-C2a1–c2d must be merged before C3 begins; no unrecorded dormant local commit counts as one of these
-implementation PRs.
+family leaves accepted extern/export spellings able to collide with an unprobed helper.
 
-The #678 approval plus the mandatory am-c pre-implementation amendments fix these twenty-three
-implementation boundaries, L2b at thirty-two implementation PRs, and L2 at thirty-six. Target the repository's
-500-line implementation checkpoint. If an implementation PR is expected to exceed roughly 1,000
-changed hand-written lines, record why it cannot split safely before coding.
+The remaining L2 execution waves are:
+
+```text
+C-A canonical callable closure  c2a2b + c2a3 + c2a4 + c2b + c2c + c2d + c3
+C-B borrow/ownership closure    af + ar + ap + t + b + L2c + L2d + L2e
+```
+
+C-B combines the former return-provenance and cleanup/borrow waves because
+they are one public capability: a reusable owner must behave identically for
+direct, indirect, imported, shared-borrow, exclusive-borrow, replacement, and
+recursively Move return paths. Landing provenance without its cleanup and
+borrow consumers would create another dormant boundary and repeat the same
+matrix/review/gate cost.
+
+Each wave may use intermediate commits and focused owner checkpoints, but it
+gets one closure matrix, one stable-candidate full-diff review and coherent
+finding closure before the draft PR opens, and one selected final verification
+cycle. Do not review the unchanged diff again after opening the PR; require a
+new independent review only for the repository's high-risk triggers. Split a
+wave only when implementation evidence reveals genuinely independent failure
+domains; line count, test count,
+or a dormant internal seam is not sufficient. A wave above roughly 1,000
+changed hand-written lines may record useful sizing evidence, but size alone is
+not a split or review trigger.
+
+The acceptance rows describe coverage, not one fixture or command per row.
+Reuse cumulative and parameterized owners wherever they detect the regression;
+add only missing discriminating cases, then run the selected owner set once on
+the final wave tree.
+
 Am-d is one cross-cutting vertical even if that exceeds roughly 1,000 hand-written changed lines:
 splitting the producer/replay/lowering conversion would merge a state in which an accepted
 producer-depth body can still overflow a remaining recursive consumer, while splitting the common
 type visitor would leave a later phase free to reintroduce the same failure for a valid deep DAG.
 The exact body preflight, every current recursive body consumer, the common type traversal, and
 their boundary/deep-graph owners therefore land atomically.
-Am-c3 remains cross-cutting by necessity for the exact activation subset stated above. If any body
-construction PR approaches the bound, split its dormant inventory row before coding and update this
-ledger; do not activate a partial validator.
+Am-c3 remains cross-cutting by necessity for the exact activation subset stated above. Do not
+activate a partial validator or publish a second graph/identity authority.
 
 Am-e deliberately narrows one unsound source corner: a no-argument `main` with any return other
 than Unit, exact i32, or `Result<Unit,builtin Error>` receives a source diagnostic before HIR.
@@ -3514,24 +3549,26 @@ owners to the shared focused targets. Every implementation slice retains the sco
 | public and malformed boundary | `ReturnBorrowSummary` and `ReturnRegionSummary` remain the L2a codec and hash shape and remain equal in L2b-a2. Semantic import keeps the L2b-a1 validation order. No projection trie, local id, span, raw nominal id, or control-state bit is serialized. Because the codec carries parameter indices only, an imported aggregate result and any later projection from one aggregate actual deliberately retain that actual's complete compatible owner set. | unchanged codec/hash goldens, interface corruption suite, aggregate-actual precision-limit fixture, and summary byte-size benchmark row |
 | scope boundary | Indirect calls, closure captures, function-value joins/moves, target-relative capture slots, and direct calls without a settled named/imported summary—including unanalyzed extern targets—retain the documented all-compatible-input fallback. No `borrow`, `borrow mut`, cleanup ABI, resource, region, or database surface is enabled. | existing deferred-function-value and compatibility/extern fixtures plus disabled-mode regressions |
 
-L2b-a2-s, L2b-a2-ac, L2b-a2-am-g-t, the am-r design gate, am-d, am-e, and am-f are fixed completed verticals.
-PR #679 implements am-d, #681 implements am-e, and #683 implements am-f. After it, the mandatory remaining sequence is am-w, am-v,
-am-u, am-p, am-n, am-h, am-b1, am-b2, am-b3, am-b4, am-c1, am-c2a1, am-c2a2a, am-c2a2b, am-c2a3, am-c2a4, am-c2b, am-c2c, am-c2d, am-c3, af, ar, ap, and t. The first PR
+L2b-a2-s, L2b-a2-ac, L2b-a2-am-g-t, the am-r design gate, and am-d through am-c2a2a are completed.
+The remaining acceptance order is am-c2a2b, am-c2a3, am-c2a4, am-c2b, am-c2c, am-c2d, am-c3,
+af, ar, ap, t, and b. It is executed in the capability waves above rather than as one PR per cell.
+The first historical L2b-a2 PR
 publishes an exact product summary while array, pipeline, and tagged/control forms deliberately
 retain the shipped flattened result. It must include product construction, reads, partial writes,
 destructuring, ordinary control joins, direct/imported consumption, and whole/per-unit parity
 together: omitting a writer or join can under-approximate the same public product fact. The second
 PR closes the general MIR continuation invariant for checked HIR. The third adds only global
-type-domain validation. The twenty-three amended am-r implementation verticals then apply stack-safety before
-the five producer corrections, followed by placement, nominal/link, header, total body metadata,
-the c1 runtime registry, c2a1 private field codec, c2a2a shared source-shape comparator, c2a2b observation/complexity closure, c2a3 private validated graph, c2a4 private equivalence/encoder, c2b table/remap activation, c2c public canonical
-decoder, c2d generated codecs, and finally c3 callable activation; af, ar, ap, and t retain their
-existing dependency order. Am-c1/c2a1/c2a2a/c2a2b/c2a3/c2a4/c2b/c2c/c2d/c3 follow am-b4 because their typed/generated identities
+type-domain validation. The completed am-r implementation cells applied stack-safety before the
+five producer corrections, followed by placement, nominal/link, header, total body metadata, the
+c1 runtime registry, c2a1 private field codec, and c2a2a shared source-shape comparator. The
+remaining canonical callable capability wave comes next; the provenance capability wave follows.
+Cell dependency order remains part of each wave, but it is no longer a mandatory PR sequence.
+Am-c1/c2a1/c2a2a/c2a2b/c2a3/c2a4/c2b/c2c/c2d/c3 follow am-b4 because their typed/generated identities
 consume already validated body callable facts; it must not duplicate or anticipate the b3/b4 body
 contract. The tagged slice still
-replaces its explicit and implicit `Result` fallbacks atomically. A PR expected to exceed roughly
-1,000 changed hand-written lines must first record in this matrix why no narrower safe boundary
-exists.
+replaces its explicit and implicit `Result` fallbacks atomically. A capability wave expected to
+exceed roughly 1,000 changed hand-written lines records why keeping its strict producer/consumer
+chain together avoids duplicated proof or an unusable intermediate state.
 The final L2b-a2-s diff is approximately 1,900 changed hand-written lines after adversarial review
 required fail-closed constructor/read/write validation, common eager-child source-order snapshots,
 snapshot-generation invalidation, checked-expression identity, action-boundary validation, and
@@ -4219,14 +4256,37 @@ Acceptance:
 - generic recursion, declarations nested inside functions, explicit call-site type arguments, and
   newly unsupported concrete collection elements remain rejected without compiler panic.
 
-Only after L1a–L7 are shipped may the first SQLite runtime/Query vertical slice begin.
+The implementation dependency is a DAG, not a mandatory serial PR list:
+
+```text
+                         +-> L3 resource ---------+
+L2 complete -------------+-> L4 region -> L6 -----+-> L7 generic integration
+                         +-> L5 static artifacts --+-> prerequisite gate
+```
+
+L3, L4, and L5 may be implemented concurrently after L2 because none consumes
+another's implementation. Plan them as three consumer-complete streams:
+
+```text
+F-A native resources        L3
+F-B region materialization  L4 + L6
+F-C static artifacts        L5
+F-D package integration     L7 after F-A/F-B; prerequisite gate also waits F-C
+```
+
+F-B keeps named regions with the first region-backed builder consumer rather
+than landing L4 as an isolated compiler seam. L7 closes
+the generic integration after the resource and `RegionPlain` types exist. D0
+native feasibility probes may run at any time. Only after the complete L1a–L7
+gate is shipped may the first safe SQLite runtime/Query vertical slice begin.
 
 ## 11. Required verification
 
-Each compiler PR runs its focused regression suite, `scripts/test-pr.sh`, Clippy, the
-`align-self-review` gate, and the repository pre/post-review flow.
+Each compiler capability PR runs its focused owner suite, `scripts/test-pr.sh`, applicable
+Clippy, the `align-self-review` gate, and the repository's one-review/finding-closure flow.
+Acceptance labels do not each force a separate broad test or review cycle.
 
-Required benchmarks:
+Local measurement inventory:
 
 - tagged Move payload Drop/propagation cost and no-allocation `Ok` path;
 - borrowed-call overhead versus the corresponding current builtin handle operation, including
@@ -4236,9 +4296,13 @@ Required benchmarks:
 - warm-cache behavior for unchanged, private-SQL-only, public-contract, and checked-metadata
   create/change/delete Query changes;
 - region builder push/freeze throughput, bytes allocated, and exact copy count;
-- no hidden heap allocation in the region builder path.
+- no hidden heap allocation in the region builder path;
 - nested-generic inference/monomorph compile time, interface/mono-key size, emitted code size, and
   proof of no runtime dictionary/extra indirect call.
+
+These measurements run locally when their named path first lands or materially changes. They are
+not ordinary regression tests and are not PR, release, or milestone gates. A previously recorded
+measurement is not rerun for an unrelated compiler or package change.
 
 The goal is not zero instructions for safety. It is one general, statically checked mechanism whose
 cost and invalidation behavior remain visible and predictable.

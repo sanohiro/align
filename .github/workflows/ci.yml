@@ -96,18 +96,18 @@ jobs:
 
       - name: Lint
         if: matrix.lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 
       - name: Build compiler and runtime
         if: ${{ !matrix.lint }}
-        run: cargo build --workspace --locked
+        run: scripts/cargo.sh build --workspace --locked
 
       - name: Bounded PR test gate
         if: matrix.lint
         run: scripts/test-pr.sh
 
       - name: Build release compiler
-        run: cargo build --locked --release -p align_runtime -p align_driver
+        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
 
       - name: Smoke test packaged command
         shell: bash

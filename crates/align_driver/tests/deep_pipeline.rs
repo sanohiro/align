@@ -247,7 +247,10 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
         .expect("deep-pipeline worker panicked");
 }
 
+/// Run locally with `scripts/cargo.sh test -p align_driver --test deep_pipeline
+/// equal_llvm_harness -- --ignored --nocapture`.
 #[test]
+#[ignore = "benchmark harness; run locally for deep-pipeline performance work"]
 fn equal_llvm_harness_checks_all_depth_shapes_and_results() {
     if !(backend_available()
         && clang22_available()

@@ -6,7 +6,9 @@
 //! `FunctionImporter` on its own). The shim links against the SAME libLLVM-22 the
 //! workspace already links via llvm-sys (prefer-dynamic), so there is a single
 //! LLVM in the process. Requires `llvm-config-22` on PATH and the LLVM 22 C++
-//! headers (`llvm-22-dev`) — already workspace prerequisites.
+//! headers (`llvm-22-dev`) — already workspace prerequisites. Local repository
+//! commands use `scripts/cargo.sh`, which resolves the platform-specific LLVM
+//! 22 location and sets `LLVM_CONFIG`/`LLVM_SYS_221_PREFIX`.
 //!
 //! The shim also carries the production instrument-PGO entry
 //! (`align_pgo_run_pipeline`) — no `PGOOptions` C surface exists, so `--pgo-*`

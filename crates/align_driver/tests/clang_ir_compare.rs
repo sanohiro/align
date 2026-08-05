@@ -33,7 +33,10 @@ fn harness_dir() -> PathBuf {
         .expect("bench/clang_ir_compare exists")
 }
 
+/// Run locally with `scripts/cargo.sh test -p align_driver --test clang_ir_compare
+/// harness_runs -- --ignored --nocapture`.
 #[test]
+#[ignore = "measurement harness; run locally for LLVM-shape comparison work"]
 fn harness_runs_and_emits_the_comparison_table() {
     if !(cfg!(target_arch = "x86_64") && backend_available() && clang22_available()) {
         return;

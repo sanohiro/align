@@ -4,6 +4,66 @@ Milestones. The principle is as in `00-overview.md` — **fix the whole design f
 
 ---
 
+## Current forward plan — `pkg.db`
+
+`HANDOFF.md` is the live implementation-status record. The exact prerequisite
+contracts are in `17-library-boundary-prerequisites.md`; the product contract and
+delivery dependencies are in `pkg-design/db.md` §23. The long milestone record
+below is historical evidence, not a second backlog.
+
+The current plan is a consumer-capability DAG, not one PR per acceptance label:
+
+```text
+L1a + L1b complete
+        |
+        v
+C-A canonical callable
+        |
+        v
+C-B borrow/ownership
+        |
+        +-> F-A resources ---------+
+        +-> F-B region+builder ----+-> F-D package integration
+        +-> F-C artifacts ---------+
+                                  |
+                                  v
+                         Q1 static Query (D1)
+                                  |
+                                  v
+                   Q2 dual-driver scalar (D2+D4)
+                         +-> Q4a reusable -> Q4b streaming -> Q6 compound --+
+                         +-> Q3 checked/offline -> Q5a migrations -----------+-> initial release
+                                                +-> Q5b metadata/EXPLAIN ----+
+```
+
+C-B combines return provenance with cleanup and public borrow semantics because
+they exercise the same direct/indirect/imported ownership matrix. F-A/F-B/F-C
+run concurrently; F-B combines L4 and L6 so named regions land with a useful
+materialization consumer. Q2 implements both drivers against one common
+surface, Q3 implements both checked-metadata codecs together, Q4a closes
+prepared/transaction reuse, and Q4b closes streaming/cancellation resilience.
+Q3 starts alongside Q4a after Q2; Q5a/Q5b follow Q3;
+D11 mutation and D12 read-only inspection may be two parallel PRs because they
+are independently useful failure domains. Q6 follows Q4b. The first public
+database release waits for Q5a/Q5b and Q6. The runtime path
+Q4a → Q4b → Q6 and tooling path Q3 → {Q5a,Q5b} proceed in parallel after Q2.
+
+D13 and D14 are committed follow-on release trains, not unspecified ideas. A1/D13
+builds on the typed streaming/cancellation/compound paths; A2/D14 builds on both
+drivers and the proved cancellation/callback rules and does not depend on D13.
+Their independently useful common/driver rails may proceed in parallel; no
+unrelated native surface waits merely for an earlier bullet in the same D label.
+For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
+**complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
+disposable native evidence and may run in parallel at any time.
+
+Every wave must produce a compiling, focused-owner-backed checkpoint within
+eight active hours and a PR-ready capability within twenty-four active hours,
+unless it is waiting only on one still-progressing required command or external
+CI. Missing that outcome causes a time-cost audit and consumer-boundary re-cut;
+it does not cause a documentation-only checkpoint or an automatically smaller
+dormant PR.
+
 ## Status & forward plan (historical snapshot)
 
 This section captures the sequence as of the date printed below. It is not a live backlog:
@@ -3540,7 +3600,7 @@ audit structural item is the explicit value-carrying-control-flow region/move/dr
 
 `pkg.db` establishes a concrete consumer for seven language/compiler gaps that are general to
 ordinary native-backed packages. They are not optional database polish and must land before a
-SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptance matrix are
+SQLite or PostgreSQL driver vertical. The design of record and exact capability acceptance matrix are
 `17-library-boundary-prerequisites.md`; the database sequence that follows is
 `pkg-design/db.md` §23. The feasibility findings and revision rationale are
 `18-pkg-db-review.md`.
@@ -3588,8 +3648,9 @@ owned `Option` field remain explicit L1b diagnostics. The focused ownership and 
 plus the alloc-count probe pin balanced Some frees, zero None allocations, and the raw LLVM tag
 guard.
 
-L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
-they are being built, but no probe API becomes public. Its recorded SQLite/libpq evidence includes
+L1a–L7 are prerequisite capabilities connected by the DAG above, not a mandatory serial PR list.
+D0 is a disposable ABI probe and may run while they are being built, but no probe API becomes
+public. Its recorded SQLite/libpq evidence includes
 the exact engine/version origin and result-nullability information actually available; catalog
 `NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database,

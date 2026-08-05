@@ -82,7 +82,7 @@ jobs:
           echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
 
       - name: Build compiler
-        run: cargo build --locked --release -p align_runtime -p align_driver
+        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
 
       - name: Smoke test compiler
         shell: bash

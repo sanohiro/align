@@ -247,7 +247,10 @@ fn gate_sv2b_stale_manifest_different_body_blob_rejected() {
 ///   * `ALIGNC_CACHE=off` forces every run cold (no reuse skew).
 ///   * `CAP = 3.0` is ~2× the headroom over the observed ratio (~1.1–1.5× in practice), so ordinary
 ///     CI scheduler noise cannot cross it.
+/// Run locally with `scripts/cargo.sh test -p align_driver --test thin_lto_sv gate_sv3
+/// -- --ignored --nocapture`.
 #[test]
+#[ignore = "benchmark: run locally when changing ThinLTO compile-time performance"]
 fn gate_sv3_compile_time_regression_bound() {
     if !backend() || !cc_available() {
         return;

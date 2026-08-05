@@ -1752,7 +1752,11 @@ callerへ返さない。transparent retryはない。
 packageが自動でsplit/追加SELECTしない。native aggregation、batch、COPY/SoAは測定して
 driver-qualified pathとして追加する。
 
-### 21.3 benchmark anchor
+### 21.3 local measurement anchor
+
+次のnamed local measurementを保つ。named pathが最初にlandする時、実質的に変わる時、または
+明示的なperformance investigationで実行する。regression、integration、PR、release、
+milestone gateではない。
 
 - generated binder/decoder対hand-written native loop;
 - SQLite package path対direct libsqlite3;
@@ -1799,6 +1803,44 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 
 ## 23. Roadmap
 
+実装は少数の前提capability PRとvertical capability PRで進める。roadmap labelは
+acceptance closureのownerであり、labelごとに別PRを要求しない。database PRが不足する
+前提をpackage名special caseで代替してはならない。
+
+以下のD1〜D14 contractは変更しない。deliveryはusefulなconsumer outcomeでまとめる。
+
+| Wave | Acceptance owner | Mergeable outcome | Default publication boundary |
+|---|---|---|---|
+| P0 native evidence | D0 | public APIなしでSQLite/libpq behaviorを記録 | product PRにせず前提実装と並行 |
+| Q1 static Query | D1 | generated Query/commandがfake driverでend-to-end実行 | 1 capability PR |
+| Q2 dual-driver scalar | D2 + D4 | 同じscalar Query/command surfaceがSQLite/PostgreSQLで動く | 1 coordinated capability PR |
+| Q3 checked/offline parity | D3 + D5 | 両driverが1つのoffline checked-metadata/invalidation contractを共有 | 1 coordinated capability PR |
+| Q4a reusable execution | D6 + D7 | prepared statementとtransactionが1つのreusable execution/ownership modelを共有 | Q2後、Q3と並行する1 capability PR |
+| Q4b streaming resilience | D8 + D9 | typed streaming、deadline、cancellation、cleanupが1つのresilient lifecycleになる | Q4a後の1 capability PR |
+| Q5 schema tooling/inspection | D11 + D12 | migrationとread-only metadata/EXPLAINでschema-facing productを完成 | mutationとinspectionは独立failure domainなので2 parallel capability PRを許可 |
+| Q6 compound product | D10 | many-to-one/one-to-many Outputを1 executionでend-to-end実行 | Q4b後の1 capability PR |
+| A1 throughput/native train | D13 | batch/SoAとdriver-native throughput surface | independently usefulなcommon/driver railを並行merge可能 |
+| A2 dynamic/callback train | D14 | dynamic rowとproved native callback | dynamic SQL/driver callback railを並行merge可能 |
+
+Q1〜Q4b/Q6は内部D labelで分割しない。両側がend-to-end実行し、独立に有用で、同じmatrix、
+review、broad gateを繰り返さない時だけ分割する。Q5はmigrationがexternal stateを変更し、
+metadata/EXPLAINがread-onlyであるため意図的な例外とする。A1/A2はadditive release trainで
+あり、独立native railを直列化しない。ただしcomplete-roadmap statusはD13/D14の全
+acceptance cellを待つ。
+
+A1のdefault railはcommon batch/SoA、PostgreSQL native throughput、SQLite native service、
+explicit poolの4つとする。A2はdynamic SQL/value/row railの後、独立にproveしたSQLite/
+PostgreSQL callback railを進める。rail内は複数commitを使えるが、useful surfaceがstableに
+なった時にreviewとselected broad gateを1回だけ行う。未指定の追加driverはcompletionに
+必須ではなく、common contract実証後にconsumer-backed railとして追加する。
+
+active implementationでは8時間でcompiling focused-owner-backed source checkpoint、24時間で
+whole capability PR-ready、またはindependently usefulなA1/A2 railを残す。達しない場合は
+dominant costを記録し、最寄りのconsumer boundaryで区切り直す。dormant seam、document拡張、
+repeated broad review、変更pathと無関係なbenchmark/full suiteで埋め合わせない。reviewと
+broad verificationはstable wave candidateで1回だけ行い、public contractが変わる時だけ
+documentを更新する。
+
 ### L1a〜L7 — 必須Align前提
 
 詳細scope、file、acceptanceは
@@ -1819,7 +1861,8 @@ L6  RegionPlain region array_builder
 L7  nested generic package API + closed structural RegionPlain bound
 ```
 
-この順で実装し、完了前にsafe DB driver APIを始めない。L7により通常package codeで
+依存DAGに従い、独立なL3/L4/L5を直列化しない。全L1a〜L7 gateの完了前にsafe DB driver
+APIを始めない。L7により通常package codeで
 `rows_stmt<P,R>`、`all<P,R: RegionPlain>`、`query<P,R>`、`rows<R>`、`array<R>`を表現できる。
 
 ### D0 — native feasibility probe
@@ -1840,7 +1883,8 @@ reachable definitionを含むstructural Params/Row contract/fingerprintとbinder
 versionをserializeし、independent byte/digest goldenとsame-path field
 name/order/type/Option変更のinvalidationを固定する。producer-owned Declared QueryMeta
 plan/materialization thunkも生成し、separate compiled Queryでruntime artifact/source I/Oなしを
-testする。reflectionとper-row name lookupがないことをbenchmark/IRで確認する。
+testする。reflectionとper-row name lookupがないことをtest/IRで固定し、このpathが最初に
+landする時または実質的に変わる時だけlocal measurementを行う。
 
 ### D2 — 最小SQLite vertical
 
@@ -1857,7 +1901,8 @@ testする。reflectionとper-row name lookupがないことをbenchmark/IRで�
 - 全pathでclose/finalize exactly once。
 
 text view、all、stream、transaction、migration、dynamic row、metadata catalog、追加native
-breadthは含めない。direct libsqlite3 loopと比較する。
+breadthは含めない。このpathが最初にlandする時または変わる時だけ、named local
+measurementでdirect libsqlite3 loopと比較する。
 
 ### D3 — checked metadata core + SQLite
 
@@ -1883,7 +1928,8 @@ raw byteaはBinary formatだけでexplicit length付きにする。
 local開発では未設定時に理由付きskipできるが、D4 merge/DB releaseでは
 `ALIGN_DB_POSTGRES_REQUIRED=1` のrequired `db-postgres` CIがpinned ephemeral serverを
 provisionし、skip/接続不能をfailureにする。同じjobでportable Queryを両driverに実行する。
-direct libpq benchmarkは通常PRではenvironment-gatedだがD4初回/release evidenceでは必須。
+direct libpq comparisonはD4が最初にlandする時またはその実行pathが変わる時のlocal
+measurementであり、無関係なPR、integration suite、database release gateには含めない。
 
 ### D5 — PostgreSQL checked metadata
 
@@ -1900,7 +1946,8 @@ option sumとdisposition test、
 `rows_stmt` の `borrow mut` statement parameter、rows Drop後のsequential reuse、
 text/blob rebind時の旧transient copy解放、partial-bind failureの全binding/Params cleanup、
 全path finalize/close、
-implicit global cacheなし。prepared/common/reprepare costを別々に測る。
+implicit global cacheなし。pathが最初にlandする時または変わる時だけ
+prepared/common/reprepare costをlocalに別々に測る。
 
 ### D7 — transaction/common exec view
 
@@ -1979,10 +2026,31 @@ notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明
 
 ### 初期release gate
 
+D labelはacceptance ownershipを表す。publicationは上記delivery waveに従う。
+
+```text
+prerequisite gate -> Q1 -> Q2
+                           +-> Q4a reusable -> Q4b streaming -> Q6 compound --+
+                           +-> Q3 checked/offline -+-> Q5a migrations -------+-> initial release
+                                                   +-> Q5b metadata/EXPLAIN -+
+
+P0は最初のnative product wave前に並行実行する。
+```
+
+Q2はD2/D4を一緒に閉じ、common APIのdriver driftを防ぐ。Q3も同じ理由でD3/D5を一緒に
+閉じる。Q3とQ4aはQ2後に並行開始する。Q4aはD6/D7のprepared/transaction reuse、Q4bは
+D8/D9のstreaming/cancellation resilienceを閉じ、それぞれuseful capabilityを1回だけ
+publish/reviewする。Q5a/Q5bはQ3後に
+並行でき、Q5aはD3がownerのshared migration identityも使う。Q6はQ4b後に進む。
+
 L1a〜L7と、driver-relevantなD1〜D12をSQLite/PostgreSQL両方で満たす。D11のSQL
 migration lifecycleとD12のcategory metadata/明示Query planも、それらを約束する初期
 release gateに含む。D13〜D14はbatch/SoA/native breadth、dynamic SQL、proved callbackの
 committed additive roadmapである。
+完了報告では、初期 `pkg.db` releaseをL1a〜L7 + D1〜D12、約束済み `pkg.db` roadmapの
+全完了をさらにD13/D14まで含む状態とする。D13はtyped streaming/cancellation/compound
+pathの後に進む。D14は両driverとproved cancellation/callback ruleの後に進み、D13には
+依存しない。
 single-table CRUDだけでは不完全。many-to-oneとone-to-many compound Outputをそれぞれ
 execution-count付きで実証する。
 
@@ -2012,12 +2080,13 @@ execution-count付きで実証する。
 22. plan取得は明示、ANALYZEは実行を明示。
 23. compound exampleがtransaction+master、User+Groupsを含む。
 24. testがSQL実行回数とhidden follow-up 0を固定。
-25. benchmarkがpackage overheadをdirect native loopと比較。
+25. package overheadをdirect native loopに対してlocalに測定可能とする。この測定は
+    PR、release、milestone gateではない。
 26. handleはgeneral resource/borrowを使い、compilerにpkg.db名のruleがない。
 27. caller materializationはnamed arena/region、ambient allocatorなし。
 28. SQL-only editはproducer/artifactをinvalidateし、unchanged consumerを不要にrecompileしない。
 29. compound shapingはPureな `borrow mut` state/独立builder stepとvisible rows loop。
-30. region builder allocationと1 compact passを測る。
+30. region builder allocationと1 compact passをlocalに測定可能かつ可視に保つ。
 31. structured Move error/Outputはordinary recursive tagged Drop、Ok path error allocationなし。
 32. 3 moduleは1つの `pkg/db` subtreeでacyclic。
 33. contextual `borrow`/`out`/`resource` parsingでcanonical signature/intrinsicがparseできる。
@@ -2042,8 +2111,8 @@ execution-count付きで実証する。
 48. canonical exampleはcallee parameterが `borrow mut` の `rows`/`stmt` を `mut` bindingにし、
     call siteへparameter modeを書かない。
 49. English/Japaneseのprepared-statement exampleは同じsignatureに対してtype-checkする。
-50. 最初のpublic database releaseはdriver-relevantなD1〜D12を完了し、D13/D14はcommitted
-    additive workとして続く。
+50. 最初のpublic database releaseはdriver-relevantなD1〜D12を完了し、約束済みroadmapの
+    全完了はさらにD13/D14を完了する。
 51. `rows`/`rows_stmt` はreturn時にParams source provenanceを全て解放し、SQLite v1は
     measured transient text/blob bind copyによって最初の `next` 前のsource invalidationを
     許可する。
@@ -2148,9 +2217,12 @@ runtime validation、option rejectionを弱める理由にはならない。
 1. この文書と
    [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
    を完全に読む。
-2. L1a〜L7を順番に実装し、gate前にsafe driver APIを始めない。
+2. L1a〜L7の依存DAGに従い、独立なL3/L4/L5を直列化しない。全前提gateの前にsafe
+   driver APIを始めない。
 3. Rust compiler PRごとにAlign self-reviewを実行する。
-4. 1 PR = 1 roadmap sliceとし、指定negative/cleanup testを入れる。
+4. owner matrixの整合性を保つ最少数のindependently correct capability PRを使う。
+   roadmap/acceptance labelをPR境界にせず、閉じるcapabilityの指定negative/cleanup owner
+   testを全て入れる。
 5. database keyword、ORM、Query DSL、reflection、public trait hierarchy、ambient allocator、
    public manual close、package-name ownership special caseを導入しない。
 6. 足りない前提をraw、destroy function、hidden heap vector、lint-only lifetime、
