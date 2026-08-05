@@ -5,47 +5,85 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ Current `main` is `bf14ee34`, including merged C1 PR #702
-(`ca26c68e`) and C2a1 PR #705 (`bf14ee34`). The active branch is
-`agent/pkg-db-am-c2a2`, created directly from that main. The original C2a2 implementation reached
-457 production lines before its benchmark and 243 required owner lines, exceeding its reviewed
-460/180 cap. Coding stopped and the checkpoint is now split into c2a2a (atomic typed comparator
-extraction/parity) and c2a2b (observer/complexity/topology/benchmark). Their author-side closure is recorded beside the am-c matrix
-in `docs/impl/17-library-boundary-prerequisites.md`. The required fresh independent matrix and
-PR-boundary review found five P2 contract gaps; all five repairs are applied, and the final bounded
-finding-closure check returned CLEAN before the measured cap failure; a fresh independent review of
-the new 440/150 and 80/150 boundaries then found three P2 documentation gaps. Those gaps are fixed,
-and bounded closure reviews of the exact projection contract, focused gates, and normative split
-returned CLEAN. The first exact-diff implementation preflight found four valid owner gaps: the
-matcher was not compile-closed over every current type, function parameter mode/type comparisons
-were not reached independently, missing/cross-kind nodes were incomplete, and the source inventory
-was manual only. Closing those rows, including the bounded final-SHA `Scalar::Param` ID finding,
-measures 437 production lines plus 210 test lines. Coding
-stopped again at the recorded 150-test cap. The cap is amended to 440/210 because these parity and
-inventory owners cannot be split from the atomic comparator extraction without publishing an
-unclosed matcher; the measured total is 647 and the cap is 650, both below 1,000. The fresh
-independent boundary review found one P3 counting ambiguity, then returned CLEAN after the measured
-647 and capped 650 conventions were made exact. The implementation findings are now closed;
-the focused comparator/field-codec owners, all 109 `align_mir` tests, and `align_mir` all-target
-Clippy with `-D warnings` pass. Neither slice may add `CanonicalTypeView`, `ValidatedGraph`,
-canonical bytes, a stored MIR field, or a public/package consumer.
+_Last updated: 2026-08-05._ Current `main` is `ddc3f393`, including merged C1
+PR #702, C2a1 PR #705, and C2a2a PR #707. C2a2a's typed source-shape comparator,
+parity owners, final-SHA preflight, post-open review, and three-platform CI are
+complete. No public `pkg.db` surface exists yet.
 
-Draft PR #707 is open from pushed reviewed head `2ec3228b`. Its final-SHA preflight passed
-`scripts/test-pr.sh`, workspace all-target locked Clippy with `-D warnings`, and eight canonical
-owners. The bounded host-native post-open review found no implementation issue; Codex CLI 0.146
-duplicated its identical CLEAN result, so the raw log is preserved and normalized without rerunning
-the unchanged diff. The independent post-open review also found no implementation issue and one P3:
-this handoff had not recorded PR #707 or pushed head `2ec3228b`. This documentation-only follow-up
-closes that operational-state finding; the comparator code and its successful gates are unchanged.
+The remaining compiler plan uses consumer-complete capability waves rather
+than one PR per dormant acceptance cell:
 
-The plan of record splits am-c into c1 (fixed typed runtime ABI registry), c2a1 (private closed
-field codec), c2a2a (shared private source-shape comparator), c2a2b (complexity observation), c2a3 (private `ValidatedGraph`
-traversal/am-n validation), c2a4 (private equivalence/canonical bytes), c2b (effect-free MIR
-function-table retention/remap), c2c (dormant public canonical decoder), c2d (dormant
-generated-identity codecs), and c3 (typed program/generated activation).
-`docs/impl/20-runtime-abi-ledger.md` owns c1.
+```text
+C-A canonical callable closure  c2a2b through c3
+C-B borrow/ownership closure    af/ar/ap/t/b + L2c/L2d/L2e
+
+after C-B, in parallel:
+F-A native resources             L3
+F-B region materialization       L4 + L6
+F-C static artifacts             L5
+
+after F-A/F-B, while also waiting for F-C:
+F-D package integration          L7 + complete prerequisite gate
+```
+
+The exact cell contracts and owner matrices remain in
+`docs/impl/17-library-boundary-prerequisites.md`. Line/test counts no longer
+trigger automatic splits. Each wave gets one stable-candidate full-diff review
+plus explicit final finding closure and one bounded final gate. It is not
+reviewed again after PR opening unless the fix crosses the high-risk triggers.
+F-A/F-B/F-C may proceed concurrently; F-B deliberately keeps the named-region
+producer with its first useful materialization consumer instead of landing L4
+as another dormant seam. D0 probes may run in parallel.
+
+After the prerequisite gate, the initial database product is delivered in seven
+waves rather than twelve serial D-label PRs:
+
+```text
+Q1 static Query vertical          D1
+Q2 dual-driver scalar parity      D2 + D4
+Q3 checked/offline parity         D3 + D5
+Q4a reusable execution            D6 + D7
+Q4b streaming resilience         D8 + D9
+Q5 schema tooling/inspection      D11 || D12
+Q6 compound product closure       D10
+```
+
+Q3 and Q4a start in parallel after Q2. Q5a/Q5b follow Q3; they are the only
+default two-PR wave because schema mutation and read-only inspection are
+independently usable failure domains. Q4b follows Q4a, and Q6 follows Q4b. The
+initial release waits for Q5a/Q5b and Q6.
+The database therefore has two parallel critical paths after Q2: runtime
+`Q4a -> Q4b -> Q6`, and tooling `Q3 -> {Q5a,Q5b}`. Checked metadata does not
+delay prepared/transaction implementation.
+D13 and D14 then run as two additive release trains whose independently useful
+driver rails may proceed in parallel; their internal acceptance labels do not
+serialize unrelated native surfaces.
+
+Every eight hours of active implementation should leave a compiling,
+owner-test-backed source checkpoint. Every twenty-four hours should leave a
+whole capability PR-ready, or one independently usable rail when the plan
+explicitly permits parallel rails. Missing that checkpoint triggers a time-cost
+audit and a consumer-boundary re-cut, not another documentation/review loop or
+an automatic smaller dormant PR. Operational PR/SHA/review narration belongs
+in Git/GitHub and is not extended here after every checkpoint.
+
+Completion terms are fixed across the roadmap. The first public `pkg.db`
+release is L1a–L7 plus D1–D12. The complete committed `pkg.db` roadmap also
+includes D13 batch/SoA/native breadth and D14 dynamic SQL/proved callbacks. A
+2026-08-05 source audit aligned this dependency plan across
+`docs/impl/07-roadmap.md`, `docs/impl/17-library-boundary-prerequisites.md`,
+`docs/impl/18-pkg-db-review.md`, `docs/impl/19-hir-validation-ledger.md`,
+`docs/impl/20-runtime-abi-ledger.md`, and both `pkg-design/db.md` language
+versions.
+The 2026-07-27 F1–F95 design review remains the incorporated review of record;
+the source audit did not pretend to be a fresh line-by-line independent review
+of the complete design contract.
 
 ## Historical detail
+
+Everything below this heading is a historical record, not current workflow
+instruction. Old line targets, hard review bounds, rerun requirements, branch
+names, and PR sequences are superseded by the baseline above and `CLAUDE.md`.
 
 The merged c1 checkpoint made `align_mir::RuntimeKey` supply the exact 281 semantic keys and
 alphabetical `ALL`; the backend-private 286-row typed ABI registry is the sole fixed-native
@@ -467,11 +505,10 @@ after narrow changes, and document or formatting churn was allowed to resemble
 implementation progress. The fast #668-#671 sequence proves that narrow,
 mergeable slices do not have the same failure mode.
 
-The canonical correction is in `CLAUDE.md`: one complete review pass, one
-coherent all-findings fix, no ordinary re-review, narrow owner checks after the
-fix, no repeated broad gate on an unchanged tree, a 60-minute implementation
-checkpoint, and a 500-line target for implementation PRs. Exceptions are
-limited to materially risky redesigns or explicit user direction.
+The current correction is in `CLAUDE.md`: capability-sized delivery, one
+complete review pass, one coherent all-findings fix, no ordinary re-review,
+narrow owner checks after the fix, and no repeated broad gate on an unchanged
+tree. Line counts are inventory, not a delivery target.
 
 ### PR #679 delivery retrospective
 
@@ -493,12 +530,11 @@ workspace all-target Clippy; that was slow but continuously progressing and is
 not a reason to narrow required verification.
 
 One separate operational error was generalizable: a normal `gh pr edit` after
-the preflight refresh deleted its hidden markers and failed CI. `CLAUDE.md` now
-requires all ordinary PR-body edits before `scripts/update-pr-preflight.sh`;
-only the marker-preserving post-review recorder may mutate the body afterward.
-If a later full-body overwrite occurs after post-review recording, both the
-preflight updater and post-review recorder must be rerun because each restores
-only its own marker family.
+preflight deleted hidden markers and failed CI. The simplified workflow now
+uses only `scripts/open-pr.sh`: ordinary prose is finished before opening, and
+the same command's `--update PR_NUMBER` mode refreshes markers after a required
+later push. Separate preflight-update and post-review-recording tools were
+removed.
 No additional rule was added for the implementation findings because the
 existing cross-cutting closure-matrix gate already states their durable fix.
 
@@ -987,10 +1023,10 @@ outcome-sensitive task-wait dominance (#685), am-v native output-buffer local/mu
 #688 completes am-u lexical extern invocation, #690 am-p placement, #691 am-n nominal/link, and
 #692 am-h declarations/headers, #694 am-b1, #695 am-b2a, #696 am-b2b, commit `af5e17a` am-b3,
 #699 task-wait replay, #700 body-fact replay, merged am-b4 activation PR #706, merged #702 am-c1,
-and merged #705 am-c2a1. The active implementation slice is am-c2a2a, followed by c2a2b, then
-c2a3/c2a4/c2b/c2c/c2d/c3 and then af/ar/ap/t.
-Am-c follows am-b4 because it consumes body-validated callable facts. The amended current project
-truth is thirty-two L2b and thirty-six L2 implementation PRs; the older #678 counts below are historical.
+merged #705 am-c2a1, and merged #707 am-c2a2a. The remaining work is grouped by capability:
+canonical callable closure through c3, return-provenance closure through b, then cleanup and
+borrow closure through L2e. Am-c follows am-b4 because it consumes body-validated callable facts.
+The former thirty-two-L2b/thirty-six-L2 PR schedule is retired; the acceptance cells remain.
 The final author pass found one additional hidden dependency before review convergence: imported
 effect bits previously arrived only through the sema call's out-of-band map and did not survive in
 checked HIR, so a later handcrafted-HIR preflight could not replay parallel purity independently.
@@ -1245,9 +1281,10 @@ also records every placement predicate and gives every body discriminator an env
 ownership row in `docs/impl/19-hir-validation-ledger.md`; any body failure returns the same
 canonical all-empty program as a global failure. Concrete MIR call-target types, structural
 generated-identity bytes, and semantic/byte goldens are now recorded in the am-r ledger. Body
-construction remains scheduled as three dormant exhaustive validator PRs and one atomic activation
-PR so no partial malformed-HIR claim is exposed. Historically, #678 fixed the then-current
-twenty-three/twenty-seven counts and strategy; the current amended totals are thirty-two/thirty-six.
+construction shipped as three dormant exhaustive validator PRs and one atomic activation PR, so no
+partial malformed-HIR claim was exposed. Historically, #678 fixed the then-current
+twenty-three/twenty-seven counts, which later expanded to thirty-two/thirty-six. Both counts are
+historical; remaining work now uses capability waves.
 
 Am-g-t's type-domain implementation is preserved separately. The split applies the existing
 review-size and closure-matrix rules; it does not justify a new process rule.
@@ -1258,21 +1295,13 @@ discriminating deferred-array/liveness owners in the same PR; separating any of 
 an under-approximating or dangling fact.
 Its final local provenance benchmark reports 3.147 ms/check, 22,848 interface bytes, and
 1.844 ms/import on Apple Silicon.
-Do not begin a SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7 are
-complete. The reviewed part of the L2 sequence is L2a
-parameter-mode and provenance-summary representation plus
-L2b-a1/a2-s/a2-ac/a2-am-g-t plus the completed am-r design gate through am-b4, c1, and c2a1. The
-remaining sequence begins with a2-am-c2a2a/a2-am-c2a2b, then a2-am-c2a3/a2-am-c2a4/a2-am-c2b/a2-am-c2c/a2-am-c2d/a2-am-c3/
-a2-af/a2-ar/a2-ap/a2-t/b
-return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
-then L2e
-mutable borrow/out and all-peer
-exclusivity, for thirty-two L2b and thirty-six L2 implementation PRs. The required milestone order
-is L2,
-L3 package-defined/dependent
-resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
-L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
-`RegionPlain` bound. No safe driver begins before L1a–L7 are complete. L2 includes contextual
+Do not begin a safe SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7
+are complete. The completed L2 cells run through c2a2a. The remaining cells close in three
+capability waves: canonical callable closure through c3, direct/captured return-provenance closure,
+and cleanup plus shared/mutable-borrow closure. These are acceptance cells, not a thirty-six-PR
+schedule. After L2, L3 resources, L4 regions, and L5 static Query/command artifacts may proceed
+concurrently; L6 follows L4 and L7 closes the integrated generic surface. No safe driver begins
+before the complete prerequisite gate. L2 includes contextual
 parameter parsing, all-peer mutable-borrow alias checking, drop-old replacement, target-relative
 capture provenance, and the dynamic Move-return cleanup ABI. L3 includes a producer-owned linkable
 Drop thunk and root-only raw transfer. L5 permits exactly one whole-body static constructor per
@@ -1343,9 +1372,10 @@ focused-test-selection clarification shipped in #649.
 deterministic non-runtime library tests, and the M0 compile/link/run smoke.
 CI no longer runs the full workspace corpus or the pkg.web performance gate on
 each PR. Deep driver regressions, differential fuzz, runtime network/filesystem,
-and performance suites remain explicit change-specific checks;
-`scripts/test-full.sh` retains the full corpus for unusually broad work and
-versioned-release preparation. `docs/impl/16-test-policy.md` records the audit,
+and performance suites remain explicit change-specific checks. The former
+`scripts/test-full.sh` all-or-nothing workspace wrapper is retired; versioned
+release preparation runs named affected owner and package smoke targets.
+`docs/impl/16-test-policy.md` records the audit,
 commands, suite-growth rule, and the relevance/cost rule: every add-on target
 must name the changed boundary, plausible failure, non-duplicate information,
 and reason its cost is justified. Meaningful expensive checks remain allowed;
@@ -1353,20 +1383,15 @@ unrelated or duplicative suites do not become mandatory by proximity.
 
 ## Build and test notes
 
-On this Apple Silicon machine, use:
+Use the repository wrapper on macOS, WSL2, Ubuntu, or Debian. It resolves LLVM
+22 and the macOS keg-only library paths; explicit environment overrides remain
+available for nonstandard installations.
 
 ```bash
-export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm
-export LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config
-export LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib
-
-cargo build --workspace
+scripts/cargo.sh build --workspace
 scripts/test-pr.sh
-cargo clippy --workspace --all-targets -- -D warnings
+scripts/cargo.sh clippy --workspace --lib --bins -- -D warnings
 ```
-
-Run `scripts/test-full.sh` only when the change scope or release preparation
-requires the retained full regression corpus.
 
 Operational rules:
 

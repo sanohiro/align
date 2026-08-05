@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run Codex review with a hard wall-clock limit and a machine-readable verdict.
+# Run Codex review with a progress-based stall guard and a machine-readable verdict.
 # Review is inspection-only: tests belong to the selected verification gate.
 set -euo pipefail
 
@@ -28,9 +28,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-timeout_seconds="${ALIGN_REVIEW_TIMEOUT_SECONDS:-900}"
-if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ALIGN_REVIEW_TIMEOUT_SECONDS must be a positive integer" >&2
+stall_seconds="${ALIGN_REVIEW_STALL_SECONDS:-900}"
+progress_interval_seconds="${ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS:-30}"
+# There is no default wall-clock maximum. ALIGN_REVIEW_TIMEOUT_SECONDS remains
+# a compatibility spelling for an explicitly requested one-invocation maximum.
+max_seconds="${ALIGN_REVIEW_MAX_SECONDS:-${ALIGN_REVIEW_TIMEOUT_SECONDS:-0}}"
+if [[ ! "$stall_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ALIGN_REVIEW_STALL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$progress_interval_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$max_seconds" =~ ^[0-9]+$ ]]; then
+  echo "ALIGN_REVIEW_MAX_SECONDS must be zero or a positive integer" >&2
   exit 2
 fi
 command -v codex >/dev/null 2>&1 || {
@@ -53,7 +65,7 @@ fi
 }
 
 tmp_dir="$(mktemp -d)"
-timed_out="$tmp_dir/timed-out"
+stop_reason="$tmp_dir/stop-reason"
 review_pid=""
 watchdog_pid=""
 if [[ -z "$output" ]]; then
@@ -79,6 +91,16 @@ terminate_group() {
   [[ -n "$pid" ]] || return 0
   kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 }
+progress_signature() {
+  local pgid="$1"
+  local log_file="$2"
+  printf 'bytes=%s\n' "$(wc -c <"$log_file" | tr -d ' ')"
+  # PID creation/exit and accumulated CPU time are progress even when the
+  # review model buffers prose until its final answer.
+  ps -axo pgid=,pid=,time= 2>/dev/null |
+    awk -v wanted="$pgid" '$1 == wanted { print $2 ":" $3 }' |
+    sort
+}
 cleanup() {
   trap - EXIT INT TERM
   terminate_group "$watchdog_pid"
@@ -93,15 +115,16 @@ trap 'exit 143' TERM
 
 head_sha="$(git rev-parse HEAD)"
 base_sha="$(git rev-parse "${base}^{commit}")"
-prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, network commands, or scripts/test-full.sh. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
+prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
   printf 'ALIGN_REVIEW_BASE=%s\n' "$base_sha"
 } >"$output"
 
-# Job control gives the review its own process group, so the watchdog terminates
-# Codex and every helper it spawned instead of leaving an orphaned review.
+# Job control gives the review its own process group, so the stall guard
+# terminates Codex and every helper it spawned instead of leaving an orphaned
+# review.
 set -m
 # codex-cli 0.145 rejects a custom PROMPT together with --base even though its
 # help text displays both. Keep code-review mode and put the explicit base in
@@ -112,13 +135,54 @@ codex review -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
 review_pid=$!
 
 (
-  sleep "$timeout_seconds"
-  if kill -0 "$review_pid" 2>/dev/null; then
-    : >"$timed_out"
-    kill -TERM "-$review_pid" 2>/dev/null || kill -TERM "$review_pid" 2>/dev/null || true
-    sleep 2
-    kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
-  fi
+  started_at="$(date +%s)"
+  last_progress_at="$started_at"
+  last_signature="$(progress_signature "$review_pid" "$output")"
+  while kill -0 "$review_pid" 2>/dev/null; do
+    now="$(date +%s)"
+    if (( max_seconds > 0 && now - started_at >= max_seconds )); then
+      printf 'MAX:%s\n' "$max_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+    if (( now - last_progress_at >= stall_seconds )); then
+      printf 'STALL:%s\n' "$stall_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+    sleep_seconds="$progress_interval_seconds"
+    if (( max_seconds > 0 && max_seconds - (now - started_at) < sleep_seconds )); then
+      sleep_seconds=$((max_seconds - (now - started_at)))
+    fi
+    if (( stall_seconds - (now - last_progress_at) < sleep_seconds )); then
+      sleep_seconds=$((stall_seconds - (now - last_progress_at)))
+    fi
+    sleep "$sleep_seconds"
+    now="$(date +%s)"
+    signature="$(progress_signature "$review_pid" "$output")"
+    if [[ "$signature" != "$last_signature" ]]; then
+      last_signature="$signature"
+      last_progress_at="$now"
+    fi
+    if (( max_seconds > 0 && now - started_at >= max_seconds )); then
+      printf 'MAX:%s\n' "$max_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+    if (( now - last_progress_at >= stall_seconds )); then
+      printf 'STALL:%s\n' "$stall_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+  done
 ) &
 watchdog_pid=$!
 set +m
@@ -127,7 +191,7 @@ set +e
 wait "$review_pid"
 review_status=$?
 set -e
-if [[ -f "$timed_out" ]]; then
+if [[ -f "$stop_reason" ]]; then
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
   kill -KILL "-$review_pid" 2>/dev/null || true
@@ -141,8 +205,19 @@ else
 fi
 
 sed -n '1,$p' "$output"
-if [[ -f "$timed_out" ]]; then
-  echo "review timed out after ${timeout_seconds}s" >&2
+if [[ -f "$stop_reason" ]]; then
+  reason="$(cat "$stop_reason")"
+  case "$reason" in
+    STALL:*)
+      echo "review stalled with no observed log or process progress for ${reason#STALL:}s" >&2
+      ;;
+    MAX:*)
+      echo "review reached the explicit one-invocation maximum of ${reason#MAX:}s" >&2
+      ;;
+    *)
+      echo "review stopped without a recognized reason" >&2
+      ;;
+  esac
   exit 124
 fi
 if [[ $review_status -ne 0 ]]; then

@@ -26,9 +26,11 @@ ownership transfer, or cache publication. Compiler-owned validation worklists
 may allocate and are released before return.
 
 The complete ledger consists of this file and the callable/native appendix in
-`17-library-boundary-prerequisites.md`. An implementation PR may not replace a
+`17-library-boundary-prerequisites.md`. An implementation capability may not replace a
 row with a broader family assumption. A new HIR discriminator must add one row,
-one valid producer fixture, and one mutation per stored field in the same PR.
+one valid producer fixture, and the safety-relevant malformed stored-field
+mutations in the same capability wave. Parameterized owners may close multiple
+fields and discriminators; the row does not require its own PR or test binary.
 
 ## Validation language
 
@@ -636,13 +638,14 @@ The result formula in every row is followed by the universal
 
 ## Expression ledger: am-b2
 
-The am-b2 implementation is delivered in contiguous dormant-validator slices, except for the
+The am-b2 implementation is closed through contiguous dormant-validator cells inside the
+canonical callable capability wave, except for the
 narrow Request 6 scanner Copy predicate, which is consumed by the active pre-lowering gate.
 Am-b2a owns
 `ExprKind::ArrayLit` through `ExprKind::VecLit`; am-b2b1 owns `ExprKind::ArraySum` through
 `ExprKind::ElemField` plus all `StageKind`; am-b2b2 owns `ExprKind::Template` through
 `ExprKind::ArrayDictEncode` plus all nested `TemplatePart`, `GroupSource`, `GroupAgg1`, and
-`GroupOp` records. Neither slice activates public HIR validation generally; the scanner predicate
+`GroupOp` records. No cell activates public HIR validation generally; the scanner predicate
 is the named Request 6 exception, while am-b4 owns the assembled body activation and body-derived
 ownership/effect correlation. The b2b1 checkpoint leaves b2b2 records fail-closed.
 

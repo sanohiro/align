@@ -3015,9 +3015,9 @@ should be forced into one product join.
 The SQL author uses CTEs, native aggregates, tagged streams, or another visible plan to avoid row
 explosion. If an application explicitly chooses two Queries after measurement, it writes two calls.
 
-### 21.3 Bench anchors
+### 21.3 Local measurement anchors
 
-The implementation roadmap must add benchmarks for at least:
+The implementation keeps named local measurements for at least:
 
 - SQLite parameter bind + one-row typed decode;
 - SQLite streamed text/blob bind with transient-copy bytes and allocations separated;
@@ -3038,6 +3038,8 @@ The implementation roadmap must add benchmarks for at least:
 
 The common layer should be within measurement noise of an equivalent direct driver loop after
 preparation, excluding costs explicitly requested by the caller.
+Run these measurements when their named path first lands or materially changes, or for an explicit
+performance investigation. They are not regression, integration, PR, release, or milestone gates.
 
 ### 21.4 Execution-count tests
 
@@ -3089,15 +3091,59 @@ Unsupported/unknown native options must identify the option and driver rather th
 
 ## 23. Roadmap
 
-The implementation follows small prerequisite and vertical PRs. A database PR is not allowed to
-paper over a missing prerequisite with a package-name special case. Every executable milestone runs
+The implementation follows a small number of prerequisite and vertical capability PRs. A database
+PR is not allowed to paper over a missing prerequisite with a package-name special case. Roadmap
+labels own acceptance closure; they do not each require a separate PR. Every executable milestone runs
 an `.align` program end to end and tests execution count, decoded values, ownership/Drop, cleanup, and
 errors.
 
+The D1–D14 contracts below are unchanged. Delivery groups them by useful
+consumer outcome:
+
+| Wave | Acceptance owners | Mergeable outcome | Default publication boundary |
+|---|---|---|---|
+| P0 native evidence | D0 | recorded SQLite/libpq behavior with no public API | no product PR; run during prerequisites |
+| Q1 static Query | D1 | generated Query/command executes end to end over the fake driver | one capability PR |
+| Q2 dual-driver scalar | D2 + D4 | the same scalar Query/command surface runs on SQLite and PostgreSQL | one coordinated capability PR |
+| Q3 checked/offline parity | D3 + D5 | both drivers share one offline checked-metadata and invalidation contract | one coordinated capability PR |
+| Q4a reusable execution | D6 + D7 | prepared statements and transactions share one reusable execution/ownership model | one capability PR after Q2, parallel with Q3 |
+| Q4b streaming resilience | D8 + D9 | typed streaming, deadline, cancellation, and cleanup form one resilient lifecycle | one capability PR after Q4a |
+| Q5 schema tooling/inspection | D11 + D12 | migrations plus read-only metadata/EXPLAIN complete the schema-facing product | two parallel capability PRs are permitted because mutation and inspection are independent failure domains |
+| Q6 compound product | D10 | many-to-one and one-to-many Output run once end to end | one capability PR after Q4b |
+| A1 throughput/native train | D13 | batch/SoA and driver-native throughput surfaces | independently usable common/driver rails may merge in parallel |
+| A2 dynamic/callback train | D14 | dynamic rows plus proved native callbacks | dynamic SQL and driver callback rails may merge in parallel |
+
+Q1–Q4b and Q6 do not split at their internal D labels. A split is justified only
+when both sides already execute end to end, are independently useful, and do
+not repeat the same matrix, review, or broad gate. Q5 is the deliberate
+exception because migrations mutate external state while metadata/EXPLAIN is
+read-only. A1/A2 are additive release trains, so independent native rails do
+not serialize each other; complete-roadmap status still waits for every D13 and
+D14 acceptance cell.
+
+A1 defaults to four consumer-visible rails: common batch/SoA, PostgreSQL native
+throughput, SQLite native services, and the explicit pool. A2 defaults to the
+dynamic SQL/value/row rail followed by independently proved SQLite and
+PostgreSQL callback rails. A rail may use multiple commits but receives one
+review and one selected broad gate when its useful surface is stable. No
+unspecified additional driver is required for completion; any added driver is
+its own consumer-backed rail after the common contracts are proven.
+
+During active implementation, eight hours must leave a compiling,
+focused-owner-backed source checkpoint and twenty-four hours must leave a whole
+capability PR-ready, or one independently useful A1/A2 rail. If not, record the
+dominant cost and re-cut at the nearest consumer boundary. Do not answer a miss
+with another dormant seam, documentation expansion, repeated broad review, or
+benchmark/full-suite work unrelated to the changed path. Review and broad
+verification run once on the stable wave candidate; documentation changes only
+when the public contract changes.
+
 ### L1a–L7 — mandatory Align library-boundary prerequisites
 
-Land the ordered milestones and closed slices specified in
-[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md), in order:
+Land the milestones and closed acceptance cells specified in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md). Follow its
+dependency DAG; do not serialize independent L3/L4/L5 work or turn every
+internal acceptance cell into a separate PR:
 
 ```text
 L1a recursive DropPlan framework + Option<string> fields
@@ -3114,9 +3160,11 @@ L6  region-backed PlainStruct array_builder
 L7  nested generic package APIs + closed structural RegionPlain bound
 ```
 
-All focused tests and benchmarks in that plan are gates. No SQLite or PostgreSQL safe public
-connection type lands before L3; no Query file support lands outside L5; no compound-output private
-vector lands before L6.
+All focused correctness tests in that plan are gates. Benchmarks are local
+measurements run only when their named performance path first lands or changes;
+they are not integration, PR, or release gates. No SQLite or PostgreSQL safe
+public connection type lands before L3; no Query file support lands outside L5;
+no compound-output private vector lands before L6.
 
 The common generic `rows_stmt<P,R>`/`all<P,R>` implementation does not land before L7.
 
@@ -3162,8 +3210,9 @@ Tests mutate SQL-only, private Query/command, same-path Params/Row field name/or
 reachable definitions, driver restriction, binder/decoder ABI versions, and per-driver metadata
 digests independently. They match the independent byte/digest goldens, materialize a separately
 compiled Declared QueryMeta table, compile-fail a command with a Row/decode contract, and prove an
-unchanged public command consumer is not recompiled by a SQL-only producer edit. Benchmark generated
-Query/command binders, the Query decoder/metadata thunk, and warm-cache behavior.
+unchanged public command consumer is not recompiled by a SQL-only producer edit. When this path
+first lands or materially changes, measure generated Query/command binders, the Query
+decoder/metadata thunk, and warm-cache behavior locally.
 
 ### D2 — minimal SQLite Query vertical
 
@@ -3184,8 +3233,8 @@ The first native vertical is deliberately exact:
 - close/finalize exactly once on success and every error exit.
 
 It does not include text views, `all`, streaming, transactions, migrations, dynamic rows, metadata
-catalogs, or later native breadth. The benchmark compares prepared bind + one-row decode with an
-equivalent direct libsqlite3 loop.
+catalogs, or later native breadth. A named local measurement compares prepared bind + one-row
+decode with an equivalent direct libsqlite3 loop when this path first lands or changes.
 
 ### D3 — checked Query metadata core + SQLite
 
@@ -3230,8 +3279,8 @@ merge, and no database release can pass its gate, on such a skip: a required `db
 provisions a pinned ephemeral PostgreSQL version, sets `ALIGN_DB_POSTGRES_REQUIRED=1`, and turns
 missing/unreachable configuration into test failure. The same non-skippable job runs the portable
 common Query against SQLite and PostgreSQL. The direct-libpq comparison benchmark is
-environment-gated for ordinary PRs but is mandatory evidence when D4 first lands and at a database
-release performance gate.
+local mandatory evidence when D4 first lands or that execution path changes; it
+is never part of an unrelated PR, integration suite, or database release gate.
 
 ### D5 — PostgreSQL checked metadata
 
@@ -3256,7 +3305,8 @@ release performance gate.
 - finalize/close on Drop and errors;
 - no implicit global statement cache.
 
-Benchmark direct prepared execution, common-layer execution, and re-prepare cost separately.
+Measure direct prepared execution, common-layer execution, and re-prepare cost separately when
+this path first lands or changes.
 
 ### D7 — transaction and common execution view
 
@@ -3283,7 +3333,7 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - PostgreSQL `BufferedFull` path first; `rows` is one-pass decode over that owned result, while
   explicitly selected single-row/portal delivery is D13;
 - early Drop/finalize;
-- one-million-row scalar and borrowed-text benchmarks;
+- local one-million-row scalar and borrowed-text measurements when the streaming path lands or changes;
 - compile-fail tests for use-after-next, storage in a longer-lived builder, return, branch, and loop.
 
 ### D9 — scoped native options, deadline enforcement, and cancellation cleanup
@@ -3312,7 +3362,7 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - User + Groups;
 - exactly one SQL execution;
 - no hidden sort/hash/materialization;
-- builder allocation/copy-count and high-fanout benchmarks.
+- correctness-pinned builder allocation/copy counts and a local high-fanout measurement.
 
 Compound Query support is part of the first product contract, not a later ORM enhancement.
 
@@ -3402,16 +3452,42 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
   callback-capture, abort, reentrancy, and thread rules are proved;
 - pin statement count, value allocation, callback lifetime, and cleanup behavior.
 
-This slice is committed after the typed Query product. It is not permission to route typed Query
+This capability follows the typed Query product. It is not permission to route typed Query
 execution through a reflective dynamic engine.
 
 ### Initial release gate
+
+The D labels define acceptance ownership. Publication follows the delivery
+waves above:
+
+```text
+prerequisite gate -> Q1 -> Q2
+                           +-> Q4a reusable -> Q4b streaming -> Q6 compound --+
+                           +-> Q3 checked/offline -+-> Q5a migrations -------+-> initial release
+                                                   +-> Q5b metadata/EXPLAIN -+
+
+P0 runs in parallel before the first native product wave.
+```
+
+Q2 closes D2 and D4 together so the common API cannot drift between drivers.
+Q3 closes D3 and D5 together for the same reason. Q3 and Q4a start in parallel
+after Q2. Q4a closes D6/D7 prepared and transaction reuse; Q4b closes D8/D9
+streaming and cancellation resilience. Each publishes and reviews one useful
+capability. Q5a and Q5b may proceed in parallel after Q3; Q5a also consumes
+the shared migration identity owned by D3. Q6 follows Q4b. The release gate
+still waits for every required D1–D12 acceptance cell.
 
 The first release presented as Align database support requires L1a–L7 and D1–D12 for both SQLite
 and PostgreSQL where the milestone is driver-relevant. D11 supplies SQL migration lifecycle and D12
 supplies the required category metadata and explicit Query-plan access; neither is omitted from the
 release whose earlier sections promise those surfaces. D13–D14 remain committed additive work for
 batch/SoA/native breadth, dynamic SQL, and proved callbacks.
+
+For completion reporting, the first release and the complete committed roadmap
+are distinct. The first release is L1a–L7 plus D1–D12. The complete committed
+`pkg.db` roadmap additionally requires D13 and D14. D13 follows the typed
+streaming/cancellation/compound paths. D14 follows both driver verticals and
+the proved cancellation/callback rules; it has no dependency on D13.
 
 A release that handles only single-table model loading is incomplete even if CRUD works. At least one
 many-to-one/master projection and one one-to-many compound Output must be end-to-end,
@@ -3448,7 +3524,8 @@ The design is implemented correctly only if all are true:
 22. Query plan retrieval is explicit, and ANALYZE visibly executes the statement.
 23. Compound examples include transaction+master and User+Groups.
 24. Tests pin SQL execution count and no hidden follow-up Queries.
-25. Benchmarks compare package overhead against direct native-driver loops.
+25. Package overhead remains locally measurable against direct native-driver loops; the
+    measurement is not a PR, release, or milestone gate.
 26. All handles use the general opaque-resource/borrow machinery; no `pkg.db`-named ownership rule
     exists in the compiler.
 27. Caller-selected materialization uses `arena name {}` and `region`, with no ambient allocator.
@@ -3457,7 +3534,7 @@ The design is implemented correctly only if all are true:
 29. Canonical compound shaping uses Pure `borrow mut` state and separate-builder transitions, so
     transitive database I/O is rejected; its Query-local orchestrator contains one visible rows
     loop.
-30. Region builder allocation and its single compacting pass are measured and visible.
+30. Region builder allocation and its single compacting pass remain locally measurable and visible.
 31. Structured owned `db.Error` and Move Output use ordinary recursive `Option`/`Result`/sum Drop;
     the successful path allocates no error storage.
 32. `pkg.db`, `.sqlite`, and `.postgres` are acyclic modules in one `pkg/db` package subtree, not
@@ -3484,8 +3561,8 @@ The design is implemented correctly only if all are true:
 48. Canonical examples bind `rows`/`stmt` as `mut` when their callee parameter is `borrow mut`, and
     never put a parameter mode at a call site.
 49. English and Japanese prepared-statement examples type-check against the same signature.
-50. The first public database release completes driver-relevant D1–D12; D13/D14 remain committed
-    additive work.
+50. The first public database release completes driver-relevant D1–D12; the complete committed
+    roadmap additionally completes D13 and D14.
 51. `rows`/`rows_stmt` release all source Params provenance at return; SQLite v1 uses measured
     transient text/blob bind copies and permits source invalidation before first `next`.
 52. Dynamic SQL names one exact `db.Driver` in source and checks it before sending SQL.
@@ -3601,9 +3678,12 @@ one-execution semantics, ownership, static artifacts, runtime validation, or opt
 ## 26. Instructions for implementation agents
 
 1. Read this document and `../17-library-boundary-prerequisites.md` completely.
-2. Implement L1a–L7 in order; do not start a safe driver API before their owning gate.
+2. Follow the L1a–L7 dependency DAG; do not serialize independent L3/L4/L5 work, and do not start
+   a safe driver API before the complete prerequisite gate.
 3. Run the Align compiler self-review for every Rust PR.
-4. Keep every PR at one roadmap slice and add its listed negative/cleanup tests.
+4. Use the fewest independently correct capability PRs that keep the owner matrices coherent.
+   Roadmap and acceptance labels are not PR boundaries. Add every listed negative/cleanup owner
+   test for the capability being closed.
 5. Do not introduce a database keyword, ORM, Query DSL, runtime reflection, public trait hierarchy,
    ambient allocator, manual public close, or package-name ownership special case.
 6. Do not replace a missing prerequisite with `raw`, an explicit destroy function, a hidden heap

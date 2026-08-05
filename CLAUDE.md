@@ -115,14 +115,48 @@ Do not re-litigate these. Full rationale is in `docs/open-questions.md`:
 - Ship the ideal unified design or defer it. Do not land compromise
   implementations that add magic special cases or violate an invariant.
 
+## Documentation proportionality
+
+Documentation work must be proportional to a changed public contract. An
+implementation of an already-settled design does not reopen or restate that
+design merely because code moved, tests grew, a PR number changed, or an
+internal checkpoint landed.
+
+- Update specifications, design notes, ledgers, mirrors, and examples only
+  when their normative promise actually changes.
+- Record implementation status once at a capability or milestone boundary.
+  `HANDOFF.md` is not a per-commit or per-review journal; archive historical
+  detail instead of extending the live handoff.
+- Operational metadata such as the current branch, draft PR number, pushed
+  SHA, review tool wording, or CI state is not a code-review finding and does
+  not block an otherwise complete implementation. Inspect Git/GitHub for that
+  live state.
+- A small non-normative documentation-only change needs `git diff --check` and
+  at most one directly relevant consistency/render check. It needs no compiler
+  build, code owner test, adversarial code review, or broad documentation
+  review.
+- Use `scripts/pre-pr.sh --docs-only` for such a PR. Its SHA-bound attestation
+  does not require preflight or post-open code-review evidence; the PR wrappers
+  mark the required status context as docs-only exempt. A broad normative
+  design change still follows the design review gate below.
+- A code PR may omit documentation changes when it implements the existing
+  contract without changing user-visible behavior. Finish any required
+  normative prose before the final-SHA attestation; do not mutate status prose
+  afterward and rerun code gates merely to narrate the PR lifecycle.
+
 ## Large design authoring gate
+
+This gate applies only when authoring or changing a broad public contract. It
+does not apply again to an implementation PR that follows an already-reviewed
+ledger without changing that contract.
 
 Before writing a broad cross-cutting design, create one public-contract ledger
 in its design or audit document. Keep that ledger authoritative while drafting.
 For every public surface, record the exact type or signature, inputs and
 defaults, errors, ownership and lifetime, allocation, compiler/runtime/package
 owner, artifact and cache identity, prerequisite milestone, acceptance test,
-benchmark, and every source-of-truth or language mirror that must agree.
+any benchmark required by an explicit performance/resource promise, and every
+source-of-truth or language mirror that must agree.
 
 Complete one author-side ledger-to-prose consistency pass before requesting an
 independent review:
@@ -156,7 +190,8 @@ independent review:
   milestone;
 - `draft.md`, `docs/language-spec.md`, implementation plans, package designs,
   and required language mirrors agree; and
-- acceptance tests and benchmarks cover each ledger invariant.
+- acceptance tests cover each ledger invariant; a local benchmark covers only
+  a ledger performance/resource promise and is not a correctness gate.
 
 Do not use independent review as the primary completion loop for a design.
 When a finding changes a public surface, update the ledger first and propagate
@@ -175,13 +210,27 @@ audit. At minimum, enumerate:
   `map_err`, branch joins, loop joins, early exits, and malformed input;
 - generic monomorphization, interface serialization, whole-program and
   per-unit compilation, runtime ownership provenance, and allocation parity;
-- the exact owner tests and benchmark row that close each applicable cell.
+- the exact owner tests that close each applicable cell, plus a benchmark only
+  for a cell that makes an explicit performance/resource claim.
 
-For those cross-cutting changes, get one fresh independent adversarial review
-of the matrix and proposed PR boundaries before implementation. Resolve plan
-findings first. Split the work into the smallest independently correct,
-mergeable vertical PRs; if a proposed PR is expected to exceed roughly 1,000
-changed hand-written lines, record why it cannot be split safely before coding.
+When the matrix introduces or changes a public contract or safety strategy,
+get one fresh independent adversarial review of it and the proposed capability
+boundaries before implementation. When implementation follows an already-
+reviewed ledger without changing strategy, perform the author-side matrix pass
+and fold boundary checking into the one preflight review instead of commissioning
+a separate plan review. Resolve plan findings first. Use the fewest
+independently correct, mergeable capability PRs. A boundary must isolate a
+distinct failure domain or leave an actually useful stable consumer; do not
+split a strict dormant producer-to-consumer chain merely to meet a line target.
+If a proposed PR is expected to exceed roughly 1,000 changed hand-written
+lines, record why the larger capability boundary produces less duplicated
+proof and lower integration risk before coding. The threshold requires an
+explanation, not an automatic split.
+
+One parameterized or invariant-level owner may close many matrix cells. Reuse
+existing regression coverage when it would fail for the changed defect; a
+matrix row does not require a new fixture or command merely to obtain a
+one-to-one paper trail.
 
 Before requesting code review, perform one author-side matrix-to-diff pass.
 Every applicable matrix cell must point to implementation and a regression
@@ -191,11 +240,10 @@ one pass rather than patching only the reported line.
 
 The second review of a revised diff should normally converge. If it finds a
 new P1 or an equivalent soundness/correctness issue, stop the local patch loop:
-re-open the closure matrix, identify the missed invariant, and re-split or
-redesign the implementation before continuing. If implementation work goes
-two hours without a PR-ready independently mergeable checkpoint (excluding a
-single still-progressing required command), re-scope to the next smaller
-correct vertical slice and record the reason in `HANDOFF.md`.
+re-open the closure matrix, identify the missed invariant, and redesign the
+implementation boundary before continuing. A redesign may combine a dormant
+producer/consumer chain, remove duplicated proof, or split genuinely distinct
+failure domains; smaller is not the default answer.
 
 ## Build and verification
 
@@ -203,15 +251,24 @@ The workspace runs end to end from lexer through executable generation.
 Use the checks appropriate to the change:
 
 ```text
-cargo build --workspace
+scripts/cargo.sh build --workspace
 scripts/test-pr.sh
-cargo clippy --workspace --all-targets
+scripts/cargo.sh clippy --workspace --lib --bins
 ```
 
-Run the narrow regression target that owns the changed behavior. The full,
-expensive corpus is explicit via `scripts/test-full.sh`; it is not the ordinary
-PR gate. See `docs/impl/16-test-policy.md` for the test categories and growth
-rules.
+Use `scripts/cargo.sh` for local Cargo work. It resolves LLVM 22 on Apple
+Silicon/Intel Homebrew and Debian/Ubuntu/WSL2 layouts, validates the major
+version, and supplies keg-only macOS library paths. It respects explicit
+`LLVM_CONFIG`, `LLVM_SYS_221_PREFIX`, and `LIBRARY_PATH` overrides. Repository
+shell scripts require Bash and must remain compatible with the macOS-provided
+Bash 3.2 and current Debian/Ubuntu Bash; do not invoke them through `sh`.
+
+Run the narrow regression target that owns the changed behavior. There is no
+mandatory full-workspace test command: deep driver, fuzz, resource, stress,
+and integration targets run only when they own the changed boundary.
+Benchmarks are separate local measurements run only for the changed
+performance path or an explicit performance/resource claim. See
+`docs/impl/16-test-policy.md` for selection and growth rules.
 
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.
@@ -262,89 +319,78 @@ contradictory, or changed areas.
 
 ## Review before merging
 
-The PR is not the first correctness pass. A coherent implementation must pass
-the pre-PR gate before a draft PR is opened:
+The PR is a publication checkpoint, not a second implementation loop. The
+normal code path is exactly:
 
-1. Finish the intended implementation scope on the branch; do not use a draft
-   PR as a scratchpad for basic correctness work.
-2. For Rust under `crates/`, run the `align-self-review` skill. Its canonical
-   source is `.claude/skills/align-self-review/SKILL.md`.
-3. Run a fresh adversarial preflight review of `git diff main...HEAD` and fix
-   valid findings locally.
-4. Run the focused owner tests, `scripts/test-pr.sh`, and applicable Clippy.
-5. Record the HEAD/base-bound clean review log, reviewer, and checks against the
-   final commit with `scripts/pre-pr.sh`. Open the draft only through
-   `scripts/open-pr.sh`; direct
-   `gh pr create` bypasses the local guard and is prohibited for agent-driven
-   work. CI rejects an absent or stale HEAD-bound attestation.
+1. Finish and commit one coherent capability. For Rust under `crates/`, run the
+   `align-self-review` skill and the narrow check needed to make the candidate
+   reviewable.
+2. Run one fresh full-diff review with `scripts/review-bounded.sh` or one fresh
+   independent adversarial reviewer.
+3. If the review finds issues, verify the complete finding set, fix all valid
+   findings in one coherent commit, and record the finding-to-fix ledger. Do
+   not ask the reviewer to reread the complete diff.
+4. Run `scripts/pre-pr.sh` on the final commit. It runs the specified owner
+   check first, then the bounded PR gate and library/binary Clippy for Rust.
+   Pass `--findings-fixed` when the review log belongs to the preceding
+   reviewed candidate. This closes the ordinary one-review/one-fix cycle
+   without pretending that the fix commit was reviewed clean.
+5. Push and open the draft with `scripts/open-pr.sh`, wait for CI, then merge.
+   Opening the PR does not invalidate or duplicate the pre-open review. Direct
+   `gh pr create` is prohibited for agent-driven work.
 
-Finish ordinary PR-body edits before refreshing the final-SHA attestation.
-If the body changes after `scripts/update-pr-preflight.sh` but before post-open
-review is recorded, rerun that updater. If it changes after post-open review is
-recorded, rerun both `scripts/update-pr-preflight.sh` and
-`scripts/record-post-review.sh`; each preserves the other marker family.
-`scripts/record-post-review.sh` is the only expected later body mutation in the
-normal flow because it preserves existing preflight markers while adding the
-post-review markers.
+A complete re-review is required only when the fix changes a public contract
+or strategy, changes an IR shape, materially crosses three or more compiler
+layers, or responds to a P1 by redesigning the implementation. A local
+ownership, cleanup, FFI, ABI, diagnostic, or test correction closes against
+the original finding and its owner check. The user may explicitly request a
+second review.
 
-Every code PR must still receive one independent review cycle after it is
-opened and before it is merged:
+Finish ordinary PR-body prose before opening. If a later code push is actually
+required, rerun preflight for the new SHA and refresh the existing PR with
+`scripts/open-pr.sh --update PR_NUMBER`. There is no separate post-open review
+recorder or body-marker workflow.
 
-1. Run the host-native review with `scripts/review-bounded.sh` and a fresh
-   independent adversarial reviewer on the pushed diff. Each reviewer must
-   inspect the complete assigned scope and report all findings in that pass.
-2. Verify every finding against the code. Apply all valid findings, explain
-   rejected ones, and batch the fixes into one coherent follow-up commit
-   whenever possible.
-3. Close an ordinary follow-up with a finding-to-fix ledger and the focused
-   owner checks for the changed lines. Do not request another full-diff review
-   merely because valid P2/P3 findings were fixed.
-4. Require another independent review only when the follow-up changes a public
-   contract or strategy, changes ownership, cleanup, FFI, ABI, or an IR shape,
-   crosses three or more compiler layers, exceeds 250 hand-written changed
-   lines, responds to a P1 by redesigning the implementation, or the user asks
-   for another review.
-5. Refresh the final-SHA attestation, record the original review and bounded
-   finding closure, wait for CI, and only then merge.
-
-The normal cycle is therefore review once, fix all findings once, run the
-affected owner checks once, and finish. Repeated review is an explicit
-high-risk exception, not the default completion loop.
-
-Review execution follows the progress-monitoring rules above. If a review tool
-reaches its configured invocation bound without a verdict, record the elapsed
-time and last completed area, preserve its useful findings, and continue from
-the unfinished scope. Do not treat the missing verdict as CLEAN, and do not
-restart the complete review solely because the bound was reached. Review
-automation must not launch
-`cargo test --workspace` or `scripts/test-full.sh` for an ordinary PR unless
-the change scope explicitly requires that expanded verification.
+Review execution follows the progress-monitoring rules above. Review duration
+is proportional to useful progress and scope; there is no default wall-clock
+cutoff. `scripts/review-bounded.sh` keeps its historical name but stops by
+default only after a configured interval with neither log growth nor process
+CPU/state progress. An explicit user-supplied maximum duration bounds that one
+invocation only. If a review stops without a verdict, record the elapsed time
+and last completed area, preserve its useful findings, and continue from the
+unfinished scope. Do not treat the missing verdict as CLEAN, and do not restart
+the complete review solely because the invocation stopped. Review automation
+must not launch builds, tests, benchmarks, or network work; review is
+inspection, and verification is selected separately.
 
 ### Review operation guardrails
 
 - Run one review for an exact `HEAD`/base pair. Do not launch a duplicate review
   for the same pair while the first is still running.
-- A timeout, invocation bound, missing machine-readable verdict, or killed
+- A stall stop, explicit user bound, missing machine-readable verdict, or killed
   process means **INCOMPLETE**, never CLEAN. Preserve the log, elapsed time,
   last completed area, and process state.
-- A user-approved duration longer than the configured bound extends only the
-  current review invocation; it never authorizes polling/restarting the same
-  review or chaining another broad review. When that invocation ends, preserve
-  its checkpoint and continue only with the unfinished slice.
+- Useful log growth, advancing review phases, or accumulating process CPU time
+  is evidence to keep a long review running. Repeated identical analysis,
+  unchanged zero-CPU process state, scope drift, or orphaned helpers is not.
+- A user-supplied maximum duration applies only to the current review
+  invocation; it never authorizes polling/restarting the same review or
+  chaining another broad review. When that invocation ends, preserve its
+  checkpoint and continue only with the unfinished slice.
 - Inspect the process and new log output at least once per minute. Stop orphaned,
   duplicate, stalled, or scope-drifting review processes after recording their
   state; do not leave helper processes running after the parent review stops.
 - Continue only with the unreviewed, contradictory, or changed slice. A review
   continuation is separate from rerunning owner tests, pre-PR attestation, or
   CI; do not repeat those gates unless the tree or their required inputs changed.
-- A broad review rerun requires a high-risk trigger: a P1, public-contract or
-  strategy change, ownership/cleanup/FFI/ABI/IR change, three or more compiler
-  layers, more than 250 hand-written changed lines, or an explicit user request.
+- A broad review rerun requires a high-risk trigger: a P1 redesign,
+  public-contract or strategy change, IR-shape change, a material change across
+  three or more compiler layers, or an explicit user request. A small
+  ownership/cleanup/FFI/ABI fix is reviewed against the original finding and
+  changed lines without rereading the unchanged full diff.
 - On macOS, a review process at CPU 0 in `_dyld_start` with repeated Xcode cache
   or `xcodebuild` errors is a host stall. Stop it as INCOMPLETE, retain its
   useful static findings, and use CI or an isolated target for verification.
-
-Do not open and immediately merge a code PR.
 
 Do not rerun the same broad review or broad test gate on an unchanged tree.
 After a bounded review fix, run the smallest owner targets that can detect a
@@ -359,11 +405,14 @@ formatting churn, or elapsed agent activity.
 
 - After the narrow source-of-truth read, reach a compiling, owner-test-backed
   implementation checkpoint within 60 minutes.
-- Before coding an exact public or compiler-boundary slice, translate every
-  `every`/`exact` acceptance phrase and every named build path into an explicit
-  owner-test closure checklist. Enumerate the Cartesian cells and mutate malformed
-  records one field at a time; representative samples do not close an exact contract.
-- Before coding a control-flow/type-inference slice, cross discriminator reachability,
+- Before changing an exact public wire/ABI contract, ownership-safety boundary,
+  or malformed input path that could panic or miscompile, translate its
+  observable `every`/`exact` promises into an owner-test checklist. Exhaustive
+  Cartesian coverage is reserved for those externally meaningful or safety-
+  critical contracts. An internal representation-preserving refactor reuses
+  the cumulative owner suite and adds only tests that discriminate its new
+  risk; it does not clone one malformed fixture per variant.
+- When changing control-flow/type-inference behavior, cross discriminator reachability,
   alternative completion kind, expected-type availability, source-order permutations,
   and clean versus already-invalid subtrees in the owner matrix. Distinguish runtime joins
   from structural type reconciliation: only fallthrough alternatives contribute to a join;
@@ -371,12 +420,18 @@ formatting churn, or elapsed agent activity.
   structurally checked; reachable eager-diverging typed wrappers receive any required late
   reconciliation without contributing a runtime value. Preserve the same diagnostic guard
   for immediate and delayed constraints.
-- Keep the existing two-hour PR-ready limit. If the checkpoint cannot be made
-  mergeable by then, reduce it to the next smaller correct vertical slice and
-  record the reason in `HANDOFF.md`.
-- Target at most 500 hand-written changed lines per implementation PR. Above
-  1,000 requires the existing written proof that the work cannot be split
-  safely.
+- Two hours without new production/test progress triggers an evidence-based
+  check of the active blocker, not an automatic split or more design prose.
+- For continuous agent-driven milestone work, eight hours should close at
+  least one end-to-end capability and 24 hours should leave the planned
+  milestone merged or waiting only on an external required check. If it does
+  not, preserve the checkpoint and record where the time went: implementation,
+  owner tests, review, broad verification, tool/host wait, documentation, or
+  repeated planning. Correct the dominant cost before continuing.
+- Do not use changed-line count as the progress unit or PR boundary. Prefer a
+  larger capability PR over multiple dormant seams that repeat the same
+  matrix, review, and broad gates. Above roughly 1,000 hand-written changed
+  lines still requires the written capability-boundary proof described above.
 - Once the one review cycle and one coherent fix are complete, merge or
   explicitly re-scope. Do not start another general improvement or discovery
   loop inside that PR.
@@ -385,13 +440,15 @@ formatting churn, or elapsed agent activity.
 
 - A human starts the dedicated review with `/code-review`.
 - When Claude drives the PR flow autonomously, use the model-invocable `review`
-  skill on the open PR and an independent adversarial subagent.
+  skill or one fresh independent adversarial subagent. Use both only for
+  complementary assigned risks or an explicit user request.
 
 ### Codex review adapter
 
 - A human starts the dedicated reviewer with `/review`.
 - Non-interactive automation may use `codex review --base <branch>`,
   `codex review --uncommitted`, or `codex review --commit <sha>`.
-- When Codex drives the PR flow autonomously, inspect the PR/base diff and use
-  a fresh independent adversarial subagent; do not pretend to invoke a
-  user-only composer command from inside the turn.
+- When Codex drives the PR flow autonomously, use one host-native review or one
+  fresh independent adversarial subagent; do not pretend to invoke a user-only
+  composer command from inside the turn. Use a second reviewer only under the
+  review rules above.

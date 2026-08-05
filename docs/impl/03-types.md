@@ -532,4 +532,4 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is
 field-derived; nested arena ordering is implemented; and minimal generics monomorphize before MIR.
 The library-boundary entries above are settled prerequisites, not open design questions; their
-implementation sequence is `17-library-boundary-prerequisites.md` L1a–L7.
+capability dependencies are in `17-library-boundary-prerequisites.md` L1a–L7.

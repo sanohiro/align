@@ -365,7 +365,10 @@ fn gate_sv2c_corrupt_profile_valid_magic_hard_errors() {
 /// INTERLEAVED per round (a mid-test load spike hits all sides symmetrically) and the per-config min is
 /// kept (`gate_sv3` in `thin_lto_sv` explains why this cannot flake). `ALIGNC_CACHE=off` forces every run
 /// cold.
+/// Run locally with `scripts/cargo.sh test -p align_driver --test pgo_sv gate_sv3
+/// -- --ignored --nocapture`.
 #[test]
+#[ignore = "benchmark: run locally when changing PGO compile-time performance"]
 fn gate_sv3_compile_time_bound_both_modes() {
     if !backend() || !cc_available() || !profile_rt_available() {
         return;

@@ -31,18 +31,17 @@ error(c)                            // sugar: constructs the Code-carrying Error
 
 ## Type & ownership classification
 
-`Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). The current implementation
-still rejects several owned Move payload shapes at `scalar_arg`, with compiler-known std-handle
-exceptions. The replacement is settled and mandatory before `pkg.db`: one recursive tagged
-`DropPlan` admits any finite non-recursive Move payload, makes the tagged container Move, drops only
-the active payload, and moves/nulls it through construction/`match`/`else`/`?`. L1a/L1b in
-[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) owns that
-implementation. Until those slices land, the existing diagnostics remain the honest compiler
-boundary; new library handles must not add another exception.
+`Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). L1a/L1b in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) are complete:
+one recursive tagged `DropPlan` admits finite non-recursive Move payloads, makes the tagged
+container Move, drops only the active payload, and moves/nulls it through
+construction/`match`/`else`/`?`. Recursive types, arbitrary new Move-element collection layouts,
+and L2's dynamic path-selected return cleanup remain separately owned restrictions; new library
+handles must not add compiler-known exceptions.
 
-The PR boundary is exact: L1a admits only `Option<string>` as an owned struct-field leaf and leaves
-`Option<MoveStruct>` rejected; L1b admits Move structs/sums as Option/Result/user-sum payloads and
-completes their tagged control flow.
+The historical checkpoint boundary was exact: L1a first admitted only `Option<string>` as an owned
+struct-field leaf, then L1b admitted Move structs/sums as Option/Result/user-sum payloads and
+completed their tagged control flow.
 
 ## Effects
 

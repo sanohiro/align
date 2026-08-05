@@ -639,7 +639,7 @@ decode-escape semantics and lifted several deferrals. All of the following are n
 
 ## 14. Settled library-boundary extension (required before `pkg.db`)
 
-The complete design and ordered implementation plan are
+The complete design and capability dependency plan are
 `17-library-boundary-prerequisites.md`. This section fixes how it extends, rather than replaces,
 Memory Model v2.
 

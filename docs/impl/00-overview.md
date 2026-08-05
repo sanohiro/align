@@ -96,6 +96,7 @@ package-defined opaque Move resources + exactly-once Drop
 named arena region capabilities
 deterministic compiler-registered static source inputs
 region-backed plain-struct builders
+nested generic package composition + closed RegionPlain bounds
 ```
 
 These are general language/compiler mechanisms. `pkg.db` is their first complete consumer, but

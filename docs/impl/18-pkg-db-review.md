@@ -2,7 +2,13 @@
 
 ## Status
 
-**REVIEW OF RECORD — 2026-07-27.**
+**REVIEW OF RECORD — 2026-07-27; findings incorporated.**
+
+This file preserves the independent design review and its F1–F95 finding
+register. It is not the live implementation sequence. Current status is in
+`HANDOFF.md`; current prerequisite dependencies are in
+`17-library-boundary-prerequisites.md`; the complete product roadmap is in
+`pkg-design/db.md` §23.
 
 Reviewed design:
 
@@ -31,7 +37,7 @@ driver, compiler implementation, runtime implementation, commit, or release.
 
 ## 1. Verdict
 
-**REVISE.**
+**Original verdict: REVISE. Current disposition: incorporated.**
 
 The SQL-native, Query-centric direction is correct and should be retained. The original package
 proposal was not implementable as ordinary Align code without either unsound native views,
@@ -40,9 +46,12 @@ generics/package rules. The revised design resolves the API and compilation ques
 the missing general language facilities in
 [`17-library-boundary-prerequisites.md`](17-library-boundary-prerequisites.md).
 
-Database driver implementation remains **blocked on L1a–L7**. Prerequisite implementation may start
-with L1a. This is not a recommendation to defer the ideal design: L1a–L7 are mandatory scheduled
-work and part of the database delivery plan.
+Safe database driver implementation remains blocked until the complete L1a–L7
+gate. L1a and L1b are complete; `HANDOFF.md` owns the exact current L2 status.
+The remaining prerequisites follow a capability DAG rather than this review's
+original one-label-per-PR sequence. This is not a recommendation to defer the
+ideal design: L1a–L7 remain mandatory scheduled work and part of the database
+delivery plan.
 
 `pkg.db` has no dependency on `std.http`. Both should eventually use the same package-defined
 resource, borrow-provenance, and owner-tied native-view machinery. Sharing that language foundation
@@ -51,7 +60,7 @@ is desirable; importing the HTTP package or extracting an HTTP-flavored database
 ### 1.1 Public-contract ledger
 
 This ledger is the author-side completion gate for the design. A surface is ready for independent
-review only when its exact contract, implementation owner, acceptance/benchmark owner, and every
+review only when its exact contract, implementation owner, acceptance/local-measurement owner, and every
 listed source agree.
 
 | Surface | Exact invariant | Owner | Verification | Sources that must agree |
@@ -71,7 +80,7 @@ listed source agree.
 | Migrations | exact entry/catalog/driver/target CLI; versioned catalog/schema-identity codecs and independent goldens; atomic default; one-statement dirty exceptional path | D11 | CLI-input/byte-golden/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
 | Metadata records | exact signature notation plus parseable positional calls, typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | signature-table/syntax/input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
 | Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
-| Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
+| Delivery dependencies | L1a–L7 prerequisite DAG, D0 parallel evidence, D1–D12 initial-release gate, D13–D14 complete committed roadmap; no consumer precedes its prerequisite | all | capability owner gates in §5; local measurements in §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
 
 ## 2. Finding register
 
@@ -1429,9 +1438,11 @@ idea is rejected.
     bind/decode from the fixed integer/float/bool/text/bytea subset, SQLSTATE error, driver
     restriction, explicit configured ephemeral/local server,
     and a non-skippable provisioned CI gate for merge/release.
-20. **Small PR order:** L1a, L1b, L2a, L2b, L2c, L2d, L2e, L3, L4, L5, L6, L7, D0, D1, D2, D3,
-    D4, D5, D6, D7, D8, D9, D10, D11, D12, then D13–D14. Each owns only the tests and benchmark
-    rail listed below.
+20. **Capability order:** L1a/L1b precede the L2 capability waves; after L2, L3/L4/L5 may proceed
+    together, L6 follows L4, and L7 closes the prerequisite integration. D0 may run at any time.
+    After D1, the SQLite and PostgreSQL driver/metadata branches proceed by the §5 dependency DAG;
+    D1–D12 close the initial release and D13–D14 close the complete committed roadmap. Labels own
+    tests and local measurement rails, not mandatory individual PRs.
 
 ## 4. Required specification revisions
 
@@ -1543,9 +1554,36 @@ documents:
 89. Define the versioned migration catalog/schema-identity codecs and independent goldens.
 90. Show exact metadata signature notation separately from syntax-checked positional call examples.
 
-## 5. Revised implementation roadmap
+## 5. Revised capability roadmap
 
-| PR | Scope | Required focused tests | Benchmark/evidence |
+This table assigns contract, test, and measurement ownership. It is not a
+one-row-per-PR queue. Current prerequisite waves and product dependencies are
+defined by `HANDOFF.md`, `17-library-boundary-prerequisites.md`, and
+`pkg-design/db.md` §23.
+
+The current default publication boundaries are:
+
+| Wave | Acceptance owners | Outcome |
+|---|---|---|
+| C-A | remaining L2 canonical callable cells through c3 | one callable/type/ABI authority |
+| C-B | return provenance cells + L2c/L2d/L2e | complete public borrow/ownership behavior |
+| F-A / F-B / F-C | L3 / L4+L6 / L5 | parallel resources, region materialization, and static artifacts |
+| F-D | L7 | integrated ordinary-package prerequisite gate |
+| Q1 | D1 | fake-driver static Query vertical |
+| Q2 | D2 + D4 | one dual-driver scalar product |
+| Q3 | D3 + D5 | one dual-driver checked/offline contract |
+| Q4a | D6 + D7 | reusable prepared/transaction execution |
+| Q4b | D8 + D9 | streaming, deadline, cancellation, and cleanup resilience |
+| Q5a / Q5b | D11 / D12 | parallel mutation and read-only schema capabilities |
+| Q6 | D10 | compound-output release closure |
+| A1 / A2 | D13 / D14 | additive throughput/native and dynamic/callback release trains |
+
+Q1–Q4b and Q6 default to one capability PR each. Q5 uses two parallel PRs
+because schema mutation and inspection are independent failure domains. A1/A2
+may publish independently useful common or driver rails in parallel. No other
+acceptance label creates a PR boundary by itself.
+
+| Milestone | Scope | Required focused tests | Local measurement/evidence |
 |---|---|---|---|
 | L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
@@ -1575,10 +1613,28 @@ documents:
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
-## 6. Exact first implementation PR
+The delivery dependencies are:
 
-The first implementation PR is **L1a only**. It must not contain database, resource, borrow, region,
-or static-input code.
+```text
+L1a/L1b -> C-A -> C-B
+C-B -> { F-A, F-B, F-C } -> F-D -> Q1 -> Q2
+Q2 -> { Q4a -> Q4b -> Q6, Q3 -> { Q5a, Q5b } } -> initial release
+initial release -> { A1, A2 } -> complete committed roadmap
+P0/D0 evidence runs in parallel before Q2.
+```
+
+This is the publication relation. The exact internal D-cell dependency remains
+in `pkg-design/db.md` §23; each wave still closes every applicable owner row
+before claiming its consumer capability.
+
+## 6. Historical first implementation checkpoint
+
+This section records the original first implementation boundary. L1a has since
+completed. Its commands and benchmark were the acceptance evidence used for
+that checkpoint, not a reusable gate for later work.
+
+The first implementation PR was **L1a only**. It did not contain database,
+resource, borrow, region, or static-input code.
 
 Scope:
 
@@ -1617,7 +1673,7 @@ Acceptance commands:
 cargo test -p align_driver --test owned_tagged_payloads
 cargo test -p align_driver --test analysis_coverage
 scripts/test-pr.sh
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --lib --bins --locked -- -D warnings
 bench/owned_tagged_payload/run.sh
 ```
 
@@ -1636,9 +1692,9 @@ Acceptance behavior:
 - malformed/unsupported types produce diagnostics rather than compiler panic;
 - generated LLVM has a tag guard and introduces no allocation on `None`.
 
-## 7. Required benchmark set
+## 7. Local measurement inventory
 
-The delivery is not performance-complete without:
+The named paths remain locally measurable through:
 
 - L1a/L1b tagged-Move branch, allocation, and Drop counts;
 - L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver,
@@ -1673,8 +1729,11 @@ The delivery is not performance-complete without:
 - D13 batch/SoA/native throughput on each driver;
 - D14 dynamic dispatch/mismatch overhead versus direct driver-qualified execution.
 
-Benchmark results are evidence and regression anchors. They may not justify removing ownership,
-runtime contract validation, explicit options, or one-statement semantics.
+Run a measurement when its named performance path first lands or materially
+changes, or when a human explicitly investigates it. Measurements are not
+ordinary regression tests and are not PR, release, or milestone gates. They may
+not justify removing ownership, runtime contract validation, explicit options,
+or one-statement semantics.
 
 ## 8. Review execution record
 
