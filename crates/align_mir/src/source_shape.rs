@@ -25,6 +25,7 @@ pub(super) enum SourceShapeNode<'a> {
         ret: &'a Ty,
         return_borrow: &'a hir::ReturnBorrowSummary,
         return_region: &'a hir::ReturnRegionSummary,
+        return_cleanup: hir::ReturnCleanupAbi,
     },
 }
 
@@ -86,6 +87,7 @@ impl SourceShapeView for hir::Program {
                         ret: &definition.ret,
                         return_borrow: &definition.return_borrow,
                         return_region: &definition.return_region,
+                        return_cleanup: definition.return_cleanup,
                     })
             }
         }
@@ -290,14 +292,19 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
                     ret: left_ret,
                     return_borrow: left_borrow,
                     return_region: left_region,
+                    return_cleanup: left_cleanup,
                 },
                 SourceShapeNode::Function {
                     params: right_params,
                     ret: right_ret,
                     return_borrow: right_borrow,
                     return_region: right_region,
+                    return_cleanup: right_cleanup,
                 },
             ) => {
+                if left_cleanup != right_cleanup {
+                    return false;
+                }
                 if left_params.len() != right_params.len()
                     || left_borrow != right_borrow
                     || left_region != right_region
@@ -562,6 +569,7 @@ fn shape_cost(node: &SourceShapeNode<'_>) -> (usize, usize) {
             ret,
             return_borrow,
             return_region,
+            return_cleanup: _,
         } => {
             let mut cost = ty_cost(**ret);
             cost.1 += 4 + borrow_summary_work(return_borrow) + region_summary_work(return_region);

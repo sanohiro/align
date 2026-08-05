@@ -1,5 +1,4 @@
-//! L2b-a1 gate: return-borrow/region summaries retain caller-relative parameter roots across
-//! named, direct, recursive, and imported call paths while aggregates stay conservatively flat.
+//! L2b return-provenance gate across direct/imported calls, projections, and function values.
 
 mod common;
 use common::*;
@@ -22,6 +21,7 @@ fn direct_return_summaries_cover_scalar_recursion_and_flattened_aggregates() {
 module views
 pub BoxedView { value: str }
 pub Choice { First(str), Second(str) }
+pub ViewError { Text(str), Fixed }
 pub fn second(first: str, second: str) -> str = second
 pub fn boxed(value: str, ignored: str) -> BoxedView =
   BoxedView { value: value }
@@ -47,6 +47,29 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
     Second(_) => \"fixed\"
   }
 }
+pub fn keep_view_error(value: ViewError) -> ViewError = value
+pub fn fixed_view_error(_: ViewError) -> ViewError = ViewError.Fixed
+pub fn map_ok(value: str, ignored: str) -> Result<str, ViewError> {
+  result: Result<str, ViewError> := Ok(value)
+  return result.map_err(keep_view_error)
+}
+pub fn map_error(value: str, ignored: str) -> Result<str, ViewError> {
+  result: Result<str, ViewError> := Err(ViewError.Text(value))
+  return result.map_err(keep_view_error)
+}
+pub fn map_fixed_error(value: str) -> Result<str, ViewError> {
+  result: Result<str, ViewError> := Err(ViewError.Text(value))
+  return result.map_err(fixed_view_error)
+}
+pub fn map_captured_error(value: str) -> Result<str, ViewError> {
+  result: Result<str, ViewError> := Err(ViewError.Fixed)
+  mapper := fn _: ViewError { ViewError.Text(value) }
+  return result.map_err(mapper)
+}
+pub fn map_unresolved(
+  result: Result<str, ViewError>,
+  mapper: fn(ViewError) -> ViewError,
+) -> Result<str, ViewError> = result.map_err(mapper)
 ",
         ),
         ("main.align", "import views\nfn main() -> i32 = 0\n"),
@@ -83,8 +106,8 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
     assert_eq!(find("loop_identity").return_borrow, roots(&[0], &[]));
     assert_eq!(
         find("propagate").return_borrow,
-        roots(&[0, 1], &[]),
-        "L2b-a1 conservatively flattens the implicit Err edge and continuing Ok value"
+        roots(&[1], &[]),
+        "the implicit Err edge owns its payload; only the continuing fallback view borrows"
     );
     assert_eq!(
         find("consume_try_success").return_borrow,
@@ -93,8 +116,20 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
     );
     assert_eq!(
         find("choose").return_borrow,
+        roots(&[0], &[]),
+        "the selected First payload must not retain the inactive Second sibling"
+    );
+    assert_eq!(find("map_ok").return_borrow, roots(&[0], &[]));
+    assert_eq!(find("map_error").return_borrow, roots(&[0], &[]));
+    assert_eq!(
+        find("map_fixed_error").return_borrow,
+        ReturnBorrowSummary::None
+    );
+    assert_eq!(find("map_captured_error").return_borrow, roots(&[0], &[]));
+    assert_eq!(
+        find("map_unresolved").return_borrow,
         roots(&[0, 1], &[]),
-        "L2b-a1 deliberately retains the flattened sum-payload union"
+        "an unresolved mapper must retain both its compatible Result input and environment"
     );
     assert_eq!(
         find("second").return_region,
@@ -363,8 +398,8 @@ pub fn deferred_pipeline_projection(first: str, second: str) -> str {
     ] {
         assert_eq!(
             find(name).return_borrow,
-            roots(&[0, 1], &[]),
-            "{name} must retain both roots until array/pipeline projection lands"
+            roots(&[0], &[]),
+            "{name} must retain only the selected first parameter"
         );
     }
 }
@@ -1909,7 +1944,7 @@ fn main() -> i32 {
 }
 
 #[test]
-fn lifted_closure_capture_roots_remain_deferred_to_l2b_b() {
+fn lifted_closure_capture_roots_drive_indirect_results() {
     if !backend_available() {
         return;
     }
@@ -1927,7 +1962,58 @@ fn main() -> i32 {
 }
 
 #[test]
-fn named_function_value_summaries_remain_deferred_to_l2b_b() {
+fn captured_indirect_results_resolve_to_outer_parameters() {
+    let files = &[
+        (
+            "views.align",
+            "\
+module views
+pub Holder { callback: fn() -> str }
+pub fn captured(value: str) -> str {
+  callback := fn { value }
+  return callback()
+}
+pub fn joined(left: str, right: str, choose: bool) -> str {
+  mut callback := fn { left }
+  if choose { callback = fn { right } }
+  return callback()
+}
+pub fn stored(value: str) -> str {
+  holder := Holder { callback: fn { value } }
+  return holder.callback()
+}
+",
+        ),
+        ("main.align", "import views\nfn main() -> i32 = 0\n"),
+    ];
+    let checked = assert_same_verdict(
+        "l2b-captured-result-outer-summary",
+        files,
+        "main.align",
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "a captured caller-owned parameter may flow through an indirect result"
+    );
+    let summary = checked
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "views")
+        .expect("views summary");
+    let find = |name: &str| {
+        summary
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} signature"))
+    };
+    assert_eq!(find("captured").return_borrow, roots(&[0], &[]));
+    assert_eq!(find("joined").return_borrow, roots(&[0, 1], &[]));
+    assert_eq!(find("stored").return_borrow, roots(&[0], &[]));
+}
+
+#[test]
+fn named_function_value_summaries_drive_indirect_results() {
     if !backend_available() {
         return;
     }
@@ -1943,4 +2029,110 @@ fn main() -> i32 {
 ";
     let output = build_and_run("l2b-a1-named-fn-value", src);
     assert_eq!(output.status.code(), Some(14));
+}
+
+#[test]
+fn named_function_value_result_keeps_the_selected_owner_live() {
+    let files = &[(
+        "main.align",
+        "\
+fn identity(value: str) -> str = value
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  owned := \"function value\".clone()
+  view: str := owned
+  f := identity
+  result := f(view)
+  consume(owned)
+  return result.len() as i32
+}
+",
+    )];
+    let checked = assert_same_verdict("l2b-named-fn-value-owner", files, "main.align");
+    assert!(
+        checked.diags.has_errors(),
+        "an indirect identity result must keep its selected argument owner live"
+    );
+}
+
+#[test]
+fn closure_target_joins_keep_capture_slots_target_relative() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn consume(value: string) -> i64 = value.len()
+fn main(args: array<str>) -> Result<(), Error> {
+  left_owner := \"left\".clone()
+  ignored_owner := \"ignored\".clone()
+  right_owner := \"right hand\".clone()
+  left: str := left_owner
+  ignored: str := ignored_owner
+  right: str := right_owner
+  mut f := fn { left }
+  if args.len() > 1 {
+    f = fn { ignored.len(); right }
+  }
+  result := f()
+  consume(ignored_owner)
+  print(result.len())
+  return Ok(())
+}
+";
+    let left = build_and_run_args("l2b-target-relative-left", src, &[]);
+    assert_eq!(left.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&left.stdout), "4\n");
+    let right = build_and_run_args("l2b-target-relative-right", src, &["right"]);
+    assert_eq!(right.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&right.stdout), "10\n");
+}
+
+#[test]
+fn closure_target_join_keeps_every_selected_owner_live() {
+    let files = &[(
+        "main.align",
+        "\
+fn consume(value: string) -> i64 = value.len()
+fn main(args: array<str>) -> i32 {
+  left_owner := \"left\".clone()
+  right_owner := \"right\".clone()
+  left: str := left_owner
+  right: str := right_owner
+  mut f := fn { left }
+  if args.len() > 1 { f = fn { right } }
+  result := f()
+  consume(left_owner)
+  return result.len() as i32
+}
+",
+    )];
+    let checked = assert_same_verdict("l2b-closure-target-owner", files, "main.align");
+    assert!(
+        checked.diags.has_errors(),
+        "a joined closure result must keep every runtime-selectable capture owner live"
+    );
+}
+
+#[test]
+fn closure_capture_roots_survive_struct_storage_and_projection() {
+    let files = &[(
+        "main.align",
+        "\
+Holder { callback: fn() -> str }
+fn consume(value: string) -> i64 = value.len()
+fn main() -> i32 {
+  owned := \"stored closure\".clone()
+  view: str := owned
+  holder := Holder { callback: fn { view } }
+  result := holder.callback()
+  consume(owned)
+  return result.len() as i32
+}
+",
+    )];
+    let checked = assert_same_verdict("l2b-closure-field-owner", files, "main.align");
+    assert!(
+        checked.diags.has_errors(),
+        "a closure projected from a struct field must retain its captured owner"
+    );
 }

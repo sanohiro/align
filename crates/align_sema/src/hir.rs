@@ -13,6 +13,14 @@ use align_span::Span;
 /// Identifier of a local variable (and its memory slot) within a function body.
 pub type LocalId = u32;
 
+/// Physical ownership result carried by an Align call. Copy returns have no extra ABI value;
+/// recursively Move returns carry the path-selected cleanup bit beside the returned value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReturnCleanupAbi {
+    None,
+    DynamicBit,
+}
+
 /// The overflow handling of an explicit-overflow integer op ([`ExprKind::IntArith`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithMode {
@@ -64,6 +72,7 @@ pub struct ExternFn {
     pub ret: crate::Ty,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
+    pub return_cleanup: ReturnCleanupAbi,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +135,7 @@ pub struct ImportedFn {
     pub return_provenance_known: bool,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
+    pub return_cleanup: ReturnCleanupAbi,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
     /// after declaration validation because the six-field imported ABI record is unchanged.
     pub effect: crate::FnEffect,
@@ -146,6 +156,8 @@ pub struct FnTy {
     /// Inputs/captures whose allocation region may own the returned value. L2a records `None`;
     /// L2b computes roots.
     pub return_region: ReturnRegionSummary,
+    /// Whether calls return only the value or the value plus a path-selected cleanup bit.
+    pub return_cleanup: ReturnCleanupAbi,
     /// Inferred observable effect of invoking a value of this type. This is internal type
     /// information: source annotations remain `fn(T) -> R`, while the checker refines the bit from
     /// each value's origin and conservatively joins mutable assignments. `Unknown` is fail-closed
@@ -281,6 +293,7 @@ pub struct Fn {
     pub ret: Ty,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
+    pub return_cleanup: ReturnCleanupAbi,
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,

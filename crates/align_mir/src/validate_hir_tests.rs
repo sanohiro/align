@@ -29,6 +29,7 @@ fn declaration_header_program() -> hir::Program {
         ret: int(64),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     program.imported_fns.push(ImportedFn {
         name: "dep$read".to_string(),
@@ -44,6 +45,7 @@ fn declaration_header_program() -> hir::Program {
             params: vec![0],
             captures: Vec::new(),
         },
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
     });
     let span = align_span::Span::new(0, 0, 0);
@@ -64,6 +66,7 @@ fn declaration_header_program() -> hir::Program {
             params: vec![0],
             captures: Vec::new(),
         },
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: vec![
             hir::Local {
                 id: 0,
@@ -151,7 +154,10 @@ fn checked_interface_program(
     external_effects.insert("dep$identity".to_string(), effect);
     let mut external_provenance = align_sema::ExternalReturnProvenance::new();
     if let Some(provenance) = provenance {
-        external_provenance.insert("dep$identity".to_string(), provenance);
+        external_provenance.insert(
+            "dep$identity".to_string(),
+            (provenance.0, provenance.1, hir::ReturnCleanupAbi::None),
+        );
     }
     let program = if external_provenance.is_empty() {
         align_sema::check_program_with_effects(&modules, &external_effects, &mut diagnostics)
@@ -215,6 +221,7 @@ fn fn_type_header_program() -> hir::Program {
             params: vec![0, 1],
             captures: Vec::new(),
         },
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: Cell::new(FnEffect::Pure),
     };
     program
@@ -268,6 +275,7 @@ fn main_header_program(params: Vec<Ty>, param_modes: Vec<align_ast::ParamMode>, 
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: local_params,
         body: hir::Block {
             stmts: Vec::new(),
@@ -433,9 +441,34 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
         program.fns[0].locals[0].is_param = false;
         program.fns[0].param_modes[0] = align_ast::ParamMode::Out;
     });
-    assert_one_header_mutation("lifted-origin-summary", &base, |program| {
-        program.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
-        program.fns[0].locals[0].is_param = false;
+    let mut lifted_summary = base.clone();
+    lifted_summary.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 1 };
+    lifted_summary.fns[0].locals[0].is_param = false;
+    lifted_summary.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: Vec::new(),
+        captures: vec![0],
+    };
+    lifted_summary.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: Vec::new(),
+        captures: vec![0],
+    };
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(&lifted_summary),
+        "an in-range lifted capture summary is valid declaration metadata"
+    );
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&lifted_summary),
+        "the lifted capture summary must agree with producer replay"
+    );
+    assert_one_header_mutation("lifted-origin-summary-range", &lifted_summary, |program| {
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: Vec::new(),
+            captures: vec![1],
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: Vec::new(),
+            captures: vec![1],
+        };
     });
 
     let fn_base = fn_type_header_program();
@@ -473,16 +506,35 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
             captures: Vec::new(),
         };
     });
-    assert_one_header_mutation("fn-type-summary-captures", &fn_base, |program| {
-        program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
+    let mut stale_fn_capture = fn_base.clone();
+    stale_fn_capture.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
             params: vec![0, 1],
             captures: vec![0],
-        };
-        program.fn_types[0].return_region = ReturnRegionSummary::Roots {
+    };
+    stale_fn_capture.fn_types[0].return_region = ReturnRegionSummary::Roots {
             params: vec![0, 1],
             captures: vec![0],
-        };
-    });
+    };
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(&stale_fn_capture),
+        "a canonical function-type capture summary is structurally valid"
+    );
+    assert_replay_rejects_without_mutating(
+        stale_fn_capture.clone(),
+        "a function-type capture summary without a concrete producer target must fail replay",
+    );
+    let source_map = SourceMap::new();
+    for lowered in [
+        lower_program(&stale_fn_capture),
+        lower_program_located(&stale_fn_capture, &source_map),
+        lower_program_per_unit(&stale_fn_capture),
+        lower_program_per_unit_located(&stale_fn_capture, &source_map),
+    ] {
+        assert!(
+            is_empty(&lowered),
+            "fn-type-summary-captures: stale producer fact published MIR"
+        );
+    }
 
     let summary_base = summary_header_program();
     assert!(validate_hir::declaration_header_metadata_is_valid(&summary_base));
@@ -1950,6 +2002,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
             params: vec![0],
             captures: Vec::new(),
         },
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Unknown,
     });
     assert!(validate_hir::declaration_header_metadata_is_valid(&program));
@@ -1964,6 +2017,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Impure,
     });
     assert_header_rejected("deep-header-later-sibling", &malformed);
@@ -1993,6 +2047,7 @@ fn fn_type(ret: Ty) -> FnTy {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: Cell::new(FnEffect::Unknown),
     }
 }
@@ -2003,6 +2058,7 @@ fn body_fn_type(params: Vec<(align_ast::ParamMode, Scalar)>, ret: Ty) -> FnTy {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: Cell::new(FnEffect::Pure),
     }
 }
@@ -2178,6 +2234,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
     }
 }
@@ -2244,6 +2301,7 @@ fn with_return(ty: Ty) -> hir::Program {
         return_provenance_known: false,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
     });
     program
@@ -2848,6 +2906,7 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
         ret: int(64),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -2932,6 +2991,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -2958,6 +3018,7 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Str,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3057,6 +3118,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3098,6 +3160,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Reader,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3177,6 +3240,7 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         ret: result_ty,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3271,6 +3335,7 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: vec![hir::Local {
             id: 0,
             name: "regex".to_string(),
@@ -3340,6 +3405,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         ret: Ty::String,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3379,6 +3445,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         ret: result_ty,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3424,6 +3491,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: vec![hir::Local {
             id: 0,
             name: "builder".to_string(),
@@ -3477,6 +3545,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: vec![hir::Local {
             id: 0,
             name: "argv".to_string(),
@@ -3529,6 +3598,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: vec![hir::Stmt::Expr(expr)],
@@ -3594,6 +3664,7 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3664,6 +3735,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         ret: expr.ty,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3749,6 +3821,7 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3840,6 +3913,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3905,6 +3979,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         ret: Ty::Bool,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3972,6 +4047,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4033,6 +4109,7 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
         ret: int(64),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4103,6 +4180,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         ret: int(64),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         locals: vec![hir::Local {
             id: 0,
             name: "xs".to_string(),
@@ -4132,6 +4210,38 @@ struct DepthFixture {
     name: &'static str,
     make: fn(usize) -> hir::Program,
     owner: MirOwner,
+}
+
+fn normalize_test_return_cleanup(program: &mut hir::Program) {
+    let structs = &program.structs;
+    let tuples = &program.tuples;
+    let enums = &program.enums;
+    let tagged_types = &program.tagged_types;
+    let classify = |ret| {
+        if align_sema::needs_drop_flag(
+            ret,
+            structs,
+            tuples,
+            enums,
+            tagged_types,
+        ) {
+            hir::ReturnCleanupAbi::DynamicBit
+        } else {
+            hir::ReturnCleanupAbi::None
+        }
+    };
+    for function in &mut program.fns {
+        function.return_cleanup = classify(function.ret);
+    }
+    for function in &mut program.externs {
+        function.return_cleanup = classify(function.ret);
+    }
+    for function in &mut program.imported_fns {
+        function.return_cleanup = classify(function.ret);
+    }
+    for function in &mut program.fn_types {
+        function.return_cleanup = classify(function.ret);
+    }
 }
 
 fn depth_fixtures() -> Vec<DepthFixture> {
@@ -4250,7 +4360,8 @@ fn checked_hir_depth_closure_matrix() {
                     align_sema::MAX_CHECKED_HIR_DEPTH - 1,
                     align_sema::MAX_CHECKED_HIR_DEPTH,
                 ] {
-                    let program = (fixture.make)(depth);
+                    let mut program = (fixture.make)(depth);
+                    normalize_test_return_cleanup(&mut program);
                     assert!(
                         align_sema::checked_hir_body_depth_is_valid(&program),
                         "{}: valid checked-HIR depth {depth} was rejected",
@@ -4263,7 +4374,8 @@ fn checked_hir_depth_closure_matrix() {
             let depth = align_sema::MAX_CHECKED_HIR_DEPTH + 1;
             let source_map = SourceMap::new();
             for fixture in depth_fixtures() {
-                let program = (fixture.make)(depth);
+                let mut program = (fixture.make)(depth);
+                normalize_test_return_cleanup(&mut program);
                 assert!(
                     !align_sema::checked_hir_body_depth_is_valid(&program),
                     "{}: over-bound checked-HIR depth {depth} was accepted",
@@ -4322,6 +4434,7 @@ fn deep_type_consumer_closure_matrix() {
                 })
                 .collect();
             program.fn_types[0].ret = Ty::Tagged(0);
+            program.fn_types[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
             assert_accepted("deep nominal/tagged type consumer", &program);
 
             program.structs[DEPTH - 1].fields.push(FieldDef {
@@ -4567,6 +4680,7 @@ fn malformed_hir_type_placement_fails_closed() {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     assert_placement_rejected("bool extern parameter", &extern_bool);
 
@@ -4578,6 +4692,7 @@ fn malformed_hir_type_placement_fails_closed() {
         ret: Ty::Str,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     assert_placement_rejected("view extern return", &extern_view_return);
 }
@@ -4987,10 +5102,12 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
         ),
     ];
     program.fn_types[0].ret = Ty::Result(Scalar::String, Scalar::Enum(0));
+    program.fn_types[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
     program
         .imported_fns
         .push(imported_fn("dep$placement", vec![Ty::File], Ty::Unit));
     program.imported_fns[0].ret = Ty::Result(Scalar::File, Scalar::Enum(0));
+    program.imported_fns[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
     assert_accepted("body-independent placement matrix", &program);
 
     let mut externs = program.clone();
@@ -5019,6 +5136,7 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
         ret: Ty::Struct(c_struct),
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     assert_accepted("extern placement matrix", &externs);
 }
@@ -5100,6 +5218,24 @@ fn body_test_expr(kind: hir::ExprKind, ty: Ty) -> hir::Expr {
     }
 }
 
+fn body_test_return_cleanup(ret: Ty) -> hir::ReturnCleanupAbi {
+    let dynamic = match ret {
+        Ty::String
+        | Ty::DynArray(_)
+        | Ty::DynStructArray(..)
+        | Ty::DynSliceArray(_)
+        | Ty::DynResponseArray => true,
+        Ty::Option(value) => value.is_move(),
+        Ty::Result(ok, err) => ok.is_move() || err.is_move(),
+        other => align_sema::is_move_handle(other),
+    };
+    if dynamic {
+        hir::ReturnCleanupAbi::DynamicBit
+    } else {
+        hir::ReturnCleanupAbi::None
+    }
+}
+
 fn body_test_named_function(
     name: &str,
     body: hir::Block,
@@ -5117,6 +5253,7 @@ fn body_test_named_function(
         ret,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: body_test_return_cleanup(ret),
         locals,
         body,
         span: align_span::Span::new(0, 0, 0),
@@ -10709,6 +10846,7 @@ fn hir_body_validator_generated_callables() {
         ret: integer,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     program.fns.push(body_unit_case("generated_source", body_test_expr(hir::ExprKind::Unit, Ty::Unit)));
     let mut lifted = body_test_parameter_function(
@@ -10881,6 +11019,7 @@ fn hir_body_validator_generated_callables() {
         ret: integer,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     program.fns.push(body_test_parameter_function(
         "generated_pipeline_extern",
@@ -10985,6 +11124,7 @@ fn hir_body_validator_native_control_flow() {
         ret: Ty::Unit,
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
     });
     program.fns.push(body_tail_case(
         "native_control_exit",
@@ -11850,6 +11990,7 @@ fn hir_body_type_mangle_golden_vectors() {
             params: vec![0],
             captures: Vec::new(),
         },
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: Cell::new(FnEffect::Pure),
     };
     assert_eq!(

@@ -1615,7 +1615,13 @@ fn borrow_leaf_paths_for_type(
                 let ty = expand_tagged_ty(ty, tagged_types);
                 let aggregate = matches!(
                     ty,
-                    Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
+                    Ty::Struct(_)
+                        | Ty::Tuple(_)
+                        | Ty::Array(..)
+                        | Ty::StructArray(..)
+                        | Ty::Enum(_)
+                        | Ty::Option(_)
+                        | Ty::Result(..)
                 );
                 if aggregate && !visiting.insert(ty) {
                     // Malformed cycles retain a conservative whole-value leaf at the cycle edge.
@@ -1651,6 +1657,16 @@ fn borrow_leaf_paths_for_type(
                                 },
                             ));
                         }
+                    }
+                    Ty::Array(element, len) => {
+                        children.extend((0..len).map(|index| {
+                            (BorrowProjection::ArrayElement(index), scalar_to_ty(element))
+                        }));
+                    }
+                    Ty::StructArray(id, len) => {
+                        children.extend((0..len).map(|index| {
+                            (BorrowProjection::ArrayElement(index), Ty::Struct(id))
+                        }));
                     }
                     Ty::Enum(id) => {
                         if let Some(definition) = enums.get(id as usize) {
@@ -2147,6 +2163,7 @@ struct FnSig {
     json_scan_return_spelling: Option<String>,
     return_borrow: hir::ReturnBorrowSummary,
     return_region: hir::ReturnRegionSummary,
+    return_cleanup: hir::ReturnCleanupAbi,
     /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
     /// The `params`/`ret` types may contain `Ty::Param(i)` indexing into this list.
     type_params: Vec<String>,
@@ -3317,7 +3334,14 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 /// The imported return-provenance facts of non-generic public functions, keyed by canonical
 /// (mangled) name. The interface codec validates every root before constructing this map.
 pub type ExternalReturnProvenance =
-    std::collections::HashMap<String, (hir::ReturnBorrowSummary, hir::ReturnRegionSummary)>;
+    std::collections::HashMap<
+        String,
+        (
+            hir::ReturnBorrowSummary,
+            hir::ReturnRegionSummary,
+            hir::ReturnCleanupAbi,
+        ),
+    >;
 
 /// M15 S1b compatibility entry point. L2b callers that reconstruct interface-only dependencies use
 /// [`check_program_with_interface_facts`] so imported return provenance is preserved as well.
@@ -4352,6 +4376,7 @@ pub fn check_program_with_interface_facts(
                 json_scan_return_spelling: f.ret.as_ref().and_then(json_scan_row_source_spelling),
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 type_params: tparams,
                 bounds,
                 is_extern: false,
@@ -4362,10 +4387,11 @@ pub fn check_program_with_interface_facts(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
+            sig.return_cleanup = *return_cleanup;
         }
     }
 
@@ -4490,6 +4516,7 @@ pub fn check_program_with_interface_facts(
                             json_scan_return_spelling: None,
                             return_borrow: hir::ReturnBorrowSummary::None,
                             return_region: hir::ReturnRegionSummary::None,
+                            return_cleanup: hir::ReturnCleanupAbi::None,
                             type_params: Vec::new(),
                             bounds: Vec::new(),
                             is_extern: true,
@@ -4506,6 +4533,7 @@ pub fn check_program_with_interface_facts(
                         ret,
                         return_borrow: hir::ReturnBorrowSummary::None,
                         return_region: hir::ReturnRegionSummary::None,
+                        return_cleanup: hir::ReturnCleanupAbi::None,
                     });
                 }
             }
@@ -4553,6 +4581,19 @@ pub fn check_program_with_interface_facts(
             if !is_generic && matches!(f.vis, ast::Vis::Pub) {
                 let mangled = mangle_fn(module, is_entry, &f.name.name);
                 if let Some(sig) = sigs.get(&mangled) {
+                    let expected_cleanup = return_cleanup_abi(
+                        sig.ret,
+                        &structs,
+                        &tuples,
+                        &enums,
+                        &tagged_types,
+                    );
+                    if sig.return_cleanup != expected_cleanup {
+                        diags.error(
+                            "imported return cleanup ABI disagrees with its return type".to_owned(),
+                            f.span,
+                        );
+                    }
                     let return_provenance_known =
                         external_return_provenance.contains_key(&mangled);
                     let effect = external_effects
@@ -4567,6 +4608,7 @@ pub fn check_program_with_interface_facts(
                         return_provenance_known,
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
+                        return_cleanup: sig.return_cleanup,
                         effect,
                     });
                 }
@@ -4773,6 +4815,8 @@ pub fn check_program_with_interface_facts(
         fn_types,
         imported_fns,
     };
+    assign_return_cleanup_abi(&mut program);
+    prepare_local_fn_types(&mut program);
     infer_return_provenance(&mut program);
     run_body_analysis_passes(
         &mut program,
@@ -4781,6 +4825,50 @@ pub fn check_program_with_interface_facts(
         false,
     );
     program
+}
+
+fn return_cleanup_abi(
+    ty: Ty,
+    structs: &[hir::StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> hir::ReturnCleanupAbi {
+    if needs_drop_flag(ty, structs, tuples, enums, tagged_types) {
+        hir::ReturnCleanupAbi::DynamicBit
+    } else {
+        hir::ReturnCleanupAbi::None
+    }
+}
+
+fn assign_return_cleanup_abi(program: &mut Program) {
+    let Program {
+        fns,
+        externs,
+        imported_fns,
+        structs,
+        tuples,
+        enums,
+        tagged_types,
+        fn_types,
+        ..
+    } = program;
+    for function in fns {
+        function.return_cleanup =
+            return_cleanup_abi(function.ret, structs, tuples, enums, tagged_types);
+    }
+    for function in externs {
+        function.return_cleanup =
+            return_cleanup_abi(function.ret, structs, tuples, enums, tagged_types);
+    }
+    for function in imported_fns {
+        function.return_cleanup =
+            return_cleanup_abi(function.ret, structs, tuples, enums, tagged_types);
+    }
+    for function in fn_types {
+        function.return_cleanup =
+            return_cleanup_abi(function.ret, structs, tuples, enums, tagged_types);
+    }
 }
 
 fn run_body_analysis_passes(
@@ -4813,6 +4901,18 @@ fn run_body_analysis_passes(
                 .map(|function| (function.name.clone(), function.return_region.clone())),
         )
         .collect();
+    let named_param_modes: std::collections::HashMap<String, Vec<ast::ParamMode>> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.param_modes.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .map(|function| (function.name.clone(), function.param_modes.clone())),
+        )
+        .collect();
+    let callable = infer_fn_value_return_provenance(program, &named_return_borrow);
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -4823,22 +4923,28 @@ fn run_body_analysis_passes(
         structs,
         enums,
         tagged_types,
+        fn_types,
         ..
     } = program;
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
     let enums: &[hir::EnumDef] = enums;
     let tagged_types: &[hir::TaggedType] = tagged_types;
+    let fn_types: &[hir::FnTy] = fn_types;
     for f in fns.iter_mut() {
         MoveCheck {
             f,
             diags,
             named_return_borrow: &named_return_borrow,
+            named_param_modes: &named_param_modes,
             summary_dependencies: None,
             tuples,
             structs,
             enums,
             tagged_types,
+            fn_types,
+            callable_targets: &callable.targets_by_type,
+            callable_target_ids: &callable.target_ids,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -4863,6 +4969,7 @@ fn run_body_analysis_passes(
                 f,
                 diags,
                 named_return_region: &named_return_region,
+                fn_types,
                 tuples,
                 structs,
                 enums,
@@ -4888,12 +4995,23 @@ fn run_body_analysis_passes(
         // write iff that path installed an individually owned value, and cleared for arena values,
         // moves, and uninitialised paths. This lets one slot safely hold Arena and Static values on
         // different paths without either freeing arena memory or leaking heap memory.
+        let borrowed_params = f
+            .params
+            .iter()
+            .copied()
+            .zip(f.param_modes.iter().copied())
+            .filter_map(|(local, mode)| {
+                matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    .then_some(local)
+            })
+            .collect::<std::collections::HashSet<_>>();
         let drops: Vec<LocalId> = f
             .locals
             .iter()
             .filter(|l| {
-                is_owned_droppable(l.ty, structs, enums, tagged_types)
-                    || ty_tuple_is_move(l.ty, tuples)
+                !borrowed_params.contains(&l.id)
+                    && (is_owned_droppable(l.ty, structs, enums, tagged_types)
+                        || ty_tuple_is_move(l.ty, tuples))
             })
             .map(|l| l.id)
             .collect();
@@ -4996,7 +5114,9 @@ fn reset_body_analysis_facts(program: &mut Program) {
             }
         }
     }
-    for function in &program.fn_types {
+    for function in &mut program.fn_types {
+        function.return_borrow = hir::ReturnBorrowSummary::None;
+        function.return_region = hir::ReturnRegionSummary::None;
         function.effect.set(FnEffect::Unknown);
     }
 }
@@ -5014,6 +5134,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
                 || expected.ret != actual.ret
                 || expected.return_borrow != actual.return_borrow
                 || expected.return_region != actual.return_region
+                || expected.return_cleanup != actual.return_cleanup
         })
     {
         return false;
@@ -5039,6 +5160,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
                 })
             || expected.return_borrow != actual.return_borrow
             || expected.return_region != actual.return_region
+            || expected.return_cleanup != actual.return_cleanup
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
             || expected.drop_individual_exprs != actual.drop_individual_exprs
@@ -5073,11 +5195,13 @@ fn assignment_facts(function: &hir::Fn) -> Vec<(hir::LocalId, bool, bool)> {
         .collect()
 }
 
-fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
+fn summary_from_roots(roots: &BorrowRoots, explicit_params: u32) -> hir::ReturnBorrowSummary {
     let mut params = Vec::new();
+    let mut captures = Vec::new();
     for root in roots {
         match root {
-            BorrowRoot::Param(index) => params.push(*index),
+            BorrowRoot::Param(index) if *index < explicit_params => params.push(*index),
+            BorrowRoot::Param(index) => captures.push(index - explicit_params),
             BorrowRoot::Local(_)
             | BorrowRoot::IterTemp(_)
             | BorrowRoot::EndedLocal(_, _)
@@ -5085,13 +5209,396 @@ fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
             | BorrowRoot::EndedParam(_, _) => {}
         }
     }
-    if params.is_empty() {
+    if params.is_empty() && captures.is_empty() {
         hir::ReturnBorrowSummary::None
     } else {
         hir::ReturnBorrowSummary::Roots {
             params,
-            captures: Vec::new(),
+            captures,
         }
+    }
+}
+
+fn join_return_summary(
+    left: &hir::ReturnBorrowSummary,
+    right: &hir::ReturnBorrowSummary,
+) -> hir::ReturnBorrowSummary {
+    let mut params = std::collections::BTreeSet::new();
+    let mut captures = std::collections::BTreeSet::new();
+    for summary in [left, right] {
+        if let hir::ReturnBorrowSummary::Roots {
+            params: incoming_params,
+            captures: incoming_captures,
+        } = summary
+        {
+            params.extend(incoming_params.iter().copied());
+            captures.extend(incoming_captures.iter().copied());
+        }
+    }
+    if params.is_empty() && captures.is_empty() {
+        hir::ReturnBorrowSummary::None
+    } else {
+        hir::ReturnBorrowSummary::Roots {
+            params: params.into_iter().collect(),
+            captures: captures.into_iter().collect(),
+        }
+    }
+}
+
+fn fn_type_id_for_expr(expression: &Expr, locals: &[Local]) -> Option<u32> {
+    let ty = match &expression.kind {
+        ExprKind::Local(local) => locals.get(*local as usize).map(|local| local.ty)?,
+        _ => expression.ty,
+    };
+    let Ty::Fn(id) = ty else { return None };
+    Some(id)
+}
+
+fn struct_path_type(root: Ty, path: &[u32], structs: &[StructDef]) -> Option<Ty> {
+    let mut ty = root;
+    for &field in path {
+        let Ty::Struct(id) = ty else { return None };
+        ty = structs
+            .get(id as usize)?
+            .fields
+            .get(field as usize)?
+            .ty;
+    }
+    Some(ty)
+}
+
+type CallableTargetSet = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct CallableProvenance {
+    target_ids: std::collections::HashMap<String, u32>,
+    targets_by_type: Vec<CallableTargetSet>,
+}
+
+fn fn_type_targets(
+    expression: &Expr,
+    locals: &[Local],
+    targets: &[CallableTargetSet],
+) -> CallableTargetSet {
+    fn_type_id_for_expr(expression, locals)
+        .and_then(|id| targets.get(id as usize))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn join_fn_type_targets(
+    targets: &mut [CallableTargetSet],
+    id: u32,
+    incoming: &CallableTargetSet,
+) -> bool {
+    let Some(current) = targets.get_mut(id as usize) else {
+        return false;
+    };
+    let before = current.clone();
+    for (&target, summary) in incoming {
+        current
+            .entry(target)
+            .and_modify(|existing| *existing = join_return_summary(existing, summary))
+            .or_insert_with(|| summary.clone());
+    }
+    *current != before
+}
+
+/// Refine concrete function-value origins and mutable locals to a finite may-union of target
+/// relative parameter/capture summaries. The same summary record travels with a moved local; a
+/// closure's capture indices remain relative to its own environment.
+fn infer_fn_value_return_provenance(
+    program: &mut Program,
+    named: &std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+) -> CallableProvenance {
+    let mut names = program
+        .fns
+        .iter()
+        .map(|function| function.name.clone())
+        .chain(program.imported_fns.iter().map(|function| function.name.clone()))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    let target_ids = names
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, name)| u32::try_from(index).ok().map(|index| (name, index)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut targets = vec![CallableTargetSet::new(); program.fn_types.len()];
+    let max_passes = program
+        .fn_types
+        .len()
+        .saturating_add(program.fns.iter().map(|function| function.locals.len()).sum())
+        .saturating_add(1);
+    for _ in 0..max_passes {
+        let mut changed = false;
+        for function in &program.fns {
+            let events = hir_depth::body_events(&function.body);
+            for expression in events.iter().filter_map(|event| match event {
+                hir_depth::BodyEvent::ExprExit { expression, .. } => Some(*expression),
+                _ => None,
+            }) {
+                let Some(destination) = fn_type_id_for_expr(expression, &function.locals) else {
+                    continue;
+                };
+                let incoming = match &expression.kind {
+                    ExprKind::FnValue(target) | ExprKind::Closure { lifted: target, .. } => {
+                        let mut targets = CallableTargetSet::new();
+                        if let Some(&id) = target_ids.get(target) {
+                            targets.insert(
+                                id,
+                                named
+                                    .get(target)
+                                    .cloned()
+                                    .unwrap_or(hir::ReturnBorrowSummary::None),
+                            );
+                        }
+                        targets
+                    }
+                    ExprKind::Local(local) => function
+                        .locals
+                        .get(*local as usize)
+                        .and_then(|local| match local.ty {
+                            Ty::Fn(id) => targets.get(id as usize),
+                            _ => None,
+                        })
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => hir_depth::direct_expr_children(expression).into_iter().fold(
+                        CallableTargetSet::new(),
+                        |mut joined, child| {
+                            let child = fn_type_targets(child, &function.locals, &targets);
+                            for (target, summary) in child {
+                                joined
+                                    .entry(target)
+                                    .and_modify(|existing| {
+                                        *existing = join_return_summary(existing, &summary)
+                                    })
+                                    .or_insert(summary);
+                            }
+                            joined
+                        },
+                    ),
+                };
+                changed |= join_fn_type_targets(&mut targets, destination, &incoming);
+            }
+            for expression in events.iter().filter_map(|event| match event {
+                hir_depth::BodyEvent::ExprExit { expression, .. } => Some(*expression),
+                _ => None,
+            }) {
+                match &expression.kind {
+                    ExprKind::StructLit { struct_id, fields } => {
+                        if let Some(definition) = program.structs.get(*struct_id as usize) {
+                            for (field, value) in definition.fields.iter().zip(fields) {
+                                if let Ty::Fn(destination) = field.ty {
+                                    let incoming =
+                                        fn_type_targets(value, &function.locals, &targets);
+                                    changed |= join_fn_type_targets(
+                                        &mut targets,
+                                        destination,
+                                        &incoming,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ExprKind::Tuple { tuple_id, elems } => {
+                        if let Some(definition) = program.tuples.get(*tuple_id as usize) {
+                            for (element, value) in definition.elems.iter().zip(elems) {
+                                if let Scalar::Fn(destination) = element {
+                                    let incoming =
+                                        fn_type_targets(value, &function.locals, &targets);
+                                    changed |= join_fn_type_targets(
+                                        &mut targets,
+                                        *destination,
+                                        &incoming,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ExprKind::ArrayLit { elems, elem: Ty::Fn(destination), .. } => {
+                        for value in elems {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                *destination,
+                                &incoming,
+                            );
+                        }
+                    }
+                    ExprKind::OptionSome(value) => {
+                        if let Ty::Option(Scalar::Fn(destination)) = expression.ty {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                    }
+                    ExprKind::ResultOk(value) => {
+                        if let Ty::Result(Scalar::Fn(destination), _) = expression.ty {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                    }
+                    ExprKind::ResultErr(value) => {
+                        if let Ty::Result(_, Scalar::Fn(destination)) = expression.ty {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                    }
+                    ExprKind::EnumValue {
+                        enum_id,
+                        variant,
+                        payload,
+                    } => {
+                        if let Some(case) = program
+                            .enums
+                            .get(*enum_id as usize)
+                            .and_then(|definition| definition.variants.get(*variant as usize))
+                        {
+                            for (element, value) in case.payload.iter().zip(payload) {
+                                if let Scalar::Fn(destination) = element {
+                                    let incoming =
+                                        fn_type_targets(value, &function.locals, &targets);
+                                    changed |= join_fn_type_targets(
+                                        &mut targets,
+                                        *destination,
+                                        &incoming,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for event in events {
+                let (local, value) = match event {
+                    hir_depth::BodyEvent::StmtEnter(Stmt::Let { local, init, .. })
+                    | hir_depth::BodyEvent::StmtEnter(Stmt::Assign { local, value: init, .. }) => {
+                        (*local, init)
+                    }
+                    hir_depth::BodyEvent::StmtEnter(Stmt::AssignField {
+                        root,
+                        path,
+                        value,
+                    }) => {
+                        let Some(root_ty) =
+                            function.locals.get(*root as usize).map(|local| local.ty)
+                        else {
+                            continue;
+                        };
+                        if let Some(Ty::Fn(destination)) =
+                            struct_path_type(root_ty, path, &program.structs)
+                        {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                        continue;
+                    }
+                    hir_depth::BodyEvent::StmtEnter(Stmt::AssignElemField {
+                        struct_id,
+                        path,
+                        value,
+                        ..
+                    }) => {
+                        if let Some(Ty::Fn(destination)) =
+                            struct_path_type(Ty::Struct(*struct_id), path, &program.structs)
+                        {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                        continue;
+                    }
+                    hir_depth::BodyEvent::StmtEnter(Stmt::AssignIndex { base, value, .. }) => {
+                        let destination = function
+                            .locals
+                            .get(*base as usize)
+                            .and_then(|local| match local.ty {
+                                Ty::Array(Scalar::Fn(id), _) => Some(id),
+                                _ => None,
+                            });
+                        if let Some(destination) = destination {
+                            let incoming = fn_type_targets(value, &function.locals, &targets);
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                        continue;
+                    }
+                    hir_depth::BodyEvent::StmtEnter(Stmt::LetTuple { locals, init, .. }) => {
+                        let Ty::Tuple(tuple) = init.ty else { continue };
+                        let Some(definition) = program.tuples.get(tuple as usize) else {
+                            continue;
+                        };
+                        for (index, local) in locals.iter().enumerate() {
+                            let Some(local) = local else { continue };
+                            let Some(Ty::Fn(destination)) = function
+                                .locals
+                                .get(*local as usize)
+                                .map(|local| local.ty)
+                            else {
+                                continue;
+                            };
+                            let Some(Scalar::Fn(source)) = definition.elems.get(index) else {
+                                continue;
+                            };
+                            let incoming = targets.get(*source as usize).cloned().unwrap_or_default();
+                            changed |= join_fn_type_targets(
+                                &mut targets,
+                                destination,
+                                &incoming,
+                            );
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let Some(Ty::Fn(destination)) =
+                    function.locals.get(local as usize).map(|local| local.ty)
+                else {
+                    continue;
+                };
+                let incoming = fn_type_targets(value, &function.locals, &targets);
+                changed |= join_fn_type_targets(&mut targets, destination, &incoming);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (function, target_set) in program.fn_types.iter_mut().zip(&targets) {
+        let summary = target_set.values().fold(
+            hir::ReturnBorrowSummary::None,
+            |joined, summary| join_return_summary(&joined, summary),
+        );
+        function.return_region = borrow_to_region_summary(&summary);
+        function.return_borrow = summary;
+    }
+    CallableProvenance {
+        target_ids,
+        targets_by_type: targets,
     }
 }
 
@@ -5105,11 +5612,11 @@ fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRe
     }
 }
 
-/// Infer the L2b-a1 named-function parameter roots before the ordinary move/escape diagnostic pass.
+/// Infer named-function parameter roots before the ordinary move/escape diagnostic pass.
 /// Calls form a finite may-lattice over sorted root sets, so recursive functions converge
-/// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
-/// and function-value targets belong to L2b-b. The existing exhaustive borrow-provenance walker
-/// remains the single expression classifier.
+/// monotonically. The callable-provenance pass then refines target-relative parameter and capture
+/// roots. The existing exhaustive borrow-provenance walker remains the single expression
+/// classifier.
 fn infer_return_provenance(program: &mut Program) {
     let mut named: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
         .fns
@@ -5134,15 +5641,22 @@ fn infer_return_provenance(program: &mut Program) {
     let mut queued = vec![true; function_count];
     let mut worklist: std::collections::VecDeque<usize> =
         (0..function_count).collect();
-    while let Some(index) = worklist.pop_front() {
-        queued[index] = false;
-        let function = &program.fns[index];
-        // Lifted lambda parameters append captures after explicit arguments. Treating those slots
-        // as ordinary named parameters would publish the wrong domain and disagree with the
-        // closure's explicit-parameter signature. L2b-b infers both domains atomically.
-        if matches!(function.origin, hir::FnOrigin::Lifted { .. }) {
-            continue;
-        }
+    let named_param_modes = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.param_modes.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .map(|function| (function.name.clone(), function.param_modes.clone())),
+        )
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut callable = infer_fn_value_return_provenance(program, &named);
+    loop {
+        while let Some(index) = worklist.pop_front() {
+            queued[index] = false;
+            let function = &program.fns[index];
 
         let mut dependencies = std::collections::HashSet::new();
         let collect_dependencies =
@@ -5152,11 +5666,15 @@ fn infer_return_provenance(program: &mut Program) {
             f: function,
             diags: &mut sink,
             named_return_borrow: &named,
+            named_param_modes: &named_param_modes,
             summary_dependencies: collect_dependencies,
             tuples: &program.tuples,
             structs: &program.structs,
             enums: &program.enums,
             tagged_types: &program.tagged_types,
+            fn_types: &program.fn_types,
+            callable_targets: &callable.targets_by_type,
+            callable_target_ids: &callable.target_ids,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -5185,17 +5703,44 @@ fn infer_return_provenance(program: &mut Program) {
             dependencies_recorded[index] = true;
         }
 
-        let summary = summary_from_roots(&roots);
-        if named.get(&function.name) == Some(&summary) {
-            continue;
-        }
-        named.insert(function.name.clone(), summary);
-        if let Some(callers) = reverse_callers.get(&function.name) {
-            for &caller in callers {
-                if !queued[caller] {
-                    queued[caller] = true;
-                    worklist.push_back(caller);
+            let capture_count = match function.origin {
+                hir::FnOrigin::Lifted { capture_count } => capture_count,
+                hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => 0,
+            };
+            let explicit_params = (function.params.len() as u32).saturating_sub(capture_count);
+            let summary = summary_from_roots(&roots, explicit_params);
+            if named.get(&function.name) == Some(&summary) {
+                continue;
+            }
+            named.insert(function.name.clone(), summary);
+            if let Some(callers) = reverse_callers.get(&function.name) {
+                for &caller in callers {
+                    if !queued[caller] {
+                        queued[caller] = true;
+                        worklist.push_back(caller);
+                    }
                 }
+            }
+        }
+
+        let next_callable = infer_fn_value_return_provenance(program, &named);
+        if next_callable == callable {
+            break;
+        }
+        callable = next_callable;
+        for (index, function) in program.fns.iter().enumerate() {
+            let has_indirect_call = hir_depth::body_events(&function.body).into_iter().any(|event| {
+                matches!(
+                    event,
+                    hir_depth::BodyEvent::ExprEnter(Expr {
+                        kind: ExprKind::CallFnValue { .. } | ExprKind::ResultMapErr { .. },
+                        ..
+                    })
+                )
+            });
+            if has_indirect_call && !queued[index] {
+                queued[index] = true;
+                worklist.push_back(index);
             }
         }
     }
@@ -5427,6 +5972,36 @@ fn effects_by_name(program: &Program, sets: &EffectSets) -> std::collections::Ha
         .collect()
 }
 
+/// Give each concrete non-parameter function local an independent inference record. Return
+/// provenance and effects share this identity so joining either fact can never contaminate an
+/// unrelated value with the same written `fn(T) -> R` signature.
+fn prepare_local_fn_types(program: &mut Program) {
+    let Program { fns, fn_types, .. } = program;
+    for function in fns {
+        for local in &mut function.locals {
+            if local.is_param {
+                continue;
+            }
+            let Ty::Fn(fid) = local.ty else { continue };
+            let Some(source) = fn_types.get(fid as usize) else {
+                continue;
+            };
+            let (params, ret, return_borrow, return_region, return_cleanup) = (
+                source.params.clone(),
+                source.ret,
+                source.return_borrow.clone(),
+                source.return_region.clone(),
+                source.return_cleanup,
+            );
+            let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
+            fn_types[fresh as usize].return_borrow = return_borrow;
+            fn_types[fresh as usize].return_region = return_region;
+            fn_types[fresh as usize].return_cleanup = return_cleanup;
+            local.ty = Ty::Fn(fresh);
+        }
+    }
+}
+
 /// Infer the effect stored in every concrete function-value type. Named targets begin at the Pure
 /// bottom of the effect lattice; value origins then refine their own `FnTy`, local bindings join all
 /// assigned targets, and the call graph is recomputed until stable. Unknown function parameters and
@@ -5436,31 +6011,6 @@ fn infer_fn_type_effects(
     program: &mut Program,
     external_effects: &std::collections::HashMap<String, FnEffect>,
 ) -> EffectSets {
-    // A local needs its own effect cell: two unrelated values with the same ABI must not poison one
-    // another merely because source-level `fn(T) -> R` annotations omit the inferred effect.
-    let Program { fns, fn_types, .. } = program;
-    for f in fns {
-        for local in &mut f.locals {
-            if local.is_param {
-                continue; // a function-typed parameter has no statically known target
-            }
-            let Ty::Fn(fid) = local.ty else { continue };
-            let Some(ft) = fn_types.get(fid as usize) else {
-                continue;
-            };
-            let (params, ret, return_borrow, return_region) = (
-                ft.params.clone(),
-                ft.ret,
-                ft.return_borrow.clone(),
-                ft.return_region.clone(),
-            );
-            let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
-            fn_types[fresh as usize].return_borrow = return_borrow;
-            fn_types[fresh as usize].return_region = return_region;
-            local.ty = Ty::Fn(fresh);
-        }
-    }
-
     solve_fn_type_effects(
         program,
         external_effects,
@@ -7880,10 +8430,10 @@ impl EffectScan<'_> {
                         }
                     }
                 }
-                // A bound/moved function value no longer identifies the named parameter boundary
-                // that must receive a callback-bearing actual. Until L2b-b carries joined target
-                // roots through function values, such an invocation is legal sequentially but
-                // cannot prove the enclosing function Pure for `par_map`.
+                // A bound/moved function value with no single static target does not identify the
+                // named effect boundary that receives a callback-bearing actual. Such an
+                // invocation is legal sequentially but cannot prove the enclosing function Pure
+                // for `par_map`.
                 if target.is_none() {
                     self.unresolved_dispatches.push((
                         e.span,
@@ -8729,6 +9279,9 @@ enum Region {
     Arena(u32),
 }
 
+type CallableRegionFact =
+    std::collections::BTreeMap<Vec<BorrowProjection>, Region>;
+
 impl Region {
     /// Ordinal in the lattice; smaller = longer-lived.
     fn ord(self) -> u32 {
@@ -8774,6 +9327,11 @@ impl Region {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct EscapeState {
     region: std::collections::HashMap<LocalId, Region>,
+    /// Region contributed to an indirect result by the selected callable's captured values. This
+    /// is distinct from `region`: a capturing closure value is frame-local because its environment
+    /// buffer lives in this frame, while a view returned from that environment may point into a
+    /// caller-owned `Static` parameter and remain returnable.
+    callable_capture_region: std::collections::HashMap<LocalId, CallableRegionFact>,
     local_backed_slice: std::collections::HashSet<LocalId>,
     /// True only when every reaching path holds individually owned storage.
     individual: std::collections::HashMap<LocalId, bool>,
@@ -8791,6 +9349,15 @@ impl EscapeState {
                 .entry(local)
                 .and_modify(|current| *current = current.shorter(region))
                 .or_insert(region);
+        }
+        for (&local, fact) in &other.callable_capture_region {
+            let current = joined.callable_capture_region.entry(local).or_default();
+            for (path, &region) in fact {
+                current
+                    .entry(path.clone())
+                    .and_modify(|current| *current = current.shorter(region))
+                    .or_insert(region);
+            }
         }
         joined
             .local_backed_slice
@@ -8973,6 +9540,9 @@ struct EscapeCheck<'a> {
     diags: &'a mut Diagnostics,
     /// Settled same-program/imported return-region summaries for direct calls.
     named_return_region: &'a std::collections::HashMap<String, hir::ReturnRegionSummary>,
+    /// Settled function-value signatures. Parameter roots select call arguments; capture roots are
+    /// resolved through `EscapeState::callable_capture_region`.
+    fn_types: &'a [hir::FnTy],
     /// Tuple defs (to decide whether a `Ty::Tuple` is region-tracked — true iff an element is).
     tuples: &'a [hir::TupleDef],
     /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
@@ -9022,6 +9592,30 @@ struct EscapeCheck<'a> {
 }
 
 impl<'a> EscapeCheck<'a> {
+    fn borrowed_param_place(&self, expression: &Expr) -> bool {
+        let root = match &expression.kind {
+            ExprKind::Local(local) => *local,
+            ExprKind::Field { root, .. } => *root,
+            _ => return false,
+        };
+        self.f
+            .params
+            .iter()
+            .position(|&parameter| parameter == root)
+            .and_then(|position| self.f.param_modes.get(position))
+            .is_some_and(|mode| {
+                matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            })
+    }
+
+    fn borrowed_storage_cap(&self, expression: &Expr) -> Region {
+        if self.borrowed_param_place(expression) {
+            Region::Static
+        } else {
+            Region::Frame
+        }
+    }
+
     fn check(&mut self) {
         for &param in &self.f.params {
             if self.f.locals.get(param as usize).is_some_and(|local| {
@@ -10075,6 +10669,388 @@ impl<'a> EscapeCheck<'a> {
         struct_contains_str(id, self.structs, self.enums)
     }
 
+    fn callable_type_id(&self, expression: &Expr) -> Option<u32> {
+        let ty = match expression.kind {
+            ExprKind::Local(local) => self
+                .f
+                .locals
+                .get(local as usize)
+                .map(|local| local.ty)
+                .unwrap_or(expression.ty),
+            _ => expression.ty,
+        };
+        match ty {
+            Ty::Fn(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn join_callable_region_fact(
+        mut left: CallableRegionFact,
+        right: CallableRegionFact,
+    ) -> CallableRegionFact {
+        for (path, region) in right {
+            left.entry(path)
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        left
+    }
+
+    fn prefix_callable_region_fact(
+        fact: CallableRegionFact,
+        projection: BorrowProjection,
+    ) -> CallableRegionFact {
+        fact.into_iter()
+            .map(|(mut path, region)| {
+                path.insert(0, projection);
+                (path, region)
+            })
+            .collect()
+    }
+
+    fn project_callable_region_fact(
+        fact: &CallableRegionFact,
+        path: &[BorrowProjection],
+    ) -> CallableRegionFact {
+        fact.iter()
+            .filter_map(|(candidate, &region)| {
+                candidate
+                    .strip_prefix(path)
+                    .map(|suffix| (suffix.to_vec(), region))
+            })
+            .collect()
+    }
+
+    fn project_callable_array_elements(fact: &CallableRegionFact) -> CallableRegionFact {
+        let mut selected = CallableRegionFact::new();
+        for (path, &region) in fact {
+            let Some((BorrowProjection::ArrayElement(_), suffix)) = path.split_first() else {
+                continue;
+            };
+            selected
+                .entry(suffix.to_vec())
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        selected
+    }
+
+    fn callable_region_fact(&self, expression: &Expr, depth: u32) -> CallableRegionFact {
+        let leaf = |region| [(Vec::new(), region)].into_iter().collect();
+        match &expression.kind {
+            ExprKind::FnValue(_) => leaf(Region::Static),
+            ExprKind::Closure { lifted, captures } => {
+                let selected = match self.named_return_region.get(lifted) {
+                    Some(hir::ReturnRegionSummary::None) => return leaf(Region::Static),
+                    Some(hir::ReturnRegionSummary::Roots { captures, .. }) => {
+                        Some(captures.as_slice())
+                    }
+                    None => None,
+                };
+                let region = captures
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        selected.is_none_or(|selected| selected.contains(&(*index as u32)))
+                    })
+                    .fold(Region::Static, |region, (_, capture)| {
+                        region.shorter(self.region_of(capture, depth))
+                    });
+                leaf(region)
+            }
+            ExprKind::Local(local) => self
+                .state
+                .callable_capture_region
+                .get(local)
+                .cloned()
+                .unwrap_or_else(|| {
+                    // A function-valued parameter borrows caller storage, like a `str` parameter.
+                    matches!(expression.ty, Ty::Fn(_))
+                        .then(|| leaf(Region::Static))
+                        .unwrap_or_default()
+                }),
+            ExprKind::Field { root, path } => {
+                let path = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                self.state
+                    .callable_capture_region
+                    .get(root)
+                    .map_or_else(CallableRegionFact::new, |fact| {
+                        Self::project_callable_region_fact(fact, &path)
+                    })
+            }
+            ExprKind::TupleIndex { recv, index } => Self::project_callable_region_fact(
+                &self.callable_region_fact(recv, depth),
+                &[BorrowProjection::TupleElement(*index)],
+            ),
+            ExprKind::Index { recv, index } => {
+                let fact = self.callable_region_fact(recv, depth);
+                match &index.kind {
+                    ExprKind::Int(value) if *value >= 0 => Self::project_callable_region_fact(
+                        &fact,
+                        &[BorrowProjection::ArrayElement(*value as u32)],
+                    ),
+                    _ => Self::project_callable_array_elements(&fact),
+                }
+            }
+            ExprKind::IndexField { base, index, path } => {
+                let mut projections = vec![BorrowProjection::ArrayElement(*index)];
+                projections.extend(path.iter().copied().map(BorrowProjection::StructField));
+                self.state
+                    .callable_capture_region
+                    .get(base)
+                    .map_or_else(CallableRegionFact::new, |fact| {
+                        Self::project_callable_region_fact(fact, &projections)
+                    })
+            }
+            ExprKind::ElemField { recv, index, path, .. } => {
+                let fact = self.callable_region_fact(recv, depth);
+                let fact = match &index.kind {
+                    ExprKind::Int(value) if *value >= 0 => Self::project_callable_region_fact(
+                        &fact,
+                        &[BorrowProjection::ArrayElement(*value as u32)],
+                    ),
+                    _ => Self::project_callable_array_elements(&fact),
+                };
+                let path = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                Self::project_callable_region_fact(&fact, &path)
+            }
+            ExprKind::StructLit { fields, .. } => fields.iter().enumerate().fold(
+                CallableRegionFact::new(),
+                |fact, (index, field)| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        Self::prefix_callable_region_fact(
+                            self.callable_region_fact(field, depth),
+                            BorrowProjection::StructField(index as u32),
+                        ),
+                    )
+                },
+            ),
+            ExprKind::Tuple { elems, .. } => elems.iter().enumerate().fold(
+                CallableRegionFact::new(),
+                |fact, (index, element)| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        Self::prefix_callable_region_fact(
+                            self.callable_region_fact(element, depth),
+                            BorrowProjection::TupleElement(index as u32),
+                        ),
+                    )
+                },
+            ),
+            ExprKind::ArrayLit { elems, .. } => elems.iter().enumerate().fold(
+                CallableRegionFact::new(),
+                |fact, (index, element)| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        Self::prefix_callable_region_fact(
+                            self.callable_region_fact(element, depth),
+                            BorrowProjection::ArrayElement(index as u32),
+                        ),
+                    )
+                },
+            ),
+            ExprKind::EnumValue { variant, payload, .. } => payload.iter().enumerate().fold(
+                CallableRegionFact::new(),
+                |fact, (index, element)| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        Self::prefix_callable_region_fact(
+                            self.callable_region_fact(element, depth),
+                            BorrowProjection::EnumPayload {
+                                variant: *variant,
+                                index: index as u32,
+                            },
+                        ),
+                    )
+                },
+            ),
+            ExprKind::OptionSome(value) => Self::prefix_callable_region_fact(
+                self.callable_region_fact(value, depth),
+                BorrowProjection::OptionSome,
+            ),
+            ExprKind::OptionNone => CallableRegionFact::new(),
+            ExprKind::ResultOk(value) => Self::prefix_callable_region_fact(
+                self.callable_region_fact(value, depth),
+                BorrowProjection::ResultOk,
+            ),
+            ExprKind::ResultErr(value) => Self::prefix_callable_region_fact(
+                self.callable_region_fact(value, depth),
+                BorrowProjection::ResultErr,
+            ),
+            ExprKind::Try(result) => Self::project_callable_region_fact(
+                &self.callable_region_fact(result, depth),
+                &[BorrowProjection::ResultOk],
+            ),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let projection = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(BorrowProjection::OptionSome),
+                    Ty::Result(..) => Some(BorrowProjection::ResultOk),
+                    _ => None,
+                };
+                let success = projection.map_or_else(CallableRegionFact::new, |projection| {
+                    Self::project_callable_region_fact(
+                        &self.callable_region_fact(opt, depth),
+                        &[projection],
+                    )
+                });
+                Self::join_callable_region_fact(
+                    success,
+                    self.callable_region_fact(fallback, depth),
+                )
+            }
+            ExprKind::Block(block)
+            | ExprKind::Unsafe(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block) => block.value.as_deref().map_or_else(
+                CallableRegionFact::new,
+                |value| self.callable_region_fact(value, depth),
+            ),
+            ExprKind::If { then, els, .. } => [then, els]
+                .into_iter()
+                .filter_map(|block| block.value.as_deref())
+                .fold(CallableRegionFact::new(), |fact, value| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        self.callable_region_fact(value, depth),
+                    )
+                }),
+            ExprKind::Match { arms, .. } => arms.iter().fold(
+                CallableRegionFact::new(),
+                |fact, arm| {
+                    Self::join_callable_region_fact(
+                        fact,
+                        self.callable_region_fact(&arm.body, depth),
+                    )
+                },
+            ),
+            _ => CallableRegionFact::new(),
+        }
+    }
+
+    /// Region of only the captured values that a callable may return. Do not use the closure
+    /// value's own region here: its environment header is frame-local, but invoking it copies the
+    /// selected returned view out of that header and does not return the header itself.
+    fn callable_capture_return_region(&self, expression: &Expr, depth: u32) -> Region {
+        self.callable_region_fact(expression, depth)
+            .get(&Vec::new())
+            .copied()
+            .unwrap_or(Region::Static)
+    }
+
+    fn indirect_return_region(&self, callee: &Expr, args: &[Expr], depth: u32) -> Region {
+        let Some(function) = self
+            .callable_type_id(callee)
+            .and_then(|id| self.fn_types.get(id as usize))
+        else {
+            return args.iter().fold(
+                self.callable_capture_return_region(callee, depth),
+                |region, argument| region.shorter(self.region_of(argument, depth)),
+            );
+        };
+        match &function.return_region {
+            hir::ReturnRegionSummary::None => Region::Static,
+            hir::ReturnRegionSummary::Roots { params, captures } => {
+                let initial = if captures.is_empty() {
+                    Region::Static
+                } else {
+                    self.callable_capture_return_region(callee, depth)
+                };
+                params.iter().fold(initial, |region, &index| {
+                    args.get(index as usize).map_or(region, |argument| {
+                        region.shorter(self.region_of(argument, depth))
+                    })
+                })
+            }
+        }
+    }
+
+    fn replace_callable_region_path(
+        &mut self,
+        local: LocalId,
+        path: &[BorrowProjection],
+        value: &Expr,
+        depth: u32,
+    ) {
+        let incoming = self.callable_region_fact(value, depth);
+        let current = self
+            .state
+            .callable_capture_region
+            .entry(local)
+            .or_default();
+        current.retain(|candidate, _| !candidate.starts_with(path));
+        for (suffix, region) in incoming {
+            let mut destination = path.to_vec();
+            destination.extend(suffix);
+            current.insert(destination, region);
+        }
+        if current.is_empty() {
+            self.state.callable_capture_region.remove(&local);
+        }
+    }
+
+    fn replace_callable_array_path(
+        &mut self,
+        local: LocalId,
+        index: &Expr,
+        fields: &[u32],
+        value: &Expr,
+        depth: u32,
+    ) {
+        let length = self
+            .f
+            .locals
+            .get(local as usize)
+            .and_then(|local| match local.ty {
+                Ty::Array(_, length) | Ty::StructArray(_, length) => Some(length),
+                _ => None,
+            });
+        let exact = match (&index.kind, length) {
+            (ExprKind::Int(value), Some(length))
+                if *value >= 0 && (*value as u128) < length as u128 =>
+            {
+                Some(*value as u32)
+            }
+            _ => None,
+        };
+        let Some(index) = exact else {
+            // A dynamic write may replace any element. Keep every old target and join the incoming
+            // target at every fixed slot so no runtime-selected capture region is lost.
+            let Some(length) = length else { return };
+            let incoming = self.callable_region_fact(value, depth);
+            let current = self
+                .state
+                .callable_capture_region
+                .entry(local)
+                .or_default();
+            for index in 0..length {
+                let mut prefix = vec![BorrowProjection::ArrayElement(index)];
+                prefix.extend(fields.iter().copied().map(BorrowProjection::StructField));
+                for (suffix, &region) in &incoming {
+                    let mut destination = prefix.clone();
+                    destination.extend(suffix);
+                    current
+                        .entry(destination)
+                        .and_modify(|current| *current = current.shorter(region))
+                        .or_insert(region);
+                }
+            }
+            return;
+        };
+        let mut path = vec![BorrowProjection::ArrayElement(index)];
+        path.extend(fields.iter().copied().map(BorrowProjection::StructField));
+        self.replace_callable_region_path(local, &path, value, depth);
+    }
+
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
@@ -10447,12 +11423,14 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner) => work.push(Work::Eval(inner, depth)),
-            // `map_err` passes the `Ok` payload through unchanged, while its mapped error may
-            // borrow the mapper closure's environment. The result can outlive neither source.
-            ExprKind::ResultMapErr { result, f } => push_fold(
-                &mut work,
-                Region::Static,
-                vec![(result, depth, None), (f, depth, None)],
+            // `map_err` passes the Ok payload through. Its mapped Err follows the mapper's settled
+            // argument/capture summary; the closure environment buffer itself is not returned.
+            ExprKind::ResultMapErr { result, f } => values.push(
+                self.region_of(result, depth).shorter(self.indirect_return_region(
+                    f,
+                    std::slice::from_ref(result.as_ref()),
+                    depth,
+                )),
             ),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
             ExprKind::ElseUnwrap { opt, fallback } => push_fold(
@@ -10470,7 +11448,7 @@ impl<'a> EscapeCheck<'a> {
             // outlive that arena — taking the shorter keeps it sound for free.
             ExprKind::StrBorrow(inner) => push_fold(
                 &mut work,
-                Region::Frame,
+                self.borrowed_storage_cap(inner),
                 vec![(inner, depth, None)],
             ),
             // `str.bytes()` is a zero-copy re-view of exactly the same `{ptr,len}` storage, so it
@@ -10491,7 +11469,7 @@ impl<'a> EscapeCheck<'a> {
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
             ExprKind::BufferBytes { buffer } => push_fold(
                 &mut work,
-                Region::Frame,
+                self.borrowed_storage_cap(buffer),
                 vec![(buffer, depth, None)],
             ),
             // `bytes.as_str()` is a zero-copy `str` view of the SAME storage `bytes` viewed, so it
@@ -10511,7 +11489,7 @@ impl<'a> EscapeCheck<'a> {
             // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
             ExprKind::CliGetStr { parsed, .. } => push_fold(
                 &mut work,
-                Region::Frame,
+                self.borrowed_storage_cap(parsed),
                 vec![(parsed, depth, None)],
             ),
             // `resp.header(name)` returns `Option<str>` and `resp.body()` a `slice<u8>`, both **views**
@@ -10522,7 +11500,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
                 push_fold(
                     &mut work,
-                    Region::Frame,
+                    self.borrowed_storage_cap(resp),
                     vec![(resp, depth, None)],
                 );
             }
@@ -10533,7 +11511,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 push_fold(
                     &mut work,
-                    Region::Frame,
+                    self.borrowed_storage_cap(out),
                     vec![(out, depth, None)],
                 );
             }
@@ -10548,7 +11526,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpCtxBody { ctx }
             | ExprKind::HttpCtxHeaders { ctx } => push_fold(
                 &mut work,
-                Region::Frame,
+                self.borrowed_storage_cap(ctx),
                 vec![(ctx, depth, None)],
             ),
             // `hs.get(name)` **inherits** its receiver's region instead of re-capping at `Frame` — the
@@ -10569,7 +11547,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => {
                 push_fold(
                     &mut work,
-                    Region::Frame,
+                    self.borrowed_storage_cap(conn),
                     vec![(conn, depth, None)],
                 );
             }
@@ -10673,17 +11651,12 @@ impl<'a> EscapeCheck<'a> {
                     .map(|arm| (&arm.body, depth, None))
                     .collect(),
             ),
-            // An indirect call's result may borrow one of its arguments (`g := id; g(s)`) or its
-            // closure environment (`f := fn { captured_view }; f()`). It therefore lives no longer
-            // than either the callee or the shortest-lived argument. Without the callee fold, a
-            // zero-argument closure can return an arena capture after that arena is freed.
-            ExprKind::CallFnValue { callee, args } => push_fold(
-                &mut work,
-                Region::Static,
-                std::iter::once((callee.as_ref(), depth, None))
-                    .chain(args.iter().map(|argument| (argument, depth, None)))
-                    .collect(),
-            ),
+            // Resolve the settled function-value summary. The closure environment itself is
+            // frame-local, but only selected capture values (plus selected explicit arguments)
+            // back the returned view.
+            ExprKind::CallFnValue { callee, args } => {
+                values.push(self.indirect_return_region(callee, args, depth));
+            }
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
             ExprKind::IndexField { base, .. } => values.push(
@@ -11677,6 +12650,12 @@ impl<'a> EscapeCheck<'a> {
         match s {
             Stmt::Let { local, init } => {
                 self.decl_depth.insert(*local, depth);
+                let callable = self.callable_region_fact(init, depth);
+                if callable.is_empty() {
+                    self.state.callable_capture_region.remove(local);
+                } else {
+                    self.state.callable_capture_region.insert(*local, callable);
+                }
                 if is_owned_droppable(init.ty, self.structs, self.enums, self.tagged_types)
                     || ty_tuple_is_move(init.ty, self.tuples)
                 {
@@ -11770,9 +12749,38 @@ impl<'a> EscapeCheck<'a> {
                         );
                     }
                 }
+                match s {
+                    Stmt::AssignIndex { base, index, value } => {
+                        self.replace_callable_array_path(*base, index, &[], value, depth);
+                    }
+                    Stmt::AssignElemField {
+                        base,
+                        index,
+                        path,
+                        value,
+                        ..
+                    } => {
+                        self.replace_callable_array_path(*base, index, path, value, depth);
+                    }
+                    Stmt::AssignElem {
+                        base,
+                        index,
+                        value,
+                        ..
+                    } => {
+                        self.replace_callable_array_path(*base, index, &[], value, depth);
+                    }
+                    _ => unreachable!("array assignment group"),
+                }
             }
             Stmt::AssignVecLane { .. } => {}
             Stmt::Assign { local, value, drop_new, .. } => {
+                let callable = self.callable_region_fact(value, depth);
+                if callable.is_empty() {
+                    self.state.callable_capture_region.remove(local);
+                } else {
+                    self.state.callable_capture_region.insert(*local, callable);
+                }
                 // Record allocation provenance separately from escape Region: region-free Move
                 // resources and owned call results are individual, while arena allocations are not.
                 if is_owned_droppable(value.ty, self.structs, self.enums, self.tagged_types)
@@ -11817,7 +12825,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            Stmt::AssignField { root, value, .. } => {
+            Stmt::AssignField { root, path, value } => {
                 if needs_drop_flag(
                     value.ty,
                     self.structs,
@@ -11856,6 +12864,12 @@ impl<'a> EscapeCheck<'a> {
                         );
                     }
                 }
+                let path = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                self.replace_callable_region_path(*root, &path, value, depth);
             }
             Stmt::Return(Some(e)) => {
                 // A returned value escapes to the caller (`Static`): only a `Static`-region
@@ -11896,6 +12910,19 @@ impl<'a> EscapeCheck<'a> {
                         if self.local_mentions_slice(*l) {
                             self.state.local_backed_slice.insert(*l);
                         }
+                    }
+                }
+                let callable = self.callable_region_fact(init, depth);
+                for (index, local) in locals.iter().enumerate() {
+                    let Some(local) = local else { continue };
+                    let selected = Self::project_callable_region_fact(
+                        &callable,
+                        &[BorrowProjection::TupleElement(index as u32)],
+                    );
+                    if selected.is_empty() {
+                        self.state.callable_capture_region.remove(local);
+                    } else {
+                        self.state.callable_capture_region.insert(*local, selected);
                     }
                 }
             }
@@ -12882,6 +13909,10 @@ struct MoveCheck<'a> {
     /// Settled same-program/imported return summaries for mapping call results back to their exact
     /// caller-side inputs. The map is recomputed to a fixpoint before the diagnostic pass.
     named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    /// Checked parameter modes for direct callees. Borrowed arguments are read from caller
+    /// storage and therefore neither transfer ownership nor contribute their value facts as if
+    /// they were by-value copies.
+    named_param_modes: &'a std::collections::HashMap<String, Vec<ast::ParamMode>>,
     /// Direct named calls observed by the exhaustive expression walk. Present only while building
     /// the reverse worklist for named-return inference.
     summary_dependencies: Option<&'a mut std::collections::HashSet<String>>,
@@ -12895,6 +13926,12 @@ struct MoveCheck<'a> {
     enums: &'a [hir::EnumDef],
     /// Interned nested Option/Result payloads.
     tagged_types: &'a [hir::TaggedType],
+    /// Interned function signatures supply indirect-call parameter modes.
+    fn_types: &'a [hir::FnTy],
+    /// Target-relative summaries for each concrete function-value type.
+    callable_targets: &'a [CallableTargetSet],
+    /// Stable per-program target ordinals used in closure-environment projection facts.
+    callable_target_ids: &'a std::collections::HashMap<String, u32>,
     /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
     /// every `break` bound to that loop; their union is the move state after the loop (code past a
     /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
@@ -13040,6 +14077,9 @@ impl BorrowRoot {
 enum BorrowProjection {
     StructField(u32),
     TupleElement(u32),
+    ArrayElement(u32),
+    ClosureTarget(u32),
+    ClosureCapture(u32),
     EnumPayload { variant: u32, index: u32 },
     OptionSome,
     ResultOk,
@@ -13124,6 +14164,24 @@ impl BorrowFact {
         out
     }
 
+    fn project_array_elements(&self) -> Self {
+        let mut out = Self::from_direct(self.direct.clone());
+        for (path, roots) in &self.projected {
+            let Some((BorrowProjection::ArrayElement(_), rest)) = path.split_first() else {
+                continue;
+            };
+            if rest.is_empty() {
+                out.direct.extend(roots);
+            } else {
+                out.projected
+                    .entry(rest.to_vec())
+                    .or_default()
+                    .extend(roots);
+            }
+        }
+        out
+    }
+
     fn replace_exact(&mut self, path: &[BorrowProjection], incoming: BorrowFact) {
         self.projected.retain(|candidate, _| {
             !candidate.starts_with(path)
@@ -13136,6 +14194,20 @@ impl BorrowFact {
                 .extend(std::mem::take(&mut incoming.direct));
         }
         for (suffix, roots) in incoming.projected {
+            let mut destination = path.to_vec();
+            destination.extend(suffix);
+            self.projected.entry(destination).or_default().extend(roots);
+        }
+    }
+
+    fn join_at(&mut self, path: &[BorrowProjection], incoming: &BorrowFact) {
+        if !incoming.direct.is_empty() {
+            self.projected
+                .entry(path.to_vec())
+                .or_default()
+                .extend(&incoming.direct);
+        }
+        for (suffix, roots) in &incoming.projected {
             let mut destination = path.to_vec();
             destination.extend(suffix);
             self.projected.entry(destination).or_default().extend(roots);
@@ -13191,7 +14263,8 @@ struct MoveMatchPrepared {
     evaluated_borrows: BorrowState,
     consumed: Option<MovedSet>,
     consumed_borrows: Option<BorrowState>,
-    scrutinee_roots: BorrowRoots,
+    scrutinee_ty: Ty,
+    scrutinee_fact: BorrowFact,
 }
 
 #[derive(Default)]
@@ -13300,6 +14373,10 @@ impl BorrowState {
         self.invalidate_matching(how, |r| r == BorrowRoot::Local(owner));
     }
 
+    fn invalidate_roots(&mut self, roots: &BorrowRoots, how: BorrowEnd) {
+        self.invalidate_matching(how, |root| roots.contains(&root));
+    }
+
     fn join(a: &Self, b: &Self) -> Self {
         let mut out = a.clone();
         for (&local, roots) in &b.sources {
@@ -13400,7 +14477,15 @@ macro_rules! move_expr {
 impl<'a> MoveCheck<'a> {
     fn check(mut self) -> BorrowRoots {
         for (position, &local) in self.f.params.iter().enumerate() {
-            if !self.local_may_borrow(local) {
+            let mode = self
+                .f
+                .param_modes
+                .get(position)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            if !self.local_may_borrow(local)
+                && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            {
                 continue;
             }
             let mut roots = BorrowRoots::new();
@@ -13465,9 +14550,102 @@ impl<'a> MoveCheck<'a> {
         })
     }
 
+    fn borrowed_param_position(&self, id: LocalId) -> Option<u32> {
+        self.f
+            .params
+            .iter()
+            .position(|&param| param == id)
+            .filter(|&position| {
+                matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                )
+            })
+            .map(|position| position as u32)
+    }
+
+    fn borrowed_param_mode(&self, id: LocalId) -> Option<ast::ParamMode> {
+        self.borrowed_param_position(id)
+            .and_then(|position| self.f.param_modes.get(position as usize).copied())
+    }
+
+    fn refresh_borrow_mut_place(&mut self, argument: &Expr) {
+        let root = match argument.kind {
+            ExprKind::Local(local) => Some(local),
+            ExprKind::Field { root, .. } => Some(root),
+            _ => None,
+        };
+        if let Some(root) = root {
+            self.borrows.invalid.remove(&root);
+        }
+    }
+
+    fn check_call_borrow_aliases(
+        &mut self,
+        display: &str,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+    ) {
+        let place = |expression: &Expr| match &expression.kind {
+            ExprKind::Local(local) => Some((*local, Vec::new())),
+            ExprKind::Field { root, path } => Some((*root, path.clone())),
+            _ => None,
+        };
+        let overlaps = |left: &(LocalId, Vec<u32>), right: &(LocalId, Vec<u32>)| {
+            left.0 == right.0
+                && (left.1.starts_with(&right.1) || right.1.starts_with(&left.1))
+        };
+        for (index, mode) in modes.iter().copied().enumerate() {
+            if !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+                continue;
+            }
+            let Some(argument) = args.get(index) else { continue };
+            let roots = self.storage_roots(argument);
+            let argument_place = place(argument);
+            for (peer_index, peer) in args.iter().enumerate() {
+                if peer_index == index {
+                    continue;
+                }
+                let peer_mode = modes
+                    .get(peer_index)
+                    .copied()
+                    .unwrap_or(ast::ParamMode::ByValue);
+                let conflicts = match (mode, peer_mode) {
+                    // An exclusive borrow can replace its owner, so every overlapping peer is
+                    // invalid even when that peer is a Copy view embedded in a plain aggregate.
+                    (ast::ParamMode::BorrowMut, _) => true,
+                    (ast::ParamMode::Borrow, ast::ParamMode::Out) => true,
+                    (ast::ParamMode::Borrow, ast::ParamMode::BorrowMut) => true,
+                    (ast::ParamMode::Borrow, ast::ParamMode::ByValue) => self.is_move_ty(peer.ty),
+                    _ => false,
+                };
+                if conflicts {
+                    let peer_roots = self.storage_roots(peer);
+                    let direct_overlap = argument_place
+                        .as_ref()
+                        .zip(place(peer).as_ref())
+                        .is_some_and(|(left, right)| overlaps(left, right));
+                    if direct_overlap || roots.iter().any(|root| peer_roots.contains(root)) {
+                        self.diags.error(
+                            format!(
+                                "borrowed argument {} to '{display}' aliases argument {}, whose mode may invalidate the same owner",
+                                index + 1,
+                                peer_index + 1,
+                            ),
+                            argument.span,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
-        if self.local_owns_view_storage(id) {
+        if let Some(position) = self.borrowed_param_position(id) {
+            roots.insert(BorrowRoot::Param(position));
+        } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
             roots.insert(BorrowRoot::Local(id));
         }
         roots
@@ -13475,7 +14653,9 @@ impl<'a> MoveCheck<'a> {
 
     fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
         let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
-        if self.local_owns_view_storage(id) {
+        if let Some(position) = self.borrowed_param_position(id) {
+            fact.direct.insert(BorrowRoot::Param(position));
+        } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
             fact.direct.insert(BorrowRoot::Local(id));
         }
         fact
@@ -13494,6 +14674,12 @@ impl<'a> MoveCheck<'a> {
                 .and_then(|def| def.elems.get(index as usize))
                 .copied()
                 .map(scalar_to_ty),
+            (Ty::Array(element, len), BorrowProjection::ArrayElement(index)) if index < len => {
+                Some(scalar_to_ty(element))
+            }
+            (Ty::StructArray(id, len), BorrowProjection::ArrayElement(index)) if index < len => {
+                Some(Ty::Struct(id))
+            }
             (
                 Ty::Enum(id),
                 BorrowProjection::EnumPayload { variant, index },
@@ -13524,7 +14710,16 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn normalize_borrow_fact(&self, ty: Ty, fact: BorrowFact) -> BorrowFact {
-        if !matches!(expand_tagged_ty(ty, self.tagged_types), Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)) {
+        if !matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Struct(_)
+                | Ty::Tuple(_)
+                | Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::Enum(_)
+                | Ty::Option(_)
+                | Ty::Result(..)
+        ) {
             return fact;
         }
         let mut out = BorrowFact::default();
@@ -13727,8 +14922,10 @@ impl<'a> MoveCheck<'a> {
                 fact.direct.extend(self.borrow_sources(capture));
             }
         }
-        for capture in node_captures(&e.kind) {
-            fact.direct.extend(self.borrow_sources(capture));
+        if !matches!(e.kind, ExprKind::Closure { .. }) {
+            for capture in node_captures(&e.kind) {
+                fact.direct.extend(self.borrow_sources(capture));
+            }
         }
         fact.join(&self.borrow_fact_inner(e))
     }
@@ -13827,8 +15024,8 @@ impl<'a> MoveCheck<'a> {
         path: &[BorrowProjection],
         result_ty: Ty,
     ) -> BorrowFact {
-        let fact = self.normalize_borrow_fact(ty, fact);
         let fallback = fact.flatten();
+        let fact = self.normalize_borrow_fact(ty, fact);
         let mut current_ty = ty;
         let mut selected = fact;
         for &projection in path {
@@ -13844,6 +15041,134 @@ impl<'a> MoveCheck<'a> {
             return BorrowFact::from_direct(fallback);
         }
         selected
+    }
+
+    fn fixed_array_shape(&self, ty: Ty) -> Option<(Ty, u32)> {
+        match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, len) => Some((scalar_to_ty(element), len)),
+            Ty::StructArray(id, len) => Some((Ty::Struct(id), len)),
+            _ => None,
+        }
+    }
+
+    fn exact_fixed_index(&self, index: &Expr, len: u32) -> Option<u32> {
+        match index.kind {
+            ExprKind::Int(value) if value >= 0 && (value as u128) < len as u128 => {
+                Some(value as u32)
+            }
+            _ => None,
+        }
+    }
+
+    fn project_fixed_array_fact(&self, recv: &Expr, index: &Expr, result_ty: Ty) -> BorrowFact {
+        let Some((element_ty, len)) = self.fixed_array_shape(recv.ty) else {
+            return BorrowFact::from_direct(self.borrow_sources(recv));
+        };
+        let raw = self.borrow_fact(recv);
+        let fallback = raw.flatten();
+        let fact = self.normalize_borrow_fact(recv.ty, raw);
+        if expand_tagged_ty(element_ty, self.tagged_types)
+            != expand_tagged_ty(result_ty, self.tagged_types)
+        {
+            let mut roots = fallback;
+            roots.extend(self.storage_roots(recv));
+            return BorrowFact::from_direct(roots);
+        }
+        self.exact_fixed_index(index, len).map_or_else(
+            || fact.project_array_elements(),
+            |index| fact.project_exact(BorrowProjection::ArrayElement(index)),
+        )
+    }
+
+    fn project_fixed_element_field_fact(
+        &self,
+        recv: &Expr,
+        index: &Expr,
+        path: &[u32],
+        result_ty: Ty,
+    ) -> BorrowFact {
+        let Some((element_ty, len)) = self.fixed_array_shape(recv.ty) else {
+            return BorrowFact::from_direct(self.borrow_sources(recv));
+        };
+        let raw = self.borrow_fact(recv);
+        let fallback = raw.flatten();
+        let projections = path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let mut selected_ty = Some(element_ty);
+        for &projection in &projections {
+            selected_ty = selected_ty.and_then(|ty| self.projection_ty(ty, projection));
+        }
+        if selected_ty.is_none_or(|ty| {
+            expand_tagged_ty(ty, self.tagged_types)
+                != expand_tagged_ty(result_ty, self.tagged_types)
+        }) {
+            let mut roots = fallback;
+            roots.extend(self.storage_roots(recv));
+            return BorrowFact::from_direct(roots);
+        }
+        let mut fact = self.normalize_borrow_fact(recv.ty, raw);
+        fact = self.exact_fixed_index(index, len).map_or_else(
+            || fact.project_array_elements(),
+            |index| fact.project_exact(BorrowProjection::ArrayElement(index)),
+        );
+        self.project_fact_or_flatten(element_ty, fact, &projections, result_ty)
+    }
+
+    fn collection_element_ty(&self, ty: Ty) -> Option<Ty> {
+        match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                Some(scalar_to_ty(element))
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Some(Ty::Struct(id)),
+            _ => None,
+        }
+    }
+
+    fn pipeline_element_fact(&self, source: &Expr, stages: &[Stage]) -> (Ty, BorrowFact) {
+        let mut element_ty = self.collection_element_ty(source.ty).unwrap_or(source.ty);
+        let mut fact = if self.fixed_array_shape(source.ty).is_some() {
+            self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
+                .project_array_elements()
+        } else {
+            BorrowFact::from_direct(self.borrow_sources(source))
+        };
+        for stage in stages {
+            match &stage.kind {
+                StageKind::Project { field } => {
+                    fact = self.project_fact_or_flatten(
+                        element_ty,
+                        fact,
+                        &[BorrowProjection::StructField(*field)],
+                        stage.out_ty,
+                    );
+                }
+                StageKind::WhereField { field } => {
+                    if self.projection_ty(element_ty, BorrowProjection::StructField(*field))
+                        != Some(Ty::Bool)
+                    {
+                        fact = BorrowFact::from_direct(fact.flatten());
+                    }
+                }
+                StageKind::Where { .. } | StageKind::WhereStrContains { .. } => {}
+                StageKind::Map { .. } => {
+                    fact = BorrowFact::from_direct(fact.flatten());
+                }
+            }
+            element_ty = stage.out_ty;
+        }
+        (element_ty, fact)
+    }
+
+    fn try_error_roots(&self, result: &Expr) -> BorrowRoots {
+        let fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
+        if self.projection_ty(result.ty, BorrowProjection::ResultErr).is_none() {
+            fact.flatten()
+        } else {
+            fact.project_exact(BorrowProjection::ResultErr).flatten()
+        }
     }
 
     fn local_projected_fact(
@@ -13873,6 +15198,94 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn callable_return_fact(&self, callee: &Expr, args: &[Expr]) -> BorrowFact {
+        let signature = match callee.ty {
+            Ty::Fn(id) => self.fn_types.get(id as usize),
+            _ => None,
+        };
+        let arguments = args
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                let fact = if signature.is_some_and(|signature| {
+                    matches!(
+                        signature.params.get(index).map(|(mode, _)| mode),
+                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    )
+                }) {
+                    BorrowFact::from_direct(self.storage_roots(argument))
+                } else {
+                    self.borrow_fact(argument)
+                };
+                (argument.ty, fact)
+            })
+            .collect::<Vec<_>>();
+        self.callable_return_fact_from_facts(callee, &arguments)
+    }
+
+    fn callable_return_fact_from_facts(
+        &self,
+        callee: &Expr,
+        arguments: &[(Ty, BorrowFact)],
+    ) -> BorrowFact {
+        let unresolved = || {
+            let mut fact = self.borrow_fact(callee);
+            for (ty, argument) in arguments {
+                if ty_may_borrow(
+                    *ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    fact = fact.join(argument);
+                }
+            }
+            fact
+        };
+        let ty = match &callee.kind {
+            ExprKind::Local(local) => self
+                .f
+                .locals
+                .get(*local as usize)
+                .map(|local| local.ty)
+                .unwrap_or(callee.ty),
+            _ => callee.ty,
+        };
+        let Ty::Fn(id) = ty else {
+            return BorrowFact::from_direct(unresolved().flatten());
+        };
+        let Some(targets) = self.callable_targets.get(id as usize) else {
+            return BorrowFact::from_direct(unresolved().flatten());
+        };
+        if targets.is_empty() {
+            // A function-typed parameter has no concrete target set. Keep the settled fail-closed
+            // fallback over every compatible explicit input and the callable environment itself.
+            return BorrowFact::from_direct(unresolved().flatten());
+        }
+        let mut fact = BorrowFact::default();
+        let environment = self.borrow_fact(callee);
+        for (&target, summary) in targets {
+            let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
+                continue;
+            };
+            for index in params.iter().copied() {
+                if let Some((_, argument)) = arguments.get(index as usize) {
+                    fact = fact.join(argument);
+                }
+            }
+            let selected_environment =
+                environment.project_exact(BorrowProjection::ClosureTarget(target));
+            for capture in captures.iter().copied() {
+                fact = fact.join(
+                    &selected_environment
+                        .project_exact(BorrowProjection::ClosureCapture(capture)),
+                );
+            }
+        }
+        fact
+    }
+
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
@@ -13890,6 +15303,78 @@ impl<'a> MoveCheck<'a> {
                 &[BorrowProjection::TupleElement(*index)],
                 e.ty,
             ),
+            ExprKind::ArrayLit { elems, elem, .. } => {
+                let valid = self.fixed_array_shape(e.ty).is_some_and(|(element_ty, len)| {
+                    len as usize == elems.len()
+                        && expand_tagged_ty(element_ty, self.tagged_types)
+                            == expand_tagged_ty(*elem, self.tagged_types)
+                        && elems.iter().all(|value| {
+                            expand_tagged_ty(value.ty, self.tagged_types)
+                                == expand_tagged_ty(element_ty, self.tagged_types)
+                        })
+                });
+                if !valid {
+                    return BorrowFact::from_direct(elems.iter().fold(
+                        BorrowRoots::new(),
+                        |mut roots, value| {
+                            roots.extend(self.borrow_sources(value));
+                            roots
+                        },
+                    ));
+                }
+                elems.iter().enumerate().fold(
+                    BorrowFact::default(),
+                    |fact, (index, value)| {
+                        fact.join(
+                            &self
+                                .borrow_fact(value)
+                                .prefixed(BorrowProjection::ArrayElement(index as u32)),
+                        )
+                    },
+                )
+            }
+            ExprKind::Index { recv, index } if self.fixed_array_shape(recv.ty).is_some() => {
+                self.project_fixed_array_fact(recv, index, e.ty)
+            }
+            ExprKind::IndexField { base, index, path } => {
+                let Some(local_ty) = self.f.locals.get(*base as usize).map(|local| local.ty) else {
+                    return BorrowFact::from_direct(self.local_storage_roots(*base));
+                };
+                let Some((element_ty, len)) = self.fixed_array_shape(local_ty) else {
+                    return BorrowFact::from_direct(self.local_storage_roots(*base));
+                };
+                let raw = self.local_borrow_fact(*base);
+                let fallback = raw.flatten();
+                let projections = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                let mut selected_ty = Some(element_ty);
+                for &projection in &projections {
+                    selected_ty = selected_ty.and_then(|ty| self.projection_ty(ty, projection));
+                }
+                if selected_ty.is_none_or(|ty| {
+                    expand_tagged_ty(ty, self.tagged_types)
+                        != expand_tagged_ty(e.ty, self.tagged_types)
+                }) {
+                    let mut roots = fallback;
+                    roots.extend(self.local_storage_roots(*base));
+                    return BorrowFact::from_direct(roots);
+                }
+                let mut fact = self.normalize_borrow_fact(local_ty, raw);
+                fact = if *index < len {
+                    fact.project_exact(BorrowProjection::ArrayElement(*index))
+                } else {
+                    return BorrowFact::from_direct(fallback);
+                };
+                self.project_fact_or_flatten(element_ty, fact, &projections, e.ty)
+            }
+            ExprKind::ElemField { recv, index, path, .. }
+                if self.fixed_array_shape(recv.ty).is_some() =>
+            {
+                self.project_fixed_element_field_fact(recv, index, path, e.ty)
+            }
             ExprKind::StructLit { struct_id, fields } => {
                 let valid = e.ty == Ty::Struct(*struct_id)
                     && self.structs.get(*struct_id as usize).is_some_and(|definition| {
@@ -13954,6 +15439,162 @@ impl<'a> MoveCheck<'a> {
                     },
                 )
             }
+            ExprKind::EnumValue {
+                enum_id,
+                variant,
+                payload,
+            } => {
+                let valid = expand_tagged_ty(e.ty, self.tagged_types) == Ty::Enum(*enum_id)
+                    && self.enums.get(*enum_id as usize).is_some_and(|definition| {
+                        definition
+                            .variants
+                            .get(*variant as usize)
+                            .is_some_and(|case| {
+                                case.payload.len() == payload.len()
+                                    && case.payload.iter().zip(payload).all(|(expected, value)| {
+                                        expand_tagged_ty(scalar_to_ty(*expected), self.tagged_types)
+                                            == expand_tagged_ty(value.ty, self.tagged_types)
+                                    })
+                            })
+                    });
+                if !valid {
+                    return BorrowFact::from_direct(payload.iter().fold(
+                        BorrowRoots::new(),
+                        |mut roots, value| {
+                            roots.extend(self.borrow_sources(value));
+                            roots
+                        },
+                    ));
+                }
+                payload.iter().enumerate().fold(
+                    BorrowFact::default(),
+                    |fact, (index, value)| {
+                        fact.join(&self.borrow_fact(value).prefixed(
+                            BorrowProjection::EnumPayload {
+                                variant: *variant,
+                                index: index as u32,
+                            },
+                        ))
+                    },
+                )
+            }
+            ExprKind::OptionSome(value) => self
+                .borrow_fact(value)
+                .prefixed(BorrowProjection::OptionSome),
+            ExprKind::OptionNone => BorrowFact::default(),
+            ExprKind::ResultOk(value) => self
+                .borrow_fact(value)
+                .prefixed(BorrowProjection::ResultOk),
+            ExprKind::ResultErr(value) => self
+                .borrow_fact(value)
+                .prefixed(BorrowProjection::ResultErr),
+            ExprKind::Try(result) => self.project_fact_or_flatten(
+                result.ty,
+                self.borrow_fact(result),
+                &[BorrowProjection::ResultOk],
+                e.ty,
+            ),
+            ExprKind::ResultMapErr { result, f } => {
+                let result_fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
+                let (input_error_ty, output_error_ty) = match (
+                    expand_tagged_ty(result.ty, self.tagged_types),
+                    expand_tagged_ty(e.ty, self.tagged_types),
+                ) {
+                    (Ty::Result(_, input), Ty::Result(_, output)) => {
+                        (scalar_to_ty(input), scalar_to_ty(output))
+                    }
+                    _ => {
+                        let mut roots = result_fact.flatten();
+                        roots.extend(self.borrow_sources(f));
+                        return BorrowFact::from_direct(roots);
+                    }
+                };
+                let ok = result_fact
+                    .project_exact(BorrowProjection::ResultOk)
+                    .prefixed(BorrowProjection::ResultOk);
+                let input_error = result_fact.project_exact(BorrowProjection::ResultErr);
+                let mapped_error = self.callable_return_fact_from_facts(
+                    f,
+                    &[(input_error_ty, input_error)],
+                );
+                if self.projection_ty(e.ty, BorrowProjection::ResultErr)
+                    != Some(output_error_ty)
+                {
+                    let mut roots = ok.flatten();
+                    roots.extend(mapped_error.flatten());
+                    return BorrowFact::from_direct(roots);
+                }
+                ok.join(&mapped_error.prefixed(BorrowProjection::ResultErr))
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let projection = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(BorrowProjection::OptionSome),
+                    Ty::Result(..) => Some(BorrowProjection::ResultOk),
+                    _ => None,
+                };
+                let success = projection.map_or_else(
+                    || BorrowFact::from_direct(self.borrow_sources(opt)),
+                    |projection| {
+                        self.project_fact_or_flatten(
+                            opt.ty,
+                            self.borrow_fact(opt),
+                            &[projection],
+                            e.ty,
+                        )
+                    },
+                );
+                if self.non_fallthrough.contains(&fallback.span) {
+                    success
+                } else {
+                    success.join(&self.borrow_fact(fallback))
+                }
+            }
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .filter(|arm| !self.non_fallthrough.contains(&arm.body.span))
+                .fold(BorrowFact::default(), |fact, arm| {
+                    fact.join(&self.borrow_fact(&arm.body))
+                }),
+            ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArrayParMap { source, stages, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, stages);
+                BorrowFact::from_direct(element.flatten())
+            }
+            ExprKind::ArrayPartition { source, stages, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, stages);
+                let roots = BorrowFact::from_direct(element.flatten());
+                roots
+                    .clone()
+                    .prefixed(BorrowProjection::TupleElement(0))
+                    .join(&roots.prefixed(BorrowProjection::TupleElement(1)))
+            }
+            ExprKind::ArrayToSoa { source, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, &[]);
+                BorrowFact::from_direct(element.flatten())
+            }
+            ExprKind::ArrayChunks { source, .. } => {
+                BorrowFact::from_direct(self.storage_roots(source))
+            }
+            ExprKind::CallFnValue { callee, args } => self.callable_return_fact(callee, args),
+            ExprKind::Closure { lifted, captures } => {
+                let fact = captures.iter().enumerate().fold(
+                    BorrowFact::default(),
+                    |fact, (index, capture)| {
+                        fact.join(
+                            &self
+                                .borrow_fact(capture)
+                                .prefixed(BorrowProjection::ClosureCapture(index as u32)),
+                        )
+                    },
+                );
+                match self.callable_target_ids.get(lifted).copied() {
+                    Some(target) => fact.prefixed(BorrowProjection::ClosureTarget(target)),
+                    None => BorrowFact::from_direct(fact.flatten()),
+                }
+            }
+            ExprKind::FnValue(_) => BorrowFact::default(),
             ExprKind::Block(block)
             | ExprKind::Arena(block)
             | ExprKind::TaskGroup(block)
@@ -13968,8 +15609,8 @@ impl<'a> MoveCheck<'a> {
                 .get(&e.span)
                 .cloned()
                 .unwrap_or_default(),
-            // L2b-a2-t owns tagged construction, match bindings, `else`, `?`, and `map_err`.
-            // Every remaining expression retains the L2b-a1 flattened conservative fact.
+            // Remaining non-fixed collection and pipeline forms retain
+            // the conservative flattened fact until their dedicated C-B cells below.
             _ => BorrowFact::from_direct(self.borrow_sources_inner(e)),
         }
     }
@@ -14015,6 +15656,7 @@ impl<'a> MoveCheck<'a> {
     fn map_summary_roots<'b>(
         &self,
         summary: &hir::ReturnBorrowSummary,
+        modes: Option<&[ast::ParamMode]>,
         args: impl std::ops::Fn(u32) -> Option<&'b Expr>,
     ) -> BorrowRoots {
         let hir::ReturnBorrowSummary::Roots {
@@ -14027,7 +15669,16 @@ impl<'a> MoveCheck<'a> {
         let mut roots = BorrowRoots::new();
         for &index in params {
             if let Some(value) = args(index) {
-                roots.extend(self.borrow_sources(value));
+                if modes.is_some_and(|modes| {
+                    matches!(
+                        modes.get(index as usize),
+                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    )
+                }) {
+                    roots.extend(self.storage_roots(value));
+                } else {
+                    roots.extend(self.borrow_sources(value));
+                }
             }
         }
         roots
@@ -14164,6 +15815,7 @@ impl<'a> MoveCheck<'a> {
                     |summary| {
                         self.map_summary_roots(
                             summary,
+                            self.named_param_modes.get(func).map(Vec::as_slice),
                             |index| args.get(index as usize),
                         )
                     },
@@ -14405,6 +16057,57 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         current.replace_exact(path, incoming);
+        self.borrows.update_fact(local, current);
+    }
+
+    fn update_local_array_projection(
+        &mut self,
+        local: LocalId,
+        index: &Expr,
+        field_path: &[u32],
+        value: &Expr,
+    ) {
+        if !self.local_may_borrow(local) {
+            return;
+        }
+        let local_ty = self.f.locals[local as usize].ty;
+        let Some((element_ty, len)) = self.fixed_array_shape(local_ty) else {
+            self.join_local_borrow_fallback(local, value);
+            return;
+        };
+        let mut current = self.normalize_borrow_fact(
+            local_ty,
+            self.borrows.facts.get(&local).cloned().unwrap_or_default(),
+        );
+        let incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
+        let mut suffix = field_path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let mut destination_ty = Some(element_ty);
+        for &projection in &suffix {
+            destination_ty = destination_ty.and_then(|ty| self.projection_ty(ty, projection));
+        }
+        if destination_ty.is_none_or(|ty| {
+            expand_tagged_ty(ty, self.tagged_types)
+                != expand_tagged_ty(value.ty, self.tagged_types)
+        }) {
+            current.direct.extend(incoming.flatten());
+            self.borrows.update_fact(local, current);
+            return;
+        }
+        if let Some(exact) = self.exact_fixed_index(index, len) {
+            suffix.insert(0, BorrowProjection::ArrayElement(exact));
+            current.replace_exact(&suffix, incoming);
+        } else {
+            for candidate in 0..len {
+                let mut path = Vec::with_capacity(suffix.len() + 1);
+                path.push(BorrowProjection::ArrayElement(candidate));
+                path.extend(&suffix);
+                current.join_at(&path, &incoming);
+            }
+        }
         self.borrows.update_fact(local, current);
     }
 
@@ -14899,14 +16602,19 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
-                    self.join_local_borrow_fallback(*base, value);
+                    self.update_local_array_projection(*base, index, &[], value);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
                 // MoveCheck must consume that RHS as well. Copy-only dynamic/SoA stores are
                 // unaffected by a consuming context.
-                Stmt::AssignElemField { base, index, value, .. }
-                | Stmt::AssignElem { base, index, value, .. } => {
+                Stmt::AssignElemField {
+                    base,
+                    index,
+                    path,
+                    value,
+                    ..
+                } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
@@ -14917,7 +16625,20 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
-                    self.join_local_borrow_fallback(*base, value);
+                    self.update_local_array_projection(*base, index, path, value);
+                }
+                Stmt::AssignElem { base, index, value, .. } => {
+                    self.check_borrow_use(*base, index.span);
+                    if whole_moved(moved, *base) {
+                        let name = &self.f.locals[*base as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), index.span);
+                    }
+                    move_expr!(self, index, moved, false, false);
+                    move_expr!(self, value, moved, true, true);
+                    if self.is_move_ty(value.ty) {
+                        self.invalidate_owner(*base);
+                    }
+                    self.update_local_array_projection(*base, index, &[], value);
                 }
                 Stmt::AssignVecLane { value, .. } => {
                     move_expr!(self, value, moved, false, false);
@@ -15411,7 +17132,7 @@ impl<'a> MoveCheck<'a> {
     ) -> Option<bool> {
         enum Post<'e> {
             None,
-            Try(&'e Expr),
+            Try(BorrowRoots),
             LoopBreak(Option<&'e Expr>),
             LoopDiverge,
             Pipeline {
@@ -15419,6 +17140,7 @@ impl<'a> MoveCheck<'a> {
                 snapshots_source: bool,
                 snapshot: Option<Option<usize>>,
             },
+            BorrowMutCall(&'e Expr),
             IfAfterCondition {
                 then: &'e Block,
                 els: &'e Block,
@@ -15487,6 +17209,7 @@ impl<'a> MoveCheck<'a> {
             BlockPairAfterIndex {
                 base: LocalId,
                 value: &'e Expr,
+                field_path: &'e [u32],
                 value_consuming: bool,
                 invalidates_owner: bool,
             },
@@ -15494,6 +17217,7 @@ impl<'a> MoveCheck<'a> {
                 base: LocalId,
                 index: &'e Expr,
                 value: &'e Expr,
+                field_path: &'e [u32],
                 invalidates_owner: bool,
                 index_complete: bool,
             },
@@ -15651,6 +17375,7 @@ impl<'a> MoveCheck<'a> {
                                 Post::BlockPairAfterIndex {
                                     base: *base,
                                     value,
+                                    field_path: &[],
                                     value_consuming: false,
                                     invalidates_owner: false,
                                 },
@@ -15665,6 +17390,7 @@ impl<'a> MoveCheck<'a> {
                                     base: *base,
                                     index,
                                     value,
+                                    field_path: &[],
                                     invalidates_owner: false,
                                     index_complete: false,
                                 },
@@ -15682,20 +17408,20 @@ impl<'a> MoveCheck<'a> {
                                     | Stmt::AssignElem { .. }]
                             ) =>
                     {
-                        let (base, index, value) = match &block.stmts[0]
-                        {
+                        let (base, index, value, field_path) = match &block.stmts[0] {
                             Stmt::AssignElemField {
                                 base,
                                 index,
+                                path,
                                 value,
                                 ..
-                            }
-                            | Stmt::AssignElem {
+                            } => (*base, index, value, path.as_slice()),
+                            Stmt::AssignElem {
                                 base,
                                 index,
                                 value,
                                 ..
-                            } => (*base, index, value),
+                            } => (*base, index, value, &[][..]),
                             _ => unreachable!("single element assign guard"),
                         };
                         self.check_borrow_use(base, index.span);
@@ -15717,6 +17443,7 @@ impl<'a> MoveCheck<'a> {
                                 Post::BlockPairAfterIndex {
                                     base,
                                     value,
+                                    field_path,
                                     value_consuming: true,
                                     invalidates_owner: true,
                                 },
@@ -15731,6 +17458,7 @@ impl<'a> MoveCheck<'a> {
                                     base,
                                     index,
                                     value,
+                                    field_path,
                                     invalidates_owner: true,
                                     index_complete: false,
                                 },
@@ -16274,7 +18002,8 @@ impl<'a> MoveCheck<'a> {
                         (child.as_ref(), false, true, true, Post::None)
                     }
                     ExprKind::Try(child) => {
-                        (child.as_ref(), false, true, true, Post::Try(child))
+                        let error_roots = self.try_error_roots(child);
+                        (child.as_ref(), false, true, true, Post::Try(error_roots))
                     }
                     ExprKind::TaskGet(child) => {
                         let consumes = is_owned_droppable(
@@ -16294,8 +18023,20 @@ impl<'a> MoveCheck<'a> {
                         {
                             dependencies.insert(func.clone());
                         }
-                        let consumes = func != "print";
-                        (&args[0], false, consumes, consumes, Post::None)
+                        let mode = self
+                            .named_param_modes
+                            .get(func)
+                            .and_then(|modes| modes.first())
+                            .copied()
+                            .unwrap_or(ast::ParamMode::ByValue);
+                        let consumes = func != "print"
+                            && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut);
+                        let post = if mode == ast::ParamMode::BorrowMut {
+                            Post::BorrowMutCall(&args[0])
+                        } else {
+                            Post::None
+                        };
+                        (&args[0], false, consumes, consumes, post)
                     }
                     ExprKind::CallFnValue { callee, args } if args.is_empty() => {
                         (callee.as_ref(), false, false, false, Post::None)
@@ -16618,7 +18359,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     None
                 }
-                Post::Try(result) => Some(result),
+                Post::Try(error_roots) => Some(error_roots),
                 Post::LoopBreak(value) => {
                     if falls_through {
                         let fact = value.map_or_else(
@@ -16654,6 +18395,14 @@ impl<'a> MoveCheck<'a> {
                             wrapper.span,
                             falls_through,
                         );
+                    }
+                    None
+                }
+                Post::BorrowMutCall(argument) => {
+                    if falls_through {
+                        let roots = self.storage_roots(argument);
+                        self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
+                        self.refresh_borrow_mut_place(argument);
                     }
                     None
                 }
@@ -17032,6 +18781,7 @@ impl<'a> MoveCheck<'a> {
                 Post::BlockPairAfterIndex {
                     base,
                     value,
+                    field_path,
                     value_consuming,
                     invalidates_owner,
                 } => {
@@ -17048,14 +18798,32 @@ impl<'a> MoveCheck<'a> {
                             {
                                 self.invalidate_owner(base);
                             }
-                            self.join_local_borrow_fallback(base, value);
+                            self.update_local_array_projection(
+                                base,
+                                match &wrapper.kind {
+                                    ExprKind::Block(block)
+                                    | ExprKind::Arena(block)
+                                    | ExprKind::TaskGroup(block)
+                                    | ExprKind::Unsafe(block) => match &block.stmts[0] {
+                                        Stmt::AssignIndex { index, .. }
+                                        | Stmt::AssignElemField { index, .. }
+                                        | Stmt::AssignElem { index, .. } => index,
+                                        _ => unreachable!("array assignment post wrapper"),
+                                    },
+                                    _ => unreachable!("array assignment post wrapper"),
+                                },
+                                field_path,
+                                value,
+                            );
                         }
                     }
                     None
                 }
                 Post::BlockPairAfterValue {
                     base,
+                    index,
                     value,
+                    field_path,
                     invalidates_owner,
                     index_complete,
                     ..
@@ -17066,7 +18834,7 @@ impl<'a> MoveCheck<'a> {
                         {
                             self.invalidate_owner(base);
                         }
-                        self.join_local_borrow_fallback(base, value);
+                        self.update_local_array_projection(base, index, field_path, value);
                     }
                     None
                 }
@@ -17118,7 +18886,7 @@ impl<'a> MoveCheck<'a> {
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
             } else {
-                if let Some(result) = try_result
+                if let Some(error_roots) = try_result
                     && ty_may_borrow(
                         self.f.ret,
                         self.structs,
@@ -17127,7 +18895,7 @@ impl<'a> MoveCheck<'a> {
                         self.tagged_types,
                     )
                 {
-                    self.return_roots.extend(self.borrow_sources(result));
+                    self.return_roots.extend(error_roots);
                 }
                 if !Self::defers_child_snapshot_validation(&wrapper.kind) {
                     for snapshot in child_snapshots {
@@ -17231,15 +18999,53 @@ impl<'a> MoveCheck<'a> {
             (None, None)
         };
         self.borrows = evaluated_borrows.clone();
-        let scrutinee_roots = self.borrow_sources(scrutinee);
+        let scrutinee_fact = self.borrow_fact(scrutinee);
         MoveMatchPrepared {
             incoming_borrows,
             evaluated,
             evaluated_borrows,
             consumed,
             consumed_borrows,
-            scrutinee_roots,
+            scrutinee_ty: scrutinee.ty,
+            scrutinee_fact,
         }
+    }
+
+    fn match_binding_fact(
+        &self,
+        scrutinee_ty: Ty,
+        scrutinee_fact: &BorrowFact,
+        arm: &MatchArm,
+        binding_index: usize,
+        binding: LocalId,
+    ) -> BorrowFact {
+        if !self.local_may_borrow(binding) {
+            return BorrowFact::default();
+        }
+        let Some(&variant) = arm
+            .variants
+            .as_slice()
+            .first()
+            .filter(|_| arm.variants.len() == 1)
+        else {
+            return BorrowFact::from_direct(scrutinee_fact.flatten());
+        };
+        let projection = match expand_tagged_ty(scrutinee_ty, self.tagged_types) {
+            Ty::Enum(_) => BorrowProjection::EnumPayload {
+                variant,
+                index: binding_index as u32,
+            },
+            Ty::Option(_) if variant == 0 && binding_index == 0 => BorrowProjection::OptionSome,
+            Ty::Result(..) if variant == 0 && binding_index == 0 => BorrowProjection::ResultOk,
+            Ty::Result(..) if variant == 1 && binding_index == 0 => BorrowProjection::ResultErr,
+            _ => return BorrowFact::from_direct(scrutinee_fact.flatten()),
+        };
+        self.project_fact_or_flatten(
+            scrutinee_ty,
+            scrutinee_fact.clone(),
+            &[projection],
+            self.f.locals[binding as usize].ty,
+        )
     }
 
     fn begin_match_arm(
@@ -17270,14 +19076,15 @@ impl<'a> MoveCheck<'a> {
         } else {
             prepared.evaluated_borrows.clone()
         };
-        for binding in &arm.bindings {
-            let roots = if self.local_may_borrow(*binding) {
-                prepared.scrutinee_roots.clone()
-            } else {
-                BorrowRoots::new()
-            };
-            self.borrows
-                .assign(*binding, BorrowFact::from_direct(roots));
+        for (binding_index, binding) in arm.bindings.iter().enumerate() {
+            let fact = self.match_binding_fact(
+                prepared.scrutinee_ty,
+                &prepared.scrutinee_fact,
+                arm,
+                binding_index,
+                *binding,
+            );
+            self.borrows.assign(*binding, fact);
             clear_moved(moved, *binding);
         }
     }
@@ -17499,6 +19306,14 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     self.check_borrow_use(*id, e.span);
                     if consuming && self.is_move(*id) {
+                        if self.borrowed_param_mode(*id).is_some() {
+                            let name = &self.f.locals[*id as usize].name;
+                            self.diags.error(
+                                format!("cannot move borrowed parameter '{name}'"),
+                                e.span,
+                            );
+                            return true;
+                        }
                         if !direct {
                             let name = &self.f.locals[*id as usize].name;
                             self.diags.error(
@@ -17540,6 +19355,14 @@ impl<'a> MoveCheck<'a> {
                             || is_move_handle(e.ty)
                             || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
+                        if self.borrowed_param_mode(*base).is_some() {
+                            let name = &self.f.locals[*base as usize].name;
+                            self.diags.error(
+                                format!("cannot move a field out of borrowed parameter '{name}'"),
+                                e.span,
+                            );
+                            return true;
+                        }
                         // A partial move of a depth-1 owned `string`/`Option<Move>` field (`n := u.name`,
                         // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
                         // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle), or
@@ -17625,9 +19448,30 @@ impl<'a> MoveCheck<'a> {
                 if let Some(dependencies) = self.summary_dependencies.as_deref_mut() {
                     dependencies.insert(func.clone());
                 }
-                let consuming = func != "print";
-                for a in args {
+                if let Some(modes) = self.named_param_modes.get(func).cloned() {
+                    self.check_call_borrow_aliases(func, args, &modes);
+                }
+                for (index, a) in args.iter().enumerate() {
+                    let consuming = func != "print"
+                        && !matches!(
+                            self.named_param_modes
+                                .get(func)
+                                .and_then(|modes| modes.get(index)),
+                            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        );
                     move_expr!(self, a, moved, consuming, consuming);
+                }
+                if let Some(mode_count) = self.named_param_modes.get(func).map(Vec::len) {
+                    for index in 0..mode_count {
+                        let mode = self.named_param_modes[func][index];
+                        if mode == ast::ParamMode::BorrowMut
+                            && let Some(argument) = args.get(index)
+                        {
+                            let roots = self.storage_roots(argument);
+                            self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
+                            self.refresh_borrow_mut_place(argument);
+                        }
+                    }
                 }
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
@@ -17640,8 +19484,44 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::CallFnValue { callee, args } => {
                 move_expr!(self, callee, moved, false, false);
-                for a in args {
-                    move_expr!(self, a, moved, true, true);
+                let modes = match callee.ty {
+                    Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                        function.params.iter().map(|(mode, _)| *mode).collect::<Vec<_>>()
+                    }),
+                    _ => None,
+                };
+                if let Some(modes) = &modes {
+                    self.check_call_borrow_aliases("function value", args, modes);
+                }
+                let mode_count = modes.as_ref().map_or(0, Vec::len);
+                drop(modes);
+                for (index, a) in args.iter().enumerate() {
+                    let mode = match callee.ty {
+                        Ty::Fn(id) => self
+                            .fn_types
+                            .get(id as usize)
+                            .and_then(|function| function.params.get(index))
+                            .map(|(mode, _)| *mode),
+                        _ => None,
+                    };
+                    let consuming = !matches!(
+                        mode,
+                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    );
+                    move_expr!(self, a, moved, consuming, consuming);
+                }
+                for index in 0..mode_count {
+                    let mode = match callee.ty {
+                        Ty::Fn(id) => self.fn_types[id as usize].params[index].0,
+                        _ => ast::ParamMode::ByValue,
+                    };
+                        if mode == ast::ParamMode::BorrowMut
+                            && let Some(argument) = args.get(index)
+                        {
+                            let roots = self.storage_roots(argument);
+                            self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
+                            self.refresh_borrow_mut_place(argument);
+                        }
                 }
             }
             ExprKind::StructLit { fields, .. } => {
@@ -17654,10 +19534,9 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) => move_expr!(self, i, moved, true, true),
             ExprKind::Try(i) => {
-                // L2b-a1 preserves the conservative flattened Result provenance. L2b-a2 splits
-                // the implicit Err return edge from the continuing Ok projection. Do not attach
-                // that flattened union to a return type that cannot carry any borrow: the operand's
-                // Ok payload may borrow even though the propagated Err and enclosing return do not.
+                // Keep the same guard as the final return summary so a borrowing Ok payload cannot
+                // taint an enclosing Result whose returned paths carry no borrow.
+                let error_roots = self.try_error_roots(i);
                 move_expr!(self, i, moved, true, true);
                 if ty_may_borrow(
                     self.f.ret,
@@ -17666,7 +19545,7 @@ impl<'a> MoveCheck<'a> {
                     self.enums,
                     self.tagged_types,
                 ) {
-                    self.return_roots.extend(self.borrow_sources(i));
+                    self.return_roots.extend(error_roots);
                 }
             }
             // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
@@ -19463,8 +21342,25 @@ impl<'a, 't> Checker<'a, 't> {
                     p.ty.span(),
                 );
             }
+            if p.mode == ast::ParamMode::Borrow
+                && ty != Ty::Error
+                && !matches!(ty, Ty::Param(_))
+                && !ty_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types)
+            {
+                self.diags.error(
+                    format!(
+                        "a borrowed parameter must be a Move type, got {}",
+                        ty_name(ty)
+                    ),
+                    p.ty.span(),
+                );
+            }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
-            let id = self.declare(&p.name.name, ty, p.mode.is_out());
+            let id = self.declare(
+                &p.name.name,
+                ty,
+                p.mode.is_out() || p.mode == ast::ParamMode::BorrowMut,
+            );
             if let Some(spelling) = self.json_scan_row_source_spelling(&p.ty) {
                 self.json_scan_local_spellings.insert(id, spelling);
             }
@@ -19508,6 +21404,7 @@ impl<'a, 't> Checker<'a, 't> {
             ret: self.finalize(ret),
             return_borrow: sig.return_borrow.clone(),
             return_region: sig.return_region.clone(),
+            return_cleanup: hir::ReturnCleanupAbi::None,
             locals,
             body,
             span: f.span,
@@ -21917,6 +23814,75 @@ impl<'a, 't> Checker<'a, 't> {
         self.check_indirect_call(callee, args, expected, span)
     }
 
+    fn validate_borrow_argument(
+        &mut self,
+        argument: &Expr,
+        mode: ast::ParamMode,
+        display: &str,
+    ) {
+        if !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+            return;
+        }
+        let root = match &argument.kind {
+            ExprKind::Local(local) => Some(*local),
+            ExprKind::Field { root, .. } => Some(*root),
+            _ => None,
+        };
+        let Some(root) = root else {
+            self.diags.error(
+                format!(
+                    "the {mode:?} argument to '{display}' must be a stable named local or field, not a temporary value"
+                ),
+                argument.span,
+            );
+            return;
+        };
+        if mode == ast::ParamMode::Borrow
+            && !ty_is_move(
+                argument.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+        {
+            self.diags.error(
+                format!(
+                    "the {mode:?} argument to '{display}' must have a Move type, got {}",
+                    self.ty_display(argument.ty)
+                ),
+                argument.span,
+            );
+        }
+        if mode == ast::ParamMode::BorrowMut
+            && matches!(argument.kind, ExprKind::Field { .. })
+            && ty_is_move(
+                argument.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+        {
+            self.diags.error(
+                format!(
+                    "cannot exclusively borrow a partial Move field for '{display}'; borrow the whole owner"
+                ),
+                argument.span,
+            );
+        }
+        if mode == ast::ParamMode::BorrowMut
+            && !self.locals.get(root as usize).is_some_and(|local| local.is_mut)
+        {
+            self.diags.error(
+                format!(
+                    "the exclusive borrowed argument to '{display}' must be rooted in mutable storage"
+                ),
+                argument.span,
+            );
+        }
+    }
+
     /// The shared body of an indirect call: `callee` is an already-checked expression of a
     /// **function-value** type (`Ty::Fn`) — a fn-value local (`f(args)`), or a struct's fn-typed
     /// field read (`route.handler(args)`, F1① of the pkg.web plan). Checks arity + argument types
@@ -21941,14 +23907,6 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let mut checked = Vec::with_capacity(args.len());
         for (a, (mode, p)) in args.iter().zip(&params) {
-            if *mode != ast::ParamMode::ByValue {
-                self.diags.error(
-                    "this function-value parameter mode is not callable until its borrow slice lands"
-                        .to_string(),
-                    span,
-                );
-                return err;
-            }
             let pt = scalar_to_ty(*p);
             let e = self.check_expr(a, Some(pt));
             if e.ty != Ty::Error && !self.source_ty_matches(e.ty, pt) {
@@ -21957,6 +23915,7 @@ impl<'a, 't> Checker<'a, 't> {
                     e.span,
                 );
             }
+            self.validate_borrow_argument(&e, *mode, "function value");
             checked.push(e);
         }
         self.constrain(ret, expected, span);
@@ -22098,6 +24057,7 @@ impl<'a, 't> Checker<'a, 't> {
                 &name,
                 &type_params,
                 &param_tys,
+                &param_modes,
                 ret,
                 &json_scan_param_spellings,
                 args,
@@ -22194,6 +24154,11 @@ impl<'a, 't> Checker<'a, 't> {
                 );
             }
         }
+        for (index, mode) in param_modes.iter().copied().enumerate() {
+            if let Some(argument) = checked.get(index) {
+                self.validate_borrow_argument(argument, mode, &name);
+            }
+        }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
     }
 
@@ -22213,6 +24178,7 @@ impl<'a, 't> Checker<'a, 't> {
         name: &str,
         type_params: &[String],
         param_tys: &[Ty],
+        param_modes: &[ast::ParamMode],
         ret: Ty,
         json_scan_param_spellings: &[Option<String>],
         args: &[ast::Expr],
@@ -22311,6 +24277,11 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             checked.push(ce);
+        }
+        for (index, mode) in param_modes.iter().copied().enumerate() {
+            if let Some(argument) = checked.get(index) {
+                self.validate_borrow_argument(argument, mode, name);
+            }
         }
         // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a
         // concrete scalar now — a `Scalar` cannot hold an inference variable, so leaving it deferred
@@ -24352,6 +26323,7 @@ impl<'a, 't> Checker<'a, 't> {
             ret,
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             locals,
             body: body_fin,
             span,
@@ -34500,6 +36472,7 @@ fn intern_fn_type(
         ret,
         return_borrow: hir::ReturnBorrowSummary::None,
         return_region: hir::ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: std::cell::Cell::new(FnEffect::Unknown),
     };
     if let Some(i) = fn_types.iter().position(|t| *t == ft) {
@@ -34523,6 +36496,7 @@ fn fresh_fn_type(
         ret,
         return_borrow: hir::ReturnBorrowSummary::None,
         return_region: hir::ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
         effect: std::cell::Cell::new(effect),
     });
     (fn_types.len() - 1) as u32
@@ -34612,11 +36586,14 @@ fn resolve_type(
                     );
                     return Ty::Error;
                 }
-                if matches!(p.mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+                if p.mode == ast::ParamMode::Borrow
+                    && !matches!(pty, Ty::Param(_))
+                    && !ty_is_move(pty, cx.structs, cx.tuples, cx.enums, cx.tagged_types)
+                {
                     diags.error(
                         format!(
-                            "function-type parameter mode {:?} is not enabled in L2a",
-                            p.mode
+                            "a borrowed function-type parameter must be a Move type, got {}",
+                            ty_name(pty)
                         ),
                         p.ty.span(),
                     );
@@ -36006,16 +37983,23 @@ fn main() -> i32 = 0
             .find(|function| function.name == "probe")
             .expect("probe function");
         let named = std::collections::HashMap::new();
+        let named_modes = std::collections::HashMap::new();
+        let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
+        let callable_target_ids = std::collections::HashMap::new();
         let mut sink = Diagnostics::new();
         let mut checker = MoveCheck {
             f: function,
             diags: &mut sink,
             named_return_borrow: &named,
+            named_param_modes: &named_modes,
             summary_dependencies: None,
             tuples: &program.tuples,
             structs: &program.structs,
             enums: &program.enums,
             tagged_types: &program.tagged_types,
+            fn_types: &program.fn_types,
+            callable_targets: &callable_targets,
+            callable_target_ids: &callable_target_ids,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -36115,6 +38099,11 @@ fn main() -> i32 = 0
 
         let pair_local = function.params[0];
         let replacement_local = function.params[1];
+        let mut all_with_local_generations = all.clone();
+        all_with_local_generations.extend([
+            BorrowRoot::Local(pair_local),
+            BorrowRoot::Local(replacement_local),
+        ]);
         let pair_fact = checker.normalize_borrow_fact(
             pair_ty,
             BorrowFact::from_direct([BorrowRoot::Param(0)].into_iter().collect()),
@@ -36167,8 +38156,8 @@ fn main() -> i32 = 0
                         Ty::Str,
                     )
                     .flatten(),
-                all,
-                "a malformed product constructor must flatten every child root"
+                all_with_local_generations,
+                "a malformed product constructor must flatten every child parameter and local-generation root"
             );
         }
 
@@ -36198,8 +38187,8 @@ fn main() -> i32 = 0
                         Ty::Str,
                     )
                     .flatten(),
-                all,
-                "a malformed product write must retain old and incoming roots"
+                all_with_local_generations,
+                "a malformed product write must retain old and incoming parameter and local-generation roots"
             );
         }
     }
@@ -39776,6 +41765,7 @@ fn exit_branch(flag: bool) -> i64 {
             ret: Ty::Int(IntTy { bits: 64, signed: true }),
             return_borrow: borrow,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             effect: std::cell::Cell::new(FnEffect::Pure),
         };
         let by_value = function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None);
@@ -39974,6 +41964,7 @@ fn exit_branch(flag: bool) -> i64 {
                 },
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 effect: std::cell::Cell::new(FnEffect::Unknown),
             })
             .collect::<Vec<_>>();

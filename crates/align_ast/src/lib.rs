@@ -164,10 +164,8 @@ pub struct Param {
     pub ty: Type,
 }
 
-/// Function parameter ownership/access mode. L2a represents every settled mode end to end while
-/// the parser still produces only [`ByValue`](ParamMode::ByValue) and the already-shipped
-/// [`Out`](ParamMode::Out). `Borrow` and `BorrowMut` remain reserved until their complete semantic
-/// slices land.
+/// Function parameter ownership/access mode. The parser treats `out`, `borrow`, and `borrow mut`
+/// contextually so the same words remain available as ordinary identifiers and type names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParamMode {
     ByValue,

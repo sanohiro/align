@@ -101,6 +101,7 @@ pub struct ImportedFn {
     pub ret: Ty,
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
 #[derive(Clone, Debug)]
@@ -143,11 +144,16 @@ pub struct Function {
     /// Source-level parameter modes. This is signature identity even while L2a lowers only the
     /// existing `ByValue` and `Out` physical ABI.
     pub param_modes: Vec<align_ast::ParamMode>,
+    /// Local proxy cleanup-bit slots for whole-Move `BorrowMut` parameters, parallel to `params`.
+    /// Codegen loads each proxy from the caller's hidden cleanup pointer and writes it back on
+    /// every return; other parameter modes and Copy `BorrowMut` entries are `None`.
+    pub borrow_mut_cleanup_slots: Vec<Option<Slot>>,
     pub ret: Ty,
     /// Span-free return provenance carried through MIR for interface and ABI identity. L2a emits
     /// only `None`; L2b computes roots.
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
     /// Type of every slot, indexed by [`Slot`].
     pub slots: Vec<Ty>,
     /// Declared over-alignment of every slot (bytes, a validated power of two), indexed by
@@ -182,7 +188,16 @@ fn par_map_function_work_units(f: &Function) -> u16 {
             units = units.saturating_add(4);
         }
         for stmt in &block.stmts {
-            if matches!(stmt, Stmt::Let(_, Rvalue::Call(..) | Rvalue::CallIndirect { .. })) {
+            if matches!(
+                stmt,
+                Stmt::Let(
+                    _,
+                    Rvalue::Call(..)
+                        | Rvalue::CallWithCleanup(_)
+                        | Rvalue::CallIndirect { .. }
+                        | Rvalue::CallIndirectWithCleanup(_)
+                )
+            ) {
                 // A call is opaque at this stage; give it more weight than a local arithmetic
                 // instruction without trying to recursively model a separately compiled callee.
                 units = units.saturating_add(4);
@@ -261,6 +276,8 @@ impl Function {
             Operand::Const(Const::Unit) => Ty::Unit,
             Operand::Value(v) => self.value_tys[*v as usize],
             Operand::Arg(i) => self.slots[self.params[*i as usize] as usize],
+            Operand::BorrowedPlace(place) => place.ty,
+            Operand::BorrowedCleanupArg(_) => Ty::Bool,
         }
     }
 }
@@ -402,6 +419,7 @@ pub struct FnSignatureFacts {
     pub param_modes: Vec<align_ast::ParamMode>,
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
 #[derive(Clone, Debug)]
@@ -424,8 +442,11 @@ pub enum Rvalue {
     /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
     MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
     Call(DirectCall, Vec<Operand>),
+    /// An Align-ABI call whose recursively Move result is returned together with its runtime
+    /// cleanup bit. Codegen defines both `result` and `cleanup` from the one physical call.
+    CallWithCleanup(Box<DirectCallWithCleanup>),
     /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
-    FnAddr { target: ProgramCall, signature: FnSignatureFacts },
+    FnAddr { target: ProgramCall, signature: Box<FnSignatureFacts> },
     /// A capturing closure value: the lifted function `lifted` (which takes the captures as
     /// trailing parameters) plus the captured values. Codegen copies the captures into a
     /// frame-local environment and builds `{ thunk_ptr, env_ptr }`, where the thunk unpacks the
@@ -434,7 +455,7 @@ pub enum Rvalue {
         lifted: ProgramCall,
         captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
-        signature: FnSignatureFacts,
+        signature: Box<FnSignatureFacts>,
     },
     /// An indirect call through a function-value `callee` (a `Ty::Fn` pointer). `param_tys`/`ret_ty`
     /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
@@ -444,8 +465,10 @@ pub enum Rvalue {
         args: Vec<Operand>,
         param_tys: Vec<Ty>,
         ret_ty: Ty,
-        signature: FnSignatureFacts,
+        signature: Box<FnSignatureFacts>,
     },
+    /// The dynamic-cleanup counterpart of [`Rvalue::CallIndirect`].
+    CallIndirectWithCleanup(Box<IndirectCallWithCleanup>),
     /// Load a (possibly nested) field from the struct in `slot`, addressed by the index `path`
     /// (length ≥ 1) — a GEP `[0, *path]` then a load.
     Field(Slot, Vec<u32>),
@@ -1366,6 +1389,38 @@ pub enum Operand {
     Value(ValueId),
     /// The i-th incoming function argument.
     Arg(u32),
+    /// A stable caller-owned place passed by shared or exclusive borrow. The root slot remains
+    /// owned by the caller; `path` selects a nested struct field without loading or moving it.
+    BorrowedPlace(Box<BorrowedPlace>),
+    /// Cleanup bit carried beside an incoming whole-Move `BorrowMut` parameter.
+    BorrowedCleanupArg(u32),
+}
+
+#[derive(Clone, Debug)]
+pub struct BorrowedPlace {
+    pub slot: Slot,
+    pub path: Vec<u32>,
+    pub ty: Ty,
+    /// Caller-side cleanup-bit slot for an exclusive borrow of a whole Move place. `None` for a
+    /// shared borrow, a Copy pointee, or a Copy field of a Move aggregate.
+    pub cleanup: Option<Slot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndirectCallWithCleanup {
+    pub callee: Operand,
+    pub args: Vec<Operand>,
+    pub param_tys: Vec<Ty>,
+    pub ret_ty: Ty,
+    pub signature: FnSignatureFacts,
+    pub cleanup: ValueId,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectCallWithCleanup {
+    pub target: ProgramCall,
+    pub args: Vec<Operand>,
+    pub cleanup: ValueId,
 }
 
 /// The boxed operands of a [`Rvalue::CryptoArgon2`] — two byte views (`password` / `salt`) and the
@@ -1409,6 +1464,8 @@ pub enum Term {
     Goto(BlockId),
     Branch(Operand, BlockId, BlockId),
     Return(Option<Operand>),
+    /// Return a recursively Move value and its path-selected ownership bit atomically.
+    ReturnWithCleanup(Box<(Operand, Operand)>),
     Unreachable,
 }
 
@@ -1632,6 +1689,44 @@ fn lower_program_unchecked(
     // Function signature facts are immutable during MIR lowering. Materialize the shared table once
     // so lowering F functions does not deep-clone all T entries F times.
     let fn_types: Rc<[hir::FnTy]> = program.fn_types.clone().into();
+    let named_return_cleanup = Rc::new(
+        program
+            .fns
+            .iter()
+            .map(|function| (function.name.clone(), function.return_cleanup))
+            .chain(
+                program
+                    .imported_fns
+                    .iter()
+                    .map(|function| (function.name.clone(), function.return_cleanup)),
+            )
+            .chain(
+                program
+                    .externs
+                    .iter()
+                    .map(|function| (function.name.clone(), function.return_cleanup)),
+            )
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
+    let named_param_modes = Rc::new(
+        program
+            .fns
+            .iter()
+            .map(|function| (function.name.clone(), function.param_modes.clone()))
+            .chain(
+                program
+                    .imported_fns
+                    .iter()
+                    .map(|function| (function.name.clone(), function.param_modes.clone())),
+            )
+            .chain(
+                program
+                    .externs
+                    .iter()
+                    .map(|function| (function.name.clone(), function.param_modes.clone())),
+            )
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
     let mut fns: Vec<Function> = program
         .fns
         .iter()
@@ -1643,6 +1738,8 @@ fn lower_program_unchecked(
                 &program.enums,
                 &program.tagged_types,
                 &fn_types,
+                &named_return_cleanup,
+                &named_param_modes,
                 lines.as_ref(),
             );
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
@@ -1674,6 +1771,7 @@ fn lower_program_unchecked(
                 ret: extern_.ret,
                 return_borrow: extern_.return_borrow.clone(),
                 return_region: extern_.return_region.clone(),
+                return_cleanup: extern_.return_cleanup,
             })
             .collect(),
         // Cross-unit `pub` callee declares are a per-unit-only concern; the whole-program path has
@@ -1689,6 +1787,7 @@ fn lower_program_unchecked(
                     ret: import.ret,
                     return_borrow: import.return_borrow.clone(),
                     return_region: import.return_region.clone(),
+                    return_cleanup: import.return_cleanup,
                 })
                 .collect()
         } else {
@@ -1706,6 +1805,7 @@ fn lower_program_unchecked(
                 ret: definition.ret,
                 return_borrow: definition.return_borrow.clone(),
                 return_region: definition.return_region.clone(),
+                return_cleanup: definition.return_cleanup,
             })
             .collect(),
         tuples: program.tuples.clone(),
@@ -1754,6 +1854,10 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     } => {
                         types.extend(param_tys.iter().copied());
                         types.push(*ret_ty);
+                    }
+                    Rvalue::CallIndirectWithCleanup(call) => {
+                        types.extend(call.param_tys.iter().copied());
+                        types.push(call.ret_ty);
                     }
                     Rvalue::SpawnTask {
                         capture_tys, r, ..
@@ -2147,6 +2251,10 @@ fn remap_function_embedded_types(
                         remap_vec(param_tys);
                         remap_ty(ret_ty, remap);
                     }
+                    Rvalue::CallIndirectWithCleanup(call) => {
+                        remap_vec(&mut call.param_tys);
+                        remap_ty(&mut call.ret_ty, remap);
+                    }
                     Rvalue::SpawnTask { capture_tys, r, .. } => {
                         remap_vec(capture_tys);
                         remap_ty(r, remap);
@@ -2317,7 +2425,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
                 propagate(*then_bb);
                 propagate(*else_bb);
             }
-            (Term::Return(_) | Term::Unreachable, _) => {}
+            (Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable, _) => {}
         }
     }
 
@@ -2351,7 +2459,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
                 pending.push(then_bb);
                 pending.push(else_bb);
             }
-            Term::Return(_) | Term::Unreachable => {}
+            Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
     if reachable.iter().all(|value| *value) {
@@ -2376,7 +2484,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
                 *then_bb = remap[*then_bb as usize];
                 *else_bb = remap[*else_bb as usize];
             }
-            Term::Return(_) | Term::Unreachable => {}
+            Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
     f.entry = remap[f.entry as usize];
@@ -2400,7 +2508,7 @@ fn builder_key(op: &Operand, loads: &std::collections::HashMap<ValueId, Slot>) -
     match op {
         Operand::Value(v) => Some(loads.get(v).map(|s| BuilderKey::Slot(*s)).unwrap_or(BuilderKey::Value(*v))),
         Operand::Arg(i) => Some(BuilderKey::Arg(*i)),
-        Operand::Const(_) => None,
+        Operand::Const(_) | Operand::BorrowedPlace(_) | Operand::BorrowedCleanupArg(_) => None,
     }
 }
 
@@ -2618,6 +2726,12 @@ struct BuilderCtx {
     /// Sema function-type facts used to make function-value and indirect-call signatures explicit
     /// in MIR. Kept behind the existing box to preserve recursive lowering stack headroom.
     fn_types: Rc<[hir::FnTy]>,
+    /// Producer-owned physical return facts for every named callable visible to this unit.
+    named_return_cleanup: Rc<std::collections::HashMap<String, hir::ReturnCleanupAbi>>,
+    /// Checked physical parameter modes for direct named calls.
+    named_param_modes: Rc<std::collections::HashMap<String, Vec<align_ast::ParamMode>>>,
+    /// Physical return ABI of the function currently being lowered.
+    return_cleanup: hir::ReturnCleanupAbi,
     /// Results produced by the active eager-expression worklist, keyed by stable HIR address.
     /// Recursive child requests consume these operands without re-entering `lower_expr`.
     eager_expr_results: std::collections::HashMap<usize, Operand>,
@@ -2860,7 +2974,7 @@ impl Builder {
                     mark(*then_bb);
                     mark(*else_bb);
                 }
-                Term::Return(_) | Term::Unreachable => {}
+                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
             }
         }
         self.blocks[current].term = Some(t);
@@ -2879,6 +2993,9 @@ impl Builder {
     }
 }
 
+// The source type tables and shared signature maps are distinct lowering invariants; keeping them
+// explicit here makes the one Builder construction auditable and avoids a bag-of-context fields.
+#[allow(clippy::too_many_arguments)]
 fn lower_fn(
     f: &hir::Fn,
     tuples: &[hir::TupleDef],
@@ -2886,6 +3003,8 @@ fn lower_fn(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
     fn_types: &Rc<[hir::FnTy]>,
+    named_return_cleanup: &Rc<std::collections::HashMap<String, hir::ReturnCleanupAbi>>,
+    named_param_modes: &Rc<std::collections::HashMap<String, Vec<align_ast::ParamMode>>>,
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
     let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
@@ -2897,6 +3016,20 @@ fn lower_fn(
         slot_align.push(None);
         drop_flags.push(None);
         drop_flags[local as usize] = Some(flag);
+    }
+    let mut borrow_mut_cleanup_slots = vec![None; f.params.len()];
+    for (index, (&local, &mode)) in f.params.iter().zip(&f.param_modes).enumerate() {
+        let ty = f.locals[local as usize].ty;
+        if mode == align_ast::ParamMode::BorrowMut
+            && needs_drop_flag(ty, structs, tuples, enums, tagged_types)
+        {
+            let flag = slots.len() as Slot;
+            slots.push(Ty::Bool);
+            slot_align.push(None);
+            drop_flags.push(None);
+            drop_flags[local as usize] = Some(flag);
+            borrow_mut_cleanup_slots[index] = Some(flag);
+        }
     }
     let mut b = Builder {
         slots,
@@ -2926,6 +3059,9 @@ fn lower_fn(
             slot_borrow_owners: std::collections::HashMap::new(),
             dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
             fn_types: Rc::clone(fn_types),
+            named_return_cleanup: Rc::clone(named_return_cleanup),
+            named_param_modes: Rc::clone(named_param_modes),
+            return_cleanup: f.return_cleanup,
             eager_expr_results: std::collections::HashMap::new(),
             eager_expr_active: false,
         }),
@@ -2938,6 +3074,9 @@ fn lower_fn(
     let params: Vec<Slot> = f.params.clone();
     for (i, &slot) in params.iter().enumerate() {
         b.push(Stmt::Store(slot, Operand::Arg(i as u32)));
+        if let Some(flag) = borrow_mut_cleanup_slots[i] {
+            b.push(Stmt::Store(flag, Operand::BorrowedCleanupArg(i as u32)));
+        }
         if b.drop_locals.contains(&slot) {
             b.set_drop_flag(slot, b.drop_individual_locals.contains(&slot));
         }
@@ -2956,15 +3095,29 @@ fn lower_fn(
         // Fall-through end of the body: if the trailing value moves an owned local out (the
         // function returns it), clear that local's slot and flag — the caller now owns the value —
         // then conditionally drop the remaining owned locals.
-        if f.ret != Ty::Unit
-            && let Some(v) = &f.body.value {
-                null_moved_source(&mut b, v);
-            }
+        let cleanup = if f.return_cleanup == hir::ReturnCleanupAbi::DynamicBit {
+            f.body
+                .value
+                .as_ref()
+                .zip(tail.as_ref())
+                .and_then(|(value, operand)| lowered_drop_flag(&mut b, value, operand))
+        } else {
+            None
+        };
+        if f.ret != Ty::Unit && let Some(v) = &f.body.value {
+            null_moved_source(&mut b, v);
+        }
         let tail = tail.filter(|_| f.ret != Ty::Unit);
         b.emit_exit_cleanup();
-        match tail {
-            Some(op) => b.terminate(Term::Return(Some(op))),
-            None => b.terminate(Term::Return(None)),
+        match (tail, f.return_cleanup, cleanup) {
+            (Some(op), hir::ReturnCleanupAbi::DynamicBit, Some(cleanup)) => {
+                b.terminate(Term::ReturnWithCleanup(Box::new((op, cleanup))))
+            }
+            (Some(_), hir::ReturnCleanupAbi::DynamicBit, None) => {
+                b.terminate(Term::Unreachable)
+            }
+            (Some(op), hir::ReturnCleanupAbi::None, _) => b.terminate(Term::Return(Some(op))),
+            (None, _, _) => b.terminate(Term::Return(None)),
         }
     }
 
@@ -3007,9 +3160,11 @@ fn lower_fn(
         name: ProgramCall::from_validated(&f.name),
         params,
         param_modes: f.param_modes.clone(),
+        borrow_mut_cleanup_slots,
         ret: f.ret,
         return_borrow: f.return_borrow.clone(),
         return_region: f.return_region.clone(),
+        return_cleanup: f.return_cleanup,
         slots: b.slots,
         slot_align: b.slot_align,
         value_tys: b.value_tys,
@@ -3784,13 +3939,30 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if !lowering_continues(b) {
                 return;
             }
+            let cleanup = if b.ctx.return_cleanup == hir::ReturnCleanupAbi::DynamicBit {
+                value
+                    .as_ref()
+                    .zip(op.as_ref())
+                    .and_then(|(value, operand)| lowered_drop_flag(b, value, operand))
+            } else {
+                None
+            };
             // A returned owned array is moved out: null its slot so the exit cleanup below frees
             // null (the caller now owns the buffer), then free open arenas / drop owned locals.
             if let Some(e) = value {
                 null_moved_source(b, e);
             }
             b.emit_exit_cleanup();
-            b.terminate(Term::Return(op));
+            match (op, b.ctx.return_cleanup, cleanup) {
+                (Some(value), hir::ReturnCleanupAbi::DynamicBit, Some(cleanup)) => {
+                    b.terminate(Term::ReturnWithCleanup(Box::new((value, cleanup))))
+                }
+                (Some(_), hir::ReturnCleanupAbi::DynamicBit, None) => {
+                    b.terminate(Term::Unreachable)
+                }
+                (value, hir::ReturnCleanupAbi::None, _) => b.terminate(Term::Return(value)),
+                (None, hir::ReturnCleanupAbi::DynamicBit, _) => b.terminate(Term::Unreachable),
+            }
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
         }
@@ -6817,6 +6989,31 @@ fn null_consumed_struct_sources(b: &mut Builder, value: &hir::Expr) {
     }
 }
 
+fn lower_borrowed_place(
+    b: &Builder,
+    e: &hir::Expr,
+    mode: align_ast::ParamMode,
+) -> Operand {
+    let (slot, path) = match &e.kind {
+        hir::ExprKind::Local(local) => (*local, Vec::new()),
+        hir::ExprKind::Field { root, path } => (*root, path.clone()),
+        _ => unreachable!("sema admitted a non-place borrowed argument"),
+    };
+    let needs_cleanup = mode == align_ast::ParamMode::BorrowMut
+        && path.is_empty()
+        && needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
+    let cleanup = needs_cleanup.then(|| {
+        b.drop_flags[slot as usize]
+            .expect("whole-Move BorrowMut place has a caller-visible cleanup slot")
+    });
+    Operand::BorrowedPlace(Box::new(BorrowedPlace {
+        slot,
+        path,
+        ty: e.ty,
+        cleanup,
+    }))
+}
+
 /// Lower an indirect call out-of-line so temporary-owner propagation does not enlarge the deeply
 /// recursive `lower_expr` stack frame (the `expr_depth` contract).
 #[inline(never)]
@@ -6828,14 +7025,33 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
+    let Some(signature) = fn_signature_facts(b, callee.ty) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
     // The function type for the indirect call comes from the (sema-checked) arg types and the
     // call's result type — no signature table is threaded into MIR.
     let mut param_tys = Vec::with_capacity(args.len());
     let mut ops = Vec::with_capacity(args.len());
     let mut arg_owners = Vec::with_capacity(args.len());
-    for arg in args {
+    for (index, arg) in args.iter().enumerate() {
         param_tys.push(arg.ty);
-        let (op, owner) = lower_consumed_call_arg(b, arg);
+        let borrowed = matches!(
+            signature.param_modes.get(index),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        );
+        let (op, owner) = if borrowed {
+            (
+                lower_borrowed_place(
+                    b,
+                    arg,
+                    signature.param_modes[index],
+                ),
+                Vec::new(),
+            )
+        } else {
+            lower_consumed_call_arg(b, arg)
+        };
         ops.push(op);
         arg_owners.push(owner);
         // A nested `return`, `?`, or diverging expression already terminated the block. Do not
@@ -6844,17 +7060,18 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
             return Operand::Const(Const::Unit);
         }
     }
-    let Some(signature) = fn_signature_facts(b, callee.ty) else {
-        b.terminate(Term::Unreachable);
-        return Operand::Const(Const::Unit);
-    };
     // A by-value owned argument is MOVED into the callee, exactly as in a direct call
     // (`lower_direct_call`) — null the source so the caller's exit `Drop` doesn't free the buffer the
     // callee now owns. Without this a bound owned local passed indirectly is double-freed (an inline
     // temporary was safe only because it has no source local to null). No-op for a Copy / borrowed
     // argument. An indirect call has no borrow-only intrinsics, so every argument transfers.
-    for arg in args {
-        null_consumed_struct_sources(b, arg);
+    for (index, arg) in args.iter().enumerate() {
+        if !matches!(
+            signature.param_modes.get(index),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        ) {
+            null_consumed_struct_sources(b, arg);
+        }
     }
     // Every argument succeeded, so the outer call takes ownership. The hidden owners only protect
     // temporaries while later arguments are being evaluated.
@@ -6893,16 +7110,33 @@ fn emit_indirect_call(
     signature: FnSignatureFacts,
 ) -> Operand {
     let v = b.fresh_value(ret_ty);
-    b.push(Stmt::Let(
-        v,
-        Rvalue::CallIndirect {
-            callee,
-            args,
-            param_tys,
-            ret_ty,
-            signature,
-        },
-    ));
+    if signature.return_cleanup == hir::ReturnCleanupAbi::DynamicBit {
+        let cleanup = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            v,
+            Rvalue::CallIndirectWithCleanup(Box::new(IndirectCallWithCleanup {
+                callee,
+                args,
+                param_tys,
+                ret_ty,
+                signature,
+                cleanup,
+            })),
+        ));
+        b.attach_value_drop_flag(v, Operand::Value(cleanup));
+        b.attach_value_temp_drop_flag(v, Operand::Value(cleanup));
+    } else {
+        b.push(Stmt::Let(
+            v,
+            Rvalue::CallIndirect {
+                callee,
+                args,
+                param_tys,
+                ret_ty,
+                signature: Box::new(signature),
+            },
+        ));
+    }
     // Align Unit is a value, but its function ABI is LLVM `void`. Keep the call statement for its
     // effects while giving every enclosing value context the canonical MIR Unit operand.
     if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
@@ -6922,7 +7156,7 @@ fn finish_fn_value(b: &mut Builder, name: &str, ty: Ty) -> Operand {
         value,
         Rvalue::FnAddr {
             target: ProgramCall::from_validated(name),
-            signature,
+            signature: Box::new(signature),
         },
     ));
     Operand::Value(value)
@@ -6947,7 +7181,7 @@ fn finish_closure(
             lifted: ProgramCall::from_validated(lifted),
             captures,
             capture_tys,
-            signature,
+            signature: Box::new(signature),
         },
     ));
     Operand::Value(value)
@@ -6962,6 +7196,7 @@ fn fn_signature_facts(b: &Builder, ty: Ty) -> Option<FnSignatureFacts> {
         param_modes: signature.params.iter().map(|(mode, _)| *mode).collect(),
         return_borrow: signature.return_borrow.clone(),
         return_region: signature.return_region.clone(),
+        return_cleanup: signature.return_cleanup,
     })
 }
 
@@ -6971,7 +7206,28 @@ fn fn_signature_facts(b: &Builder, ty: Ty) -> Option<FnSignatureFacts> {
 /// Pipeline callables use this helper as well as ordinary call expressions so the rule cannot drift.
 fn emit_named_call(b: &mut Builder, func: ProgramCall, args: Vec<Operand>, ret_ty: Ty) -> Operand {
     let v = b.fresh_value(ret_ty);
-    b.push(Stmt::Let(v, Rvalue::Call(DirectCall::Program(func), args)));
+    match b.ctx.named_return_cleanup.get(func.as_str()).copied() {
+        Some(hir::ReturnCleanupAbi::DynamicBit) => {
+            let cleanup = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                v,
+                Rvalue::CallWithCleanup(Box::new(DirectCallWithCleanup {
+                    target: func,
+                    args,
+                    cleanup,
+                })),
+            ));
+            b.attach_value_drop_flag(v, Operand::Value(cleanup));
+            b.attach_value_temp_drop_flag(v, Operand::Value(cleanup));
+        }
+        Some(hir::ReturnCleanupAbi::None) => {
+            b.push(Stmt::Let(v, Rvalue::Call(DirectCall::Program(func), args)));
+        }
+        None => {
+            b.terminate(Term::Unreachable);
+            return Operand::Const(Const::Unit);
+        }
+    }
     if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
 }
 
@@ -7120,10 +7376,24 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         unreachable!("lower_direct_call on a non-call expression");
     };
     let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
+    let param_modes = b.ctx.named_param_modes.get(func).cloned();
     let mut ops = Vec::with_capacity(args.len());
     let mut arg_owners = Vec::with_capacity(args.len());
-    for arg in args {
-        let (op, owners) = if borrows_args {
+    for (index, arg) in args.iter().enumerate() {
+        let borrowed_place = matches!(
+            param_modes.as_ref().and_then(|modes| modes.get(index)),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        );
+        let (op, owners) = if borrowed_place {
+            (
+                lower_borrowed_place(
+                    b,
+                    arg,
+                    param_modes.as_ref().expect("program call modes")[index],
+                ),
+                Vec::new(),
+            )
+        } else if borrows_args {
             (lower_borrowed_owned(b, arg), Vec::new())
         } else {
             lower_consumed_call_arg(b, arg)
@@ -7144,22 +7414,29 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
     // source, matching their sema contract.
     if !borrows_args {
-        for arg in args {
-            null_consumed_struct_sources(b, arg);
+        for (index, arg) in args.iter().enumerate() {
+            if !matches!(
+                param_modes.as_ref().and_then(|modes| modes.get(index)),
+                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+            ) {
+                null_consumed_struct_sources(b, arg);
+            }
         }
         for owner in arg_owners.into_iter().flatten() {
             b.set_drop_flag(owner, false);
         }
     }
-    let v = b.fresh_value(e.ty);
-    b.push(Stmt::Let(
-        v,
-        Rvalue::Call(direct_call_target(func, args), ops.clone()),
-    ));
-    let result = if e.ty == Ty::Unit {
-        Operand::Const(Const::Unit)
-    } else {
-        Operand::Value(v)
+    let result = match direct_call_target(func, args) {
+        DirectCall::Program(target) => emit_named_call(b, target, ops.clone(), e.ty),
+        target @ DirectCall::Runtime(_) => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Call(target, ops.clone())));
+            if e.ty == Ty::Unit {
+                Operand::Const(Const::Unit)
+            } else {
+                Operand::Value(v)
+            }
+        }
     };
     if let Operand::Value(v) = &result {
         inherit_borrow_owners(b, *v, &ops);
@@ -13404,7 +13681,15 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     null_moved_source(b, inner);
     // `?` exits the function: free open arenas and drop owned locals first.
     b.emit_exit_cleanup();
-    b.terminate(Term::Return(Some(Operand::Value(propagated))));
+    match (b.ctx.return_cleanup, inner_flag.clone()) {
+        (hir::ReturnCleanupAbi::DynamicBit, Some(cleanup)) => b.terminate(
+            Term::ReturnWithCleanup(Box::new((Operand::Value(propagated), cleanup))),
+        ),
+        (hir::ReturnCleanupAbi::DynamicBit, None) => b.terminate(Term::Unreachable),
+        (hir::ReturnCleanupAbi::None, _) => {
+            b.terminate(Term::Return(Some(Operand::Value(propagated))))
+        }
+    }
 
     // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
     // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
@@ -13988,15 +14273,11 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
         e2_ty,
         mapper_signature,
     );
+    let mapped_flag = b
+        .value_drop_flag(&conv)
+        .unwrap_or(Operand::Const(Const::Bool(false)));
     let errr = b.fresh_value(out_ty);
     b.push(Stmt::Let(errr, Rvalue::ResultErr(conv)));
-    let mapped_flag = Operand::Const(Const::Bool(needs_drop_flag(
-        e2_ty,
-        &b.structs,
-        &b.tuples,
-        &b.enums,
-        &b.tagged_types,
-    )));
     if let Some(flag_slot) = result_flag {
         b.push(Stmt::Store(flag_slot, mapped_flag.clone()));
     }
@@ -14308,6 +14589,9 @@ mod tests {
                 slot_borrow_owners: Default::default(),
                 dbg: None,
                 fn_types: Rc::from(Vec::<hir::FnTy>::new()),
+                named_return_cleanup: Rc::new(std::collections::HashMap::new()),
+                named_param_modes: Rc::new(std::collections::HashMap::new()),
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 eager_expr_results: std::collections::HashMap::new(),
                 eager_expr_active: false,
             }),
@@ -15090,7 +15374,10 @@ fn main() -> i32 = 0
                 function
                     .blocks
                     .iter()
-                    .any(|block| matches!(block.term, Term::Return(Some(_)))),
+                    .any(|block| matches!(
+                        block.term,
+                        Term::Return(Some(_)) | Term::ReturnWithCleanup(_)
+                    )),
                 "{name} must retain a real continuation to its function return: {function:#?}"
             );
         }
@@ -15129,8 +15416,10 @@ fn main() -> i32 = 0
                 name: ProgramCall::from_validated("main"),
                 params: vec![],
                 param_modes: vec![],
+                borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
@@ -15145,11 +15434,12 @@ fn main() -> i32 = 0
                             lifted: ProgramCall::from_validated("unused"),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(1)],
-                            signature: FnSignatureFacts {
+                            signature: Box::new(FnSignatureFacts {
                                 param_modes: vec![],
                                 return_borrow: hir::ReturnBorrowSummary::None,
                                 return_region: hir::ReturnRegionSummary::None,
-                            },
+                                return_cleanup: hir::ReturnCleanupAbi::None,
+                            }),
                         },
                     )],
                     stmt_lines: vec![(0, 0)],
@@ -15237,7 +15527,12 @@ fn main() -> i32 = 0
                 function
                     .blocks
                     .iter()
-                    .any(|block| matches!(block.term, Term::Return(Some(_)))),
+                    .any(|block| {
+                        matches!(
+                            block.term,
+                            Term::Return(Some(_)) | Term::ReturnWithCleanup(_)
+                        )
+                    }),
                 "{name} must return a typed operand:\n{}",
                 print::function_to_string(function)
             );

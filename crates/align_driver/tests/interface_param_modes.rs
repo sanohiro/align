@@ -1,5 +1,5 @@
-//! L2a gate: parameter modes and explicit empty return-provenance summaries survive whole-program
-//! and per-unit checking, HIR-to-MIR lowering, interface rendering, and imported declarations.
+//! L2 signature gate: parameter modes and return-provenance summaries survive whole-program and
+//! per-unit checking, HIR-to-MIR lowering, interface rendering, and imported declarations.
 
 mod common;
 use common::*;
@@ -36,7 +36,7 @@ fn files() -> &'static [(&'static str, &'static str)] {
 #[test]
 fn whole_and_per_unit_interfaces_preserve_modes_and_explicit_none_summaries() {
     let checked = assert_same_verdict("l2a-interface-modes", files(), "main.align");
-    assert!(!checked.diags.has_errors(), "L2a source must check");
+    assert!(!checked.diags.has_errors(), "L2 source must check");
 
     let buffer = checked
         .summaries
@@ -184,17 +184,17 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         "unexpected diagnostic: {error}"
     );
 
-    let mut disabled_mode = buffer.mir.clone();
-    let put = disabled_mode
+    let mut wrong_borrow_type = buffer.mir.clone();
+    let put = wrong_borrow_type
         .fns
         .iter_mut()
         .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.param_modes[0] = ParamMode::Borrow;
-    let error = emit_llvm_ir(&disabled_mode, BuildTarget::Baseline, false, &[], false)
-        .expect_err("disabled mode must fail");
+    let error = emit_llvm_ir(&wrong_borrow_type, BuildTarget::Baseline, false, &[], false)
+        .expect_err("shared borrow of a Copy slice must fail");
     assert!(
-        error.contains("before its ABI is enabled"),
+        error.contains("uses Borrow with a non-Move parameter type"),
         "unexpected diagnostic: {error}"
     );
 
@@ -215,20 +215,24 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         "unexpected diagnostic: {error}"
     );
 
-    let mut premature_capture = buffer.mir.clone();
-    let put = premature_capture
+    let mut invalid_capture = buffer.mir.clone();
+    let put = invalid_capture
         .fns
         .iter_mut()
         .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
+    put.return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![],
+        captures: vec![0],
+    };
     put.return_region = ReturnRegionSummary::Roots {
         params: vec![],
         captures: vec![0],
     };
-    let error = emit_llvm_ir(&premature_capture, BuildTarget::Baseline, false, &[], false)
-        .expect_err("capture roots must remain disabled until L2b-b");
+    let error = emit_llvm_ir(&invalid_capture, BuildTarget::Baseline, false, &[], false)
+        .expect_err("a non-borrowing return cannot carry capture roots");
     assert!(
-        error.contains("capture roots before L2b-b"),
+        error.contains("cannot borrow"),
         "unexpected diagnostic: {error}"
     );
 
@@ -323,7 +327,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let error = emit_llvm_ir(&extern_mir, BuildTarget::Baseline, false, &[], false)
         .expect_err("unanalyzed extern roots must retain the conservative fallback");
     assert!(
-        error.contains("function-value provenance lands in L2b-b"),
+        error.contains("cannot carry return provenance across an unanalyzed extern boundary"),
         "unexpected diagnostic: {error}"
     );
 }
@@ -396,8 +400,8 @@ fn main() -> i32 = apply(increment, 41) as i32
         "unexpected diagnostic: {error}"
     );
 
-    let mut premature_roots = mir;
-    'functions: for function in &mut premature_roots.fns {
+    let mut invalid_roots = mir;
+    'functions: for function in &mut invalid_roots.fns {
         for block in &mut function.blocks {
             for statement in &mut block.stmts {
                 if let Stmt::Let(_, Rvalue::FnAddr { signature, .. }) = statement {
@@ -414,10 +418,10 @@ fn main() -> i32 = apply(increment, 41) as i32
             }
         }
     }
-    let error = emit_llvm_ir(&premature_roots, BuildTarget::Baseline, false, &[], false)
-        .expect_err("function-value roots must remain deferred until L2b-b");
+    let error = emit_llvm_ir(&invalid_roots, BuildTarget::Baseline, false, &[], false)
+        .expect_err("a non-borrowing function-value return cannot carry roots");
     assert!(
-        error.contains("function-value provenance lands in L2b-b"),
+        error.contains("cannot borrow"),
         "unexpected diagnostic: {error}"
     );
 }

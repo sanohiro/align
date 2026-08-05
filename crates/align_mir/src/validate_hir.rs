@@ -6,6 +6,15 @@ use align_span::Span;
 use super::canonical_graph::Node;
 use super::source_shape::source_shape_equal;
 
+fn source_shapes_match(
+    program: &hir::Program,
+    left: Node,
+    right: Node,
+    known_shapes: &mut HashSet<(Node, Node)>,
+) -> bool {
+    source_shape_equal(program, left, right, known_shapes)
+}
+
 /// Validate the program-global HIR type domain before MIR construction.
 pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
     Validator::new(program).validate()
@@ -197,6 +206,7 @@ impl<'a> DeclarationValidator<'a> {
                     .all(|&ty| self.placement.ffi_parameter_ok(ty))
                 || !self.placement.ffi_return_ok(function.ret)
                 || !summary_is_none(&function.return_borrow, &function.return_region)
+                || !self.return_cleanup_valid(function.ret, function.return_cleanup)
             {
                 return false;
             }
@@ -217,6 +227,7 @@ impl<'a> DeclarationValidator<'a> {
                     &function.return_borrow,
                     &function.return_region,
                 )
+                || !self.return_cleanup_valid(function.ret, function.return_cleanup)
             {
                 return false;
             }
@@ -238,7 +249,7 @@ impl<'a> DeclarationValidator<'a> {
             };
             let allow_param = self.placement.is_abstract(Node::Fn(id));
             if function.params.iter().any(|(mode, scalar)| {
-                !mode_is_valid(*mode, align_sema::scalar_to_ty(*scalar), true)
+                !mode_is_valid(self.program, *mode, align_sema::scalar_to_ty(*scalar), true)
                     || !self.placement.scalar_ok(
                         *scalar,
                         ScalarPlacement::FnParameter { allow_param },
@@ -253,7 +264,13 @@ impl<'a> DeclarationValidator<'a> {
                         .iter()
                         .map(|(_, scalar)| align_sema::scalar_to_ty(*scalar))
                         .collect::<Vec<_>>(),
+                    &function
+                        .params
+                        .iter()
+                        .map(|(mode, _)| *mode)
+                        .collect::<Vec<_>>(),
                 )
+                || !self.return_cleanup_valid(function.ret, function.return_cleanup)
             {
                 return false;
             }
@@ -282,17 +299,22 @@ impl<'a> DeclarationValidator<'a> {
 
     fn origin_valid(&self, function: &hir::Fn) -> bool {
         match function.origin {
-            hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => true,
+            hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => match &function.return_borrow {
+                hir::ReturnBorrowSummary::None => true,
+                hir::ReturnBorrowSummary::Roots { captures, .. } => captures.is_empty(),
+            },
             hir::FnOrigin::Lifted { capture_count } => {
                 usize::try_from(capture_count).is_ok_and(|count| count <= function.params.len())
                     && function
                         .param_modes
                         .iter()
                         .all(|mode| *mode == align_ast::ParamMode::ByValue)
-                    && summary_is_none(
-                        &function.return_borrow,
-                        &function.return_region,
-                    )
+                    && match &function.return_borrow {
+                        hir::ReturnBorrowSummary::None => true,
+                        hir::ReturnBorrowSummary::Roots { captures, .. } => captures
+                            .iter()
+                            .all(|capture| *capture < capture_count),
+                    }
             }
         }
     }
@@ -305,6 +327,7 @@ impl<'a> DeclarationValidator<'a> {
         for (&local_id, &mode) in function.params.iter().zip(&function.param_modes) {
             if !seen.insert(local_id)
                 || !mode_is_valid(
+                    self.program,
                     mode,
                     function
                         .locals
@@ -319,7 +342,9 @@ impl<'a> DeclarationValidator<'a> {
             let Some(local) = function.locals.get(local_id as usize) else {
                 return false;
             };
-            if local.id != local_id {
+            if local.id != local_id
+                || (mode == align_ast::ParamMode::BorrowMut && !local.is_mut)
+            {
                 return false;
             }
         }
@@ -384,7 +409,24 @@ impl<'a> DeclarationValidator<'a> {
                 &function.return_borrow,
                 &function.return_region,
                 &parameter_types,
+                &function.param_modes,
             )
+            && self.return_cleanup_valid(function.ret, function.return_cleanup)
+    }
+
+    fn return_cleanup_valid(&self, ret: Ty, cleanup: hir::ReturnCleanupAbi) -> bool {
+        let expected = if align_sema::needs_drop_flag(
+            ret,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        ) {
+            hir::ReturnCleanupAbi::DynamicBit
+        } else {
+            hir::ReturnCleanupAbi::None
+        };
+        cleanup == expected
     }
 
     fn drop_sets_valid(&self, function: &hir::Fn) -> bool {
@@ -458,11 +500,11 @@ impl<'a> DeclarationValidator<'a> {
                 .iter()
                 .zip(params)
                 .all(|(&mode, &ty)| {
-                    mode_is_valid(mode, ty, true)
+                    mode_is_valid(self.program, mode, ty, true)
                         && self.placement.source_function_type_ok(ty, true, false)
                 })
             && self.placement.source_function_type_ok(ret, false, true)
-            && summary_valid(self.program, borrow, region, params)
+            && summary_valid(self.program, borrow, region, params, modes)
     }
 }
 
@@ -478,11 +520,25 @@ fn valid_span(span: Span) -> bool {
     span.lo <= span.hi
 }
 
-fn mode_is_valid(mode: align_ast::ParamMode, ty: Ty, allow_out: bool) -> bool {
+fn mode_is_valid(
+    program: &hir::Program,
+    mode: align_ast::ParamMode,
+    ty: Ty,
+    allow_out: bool,
+) -> bool {
     match mode {
         align_ast::ParamMode::ByValue => true,
         align_ast::ParamMode::Out => allow_out && matches!(ty, Ty::Slice(_)),
-        align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => false,
+        align_ast::ParamMode::Borrow => {
+            align_sema::needs_drop_flag(
+                ty,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            )
+        }
+        align_ast::ParamMode::BorrowMut => true,
     }
 }
 
@@ -499,6 +555,7 @@ fn summary_valid(
     borrow: &hir::ReturnBorrowSummary,
     region: &hir::ReturnRegionSummary,
     params: &[Ty],
+    modes: &[align_ast::ParamMode],
 ) -> bool {
     match (borrow, region) {
         (hir::ReturnBorrowSummary::None, hir::ReturnRegionSummary::None) => true,
@@ -512,16 +569,16 @@ fn summary_valid(
                 captures: region_captures,
             },
         ) => {
-            !borrow_params.is_empty()
+            (!borrow_params.is_empty() || !borrow_captures.is_empty())
                 && borrow_params == region_params
-                && borrow_captures.is_empty()
-                && region_captures.is_empty()
+                && borrow_captures == region_captures
                 && borrow_params.windows(2).all(|pair| pair[0] < pair[1])
+                && borrow_captures.windows(2).all(|pair| pair[0] < pair[1])
                 && borrow_params.iter().all(|&id| {
-                    params
-                        .get(id as usize)
-                        .is_some_and(|&ty| {
-                            align_sema::ty_may_borrow(
+                    params.get(id as usize).is_some_and(|&ty| {
+                        modes.get(id as usize).is_some_and(|mode| {
+                            matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                                || align_sema::ty_may_borrow(
                                 ty,
                                 &program.structs,
                                 &program.tuples,
@@ -529,6 +586,7 @@ fn summary_valid(
                                 &program.tagged_types,
                             )
                         })
+                    })
                 })
         }
         _ => false,
@@ -656,7 +714,7 @@ impl<'a> NominalLinkValidator<'a> {
             return true;
         };
         existing_kind == kind
-            && source_shape_equal(
+            && source_shapes_match(
                 self.program,
                 nominal_node(kind, existing_id),
                 nominal_node(kind, id),
@@ -2549,6 +2607,7 @@ impl<'a> BodyValidator<'a> {
         let mut work = vec![Pending::Ty(actual, expected)];
         let mut seen_tys = HashSet::new();
         let mut seen_scalars = HashSet::new();
+        let mut known_shapes = HashSet::new();
         while let Some(item) = work.pop() {
             match item {
                 Pending::Ty(actual, expected) => {
@@ -2600,6 +2659,92 @@ impl<'a> BodyValidator<'a> {
                             };
                             work.push(Pending::Ty(actual, expected));
                         }
+                        (Ty::Struct(actual), Ty::Struct(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Struct(actual),
+                                Node::Struct(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (Ty::Enum(actual), Ty::Enum(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Enum(actual),
+                                Node::Enum(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (Ty::Tuple(actual), Ty::Tuple(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Tuple(actual),
+                                Node::Tuple(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (
+                            Ty::StructArray(actual, actual_len),
+                            Ty::StructArray(expected, expected_len),
+                        ) => {
+                            if actual_len != expected_len
+                                || !source_shapes_match(
+                                    self.program,
+                                    Node::Struct(actual),
+                                    Node::Struct(expected),
+                                    &mut known_shapes,
+                                )
+                            {
+                                return false;
+                            }
+                        }
+                        (
+                            Ty::DynStructArray(actual, actual_layout),
+                            Ty::DynStructArray(expected, expected_layout),
+                        ) => {
+                            if actual_layout != expected_layout
+                                || !source_shapes_match(
+                                    self.program,
+                                    Node::Struct(actual),
+                                    Node::Struct(expected),
+                                    &mut known_shapes,
+                                )
+                            {
+                                return false;
+                            }
+                        }
+                        (Ty::Soa(actual), Ty::Soa(expected))
+                        | (Ty::JsonScanner(actual), Ty::JsonScanner(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Struct(actual),
+                                Node::Struct(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (
+                            Ty::DictEncoded(actual, actual_field),
+                            Ty::DictEncoded(expected, expected_field),
+                        ) => {
+                            if actual_field != expected_field
+                                || !source_shapes_match(
+                                    self.program,
+                                    Node::Struct(actual),
+                                    Node::Struct(expected),
+                                    &mut known_shapes,
+                                )
+                            {
+                                return false;
+                            }
+                        }
                         (Ty::Option(actual), Ty::Option(expected))
                         | (Ty::Box(actual), Ty::Box(expected))
                         | (Ty::Slice(actual), Ty::Slice(expected))
@@ -2628,6 +2773,31 @@ impl<'a> BodyValidator<'a> {
                         continue;
                     }
                     match (actual, expected) {
+                        (Scalar::Struct(actual), Scalar::Struct(expected))
+                        | (
+                            Scalar::DynStructArray(actual),
+                            Scalar::DynStructArray(expected),
+                        )
+                        | (Scalar::Soa(actual), Scalar::Soa(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Struct(actual),
+                                Node::Struct(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (Scalar::Enum(actual), Scalar::Enum(expected)) => {
+                            if !source_shapes_match(
+                                self.program,
+                                Node::Enum(actual),
+                                Node::Enum(expected),
+                                &mut known_shapes,
+                            ) {
+                                return false;
+                            }
+                        }
                         (Scalar::Fn(actual_id), Scalar::Fn(expected_id)) => {
                             work.push(Pending::Ty(Ty::Fn(actual_id), Ty::Fn(expected_id)));
                         }
@@ -4873,11 +5043,7 @@ impl<'a> BodyValidator<'a> {
                 let callee_flow = self.expr_flow(callee)?;
                 let Ty::Fn(fid) = callee_flow.ty else { return None };
                 let function = self.program.fn_types.get(fid as usize)?;
-                if function.params.len() != args.len()
-                    || function.params.iter().any(|(mode, _)| {
-                        matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-                    })
-                {
+                if function.params.len() != args.len() {
                     return None;
                 }
                 let arg_flows = self.expr_flows(args)?;
@@ -4888,6 +5054,11 @@ impl<'a> BodyValidator<'a> {
                     }
                     if *mode == align_ast::ParamMode::Out
                         && !self.out_arg_is_writable(context, args, index)
+                    {
+                        return None;
+                    }
+                    if matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                        && !self.borrow_arg_is_valid(context, &args[index], *mode)
                     {
                         return None;
                     }
@@ -5110,8 +5281,13 @@ impl<'a> BodyValidator<'a> {
                     if !self.body_ty_matches(actual.ty, *expected) {
                         return None;
                     }
-                    if matches!(mode, align_ast::ParamMode::Out | align_ast::ParamMode::BorrowMut)
+                    if *mode == align_ast::ParamMode::Out
                         && !self.out_arg_is_writable(context, args, index)
+                    {
+                        return None;
+                    }
+                    if matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                        && !self.borrow_arg_is_valid(context, &args[index], *mode)
                     {
                         return None;
                     }
@@ -8573,14 +8749,56 @@ impl<'a> BodyValidator<'a> {
         args: &[hir::Expr],
         index: usize,
     ) -> bool {
-        let Some(hir::ExprKind::Local(id)) = args.get(index).map(|arg| &arg.kind) else {
+        let Some(mut argument) = args.get(index) else {
             return false;
+        };
+        let id = loop {
+            match &argument.kind {
+                hir::ExprKind::Local(id) => break *id,
+                hir::ExprKind::ArrayToSlice(inner) => argument = inner,
+                hir::ExprKind::SliceRange { recv, .. } => argument = recv,
+                _ => return false,
+            }
         };
         self.program
             .fns
             .get(context.function)
-            .and_then(|function| function.locals.get(*id as usize))
-            .is_some_and(|local| local.id == *id && local.is_mut)
+            .and_then(|function| function.locals.get(id as usize))
+            .is_some_and(|local| local.id == id && local.is_mut)
+    }
+
+    fn borrow_arg_is_valid(
+        &self,
+        context: &BodyContext,
+        argument: &hir::Expr,
+        mode: align_ast::ParamMode,
+    ) -> bool {
+        let (root, field) = match &argument.kind {
+            hir::ExprKind::Local(local) => (*local, false),
+            hir::ExprKind::Field { root, .. } => (*root, true),
+            _ => return false,
+        };
+        let Some(local) = self
+            .program
+            .fns
+            .get(context.function)
+            .and_then(|function| function.locals.get(root as usize))
+            .filter(|local| local.id == root)
+        else {
+            return false;
+        };
+        let move_pointee = align_sema::needs_drop_flag(
+            argument.ty,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        );
+        match mode {
+            align_ast::ParamMode::Borrow => move_pointee,
+            align_ast::ParamMode::BorrowMut => local.is_mut && !(field && move_pointee),
+            _ => false,
+        }
     }
 
     fn raw_scalar_ok(&self, scalar: Scalar) -> bool {

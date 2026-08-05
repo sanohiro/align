@@ -5,6 +5,10 @@ This cumulative harness owns the measurements named by
 
 ```text
 bench/library_boundary/run.sh interface
+bench/library_boundary/run.sh provenance
+bench/library_boundary/run.sh move-return
+bench/library_boundary/run.sh shared-borrow
+bench/library_boundary/run.sh exclusive-borrow
 ```
 
 `interface` builds a deterministic 512-function exported surface with explicit L2a parameter modes
@@ -43,6 +47,18 @@ a 256-function, high-CFG fixture with three expression-valued branches per funct
 
 L2b-b adds the `indirect-return` row to the same group after target-relative function-value
 provenance lands.
+
+`move-return` builds four optimized executables around the same 100,000-call loop and reports
+nanoseconds per call. `copy-return-control` is the value-only control; `move-return-none`,
+`move-return-some`, and `move-return-err` exercise the dynamic cleanup-bit ABI with the clear
+`Option` path, owned `Option` payload, and owned `Result` error payload respectively. Process launch
+cost is amortized across the inner loop; the rows are comparative evidence, not timing assertions.
+
+`shared-borrow` compares the `by-value-call-control` row with repeated zero-allocation
+`shared-borrow-call` inspection of one owned string. `exclusive-borrow` compares a by-value Copy
+update (`exclusive-copy-control`) with an in-place Copy update (`exclusive-copy-call`) and records
+the allocation-and-Drop cost of replacing a Move string through the caller cleanup-bit ABI
+(`exclusive-move-replace`). Each row uses the same 100,000-call inner loop.
 
 The benchmark is a regression tracker, not a timing assertion. Record the command, compiler commit,
 host, and output when comparing changes.

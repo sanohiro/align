@@ -1344,6 +1344,7 @@ mod tests {
                 ret: int_ty(),
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 locals: Vec::new(),
                 body: Block {
                     stmts: Vec::new(),
@@ -1402,6 +1403,7 @@ mod tests {
                 ret: result_ty,
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1470,6 +1472,7 @@ mod tests {
                 ret: Ty::String,
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1540,6 +1543,11 @@ mod tests {
                 ret,
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: if ret == Ty::String {
+                    hir::ReturnCleanupAbi::DynamicBit
+                } else {
+                    hir::ReturnCleanupAbi::None
+                },
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1963,6 +1971,11 @@ mod tests {
                 ret,
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: if ret == Ty::String {
+                    hir::ReturnCleanupAbi::DynamicBit
+                } else {
+                    hir::ReturnCleanupAbi::None
+                },
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2131,15 +2144,23 @@ mod tests {
                     assert!(checked_hir_body_depth_is_valid(&move_program));
                     let mut diagnostics = crate::Diagnostics::new();
                     let named_return_borrow = std::collections::HashMap::new();
+                    let named_param_modes = std::collections::HashMap::new();
+                    let callable_targets =
+                        vec![crate::CallableTargetSet::new(); move_program.fn_types.len()];
+                    let callable_target_ids = std::collections::HashMap::new();
                     crate::MoveCheck {
                         f: &move_program.fns[0],
                         diags: &mut diagnostics,
                         named_return_borrow: &named_return_borrow,
+                        named_param_modes: &named_param_modes,
                         summary_dependencies: None,
                         tuples: &move_program.tuples,
                         structs: &move_program.structs,
                         enums: &move_program.enums,
                         tagged_types: &move_program.tagged_types,
+                        fn_types: &move_program.fn_types,
+                        callable_targets: &callable_targets,
+                        callable_target_ids: &callable_target_ids,
                         loop_breaks: Vec::new(),
                         borrows: crate::BorrowState::default(),
                         next_pipeline_snapshot: 0,
@@ -2173,6 +2194,7 @@ mod tests {
                         f: function,
                         diags: &mut diagnostics,
                         named_return_region: &named_return_region,
+                        fn_types: &program.fn_types,
                         tuples: &program.tuples,
                         structs: &program.structs,
                         enums: &program.enums,
