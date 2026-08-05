@@ -5,9 +5,9 @@
 //! yields a nondeterministic exit code"): before the fix, a `()`-returning Align `main` WAS the C
 //! entry `main` directly, declared `void` in LLVM IR — but the C ABI's `main` must return `i32`,
 //! so `ret void` left the return register (`eax`/`w0`) undefined and the observed exit code varied
-//! run to run (88/216/168/120/104 across five runs of the identical binary). The fix renames a
-//! `Unit`-returning `main` to `align_main` (same as the existing `Result`-returning `main` split)
-//! and generates a C `main` wrapper that always emits `ret i32 0` after the call.
+//! run to run (88/216/168/120/104 across five runs of the identical binary). The fix emits the
+//! `Unit`-returning Align body under its encoded program identity and generates a C `main` wrapper
+//! that always emits `ret i32 0` after the call.
 //!
 //! Both the whole-program and per-unit (`build_per_unit`/M15 S2) codegen paths share this wrapper
 //! logic, so both are pinned here with a same-binary, run-N-times determinism check.

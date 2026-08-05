@@ -152,7 +152,7 @@ unsafe fn slice_to_string(ptr: *const c_char, len: usize) -> String {
     if ptr.is_null() || len == 0 {
         return String::new();
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast(), len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 

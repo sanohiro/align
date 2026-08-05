@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -205,10 +206,11 @@ impl<'a> ValidatedGraph<'a> {
             candidates: Vec::new(),
             next_ordinal: 0,
             end_ordinals: HashMap::new(),
+            inline_edges: Vec::new(),
         };
         let mut references = Vec::new();
         for &root in roots {
-            validator.scan_ty(root, &mut references);
+            validator.scan_ty(root, &mut references, None);
         }
         references.reverse();
         validator.pending.extend(references);
@@ -216,6 +218,7 @@ impl<'a> ValidatedGraph<'a> {
             validator.visit_node(node);
         }
         validator.collect_cross_node_candidates();
+        validator.collect_inline_cycle_candidates();
         if let Some(candidate) = validator
             .candidates
             .iter()
@@ -239,6 +242,7 @@ struct GraphValidator<'a> {
     candidates: Vec<ErrorCandidate>,
     next_ordinal: u64,
     end_ordinals: HashMap<Node, u64>,
+    inline_edges: Vec<InlineEdge>,
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +250,13 @@ struct ErrorCandidate {
     ordinal: u64,
     tie_rank: u8,
     error: CanonicalGraphError,
+}
+
+#[derive(Clone, Copy)]
+struct InlineEdge {
+    from: Node,
+    to: Node,
+    ordinal: u64,
 }
 
 impl<'a> GraphValidator<'a> {
@@ -288,7 +299,7 @@ impl<'a> GraphValidator<'a> {
                     if !names.insert(field.name.as_str()) {
                         self.candidate(name_ordinal, CanonicalGraphError::DuplicateMember);
                     }
-                    self.scan_ty(field.ty, &mut references);
+                    self.scan_ty(field.ty, &mut references, Some(node));
                 }
             }
             SourceShapeNode::Enum {
@@ -321,7 +332,7 @@ impl<'a> GraphValidator<'a> {
                         None => self.candidate(count_ordinal, CanonicalGraphError::InvalidCount),
                     }
                     for &value in &variant.payload {
-                        self.scan_scalar(value, &mut references);
+                        self.scan_scalar(value, &mut references, Some(node));
                     }
                 }
             }
@@ -329,18 +340,18 @@ impl<'a> GraphValidator<'a> {
                 let count_ordinal = self.field_ordinal();
                 self.validate_count(elems.len(), count_ordinal);
                 for &value in elems {
-                    self.scan_scalar(value, &mut references);
+                    self.scan_scalar(value, &mut references, Some(node));
                 }
             }
             SourceShapeNode::Tagged(value) => match value {
                 hir::TaggedType::Option(value) => {
                     self.field_ordinal();
-                    self.scan_scalar(*value, &mut references);
+                    self.scan_scalar(*value, &mut references, Some(node));
                 }
                 hir::TaggedType::Result(ok, err) => {
                     self.field_ordinal();
-                    self.scan_scalar(*ok, &mut references);
-                    self.scan_scalar(*err, &mut references);
+                    self.scan_scalar(*ok, &mut references, Some(node));
+                    self.scan_scalar(*err, &mut references, Some(node));
                 }
             },
             SourceShapeNode::Function {
@@ -356,9 +367,9 @@ impl<'a> GraphValidator<'a> {
                     if !matches!(mode, ParamMode::ByValue | ParamMode::Out) {
                         self.candidate(mode_ordinal, CanonicalGraphError::InvalidGraph);
                     }
-                    self.scan_scalar(value, &mut references);
+                    self.scan_scalar(value, &mut references, None);
                 }
-                self.scan_ty(*ret, &mut references);
+                self.scan_ty(*ret, &mut references, None);
                 self.scan_borrow_summary(return_borrow, params.len());
                 let region_ordinal = self.scan_region_summary(return_region, params.len());
                 if !summaries_agree(return_borrow, return_region) {
@@ -384,39 +395,110 @@ impl<'a> GraphValidator<'a> {
             };
             match node {
                 Node::Struct(id) => {
-                    if let Some(definition) = view.structs.get(id as usize) {
-                        if let Some(error) = Self::compare_nominal(
+                    if let Some(definition) = view.structs.get(id as usize)
+                        && let Some(error) = Self::compare_nominal(
                             view,
                             node,
                             &definition.source_name,
                             &mut nominal_sources,
                             &mut known_shapes,
-                        ) {
-                            self.candidate(end_ordinal, error);
-                        }
+                        )
+                    {
+                        self.candidate(end_ordinal, error);
                     }
                 }
                 Node::Enum(id) => {
-                    if let Some(definition) = view.enums.get(id as usize) {
-                        if let Some(error) = Self::compare_nominal(
+                    if let Some(definition) = view.enums.get(id as usize)
+                        && let Some(error) = Self::compare_nominal(
                             view,
                             node,
                             &definition.source_name,
                             &mut nominal_sources,
                             &mut known_shapes,
-                        ) {
-                            self.candidate(end_ordinal, error);
-                        }
+                        )
+                    {
+                        self.candidate(end_ordinal, error);
                     }
                 }
                 Node::Tuple(id) => {
-                    if let Some(definition) = view.tuples.get(id as usize) {
-                        if tuples.insert(definition.elems.clone(), node).is_some() {
-                            self.candidate(end_ordinal, CanonicalGraphError::DuplicateMember);
-                        }
+                    if let Some(definition) = view.tuples.get(id as usize)
+                        && tuples.insert(definition.elems.clone(), node).is_some()
+                    {
+                        self.candidate(end_ordinal, CanonicalGraphError::DuplicateMember);
                     }
                 }
                 Node::Tagged(_) | Node::Fn(_) => {}
+            }
+        }
+    }
+
+    fn collect_inline_cycle_candidates(&mut self) {
+        let mut forward = HashMap::<Node, Vec<Node>>::new();
+        let mut reverse = HashMap::<Node, Vec<Node>>::new();
+        for edge in &self.inline_edges {
+            if self.view.source_shape_node(edge.to).is_none() {
+                continue;
+            }
+            forward.entry(edge.from).or_default().push(edge.to);
+            reverse.entry(edge.to).or_default().push(edge.from);
+        }
+
+        let mut seen = HashSet::new();
+        let mut finish = Vec::with_capacity(self.order.len());
+        for &start in &self.order {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut work = vec![(start, false)];
+            while let Some((node, exiting)) = work.pop() {
+                if exiting {
+                    finish.push(node);
+                    continue;
+                }
+                work.push((node, true));
+                if let Some(children) = forward.get(&node) {
+                    for &child in children.iter().rev() {
+                        if seen.insert(child) {
+                            work.push((child, false));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut component_by_node = HashMap::new();
+        let mut component_sizes = Vec::new();
+        for start in finish.into_iter().rev() {
+            if component_by_node.contains_key(&start) {
+                continue;
+            }
+            let component = component_sizes.len();
+            let mut size = 0usize;
+            let mut work = vec![start];
+            component_by_node.insert(start, component);
+            while let Some(node) = work.pop() {
+                size += 1;
+                if let Some(parents) = reverse.get(&node) {
+                    for &parent in parents {
+                        if let Entry::Vacant(entry) = component_by_node.entry(parent) {
+                            entry.insert(component);
+                            work.push(parent);
+                        }
+                    }
+                }
+            }
+            component_sizes.push(size);
+        }
+
+        let edges = self.inline_edges.clone();
+        for edge in edges {
+            let Some(&component) = component_by_node.get(&edge.from) else {
+                continue;
+            };
+            if component_by_node.get(&edge.to) == Some(&component)
+                && (edge.from == edge.to || component_sizes[component] > 1)
+            {
+                self.candidate(edge.ordinal, CanonicalGraphError::InvalidGraph);
             }
         }
     }
@@ -440,14 +522,31 @@ impl<'a> GraphValidator<'a> {
         (!same_shape).then_some(CanonicalGraphError::InvalidGraph)
     }
 
-    fn scan_scalar(&mut self, value: Scalar, references: &mut Vec<Node>) {
+    fn scan_scalar(
+        &mut self,
+        value: Scalar,
+        references: &mut Vec<Node>,
+        inline_from: Option<Node>,
+    ) {
         let ordinal = self.field_ordinal();
         match value {
             Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
-                self.scan_reference(Node::Struct(id), ordinal, references)
+                let node = Node::Struct(id);
+                self.scan_reference(node, ordinal, references);
+                if matches!(value, Scalar::Struct(_)) {
+                    self.record_inline_edge(inline_from, node, ordinal);
+                }
             }
-            Scalar::Enum(id) => self.scan_reference(Node::Enum(id), ordinal, references),
-            Scalar::Tagged(id) => self.scan_reference(Node::Tagged(id), ordinal, references),
+            Scalar::Enum(id) => {
+                let node = Node::Enum(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
+            }
+            Scalar::Tagged(id) => {
+                let node = Node::Tagged(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
+            }
             Scalar::Fn(id) => self.scan_reference(Node::Fn(id), ordinal, references),
             Scalar::Int(value) if validate_int(value.signed, value.bits).is_err() => {
                 self.candidate(ordinal, CanonicalGraphError::InvalidWidth)
@@ -463,26 +562,31 @@ impl<'a> GraphValidator<'a> {
         }
     }
 
-    fn scan_ty(&mut self, value: Ty, references: &mut Vec<Node>) {
+    fn scan_ty(
+        &mut self,
+        value: Ty,
+        references: &mut Vec<Node>,
+        inline_from: Option<Node>,
+    ) {
         let ordinal = self.field_ordinal();
         match value {
-            Ty::Option(value)
-            | Ty::Box(value)
+            Ty::Option(value) => self.scan_scalar(value, references, inline_from),
+            Ty::Box(value)
             | Ty::Slice(value)
             | Ty::DynArray(value)
             | Ty::ArrayBuilder(value)
-            | Ty::Task(value) => self.scan_scalar(value, references),
+            | Ty::Task(value) => self.scan_scalar(value, references, None),
             Ty::Result(ok, err) => {
-                self.scan_scalar(ok, references);
-                self.scan_scalar(err, references);
+                self.scan_scalar(ok, references, inline_from);
+                self.scan_scalar(err, references, inline_from);
             }
             Ty::Array(value, _) => {
-                self.scan_scalar(value, references);
+                self.scan_scalar(value, references, inline_from);
                 self.field_ordinal();
             }
             Ty::Vec(value, lanes) | Ty::Mask(value, lanes) => {
                 let scalar_ordinal = self.next_ordinal;
-                self.scan_scalar(value, references);
+                self.scan_scalar(value, references, None);
                 let lanes_ordinal = self.field_ordinal();
                 if !matches!(value, Scalar::Int(_) | Scalar::Float(_)) {
                     self.candidate(scalar_ordinal, CanonicalGraphError::InvalidWidth);
@@ -492,7 +596,9 @@ impl<'a> GraphValidator<'a> {
                 }
             }
             Ty::StructArray(id, _) => {
-                self.scan_reference(Node::Struct(id), ordinal, references);
+                let node = Node::Struct(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
                 self.field_ordinal();
             }
             Ty::DictEncoded(id, field) => {
@@ -511,13 +617,29 @@ impl<'a> GraphValidator<'a> {
                 self.scan_reference(Node::Struct(id), ordinal, references);
                 self.field_ordinal();
             }
-            Ty::Tagged(id) => self.scan_reference(Node::Tagged(id), ordinal, references),
-            Ty::Soa(id) | Ty::JsonScanner(id) | Ty::Struct(id) => {
-                self.scan_reference(Node::Struct(id), ordinal, references)
+            Ty::Tagged(id) => {
+                let node = Node::Tagged(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
             }
-            Ty::Tuple(id) => self.scan_reference(Node::Tuple(id), ordinal, references),
+            Ty::Soa(id) | Ty::JsonScanner(id) | Ty::Struct(id) => {
+                let node = Node::Struct(id);
+                self.scan_reference(node, ordinal, references);
+                if matches!(value, Ty::Struct(_)) {
+                    self.record_inline_edge(inline_from, node, ordinal);
+                }
+            }
+            Ty::Tuple(id) => {
+                let node = Node::Tuple(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
+            }
             Ty::Fn(id) => self.scan_reference(Node::Fn(id), ordinal, references),
-            Ty::Enum(id) => self.scan_reference(Node::Enum(id), ordinal, references),
+            Ty::Enum(id) => {
+                let node = Node::Enum(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
+            }
             Ty::Int(value) if validate_int(value.signed, value.bits).is_err() => {
                 self.candidate(ordinal, CanonicalGraphError::InvalidWidth)
             }
@@ -539,6 +661,12 @@ impl<'a> GraphValidator<'a> {
             references.push(node);
         } else {
             self.candidate(ordinal, CanonicalGraphError::MissingReference);
+        }
+    }
+
+    fn record_inline_edge(&mut self, from: Option<Node>, to: Node, ordinal: u64) {
+        if let Some(from) = from {
+            self.inline_edges.push(InlineEdge { from, to, ordinal });
         }
     }
 
@@ -1479,18 +1607,16 @@ pub(super) fn canonical_fn_abi_record_len(bytes: &[u8]) -> Result<usize, Canonic
         return Err(CanonicalCodecError::UnsupportedVersion);
     }
     let count = cursor.count(7)?;
-    let mut invalid_mode = false;
     for _ in 0..count {
         let mode = decode_param_mode(&mut cursor)?;
-        invalid_mode |= matches!(mode, ParamMode::Borrow | ParamMode::BorrowMut);
+        if matches!(mode, ParamMode::Borrow | ParamMode::BorrowMut) {
+            return Err(CanonicalCodecError::InvalidGraph);
+        }
         decode_nested_canonical_type(&mut cursor)?;
     }
     decode_nested_canonical_type(&mut cursor)?;
     let borrow = decode_borrow_summary(&mut cursor)?;
     let region = decode_region_summary(&mut cursor)?;
-    if invalid_mode {
-        return Err(CanonicalCodecError::InvalidGraph);
-    }
     validate_function_summaries(&borrow, &region, count)?;
     Ok(cursor.offset)
 }
@@ -2255,14 +2381,14 @@ pub fn function_types_are_canonical(program: &Program) -> bool {
         && definitions == function_type_facts(&canonical.fn_types)
 }
 
-fn function_type_facts(
-    definitions: &[FunctionTypeDef],
-) -> Vec<(
+type FunctionTypeFacts = (
     Vec<(ParamMode, Scalar)>,
     Ty,
     hir::ReturnBorrowSummary,
     hir::ReturnRegionSummary,
-)> {
+);
+
+fn function_type_facts(definitions: &[FunctionTypeDef]) -> Vec<FunctionTypeFacts> {
     definitions
         .iter()
         .map(|definition| {
@@ -2624,6 +2750,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_graph_rejects_inline_cycles_but_allows_header_cycles() {
+        let mut direct = baseline_program();
+        direct.structs[0].fields[0].ty = Ty::Struct(0);
+        assert_eq!(
+            validate(Ty::Struct(0), &direct),
+            Err(CanonicalGraphError::InvalidGraph)
+        );
+
+        let mut cycle_before_missing = direct.clone();
+        let mut later = cycle_before_missing.structs[0].fields[0].clone();
+        later.name = "later".into();
+        later.ty = Ty::Struct(u32::MAX);
+        cycle_before_missing.structs[0].fields.push(later);
+        assert_eq!(
+            validate(Ty::Struct(0), &cycle_before_missing),
+            Err(CanonicalGraphError::InvalidGraph)
+        );
+
+        let mut missing_before_cycle = direct.clone();
+        let mut later = missing_before_cycle.structs[0].fields[0].clone();
+        later.name = "later".into();
+        missing_before_cycle.structs[0].fields[0].ty = Ty::Struct(u32::MAX);
+        missing_before_cycle.structs[0].fields.push(later);
+        assert_eq!(
+            validate(Ty::Struct(0), &missing_before_cycle),
+            Err(CanonicalGraphError::MissingReference)
+        );
+
+        let mut mutual = baseline_program();
+        let mut child = mutual.structs[0].clone();
+        child.source_name = "Child".into();
+        child.fields[0].ty = Ty::Struct(0);
+        mutual.structs[0].fields[0].ty = Ty::Struct(1);
+        mutual.structs.push(child);
+        assert_eq!(
+            validate(Ty::Struct(0), &mutual),
+            Err(CanonicalGraphError::InvalidGraph)
+        );
+
+        let mut boxed = baseline_program();
+        boxed.structs[0].fields[0].ty = Ty::Box(Scalar::Struct(0));
+        assert_eq!(
+            validate(Ty::Struct(0), &boxed).unwrap(),
+            [Node::Struct(0)]
+        );
+    }
+
+    #[test]
     fn canonical_graph_validation_error_precedence() {
         let base = baseline_program();
         let make_struct = |source_name: &str, fields: Vec<(&str, Ty)>| {
@@ -2770,7 +2944,7 @@ mod tests {
         let mut second = program.structs[0].fields[0].clone();
         second.name = "other".into();
         program.structs[0].fields.push(second);
-        program.structs[1].fields[0].ty = Ty::Struct(1);
+        program.structs[1].fields[0].ty = Ty::Box(Scalar::Struct(1));
         let order = validate(Ty::Struct(0), &program).unwrap();
         assert_eq!(order, [Node::Struct(0), Node::Struct(1)]);
         let view = CanonicalTypeView {
@@ -3042,6 +3216,25 @@ mod tests {
         ];
         error(&invalid_align, CanonicalCodecError::InvalidGraph);
 
+        let mut inline_cycle = baseline_program();
+        let mut child = inline_cycle.structs[0].clone();
+        child.source_name = "Child".into();
+        child.fields[0].ty = Ty::Bool;
+        inline_cycle.structs[0].fields[0].ty = Ty::Struct(1);
+        inline_cycle.structs.push(child);
+        let valid = CanonicalTy::from_program(
+            Ty::Struct(0),
+            &mir_program(&inline_cycle),
+        )
+        .unwrap();
+        let mut recursive = valid.as_bytes().to_vec();
+        let reference = recursive
+            .windows(5)
+            .position(|window| window == [50, 1, 0, 0, 0])
+            .expect("fixture contains the root-to-child inline reference");
+        recursive[reference + 1..reference + 5].copy_from_slice(&0u32.to_le_bytes());
+        error(&recursive, CanonicalCodecError::InvalidGraph);
+
         let duplicate_function = [
             1, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 52, 0, 0, 0, 0,
         ];
@@ -3065,6 +3258,12 @@ mod tests {
         invalid_mode.extend([0, 0]);
         assert_eq!(
             CanonicalFnAbi::decode(&invalid_mode),
+            Err(CanonicalCodecError::InvalidGraph)
+        );
+        let mut invalid_mode_then_truncated = vec![1, 1, 0, 0, 0, 2];
+        invalid_mode_then_truncated.extend(unit);
+        assert_eq!(
+            CanonicalFnAbi::decode(&invalid_mode_then_truncated),
             Err(CanonicalCodecError::InvalidGraph)
         );
         let mut abi_trailing = vec![1, 0, 0, 0, 0];

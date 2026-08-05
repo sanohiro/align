@@ -538,7 +538,7 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
     hints.ai_socktype = SOCK_STREAM;
 
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(c_host.as_ptr() as *const u8, core::ptr::null(), &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), core::ptr::null(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -779,7 +779,7 @@ pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, po
     hints.ai_socktype = SOCK_STREAM;
 
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(c_host.as_ptr() as *const u8, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), c_service.as_ptr().cast(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -1057,9 +1057,9 @@ unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr() as *const u8);
+    let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr().cast());
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(node, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(node, c_service.as_ptr().cast(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -1290,9 +1290,9 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
 
-    let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr() as *const u8);
+    let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr().cast());
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(node, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(node, c_service.as_ptr().cast(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -1386,7 +1386,7 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     hints.ai_socktype = SOCK_DGRAM;
 
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(c_host.as_ptr() as *const u8, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), c_service.as_ptr().cast(), &hints, &mut res) };
     if rc != 0 {
         return -(eai_to_status(rc) as i64);
     }
@@ -10963,7 +10963,7 @@ unsafe fn marshal_cmd_argv(
         argv_owned.push(c);
     }
     // The argv pointer vector (borrowing `argv_owned`'s bytes) + a null terminator.
-    let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr() as *const u8).collect();
+    let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr().cast()).collect();
     argv_ptrs.push(core::ptr::null());
     Ok((cmd_c, argv_owned, argv_ptrs))
 }
@@ -11021,7 +11021,7 @@ pub unsafe extern "C" fn align_rt_process_spawn(
         // Child: replace the image. `execvp` returns only on failure — then `_exit(127)` (the shell
         // "command not found / not executable" convention). No `malloc`/`print` here.
         unsafe {
-            execvp(cmd_c.as_ptr() as *const u8, argv_ptrs.as_ptr());
+            execvp(cmd_c.as_ptr().cast(), argv_ptrs.as_ptr());
             _exit(127)
         }
     }
@@ -11156,7 +11156,7 @@ pub unsafe extern "C" fn align_rt_process_exec(
     // NULL-terminated. `execvp` returns ONLY on failure (on success the image is replaced and control
     // never returns here), so reading `errno` afterwards is always valid.
     unsafe {
-        execvp(cmd_c.as_ptr() as *const u8, argv_ptrs.as_ptr());
+        execvp(cmd_c.as_ptr().cast(), argv_ptrs.as_ptr());
     }
     io_error_to_status(&std::io::Error::last_os_error())
 }
@@ -11616,10 +11616,10 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
 
     // Marshal the argv pointer vector in the PARENT (the child does no allocation between fork and
     // exec — the async-signal-safety discipline shared with `spawn`). `argv_ptrs` borrows `cmd.argv`.
-    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr() as *const u8).collect();
+    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr().cast()).collect();
     argv_ptrs.push(core::ptr::null());
-    let cmd_ptr = cmd.cmd.as_ptr() as *const u8;
-    let cwd_ptr = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr() as *const u8);
+    let cmd_ptr: *const u8 = cmd.cmd.as_ptr().cast();
+    let cwd_ptr: *const u8 = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr().cast());
     // With a timeout, run the child in its OWN process group so the deadline kill reaps the whole
     // tree it spawns (e.g. `sh -c "sleep 10"`'s `sleep` grandchild), not just the direct child —
     // otherwise a surviving grandchild holds the capture pipes open and wedges the drain-to-EOF.
@@ -11682,7 +11682,7 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
                 clearenv_portable();
             }
             for (n, v) in &cmd.env {
-                setenv(n.as_ptr() as *const u8, v.as_ptr() as *const u8, 1);
+                setenv(n.as_ptr().cast(), v.as_ptr().cast(), 1);
             }
             // Redirect stdout/stderr to the pipe write-ends, then close every pipe fd (the read ends
             // and the now-duplicated write ends). The dup2'd fds 1/2 are NOT CLOEXEC, so they survive

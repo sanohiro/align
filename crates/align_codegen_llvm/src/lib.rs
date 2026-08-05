@@ -1138,8 +1138,8 @@ fn build_module<'c>(
     }
 
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
-    // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
-    // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
+    // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by a
+    // canonical function-value helper so all closure callees share that ABI (the env pointer
     // is null and ignored). Capturing closures (a later slice) instead point at an env-reading fn.
     let mut thunk_names: std::collections::BTreeSet<ProgramCall> =
         std::collections::BTreeSet::new();
@@ -1193,7 +1193,7 @@ fn build_module<'c>(
     }
 
     // Pass 1c: a closure thunk per lifted function used as a *capturing* closure. The env-ABI
-    // thunk `lifted$clos(env, explicit…)` loads the captured values out of `env` and forwards them
+    // helper loads the captured values out of `env` and forwards them
     // as the lifted function's trailing capture parameters: `lifted(explicit…, env.0, env.1, …)`.
     let mut closure_thunks: std::collections::BTreeMap<ProgramCall, Vec<Ty>> =
         std::collections::BTreeMap::new();
@@ -1301,10 +1301,9 @@ fn build_module<'c>(
         generated_funcs.insert(id, thunk);
     }
 
-    // Pass 1d: a `spawn` trampoline per result type `R`. `tramp$R(thunk, env, slot)` runs the
-    // spawned closure (`thunk(env) -> R`) and stores the result into `slot` (the typed store is
-    // why it is generated, not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs
-    // it on a worker thread.
+    // Pass 1d: a canonical `spawn` trampoline per result type `R`. It runs the spawned closure
+    // (`thunk(env) -> R`) and stores the result into `slot` (the typed store is why it is generated,
+    // not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs it on a worker thread.
     // A trampoline per (result type `R`, fallibility): `tramp(thunk, env, slot) -> i32` runs the
     // spawned closure and writes its result into `slot`, returning an error code (`0` = ok). A
     // fallible closure returns `Result<R, Error>`; the trampoline stores the `Ok` payload and
@@ -2897,6 +2896,7 @@ fn validate_parallel_request(
     validate_parallel_callable(declarations, terminal, &terminal_params, elem_out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parallel_generated_ids(
     program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,

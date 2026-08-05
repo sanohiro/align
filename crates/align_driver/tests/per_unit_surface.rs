@@ -47,6 +47,15 @@ fn alignc() -> &'static str {
     env!("CARGO_BIN_EXE_alignc")
 }
 
+fn align_symbol(value: &str) -> String {
+    let hex = value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", value.len())
+}
+
 /// Strip a Mach-O leading underscore so a symbol comparison is object-format-portable.
 fn norm(sym: &str) -> &str {
     sym.strip_prefix('_').unwrap_or(sym)
@@ -270,8 +279,9 @@ fn emit_obj_multi_file_writes_one_object_per_unit() {
 
     // The non-entry `pub` fn is a defined external (`T`) in ITS object (mangled `util.math$cube`).
     if let Some(dep_syms) = nm_symbols(&proj.dir.join("util.math.o")) {
+        let cube = align_symbol("util.math$cube");
         assert!(
-            dep_syms.iter().any(|(k, n)| *k == 'T' && norm(n) == "util.math$cube"),
+            dep_syms.iter().any(|(k, n)| *k == 'T' && norm(n) == cube),
             "util.math$cube must be external in util.math.o: {dep_syms:?}"
         );
         // The entry object exports `main`.
@@ -377,13 +387,13 @@ fn emit_llvm_optimized_leaves_cross_unit_call_opaque() {
 
     let dep_ir = emit_llvm_ir(&dep.mir, BuildTarget::Baseline, true, &[], false).expect("dep opt ir");
     assert!(
-        !dep_ir.contains("call") || !dep_ir.contains("$sq"),
+        !dep_ir.contains("call") || !dep_ir.contains(&align_symbol("util.math$sq")),
         "the intra-unit private `sq` must inline into `cube` (no surviving call):\n{dep_ir}"
     );
 
     let entry_ir = emit_llvm_ir(&entry.mir, BuildTarget::Baseline, true, &[], false).expect("entry opt ir");
     assert!(
-        entry_ir.contains("util.math$cube"),
+        entry_ir.contains(&align_symbol("util.math$cube")),
         "the cross-unit `pub` call must stay an opaque call to the extern:\n{entry_ir}"
     );
 }

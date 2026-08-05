@@ -217,7 +217,11 @@ fn combined_par_map_stage_work_weight(
         .chain(std::iter::once(weights.get(terminal).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)))
         .map(u16::from)
         .fold(0u16, u16::saturating_add);
-    total.min(u16::from(PAR_MAP_MAX_WORK_WEIGHT)) as u8
+    match total {
+        0..=1 => PAR_MAP_DEFAULT_WORK_WEIGHT,
+        2 => 2,
+        _ => PAR_MAP_MAX_WORK_WEIGHT,
+    }
 }
 
 /// Fill the runtime scheduling hint after all functions have been lowered. Keeping this as a
