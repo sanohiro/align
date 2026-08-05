@@ -95,6 +95,65 @@ fn resource_construct_borrow_drop_whole_and_per_unit() {
 }
 
 #[test]
+fn resource_tuple_annotations_preserve_move_and_reference_provenance() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub fn present(reference: resource_ref<conn>) -> bool {
+  unsafe { return !resource.raw(reference).is_null() }
+}
+pub fn move_through(pair: (conn, i64)) -> conn {
+  (owner, _) := pair
+  return owner
+}
+pub fn inspect_through(pair: (resource_ref<conn>, i64)) -> bool {
+  (reference, _) := pair
+  return present(reference)
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        (
+            "main.align",
+            "module main\nimport pkg.db\nfn main() -> i32 { reference_owner := pkg.db.open(); reference := resource.borrow(reference_owner); if !pkg.db.inspect_through((reference, 7)) { return 1 }; move_owner := pkg.db.open(); moved := pkg.db.move_through((move_owner, 9)); if pkg.db.present(resource.borrow(moved)) { return 42 }; return 2 }\n",
+        ),
+    ];
+    let differential = diff_check_multi("resource-tuple-annotations", &project, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(
+        !differential.whole_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    let per_unit = build_per_unit_multi("resource-tuple-annotations-units", &project, "main.align");
+    let producer_mir = align_mir::print::program_to_string(&per_unit.unit("pkg.db").mir);
+    assert!(
+        producer_mir.contains("fn pkg.db$move_through")
+            && producer_mir.contains("fn pkg.db$inspect_through"),
+        "resource tuples must survive the checked-HIR boundary:\n{producer_mir}"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("resource-tuple-annotations", &project, "main.align")
+                .status
+                .code(),
+            Some(42),
+        );
+        assert_eq!(
+            per_unit.link_and_run().status.code(),
+            Some(42),
+        );
+    }
+}
+
+#[test]
 fn representation_operations_require_descendant_privilege_even_in_unsafe() {
     let project = files(
         "module main\nimport pkg.db\nfn main() -> i32 { unsafe { handle := raw.alloc(8); owner: pkg.db.conn := resource.from_raw(handle); print(resource.raw(resource.borrow(owner)).is_null()) }; return 0 }\n",

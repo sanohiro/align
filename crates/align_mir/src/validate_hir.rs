@@ -1046,6 +1046,9 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
             Scalar::DynArray(element) => valid_prim(element),
             Scalar::DynStructArray(id) => self.dynamic_struct_array_ok(id),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             _ => false,
         }
     }

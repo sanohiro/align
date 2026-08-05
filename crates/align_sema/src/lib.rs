@@ -5054,6 +5054,7 @@ pub fn check_program_with_all_interface_facts(
             &enums,
             &tuples,
             &fn_types,
+            &resources,
         );
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
@@ -23090,7 +23091,8 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `(e0, e1, ...)` — a tuple literal. Element types are taken from the expected tuple type
     /// when context fixes one (e.g. a multi-value `return`), else each element defaults like a
-    /// bare `:=` binding (int → i64, float → f64). PR1 cut: elements are primitive scalars.
+    /// bare `:=` binding (int → i64, float → f64). Resource and resource-reference elements use
+    /// the same recursive Move/Drop/provenance machinery as other supported tuple scalars.
     fn check_tuple(&mut self, elems: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // If the context fixes a concrete tuple type, use its element types to drive checking.
@@ -23120,11 +23122,12 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
                 Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
+                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
+                | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
-                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ce.ty)),
+                            format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ce.ty)),
                             ce.span,
                         );
                     }
@@ -34833,6 +34836,7 @@ impl<'a, 't> Checker<'a, 't> {
                             self.enums,
                             self.tuples,
                             self.fn_types,
+                            self.resources,
                         );
                     }
                 }
@@ -37034,6 +37038,7 @@ fn generic_param_state(ty: Ty, subst: &[Option<Ty>], tagged_types: &[hir::Tagged
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
 /// (`pick` with `[i32]` → `pick$i32`). Deterministic and collision-free across instantiations.
+#[allow(clippy::too_many_arguments)]
 fn mangle_mono(
     name: &str,
     args: &[Ty],
@@ -37042,6 +37047,7 @@ fn mangle_mono(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
@@ -37053,6 +37059,7 @@ fn mangle_mono(
             enums,
             tuples,
             fn_types,
+            resources,
         ));
     }
     s
@@ -37060,6 +37067,7 @@ fn mangle_mono(
 
 /// Source-visible counterpart of [`mangle_mono`]. Concrete function-value effect origins are
 /// erased, but all written signature facts remain structural identity.
+#[allow(clippy::too_many_arguments)]
 fn mangle_mono_source(
     name: &str,
     args: &[Ty],
@@ -37068,6 +37076,7 @@ fn mangle_mono_source(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
@@ -37079,6 +37088,7 @@ fn mangle_mono_source(
             enums,
             tuples,
             fn_types,
+            resources,
         ));
     }
     s
@@ -37092,6 +37102,7 @@ fn ty_mangle(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     ty_mangle_impl(
         ty,
@@ -37100,6 +37111,7 @@ fn ty_mangle(
         enums,
         tuples,
         fn_types,
+        resources,
         true,
     )
 }
@@ -37111,6 +37123,7 @@ fn source_ty_mangle(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     ty_mangle_impl(
         ty,
@@ -37119,10 +37132,12 @@ fn source_ty_mangle(
         enums,
         tuples,
         fn_types,
+        resources,
         false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ty_mangle_impl(
     ty: Ty,
     tagged_types: &[hir::TaggedType],
@@ -37130,6 +37145,7 @@ fn ty_mangle_impl(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
     include_fn_origin: bool,
 ) -> String {
     enum Work {
@@ -37179,6 +37195,24 @@ fn ty_mangle_impl(
                         format!("E{}_{}", name.len(), name)
                     },
                 )),
+                Ty::Resource(id) => output.push_str(&resources.get(id as usize).map_or_else(
+                    || "W_invalid".to_string(),
+                    |resource| {
+                        let name = if include_fn_origin {
+                            &resource.name
+                        } else {
+                            &resource.source_name
+                        };
+                        format!("W{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::ResourceRef(id) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("J_".to_string()),
+                        Work::Type(Ty::Resource(id)),
+                    ],
+                ),
                 Ty::Tagged(id) if tagged_visiting.insert(id) => {
                     let sequence = match tagged_types.get(id as usize).copied() {
                         Some(hir::TaggedType::Option(payload)) => vec![
@@ -37652,9 +37686,9 @@ fn resolve_type(
             return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
         }
         ast::Type::Tuple { elems, span: _ } => {
-            // Tuple elements use the supported scalar forms: primitive scalars, `str` views, and
-            // owned `string`/array values. A tuple containing a Move element carries the recursive
-            // Drop/region behavior of those elements and remains restricted to temporary results.
+            // Tuple elements use the supported scalar forms: primitive scalars, `str` views,
+            // owned `string`/array/resource values, and resource references. A tuple containing a
+            // Move element carries the recursive Drop/region behavior of those elements.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
                 let ety = resolve_type(e, cx, type_params, diags);
@@ -37663,10 +37697,11 @@ fn resolve_type(
                 }
                 match ty_to_scalar(ety) {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
+                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
+                    | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
                     _ => {
                         diags.error(
-                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ety)),
+                            format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ety)),
                             e.span(),
                         );
                         return Ty::Error;
@@ -38209,6 +38244,7 @@ fn instantiate_resource(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     if let Some(&id) = cx.resource_mono.get(&mangled) {
         return id;
@@ -38694,6 +38730,7 @@ fn instantiate_struct(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
@@ -38706,6 +38743,7 @@ fn instantiate_struct(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
@@ -38803,6 +38841,7 @@ fn instantiate_enum(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
@@ -38815,6 +38854,7 @@ fn instantiate_enum(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     let mut variants = Vec::with_capacity(tmpl.variants.len());
     for v in &tmpl.variants {
@@ -42867,20 +42907,20 @@ fn exit_branch(flag: bool) -> i64 {
         let by_value = function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None);
         let origins = vec![by_value.clone(), by_value.clone()];
         assert_ne!(
-            ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
-            ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
+            ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins, &[]),
+            ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins, &[]),
             "concrete function-value origins need distinct semantic monomorphs so later effect refinement cannot alias their cells"
         );
         assert_eq!(
-            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
-            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins, &[]),
+            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins, &[]),
             "source-visible function types erase inferred effect origins"
         );
         let mangle_signature =
-            |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function]);
+            |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function], &[]);
         let source_mangle_signature =
             |function| {
-                source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function])
+                source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function], &[])
             };
         assert_ne!(
             mangle_signature(by_value.clone()),
@@ -42949,8 +42989,8 @@ fn exit_branch(flag: bool) -> i64 {
             },
         ];
         assert_ne!(
-            ty_mangle(Ty::Tuple(0), &[], &structs, &[], &tuples, &[]),
-            ty_mangle(Ty::Tuple(1), &[], &structs, &[], &tuples, &[]),
+            ty_mangle(Ty::Tuple(0), &[], &structs, &[], &tuples, &[], &[]),
+            ty_mangle(Ty::Tuple(1), &[], &structs, &[], &tuples, &[], &[]),
             "semantic tuple identity retains nested concrete callback origins"
         );
         assert_eq!(
@@ -42961,6 +43001,7 @@ fn exit_branch(flag: bool) -> i64 {
                 &[],
                 &tuples,
                 &[],
+                &[],
             ),
             source_ty_mangle(
                 Ty::Tuple(1),
@@ -42969,8 +43010,74 @@ fn exit_branch(flag: bool) -> i64 {
                 &[],
                 &tuples,
                 &[],
+                &[],
             ),
             "source tuple identity recursively erases nested callback origins"
+        );
+    }
+
+    #[test]
+    fn resource_mangling_uses_nominal_identity_instead_of_local_ids() {
+        let resource = |name: &str| hir::ResourceDef {
+            name: name.to_string(),
+            source_name: name.to_string(),
+            declaring_module: name.split('$').next().unwrap_or(name).to_string(),
+            generic_arity: 0,
+            drop_hook: "pkg$internal$drop".to_string(),
+            drop_thunk: format!("__align_resource_drop${name}"),
+            representation_version: RESOURCE_REPRESENTATION_VERSION,
+            drop_abi_fingerprint: RESOURCE_DROP_ABI_FINGERPRINT,
+        };
+        let producer_order = vec![resource("pkg$alpha"), resource("pkg$beta")];
+        let consumer_order = vec![resource("pkg$beta"), resource("pkg$alpha")];
+
+        let alpha_producer = ty_mangle(
+            Ty::Resource(0),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &producer_order,
+        );
+        let alpha_consumer = ty_mangle(
+            Ty::Resource(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &consumer_order,
+        );
+        let beta_producer = ty_mangle(
+            Ty::Resource(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &producer_order,
+        );
+        assert_eq!(
+            alpha_producer, alpha_consumer,
+            "the same nominal resource must mangle identically after declaration-order-independent id reconstruction"
+        );
+        assert_ne!(
+            alpha_producer, beta_producer,
+            "different nominal resources must not collide even when their pointer ABI is identical"
+        );
+        assert_ne!(
+            alpha_consumer,
+            ty_mangle(
+                Ty::ResourceRef(1),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &consumer_order,
+            ),
+            "owning resources and resource references need distinct generic identities"
         );
     }
 
@@ -43027,7 +43134,7 @@ fn exit_branch(flag: bool) -> i64 {
             }))
             .collect::<Vec<_>>();
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
-        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[]);
+        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[], &[]);
         assert!(tagged_mangle.len() > DEPTH * 2);
         assert!(is_field_ok(Ty::Tagged(0), &tagged));
         let mut tagged_struct = tagged.clone();
@@ -43064,11 +43171,11 @@ fn exit_branch(flag: bool) -> i64 {
                 effect: std::cell::Cell::new(FnEffect::Unknown),
             })
             .collect::<Vec<_>>();
-        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types);
+        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types, &[]);
         assert!(fn_mangle.len() > DEPTH * 3);
         assert_ne!(
             fn_mangle,
-            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types),
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types, &[]),
             "concrete function origins remain part of the internal mangle"
         );
 
