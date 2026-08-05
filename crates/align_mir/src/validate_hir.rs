@@ -949,6 +949,9 @@ impl<'a> PlacementValidator<'a> {
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             Ty::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Ty::Option(payload) => self.field_scalar_ok(payload, allow_param),
             Ty::Result(ok, err) => {
@@ -1043,6 +1046,9 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
             Scalar::DynArray(element) => valid_prim(element),
             Scalar::DynStructArray(id) => self.dynamic_struct_array_ok(id),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             _ => false,
         }
     }
@@ -1104,6 +1110,11 @@ impl<'a> PlacementValidator<'a> {
                     | ScalarPlacement::FnParameter { allow_param: true }
             ),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
+            Scalar::Resource(id) => {
+                !matches!(mode, ScalarPlacement::Collection)
+                    && self.program.resources.get(id as usize).is_some()
+            }
+            Scalar::ResourceRef(id) => self.program.resources.get(id as usize).is_some(),
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => {
                 matches!(mode, ScalarPlacement::Collection)
@@ -1165,6 +1176,9 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::ResponseBuilder => true,
@@ -1225,6 +1239,9 @@ impl<'a> PlacementValidator<'a> {
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Enum(id) => self.program.enums.get(id as usize).is_some(),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             Ty::Writer
             | Ty::Reader
             | Ty::Buffer
@@ -1516,13 +1533,15 @@ impl<'a> Validator<'a> {
                 + program.enums.len()
                 + program.tuples.len()
                 + program.tagged_types.len()
-                + program.fn_types.len(),
+                + program.fn_types.len()
+                + program.resources.len(),
         );
         nodes.extend((0..program.structs.len()).map(|id| Node::Struct(id as u32)));
         nodes.extend((0..program.enums.len()).map(|id| Node::Enum(id as u32)));
         nodes.extend((0..program.tuples.len()).map(|id| Node::Tuple(id as u32)));
         nodes.extend((0..program.tagged_types.len()).map(|id| Node::Tagged(id as u32)));
         nodes.extend((0..program.fn_types.len()).map(|id| Node::Fn(id as u32)));
+        nodes.extend((0..program.resources.len()).map(|id| Node::Resource(id as u32)));
         Self {
             program,
             nodes,
@@ -1568,6 +1587,19 @@ impl<'a> Validator<'a> {
                         self.inspect_scalar(*parameter, Edge::Header, &mut facts)
                     }) && self.inspect_ty(function.ret, Edge::Header, &mut facts)
                 }
+                Node::Resource(id) => {
+                    let resource = &self.program.resources[id as usize];
+                    !resource.name.is_empty()
+                        && !resource.source_name.is_empty()
+                        && !resource.drop_hook.is_empty()
+                        && !resource.drop_thunk.is_empty()
+                        && !resource.name.as_bytes().contains(&0)
+                        && !resource.source_name.as_bytes().contains(&0)
+                        && !resource.drop_hook.as_bytes().contains(&0)
+                        && !resource.drop_thunk.as_bytes().contains(&0)
+                        && resource.representation_version == 1
+                        && resource.drop_abi_fingerprint == *b"align-res-drop-1"
+                }
             };
             if !valid {
                 return false;
@@ -1612,6 +1644,9 @@ impl<'a> Validator<'a> {
             Ty::Tuple(id) => self.push_ref(Node::Tuple(id), edge, facts),
             Ty::Fn(id) => self.push_ref(Node::Fn(id), Edge::Header, facts),
             Ty::Enum(id) => self.push_ref(Node::Enum(id), edge, facts),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                self.push_ref(Node::Resource(id), Edge::Header, facts)
+            }
             Ty::DictEncoded(id, field) => {
                 let Some(definition) = self.program.structs.get(id as usize) else {
                     return false;
@@ -1670,6 +1705,9 @@ impl<'a> Validator<'a> {
             Scalar::Enum(id) => self.push_ref(Node::Enum(id), edge, facts),
             Scalar::Tagged(id) => self.push_ref(Node::Tagged(id), edge, facts),
             Scalar::Fn(id) => self.push_ref(Node::Fn(id), Edge::Header, facts),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.push_ref(Node::Resource(id), Edge::Header, facts)
+            }
             Scalar::DynStructArray(id) | Scalar::Soa(id) => {
                 self.push_ref(Node::Struct(id), Edge::Header, facts)
             }
@@ -1716,6 +1754,7 @@ impl<'a> Validator<'a> {
             Node::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
             Node::Tagged(id) => self.program.tagged_types.get(id as usize).is_some(),
             Node::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
+            Node::Resource(id) => self.program.resources.get(id as usize).is_some(),
         }
     }
 
@@ -2549,6 +2588,9 @@ impl<'a> BodyValidator<'a> {
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             Ty::Task(payload) => primitive_task_scalar(payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
             Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
@@ -2832,6 +2874,9 @@ impl<'a> BodyValidator<'a> {
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Tagged(id) => self.program.tagged_types.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.program.resources.get(id as usize).is_some()
+            }
             Scalar::DynArray(element) | Scalar::Slice(element) => valid_prim(element),
             Scalar::DynStructArray(id) => self.placement.dynamic_struct_array_ok(id),
             Scalar::Soa(id) => self.soa_type_ok(id),
@@ -3222,6 +3267,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::RawLoad { .. }
             | hir::ExprKind::RawStore { .. }
             | hir::ExprKind::RawOffset { .. }
+            | hir::ExprKind::RawIsNull(_)
             | hir::ExprKind::HeapNew(_)
             | hir::ExprKind::BoxGet(_)
             | hir::ExprKind::BoxClone(_)
@@ -3232,6 +3278,48 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderNew { .. }
             | hir::ExprKind::BuilderWrite { .. }
             | hir::ExprKind::BuilderToString(_) => true,
+            hir::ExprKind::ResourceFromRaw { resource, parent, .. } => {
+                self.program.resources.get(*resource as usize).is_some()
+                    && expression.ty == Ty::Resource(*resource)
+                    && parent.as_ref().is_none_or(|parent| {
+                        matches!(parent.ty, Ty::ResourceRef(id) if self.program.resources.get(id as usize).is_some())
+                    })
+            }
+            hir::ExprKind::ResourceBorrow { resource, owner } => {
+                self.program.resources.get(*resource as usize).is_some()
+                    && owner.ty == Ty::Resource(*resource)
+                    && expression.ty == Ty::ResourceRef(*resource)
+            }
+            hir::ExprKind::ResourceRaw { resource, reference } => {
+                self.program.resources.get(*resource as usize).is_some()
+                    && reference.ty == Ty::ResourceRef(*resource)
+                    && expression.ty == Ty::Raw
+            }
+            hir::ExprKind::ResourceIntoRaw { resource, owner } => {
+                self.program.resources.get(*resource as usize).is_some()
+                    && owner.ty == Ty::Resource(*resource)
+                    && expression.ty == Ty::Raw
+            }
+            hir::ExprKind::ResourceViewFromRaw {
+                owner,
+                resource,
+                view,
+                ..
+            } => {
+                let expected = match view {
+                    hir::ResourceViewKind::StrUtf8 => Ty::Option(Scalar::Str),
+                    hir::ResourceViewKind::Slice(
+                        scalar @ (Scalar::Int(_) | Scalar::Float(_)),
+                    ) => Ty::Option(Scalar::Slice(
+                        align_sema::scalar_to_prim(*scalar)
+                            .expect("validated primitive resource view scalar"),
+                    )),
+                    hir::ResourceViewKind::Slice(_) => Ty::Error,
+                };
+                self.program.resources.get(*resource as usize).is_some()
+                    && owner.ty == Ty::ResourceRef(*resource)
+                    && expression.ty == expected
+            }
             hir::ExprKind::ArrayLit {
                 elems,
                 elem,
@@ -4635,6 +4723,29 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(offset, context.clone());
                 push_expr!(ptr, context.clone());
             }
+            hir::ExprKind::RawIsNull(pointer) => {
+                push_expr!(pointer, context.clone());
+            }
+            hir::ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                if let Some(parent) = parent {
+                    push_expr!(parent, context.clone());
+                }
+                push_expr!(raw, context.clone());
+            }
+            hir::ExprKind::ResourceBorrow { owner, .. }
+            | hir::ExprKind::ResourceIntoRaw { owner, .. } => {
+                push_expr!(owner, context.clone());
+            }
+            hir::ExprKind::ResourceRaw { reference, .. } => {
+                push_expr!(reference, context.clone());
+            }
+            hir::ExprKind::ResourceViewFromRaw {
+                owner, ptr, len, ..
+            } => {
+                push_expr!(len, context.clone());
+                push_expr!(ptr, context.clone());
+                push_expr!(owner, context.clone());
+            }
             hir::ExprKind::RawStore { ptr, offset, value } => {
                 push_expr!(value, context.clone());
                 push_expr!(offset, context.clone());
@@ -5724,6 +5835,113 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[pointer, offset]);
                 Some((Ty::Raw, falls, breaks))
             }
+            hir::ExprKind::RawIsNull(pointer) => {
+                let pointer = self.expr_flow(pointer)?;
+                (pointer.ty == Ty::Raw && expression.ty == Ty::Bool)
+                    .then_some((Ty::Bool, pointer.falls, pointer.breaks))
+            }
+            hir::ExprKind::ResourceFromRaw {
+                raw,
+                resource,
+                parent,
+            } => {
+                let raw = self.expr_flow(raw)?;
+                if context.unsafe_depth == 0
+                    || raw.ty != Ty::Raw
+                    || self.program.resources.get(*resource as usize).is_none()
+                    || expression.ty != Ty::Resource(*resource)
+                {
+                    return None;
+                }
+                let mut flows = vec![raw];
+                if let Some(parent) = parent {
+                    let parent = self.expr_flow(parent)?;
+                    if !matches!(parent.ty, Ty::ResourceRef(id)
+                        if self.program.resources.get(id as usize).is_some())
+                    {
+                        return None;
+                    }
+                    flows.push(parent);
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Resource(*resource), falls, breaks))
+            }
+            hir::ExprKind::ResourceBorrow { owner, resource } => {
+                let owner = self.expr_flow(owner)?;
+                if owner.ty != Ty::Resource(*resource)
+                    || self.program.resources.get(*resource as usize).is_none()
+                    || expression.ty != Ty::ResourceRef(*resource)
+                {
+                    return None;
+                }
+                Some((Ty::ResourceRef(*resource), owner.falls, owner.breaks))
+            }
+            hir::ExprKind::ResourceRaw {
+                reference,
+                resource,
+            } => {
+                let reference = self.expr_flow(reference)?;
+                if context.unsafe_depth == 0
+                    || reference.ty != Ty::ResourceRef(*resource)
+                    || self.program.resources.get(*resource as usize).is_none()
+                    || expression.ty != Ty::Raw
+                {
+                    return None;
+                }
+                Some((Ty::Raw, reference.falls, reference.breaks))
+            }
+            hir::ExprKind::ResourceIntoRaw { owner, resource } => {
+                let owner_flow = self.expr_flow(owner)?;
+                let function = self.program.fns.get(context.function)?;
+                let transferable = match owner.kind {
+                    hir::ExprKind::Local(local) => function
+                        .params
+                        .iter()
+                        .position(|&parameter| parameter == local)
+                        .is_none_or(|index| {
+                            function.param_modes.get(index) == Some(&align_ast::ParamMode::ByValue)
+                        }),
+                    _ => false,
+                };
+                if context.unsafe_depth == 0
+                    || owner_flow.ty != Ty::Resource(*resource)
+                    || self.program.resources.get(*resource as usize).is_none()
+                    || expression.ty != Ty::Raw
+                    || !transferable
+                {
+                    return None;
+                }
+                Some((Ty::Raw, owner_flow.falls, owner_flow.breaks))
+            }
+            hir::ExprKind::ResourceViewFromRaw {
+                owner,
+                ptr,
+                len,
+                resource,
+                view,
+            } => {
+                let owner = self.expr_flow(owner)?;
+                let ptr = self.expr_flow(ptr)?;
+                let len = self.expr_flow(len)?;
+                let expected = match view {
+                    hir::ResourceViewKind::StrUtf8 => Ty::Option(Scalar::Str),
+                    hir::ResourceViewKind::Slice(
+                        scalar @ (Scalar::Int(_) | Scalar::Float(_)),
+                    ) => Ty::Option(Scalar::Slice(align_sema::scalar_to_prim(*scalar)?)),
+                    hir::ResourceViewKind::Slice(_) => return None,
+                };
+                if context.unsafe_depth == 0
+                    || owner.ty != Ty::ResourceRef(*resource)
+                    || ptr.ty != Ty::Raw
+                    || len.ty != i64_ty()
+                    || self.program.resources.get(*resource as usize).is_none()
+                    || expression.ty != expected
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[owner, ptr, len]);
+                Some((expected, falls, breaks))
+            }
             hir::ExprKind::HeapNew(value) => {
                 let flow = self.expr_flow(value)?;
                 if context.arena_depth == 0 {
@@ -6714,6 +6932,8 @@ impl<'a> BodyValidator<'a> {
             | Ty::Float(_)
             | Ty::Int(_)
             | Ty::Raw
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
             | Ty::Option(_)
             | Ty::Result(_, _)
             | Ty::Tagged(_)

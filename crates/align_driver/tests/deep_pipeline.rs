@@ -62,7 +62,7 @@ fn cyclic_components(f: &align_mir::Function) -> usize {
                 reach[from][*then_target as usize] = true;
                 reach[from][*else_target as usize] = true;
             }
-            Term::Return(_) | Term::Unreachable => {}
+            Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
     for via in 0..n {

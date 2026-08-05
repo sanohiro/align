@@ -128,6 +128,7 @@ pub(super) enum Node {
     Tuple(u32),
     Tagged(u32),
     Fn(u32),
+    Resource(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +138,7 @@ struct CanonicalTypeView<'a> {
     tuples: &'a [hir::TupleDef],
     tagged_types: &'a [hir::TaggedType],
     fn_types: &'a [FunctionTypeDef],
+    resources: &'a [hir::ResourceDef],
 }
 
 impl SourceShapeView for CanonicalTypeView<'_> {
@@ -181,6 +183,7 @@ impl SourceShapeView for CanonicalTypeView<'_> {
                         return_cleanup: definition.return_cleanup,
                     })
             }
+            Node::Resource(id) => self.resources.get(id as usize).map(SourceShapeNode::Resource),
         }
     }
 }
@@ -392,6 +395,31 @@ impl<'a> GraphValidator<'a> {
                     self.candidate(cleanup_ordinal, CanonicalGraphError::InvalidGraph);
                 }
             }
+            SourceShapeNode::Resource(resource) => {
+                for value in [
+                    resource.source_name.as_str(),
+                    resource.name.as_str(),
+                    resource.declaring_module.as_str(),
+                    resource.drop_hook.as_str(),
+                    resource.drop_thunk.as_str(),
+                ] {
+                    let ordinal = self.field_ordinal();
+                    self.validate_source_name(value, ordinal);
+                }
+                if resource.representation_version != 1 {
+                    let ordinal = self.field_ordinal();
+                    self.candidate(ordinal, CanonicalGraphError::InvalidGraph);
+                } else {
+                    self.field_ordinal();
+                }
+                if resource.drop_abi_fingerprint != *b"align-res-drop-1" {
+                    let ordinal = self.field_ordinal();
+                    self.candidate(ordinal, CanonicalGraphError::InvalidGraph);
+                } else {
+                    self.field_ordinal();
+                }
+                self.field_ordinal(); // generic arity
+            }
         }
         let end_ordinal = self.field_ordinal();
         self.end_ordinals.insert(node, end_ordinal);
@@ -425,6 +453,19 @@ impl<'a> GraphValidator<'a> {
                 }
                 Node::Enum(id) => {
                     if let Some(definition) = view.enums.get(id as usize)
+                        && let Some(error) = Self::compare_nominal(
+                            view,
+                            node,
+                            &definition.source_name,
+                            &mut nominal_sources,
+                            &mut known_shapes,
+                        )
+                    {
+                        self.candidate(end_ordinal, error);
+                    }
+                }
+                Node::Resource(id) => {
+                    if let Some(definition) = view.resources.get(id as usize)
                         && let Some(error) = Self::compare_nominal(
                             view,
                             node,
@@ -564,6 +605,9 @@ impl<'a> GraphValidator<'a> {
                 self.record_inline_edge(inline_from, node, ordinal);
             }
             Scalar::Fn(id) => self.scan_reference(Node::Fn(id), ordinal, references),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                self.scan_reference(Node::Resource(id), ordinal, references)
+            }
             Scalar::Int(value) if validate_int(value.signed, value.bits).is_err() => {
                 self.candidate(ordinal, CanonicalGraphError::InvalidWidth)
             }
@@ -651,6 +695,9 @@ impl<'a> GraphValidator<'a> {
                 self.record_inline_edge(inline_from, node, ordinal);
             }
             Ty::Fn(id) => self.scan_reference(Node::Fn(id), ordinal, references),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                self.scan_reference(Node::Resource(id), ordinal, references)
+            }
             Ty::Enum(id) => {
                 let node = Node::Enum(id);
                 self.scan_reference(node, ordinal, references);
@@ -879,7 +926,7 @@ fn canonical_type_bytes_with_classes(
     }
 
     let mut out = Vec::new();
-    out.push(1);
+    out.push(2);
     out.extend(checked_count(class_order.len())?.to_le_bytes());
     let ordinal = |node: Node| {
         let class = classes
@@ -983,6 +1030,7 @@ fn canonical_view(program: &Program) -> CanonicalTypeView<'_> {
         tuples: &program.tuples,
         tagged_types: &program.tagged_types,
         fn_types: &program.fn_types,
+        resources: &program.resources,
     }
 }
 
@@ -1093,6 +1141,13 @@ impl<'a> DecodeCursor<'a> {
         }
         Ok(value.to_owned())
     }
+
+    fn fixed16(&mut self) -> Result<[u8; 16], CanonicalCodecError> {
+        let end = self.offset.checked_add(16).ok_or(CanonicalCodecError::Truncated)?;
+        let bytes = self.bytes.get(self.offset..end).ok_or(CanonicalCodecError::Truncated)?;
+        self.offset = end;
+        bytes.try_into().map_err(|_| CanonicalCodecError::Truncated)
+    }
 }
 
 enum DecodedNode {
@@ -1101,11 +1156,12 @@ enum DecodedNode {
     Tuple(hir::TupleDef),
     Tagged(hir::TaggedType),
     Function(FunctionTypeDef),
+    Resource(hir::ResourceDef),
 }
 
 pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
     let mut cursor = DecodeCursor::new(bytes);
-    if cursor.byte()? != 1 {
+    if cursor.byte()? != 2 {
         return Err(CanonicalCodecError::UnsupportedVersion);
     }
     let node_count = cursor.count(1)?;
@@ -1121,6 +1177,7 @@ pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, Canonical
     let mut tuple_count = 0usize;
     let mut tagged_count = 0usize;
     let mut function_count = 0usize;
+    let mut resource_count = 0usize;
     let mut resolved = Vec::with_capacity(nodes.len());
     for node in &nodes {
         let (tag, local) = match node {
@@ -1149,6 +1206,11 @@ pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, Canonical
                 function_count += 1;
                 (4, local)
             }
+            DecodedNode::Resource(_) => {
+                let local = resource_count;
+                resource_count += 1;
+                (5, local)
+            }
         };
         resolved.push((
             tag,
@@ -1161,6 +1223,7 @@ pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, Canonical
     let mut tuples = Vec::with_capacity(tuple_count);
     let mut tagged_types = Vec::with_capacity(tagged_count);
     let mut fn_types = Vec::with_capacity(function_count);
+    let mut resources = Vec::with_capacity(resource_count);
     for mut node in nodes {
         remap_decoded_node(&mut node, &resolved)?;
         match node {
@@ -1169,6 +1232,7 @@ pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, Canonical
             DecodedNode::Tuple(value) => tuples.push(value),
             DecodedNode::Tagged(value) => tagged_types.push(value),
             DecodedNode::Function(value) => fn_types.push(value),
+            DecodedNode::Resource(value) => resources.push(value),
         }
     }
     remap_decoded_ty(&mut root, &resolved)?;
@@ -1179,6 +1243,7 @@ pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, Canonical
         tuples: &tuples,
         tagged_types: &tagged_types,
         fn_types: &fn_types,
+        resources: &resources,
     };
     let mut roots = Vec::with_capacity(resolved.len() + 1);
     for &(tag, local) in &resolved {
@@ -1205,6 +1270,7 @@ fn node_root_ty(tag: u8, id: u32) -> Result<Ty, CanonicalCodecError> {
         2 => Ok(Ty::Tuple(id)),
         3 => Ok(Ty::Tagged(id)),
         4 => Ok(Ty::Fn(id)),
+        5 => Ok(Ty::Resource(id)),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1291,6 +1357,26 @@ fn decode_node(cursor: &mut DecodeCursor<'_>) -> Result<DecodedNode, CanonicalCo
                 return_cleanup: decode_return_cleanup(cursor)?,
             }))
         }
+        5 => {
+            let source_name = cursor.text()?;
+            let name = cursor.text()?;
+            let declaring_module = cursor.text()?;
+            let drop_hook = cursor.text()?;
+            let drop_thunk = cursor.text()?;
+            let representation_version = cursor.u32()?;
+            let drop_abi_fingerprint = cursor.fixed16()?;
+            let generic_arity = cursor.u32()?;
+            Ok(DecodedNode::Resource(hir::ResourceDef {
+                name,
+                source_name,
+                declaring_module,
+                generic_arity,
+                drop_hook,
+                drop_thunk,
+                representation_version,
+                drop_abi_fingerprint,
+            }))
+        }
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1371,6 +1457,8 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         31 => Ok(Scalar::HttpStream),
         32 => Ok(Scalar::RunOutput),
         33 => Ok(Scalar::Fn(node(cursor)?)),
+        34 => Ok(Scalar::Resource(node(cursor)?)),
+        35 => Ok(Scalar::ResourceRef(node(cursor)?)),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1456,6 +1544,8 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         54 => Ok(Ty::Task(decode_scalar(cursor)?)),
         55 => Ok(Ty::DictEncoded(node(cursor)?, cursor.u32()?)),
         56 => Ok(Ty::Unit),
+        57 => Ok(Ty::Resource(node(cursor)?)),
+        58 => Ok(Ty::ResourceRef(node(cursor)?)),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1526,6 +1616,7 @@ fn remap_decoded_scalar(
         Scalar::Enum(id) => (id, 1),
         Scalar::Tagged(id) => (id, 3),
         Scalar::Fn(id) => (id, 4),
+        Scalar::Resource(id) | Scalar::ResourceRef(id) => (id, 5),
         _ => return Ok(()),
     };
     *id = resolve_decoded_node(*id, tag, resolved)?;
@@ -1572,6 +1663,10 @@ fn remap_decoded_ty(value: &mut Ty, resolved: &[(u8, u32)]) -> Result<(), Canoni
             *id = resolve_decoded_node(*id, 1, resolved)?;
             Ok(())
         }
+        Ty::Resource(id) | Ty::ResourceRef(id) => {
+            *id = resolve_decoded_node(*id, 5, resolved)?;
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1611,6 +1706,7 @@ fn remap_decoded_node(
             }
             remap_decoded_ty(&mut definition.ret, resolved)?;
         }
+        DecodedNode::Resource(_) => {}
     }
     Ok(())
 }
@@ -1774,6 +1870,7 @@ fn initial_signature(
         Node::Tuple(_) => 2,
         Node::Tagged(_) => 3,
         Node::Fn(_) => 4,
+        Node::Resource(_) => 5,
     }];
     match node {
         Node::Struct(id) => text(
@@ -1788,6 +1885,14 @@ fn initial_signature(
             &mut out,
             &view
                 .enums
+                .get(id as usize)
+                .ok_or(CanonicalGraphError::MissingReference)?
+                .source_name,
+        )?,
+        Node::Resource(id) => text(
+            &mut out,
+            &view
+                .resources
                 .get(id as usize)
                 .ok_or(CanonicalGraphError::MissingReference)?
                 .source_name,
@@ -1890,6 +1995,22 @@ fn encode_node(
             encode_borrow_summary(out, &definition.return_borrow)?;
             encode_region_summary(out, &definition.return_region)?;
             encode_return_cleanup(out, definition.return_cleanup);
+            Ok(())
+        }
+        Node::Resource(id) => {
+            let definition = view
+                .resources
+                .get(id as usize)
+                .ok_or(CanonicalGraphError::MissingReference)?;
+            out.push(5);
+            text(out, &definition.source_name)?;
+            text(out, &definition.name)?;
+            text(out, &definition.declaring_module)?;
+            text(out, &definition.drop_hook)?;
+            text(out, &definition.drop_thunk)?;
+            out.extend(definition.representation_version.to_le_bytes());
+            out.extend(definition.drop_abi_fingerprint);
+            out.extend(definition.generic_arity.to_le_bytes());
             Ok(())
         }
     })
@@ -1995,6 +2116,7 @@ fn node_children(
             }
             children.extend(type_nodes(*ret));
         }
+        SourceShapeNode::Resource(_) => {}
     }
     Ok(children)
 }
@@ -2007,6 +2129,7 @@ fn scalar_nodes(value: Scalar) -> Vec<Node> {
         Scalar::Enum(id) => vec![Node::Enum(id)],
         Scalar::Tagged(id) => vec![Node::Tagged(id)],
         Scalar::Fn(id) => vec![Node::Fn(id)],
+        Scalar::Resource(id) | Scalar::ResourceRef(id) => vec![Node::Resource(id)],
         _ => Vec::new(),
     }
 }
@@ -2036,6 +2159,7 @@ fn type_nodes(value: Ty) -> Vec<Node> {
         | Ty::Struct(id) => vec![Node::Struct(id)],
         Ty::Tuple(id) => vec![Node::Tuple(id)],
         Ty::Fn(id) => vec![Node::Fn(id)],
+        Ty::Resource(id) | Ty::ResourceRef(id) => vec![Node::Resource(id)],
         Ty::Enum(id) => vec![Node::Enum(id)],
         _ => Vec::new(),
     }
@@ -2195,6 +2319,8 @@ fn scalar(
             Scalar::HttpStream => leaf!(31),
             Scalar::RunOutput => leaf!(32),
             Scalar::Fn(id) => node!(33, Fn, id),
+            Scalar::Resource(id) => node!(34, Resource, id),
+            Scalar::ResourceRef(id) => node!(35, Resource, id),
             Scalar::Param(_) => Err(CanonicalGraphError::InvalidGraph),
         }
     })
@@ -2339,6 +2465,8 @@ fn ty(
                 Ok(())
             }
             Ty::Unit => leaf!(56),
+            Ty::Resource(id) => node!(57, Resource, id),
+            Ty::ResourceRef(id) => node!(58, Resource, id),
             Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2356,6 +2484,7 @@ pub(super) fn canonicalize_function_types(
         tuples: &program.tuples,
         tagged_types: &program.tagged_types,
         fn_types: &program.fn_types,
+        resources: &program.resources,
     };
     let graph = ValidatedGraph::new_many(Ty::Unit, &roots, view)?;
     let reachable: BTreeSet<u32> = graph
@@ -2599,6 +2728,7 @@ mod tests {
                 tuples: &program.tuples,
                 tagged_types: &program.tagged_types,
                 fn_types: &fn_types,
+                resources: &program.resources,
             },
         )?;
         assert_eq!(graph.root, root);
@@ -2616,6 +2746,7 @@ mod tests {
                 tuples: &program.tuples,
                 tagged_types: &program.tagged_types,
                 fn_types: &fn_types,
+                resources: &program.resources,
             },
         )?;
         canonical_type_bytes(&graph)
@@ -2629,6 +2760,7 @@ mod tests {
             link_libs: Vec::new(),
             structs: program.structs.clone(),
             enums: program.enums.clone(),
+            resources: program.resources.clone(),
             tagged_types: program.tagged_types.clone(),
             fn_types: function_defs(program),
             tuples: program.tuples.clone(),
@@ -2672,6 +2804,7 @@ mod tests {
                 tuples: &program.tuples,
                 tagged_types: &program.tagged_types,
                 fn_types: &fn_types,
+                resources: &program.resources,
             },
         )?;
         let mut metrics = RefinementMetrics::default();
@@ -2694,6 +2827,7 @@ mod tests {
             Node::Tuple(id) => 0x3000 + id,
             Node::Tagged(id) => 0x4000 + id,
             Node::Fn(id) => 0x5000 + id,
+            Node::Resource(id) => 0x6000 + id,
         })
     }
 
@@ -2997,6 +3131,7 @@ mod tests {
             tuples: &program.tuples,
             tagged_types: &program.tagged_types,
             fn_types: &[],
+            resources: &program.resources,
         };
         let edges: usize = order
             .iter()
@@ -3028,14 +3163,14 @@ mod tests {
     #[test]
     fn canonical_graph_engine() {
         let program = baseline_program();
-        assert_eq!(canonical(Ty::Unit, &program).unwrap(), [1, 0, 0, 0, 0, 56]);
-        assert_eq!(canonical(Ty::Bool, &program).unwrap(), [1, 0, 0, 0, 0, 2]);
+        assert_eq!(canonical(Ty::Unit, &program).unwrap(), [2, 0, 0, 0, 0, 56]);
+        assert_eq!(canonical(Ty::Bool, &program).unwrap(), [2, 0, 0, 0, 0, 2]);
         assert_eq!(
             canonical(Ty::Int(i(64)), &program).unwrap(),
-            [1, 0, 0, 0, 0, 0, 1, 64]
+            [2, 0, 0, 0, 0, 0, 1, 64]
         );
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [1, 1, 0, 0, 0]);
+        assert_eq!(&bytes[..5], [2, 1, 0, 0, 0]);
         assert_eq!(bytes.last(), Some(&0));
     }
 
@@ -3043,9 +3178,9 @@ mod tests {
     fn canonical_type_codec() {
         let program = mir_program(&baseline_program());
         for (root, expected) in [
-            (Ty::Unit, vec![1, 0, 0, 0, 0, 56]),
-            (Ty::Bool, vec![1, 0, 0, 0, 0, 2]),
-            (Ty::Int(i(64)), vec![1, 0, 0, 0, 0, 0, 1, 64]),
+            (Ty::Unit, vec![2, 0, 0, 0, 0, 56]),
+            (Ty::Bool, vec![2, 0, 0, 0, 0, 2]),
+            (Ty::Int(i(64)), vec![2, 0, 0, 0, 0, 0, 1, 64]),
         ] {
             let encoded = CanonicalTy::from_program(root, &program).unwrap();
             assert_eq!(encoded.as_bytes(), expected);
@@ -3201,7 +3336,7 @@ mod tests {
             &program,
         )
         .unwrap();
-        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 56, 0, 0, 0]);
+        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 56, 0, 0, 0]);
         assert_eq!(CanonicalFnAbi::decode(abi.as_bytes()).unwrap(), abi);
 
         let params = [(ParamMode::ByValue, Ty::Fn(0))];
@@ -3232,33 +3367,33 @@ mod tests {
             assert_eq!(CanonicalTy::decode(bytes), Err(expected), "{bytes:02x?}");
         };
         error(&[], CanonicalCodecError::Truncated);
-        error(&[2], CanonicalCodecError::UnsupportedVersion);
-        error(&[1, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
-        error(&[1, 0, 0, 0, 0, 0, 2, 64], CanonicalCodecError::InvalidBool);
+        error(&[3], CanonicalCodecError::UnsupportedVersion);
+        error(&[2, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
+        error(&[2, 0, 0, 0, 0, 0, 2, 64], CanonicalCodecError::InvalidBool);
         error(
-            &[1, 0, 0, 0, 0, 0, 1, 24],
+            &[2, 0, 0, 0, 0, 0, 1, 24],
             CanonicalCodecError::InvalidWidth,
         );
         error(
-            &[1, 0, 0, 0, 0, 50, 0xff, 0xff, 0xff, 0xff],
+            &[2, 0, 0, 0, 0, 50, 0xff, 0xff, 0xff, 0xff],
             CanonicalCodecError::MissingReference,
         );
 
-        let mut trailing = vec![1, 0, 0, 0, 0, 56];
+        let mut trailing = vec![2, 0, 0, 0, 0, 56];
         trailing.push(0);
         error(&trailing, CanonicalCodecError::TrailingBytes);
 
         let invalid_utf8 = [
-            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_utf8, CanonicalCodecError::InvalidUtf8);
         let embedded_nul = [
-            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&embedded_nul, CanonicalCodecError::EmbeddedNul);
 
         let invalid_align = [
-            1, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_align, CanonicalCodecError::InvalidGraph);
 
@@ -3282,22 +3417,22 @@ mod tests {
         error(&recursive, CanonicalCodecError::InvalidGraph);
 
         let duplicate_function = [
-            1, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
+            2, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&duplicate_function, CanonicalCodecError::DuplicateMember);
 
-        let unreachable_function = [1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 56];
+        let unreachable_function = [2, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 56];
         error(
             &unreachable_function,
             CanonicalCodecError::NonCanonicalOrder,
         );
 
         let invalid_summary = [
-            1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&invalid_summary, CanonicalCodecError::InvalidSummary);
 
-        let unit = [1, 0, 0, 0, 0, 56];
+        let unit = [2, 0, 0, 0, 0, 56];
         let mut invalid_mode = vec![1, 1, 0, 0, 0, 4];
         invalid_mode.extend(unit);
         invalid_mode.extend(unit);
@@ -3361,7 +3496,7 @@ mod tests {
         second.ty = Ty::Tuple(1);
         program.structs[0].fields.push(second);
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [1, 3, 0, 0, 0]);
+        assert_eq!(&bytes[..5], [2, 3, 0, 0, 0]);
 
         let mut permuted = program.clone();
         permuted.tuples.swap(0, 1);
@@ -3460,7 +3595,7 @@ mod tests {
             program.structs.push(definition);
         }
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [1, 0, 16, 0, 0]);
+        assert_eq!(&bytes[..5], [2, 0, 16, 0, 0]);
     }
 
     #[test]
@@ -3501,6 +3636,7 @@ mod tests {
             link_libs: Vec::new(),
             structs,
             enums,
+            resources: Vec::new(),
             tagged_types: vec![hir::TaggedType::Result(Scalar::Fn(0), Scalar::Fn(1))],
             fn_types: vec![first, second, duplicate, unreachable],
             tuples,

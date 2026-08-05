@@ -134,6 +134,7 @@ impl Annotations {
                     }
                 }
             }
+            Item::Resource(d) => self.visit_generics(&d.type_params, src),
             Item::Const(d) => {
                 if let Some(t) = &d.ty {
                     self.visit_type(t);

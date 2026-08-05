@@ -38,6 +38,7 @@ use align_sema::{
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
+use inkwell::GlobalVisibility;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
@@ -717,6 +718,8 @@ fn build_module<'c>(
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
     validate_tagged_program(program)?;
+    validate_resource_program(program)?;
+    validate_resource_rvalues(program)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -1413,6 +1416,41 @@ fn build_module<'c>(
         generated_funcs.insert(id.clone(), tramp);
     }
 
+    // Producer units define one externally linkable hidden support thunk per concrete resource;
+    // consumer units carry only the declaration named by public resource metadata. The thunk ABI
+    // is always `void(ptr)` and deliberately hides the internal hook's source path from consumers.
+    let resource_drop_ty = ctx
+        .void_type()
+        .fn_type(&[ctx.ptr_type(AddressSpace::default()).into()], false);
+    let mut resource_thunks = std::collections::BTreeSet::new();
+    for resource in &program.resources {
+        if !resource_thunks.insert(resource.drop_thunk.as_str()) {
+            continue;
+        }
+        let thunk = module.add_function(&resource.drop_thunk, resource_drop_ty, None);
+        thunk
+            .as_global_value()
+            .set_visibility(GlobalVisibility::Hidden);
+        mark_nounwind(ctx, thunk);
+        if let Some(hook) = program_funcs
+            .iter()
+            .find_map(|(name, function)| (name.as_str() == resource.drop_hook).then_some(*function))
+        {
+            let block = ctx.append_basic_block(thunk, "entry");
+            let builder = ctx.create_builder();
+            builder.position_at_end(block);
+            let handle = thunk
+                .get_nth_param(0)
+                .ok_or_else(|| CodegenError::Lowering("resource drop thunk lost its handle parameter".into()))?;
+            builder
+                .build_call(hook, &[handle.into()], "")
+                .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+            builder
+                .build_return(None)
+                .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+        }
+    }
+
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -1512,6 +1550,259 @@ fn build_module<'c>(
         )?;
     }
     Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
+}
+
+/// Recheck package-resource operations at the cached/hand-built MIR boundary. HIR validation
+/// proves these facts for normal lowering, but resource ids and safety discriminators live directly
+/// on MIR nodes and must fail closed before LLVM construction if an external producer corrupts them.
+fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
+    fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
+        Some(match operand {
+            align_mir::Operand::Const(align_mir::Const::Int(_, ty))
+            | align_mir::Operand::Const(align_mir::Const::Float(_, ty)) => *ty,
+            align_mir::Operand::Const(align_mir::Const::Char(_)) => Ty::Char,
+            align_mir::Operand::Const(align_mir::Const::Bool(_)) => Ty::Bool,
+            align_mir::Operand::Const(align_mir::Const::Unit) => Ty::Unit,
+            align_mir::Operand::Value(value) => *function.value_tys.get(*value as usize)?,
+            align_mir::Operand::Arg(index) => {
+                let slot = *function.params.get(*index as usize)?;
+                *function.slots.get(slot as usize)?
+            }
+            align_mir::Operand::BorrowedPlace(place) => place.ty,
+            align_mir::Operand::BorrowedCleanupArg(_) => Ty::Bool,
+        })
+    }
+
+    let fail = |function: &align_mir::Function, detail: &str| {
+        CodegenError::Lowering(format!(
+            "resource MIR in function '{}' is malformed: {detail}",
+            function.name
+        ))
+    };
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let align_mir::Stmt::Let(value, rvalue) = statement else {
+                    continue;
+                };
+                let result = function
+                    .value_tys
+                    .get(*value as usize)
+                    .copied()
+                    .ok_or_else(|| fail(function, "result value id is absent"))?;
+                let valid = match rvalue {
+                    Rvalue::RawIsNull(pointer) => {
+                        operand_ty(function, pointer) == Some(Ty::Raw) && result == Ty::Bool
+                    }
+                    Rvalue::ResourceFromRaw {
+                        raw,
+                        resource,
+                        parent,
+                        abort_on_null,
+                    } => {
+                        program.resources.get(*resource as usize).is_some()
+                            && operand_ty(function, raw) == Some(Ty::Raw)
+                            && result == Ty::Resource(*resource)
+                            && *abort_on_null
+                            && parent.as_ref().is_none_or(|parent| {
+                                matches!(operand_ty(function, parent), Some(Ty::ResourceRef(id))
+                                    if program.resources.get(id as usize).is_some())
+                            })
+                    }
+                    Rvalue::ResourceBorrow { owner, resource } => {
+                        program.resources.get(*resource as usize).is_some()
+                            && operand_ty(function, owner) == Some(Ty::Resource(*resource))
+                            && result == Ty::ResourceRef(*resource)
+                    }
+                    Rvalue::ResourceRaw {
+                        reference,
+                        resource,
+                    } => {
+                        program.resources.get(*resource as usize).is_some()
+                            && operand_ty(function, reference) == Some(Ty::ResourceRef(*resource))
+                            && result == Ty::Raw
+                    }
+                    Rvalue::ResourceIntoRaw { owner, resource } => {
+                        program.resources.get(*resource as usize).is_some()
+                            && operand_ty(function, owner) == Some(Ty::Resource(*resource))
+                            && result == Ty::Raw
+                    }
+                    Rvalue::ResourceViewFromRaw {
+                        owner,
+                        ptr,
+                        len,
+                        resource,
+                        view,
+                        allow_null_if_empty,
+                        check_nonnegative_len,
+                        check_alignment,
+                        check_utf8,
+                    } => {
+                        let expected = match view {
+                            hir::ResourceViewKind::StrUtf8 => Some((Ty::Option(Scalar::Str), 1, true)),
+                            hir::ResourceViewKind::Slice(Scalar::Int(integer)) => {
+                                align_sema::scalar_to_prim(Scalar::Int(*integer)).map(|primitive| {
+                                    (
+                                        Ty::Option(Scalar::Slice(primitive)),
+                                        u32::from(integer.bits) / 8,
+                                        false,
+                                    )
+                                })
+                            }
+                            hir::ResourceViewKind::Slice(Scalar::Float(float)) => {
+                                align_sema::scalar_to_prim(Scalar::Float(*float)).map(|primitive| {
+                                    (
+                                        Ty::Option(Scalar::Slice(primitive)),
+                                        u32::from(float.bits) / 8,
+                                        false,
+                                    )
+                                })
+                            }
+                            hir::ResourceViewKind::Slice(_) => None,
+                        };
+                        expected.is_some_and(|(expected, alignment, utf8)| {
+                            program.resources.get(*resource as usize).is_some()
+                                && operand_ty(function, owner)
+                                    == Some(Ty::ResourceRef(*resource))
+                                && operand_ty(function, ptr) == Some(Ty::Raw)
+                                && operand_ty(function, len)
+                                    == Some(Ty::Int(IntTy {
+                                        bits: 64,
+                                        signed: true,
+                                    }))
+                                && result == expected
+                                && *allow_null_if_empty
+                                && *check_nonnegative_len
+                                && *check_alignment == alignment
+                                && *check_utf8 == utf8
+                        })
+                    }
+                    _ => continue,
+                };
+                if !valid {
+                    return Err(fail(function, "resource operation contract mismatch"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate producer-owned resource records before LLVM symbols or types are created. Normal HIR
+/// lowering constructs these fields canonically; cached or hand-built MIR must not be able to
+/// redirect Drop to an arbitrary symbol, alias two incompatible resources onto one thunk, or call
+/// a hook through a disagreeing ABI.
+fn validate_resource_program(program: &Program) -> Result<(), CodegenError> {
+    let fail = |detail: String| {
+        CodegenError::Lowering(format!("resource metadata is malformed: {detail}"))
+    };
+    let valid_text = |value: &str| !value.is_empty() && !value.as_bytes().contains(&0);
+    let mut names = std::collections::HashSet::new();
+    let mut source_names = std::collections::HashSet::new();
+    let mut thunks = std::collections::HashMap::new();
+
+    for resource in &program.resources {
+        for (field, value) in [
+            ("name", resource.name.as_str()),
+            ("source name", resource.source_name.as_str()),
+            ("declaring module", resource.declaring_module.as_str()),
+            ("Drop hook", resource.drop_hook.as_str()),
+            ("Drop thunk", resource.drop_thunk.as_str()),
+        ] {
+            if !valid_text(value) {
+                return Err(fail(format!("resource {field} is empty or contains NUL")));
+            }
+        }
+        if !names.insert(resource.name.as_str()) {
+            return Err(fail(format!(
+                "duplicate concrete resource name '{}'",
+                resource.name
+            )));
+        }
+        if !source_names.insert(resource.source_name.as_str()) {
+            return Err(fail(format!(
+                "duplicate resource source identity '{}'",
+                resource.source_name
+            )));
+        }
+        if resource.representation_version != 1 {
+            return Err(fail(format!(
+                "resource '{}' uses representation version {}",
+                resource.source_name, resource.representation_version
+            )));
+        }
+        if resource.drop_abi_fingerprint != *b"align-res-drop-1" {
+            return Err(fail(format!(
+                "resource '{}' has an unsupported Drop ABI fingerprint",
+                resource.source_name
+            )));
+        }
+        if !resource.drop_thunk.starts_with("__align_resource_drop$") {
+            return Err(fail(format!(
+                "resource '{}' has a noncanonical Drop thunk",
+                resource.source_name
+            )));
+        }
+        if resource.generic_arity == 0
+            && resource.drop_thunk
+                != format!("__align_resource_drop${}", resource.source_name)
+        {
+            return Err(fail(format!(
+                "resource '{}' Drop thunk disagrees with its nominal identity",
+                resource.source_name
+            )));
+        }
+        let thunk_contract = (
+            resource.drop_hook.as_str(),
+            resource.representation_version,
+            resource.drop_abi_fingerprint,
+        );
+        if let Some(previous) = thunks.insert(resource.drop_thunk.as_str(), thunk_contract)
+            && previous != thunk_contract
+        {
+            return Err(fail(format!(
+                "Drop thunk '{}' is shared by incompatible resource records",
+                resource.drop_thunk
+            )));
+        }
+
+        if let Some(function) = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == resource.drop_hook)
+        {
+            let params = function
+                .params
+                .iter()
+                .filter_map(|slot| function.slots.get(*slot as usize))
+                .copied()
+                .collect::<Vec<_>>();
+            if params != [Ty::Raw]
+                || function.params.len() != 1
+                || function.param_modes != [align_ast::ParamMode::ByValue]
+                || function.ret != Ty::Unit
+            {
+                return Err(fail(format!(
+                    "resource '{}' Drop hook has a disagreeing stored-function ABI",
+                    resource.source_name
+                )));
+            }
+        }
+        if let Some(function) = program
+            .imported_fns
+            .iter()
+            .find(|function| function.name.as_str() == resource.drop_hook)
+            && (function.params != [Ty::Raw]
+                || function.param_modes != [align_ast::ParamMode::ByValue]
+                || function.ret != Ty::Unit)
+        {
+            return Err(fail(format!(
+                "resource '{}' Drop hook has a disagreeing imported-function ABI",
+                resource.source_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate the nested tagged table before any LLVM type lookup. This is the fail-closed seam for
@@ -1907,6 +2198,14 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 .ok_or_else(|| Self::invalid(format!("nested tagged type id {id} is missing")))
         }
 
+        fn require_resource(&self, id: u32) -> Result<(), CodegenError> {
+            self.program
+                .resources
+                .get(id as usize)
+                .map(|_| ())
+                .ok_or_else(|| Self::invalid(format!("resource type id {id} is missing")))
+        }
+
         fn enter_struct(
             &mut self,
             id: u32,
@@ -2006,6 +2305,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 }
                 Scalar::Enum(id) => self.require_enum(id),
                 Scalar::Tagged(id) => self.require_tagged(id),
+                Scalar::Resource(id) | Scalar::ResourceRef(id) => self.require_resource(id),
                 Scalar::Param(id) => Err(Self::invalid(format!(
                     "abstract tagged payload parameter {id} survived into MIR"
                 ))),
@@ -2073,6 +2373,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         Ty::Enum(id) => self.enter_enum(id, &mut work)?,
                         Ty::Tuple(id) => self.enter_tuple(id, &mut work)?,
                         Ty::Tagged(id) => self.enter_tagged(id, &mut work)?,
+                        Ty::Resource(id) | Ty::ResourceRef(id) => self.require_resource(id)?,
                         Ty::Option(payload)
                         | Ty::Array(payload, _)
                         | Ty::Vec(payload, _)
@@ -3949,6 +4250,7 @@ fn scalar_type<'c>(
         // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
         // table happens to have a row.
         Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Resource(_) | Ty::ResourceRef(_) => ctx.ptr_type(AddressSpace::default()).into(),
         _ if align_sema::is_move_handle(ty) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
@@ -4071,6 +4373,7 @@ fn abi_type<'c>(
         | Ty::Child
         | Ty::File
         | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Resource(_) | Ty::ResourceRef(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -4430,6 +4733,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Child => unreachable!("a child handle is not a box/array payload"),
         Scalar::RunOutput => unreachable!("a run_output handle is not a box/array payload"),
         Scalar::Fn(_) => 16,
+        Scalar::Resource(_) | Scalar::ResourceRef(_) => 8,
     }
 }
 
@@ -6782,7 +7086,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -6919,6 +7223,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.runtime(free_key), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
+                    } else if let Ty::Resource(id) = ty {
+                        let resource = self.program.resources.get(id as usize).ok_or_else(|| {
+                            self.err(format!("resource type id {id} is missing"))
+                        })?;
+                        let drop_thunk = self.module.get_function(&resource.drop_thunk).ok_or_else(|| {
+                            self.err(format!("resource drop thunk '{}' is missing", resource.drop_thunk))
+                        })?;
+                        let pointer = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropresource")
+                            .map_err(|error| self.err(error))?;
+                        self.builder
+                            .build_call(drop_thunk, &[pointer.into()], "")
+                            .map_err(|error| self.err(error))?;
                     } else if let Some(free_key) = handle_free_key(ty) {
                         // A bare Move **handle**: a writer flushes + closes; a reader closes; a buffer /
                         // cli / http handle frees; a tcp_conn / tcp_listener / udp_socket closes its
@@ -7811,6 +8129,234 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `raw.offset(p, n)` → `p + n` bytes, as a new `raw` pointer (a plain i8 GEP, no
                 // `inbounds` — unsafe pointer arithmetic must stay well-defined out of bounds).
                 self.raw_elem_ptr(ptr, offset)?.into()
+            }
+            Rvalue::RawIsNull(pointer) => self
+                .builder
+                .build_is_null(self.operand(pointer)?.into_pointer_value(), "raw.null")
+                .map_err(|e| self.err(e))?
+                .into(),
+            Rvalue::ResourceFromRaw {
+                raw,
+                parent: _,
+                abort_on_null,
+                ..
+            } => {
+                let pointer = self.operand(raw)?.into_pointer_value();
+                if *abort_on_null {
+                    let is_null = self
+                        .builder
+                        .build_is_null(pointer, "resource.null")
+                        .map_err(|e| self.err(e))?;
+                    let fail = self.ctx.append_basic_block(self.func, "resource.null.fail");
+                    let ok = self.ctx.append_basic_block(self.func, "resource.null.ok");
+                    self.builder
+                        .build_conditional_branch(is_null, fail, ok)
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(fail);
+                    self.builder
+                        .build_call(self.runtime(RuntimeKey::ProcessAbort), &[], "")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_unreachable().map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(ok);
+                }
+                pointer.into()
+            }
+            Rvalue::ResourceBorrow { owner, .. }
+            | Rvalue::ResourceIntoRaw { owner, .. } => self.operand(owner)?,
+            Rvalue::ResourceRaw { reference, .. } => self.operand(reference)?,
+            Rvalue::ResourceViewFromRaw {
+                owner: _,
+                ptr,
+                len,
+                view,
+                allow_null_if_empty,
+                check_nonnegative_len,
+                check_alignment,
+                check_utf8,
+                ..
+            } => {
+                let pointer = self.operand(ptr)?.into_pointer_value();
+                let length = self.operand(len)?.into_int_value();
+                let zero = self.ctx.i64_type().const_zero();
+                let length_negative = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, length, zero, "resource.len.negative")
+                    .map_err(|e| self.err(e))?;
+                let length_zero = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, length, zero, "resource.len.zero")
+                    .map_err(|e| self.err(e))?;
+                let pointer_null = self
+                    .builder
+                    .build_is_null(pointer, "resource.ptr.null")
+                    .map_err(|e| self.err(e))?;
+                let null_allowed = if *allow_null_if_empty {
+                    length_zero
+                } else {
+                    self.ctx.bool_type().const_zero()
+                };
+                let pointer_valid = self
+                    .builder
+                    .build_or(
+                        self.builder
+                            .build_not(pointer_null, "resource.ptr.nonnull")
+                            .map_err(|e| self.err(e))?,
+                        null_allowed,
+                        "resource.ptr.valid",
+                    )
+                    .map_err(|e| self.err(e))?;
+                let length_valid = if *check_nonnegative_len {
+                    self.builder
+                        .build_not(length_negative, "resource.len.valid")
+                        .map_err(|e| self.err(e))?
+                } else {
+                    self.ctx.bool_type().const_int(1, false)
+                };
+                let max_elements = self.ctx.i64_type().const_int(
+                    (i64::MAX as u64) / u64::from(*check_alignment),
+                    false,
+                );
+                let length_representable = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::ULE,
+                        length,
+                        max_elements,
+                        "resource.len.representable",
+                    )
+                    .map_err(|e| self.err(e))?;
+                let address = self
+                    .builder
+                    .build_ptr_to_int(pointer, self.ctx.i64_type(), "resource.addr")
+                    .map_err(|e| self.err(e))?;
+                let misalignment = self
+                    .builder
+                    .build_and(
+                        address,
+                        self.ctx
+                            .i64_type()
+                            .const_int(u64::from(check_alignment.saturating_sub(1)), false),
+                        "resource.misalignment",
+                    )
+                    .map_err(|e| self.err(e))?;
+                let aligned = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, misalignment, zero, "resource.aligned")
+                    .map_err(|e| self.err(e))?;
+                let valid = self
+                    .builder
+                    .build_and(pointer_valid, length_valid, "resource.valid.length")
+                    .map_err(|e| self.err(e))?;
+                let valid = self
+                    .builder
+                    .build_and(
+                        valid,
+                        length_representable,
+                        "resource.valid.representable",
+                    )
+                    .map_err(|e| self.err(e))?;
+                let valid = self
+                    .builder
+                    .build_and(valid, aligned, "resource.valid.alignment")
+                    .map_err(|e| self.err(e))?;
+
+                let valid = if *check_utf8 {
+                    let check = self.ctx.append_basic_block(self.func, "resource.utf8.check");
+                    let invalid = self.ctx.append_basic_block(self.func, "resource.utf8.skip");
+                    let join = self.ctx.append_basic_block(self.func, "resource.utf8.join");
+                    self.builder
+                        .build_conditional_branch(valid, check, invalid)
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(check);
+                    let utf8 = self
+                        .builder
+                        .build_call(
+                            self.runtime(RuntimeKey::Utf8Valid),
+                            &[pointer.into(), length.into()],
+                            "resource.utf8",
+                        )
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .expect("utf8_valid returns i32")
+                        .into_int_value();
+                    let utf8_valid = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            utf8,
+                            self.ctx.i32_type().const_zero(),
+                            "resource.utf8.valid",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_unconditional_branch(join)
+                        .map_err(|e| self.err(e))?;
+                    let check_end = self.builder.get_insert_block().expect("utf8 check block");
+                    self.builder.position_at_end(invalid);
+                    self.builder
+                        .build_unconditional_branch(join)
+                        .map_err(|e| self.err(e))?;
+                    let invalid_end = self.builder.get_insert_block().expect("utf8 skip block");
+                    self.builder.position_at_end(join);
+                    let phi = self
+                        .builder
+                        .build_phi(self.ctx.bool_type(), "resource.view.valid")
+                        .map_err(|e| self.err(e))?;
+                    phi.add_incoming(&[
+                        (&utf8_valid, check_end),
+                        (&self.ctx.bool_type().const_zero(), invalid_end),
+                    ]);
+                    phi.as_basic_value().into_int_value()
+                } else {
+                    valid
+                };
+
+                let Ty::Option(payload) = result_ty else {
+                    return Err(self.err("resource view result is not an Option"));
+                };
+                let expected_payload = match view {
+                    hir::ResourceViewKind::StrUtf8 => Scalar::Str,
+                    hir::ResourceViewKind::Slice(scalar) => Scalar::Slice(
+                        align_sema::scalar_to_prim(*scalar)
+                            .ok_or_else(|| self.err("resource slice view element is not primitive"))?,
+                    ),
+                };
+                if payload != expected_payload {
+                    return Err(self.err("resource view result payload does not match its view kind"));
+                }
+                let slice_ty = slice_struct_type(self.ctx);
+                let slice = self
+                    .builder
+                    .build_insert_value(slice_ty.const_zero(), pointer, 0, "resource.view.ptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let slice = self
+                    .builder
+                    .build_insert_value(slice, length, 1, "resource.view.len")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let option_ty = option_struct_type(
+                    self.ctx,
+                    payload,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                let tag = self
+                    .builder
+                    .build_int_z_extend(valid, self.ctx.i8_type(), "resource.view.tag")
+                    .map_err(|e| self.err(e))?;
+                let option = self
+                    .builder
+                    .build_insert_value(option_ty.const_zero(), tag, 0, "resource.view.tag")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(option, slice, 1, "resource.view")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
             }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(
@@ -10956,6 +11502,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Child
             | Ty::File
             | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Resource(_) | Ty::ResourceRef(_) => {
+                self.ctx.ptr_type(AddressSpace::default()).into()
+            }
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(
                 self.ctx,
@@ -11218,6 +11767,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "drophandlev")
                         .map_err(|e| self.err(e))?;
                     self.builder.build_call(self.runtime(free_key), &[p.into()], "").map_err(|e| self.err(e))?;
+                }
+                // A package-defined resource field uses its declaration-owned hidden thunk. Keep
+                // aggregate cleanup on the same pointer-based dispatcher as a standalone resource
+                // local so adding a nominal wrapper cannot suppress the package destructor.
+                ty @ Ty::Resource(_) => {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropresourcefield")
+                        .map_err(|error| self.err(error))?;
+                    self.drop_ty_at(fp, ty)?;
                 }
                 _ => {}
             }
@@ -13295,6 +13854,49 @@ mod tests {
         emit_llvm_ir(&mir(src), &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
+    fn test_resource() -> hir::ResourceDef {
+        hir::ResourceDef {
+            name: "pkg$db$conn".into(),
+            source_name: "pkg$db$conn".into(),
+            declaring_module: "pkg.db".into(),
+            generic_arity: 0,
+            drop_hook: "pkg.db.internal.resource$drop_conn".into(),
+            drop_thunk: "__align_resource_drop$pkg$db$conn".into(),
+            representation_version: 1,
+            drop_abi_fingerprint: *b"align-res-drop-1",
+        }
+    }
+
+    #[test]
+    fn resource_metadata_fails_closed_before_llvm_construction() {
+        let mut valid = mir("fn main() -> i32 = 0\n");
+        valid.resources.push(test_resource());
+        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, false, &[], None).unwrap();
+        assert!(llvm.contains("__align_resource_drop$pkg$db$conn"));
+
+        let rejected = |program: &Program, needle: &str| {
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("malformed resource metadata must fail closed");
+            assert!(error.to_string().contains(needle), "{error}");
+        };
+
+        let mut bad_version = valid.clone();
+        bad_version.resources[0].representation_version = 2;
+        rejected(&bad_version, "representation version 2");
+
+        let mut bad_fingerprint = valid.clone();
+        bad_fingerprint.resources[0].drop_abi_fingerprint = [0; 16];
+        rejected(&bad_fingerprint, "unsupported Drop ABI fingerprint");
+
+        let mut redirected = valid.clone();
+        redirected.resources[0].drop_thunk = "arbitrary_symbol".into();
+        rejected(&redirected, "noncanonical Drop thunk");
+
+        let mut duplicate = valid;
+        duplicate.resources.push(test_resource());
+        rejected(&duplicate, "duplicate concrete resource name");
+    }
+
     #[test]
     fn runtime_abi_declaration_order_is_runtime_key_all_order() {
         let expected: Vec<_> = runtime_abi::keyed_runtime_abis()
@@ -14291,6 +14893,7 @@ mod tests {
             link_libs: vec![],
             structs,
             enums,
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -14364,6 +14967,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -14419,6 +15023,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -14469,6 +15074,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -14511,6 +15117,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![hir::TaggedType::Option(payload)],
             fn_types: vec![],
             tuples: vec![],
@@ -14564,6 +15171,7 @@ mod tests {
             link_libs: vec![],
             structs,
             enums,
+            resources: vec![],
             tagged_types,
             fn_types: vec![],
             tuples: vec![],
@@ -14642,6 +15250,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -14894,6 +15503,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![hir::TaggedType::Option(Scalar::String)],
             fn_types: vec![],
             tuples: vec![],
@@ -14936,6 +15546,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![TupleDef {
@@ -14985,6 +15596,7 @@ mod tests {
                 c_repr: false,
             }],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![TupleDef {
@@ -15034,6 +15646,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: vec![],
             tagged_types,
             fn_types: vec![],
             tuples: vec![],
@@ -15812,6 +16425,7 @@ mod tests {
             link_libs: vec![],
             structs,
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -15875,6 +16489,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],
@@ -15925,6 +16540,7 @@ mod tests {
             link_libs: vec![],
             structs: vec![row],
             enums: vec![],
+            resources: Vec::new(),
             tagged_types: vec![],
             fn_types: vec![],
             tuples: vec![],

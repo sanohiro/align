@@ -128,6 +128,9 @@ pub struct IFnSig {
     pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
+    /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
+    /// resource Drop hook. This is semantic validation metadata, not an importable hook path.
+    pub resource_hook_body: bool,
     /// For a generic `pub` template: the declaration's source text (the body is part of the
     /// interface, C++-template-like — editing it invalidates consumers). `None` for a non-generic fn
     /// (whose body lives in the implementation, not the interface).
@@ -160,6 +163,18 @@ pub struct IEnumDef {
     pub generic_body: Option<String>,
 }
 
+/// An exported nominal native-resource definition. The internal source hook is intentionally not
+/// part of the consumer API; cleanup links through the producer-owned support thunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IResourceDef {
+    pub name: String,
+    pub type_params: Vec<ITypeParam>,
+    pub generic_arity: u32,
+    pub representation_version: u32,
+    pub drop_thunk: String,
+    pub drop_abi_fingerprint: [u8; 16],
+}
+
 /// An exported (`pub`) compile-time constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IConst {
@@ -181,6 +196,8 @@ pub struct InterfaceSummary {
     pub structs: Vec<IStructDef>,
     /// Exported sum types, sorted by name.
     pub enums: Vec<IEnumDef>,
+    /// Exported native resources, sorted by nominal name.
+    pub resources: Vec<IResourceDef>,
     /// Exported consts, sorted by name.
     pub consts: Vec<IConst>,
     /// The unit's capability set (gated external libraries its code needs), sorted. Link-summary
@@ -401,6 +418,7 @@ pub fn build_summaries_with_effects(
         let mut fns: Vec<IFnSig> = Vec::new();
         let mut structs: Vec<IStructDef> = Vec::new();
         let mut enums: Vec<IEnumDef> = Vec::new();
+        let mut resources: Vec<IResourceDef> = Vec::new();
         let mut consts: Vec<IConst> = Vec::new();
 
         for item in &m.file.items {
@@ -471,6 +489,7 @@ pub fn build_summaries_with_effects(
                             return_region,
                             return_cleanup,
                             effect,
+                            resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
                     }
@@ -557,6 +576,29 @@ pub fn build_summaries_with_effects(
                     }
                     // Non-pub enums are module-private: not part of the exported interface surface.
                 }
+                align_ast::Item::Resource(resource) => {
+                    if is_pub(resource.vis) {
+                        let canonical = mangle(&m.path, m.is_entry, &resource.name.name);
+                        let resolved = program.resources.iter().find(|definition| {
+                            definition.source_name == canonical || definition.name == canonical
+                        });
+                        resources.push(IResourceDef {
+                            name: resource.name.name.clone(),
+                            type_params: convert_type_params(&resource.type_params),
+                            generic_arity: resource.type_params.len() as u32,
+                            representation_version: resolved
+                                .map_or(1, |definition| definition.representation_version),
+                            drop_thunk: resolved.map_or_else(
+                                || format!("__align_resource_drop${canonical}"),
+                                |definition| definition.drop_thunk.clone(),
+                            ),
+                            drop_abi_fingerprint: resolved.map_or(
+                                *b"align-res-drop-1",
+                                |definition| definition.drop_abi_fingerprint,
+                            ),
+                        });
+                    }
+                }
                 align_ast::Item::Const(cd) => {
                     if is_pub(cd.vis) {
                         consts.push(IConst {
@@ -579,6 +621,7 @@ pub fn build_summaries_with_effects(
         fns.sort_by(|a, b| a.name.cmp(&b.name));
         structs.sort_by(|a, b| a.name.cmp(&b.name));
         enums.sort_by(|a, b| a.name.cmp(&b.name));
+        resources.sort_by(|a, b| a.name.cmp(&b.name));
         consts.sort_by(|a, b| a.name.cmp(&b.name));
 
         let mut capabilities = caps_by_unit.get(&m.path).cloned().unwrap_or_default();
@@ -591,6 +634,7 @@ pub fn build_summaries_with_effects(
             fns,
             structs,
             enums,
+            resources,
             consts,
             capabilities,
             interface_hash: Hash128 { lo: 0, hi: 0 },
@@ -853,6 +897,13 @@ pub enum ImportCompatibilityError {
     GenericCLayoutUnsupported(String),
     GenericBodySyntax(String),
     GenericBodyMismatch(String),
+    ResourceArityMismatch(String),
+    ResourceRepresentationVersion {
+        name: String,
+        version: u32,
+    },
+    ResourceDropThunk(String),
+    ResourceDropAbi(String),
     BorrowParamNotMove,
     ReturnSummaryOnNonBorrowingType,
     ReturnSummaryRootCannotBorrow(u32),
@@ -915,6 +966,21 @@ impl std::fmt::Display for ImportCompatibilityError {
                     "generic interface declaration `{name}` disagrees with its structured record"
                 )
             }
+            ImportCompatibilityError::ResourceArityMismatch(name) => {
+                write!(f, "interface resource `{name}` has inconsistent generic arity")
+            }
+            ImportCompatibilityError::ResourceRepresentationVersion { name, version } => {
+                write!(
+                    f,
+                    "interface resource `{name}` uses unsupported representation version {version}"
+                )
+            }
+            ImportCompatibilityError::ResourceDropThunk(name) => {
+                write!(f, "interface resource `{name}` has a noncanonical Drop thunk")
+            }
+            ImportCompatibilityError::ResourceDropAbi(name) => {
+                write!(f, "interface resource `{name}` has an unsupported Drop ABI fingerprint")
+            }
             ImportCompatibilityError::BorrowParamNotMove => {
                 write!(f, "interface borrowed parameter does not have a provably Move type")
             }
@@ -967,6 +1033,7 @@ impl std::error::Error for ImportCompatibilityError {}
 enum LocalDefinition<'a> {
     Struct(&'a IStructDef),
     Enum(&'a IEnumDef),
+    Resource(&'a IResourceDef),
 }
 
 impl<'a> LocalDefinition<'a> {
@@ -974,6 +1041,7 @@ impl<'a> LocalDefinition<'a> {
         match self {
             LocalDefinition::Struct(definition) => &definition.type_params,
             LocalDefinition::Enum(definition) => &definition.type_params,
+            LocalDefinition::Resource(definition) => &definition.type_params,
         }
     }
 
@@ -987,6 +1055,7 @@ impl<'a> LocalDefinition<'a> {
                 .iter()
                 .flat_map(|(_, payload)| payload)
                 .collect(),
+            LocalDefinition::Resource(_) => Vec::new(),
         }
     }
 }
@@ -1011,6 +1080,12 @@ impl<'a> LocalDefinitionIndex<'a> {
                     .iter()
                     .map(|definition| &definition.name),
             )
+            .chain(
+                summary
+                    .resources
+                    .iter()
+                    .map(|definition| &definition.name),
+            )
         {
             if is_reserved_local_type_name(name) {
                 return Err(ImportCompatibilityError::ReservedLocalType(
@@ -1018,7 +1093,9 @@ impl<'a> LocalDefinitionIndex<'a> {
                 ));
             }
         }
-        let mut definitions = Vec::with_capacity(summary.structs.len() + summary.enums.len());
+        let mut definitions = Vec::with_capacity(
+            summary.structs.len() + summary.enums.len() + summary.resources.len(),
+        );
         let mut by_name = HashMap::new();
         for definition in &summary.structs {
             if by_name
@@ -1041,6 +1118,17 @@ impl<'a> LocalDefinitionIndex<'a> {
                 ));
             }
             definitions.push(LocalDefinition::Enum(definition));
+        }
+        for definition in &summary.resources {
+            if by_name
+                .insert(definition.name.as_str(), definitions.len())
+                .is_some()
+            {
+                return Err(ImportCompatibilityError::DuplicateLocalType(
+                    definition.name.clone(),
+                ));
+            }
+            definitions.push(LocalDefinition::Resource(definition));
         }
         let mut total_params = 0usize;
         let mut param_offsets = Vec::with_capacity(definitions.len());
@@ -1094,7 +1182,9 @@ fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
         "str" | "reader" | "writer" | "http_headers" | "json.doc" => {
             (0, BuiltinCapability::BorrowLeaf)
         }
-        "slice" | "soa" | "json.scanner" => (1, BuiltinCapability::BorrowLeaf),
+        "slice" | "soa" | "json.scanner" | "resource_ref" => {
+            (1, BuiltinCapability::BorrowLeaf)
+        }
         "Option" | "array" => (1, BuiltinCapability::Transparent),
         "Result" => (2, BuiltinCapability::Transparent),
         "box" | "array_builder" => (1, BuiltinCapability::Opaque),
@@ -1263,6 +1353,9 @@ impl<'a> CapabilityAnalysis<'a> {
             for index in 0..self.index.definitions.len() {
                 let definition = self.index.definitions[index];
                 let mut next = OwnershipFacts::empty(definition.type_params().len());
+                if matches!(definition, LocalDefinition::Resource(_)) {
+                    next.intrinsic = true;
+                }
                 for value in definition.values() {
                     next.union(&self.eval_ownership(
                         value,
@@ -1397,6 +1490,12 @@ impl<'a> CapabilityAnalysis<'a> {
             for index in 0..self.index.definitions.len() {
                 let definition = self.index.definitions[index];
                 let mut next = self.borrow[index].clone();
+                if matches!(definition, LocalDefinition::Resource(_)) {
+                    // A resource may carry one inferred parent generation even though its public
+                    // representation is always one pointer. Treat it as a borrow-capable leaf so
+                    // imported return provenance cannot be discarded by interface validation.
+                    next.intrinsic = true;
+                }
                 for value in definition.values() {
                     next.union(&self.eval_borrow(
                         value,
@@ -1689,9 +1788,49 @@ fn validate_import_shapes(
             }
         }
     }
+    for resource in &summary.resources {
+        validate_type_params(&resource.type_params, index)?;
+    }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
             validate_import_type_shape(ty, index, &[])?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_resources(
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
+    for resource in &summary.resources {
+        if resource.generic_arity as usize != resource.type_params.len() {
+            return Err(ImportCompatibilityError::ResourceArityMismatch(
+                resource.name.clone(),
+            ));
+        }
+        if resource.representation_version != 1 {
+            return Err(
+                ImportCompatibilityError::ResourceRepresentationVersion {
+                    name: resource.name.clone(),
+                    version: resource.representation_version,
+                },
+            );
+        }
+        let mut qualified = format!("__align_resource_drop${}", summary.unit);
+        qualified.push('$');
+        qualified.push_str(&resource.name);
+        let entry = format!("__align_resource_drop${}", resource.name);
+        if resource.drop_thunk != qualified
+            && !(summary.unit == "main" && resource.drop_thunk == entry)
+        {
+            return Err(ImportCompatibilityError::ResourceDropThunk(
+                resource.name.clone(),
+            ));
+        }
+        if resource.drop_abi_fingerprint != *b"align-res-drop-1" {
+            return Err(ImportCompatibilityError::ResourceDropAbi(
+                resource.name.clone(),
+            ));
         }
     }
     Ok(())
@@ -2057,6 +2196,7 @@ pub fn validate_for_import(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
     let index = LocalDefinitionIndex::new(summary)?;
+    validate_import_resources(summary)?;
     validate_import_shapes(summary, &index)?;
     validate_import_generic_bodies(summary)?;
     validate_import_headers(summary)?;
@@ -2141,6 +2281,19 @@ fn render_fn(f: &IFnSig) -> String {
     format!("pub fn {}({params}){ret} {{}}\n", f.name)
 }
 
+fn render_resource(resource: &IResourceDef, unit: &str) -> String {
+    // The internal hook path is not a public interface field. This declaration is parsed only in
+    // an interface-only module; sema restores the producer-owned thunk metadata out of band and
+    // deliberately never resolves this inert placeholder path.
+    format!(
+        "pub resource {}{} = {}.internal.resource.__align_interface_drop_{}\n",
+        resource.name,
+        render_type_params(&resource.type_params),
+        unit,
+        resource.name,
+    )
+}
+
 /// Render an imported unit's `InterfaceSummary` back to Align source: exactly its public surface, as
 /// the consumer's per-unit sema must re-parse it to resolve `dep.name`. `dep_units` are the names of
 /// the other units in the transitive dependency set; each is `import`ed so any module reference in a
@@ -2173,6 +2326,9 @@ pub fn summary_to_source(
     }
     for e in &summary.enums {
         out.push_str(&render_enum(e));
+    }
+    for resource in &summary.resources {
+        out.push_str(&render_resource(resource, &summary.unit));
     }
     for f in &summary.fns {
         out.push_str(&render_fn(f));
@@ -2227,4 +2383,46 @@ pub fn summary_return_provenance(
         );
     }
     facts
+}
+
+
+/// Producer-owned resource facts keyed by the canonical non-entry nominal identity used when a
+/// dependency is reconstructed as an interface-only module.
+pub fn summary_resource_facts(
+    summary: &InterfaceSummary,
+) -> align_sema::ExternalResourceFacts {
+    summary
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                mangle(&summary.unit, false, &resource.name),
+                align_sema::ExternalResourceFact {
+                    generic_arity: resource.generic_arity,
+                    representation_version: resource.representation_version,
+                    drop_thunk: resource.drop_thunk.clone(),
+                    drop_abi_fingerprint: resource.drop_abi_fingerprint,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Producer-checked raw-hook body facts for per-unit consumers. Generic functions are excluded:
+/// resource hooks are required to be non-generic before this fact is consulted.
+pub fn summary_resource_hook_facts(
+    summary: &InterfaceSummary,
+    is_entry: bool,
+) -> align_sema::ExternalResourceHookFacts {
+    summary
+        .fns
+        .iter()
+        .filter(|function| function.generic_body.is_none())
+        .map(|function| {
+            (
+                mangle(&summary.unit, is_entry, &function.name),
+                function.resource_hook_body,
+            )
+        })
+        .collect()
 }

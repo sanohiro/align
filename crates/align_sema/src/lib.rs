@@ -217,15 +217,19 @@ pub enum Scalar {
     /// non-capturing fn's `region_of` is `Static`, so a fn-payload enum stays freely returnable and
     /// array-eligible in practice (a `Route { handler: Handler }` table is fine).
     Fn(u32),
+    /// A concrete nominal native resource. One non-null pointer, Move, recursively droppable.
+    Resource(u32),
+    /// A checked non-owning borrow of a concrete nominal native resource. One pointer, Copy.
+    ResourceRef(u32),
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b),
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
-    /// `tcp_listener`, and a `udp_socket`.
+    /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::Resource(_))
     }
 }
 
@@ -389,6 +393,10 @@ pub enum Ty {
     /// — the memory is manually managed, which is why `raw.*` ops are confined to an `unsafe {}` block.
     /// Lowers to an LLVM `ptr`, like the other opaque-pointer types.
     Raw,
+    /// A concrete nominal native resource. The id indexes [`hir::Program::resources`].
+    Resource(u32),
+    /// A checked non-owning resource view; the id is the exact owner's nominal resource id.
+    ResourceRef(u32),
     /// `builder` — an append-oriented string writer (draft.md §12), the canonical way to
     /// construct a `string`. An opaque owned handle to a heap builder
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
@@ -639,6 +647,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
         Ty::Struct(id) => Some(Scalar::Struct(id)),
+        Ty::Resource(id) => Some(Scalar::Resource(id)),
+        Ty::ResourceRef(id) => Some(Scalar::ResourceRef(id)),
         Ty::String => Some(Scalar::String),
         // An owned `array<T>` is a payload only when its element is primitive (slice 8b).
         Ty::DynArray(elem) => scalar_to_prim(elem).map(Scalar::DynArray),
@@ -730,6 +740,8 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
         Scalar::Struct(id) => Ty::Struct(id),
+        Scalar::Resource(id) => Ty::Resource(id),
+        Scalar::ResourceRef(id) => Ty::ResourceRef(id),
         Scalar::String => Ty::String,
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
@@ -1301,6 +1313,7 @@ pub fn drop_plan(
                         | Ty::Command
                         | Ty::RunOutput
                         | Ty::DictEncoded(..)
+                        | Ty::Resource(_)
                 ) =>
             {
                 built.push(Built {
@@ -1450,6 +1463,76 @@ fn ty_mentions_slice(
     false
 }
 
+/// Whether a type contains an owning native resource or its checked reference. Resource-bearing
+/// values are legal in one-owner structs/sums, but v1 excludes every such shape from fixed arrays,
+/// pipeline elements, and spawned-task captures. Keep this recursive classifier shared by those
+/// gates so an aggregate wrapper cannot turn the restriction into a shallow type-name check.
+fn ty_mentions_resource(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Resource(_) | Ty::ResourceRef(_) => return true,
+            Ty::Array(scalar, _)
+            | Ty::DynArray(scalar)
+            | Ty::Option(scalar)
+            | Ty::Task(scalar)
+            | Ty::Box(scalar) => work.push(scalar_to_ty(scalar)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Struct(id) | Ty::StructArray(id, _) | Ty::DynStructArray(id, _)
+                if visited_structs.insert(id) =>
+            {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(enumeration) = enums.get(id as usize) {
+                    work.extend(
+                        enumeration
+                            .variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
 /// same cycle-safe graph classification when deciding whether an indexed result retains a
 /// synthetic temporary owner or can release it immediately after a scalar load. This is narrower
@@ -1483,7 +1566,9 @@ pub fn ty_may_borrow(
             | Ty::JsonScanner(_)
             | Ty::DictEncoded(..)
             | Ty::DynSliceArray(_)
-            | Ty::Fn(_) => return true,
+            | Ty::Fn(_)
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_) => return true,
             Ty::Tagged(id) if visited_tagged.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
@@ -2277,6 +2362,21 @@ fn mangle_fn(module: &str, is_entry: bool, name: &str) -> String {
         name.to_string()
     } else {
         format!("{module}${name}")
+    }
+}
+
+pub fn resource_hook_has_unsafe_body(body: &ast::FnBody) -> bool {
+    fn is_unsafe_expression(expression: &ast::Expr) -> bool {
+        matches!(expression.kind, ast::ExprKind::Unsafe(_))
+    }
+    match body {
+        ast::FnBody::Expr(expression) => is_unsafe_expression(expression),
+        ast::FnBody::Block(block) => {
+            block.stmts.iter().any(|statement| match statement {
+                ast::Stmt::Expr(expression) => is_unsafe_expression(expression),
+                _ => false,
+            }) || block.tail.as_deref().is_some_and(is_unsafe_expression)
+        }
     }
 }
 
@@ -3343,6 +3443,23 @@ pub type ExternalReturnProvenance =
         ),
     >;
 
+/// Resource metadata that cannot be represented by synthesized interface source. The producer
+/// owns the linkable Drop thunk identity; consumers must reuse it verbatim rather than deriving a
+/// symbol from the placeholder hook used to reconstruct the public declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalResourceFact {
+    pub generic_arity: u32,
+    pub representation_version: u32,
+    pub drop_thunk: String,
+    pub drop_abi_fingerprint: [u8; 16],
+}
+
+pub type ExternalResourceFacts = std::collections::HashMap<String, ExternalResourceFact>;
+/// Producer-validated top-level unsafe-body shape for public raw-hook candidates reconstructed from
+/// interfaces. The bit is stable across valid hook-body edits and prevents per-unit checking from
+/// trusting an empty synthesized function body.
+pub type ExternalResourceHookFacts = std::collections::HashMap<String, bool>;
+
 /// M15 S1b compatibility entry point. L2b callers that reconstruct interface-only dependencies use
 /// [`check_program_with_interface_facts`] so imported return provenance is preserved as well.
 pub fn check_program_with_effects(
@@ -3365,6 +3482,25 @@ pub fn check_program_with_interface_facts(
     external_return_provenance: &ExternalReturnProvenance,
     diags: &mut Diagnostics,
 ) -> Program {
+    check_program_with_all_interface_facts(
+        modules,
+        external_effects,
+        external_return_provenance,
+        &HashMap::new(),
+        &HashMap::new(),
+        diags,
+    )
+}
+
+/// Per-unit checking with all producer-owned semantic facts restored from dependency interfaces.
+pub fn check_program_with_all_interface_facts(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    external_return_provenance: &ExternalReturnProvenance,
+    external_resources: &ExternalResourceFacts,
+    external_resource_hooks: &ExternalResourceHookFacts,
+    diags: &mut Diagnostics,
+) -> Program {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -3375,9 +3511,12 @@ pub fn check_program_with_interface_facts(
     let mut struct_decls: Vec<(&str, bool, &ast::StructDecl)> = Vec::new();
     let mut enum_ids: HashMap<String, u32> = HashMap::new();
     let mut enum_decls: Vec<(&str, bool, &ast::EnumDecl)> = Vec::new();
+    let mut resource_ids: HashMap<String, u32> = HashMap::new();
+    let mut resource_decls: Vec<(&str, bool, &ast::ResourceDecl)> = Vec::new();
     // Generic templates (`Pair<T>` / `Opt<T>`) — kept separate from concrete structs / enums.
     let mut generic_struct_decls: Vec<(&str, bool, &ast::StructDecl)> = Vec::new();
     let mut generic_enum_decls: Vec<(&str, bool, &ast::EnumDecl)> = Vec::new();
+    let mut generic_resource_decls: Vec<(&str, bool, &ast::ResourceDecl)> = Vec::new();
     let mut type_table: ModTypes = HashMap::new();
     for m in modules {
         // Ensure the module has an entry even if it declares no types (so a bare lookup in it is a
@@ -3387,6 +3526,7 @@ pub fn check_program_with_interface_facts(
             let (bare, vis, type_params, span) = match item {
                 ast::Item::Struct(s) => (&s.name.name, s.vis, s.type_params.len(), s.span),
                 ast::Item::Enum(e) => (&e.name.name, e.vis, e.type_params.len(), e.span),
+                ast::Item::Resource(r) => (&r.name.name, r.vis, r.type_params.len(), r.span),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
             if bare == "Error" {
@@ -3444,6 +3584,11 @@ pub fn check_program_with_interface_facts(
                     enum_decls.push((m.path.as_str(), m.is_entry, e));
                 }
                 ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
+                ast::Item::Resource(r) if type_params == 0 => {
+                    resource_ids.insert(canonical, resource_decls.len() as u32);
+                    resource_decls.push((m.path.as_str(), m.is_entry, r));
+                }
+                ast::Item::Resource(r) => generic_resource_decls.push((m.path.as_str(), m.is_entry, r)),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => unreachable!(),
             }
         }
@@ -3462,6 +3607,7 @@ pub fn check_program_with_interface_facts(
                 ast::Item::Fn(function) => &function.type_params,
                 ast::Item::Struct(structure) => &structure.type_params,
                 ast::Item::Enum(enumeration) => &enumeration.type_params,
+                ast::Item::Resource(resource) => &resource.type_params,
                 ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
             validate_declared_type_parameters(parameters, local_types, diags);
@@ -3575,6 +3721,31 @@ pub fn check_program_with_interface_facts(
         })
         .collect();
     let mut enum_mono: HashMap<String, u32> = HashMap::new();
+    let mut resources: Vec<hir::ResourceDef> = resource_decls
+        .iter()
+        .map(|(module, is_entry, declaration)| {
+            let name = mangle_fn(module, *is_entry, &declaration.name.name);
+            let external = external_resources.get(&name);
+            hir::ResourceDef {
+                source_name: name.clone(),
+                declaring_module: (*module).to_string(),
+                drop_hook: path_str(&declaration.drop_hook),
+                drop_thunk: external
+                    .map_or_else(|| resource_drop_thunk(&name), |fact| fact.drop_thunk.clone()),
+                name,
+                generic_arity: 0,
+                representation_version: external.map_or(
+                    RESOURCE_REPRESENTATION_VERSION,
+                    |fact| fact.representation_version,
+                ),
+                drop_abi_fingerprint: external.map_or(
+                    RESOURCE_DROP_ABI_FINGERPRINT,
+                    |fact| fact.drop_abi_fingerprint,
+                ),
+            }
+        })
+        .collect();
+    let mut resource_mono: HashMap<String, u32> = HashMap::new();
     // Resolution context for type-declaration passes (0b/0c, templates): a bare field/payload type
     // resolves in the declaring module; a qualified `field: other.Type` resolves against that
     // module's imports. `no_imports` is the fallback for a module with none / not in the map.
@@ -3713,9 +3884,11 @@ pub fn check_program_with_interface_facts(
     // generic def, so empty template maps suffice while building them.
     let mut struct_templates: HashMap<String, StructTemplate> = HashMap::new();
     let mut enum_templates: HashMap<String, EnumTemplate> = HashMap::new();
+    let mut resource_templates: HashMap<String, ResourceTemplate> = HashMap::new();
     {
         let est: HashMap<String, StructTemplate> = HashMap::new();
         let eet: HashMap<String, EnumTemplate> = HashMap::new();
+        let ert: HashMap<String, ResourceTemplate> = HashMap::new();
         macro_rules! build_cx {
             ($module:expr) => {
                 &mut TyCx {
@@ -3724,6 +3897,7 @@ pub fn check_program_with_interface_facts(
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
+                    resource_ids: &resource_ids,
                     struct_source_spellings: &mut struct_source_spellings,
                     enum_source_spellings: &mut enum_source_spellings,
                     struct_templates: &est,
@@ -3732,6 +3906,9 @@ pub fn check_program_with_interface_facts(
                     enum_templates: &eet,
                     enums: &mut enums,
                     enum_mono: &mut enum_mono,
+                    resource_templates: &ert,
+                    resources: &mut resources,
+                    resource_mono: &mut resource_mono,
                     tuples: &mut tuples,
                     fn_types: &mut fn_types,
                     tagged_types: &mut tagged_types,
@@ -3784,6 +3961,28 @@ pub fn check_program_with_interface_facts(
             }
             enum_templates.insert(mangle_fn(module, *is_entry, &e.name.name), EnumTemplate { type_params: tparams, variants });
         }
+        for (module, is_entry, resource) in &generic_resource_decls {
+            let canonical = mangle_fn(module, *is_entry, &resource.name.name);
+            let external = external_resources.get(&canonical);
+            resource_templates.insert(
+                canonical.clone(),
+                ResourceTemplate {
+                    type_params: resource.type_params.iter().map(|p| p.name.name.clone()).collect(),
+                    declaring_module: (*module).to_string(),
+                    drop_hook: path_str(&resource.drop_hook),
+                    drop_thunk: external
+                        .map_or_else(|| resource_drop_thunk(&canonical), |fact| fact.drop_thunk.clone()),
+                    representation_version: external.map_or(
+                        RESOURCE_REPRESENTATION_VERSION,
+                        |fact| fact.representation_version,
+                    ),
+                    drop_abi_fingerprint: external.map_or(
+                        RESOURCE_DROP_ABI_FINGERPRINT,
+                        |fact| fact.drop_abi_fingerprint,
+                    ),
+                },
+            );
+        }
     }
 
     // A fresh `TyCx` borrowing the resolution interners — built per `resolve_type` call so each
@@ -3797,6 +3996,7 @@ pub fn check_program_with_interface_facts(
                 type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
+                resource_ids: &resource_ids,
                 struct_source_spellings: &mut struct_source_spellings,
                 enum_source_spellings: &mut enum_source_spellings,
                 struct_templates: &struct_templates,
@@ -3805,6 +4005,9 @@ pub fn check_program_with_interface_facts(
                 enum_templates: &enum_templates,
                 enums: &mut enums,
                 enum_mono: &mut enum_mono,
+                resource_templates: &resource_templates,
+                resources: &mut resources,
+                resource_mono: &mut resource_mono,
                 tuples: &mut tuples,
                 fn_types: &mut fn_types,
                 tagged_types: &mut tagged_types,
@@ -3940,6 +4143,12 @@ pub fn check_program_with_interface_facts(
                     // An owned string is a finite Move leaf. The enclosing sum's tag-switched Drop
                     // frees it only when this variant is active.
                     Ty::String => payload.push(Scalar::String),
+                    // Opaque resources are one-pointer Move leaves; a sum tag selects the one live
+                    // payload and its recursive DropPlan calls the producer thunk exactly once.
+                    // `resource_ref` is the Copy counterpart and carries its owner-generation fact
+                    // through the same structural provenance machinery.
+                    Ty::Resource(id) => payload.push(Scalar::Resource(id)),
+                    Ty::ResourceRef(id) => payload.push(Scalar::ResourceRef(id)),
                     // A plain-data struct payload — `str`-bearing is now allowed (J1: the enum is
                     // region-tracked through it). Move-ness is checked after all enums resolve.
                     Ty::Struct(id) => {
@@ -4395,6 +4604,154 @@ pub fn check_program_with_interface_facts(
         }
     }
 
+    // L3 resource declarations name an ordinary raw-only function, but the source hook itself is
+    // restricted to the declaring module's `internal` subtree. Resolve and validate it once here,
+    // after all user signatures are known and before any body/codegen work can observe a resource.
+    // Interface-only declarations deliberately carry an inert placeholder path; their producer-
+    // owned thunk metadata was restored through `external_resources` above.
+    for module in modules {
+        if module.interface_only {
+            continue;
+        }
+        for item in &module.file.items {
+            let ast::Item::Resource(declaration) = item else {
+                continue;
+            };
+            if !matches!(declaration.vis, ast::Vis::Pub) {
+                diags.error(
+                    "a resource declaration must be `pub` so its producer-owned Drop thunk has one public nominal identity"
+                        .to_string(),
+                    declaration.span,
+                );
+            }
+            let segments = &declaration.drop_hook.segments;
+            if segments.len() < 2 {
+                diags.error(
+                    "a resource Drop hook must be a fully qualified function path".to_string(),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            }
+            let hook_name = segments.last().expect("nonempty hook path").name.as_str();
+            let hook_module = segments[..segments.len() - 1]
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let internal_root = format!("{}.internal", module.path);
+            if hook_module != internal_root
+                && !hook_module
+                    .strip_prefix(&internal_root)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                diags.error(
+                    format!(
+                        "resource Drop hook must be in the declaring module's `{internal_root}` subtree"
+                    ),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            }
+            let Some(hook_info) = mod_table.get(&hook_module) else {
+                diags.error(
+                    format!("unknown resource Drop-hook module `{hook_module}`"),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            };
+            let Some((canonical_hook, is_pub)) = hook_info.fns.get(hook_name) else {
+                diags.error(
+                    format!(
+                        "resource Drop hook `{hook_module}.{hook_name}` does not resolve to a function"
+                    ),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            };
+            if !*is_pub {
+                diags.error(
+                    "a resource Drop hook must be `pub` inside its internal module".to_string(),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            }
+            if hook_info.user_imports.contains(&module.path) {
+                diags.error(
+                    "a resource Drop-hook module cannot import the declaring resource module"
+                        .to_string(),
+                    declaration.drop_hook.span,
+                );
+            }
+            let Some(signature) = sigs.get(canonical_hook) else {
+                diags.error(
+                    "resource Drop hook signature is unavailable".to_string(),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            };
+            let valid_signature = !signature.is_extern
+                && signature.type_params.is_empty()
+                && signature.params == [Ty::Raw]
+                && signature.param_modes == [ast::ParamMode::ByValue]
+                && signature.ret == Ty::Unit;
+            if !valid_signature {
+                diags.error(
+                    "a resource Drop hook must be a non-generic `pub fn(raw) -> ()`"
+                        .to_string(),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            }
+            let hook_decl = all_fns.iter().find_map(|(path, _, function)| {
+                (*path == hook_module && function.name.name == hook_name).then_some(*function)
+            });
+            let hook_is_interface_only = modules
+                .iter()
+                .find(|candidate| candidate.path == hook_module)
+                .is_some_and(|candidate| candidate.interface_only);
+            let body_is_valid = if hook_is_interface_only {
+                external_resource_hooks
+                    .get(canonical_hook)
+                    .copied()
+                    .unwrap_or(false)
+            } else {
+                hook_decl.is_some_and(|function| resource_hook_has_unsafe_body(&function.body))
+            };
+            if !body_is_valid {
+                diags.error(
+                    "a resource Drop hook must perform destruction in a top-level `unsafe { }` body"
+                        .to_string(),
+                    declaration.drop_hook.span,
+                );
+                continue;
+            }
+
+            let canonical_resource =
+                mangle_fn(&module.path, module.is_entry, &declaration.name.name);
+            if declaration.type_params.is_empty() {
+                if let Some(&id) = resource_ids.get(&canonical_resource)
+                    && let Some(resource) = resources.get_mut(id as usize)
+                {
+                    resource.drop_hook = canonical_hook.clone();
+                }
+            } else if let Some(template) = resource_templates.get_mut(&canonical_resource) {
+                // Type resolution may already have instantiated this generic declaration while
+                // collecting signatures above. Canonical hook validation intentionally runs only
+                // after the complete function table exists, so update both the template used by
+                // later instantiations and every earlier concrete instance sharing its unique
+                // declaration-owned thunk.
+                template.drop_hook = canonical_hook.clone();
+                let drop_thunk = template.drop_thunk.clone();
+                for resource in resources.iter_mut().filter(|resource| {
+                    resource.drop_thunk == drop_thunk
+                        && resource.generic_arity == declaration.type_params.len() as u32
+                }) {
+                    resource.drop_hook = canonical_hook.clone();
+                }
+            }
+        }
+    }
+
     // Extern (`extern "C"`) declarations: resolve + FFI-validate each foreign signature, register it
     // in `sigs` under its bare C symbol (never mangled — a C symbol is global), make it resolvable
     // from every module (like a builtin), and collect it for codegen's external-declaration pass.
@@ -4625,11 +4982,15 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &resource_ids,
             &mut struct_source_spellings,
             &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
+            &resource_templates,
+            &mut resources,
+            &mut resource_mono,
             error_enum_id,
             &mut structs,
             &struct_templates,
@@ -4693,6 +5054,7 @@ pub fn check_program_with_interface_facts(
             &enums,
             &tuples,
             &fn_types,
+            &resources,
         );
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
@@ -4712,11 +5074,15 @@ pub fn check_program_with_interface_facts(
             &sigs,
             &struct_ids,
             &enum_ids,
+            &resource_ids,
             &mut struct_source_spellings,
             &mut enum_source_spellings,
             &mut enums,
             &enum_templates,
             &mut enum_mono,
+            &resource_templates,
+            &mut resources,
+            &mut resource_mono,
             error_enum_id,
             &mut structs,
             &struct_templates,
@@ -4810,6 +5176,7 @@ pub fn check_program_with_interface_facts(
         link_libs,
         structs,
         enums,
+        resources,
         tagged_types,
         tuples,
         fn_types,
@@ -9122,6 +9489,7 @@ impl EffectScan<'_> {
                 walk!(e);
                 self.impure_direct = true;
             }
+            ExprKind::RawIsNull(e) => walk!(e),
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 walk!(ptr);
                 walk!(offset);
@@ -9131,6 +9499,28 @@ impl EffectScan<'_> {
                 walk!(ptr);
                 walk!(offset);
                 walk!(value);
+                self.impure_direct = true;
+            }
+            ExprKind::ResourceBorrow { owner, .. } => walk!(owner),
+            ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                walk!(raw);
+                if let Some(parent) = parent {
+                    walk!(parent);
+                }
+                self.impure_direct = true;
+            }
+            ExprKind::ResourceRaw { reference, .. } => {
+                walk!(reference);
+                self.impure_direct = true;
+            }
+            ExprKind::ResourceIntoRaw { owner, .. } => {
+                walk!(owner);
+                self.impure_direct = true;
+            }
+            ExprKind::ResourceViewFromRaw { owner, ptr, len, .. } => {
+                walk!(owner);
+                walk!(ptr);
+                walk!(len);
                 self.impure_direct = true;
             }
             // Spawning / joining concurrent work is an observable effect (the enclosing function
@@ -10179,6 +10569,7 @@ impl<'a> EscapeCheck<'a> {
             // unknown borrowing boundary. (A `tcp_conn` itself is always owned, never a borrow,
             // so it is deliberately NOT here.)
             Ty::Reader | Ty::Writer | Ty::Fn(_) => return true,
+            Ty::Resource(_) | Ty::ResourceRef(_) => return true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
             Ty::Int(_)
@@ -11727,6 +12118,24 @@ impl<'a> EscapeCheck<'a> {
                     .map(|capture| (capture, depth, None))
                     .collect(),
             ),
+            ExprKind::ResourceFromRaw {
+                parent: Some(parent),
+                ..
+            }
+            | ExprKind::ResourceViewFromRaw { owner: parent, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(parent, depth, None)],
+            ),
+            ExprKind::ResourceBorrow { owner: parent, .. } => push_fold(
+                &mut work,
+                Region::Static,
+                vec![(
+                    parent,
+                    depth,
+                    Some(self.borrowed_storage_cap(parent)),
+                )],
+            ),
             // Producers that own their result, return a scalar, or otherwise carry no borrow
             // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
             // expression must force its escape semantics to be classified here instead of falling
@@ -11753,6 +12162,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawLoad { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
+            | ExprKind::RawIsNull(..)
+            | ExprKind::ResourceFromRaw { parent: None, .. }
+            | ExprKind::ResourceRaw { .. }
+            | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::BoxGet(..)
             | ExprKind::StrClone(..)
             | ExprKind::StrPredicate { .. }
@@ -12025,6 +12438,8 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Closure { captures, .. } => {
                 work.extend(captures.iter().rev());
             }
+            ExprKind::ResourceViewFromRaw { owner, .. }
+            | ExprKind::ResourceBorrow { owner, .. } => work.push(owner),
             // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
             // the body, not reachable from this node. Each `break` value is escape-checked directly
             // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
@@ -12059,6 +12474,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawLoad { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
+            | ExprKind::RawIsNull(..)
+            | ExprKind::ResourceFromRaw { .. }
+            | ExprKind::ResourceRaw { .. }
+            | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::HeapNew(..)
             | ExprKind::BoxGet(..)
             | ExprKind::BoxClone(..)
@@ -12976,6 +13395,20 @@ impl<'a> EscapeCheck<'a> {
 
     fn check_spawn_capture(&mut self, closure: &Expr, group: Region, depth: u32) {
         let check = |this: &mut Self, capture: &Expr| {
+            if ty_mentions_resource(
+                capture.ty,
+                this.structs,
+                this.tuples,
+                this.enums,
+                this.tagged_types,
+            ) {
+                this.diags.error(
+                    "a spawned task cannot capture a resource or resource_ref (native resources are non-Send)"
+                        .to_string(),
+                    capture.span,
+                );
+                return;
+            }
             if this.region_bearing(capture.ty)
                 && !this.region_of(capture, depth).outlives(group)
             {
@@ -13119,9 +13552,24 @@ impl<'a> EscapeCheck<'a> {
                 unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
+            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
+            | ExprKind::RawIsNull(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                self.walk(raw, depth);
+                if let Some(parent) = parent {
+                    self.walk(parent, depth);
+                }
+            }
+            ExprKind::ResourceBorrow { owner, .. }
+            | ExprKind::ResourceIntoRaw { owner, .. } => self.walk(owner, depth),
+            ExprKind::ResourceRaw { reference, .. } => self.walk(reference, depth),
+            ExprKind::ResourceViewFromRaw { owner, ptr, len, .. } => {
+                self.walk(owner, depth);
+                self.walk(ptr, depth);
+                self.walk(len, depth);
+            }
             ExprKind::ArraySum { source, stages }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayAnyAll { source, stages, .. }
@@ -15289,6 +15737,19 @@ impl<'a> MoveCheck<'a> {
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
+            ExprKind::ResourceBorrow { owner, .. } => {
+                BorrowFact::from_direct(self.storage_roots(owner))
+            }
+            ExprKind::ResourceFromRaw {
+                parent: Some(parent),
+                ..
+            } => self.borrow_fact(parent),
+            ExprKind::ResourceFromRaw { parent: None, .. }
+            | ExprKind::ResourceRaw { .. }
+            | ExprKind::ResourceIntoRaw { .. } => BorrowFact::default(),
+            ExprKind::ResourceViewFromRaw { owner, .. } => self
+                .borrow_fact(owner)
+                .prefixed(BorrowProjection::OptionSome),
             ExprKind::Field { root, path } => {
                 let path = path
                     .iter()
@@ -15694,6 +16155,14 @@ impl<'a> MoveCheck<'a> {
         };
         match &e.kind {
             ExprKind::Local(id) => self.borrows.sources.get(id).cloned().unwrap_or_default(),
+            ExprKind::ResourceBorrow { owner, .. } => self.storage_roots(owner),
+            ExprKind::ResourceFromRaw {
+                parent: Some(parent),
+                ..
+            }
+            | ExprKind::ResourceViewFromRaw { owner: parent, .. } => {
+                self.borrow_sources(parent)
+            }
             ExprKind::StrBorrow(inner)
             | ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. } => self.storage_roots(inner),
@@ -15942,6 +16411,10 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Unary { .. } | ExprKind::Cast(..) | ExprKind::Binary { .. } | ExprKind::IntArith { .. }
             | ExprKind::MathOp { .. } | ExprKind::Wait | ExprKind::RawAlloc(..) | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. } | ExprKind::RawStore { .. } | ExprKind::RawOffset { .. }
+            | ExprKind::RawIsNull(..)
+            | ExprKind::ResourceFromRaw { parent: None, .. }
+            | ExprKind::ResourceRaw { .. }
+            | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::HeapNew(..) | ExprKind::BoxGet(..) | ExprKind::BoxClone(..) | ExprKind::StrClone(..)
             | ExprKind::StrPredicate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..) | ExprKind::Select { .. } | ExprKind::VecSumWhere { .. }
@@ -16127,6 +16600,63 @@ impl<'a> MoveCheck<'a> {
 
     fn invalidate_owner(&mut self, owner: LocalId) {
         self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
+    }
+
+    /// A resource/reference borrower is itself live native state, not merely a view whose later use
+    /// can diagnose lazily. End the owner generation only after every such dependent value has been
+    /// consumed, so a child resource's eventual Drop can never run against a moved/replaced parent.
+    fn reject_live_resource_dependents(
+        &mut self,
+        owner: LocalId,
+        moved: &MovedSet,
+        span: Span,
+    ) {
+        let dependent = self.borrows.sources.iter().find_map(|(&borrower, roots)| {
+            (borrower != owner
+                && !whole_moved(moved, borrower)
+                && roots.contains(&BorrowRoot::Local(owner))
+                && self.f.locals.get(borrower as usize).is_some_and(|local| {
+                    ty_mentions_resource(
+                        local.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                }))
+            .then_some(borrower)
+        });
+        if let Some(dependent) = dependent {
+            let owner_name = self
+                .f
+                .locals
+                .get(owner as usize)
+                .map_or("<owner>", |local| local.name.as_str());
+            let dependent_name = self
+                .f
+                .locals
+                .get(dependent as usize)
+                .map_or("<dependent>", |local| local.name.as_str());
+            self.diags.error(
+                format!(
+                    "cannot move, replace, or mutably borrow resource owner '{owner_name}' while dependent resource/reference '{dependent_name}' is live"
+                ),
+                span,
+            );
+        }
+    }
+
+    fn reject_live_resource_dependents_of_roots(
+        &mut self,
+        roots: &BorrowRoots,
+        moved: &MovedSet,
+        span: Span,
+    ) {
+        for root in roots {
+            if let BorrowRoot::Local(owner) = root {
+                self.reject_live_resource_dependents(*owner, moved, span);
+            }
+        }
     }
 
     /// End every generation `storage` owns — a reallocating mutation invalidates views of the
@@ -16539,6 +17069,7 @@ impl<'a> MoveCheck<'a> {
                     let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
                     drop_old.set(self.is_move(*local) && !consumed_by_rhs);
                     if self.local_owns_view_storage(*local) {
+                        self.reject_live_resource_dependents(*local, moved, value.span);
                         self.invalidate_owner(*local);
                     }
                     self.assign_borrow(*local, value);
@@ -16577,6 +17108,7 @@ impl<'a> MoveCheck<'a> {
                     // value and ownership instead of leaving the destination marked moved. MIR
                     // emits no code for this exact place identity, so do not invalidate borrows.
                     if !self_assign && self.is_move_ty(value.ty) {
+                        self.reject_live_resource_dependents(*root, moved, value.span);
                         self.invalidate_owner(*root);
                     }
                     if !self_assign {
@@ -16797,6 +17329,7 @@ impl<'a> MoveCheck<'a> {
                             expression.span,
                         );
                     }
+                    self.reject_live_resource_dependents(*id, moved, expression.span);
                     self.invalidate_owner(*id);
                     moved.insert(MovedKey::Whole(*id));
                     return;
@@ -16826,6 +17359,7 @@ impl<'a> MoveCheck<'a> {
                                 )
                         )
                     {
+                        self.reject_live_resource_dependents(*root, moved, expression.span);
                         self.invalidate_owner(*root);
                         moved.insert(MovedKey::Field(*root, field));
                     } else if self.is_move_ty(expression.ty) {
@@ -18070,6 +18604,7 @@ impl<'a> MoveCheck<'a> {
                     | ExprKind::Cast(child)
                     | ExprKind::RawAlloc(child)
                     | ExprKind::RawFree(child)
+                    | ExprKind::RawIsNull(child)
                     | ExprKind::BoxGet(child)
                     | ExprKind::BoxClone(child)
                     | ExprKind::StrClone(child)
@@ -18401,6 +18936,11 @@ impl<'a> MoveCheck<'a> {
                 Post::BorrowMutCall(argument) => {
                     if falls_through {
                         let roots = self.storage_roots(argument);
+                        self.reject_live_resource_dependents_of_roots(
+                            &roots,
+                            moved,
+                            argument.span,
+                        );
                         self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
                         self.refresh_borrow_mut_place(argument);
                     }
@@ -18663,6 +19203,7 @@ impl<'a> MoveCheck<'a> {
                             self.is_move(local) && !consumed_by_rhs,
                         );
                         if self.local_owns_view_storage(local) {
+                            self.reject_live_resource_dependents(local, moved, wrapper.span);
                             self.invalidate_owner(local);
                         }
                         self.assign_borrow(local, value);
@@ -18761,6 +19302,7 @@ impl<'a> MoveCheck<'a> {
                             moved.remove(&MovedKey::Field(root, *field));
                         }
                         if !self_assign && self.is_move_ty(value.ty) {
+                            self.reject_live_resource_dependents(root, moved, wrapper.span);
                             self.invalidate_owner(root);
                         }
                         if !self_assign {
@@ -19324,6 +19866,7 @@ impl<'a> MoveCheck<'a> {
                                 e.span,
                             );
                         }
+                        self.reject_live_resource_dependents(*id, moved, e.span);
                         self.invalidate_owner(*id);
                         moved.insert(MovedKey::Whole(*id));
                     }
@@ -19373,6 +19916,7 @@ impl<'a> MoveCheck<'a> {
                         // but its other fields stay readable. A *borrow* (`u.name.len()`, a `str`
                         // argument) reaches here non-consuming (wrapped in `StrBorrow`/`Len`), so it
                         // is allowed and moves nothing.
+                        self.reject_live_resource_dependents(*base, moved, e.span);
                         self.invalidate_owner(*base);
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
@@ -19468,6 +20012,11 @@ impl<'a> MoveCheck<'a> {
                             && let Some(argument) = args.get(index)
                         {
                             let roots = self.storage_roots(argument);
+                            self.reject_live_resource_dependents_of_roots(
+                                &roots,
+                                moved,
+                                argument.span,
+                            );
                             self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
                             self.refresh_borrow_mut_place(argument);
                         }
@@ -19519,6 +20068,11 @@ impl<'a> MoveCheck<'a> {
                             && let Some(argument) = args.get(index)
                         {
                             let roots = self.storage_roots(argument);
+                            self.reject_live_resource_dependents_of_roots(
+                                &roots,
+                                moved,
+                                argument.span,
+                            );
                             self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
                             self.refresh_borrow_mut_place(argument);
                         }
@@ -19859,7 +20413,9 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => move_expr!(self, e, moved, false, false),
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
+                move_expr!(self, e, moved, false, false)
+            }
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 move_expr!(self, ptr, moved, false, false);
@@ -19869,6 +20425,26 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ptr, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
                 move_expr!(self, value, moved, false, false);
+            }
+            ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                move_expr!(self, raw, moved, false, false);
+                if let Some(parent) = parent {
+                    move_expr!(self, parent, moved, false, false);
+                }
+            }
+            ExprKind::ResourceBorrow { owner, .. } => {
+                move_expr!(self, owner, moved, false, false);
+            }
+            ExprKind::ResourceRaw { reference, .. } => {
+                move_expr!(self, reference, moved, false, false);
+            }
+            ExprKind::ResourceIntoRaw { owner, .. } => {
+                move_expr!(self, owner, moved, true, true);
+            }
+            ExprKind::ResourceViewFromRaw { owner, ptr, len, .. } => {
+                move_expr!(self, owner, moved, false, false);
+                move_expr!(self, ptr, moved, false, false);
+                move_expr!(self, len, moved, false, false);
             }
             ExprKind::Spawn { closure, .. } => move_expr!(self, closure, moved, false, false),
             // A sum-type construction moves each payload into the variant, exactly like a struct
@@ -20440,6 +21016,7 @@ impl<'a> MoveCheck<'a> {
                             let owned = matches!(self.f.locals.get(*t as usize).map(|l| l.ty), Some(Ty::Tuple(tid))
                                 if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
                             if owned && consuming {
+                                self.reject_live_resource_dependents(*t, moved, e.span);
                                 self.invalidate_owner(*t);
                                 moved.insert(MovedKey::Field(*t, *index));
                             }
@@ -20483,6 +21060,7 @@ struct Checker<'a, 't> {
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    resource_ids: &'a HashMap<String, u32>,
     /// Producer-owned public spellings for concrete nominal ids. This is deliberately separate
     /// from `StructDef`/`EnumDef` names so diagnostics never depend on HIR or mangled identities.
     struct_source_spellings: &'t mut HashMap<u32, String>,
@@ -20494,6 +21072,9 @@ struct Checker<'a, 't> {
     enum_templates: &'a HashMap<String, EnumTemplate>,
     /// Mangled monomorph name -> `enums` index — the shared monomorph dedup cache.
     enum_mono: &'t mut HashMap<String, u32>,
+    resource_templates: &'a HashMap<String, ResourceTemplate>,
+    resources: &'t mut Vec<hir::ResourceDef>,
+    resource_mono: &'t mut HashMap<String, u32>,
     /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
     error_enum_id: u32,
     /// The id of the builtin `json.kind` enum (the result of `d.kind()` on a `json.doc`, J4).
@@ -20655,11 +21236,15 @@ impl<'a, 't> Checker<'a, 't> {
         sigs: &'a HashMap<String, FnSig>,
         struct_ids: &'a HashMap<String, u32>,
         enum_ids: &'a HashMap<String, u32>,
+        resource_ids: &'a HashMap<String, u32>,
         struct_source_spellings: &'t mut HashMap<u32, String>,
         enum_source_spellings: &'t mut HashMap<u32, String>,
         enums: &'t mut Vec<hir::EnumDef>,
         enum_templates: &'a HashMap<String, EnumTemplate>,
         enum_mono: &'t mut HashMap<String, u32>,
+        resource_templates: &'a HashMap<String, ResourceTemplate>,
+        resources: &'t mut Vec<hir::ResourceDef>,
+        resource_mono: &'t mut HashMap<String, u32>,
         error_enum_id: u32,
         structs: &'t mut Vec<StructDef>,
         struct_templates: &'a HashMap<String, StructTemplate>,
@@ -20688,11 +21273,15 @@ impl<'a, 't> Checker<'a, 't> {
             consts,
             struct_ids,
             enum_ids,
+            resource_ids,
             struct_source_spellings,
             enum_source_spellings,
             enums,
             enum_templates,
             enum_mono,
+            resource_templates,
+            resources,
+            resource_mono,
             error_enum_id,
             // The builtin `json.kind` enum is registered before any `Checker` is built (right after
             // `Error`), so its id is always present in `enum_ids`.
@@ -21766,6 +22355,7 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            resource_ids: self.resource_ids,
             struct_source_spellings: self.struct_source_spellings,
             enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
@@ -21774,6 +22364,9 @@ impl<'a, 't> Checker<'a, 't> {
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            resource_templates: self.resource_templates,
+            resources: self.resources,
+            resource_mono: self.resource_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
@@ -22498,7 +23091,8 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `(e0, e1, ...)` — a tuple literal. Element types are taken from the expected tuple type
     /// when context fixes one (e.g. a multi-value `return`), else each element defaults like a
-    /// bare `:=` binding (int → i64, float → f64). PR1 cut: elements are primitive scalars.
+    /// bare `:=` binding (int → i64, float → f64). Resource and resource-reference elements use
+    /// the same recursive Move/Drop/provenance machinery as other supported tuple scalars.
     fn check_tuple(&mut self, elems: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // If the context fixes a concrete tuple type, use its element types to drive checking.
@@ -22528,11 +23122,12 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
                 Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
+                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
+                | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
-                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ce.ty)),
+                            format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ce.ty)),
                             ce.span,
                         );
                     }
@@ -22996,6 +23591,7 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            resource_ids: self.resource_ids,
             struct_source_spellings: self.struct_source_spellings,
             enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
@@ -23004,6 +23600,9 @@ impl<'a, 't> Checker<'a, 't> {
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            resource_templates: self.resource_templates,
+            resources: self.resources,
+            resource_mono: self.resource_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
@@ -24482,7 +25081,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// arguments, `str`-annotated `let` bindings, and `str`-place assignments. Pass `None` first so
     /// the source types as `string`, then wrap the borrow.
     fn check_str_init(&mut self, a: &ast::Expr) -> Expr {
-        let e = self.check_expr(a, None);
+        let expected =
+            matches!(a.kind, ast::ExprKind::ElseUnwrap { .. }).then_some(Ty::Str);
+        let e = self.check_expr(a, expected);
         if e.ty == Ty::String {
             let span = e.span;
             return Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span };
@@ -24514,6 +25115,7 @@ impl<'a, 't> Checker<'a, 't> {
         // An inline array literal takes the slice's element type.
         let e = match &a.kind {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
+            ast::ExprKind::ElseUnwrap { .. } => self.check_expr(a, Some(Ty::Slice(ps))),
             _ => self.check_expr(a, None),
         };
         // A fixed **struct** array (`[Route{…}, Route{…}]` -> `Ty::StructArray`) coerces to
@@ -24846,6 +25448,19 @@ impl<'a, 't> Checker<'a, 't> {
             // `unsafe {}`-only.
             if module == "raw" && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
                 return self.check_raw_op(method, args, expected, span);
+            }
+            if module == "resource"
+                && matches!(
+                    method,
+                    "from_raw"
+                        | "from_raw_borrowed"
+                        | "borrow"
+                        | "raw"
+                        | "into_raw"
+                        | "view_from_raw"
+                )
+            {
+                return self.check_resource_op(method, args, expected, span);
             }
             if module == "json" && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
@@ -25528,6 +26143,21 @@ impl<'a, 't> Checker<'a, 't> {
             "kind" | "get" | "at" | "key" | "elems" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
                 self.check_json_doc_method(recv_expr, method, args, span)
             }
+            "is_null" if recv_ty == Ty::Raw => {
+                if !args.is_empty() {
+                    self.diags.error(
+                        format!("'raw.is_null' takes no arguments, got {}", args.len()),
+                        span,
+                    );
+                    err
+                } else {
+                    Expr {
+                        kind: ExprKind::RawIsNull(Box::new(recv_expr)),
+                        ty: Ty::Bool,
+                        span,
+                    }
+                }
+            }
             // `hs.get(name)` on a `http_headers` view (http.md item 10 ⑥) — the RFC 9110 §5.1
             // case-insensitive request-header lookup. Type-guarded and placed **above** the catch-all
             // `get` arm below for the same reason the `json.doc` arm is: `check_box_get` would
@@ -26019,17 +26649,51 @@ impl<'a, 't> Checker<'a, 't> {
                 // over-aligned (`type_align`) and the struct's LLVM size is padded up to `N`, so every
                 // element's stride keeps the alignment. (A *dynamic* `array<align(N)Struct>` stays
                 // rejected — its heap buffer over-alignment is a separate, still-deferred concern.)
-                Some(id) => Expr {
-                    kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id), pooled: false },
-                    ty: Ty::StructArray(id, n),
-                    span,
-                },
+                Some(id) => {
+                    if ty_mentions_resource(
+                        Ty::Struct(id),
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) {
+                        self.diags.error(
+                            "a resource or resource_ref cannot be an element of a fixed array"
+                                .to_string(),
+                            span,
+                        );
+                        Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                    } else {
+                        Expr {
+                            kind: ExprKind::ArrayLit {
+                                elems: checked,
+                                elem: Ty::Struct(id),
+                                pooled: false,
+                            },
+                            ty: Ty::StructArray(id, n),
+                            span,
+                        }
+                    }
+                }
                 None => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             };
         }
         // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
+        if ty_mentions_resource(
+            self.resolve(elem_ty),
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            self.diags.error(
+                "a resource or resource_ref cannot be an element of a fixed array".to_string(),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
@@ -26612,6 +27276,19 @@ impl<'a, 't> Checker<'a, 't> {
                 return None;
             }
         };
+        if ty_mentions_resource(
+            elem,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            self.diags.error(
+                "a resource or resource_ref cannot be a pipeline element".to_string(),
+                span,
+            );
+            return None;
+        }
         // The `scan_terminal` permission (set by `sum`/`count`) applies ONLY to *this* pipeline's
         // direct source, which is now resolved. Clear it before the stages are type-checked so a
         // nested pipeline inside a stage lambda (e.g. `map(fn r { other_scanner.to_array() })`) does
@@ -26814,6 +27491,19 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
+        }
+        if ty_mentions_resource(
+            elem,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            self.diags.error(
+                "a resource or resource_ref cannot be a pipeline element".to_string(),
+                span,
+            );
+            return None;
         }
         Some((source, stages, elem))
     }
@@ -28559,6 +29249,285 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if !matches!(off.ty, Ty::Int(_) | Ty::IntVar(_) | Ty::Error) {
             self.diags.error(format!("'raw.{method}' offset must be an integer, got {}", ty_name(off.ty)), ospan);
+        }
+    }
+
+    fn resource_privileged(&self, resource: u32) -> bool {
+        self.resources.get(resource as usize).is_some_and(|definition| {
+            self.cur_module == definition.declaring_module
+                || self
+                    .cur_module
+                    .strip_prefix(&definition.declaring_module)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+    }
+
+    /// Type-check the one package-neutral native-resource intrinsic family. Representation-bearing
+    /// operations require both `unsafe` and canonical descendant-module privilege; `borrow` is the
+    /// sole safe public operation and exposes only `resource_ref<R>`.
+    fn check_resource_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let required = match method {
+            "from_raw" | "borrow" | "raw" | "into_raw" => 1,
+            "from_raw_borrowed" => 2,
+            "view_from_raw" => 3,
+            _ => unreachable!("resource dispatcher admits only the settled intrinsic set"),
+        };
+        if args.len() != required {
+            self.diags.error(
+                format!(
+                    "'resource.{method}' takes {required} argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        }
+
+        if method == "borrow" {
+            let owner = self.check_expr(&args[0], None);
+            let Ty::Resource(resource) = self.resolve(owner.ty) else {
+                self.diags.error(
+                    format!(
+                        "'resource.borrow' expects an owning resource, got {}",
+                        self.ty_display(owner.ty)
+                    ),
+                    args[0].span,
+                );
+                return err();
+            };
+            return Expr {
+                kind: ExprKind::ResourceBorrow {
+                    owner: Box::new(owner),
+                    resource,
+                },
+                ty: Ty::ResourceRef(resource),
+                span,
+            };
+        }
+
+        if self.unsafe_depth == 0 {
+            self.diags.error(
+                format!(
+                    "'resource.{method}' is an unsafe operation — use it inside an `unsafe {{}}` block"
+                ),
+                span,
+            );
+        }
+
+        match method {
+            "from_raw" | "from_raw_borrowed" => {
+                let Some(Ty::Resource(resource)) = expected.map(|ty| self.resolve(ty)) else {
+                    self.diags.error(
+                        format!(
+                            "'resource.{method}' needs an expected concrete resource type"
+                        ),
+                        span,
+                    );
+                    return err();
+                };
+                if !self.resource_privileged(resource) {
+                    self.diags.error(
+                        format!(
+                            "module '{}' cannot construct {}: resource representation is private to its declaring module subtree",
+                            self.cur_module,
+                            self.ty_display(Ty::Resource(resource))
+                        ),
+                        span,
+                    );
+                }
+                let raw = self.check_expr(&args[0], Some(Ty::Raw));
+                if !matches!(self.resolve(raw.ty), Ty::Raw | Ty::Error) {
+                    self.diags.error(
+                        format!(
+                            "'resource.{method}' expects a `raw` handle, got {}",
+                            self.ty_display(raw.ty)
+                        ),
+                        args[0].span,
+                    );
+                }
+                let parent = if method == "from_raw_borrowed" {
+                    let parent = self.check_expr(&args[1], None);
+                    if !matches!(self.resolve(parent.ty), Ty::ResourceRef(_)) {
+                        self.diags.error(
+                            format!(
+                                "'resource.from_raw_borrowed' expects one `resource_ref<Parent>`, got {}",
+                                self.ty_display(parent.ty)
+                            ),
+                            args[1].span,
+                        );
+                    }
+                    Some(Box::new(parent))
+                } else {
+                    None
+                };
+                Expr {
+                    kind: ExprKind::ResourceFromRaw {
+                        raw: Box::new(raw),
+                        resource,
+                        parent,
+                    },
+                    ty: Ty::Resource(resource),
+                    span,
+                }
+            }
+            "raw" => {
+                let reference = self.check_expr(&args[0], None);
+                let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+                    self.diags.error(
+                        format!(
+                            "'resource.raw' expects `resource_ref<R>`, got {}",
+                            self.ty_display(reference.ty)
+                        ),
+                        args[0].span,
+                    );
+                    return err();
+                };
+                if !self.resource_privileged(resource) {
+                    self.diags.error(
+                        format!(
+                            "module '{}' cannot extract this resource representation",
+                            self.cur_module
+                        ),
+                        span,
+                    );
+                }
+                Expr {
+                    kind: ExprKind::ResourceRaw {
+                        reference: Box::new(reference),
+                        resource,
+                    },
+                    ty: Ty::Raw,
+                    span,
+                }
+            }
+            "into_raw" => {
+                let owner = self.check_expr(&args[0], None);
+                let Ty::Resource(resource) = self.resolve(owner.ty) else {
+                    self.diags.error(
+                        format!(
+                            "'resource.into_raw' expects an owning resource, got {}",
+                            self.ty_display(owner.ty)
+                        ),
+                        args[0].span,
+                    );
+                    return err();
+                };
+                if !self.resource_privileged(resource) {
+                    self.diags.error(
+                        format!(
+                            "module '{}' cannot transfer this resource representation",
+                            self.cur_module
+                        ),
+                        span,
+                    );
+                }
+                let standalone = match &owner.kind {
+                    ExprKind::Local(local) => {
+                        let definition = self.locals.get(*local as usize);
+                        definition.is_some_and(|local| {
+                            if !local.is_param {
+                                return true;
+                            }
+                            let parameter = self.locals[..local.id as usize]
+                                .iter()
+                                .filter(|candidate| candidate.is_param)
+                                .count();
+                            self.sigs
+                                .get(&self.cur_fn)
+                                .and_then(|signature| signature.param_modes.get(parameter))
+                                .is_some_and(|mode| *mode == ast::ParamMode::ByValue)
+                        })
+                    }
+                    _ => false,
+                };
+                if !standalone {
+                    self.diags.error(
+                        "'resource.into_raw' requires a standalone owned local or by-value resource parameter"
+                            .to_string(),
+                        args[0].span,
+                    );
+                }
+                Expr {
+                    kind: ExprKind::ResourceIntoRaw {
+                        owner: Box::new(owner),
+                        resource,
+                    },
+                    ty: Ty::Raw,
+                    span,
+                }
+            }
+            "view_from_raw" => {
+                let owner = self.check_expr(&args[0], None);
+                let Ty::ResourceRef(resource) = self.resolve(owner.ty) else {
+                    self.diags.error(
+                        format!(
+                            "'resource.view_from_raw' expects `resource_ref<R>` first, got {}",
+                            self.ty_display(owner.ty)
+                        ),
+                        args[0].span,
+                    );
+                    return err();
+                };
+                if !self.resource_privileged(resource) {
+                    self.diags.error(
+                        format!(
+                            "module '{}' cannot construct a native view for this resource",
+                            self.cur_module
+                        ),
+                        span,
+                    );
+                }
+                let ptr = self.check_expr(&args[1], Some(Ty::Raw));
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let len = self.check_expr(&args[2], Some(i64_ty));
+                let expected = expected.map(|ty| expand_tagged_ty(self.resolve(ty), self.tagged_types));
+                let (ty, view) = match expected {
+                    Some(Ty::Option(Scalar::Str)) => {
+                        (Ty::Option(Scalar::Str), hir::ResourceViewKind::StrUtf8)
+                    }
+                    Some(Ty::Option(Scalar::Slice(element @ (PrimScalar::Int(_) | PrimScalar::Float(_))))) => {
+                        let scalar = prim_to_scalar(element);
+                        (
+                            Ty::Option(Scalar::Slice(element)),
+                            hir::ResourceViewKind::Slice(scalar),
+                        )
+                    }
+                    _ => {
+                        self.diags.error(
+                            "'resource.view_from_raw' needs an expected `Option<str>` or `Option<slice<FFIScalar>>` type"
+                                .to_string(),
+                            span,
+                        );
+                        return err();
+                    }
+                };
+                Expr {
+                    kind: ExprKind::ResourceViewFromRaw {
+                        owner: Box::new(owner),
+                        ptr: Box::new(ptr),
+                        len: Box::new(len),
+                        resource,
+                        view,
+                    },
+                    ty,
+                    span,
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -33048,7 +34017,28 @@ impl<'a, 't> Checker<'a, 't> {
     /// `opt else fallback`. The fallback either yields the payload type or diverges via
     /// `return` (only the braced `else { … }` form is supported in M2).
     fn check_else_unwrap(&mut self, opt: &ast::Expr, fallback: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
-        let o = self.check_expr(opt, None);
+        // `resource.view_from_raw` is deliberately result-directed: its `str` versus scalar-slice
+        // discriminator is the unwrapped destination type at `value: T := call(...) else { ... }`.
+        // Transport that payload expectation through the `else` wrapper as `Option<T>`; ordinary
+        // Option/Result expressions remain checked without guessing which tagged family they use.
+        let opt_expected = match (&opt.kind, expected.and_then(|ty| ty_to_scalar(self.resolve(ty)))) {
+            (
+                ast::ExprKind::Call { callee, .. },
+                Some(payload @ (Scalar::Str | Scalar::Slice(_))),
+            ) if matches!(
+                &callee.kind,
+                ast::ExprKind::FieldAccess { recv, field }
+                    if field.name == "view_from_raw"
+                        && matches!(
+                            &recv.kind,
+                            ast::ExprKind::Path(path)
+                                if path.segments.len() == 1
+                                    && path.segments[0].name == "resource"
+                        )
+            ) => Some(Ty::Option(payload)),
+            _ => None,
+        };
+        let o = self.check_expr(opt, opt_expected);
         // The fallback runs only on `None`, so its `wait()`/`spawn()` must not leak into the
         // post-unwrap `wait`-state (slice ④c) — snapshot here and restore after the fallback.
         let w_snapshot = self.wait_state.last().copied();
@@ -33144,6 +34134,7 @@ impl<'a, 't> Checker<'a, 't> {
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
+            resource_ids: self.resource_ids,
             struct_source_spellings: self.struct_source_spellings,
             enum_source_spellings: self.enum_source_spellings,
             struct_templates: self.struct_templates,
@@ -33152,6 +34143,9 @@ impl<'a, 't> Checker<'a, 't> {
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            resource_templates: self.resource_templates,
+            resources: self.resources,
+            resource_mono: self.resource_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
@@ -33842,6 +34836,7 @@ impl<'a, 't> Checker<'a, 't> {
                             self.enums,
                             self.tuples,
                             self.fn_types,
+                            self.resources,
                         );
                     }
                 }
@@ -33869,7 +34864,9 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) | ExprKind::Loop { body: b, .. } => self.finalize_block(b),
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.finalize_expr(e),
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
+                self.finalize_expr(e)
+            }
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.finalize_expr(ptr);
                 self.finalize_expr(offset);
@@ -33878,6 +34875,20 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ptr);
                 self.finalize_expr(offset);
                 self.finalize_expr(value);
+            }
+            ExprKind::ResourceFromRaw { raw, parent, .. } => {
+                self.finalize_expr(raw);
+                if let Some(parent) = parent {
+                    self.finalize_expr(parent);
+                }
+            }
+            ExprKind::ResourceBorrow { owner, .. }
+            | ExprKind::ResourceIntoRaw { owner, .. } => self.finalize_expr(owner),
+            ExprKind::ResourceRaw { reference, .. } => self.finalize_expr(reference),
+            ExprKind::ResourceViewFromRaw { owner, ptr, len, .. } => {
+                self.finalize_expr(owner);
+                self.finalize_expr(ptr);
+                self.finalize_expr(len);
             }
             ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
             ExprKind::EnumValue { payload, .. } => {
@@ -34782,6 +35793,11 @@ fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>
                     }
                 }
             }
+            ast::Item::Resource(resource) => {
+                if let Some(prefix) = path_module_prefix(&resource.drop_hook) {
+                    out.insert(prefix);
+                }
+            }
             ast::Item::Const(c) => {
                 if let Some(t) = &c.ty {
                     walk_type(t, out);
@@ -35119,6 +36135,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Raw => "raw".to_string(),
+        Ty::Resource(id) => format!("resource#{id}"),
+        Ty::ResourceRef(id) => format!("resource_ref<resource#{id}>"),
         Ty::Builder => "builder".to_string(),
         // Compiler-internal (no surface syntax); named only for diagnostics/debug completeness.
         Ty::StrFinder => "str_finder".to_string(),
@@ -35255,6 +36273,8 @@ fn resolved_type_source_spelling(
                     })
                 })
                 .unwrap_or_else(|| "<struct>".to_string()),
+            Ty::Resource(id) => format!("resource#{id}"),
+            Ty::ResourceRef(id) => format!("resource_ref<resource#{id}>"),
             Ty::Soa(id) => format!(
                 "soa<{}>",
                 resolved(
@@ -36018,6 +37038,7 @@ fn generic_param_state(ty: Ty, subst: &[Option<Ty>], tagged_types: &[hir::Tagged
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
 /// (`pick` with `[i32]` → `pick$i32`). Deterministic and collision-free across instantiations.
+#[allow(clippy::too_many_arguments)]
 fn mangle_mono(
     name: &str,
     args: &[Ty],
@@ -36026,6 +37047,7 @@ fn mangle_mono(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
@@ -36037,6 +37059,7 @@ fn mangle_mono(
             enums,
             tuples,
             fn_types,
+            resources,
         ));
     }
     s
@@ -36044,6 +37067,7 @@ fn mangle_mono(
 
 /// Source-visible counterpart of [`mangle_mono`]. Concrete function-value effect origins are
 /// erased, but all written signature facts remain structural identity.
+#[allow(clippy::too_many_arguments)]
 fn mangle_mono_source(
     name: &str,
     args: &[Ty],
@@ -36052,6 +37076,7 @@ fn mangle_mono_source(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     let mut s = name.to_string();
     for a in args {
@@ -36063,6 +37088,7 @@ fn mangle_mono_source(
             enums,
             tuples,
             fn_types,
+            resources,
         ));
     }
     s
@@ -36076,6 +37102,7 @@ fn ty_mangle(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     ty_mangle_impl(
         ty,
@@ -36084,6 +37111,7 @@ fn ty_mangle(
         enums,
         tuples,
         fn_types,
+        resources,
         true,
     )
 }
@@ -36095,6 +37123,7 @@ fn source_ty_mangle(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
 ) -> String {
     ty_mangle_impl(
         ty,
@@ -36103,10 +37132,12 @@ fn source_ty_mangle(
         enums,
         tuples,
         fn_types,
+        resources,
         false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ty_mangle_impl(
     ty: Ty,
     tagged_types: &[hir::TaggedType],
@@ -36114,6 +37145,7 @@ fn ty_mangle_impl(
     enums: &[hir::EnumDef],
     tuples: &[hir::TupleDef],
     fn_types: &[hir::FnTy],
+    resources: &[hir::ResourceDef],
     include_fn_origin: bool,
 ) -> String {
     enum Work {
@@ -36163,6 +37195,24 @@ fn ty_mangle_impl(
                         format!("E{}_{}", name.len(), name)
                     },
                 )),
+                Ty::Resource(id) => output.push_str(&resources.get(id as usize).map_or_else(
+                    || "W_invalid".to_string(),
+                    |resource| {
+                        let name = if include_fn_origin {
+                            &resource.name
+                        } else {
+                            &resource.source_name
+                        };
+                        format!("W{}_{}", name.len(), name)
+                    },
+                )),
+                Ty::ResourceRef(id) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("J_".to_string()),
+                        Work::Type(Ty::Resource(id)),
+                    ],
+                ),
                 Ty::Tagged(id) if tagged_visiting.insert(id) => {
                     let sequence = match tagged_types.get(id as usize).copied() {
                         Some(hir::TaggedType::Option(payload)) => vec![
@@ -36525,6 +37575,16 @@ struct EnumTemplate {
     variants: Vec<hir::EnumVariant>,
 }
 
+#[derive(Clone)]
+struct ResourceTemplate {
+    type_params: Vec<String>,
+    declaring_module: String,
+    drop_hook: String,
+    drop_thunk: String,
+    representation_version: u32,
+    drop_abi_fingerprint: [u8; 16],
+}
+
 /// The mutable + shared type-resolution context threaded through [`resolve_type`]: the concrete
 /// struct / enum tables (grown with monomorph instances), the generic templates + their monomorph
 /// caches, and the tuple / `Ty::Fn` interners.
@@ -36537,6 +37597,7 @@ struct TyCx<'a> {
     type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
+    resource_ids: &'a HashMap<String, u32>,
     /// Producer-owned public spellings for resolved nominal ids. These maps are checker state;
     /// they are never serialized into HIR and are used only when a later generic specialization
     /// must render a concrete source annotation.
@@ -36554,6 +37615,9 @@ struct TyCx<'a> {
     enums: &'a mut Vec<hir::EnumDef>,
     /// Mangled monomorph name (`Opt$i32`) -> `enums` index — dedups monomorph instances.
     enum_mono: &'a mut HashMap<String, u32>,
+    resource_templates: &'a HashMap<String, ResourceTemplate>,
+    resources: &'a mut Vec<hir::ResourceDef>,
+    resource_mono: &'a mut HashMap<String, u32>,
     tuples: &'a mut Vec<hir::TupleDef>,
     fn_types: &'a mut Vec<hir::FnTy>,
     tagged_types: &'a mut Vec<hir::TaggedType>,
@@ -36622,9 +37686,9 @@ fn resolve_type(
             return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
         }
         ast::Type::Tuple { elems, span: _ } => {
-            // Tuple elements use the supported scalar forms: primitive scalars, `str` views, and
-            // owned `string`/array values. A tuple containing a Move element carries the recursive
-            // Drop/region behavior of those elements and remains restricted to temporary results.
+            // Tuple elements use the supported scalar forms: primitive scalars, `str` views,
+            // owned `string`/array/resource values, and resource references. A tuple containing a
+            // Move element carries the recursive Drop/region behavior of those elements.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
                 let ety = resolve_type(e, cx, type_params, diags);
@@ -36633,10 +37697,11 @@ fn resolve_type(
                 }
                 match ty_to_scalar(ety) {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
+                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
+                    | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
                     _ => {
                         diags.error(
-                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ety)),
+                            format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ety)),
                             e.span(),
                         );
                         return Ty::Error;
@@ -36705,6 +37770,23 @@ fn resolve_type(
         // `raw` — an opaque raw byte pointer (`raw.alloc` yields one). Nameable so it can be a `let`
         // annotation / function parameter (holding a `raw` is safe; only `raw.*` ops need `unsafe`).
         "raw" => Ty::Raw,
+        "resource_ref" => {
+            let [owner] = args else {
+                diags.error("resource_ref takes exactly one resource type argument".to_string(), span);
+                return Ty::Error;
+            };
+            match resolve_type(owner, cx, type_params, diags) {
+                Ty::Resource(id) => Ty::ResourceRef(id),
+                Ty::Error => Ty::Error,
+                other => {
+                    diags.error(
+                        format!("resource_ref<R> requires a resource type, got {}", ty_name(other)),
+                        owner.span(),
+                    );
+                    Ty::Error
+                }
+            }
+        }
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
@@ -37120,16 +38202,66 @@ fn resolve_user_type(
             None => Ty::Error,
         };
     }
+    if let Some(tmpl) = cx.resource_templates.get(canonical).cloned() {
+        return match resolve_generic_args(canonical, "resource", args, tmpl.type_params.len(), cx, type_params, span, diags) {
+            Some(arg_tys) => Ty::Resource(instantiate_resource(canonical, &tmpl, &arg_tys, cx)),
+            None => Ty::Error,
+        };
+    }
     match cx.struct_ids.get(canonical) {
         Some(&id) => Ty::Struct(id),
         None => match cx.enum_ids.get(canonical) {
             Some(&id) => Ty::Enum(id),
-            None => {
+            None => match cx.resource_ids.get(canonical) {
+                Some(&id) => Ty::Resource(id),
+                None => {
                 diags.error(format!("unknown type: '{canonical}'"), span);
                 Ty::Error
+                }
             }
         },
     }
+}
+
+const RESOURCE_REPRESENTATION_VERSION: u32 = 1;
+const RESOURCE_DROP_ABI_FINGERPRINT: [u8; 16] = *b"align-res-drop-1";
+
+fn resource_drop_thunk(name: &str) -> String {
+    format!("__align_resource_drop${name}")
+}
+
+fn instantiate_resource(
+    name: &str,
+    tmpl: &ResourceTemplate,
+    args: &[Ty],
+    cx: &mut TyCx,
+) -> u32 {
+    let mangled = mangle_mono(
+        name,
+        args,
+        cx.tagged_types,
+        cx.structs,
+        cx.enums,
+        cx.tuples,
+        cx.fn_types,
+        cx.resources,
+    );
+    if let Some(&id) = cx.resource_mono.get(&mangled) {
+        return id;
+    }
+    let id = cx.resources.len() as u32;
+    cx.resources.push(hir::ResourceDef {
+        source_name: mangled.clone(),
+        name: mangled.clone(),
+        declaring_module: tmpl.declaring_module.clone(),
+        generic_arity: tmpl.type_params.len() as u32,
+        drop_hook: tmpl.drop_hook.clone(),
+        drop_thunk: tmpl.drop_thunk.clone(),
+        representation_version: tmpl.representation_version,
+        drop_abi_fingerprint: tmpl.drop_abi_fingerprint,
+    });
+    cx.resource_mono.insert(mangled, id);
+    id
 }
 
 /// Whether `ty` is a bare Move **handle** — a single opaque-pointer resource handle whose drop
@@ -37191,7 +38323,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => {}
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Resource(_) | Ty::ResourceRef(_) | Ty::Error => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
@@ -37598,6 +38730,7 @@ fn instantiate_struct(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
@@ -37610,6 +38743,7 @@ fn instantiate_struct(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
@@ -37707,6 +38841,7 @@ fn instantiate_enum(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
@@ -37719,6 +38854,7 @@ fn instantiate_enum(
         cx.enums,
         cx.tuples,
         cx.fn_types,
+        cx.resources,
     );
     let mut variants = Vec::with_capacity(tmpl.variants.len());
     for v in &tmpl.variants {
@@ -41771,20 +42907,20 @@ fn exit_branch(flag: bool) -> i64 {
         let by_value = function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None);
         let origins = vec![by_value.clone(), by_value.clone()];
         assert_ne!(
-            ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
-            ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
+            ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins, &[]),
+            ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins, &[]),
             "concrete function-value origins need distinct semantic monomorphs so later effect refinement cannot alias their cells"
         );
         assert_eq!(
-            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins),
-            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins),
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &origins, &[]),
+            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &[], &origins, &[]),
             "source-visible function types erase inferred effect origins"
         );
         let mangle_signature =
-            |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function]);
+            |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function], &[]);
         let source_mangle_signature =
             |function| {
-                source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function])
+                source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &[function], &[])
             };
         assert_ne!(
             mangle_signature(by_value.clone()),
@@ -41853,8 +42989,8 @@ fn exit_branch(flag: bool) -> i64 {
             },
         ];
         assert_ne!(
-            ty_mangle(Ty::Tuple(0), &[], &structs, &[], &tuples, &[]),
-            ty_mangle(Ty::Tuple(1), &[], &structs, &[], &tuples, &[]),
+            ty_mangle(Ty::Tuple(0), &[], &structs, &[], &tuples, &[], &[]),
+            ty_mangle(Ty::Tuple(1), &[], &structs, &[], &tuples, &[], &[]),
             "semantic tuple identity retains nested concrete callback origins"
         );
         assert_eq!(
@@ -41865,6 +43001,7 @@ fn exit_branch(flag: bool) -> i64 {
                 &[],
                 &tuples,
                 &[],
+                &[],
             ),
             source_ty_mangle(
                 Ty::Tuple(1),
@@ -41873,8 +43010,74 @@ fn exit_branch(flag: bool) -> i64 {
                 &[],
                 &tuples,
                 &[],
+                &[],
             ),
             "source tuple identity recursively erases nested callback origins"
+        );
+    }
+
+    #[test]
+    fn resource_mangling_uses_nominal_identity_instead_of_local_ids() {
+        let resource = |name: &str| hir::ResourceDef {
+            name: name.to_string(),
+            source_name: name.to_string(),
+            declaring_module: name.split('$').next().unwrap_or(name).to_string(),
+            generic_arity: 0,
+            drop_hook: "pkg$internal$drop".to_string(),
+            drop_thunk: format!("__align_resource_drop${name}"),
+            representation_version: RESOURCE_REPRESENTATION_VERSION,
+            drop_abi_fingerprint: RESOURCE_DROP_ABI_FINGERPRINT,
+        };
+        let producer_order = vec![resource("pkg$alpha"), resource("pkg$beta")];
+        let consumer_order = vec![resource("pkg$beta"), resource("pkg$alpha")];
+
+        let alpha_producer = ty_mangle(
+            Ty::Resource(0),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &producer_order,
+        );
+        let alpha_consumer = ty_mangle(
+            Ty::Resource(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &consumer_order,
+        );
+        let beta_producer = ty_mangle(
+            Ty::Resource(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &producer_order,
+        );
+        assert_eq!(
+            alpha_producer, alpha_consumer,
+            "the same nominal resource must mangle identically after declaration-order-independent id reconstruction"
+        );
+        assert_ne!(
+            alpha_producer, beta_producer,
+            "different nominal resources must not collide even when their pointer ABI is identical"
+        );
+        assert_ne!(
+            alpha_consumer,
+            ty_mangle(
+                Ty::ResourceRef(1),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &consumer_order,
+            ),
+            "owning resources and resource references need distinct generic identities"
         );
     }
 
@@ -41931,7 +43134,7 @@ fn exit_branch(flag: bool) -> i64 {
             }))
             .collect::<Vec<_>>();
         assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
-        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[]);
+        let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[], &[]);
         assert!(tagged_mangle.len() > DEPTH * 2);
         assert!(is_field_ok(Ty::Tagged(0), &tagged));
         let mut tagged_struct = tagged.clone();
@@ -41968,11 +43171,11 @@ fn exit_branch(flag: bool) -> i64 {
                 effect: std::cell::Cell::new(FnEffect::Unknown),
             })
             .collect::<Vec<_>>();
-        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types);
+        let fn_mangle = ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types, &[]);
         assert!(fn_mangle.len() > DEPTH * 3);
         assert_ne!(
             fn_mangle,
-            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types),
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[], &fn_types, &[]),
             "concrete function origins remain part of the internal mangle"
         );
 

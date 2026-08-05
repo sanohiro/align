@@ -11,14 +11,14 @@
 //!   or malformed buffer returns [`DecodeError`], never a panic.
 
 use crate::{
-    Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IStructDef, IType, ITypeParam,
+    Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IResourceDef, IStructDef, IType, ITypeParam,
     InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary,
 };
 
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -177,6 +177,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_return_region(w, &f.return_region);
     write_return_cleanup(w, f.return_cleanup);
     write_effect(w, f.effect);
+    w.bool(f.resource_hook_body);
     w.opt_str(&f.generic_body);
 }
 
@@ -202,6 +203,15 @@ fn write_enum(w: &mut Writer, e: &IEnumDef) {
     w.opt_str(&e.generic_body);
 }
 
+fn write_resource(w: &mut Writer, resource: &IResourceDef) {
+    w.str(&resource.name);
+    write_type_params(w, &resource.type_params);
+    w.u32(resource.generic_arity);
+    w.u32(resource.representation_version);
+    w.str(&resource.drop_thunk);
+    w.buf.extend_from_slice(&resource.drop_abi_fingerprint);
+}
+
 fn write_const(w: &mut Writer, c: &IConst) {
     w.str(&c.name);
     match &c.ty {
@@ -223,6 +233,7 @@ fn write_surface(w: &mut Writer, s: &InterfaceSummary) {
     w.seq(&s.fns, write_fn);
     w.seq(&s.structs, write_struct);
     w.seq(&s.enums, write_enum);
+    w.seq(&s.resources, write_resource);
     w.seq(&s.consts, write_const);
 }
 
@@ -483,6 +494,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let return_region = read_return_region(r, params.len())?;
     let return_cleanup = read_return_cleanup(r)?;
     let effect = read_effect(r)?;
+    let resource_hook_body = r.bool()?;
     let generic_body = r.opt_str()?;
     Ok(IFnSig {
         name,
@@ -493,6 +505,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         return_region,
         return_cleanup,
         effect,
+        resource_hook_body,
         generic_body,
     })
 }
@@ -514,6 +527,25 @@ fn read_enum(r: &mut Reader<'_>) -> Result<IEnumDef, DecodeError> {
         type_params: read_type_params(r)?,
         variants: r.seq(|r| Ok((r.str()?, r.seq(read_type)?)))?,
         generic_body: r.opt_str()?,
+    })
+}
+
+fn read_resource(r: &mut Reader<'_>) -> Result<IResourceDef, DecodeError> {
+    let name = r.str()?;
+    let type_params = read_type_params(r)?;
+    let generic_arity = r.u32()?;
+    let representation_version = r.u32()?;
+    let drop_thunk = r.str()?;
+    let fingerprint = r.take(16)?;
+    let mut drop_abi_fingerprint = [0u8; 16];
+    drop_abi_fingerprint.copy_from_slice(fingerprint);
+    Ok(IResourceDef {
+        name,
+        type_params,
+        generic_arity,
+        representation_version,
+        drop_thunk,
+        drop_abi_fingerprint,
     })
 }
 
@@ -540,6 +572,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     let fns = r.seq(read_fn)?;
     let structs = r.seq(read_struct)?;
     let enums = r.seq(read_enum)?;
+    let resources = r.seq(read_resource)?;
     let consts = r.seq(read_const)?;
     let surface_len = r.pos;
     let capabilities = r.seq(|r| r.str())?;
@@ -551,6 +584,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
         fns,
         structs,
         enums,
+        resources,
         consts,
         capabilities,
         interface_hash,

@@ -38,8 +38,22 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Resource(ResourceDecl),
     Const(ConstDecl),
     Extern(ExternBlock),
+}
+
+/// A package-defined opaque Move resource: `pub resource conn = pkg.internal.drop_conn`.
+/// `resource` is contextual and this node exists only for the exact item-position declaration.
+#[derive(Clone, Debug)]
+pub struct ResourceDecl {
+    pub vis: Vis,
+    pub name: Ident,
+    /// Phantom compile-time identity parameters. Concrete applications retain the one-pointer ABI.
+    pub type_params: Vec<TypeParam>,
+    /// Fully qualified ordinary function path for the raw Drop hook.
+    pub drop_hook: Path,
+    pub span: Span,
 }
 
 /// A foreign-function-interface declaration: `extern "C" fn name(params) -> ret` (or a braced group
