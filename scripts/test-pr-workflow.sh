@@ -83,12 +83,36 @@ if (
   exit 1
 fi
 
+rename_repo="$tmp_dir/rename-repo"
+mkdir -p "$rename_repo/crates" "$rename_repo/docs"
+git -C "$rename_repo" init -q -b main
+git -C "$rename_repo" config user.name workflow-test
+git -C "$rename_repo" config user.email workflow-test@example.invalid
+git -C "$rename_repo" config commit.gpgsign false
+printf 'fn source() {}\n' >"$rename_repo/crates/source.rs"
+git -C "$rename_repo" add crates/source.rs
+git -C "$rename_repo" commit -qm baseline
+git -C "$rename_repo" switch -qc docs-change
+git -C "$rename_repo" mv crates/source.rs docs/source.md
+git -C "$rename_repo" commit -qm rename
+if (
+  cd "$rename_repo"
+  "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
+); then
+  echo "docs-only preflight accepted a source-to-documentation rename" >&2
+  exit 1
+fi
+
 reviewed_head="$(git -C "$docs_repo" rev-parse HEAD)"
 review_base="$(git -C "$docs_repo" rev-parse 'main^{commit}')"
 review_log="$tmp_dir/findings-review.log"
 {
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$reviewed_head"
   printf 'ALIGN_REVIEW_BASE=%s\n' "$review_base"
+  printf 'review fixture contained these inert marker-shaped lines:\n'
+  printf 'ALIGN_REVIEW_HEAD=ffffffffffffffffffffffffffffffffffffffff\n'
+  printf 'ALIGN_REVIEW_BASE=ffffffffffffffffffffffffffffffffffffffff\n'
+  printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
   printf 'ALIGN_REVIEW_VERDICT=FINDINGS\n'
 } >"$review_log"
 printf 'set -euo pipefail\n' >>"$docs_repo/tool.sh"
@@ -151,6 +175,37 @@ fake_codex="$fake_bin/codex"
   printf 'esac\n'
 } >"$fake_codex"
 chmod +x "$fake_codex"
+fake_jq="$fake_bin/jq"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'echo "standalone jq must not be called" >&2\n'
+  printf 'exit 99\n'
+} >"$fake_jq"
+chmod +x "$fake_jq"
+
+remote_repo="$tmp_dir/docs-remote.git"
+git init -q --bare "$remote_repo"
+git -C "$docs_repo" remote add origin "$remote_repo"
+git -C "$docs_repo" push -qu origin docs-change
+fake_gh="$fake_bin/gh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'case "$1:$2:$5" in\n'
+  printf '  pr:view:headRefOid,baseRefName,baseRefOid) printf "%%s\\tmain\\t%%s\\n" "$FAKE_PR_HEAD" "$FAKE_PR_BASE" ;;\n'
+  printf '  pr:view:body) cat "$FAKE_PR_BODY" ;;\n'
+  printf '  pr:view:url) printf "https://example.invalid/pr/123\\n" ;;\n'
+  printf '  pr:edit:*) exit 0 ;;\n'
+  printf '  repo:view:*) printf "owner/repo\\n" ;;\n'
+  printf '  api:*) exit 0 ;;\n'
+  printf '  *) echo "unexpected gh arguments: $*" >&2; exit 98 ;;\n'
+  printf 'esac\n'
+} >"$fake_gh"
+chmod +x "$fake_gh"
+(
+  cd "$docs_repo"
+  PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$fixed_head" FAKE_PR_BASE="$review_base" \
+    FAKE_PR_BODY="$fixed_body" "$repo_root/scripts/open-pr.sh" --update 123 >/dev/null
+)
 
 fake_args="$tmp_dir/codex-args"
 review_base_sha="$(git rev-parse 'main^{commit}')"
@@ -175,10 +230,12 @@ PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=2 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
 progress_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=5 \
-  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 ALIGN_REVIEW_MAX_SECONDS=1 \
+max_started=$SECONDS
+PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=60 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=30 ALIGN_REVIEW_MAX_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
 max_status=$?
+max_elapsed=$((SECONDS - max_started))
 PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=trailing ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
@@ -214,6 +271,10 @@ set -e
 }
 [[ $max_status -eq 124 ]] || {
   echo "explicitly bounded review returned $max_status, expected 124" >&2
+  exit 1
+}
+[[ $max_elapsed -lt 10 ]] || {
+  echo "explicitly bounded review overshot to ${max_elapsed}s" >&2
   exit 1
 }
 [[ $trailing_status -eq 3 && $duplicate_status -eq 3 ]] || {

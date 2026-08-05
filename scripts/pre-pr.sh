@@ -56,18 +56,22 @@ else
     echo "code preflight requires --reviewer ID and --review-log FILE" >&2
     exit 2
   }
-  verdict="$(awk -F= '/^ALIGN_REVIEW_VERDICT=(CLEAN|FINDINGS)$/ { count++; value=$2 } END { if (count == 1) print value }' "$review_log")"
   last_nonempty="$(awk 'NF { line=$0 } END { print line }' "$review_log")"
-  [[ -n "$verdict" && "$last_nonempty" == "ALIGN_REVIEW_VERDICT=$verdict" ]] || {
-    echo "review log must end with one CLEAN or FINDINGS verdict" >&2
+  case "$last_nonempty" in
+    ALIGN_REVIEW_VERDICT=CLEAN) verdict="CLEAN" ;;
+    ALIGN_REVIEW_VERDICT=FINDINGS) verdict="FINDINGS" ;;
+    *)
+      echo "review log must end with a CLEAN or FINDINGS verdict" >&2
+      exit 1
+      ;;
+  esac
+  review_head="$(sed -n 's/^ALIGN_REVIEW_HEAD=//p' "$review_log" | sed -n '1p')"
+  review_base="$(sed -n 's/^ALIGN_REVIEW_BASE=//p' "$review_log" | sed -n '1p')"
+  [[ "$review_head" =~ ^[0-9a-f]{40}$ && "$review_base" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "review log has no initial HEAD/base binding" >&2
     exit 1
   }
-  review_head="$(sed -n 's/^ALIGN_REVIEW_HEAD=//p' "$review_log")"
-  [[ "$review_head" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "review log has no unique review HEAD" >&2
-    exit 1
-  }
-  grep -Fqx "ALIGN_REVIEW_BASE=$base_sha" "$review_log" || {
+  [[ "$review_base" == "$base_sha" ]] || {
     echo "review log belongs to another base" >&2
     exit 1
   }
@@ -109,7 +113,7 @@ while IFS= read -r path; do
     crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*) rust_changed=true ;;
   esac
   case "$path" in *.sh) [[ ! -f "$path" ]] || bash -n "$path" ;; esac
-done < <(git diff --name-only "$base_sha"...HEAD)
+done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
 [[ "$docs_only" == false || "$non_documentation_changed" == false ]] || {
   echo "--docs-only requires Markdown/documentation changes only" >&2
   exit 1

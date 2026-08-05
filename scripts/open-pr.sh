@@ -74,14 +74,15 @@ tmp_body="$(mktemp)"
 cleanup() { rm -f "$tmp_old" "$tmp_body"; }
 trap cleanup EXIT
 if [[ -n "$update_pr" ]]; then
-  pr_json="$(gh pr view "$update_pr" --json headRefOid,baseRefName,baseRefOid,body)"
-  [[ "$(jq -r .headRefOid <<<"$pr_json")" == "$head_sha" &&
-    "$(jq -r .baseRefOid <<<"$pr_json")" == "$base_sha" ]] || {
+  pr_meta="$(gh pr view "$update_pr" --json headRefOid,baseRefName,baseRefOid \
+    --jq '[.headRefOid, .baseRefName, .baseRefOid] | @tsv')"
+  IFS=$'\t' read -r pr_head pr_base pr_base_sha <<<"$pr_meta"
+  [[ "$pr_head" == "$head_sha" && "$pr_base_sha" == "$base_sha" ]] || {
     echo "PR head or base does not match the preflight stamp" >&2
     exit 1
   }
-  base="$(jq -r .baseRefName <<<"$pr_json")"
-  jq -r '.body // ""' <<<"$pr_json" >"$tmp_old"
+  base="$pr_base"
+  gh pr view "$update_pr" --json body --jq '.body // ""' >"$tmp_old"
 else
   requested_ref="$base"
   git rev-parse --verify --quiet "refs/remotes/origin/${base}^{commit}" >/dev/null && requested_ref="origin/$base"

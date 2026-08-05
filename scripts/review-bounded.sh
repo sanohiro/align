@@ -139,7 +139,29 @@ review_pid=$!
   last_progress_at="$started_at"
   last_signature="$(progress_signature "$review_pid" "$output")"
   while kill -0 "$review_pid" 2>/dev/null; do
-    sleep "$progress_interval_seconds"
+    now="$(date +%s)"
+    if (( max_seconds > 0 && now - started_at >= max_seconds )); then
+      printf 'MAX:%s\n' "$max_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+    if (( now - last_progress_at >= stall_seconds )); then
+      printf 'STALL:%s\n' "$stall_seconds" >"$stop_reason"
+      terminate_group "$review_pid"
+      sleep 2
+      kill -KILL "-$review_pid" 2>/dev/null || kill -KILL "$review_pid" 2>/dev/null || true
+      break
+    fi
+    sleep_seconds="$progress_interval_seconds"
+    if (( max_seconds > 0 && max_seconds - (now - started_at) < sleep_seconds )); then
+      sleep_seconds=$((max_seconds - (now - started_at)))
+    fi
+    if (( stall_seconds - (now - last_progress_at) < sleep_seconds )); then
+      sleep_seconds=$((stall_seconds - (now - last_progress_at)))
+    fi
+    sleep "$sleep_seconds"
     now="$(date +%s)"
     signature="$(progress_signature "$review_pid" "$output")"
     if [[ "$signature" != "$last_signature" ]]; then
