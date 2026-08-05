@@ -1,4 +1,21 @@
-use crate::{CanonicalCodecError, CanonicalFnAbi, CanonicalTy, ProgramCall};
+use std::fmt;
+
+use crate::{CanonicalCodecError, CanonicalFnAbi, CanonicalTy, ProgramCall, RuntimeKey};
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DirectCall {
+    Program(ProgramCall),
+    Runtime(RuntimeKey),
+}
+
+impl fmt::Display for DirectCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(target) => target.fmt(f),
+            Self::Runtime(key) => f.write_str(key.logical_name()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]

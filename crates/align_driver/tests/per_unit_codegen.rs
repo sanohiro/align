@@ -31,6 +31,15 @@ fn norm(sym: &str) -> &str {
     sym.strip_prefix('_').unwrap_or(sym)
 }
 
+fn encoded(sym: &str) -> String {
+    let hex = sym
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", sym.len())
+}
+
 // ---- Gate a: N=1 byte-identity ------------------------------------------------------------------
 
 #[test]
@@ -151,7 +160,7 @@ fn main() {
         .mir
         .fns
         .iter()
-        .find(|function| function.name == "continuation$value")
+        .find(|function| function.name.as_str() == "continuation$value")
         .expect("exported value function");
     assert!(
         function
@@ -253,16 +262,16 @@ fn gate_c_visibility_symbols() {
     let has_any = |syms: &[(char, String)], want: &str| syms.iter().any(|(_, n)| norm(n) == want);
 
     // Non-entry unit `lib`: its `pub` non-generic fns are external-defined...
-    assert!(is_ext(&lib_syms, "lib$sumv"), "lib$sumv must be external in lib.o:\n{lib_syms:?}");
-    assert!(is_ext(&lib_syms, "lib$dbl"), "lib$dbl must be external in lib.o");
+    assert!(is_ext(&lib_syms, &encoded("lib$sumv")), "lib$sumv must be external in lib.o:\n{lib_syms:?}");
+    assert!(is_ext(&lib_syms, &encoded("lib$dbl")), "lib$dbl must be external in lib.o");
     // ...its private fn is NOT external (internal linkage — never a 'T')...
     assert!(
-        !is_ext(&lib_syms, "lib$secret"),
+        !is_ext(&lib_syms, &encoded("lib$secret")),
         "lib$secret is private; it must not be an external symbol:\n{lib_syms:?}"
     );
     // ...and the generic's monomorph is emitted consumer-side, so no `lib$id...` symbol here.
     assert!(
-        !lib_syms.iter().any(|(_, n)| norm(n).starts_with("lib$id")),
+        !has_any(&lib_syms, &encoded("lib$id$i64")),
         "a generic pub fn's monomorph must NOT live in the producer object:\n{lib_syms:?}"
     );
 
@@ -270,12 +279,14 @@ fn gate_c_visibility_symbols() {
     assert!(is_ext(&main_syms, "main"), "main must be external in main.o:\n{main_syms:?}");
     // ...the cross-unit call is an undefined reference to the mangled extern...
     assert!(
-        main_syms.iter().any(|(k, n)| *k == 'U' && norm(n) == "lib$sumv"),
+        main_syms
+            .iter()
+            .any(|(k, n)| *k == 'U' && norm(n) == encoded("lib$sumv")),
         "main.o must reference lib$sumv as an undefined extern:\n{main_syms:?}"
     );
     // ...and the in-consumer monomorph lives here (as an internal, non-'T' symbol).
     assert!(
-        has_any(&main_syms, "lib$id$i64") || main_syms.iter().any(|(_, n)| norm(n).starts_with("lib$id")),
+        has_any(&main_syms, &encoded("lib$id$i64")),
         "the lib$id monomorph must be emitted into the consumer object:\n{main_syms:?}"
     );
 }

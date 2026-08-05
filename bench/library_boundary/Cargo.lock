@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "align_driver",
  "align_interface",
+ "align_mir",
  "align_span",
 ]
 

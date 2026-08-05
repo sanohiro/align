@@ -6,7 +6,14 @@
 mod common;
 use common::*;
 
-use align_mir::{Rvalue, Stmt, Term};
+use align_mir::{DirectCall, Rvalue, Stmt, Term};
+
+fn direct_program_name(call: &DirectCall) -> Option<&str> {
+    match call {
+        DirectCall::Program(target) => Some(target.as_str()),
+        DirectCall::Runtime(_) => None,
+    }
+}
 
 const SOURCE: &str = "\
 Holder<T> { callback: T }
@@ -119,13 +126,13 @@ fn eager_children_stop_before_parent_actions() {
         let function = program
             .fns
             .iter()
-            .find(|function| function.name == name)
+            .find(|function| function.name.as_str() == name)
             .unwrap_or_else(|| panic!("{name} function"));
         let emitted_forbidden_action = |statement: &Stmt| match name {
             "unary" => matches!(statement, Stmt::Let(_, Rvalue::Un(..))),
             "binary" | "selected" => matches!(statement, Stmt::Let(_, Rvalue::Bin(..))),
             "arguments" => {
-                matches!(statement, Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "call")
+                matches!(statement, Stmt::Let(_, Rvalue::Call(callee, _)) if direct_program_name(callee) == Some("call"))
             }
             "fixed_index" => matches!(statement, Stmt::Let(_, Rvalue::Index(..))),
             "dynamic_index" => matches!(statement, Stmt::Let(_, Rvalue::SliceIndex(..))),
@@ -155,7 +162,7 @@ fn eager_children_stop_before_parent_actions() {
                 .all(|statement| {
                     !matches!(
                         statement,
-                        Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "later"
+                        Stmt::Let(_, Rvalue::Call(callee, _)) if direct_program_name(callee) == Some("later")
                     ) && !emitted_forbidden_action(statement)
                         && !matches!(
                             statement,
@@ -179,7 +186,7 @@ fn eager_children_stop_before_parent_actions() {
     let source_compatible = program
         .fns
         .iter()
-        .find(|function| function.name == "source_compatible")
+        .find(|function| function.name.as_str() == "source_compatible")
         .expect("source-compatible indirect call");
     assert!(
         source_compatible
@@ -194,7 +201,7 @@ fn eager_children_stop_before_parent_actions() {
     let string_field = program
         .fns
         .iter()
-        .find(|function| function.name == "string_field")
+        .find(|function| function.name.as_str() == "string_field")
         .expect("owned-string element field");
     assert!(
         string_field
@@ -218,7 +225,7 @@ fn eager_children_stop_before_parent_actions() {
     let source_compatible_map_err = program
         .fns
         .iter()
-        .find(|function| function.name == "source_compatible_map_err")
+        .find(|function| function.name.as_str() == "source_compatible_map_err")
         .expect("source-compatible map_err");
     assert!(
         source_compatible_map_err

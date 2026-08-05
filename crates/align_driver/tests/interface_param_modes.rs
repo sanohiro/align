@@ -46,7 +46,7 @@ fn whole_and_per_unit_interfaces_preserve_modes_and_explicit_none_summaries() {
     let put = buffer
         .fns
         .iter()
-        .find(|function| function.name == "put")
+        .find(|function| function.name.as_str() == "put")
         .expect("put signature");
     assert_eq!(
         put.params
@@ -61,7 +61,7 @@ fn whole_and_per_unit_interfaces_preserve_modes_and_explicit_none_summaries() {
     let named_borrow = buffer
         .fns
         .iter()
-        .find(|function| function.name == "named_borrow")
+        .find(|function| function.name.as_str() == "named_borrow")
         .expect("named_borrow signature");
     assert_eq!(named_borrow.params[0].mode, ParamMode::ByValue);
 
@@ -118,7 +118,7 @@ fn per_unit_mir_preserves_defining_and_imported_signature_facts() {
         .mir
         .fns
         .iter()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     assert_eq!(put.param_modes, vec![ParamMode::Out, ParamMode::ByValue]);
     assert_eq!(put.return_borrow, ReturnBorrowSummary::None);
@@ -134,7 +134,7 @@ fn per_unit_mir_preserves_defining_and_imported_signature_facts() {
         .mir
         .imported_fns
         .iter()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("imported put declaration");
     assert_eq!(
         imported.param_modes,
@@ -174,7 +174,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let put = wrong_arity
         .fns
         .iter_mut()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.param_modes.pop();
     let error = emit_llvm_ir(&wrong_arity, BuildTarget::Baseline, false, &[], false)
@@ -188,7 +188,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let put = disabled_mode
         .fns
         .iter_mut()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.param_modes[0] = ParamMode::Borrow;
     let error = emit_llvm_ir(&disabled_mode, BuildTarget::Baseline, false, &[], false)
@@ -202,7 +202,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let put = malformed_roots
         .fns
         .iter_mut()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.return_borrow = ReturnBorrowSummary::Roots {
         params: vec![99],
@@ -219,7 +219,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let put = premature_capture
         .fns
         .iter_mut()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.return_region = ReturnRegionSummary::Roots {
         params: vec![],
@@ -236,7 +236,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let put = disagreeing_roots
         .fns
         .iter_mut()
-        .find(|function| function.name == "buffer$put")
+        .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.return_borrow = ReturnBorrowSummary::Roots {
         params: vec![0],
@@ -260,7 +260,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let scalar = scalar_mir
         .fns
         .iter_mut()
-        .find(|function| function.name == "scalar")
+        .find(|function| function.name.as_str() == "scalar")
         .expect("scalar MIR");
     scalar.return_borrow = ReturnBorrowSummary::Roots {
         params: vec![0],
@@ -292,7 +292,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
     let scalar = cyclic_mir
         .fns
         .iter_mut()
-        .find(|function| function.name == "scalar")
+        .find(|function| function.name.as_str() == "scalar")
         .expect("scalar MIR");
     scalar.ret = Ty::Struct(cycle_id);
     scalar.slots[scalar.params[0] as usize] = Ty::Struct(cycle_id);

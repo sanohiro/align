@@ -12,6 +12,13 @@ use align_lexer::tokenize;
 use align_parser::parse_file;
 use std::cell::Cell;
 
+fn direct_program_name(call: &DirectCall) -> Option<&str> {
+    match call {
+        DirectCall::Program(target) => Some(target.as_str()),
+        DirectCall::Runtime(_) => None,
+    }
+}
+
 fn declaration_header_program() -> hir::Program {
     let mut program = baseline_program();
     let slice_i32 = Ty::Slice(scalar_int(32));
@@ -533,6 +540,52 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
 }
 
 #[test]
+fn malformed_hir_callable_namespace_fails_closed() {
+    fn assert_unpublished(label: &str, program: &hir::Program) {
+        let source_map = SourceMap::new();
+        for lowered in [
+            lower_program(program),
+            lower_program_located(program, &source_map),
+            lower_program_per_unit(program),
+            lower_program_per_unit_located(program, &source_map),
+        ] {
+            assert!(is_empty(&lowered), "{label}: malformed callable namespace published MIR");
+        }
+    }
+
+    let mut stored = checked_source_program(
+        "fn helper(value: i64) -> i64 = value\n\
+         fn main() -> i32 {\n  unused := helper(1)\n  return 0\n}\n",
+    );
+    stored.fns[0].name.push('\0');
+    assert_unpublished("stored-name-nul", &stored);
+
+    let mut direct = checked_source_program(
+        "fn helper(value: i64) -> i64 = value\n\
+         fn main() -> i32 {\n  unused := helper(1)\n  return 0\n}\n",
+    );
+    let call = direct.fns[1]
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|statement| match statement {
+            hir::Stmt::Let { init, .. } => match &mut init.kind {
+                hir::ExprKind::Call { func, .. } => Some(func),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("fixture contains a direct call");
+    call.clear();
+    assert_unpublished("empty-direct-target", &direct);
+
+    let mut declarations = declaration_header_program();
+    declarations.imported_fns[0].name.push('\0');
+    declarations.externs[0].name.clear();
+    assert_unpublished("import-before-extern-name", &declarations);
+}
+
+#[test]
 fn main_header_abi_matrix_is_exhaustive() {
     let result = Ty::Result(Scalar::Unit, Scalar::Enum(1));
     let argv = Ty::DynArray(Scalar::Str);
@@ -664,7 +717,7 @@ fn valid_hir_declaration_header_preflight_is_mir_identity() {
         );
         assert_eq!(format!("{located:#?}"), format!("{located_unchecked:#?}"));
         assert_eq!(checked.imported_fns.len(), 1);
-        assert_eq!(checked.imported_fns[0].name, "dep$read");
+        assert_eq!(checked.imported_fns[0].name.as_str(), "dep$read");
     }
 
     let mut lifted = declaration_header_program();
@@ -1207,7 +1260,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
     let hidden_function = program
         .fns
         .iter()
-        .find(|function| function.name == "hidden_tuple_discards")
+        .find(|function| function.name.as_str() == "hidden_tuple_discards")
         .expect("hidden tuple fixture");
     let hidden_ids = hidden_function
         .locals
@@ -1237,7 +1290,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         let function = lowered
             .fns
             .iter()
-            .find(|function| function.name == "hidden_tuple_discards")
+            .find(|function| function.name.as_str() == "hidden_tuple_discards")
             .expect("hidden tuple MIR function");
         for &hidden in &hidden_ids {
             assert_eq!(
@@ -1295,7 +1348,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         accepted
             .fns
             .iter_mut()
-            .find(|function| function.name == function_name)
+            .find(|function| function.name.as_str() == function_name)
             .expect("visible-name acceptance function")
             .locals
             .iter_mut()
@@ -1331,7 +1384,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         let function = malformed
             .fns
             .iter_mut()
-            .find(|function| function.name == "hidden_tuple_discards")
+            .find(|function| function.name.as_str() == "hidden_tuple_discards")
             .expect("hidden tuple fixture");
         for &hidden in &hidden_ids {
             function.locals[hidden as usize].name = spelling.to_string();
@@ -1351,7 +1404,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         let function = malformed
             .fns
             .iter_mut()
-            .find(|function| function.name == function_name)
+            .find(|function| function.name.as_str() == function_name)
             .expect("visible-name matrix function");
         for original in [first, second] {
             function
@@ -1419,7 +1472,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         let function = program
             .fns
             .iter_mut()
-            .find(|function| function.name == "hidden_scope")
+            .find(|function| function.name.as_str() == "hidden_scope")
             .expect("hidden scope fixture");
         let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
             panic!("hidden scope outer binding")
@@ -1449,7 +1502,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
         let function = after_scope
             .fns
             .iter()
-            .find(|function| function.name == "hidden_scope")
+            .find(|function| function.name.as_str() == "hidden_scope")
             .expect("hidden scope fixture");
         let hir::Stmt::Let { init, .. } = &function.body.stmts[0] else {
             panic!("hidden scope outer binding")
@@ -1465,7 +1518,7 @@ fn malformed_hir_visible_local_name_collisions_fail_closed() {
     after_scope
         .fns
         .iter_mut()
-        .find(|function| function.name == "hidden_scope")
+        .find(|function| function.name.as_str() == "hidden_scope")
         .expect("hidden scope fixture")
         .body
         .stmts
@@ -1716,7 +1769,7 @@ fn checked_hir_body_fact_replay_preserves_imported_fact_presence() {
         let unknown_consumer = unknown
             .fns
             .iter()
-            .find(|function| function.name == "consume")
+            .find(|function| function.name.as_str() == "consume")
             .expect("consumer function");
         assert_eq!(unknown_consumer.return_borrow, roots);
         assert_eq!(unknown_consumer.return_region, regions);
@@ -1734,7 +1787,7 @@ fn checked_hir_body_fact_replay_preserves_imported_fact_presence() {
             let consumer = program
                 .fns
                 .iter()
-                .find(|function| function.name == "consume")
+                .find(|function| function.name.as_str() == "consume")
                 .expect("consumer function");
             if matches!(return_borrow, ReturnBorrowSummary::None) {
                 assert_eq!(consumer.return_borrow, ReturnBorrowSummary::None);
@@ -1782,7 +1835,7 @@ fn main() -> i32 {
     let main_index = malformed_fn_id
         .fns
         .iter()
-        .position(|function| function.name == "main")
+        .position(|function| function.name.as_str() == "main")
         .expect("main function");
     let local = malformed_fn_id.fns[main_index]
         .locals
@@ -1798,7 +1851,7 @@ fn main() -> i32 {
     let replace_index = base
         .fns
         .iter()
-        .position(|function| function.name == "replace")
+        .position(|function| function.name.as_str() == "replace")
         .expect("replace function");
     let assignment_index = base.fns[replace_index]
         .body
@@ -1839,7 +1892,7 @@ fn main() -> i32 {
     let main = base
         .fns
         .iter()
-        .find(|function| function.name == "main")
+        .find(|function| function.name.as_str() == "main")
         .expect("main function");
     let function_value_ids: Vec<u32> = main
         .locals
@@ -2507,7 +2560,7 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner, evidence: H
         values
             .iter()
             .copied()
-            .any(|rv| matches!(rv, Rvalue::Call(name, _) if name == expected))
+            .any(|rv| matches!(rv, Rvalue::Call(name, _) if direct_program_name(name) == Some(expected)))
     };
     let owned = match owner {
         MirOwner::Unary => has(|rv| matches!(rv, Rvalue::Un(..))),
@@ -2596,7 +2649,9 @@ fn assert_mir_owner(label: &str, program: &Program, owner: MirOwner, evidence: H
                 .iter()
                 .any(|block| matches!(block.term, Term::Goto(_)))
         }),
-        MirOwner::Stage => has(|rv| matches!(rv, Rvalue::Call(name, _) if name == "dep$stage_id")),
+        MirOwner::Stage => has(|rv| {
+            matches!(rv, Rvalue::Call(name, _) if direct_program_name(name) == Some("dep$stage_id"))
+        }),
         // Transparent blocks and expression statements emit no instruction of their own, so their
         // fixture ends in a producer-valid imported sentinel. Reaching that call proves the whole
         // structural spine was traversed rather than merely publishing an empty function.
@@ -5194,7 +5249,7 @@ fn body_value_expression_mut<'a>(
     program
         .fns
         .iter_mut()
-        .find(|function| function.name == name)
+        .find(|function| function.name.as_str() == name)
         .unwrap_or_else(|| panic!("missing value fixture {name}"))
         .body
         .value
@@ -5206,7 +5261,7 @@ fn body_first_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'
     program
         .fns
         .iter_mut()
-        .find(|function| function.name == name)
+        .find(|function| function.name.as_str() == name)
         .unwrap_or_else(|| panic!("missing statement fixture {name}"))
         .body
         .stmts
@@ -5218,7 +5273,7 @@ fn body_loop_statement_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a
     let expression = program
         .fns
         .iter_mut()
-        .find(|function| function.name == name)
+        .find(|function| function.name.as_str() == name)
         .unwrap_or_else(|| panic!("missing loop statement fixture {name}"))
         .body
         .value
@@ -6757,7 +6812,7 @@ fn hir_body_validator_expression_inventory() {
     let case = malformed
         .fns
         .iter_mut()
-        .find(|function| function.name == "str_predicate_case")
+        .find(|function| function.name.as_str() == "str_predicate_case")
         .expect("inventory case");
     let hir::Stmt::Expr(expression) = &mut case.body.stmts[0] else {
         panic!("inventory case lost its expression");
@@ -7044,7 +7099,7 @@ fn hir_body_validator_storage_vector_array() {
     reject
         .fns
         .iter_mut()
-        .find(|function| function.name == "vec_store_case")
+        .find(|function| function.name.as_str() == "vec_store_case")
         .expect("vec-store fixture")
         .locals[0]
         .is_mut = false;
@@ -7063,7 +7118,7 @@ fn hir_body_validator_storage_vector_array() {
     reject
         .fns
         .iter_mut()
-        .find(|function| function.name == "body_test")
+        .find(|function| function.name.as_str() == "body_test")
         .expect("pooled fixture")
         .locals[0]
         .is_mut = true;
@@ -7636,7 +7691,7 @@ fn hir_body_validator_pipeline_terminals() {
     reject
         .fns
         .iter_mut()
-        .find(|function| function.name == "pipeline_map_into")
+        .find(|function| function.name.as_str() == "pipeline_map_into")
         .expect("map-into fixture")
         .locals[1]
         .is_mut = false;
@@ -7690,7 +7745,7 @@ fn hir_body_validator_pipeline_terminals() {
     impure
         .imported_fns
         .iter_mut()
-        .find(|function| function.name == "dep$terminal_map")
+        .find(|function| function.name.as_str() == "dep$terminal_map")
         .expect("par-map callable")
         .effect = FnEffect::Impure;
     assert!(body_core_metadata_is_valid(&impure));
@@ -10616,7 +10671,7 @@ fn hir_body_validator_native() {
     let native = deferred
         .fns
         .iter_mut()
-        .find(|function| function.name == "native_buffer_new")
+        .find(|function| function.name.as_str() == "native_buffer_new")
         .expect("native buffer fixture");
     native.drop_locals = vec![u32::MAX];
     native.drop_individual_locals = vec![u32::MAX];
@@ -10904,7 +10959,7 @@ fn hir_body_validator_generated_callables() {
     let target = reject
         .fns
         .iter_mut()
-        .find(|function| function.name == "generated_source")
+        .find(|function| function.name.as_str() == "generated_source")
         .expect("generated source target");
     target.origin = hir::FnOrigin::Monomorph;
     assert!(!body_core_metadata_is_valid(&reject));

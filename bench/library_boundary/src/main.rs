@@ -136,6 +136,32 @@ fn mir_nominal_link_fixture() -> String {
     source
 }
 
+fn canonical_type_graph_fixture() -> String {
+    let mut source = String::new();
+    for index in 0..128 {
+        source.push_str(&format!("Canonical_{index:04} {{ value: i64 }}\n"));
+        source.push_str(&format!(
+            "fn canonical_{index:04}(value: Canonical_{index:04}) -> Canonical_{index:04} = value\n"
+        ));
+    }
+    source.push_str("fn main() -> i32 = 0\n");
+    source
+}
+
+fn callable_namespace_fixture() -> String {
+    let mut source = String::new();
+    for index in 0..256 {
+        source.push_str(&format!(
+            "fn target_{index:04}(value: i64) -> i64 = value + {index}\n"
+        ));
+        source.push_str(&format!(
+            "fn caller_{index:04}(value: i64) -> i64 = target_{index:04}(value)\n"
+        ));
+    }
+    source.push_str("fn main() -> i32 = caller_0255(1) as i32\n");
+    source
+}
+
 fn import_validation_fixture() -> InterfaceSummary {
     let parameter = ITypeParam {
         name: "T".to_string(),
@@ -326,6 +352,82 @@ fn run_provenance() {
     let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
     println!(
         "mir-nominal-link-validation\t{milliseconds:.3}\tms/lower\t{nominal_definitions}\tdefinitions"
+    );
+
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let mir = align_driver::lower_to_mir(black_box(&nominal_hir));
+        black_box(mir);
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "canonical-source-shape-comparison\t{milliseconds:.3}\tms/lower\t{nominal_definitions}\tdefinitions"
+    );
+
+    let canonical_source = canonical_type_graph_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let canonical_checked = align_driver::check(
+        &mut source_map,
+        "canonical-type-graph.align",
+        &canonical_source,
+    );
+    assert!(
+        !canonical_checked.diags.has_errors(),
+        "canonical type-graph fixture must check"
+    );
+    let canonical_mir = align_driver::lower_to_mir(&canonical_checked.hir);
+    let canonical_roots = canonical_mir.fns.len();
+    for function in &canonical_mir.fns {
+        align_mir::CanonicalTy::from_program(function.ret, &canonical_mir)
+            .expect("canonical fixture root");
+    }
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        for function in &canonical_mir.fns {
+            let canonical = align_mir::CanonicalTy::from_program(
+                black_box(function.ret),
+                black_box(&canonical_mir),
+            )
+            .expect("benchmark canonical root");
+            black_box(canonical);
+        }
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "canonical-type-graph\t{milliseconds:.3}\tms/all-roots\t{canonical_roots}\troots"
+    );
+
+    let callable_source = callable_namespace_fixture();
+    let mut source_map = align_span::SourceMap::new();
+    let callable_checked = align_driver::check(
+        &mut source_map,
+        "mir-callable-namespace.align",
+        &callable_source,
+    );
+    assert!(
+        !callable_checked.diags.has_errors(),
+        "callable namespace fixture must check"
+    );
+    let callable_mir = align_driver::lower_to_mir(&callable_checked.hir);
+    let callable_count = callable_mir.fns.len();
+    assert!(callable_count >= 512, "fixture must retain every callable declaration");
+    let mut iterations = 0_u64;
+    let start = Instant::now();
+    while start.elapsed() < minimum {
+        let mir = align_driver::lower_to_mir(black_box(&callable_checked.hir));
+        black_box(mir);
+        iterations += 1;
+    }
+    let elapsed = start.elapsed();
+    let milliseconds = elapsed.as_secs_f64() * 1_000.0 / iterations as f64;
+    println!(
+        "mir-callable-namespace-validation\t{milliseconds:.3}\tms/lower\t{callable_count}\tcallables"
     );
 
     let header_source = provenance_fixture();

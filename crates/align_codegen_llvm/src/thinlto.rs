@@ -172,10 +172,10 @@ pub fn ir_opt_level(profile: Profile) -> c_int {
 /// ThinLTO preserve set. Mirrors [`crate::declare_fn`]'s linkage decision and
 /// [`crate::emit_main_wrapper`] exactly:
 ///   * a `main` function yields the external C entry symbol `main` (a plain `-> i32`
-///     main, or the generated wrapper for a `Result`/`Unit` main — never the internal
-///     `align_main`);
+///     main, or the generated wrapper for a `Result`/`Unit` main — never its internal
+///     encoded Align body);
 ///   * a `pub` non-entry function (`f.exportable`) keeps external linkage under its
-///     mangled `module$name` symbol;
+///     encoded Align program symbol;
 ///   * an `--export` root keeps its symbol external (keyed on the LLVM `symbol`, as
 ///     `declare_fn` does — so `--export main` stays the documented no-op).
 ///
@@ -189,13 +189,13 @@ pub fn exported_symbols(program: &Program, exports: &[String]) -> Vec<String> {
         }
     };
     for f in &program.fns {
-        let sym = symbol_name(f);
-        if f.name == "main" {
+        let sym = symbol_name(f, exports);
+        if f.name.as_str() == "main" {
             // The external C entry is always `main` (direct i32 main or the wrapper).
             push("main", &mut out);
         }
-        if f.exportable || exports.iter().any(|e| e == sym) {
-            push(sym, &mut out);
+        if f.exportable || exports.iter().any(|e| e == f.name.as_str()) {
+            push(&sym, &mut out);
         }
     }
     out
@@ -204,7 +204,7 @@ pub fn exported_symbols(program: &Program, exports: &[String]) -> Vec<String> {
 /// Whether a unit defines a `main` (so its object owns the external C `main`) — a
 /// convenience for the driver's preserve-set assembly and diagnostics.
 pub fn defines_main(program: &Program) -> bool {
-    program.fns.iter().any(|f| f.name == "main")
+    program.fns.iter().any(|f| f.name.as_str() == "main")
 }
 
 // ---- entry-point wrappers ------------------------------------------------

@@ -156,7 +156,7 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
                 let function = mir
                     .fns
                     .iter()
-                    .find(|f| f.name == *name)
+                    .find(|f| f.name.as_str() == name)
                     .unwrap_or_else(|| panic!("missing MIR function `{name}`"));
                 assert_eq!(
                     cyclic_components(function),

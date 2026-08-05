@@ -215,12 +215,19 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = operands.iter().map(operand_str).collect();
             format!("{f}({}) : {}", a.join(", "), ty_name(*ty))
         }
-        Rvalue::Call(name, args) => {
+        Rvalue::Call(target, args) => {
             let a: Vec<String> = args.iter().map(operand_str).collect();
-            format!("call {name}({})", a.join(", "))
+            match target {
+                crate::DirectCall::Program(name) => {
+                    format!("call program {name}({})", a.join(", "))
+                }
+                crate::DirectCall::Runtime(key) => {
+                    format!("call runtime {}({})", key.logical_name(), a.join(", "))
+                }
+            }
         }
-        Rvalue::FnAddr { name, signature } => {
-            format!("fn_addr {name} signature={signature:?}")
+        Rvalue::FnAddr { target, signature } => {
+            format!("fn_addr {target} signature={signature:?}")
         }
         Rvalue::Closure {
             lifted,
@@ -397,13 +404,24 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let chain = if stages.is_empty() {
-                func.clone()
+                func.as_str().to_owned()
             } else {
                 let prefix = stages
                     .iter()
                     .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "<missing-map>".to_string()),
-                        ParMapStageKind::Filter => format!("where {}", stage.func.as_deref().unwrap_or("<missing-filter>")),
+                        ParMapStageKind::Map => stage
+                            .func
+                            .as_ref()
+                            .map(|target| target.as_str().to_owned())
+                            .unwrap_or_else(|| "<missing-map>".to_string()),
+                        ParMapStageKind::Filter => format!(
+                            "where {}",
+                            stage
+                                .func
+                                .as_ref()
+                                .map(|target| target.as_str())
+                                .unwrap_or("<missing-filter>")
+                        ),
                         ParMapStageKind::FilterStrContains => "where str.contains".to_string(),
                         ParMapStageKind::Project { field } => format!("field#{field}"),
                         ParMapStageKind::FilterField { field } => format!("where field#{field}"),

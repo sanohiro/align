@@ -31,6 +31,15 @@ fn define_prefix<'a>(ir: &'a str, sym: &str) -> &'a str {
     panic!("no `define` for @{sym} found in IR:\n{ir}");
 }
 
+fn encoded(sym: &str) -> String {
+    let hex = sym
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", sym.len())
+}
+
 fn assert_internal(ir: &str, sym: &str) {
     let pfx = define_prefix(ir, sym);
     assert!(pfx.contains("internal"), "@{sym} should have `internal` linkage, got `define {pfx}@{sym}(...`");
@@ -62,13 +71,13 @@ fn exported_fn_is_external() {
     // The named export root is external; everything else keeps the whole-program default
     // (`internal`) — `--export` is additive, not a switch that turns off internalization.
     assert_external(&ir, "k1");
-    assert_internal(&ir, "k2");
-    assert_internal(&ir, "helper");
+    assert_internal(&ir, &encoded("k2"));
+    assert_internal(&ir, &encoded("helper"));
 
     // `helper` must still be defined and actually called from `k1` — the export-roots change must
     // not perturb which functions are lowered or how they call each other, only their linkage.
     assert!(
-        ir.contains("call i64 @helper(") || ir.contains("call i64 @\"helper\"("),
+        ir.contains(&format!("call i64 @\"{}\"(", encoded("helper"))),
         "k1 must still call helper:\n{ir}"
     );
 }
@@ -81,14 +90,13 @@ fn unexported_still_internal() {
     // Same library, no `--export` at all: every program function stays internal (pins the M13
     // Slice 1 default — `pub` alone never exports; `--export` is the only opt-in).
     let ir = emit_llvm_with_exports(LIB, &[]);
-    assert_internal(&ir, "k1");
-    assert_internal(&ir, "k2");
-    assert_internal(&ir, "helper");
+    assert_internal(&ir, &encoded("k1"));
+    assert_internal(&ir, &encoded("k2"));
+    assert_internal(&ir, &encoded("helper"));
 }
 
-/// A `Result`-returning `main`: lowers to TWO LLVM definitions — the body under the renamed symbol
-/// `align_main` (`Function::name` is still the source name `"main"`), and a separately generated C
-/// `main` wrapper (always external, unconditionally, so `crt0` finds it).
+/// A `Result`-returning `main`: lowers to TWO LLVM definitions — the body under its encoded Align
+/// symbol, and a separately generated C `main` wrapper (always external so `crt0` finds it).
 const RESULT_MAIN: &str = concat!(
     "fn helper(x: i64) -> i64 = x + 1\n",
     "fn main() -> Result<(), Error> {\n",
@@ -103,17 +111,13 @@ fn export_main_is_a_harmless_noop_for_result_main() {
         return;
     }
     // `--export main` names the SOURCE function `main` — but for a `Result`-returning `main`,
-    // `Function::name == "main"` while the LLVM symbol is `align_main`. A regression here (caught in
-    // PR review): if the internalization guard compared `exports` against `Function::name` instead
-    // of the LLVM symbol, `--export main` would spuriously match the `align_main` body too (since
-    // its `Function::name` is also `"main"`) and leave it wrongly external — silently breaking the
-    // `link_hygiene.rs` invariant that `main` is the only externally-resolved definition. The C
-    // `main` wrapper is already external unconditionally (first half of the guard), so `--export
-    // main` must be a genuine no-op: `align_main` stays internal either way.
+    // `Function::name == "main"` while the LLVM body uses the encoded program identity. The C
+    // wrapper is already external unconditionally, so `--export main` must remain a genuine no-op:
+    // the encoded body stays internal either way.
     let ir = emit_llvm_with_exports(RESULT_MAIN, &["main"]);
     assert_external(&ir, "main");
-    assert_internal(&ir, "align_main");
-    assert_internal(&ir, "helper");
+    assert_internal(&ir, &encoded("main"));
+    assert_internal(&ir, &encoded("helper"));
 }
 
 #[test]

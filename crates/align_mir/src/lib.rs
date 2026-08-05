@@ -28,10 +28,10 @@ mod runtime_key;
 
 pub use canonical_graph::{
     CanonicalCodecError, CanonicalFnAbi, CanonicalTy, FunctionTypeDef, ProgramCall,
-    ProgramCallError, function_types_are_canonical,
+    ProgramCallError, ProgramExtern, function_types_are_canonical,
 };
 pub use generated_id::{
-    GeneratedId, ParallelGeneratedId, ParallelKernelMode, ParallelStageId,
+    DirectCall, GeneratedId, ParallelGeneratedId, ParallelKernelMode, ParallelStageId,
 };
 pub use runtime_key::RuntimeKey;
 
@@ -95,7 +95,7 @@ pub type BlockId = u32;
 /// Align ABI, structural MIR bytes, implementation hash, or object-cache input.
 #[derive(Clone, Debug)]
 pub struct ImportedFn {
-    pub name: String,
+    pub name: ProgramCall,
     pub params: Vec<Ty>,
     pub param_modes: Vec<align_ast::ParamMode>,
     pub ret: Ty,
@@ -108,7 +108,7 @@ pub struct Program {
     pub fns: Vec<Function>,
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
-    pub externs: Vec<hir::ExternFn>,
+    pub externs: Vec<ProgramExtern>,
     /// M15 S2 (per-unit compilation): non-generic `pub` functions declared by interface-only
     /// dependencies and defined in another unit's object. Codegen emits an external Align-ABI
     /// `declare` for each so a `Rvalue::Call` keyed by the mangled `module$name` resolves at link
@@ -137,7 +137,7 @@ pub struct Program {
 
 #[derive(Clone, Debug)]
 pub struct Function {
-    pub name: String,
+    pub name: ProgramCall,
     /// Slots holding the incoming parameters, in order.
     pub params: Vec<Slot>,
     /// Source-level parameter modes. This is signature identity even while L2a lowers only the
@@ -200,7 +200,11 @@ fn par_map_function_work_weight(f: &Function) -> u8 {
     }
 }
 
-fn combined_par_map_stage_work_weight(stages: &[ParMapStage], terminal: &str, weights: &std::collections::HashMap<String, u8>) -> u8 {
+fn combined_par_map_stage_work_weight(
+    stages: &[ParMapStage],
+    terminal: &ProgramCall,
+    weights: &std::collections::HashMap<ProgramCall, u8>,
+) -> u8 {
     let stage_weights = stages.iter().map(|stage| match stage.kind {
         ParMapStageKind::FilterStrContains => PAR_MAP_STRING_CONTAINS_WORK_WEIGHT,
         _ => stage
@@ -220,7 +224,7 @@ fn combined_par_map_stage_work_weight(stages: &[ParMapStage], terminal: &str, we
 /// post-pass means a staged node can sum the local cost of every source-first stage and terminal,
 /// while a separate-compilation import with no body remains the fail-closed default.
 fn annotate_par_map_work(fns: &mut [Function]) {
-    let weights: std::collections::HashMap<String, u8> = fns
+    let weights: std::collections::HashMap<ProgramCall, u8> = fns
         .iter()
         .map(|f| (f.name.clone(), par_map_function_work_weight(f)))
         .collect();
@@ -379,7 +383,7 @@ pub enum ParMapStageKind {
 pub struct ParMapStage {
     pub kind: ParMapStageKind,
     /// A callable name for `Map`/`Filter`; `None` for compiler-generated field and string stages.
-    pub func: Option<String>,
+    pub func: Option<ProgramCall>,
     pub captures: Vec<Operand>,
     pub capture_tys: Vec<Ty>,
     pub elem_in: Ty,
@@ -415,15 +419,15 @@ pub enum Rvalue {
     /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
     /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
     MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
-    Call(String, Vec<Operand>),
+    Call(DirectCall, Vec<Operand>),
     /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
-    FnAddr { name: String, signature: FnSignatureFacts },
+    FnAddr { target: ProgramCall, signature: FnSignatureFacts },
     /// A capturing closure value: the lifted function `lifted` (which takes the captures as
     /// trailing parameters) plus the captured values. Codegen copies the captures into a
     /// frame-local environment and builds `{ thunk_ptr, env_ptr }`, where the thunk unpacks the
     /// env and forwards to `lifted`. `capture_tys` give the env layout.
     Closure {
-        lifted: String,
+        lifted: ProgramCall,
         captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
         signature: FnSignatureFacts,
@@ -650,7 +654,7 @@ pub enum Rvalue {
     /// small post-lowering cost hint (1/2/4) combined with element byte width by the runtime.
     ParMapParallel {
         src: Operand,
-        func: String,
+        func: ProgramCall,
         /// Prior admitted length-preserving scalar/AoS stages. Empty for a direct `par_map`.
         stages: Vec<ParMapStage>,
         captures: Vec<Operand>,
@@ -668,7 +672,7 @@ pub enum Rvalue {
     /// output slot supplied by the runtime.
     ParMapReduce {
         src: Operand,
-        func: String,
+        func: ProgramCall,
         captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
         elem_in: Ty,
@@ -1656,7 +1660,18 @@ fn lower_program_unchecked(
     }
     let mut mir = Program {
         fns,
-        externs: program.externs.clone(),
+        externs: program
+            .externs
+            .iter()
+            .map(|extern_| ProgramExtern {
+                name: ProgramCall::from_validated(&extern_.name),
+                params: extern_.params.clone(),
+                param_modes: extern_.param_modes.clone(),
+                ret: extern_.ret,
+                return_borrow: extern_.return_borrow.clone(),
+                return_region: extern_.return_region.clone(),
+            })
+            .collect(),
         // Cross-unit `pub` callee declares are a per-unit-only concern; the whole-program path has
         // every callee body in `fns`, so its declare list is empty (byte-identity).
         imported_fns: if per_unit {
@@ -1664,7 +1679,7 @@ fn lower_program_unchecked(
                 .imported_fns
                 .iter()
                 .map(|import| ImportedFn {
-                    name: import.name.clone(),
+                    name: ProgramCall::from_validated(&import.name),
                     params: import.params.clone(),
                     param_modes: import.param_modes.clone(),
                     ret: import.ret,
@@ -2985,7 +3000,7 @@ fn lower_fn(
         .collect();
 
     Function {
-        name: f.name.clone(),
+        name: ProgramCall::from_validated(&f.name),
         params,
         param_modes: f.param_modes.clone(),
         ret: f.ret,
@@ -5060,7 +5075,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let v = b.fresh_value(Ty::Unit);
                 b.push(Stmt::Let(
                     v,
-                    Rvalue::Call("process_exit".to_string(), vec![c]),
+                    Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessExit), vec![c]),
                 ));
                 b.terminate(Term::Unreachable);
                 Operand::Const(Const::Unit)
@@ -5071,7 +5086,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let v = b.fresh_value(Ty::Unit);
                 b.push(Stmt::Let(
                     v,
-                    Rvalue::Call("process_abort".to_string(), vec![]),
+                    Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
                 ));
                 b.terminate(Term::Unreachable);
                 Operand::Const(Const::Unit)
@@ -6169,7 +6184,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 stages,
                 *elem,
                 Some(SortKey {
-                    func: key_func.clone(),
+                    func: ProgramCall::from_validated(key_func),
                     captures: captures.clone(),
                     key_ty: *key_ty,
                 }),
@@ -6315,12 +6330,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         let (kind, func, captures) = match &stage.kind {
                             hir::StageKind::Map { func, captures } => (
                                 ParMapStageKind::Map,
-                                Some(func.clone()),
+                                Some(ProgramCall::from_validated(func)),
                                 captures.as_slice(),
                             ),
                             hir::StageKind::Where { func, captures } => (
                                 ParMapStageKind::Filter,
-                                Some(func.clone()),
+                                Some(ProgramCall::from_validated(func)),
                                 captures.as_slice(),
                             ),
                             hir::StageKind::Project { field } => {
@@ -6370,7 +6385,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         v,
                         Rvalue::ParMapParallel {
                             src: src.clone(),
-                            func: func.clone(),
+                            func: ProgramCall::from_validated(func),
                             stages: stage_records,
                             captures: capture_ops,
                             capture_tys,
@@ -6902,7 +6917,7 @@ fn finish_fn_value(b: &mut Builder, name: &str, ty: Ty) -> Operand {
     b.push(Stmt::Let(
         value,
         Rvalue::FnAddr {
-            name: name.to_string(),
+            target: ProgramCall::from_validated(name),
             signature,
         },
     ));
@@ -6925,7 +6940,7 @@ fn finish_closure(
     b.push(Stmt::Let(
         value,
         Rvalue::Closure {
-            lifted: lifted.to_string(),
+            lifted: ProgramCall::from_validated(lifted),
             captures,
             capture_tys,
             signature,
@@ -6950,10 +6965,37 @@ fn fn_signature_facts(b: &Builder, ty: Ty) -> Option<FnSignatureFacts> {
 /// value, while its function ABI is LLVM `void`; the `ValueId` remains as statement bookkeeping,
 /// but every consumer must receive `Const::Unit` instead of referring to that valueless definition.
 /// Pipeline callables use this helper as well as ordinary call expressions so the rule cannot drift.
-fn emit_named_call(b: &mut Builder, func: String, args: Vec<Operand>, ret_ty: Ty) -> Operand {
+fn emit_named_call(b: &mut Builder, func: ProgramCall, args: Vec<Operand>, ret_ty: Ty) -> Operand {
     let v = b.fresh_value(ret_ty);
-    b.push(Stmt::Let(v, Rvalue::Call(func, args)));
+    b.push(Stmt::Let(v, Rvalue::Call(DirectCall::Program(func), args)));
     if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+}
+
+fn direct_call_target(func: &str, args: &[hir::Expr]) -> DirectCall {
+    let runtime = match func {
+        "print" => Some(match args.first().map(|argument| argument.ty) {
+            Some(Ty::Str) => RuntimeKey::PrintStr,
+            Some(Ty::Bool) => RuntimeKey::PrintBool,
+            Some(Ty::Char) => RuntimeKey::PrintChar,
+            Some(Ty::Float(FloatTy { bits: 32 })) => RuntimeKey::PrintF32,
+            Some(Ty::Float(FloatTy { bits: 64 })) => RuntimeKey::PrintF64,
+            _ => RuntimeKey::Print,
+        }),
+        "hash64" => Some(RuntimeKey::Hash64),
+        "hash128" => Some(RuntimeKey::Hash128),
+        "process_exit" => Some(RuntimeKey::ProcessExit),
+        "process_abort" => Some(RuntimeKey::ProcessAbort),
+        "div_fail" => Some(RuntimeKey::DivFail),
+        "bounds_fail" => Some(RuntimeKey::BoundsFail),
+        "range_fail" => Some(RuntimeKey::RangeFail),
+        "utf8_boundary_fail" => Some(RuntimeKey::Utf8BoundaryFail),
+        "len_mismatch_fail" => Some(RuntimeKey::LenMismatchFail),
+        _ => None,
+    };
+    runtime.map_or_else(
+        || DirectCall::Program(ProgramCall::from_validated(func)),
+        DirectCall::Runtime,
+    )
 }
 
 /// Lower an argument whose value will transfer into a call. A fresh Move temporary needs a hidden
@@ -7090,6 +7132,11 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
             return Operand::Const(Const::Unit);
         }
     }
+    // `error(code)` is the language-level constructor for the scalar Error representation. It is
+    // an identity in MIR, not a program or runtime callable, so it never enters either namespace.
+    if func == "error" {
+        return ops.into_iter().next().unwrap_or(Operand::Const(Const::Unit));
+    }
     // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
     // source, matching their sema contract.
     if !borrows_args {
@@ -7100,7 +7147,16 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.set_drop_flag(owner, false);
         }
     }
-    let result = emit_named_call(b, func.clone(), ops.clone(), e.ty);
+    let v = b.fresh_value(e.ty);
+    b.push(Stmt::Let(
+        v,
+        Rvalue::Call(direct_call_target(func, args), ops.clone()),
+    ));
+    let result = if e.ty == Ty::Unit {
+        Operand::Const(Const::Unit)
+    } else {
+        Operand::Value(v)
+    };
     if let Operand::Value(v) = &result {
         inherit_borrow_owners(b, *v, &ops);
         if borrows_args
@@ -7186,7 +7242,7 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     b.terminate(Term::Branch(Operand::Value(is_zero), fail, ok));
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("div_fail".to_string(), vec![])));
+    b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![])));
     b.terminate(Term::Unreachable);
     b.cur = ok;
 
@@ -7296,7 +7352,7 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
     b.terminate(Term::Branch(Operand::Value(any_zero), fail, ok));
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("div_fail".to_string(), vec![])));
+    b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![])));
     b.terminate(Term::Unreachable);
     b.cur = ok;
 
@@ -7343,7 +7399,10 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) {
     // fail: report (index, len) and abort. `bounds_fail` is `-> !`, so the block is `Unreachable`.
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("bounds_fail".to_string(), vec![idx.clone(), len])));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::BoundsFail), vec![idx.clone(), len]),
+    ));
     b.terminate(Term::Unreachable);
 
     b.cur = ok;
@@ -7689,7 +7748,13 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
 
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("range_fail".to_string(), vec![start.clone(), end.clone(), len])));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(
+            DirectCall::Runtime(RuntimeKey::RangeFail),
+            vec![start.clone(), end.clone(), len],
+        ),
+    ));
     b.terminate(Term::Unreachable);
 
     b.cur = ok;
@@ -7745,7 +7810,10 @@ fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, le
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
         t,
-        Rvalue::Call("utf8_boundary_fail".to_string(), vec![index.clone(), len.clone()]),
+        Rvalue::Call(
+            DirectCall::Runtime(RuntimeKey::Utf8BoundaryFail),
+            vec![index.clone(), len.clone()],
+        ),
     ));
     b.terminate(Term::Unreachable);
 
@@ -8237,9 +8305,9 @@ enum Reducer {
     Count,
     /// `reduce(init, f)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
     /// passed after the `(acc, element)` arguments.
-    Fold { func: String, captures: Vec<Operand> },
+    Fold { func: ProgramCall, captures: Vec<Operand> },
     /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`. `captures` as `Fold`.
-    AnyAll { func: String, captures: Vec<Operand>, all: bool },
+    AnyAll { func: ProgramCall, captures: Vec<Operand>, all: bool },
     /// `min` / `max`: keep `element` when it is smaller / larger than `acc`.
     MinMax { is_max: bool },
 }
@@ -8272,11 +8340,11 @@ fn prepare_reducer(b: &mut Builder, spec: ReducerSpec<'_>) -> Option<Reducer> {
         ReducerSpec::Sum => Reducer::Sum,
         ReducerSpec::Count => Reducer::Count,
         ReducerSpec::Fold { func, captures } => Reducer::Fold {
-            func: func.to_string(),
+            func: ProgramCall::from_validated(func),
             captures: lower_captures(b, captures)?,
         },
         ReducerSpec::AnyAll { func, captures, all } => Reducer::AnyAll {
-            func: func.to_string(),
+            func: ProgramCall::from_validated(func),
             captures: lower_captures(b, captures)?,
             all,
         },
@@ -8742,7 +8810,7 @@ fn lower_array_par_map_reduce(
     let v = b.fresh_value(elem_out);
     b.push(Stmt::Let(v, Rvalue::ParMapReduce {
         src: src.clone(),
-        func: func.to_string(),
+        func: ProgramCall::from_validated(func),
         captures: capture_ops,
         capture_tys,
         elem_in,
@@ -8888,7 +8956,12 @@ fn lower_array_reduce(
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
-                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
+                cur = Some(emit_named_call(
+                    b,
+                    ProgramCall::from_validated(func),
+                    call_args,
+                    stage.out_ty,
+                ));
             }
             hir::StageKind::Where { func, .. } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
@@ -8906,7 +8979,13 @@ fn lower_array_reduce(
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                b.push(Stmt::Let(
+                    pred,
+                    Rvalue::Call(
+                        DirectCall::Program(ProgramCall::from_validated(func)),
+                        call_args,
+                    ),
+                ));
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -8999,7 +9078,7 @@ fn lower_array_reduce(
             let cur = cur.expect("any/all needs a scalar element");
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(cur, captures);
-            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
+            b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Program(func.clone()), args)));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
@@ -9151,7 +9230,12 @@ fn lower_json_scan_reduce(
             hir::StageKind::Map { func, .. } => {
                 let arg = cur.take().unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
-                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
+                cur = Some(emit_named_call(
+                    b,
+                    ProgramCall::from_validated(func),
+                    call_args,
+                    stage.out_ty,
+                ));
             }
             hir::StageKind::Where { func, .. } => {
                 let arg = match &cur {
@@ -9160,7 +9244,13 @@ fn lower_json_scan_reduce(
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                b.push(Stmt::Let(
+                    pred,
+                    Rvalue::Call(
+                        DirectCall::Program(ProgramCall::from_validated(func)),
+                        call_args,
+                    ),
+                ));
                 let accepted = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
                 b.cur = accepted;
@@ -9212,7 +9302,7 @@ fn lower_json_scan_reduce(
             let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(cur, captures);
-            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
+            b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Program(func.clone()), args)));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
@@ -9278,7 +9368,7 @@ enum CollectKind<'a> {
 
 enum PreparedCollectKind {
     Collect,
-    Scan { func: String, init: Operand, captures: Vec<Operand> },
+    Scan { func: ProgramCall, init: Operand, captures: Vec<Operand> },
 }
 
 /// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
@@ -9320,7 +9410,7 @@ fn lower_array_collect(
                 }
             }
             PreparedCollectKind::Scan {
-                func: func.to_string(),
+                func: ProgramCall::from_validated(func),
                 init,
                 captures: lowered,
             }
@@ -9454,7 +9544,12 @@ fn lower_array_collect(
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
-                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
+                cur = Some(emit_named_call(
+                    b,
+                    ProgramCall::from_validated(func),
+                    call_args,
+                    stage.out_ty,
+                ));
             }
             hir::StageKind::Where { func, .. } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
@@ -9472,7 +9567,13 @@ fn lower_array_collect(
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                b.push(Stmt::Let(
+                    pred,
+                    Rvalue::Call(
+                        DirectCall::Program(ProgramCall::from_validated(func)),
+                        call_args,
+                    ),
+                ));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -9574,7 +9675,10 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
     b.terminate(Term::Branch(Operand::Value(ne), fail, ok));
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("len_mismatch_fail".to_string(), vec![have, want])));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::LenMismatchFail), vec![have, want]),
+    ));
     b.terminate(Term::Unreachable);
     b.cur = ok;
 }
@@ -9689,7 +9793,12 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
-                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
+                cur = Some(emit_named_call(
+                    b,
+                    ProgramCall::from_validated(func),
+                    call_args,
+                    stage.out_ty,
+                ));
             }
             hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. } => {
                 unreachable!("map_into rejects filtering `where` stages in sema")
@@ -10248,7 +10357,12 @@ fn lower_array_partition(
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
-                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
+                cur = Some(emit_named_call(
+                    b,
+                    ProgramCall::from_validated(func),
+                    call_args,
+                    stage.out_ty,
+                ));
             }
             hir::StageKind::Where { func, .. } => {
                 let arg = match &cur {
@@ -10263,7 +10377,13 @@ fn lower_array_partition(
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                b.push(Stmt::Let(
+                    pred,
+                    Rvalue::Call(
+                        DirectCall::Program(ProgramCall::from_validated(func)),
+                        call_args,
+                    ),
+                ));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -10291,7 +10411,13 @@ fn lower_array_partition(
     let cur = cur.expect("partition needs a scalar element");
     let pred = b.fresh_value(Ty::Bool);
     let pred_args = stage_call_args(cur.clone(), &prepared_pred_captures);
-    b.push(Stmt::Let(pred, Rvalue::Call(pred_func.to_string(), pred_args)));
+    b.push(Stmt::Let(
+        pred,
+        Rvalue::Call(
+            DirectCall::Program(ProgramCall::from_validated(pred_func)),
+            pred_args,
+        ),
+    ));
     let to_a = b.new_block();
     let to_b = b.new_block();
     b.terminate(Term::Branch(Operand::Value(pred), to_a, to_b));
@@ -10341,7 +10467,7 @@ fn lower_array_partition(
 /// compares `key(a)` against `key(b)` instead of `a` against `b` — see [`lower_array_sort`], where
 /// the keys are precomputed once (decorate) rather than recomputed per comparison.
 struct SortKey {
-    func: String,
+    func: ProgramCall,
     captures: Vec<hir::Expr>,
     key_ty: Ty,
 }
@@ -10577,7 +10703,10 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
                 let mut args = Vec::with_capacity(1 + lowered_captures.len());
                 args.push(v);
                 args.extend(lowered_captures.iter().cloned());
-                b.push(Stmt::Let(kc, Rvalue::Call(sk.func.clone(), args)));
+                b.push(Stmt::Let(
+                    kc,
+                    Rvalue::Call(DirectCall::Program(sk.func.clone()), args),
+                ));
                 Operand::Value(kc)
             }
             None => v,
@@ -14126,6 +14255,13 @@ mod tests {
     use align_parser::parse_file;
     use align_sema::check_file;
 
+    fn direct_program_name(call: &DirectCall) -> Option<&str> {
+        match call {
+            DirectCall::Program(target) => Some(target.as_str()),
+            DirectCall::Runtime(_) => None,
+        }
+    }
+
     fn lower(src: &str) -> Program {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
@@ -14298,13 +14434,13 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             let emitted_forbidden_action = |statement: &Stmt| match name {
                 "unary" => matches!(statement, Stmt::Let(_, Rvalue::Un(..))),
                 "binary" | "selected" => matches!(statement, Stmt::Let(_, Rvalue::Bin(..))),
                 "arguments" => {
-                    matches!(statement, Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "call")
+                    matches!(statement, Stmt::Let(_, Rvalue::Call(callee, _)) if direct_program_name(callee) == Some("call"))
                 }
                 "fixed_index" => matches!(statement, Stmt::Let(_, Rvalue::Index(..))),
                 "dynamic_index" => matches!(statement, Stmt::Let(_, Rvalue::SliceIndex(..))),
@@ -14334,7 +14470,7 @@ fn main() -> i32 = 0
                     .all(|statement| {
                         !matches!(
                             statement,
-                            Stmt::Let(_, Rvalue::Call(callee, _)) if callee == "later"
+                            Stmt::Let(_, Rvalue::Call(callee, _)) if direct_program_name(callee) == Some("later")
                         ) && !emitted_forbidden_action(statement)
                     }),
                 "{name} emitted a later sibling or parent action: {function:#?}"
@@ -14375,7 +14511,7 @@ fn main() -> i32 = 0
             let function = hir
                 .fns
                 .iter_mut()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             let field_expr = match function.body.value.as_mut() {
                 Some(value) => value,
@@ -14397,7 +14533,7 @@ fn main() -> i32 = 0
         let apply = hir
             .fns
             .iter_mut()
-            .find(|function| function.name == "apply")
+            .find(|function| function.name.as_str() == "apply")
             .expect("apply function");
         let call = apply.body.value.as_mut().expect("apply expression body");
         let hir::ExprKind::CallFnValue { callee, .. } = &mut call.kind else {
@@ -14412,7 +14548,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("lowered {name}"));
             assert!(
                 function
@@ -14443,7 +14579,7 @@ fn main() -> i32 = 0
         let apply = program
             .fns
             .iter()
-            .find(|function| function.name == "apply")
+            .find(|function| function.name.as_str() == "apply")
             .expect("lowered apply");
         assert!(
             apply
@@ -14486,12 +14622,15 @@ fn main() -> i32 {
         let main = program
             .fns
             .iter()
-            .find(|function| function.name == "main")
+            .find(|function| function.name.as_str() == "main")
             .expect("main function");
         let mut captures = Vec::new();
         for block in &main.blocks {
             for statement in &block.stmts {
                 let Stmt::Let(_, Rvalue::Call(name, args)) = statement else {
+                    continue;
+                };
+                let Some(name) = direct_program_name(name) else {
                     continue;
                 };
                 if !name.starts_with("main$lambda") {
@@ -14500,7 +14639,7 @@ fn main() -> i32 {
                 let Operand::Value(capture) = args.last().expect("lifted lambda capture") else {
                     panic!("lifted capture must be a preheader SSA value: {statement:?}");
                 };
-                captures.push((name.as_str(), *capture, block.id));
+                captures.push((name, *capture, block.id));
             }
         }
         captures.sort_by_key(|(name, _, _)| *name);
@@ -14550,7 +14689,7 @@ fn main() -> i32 {
         let main = program
             .fns
             .iter()
-            .find(|function| function.name == "main")
+            .find(|function| function.name.as_str() == "main")
             .expect("main function");
         assert!(
             main.blocks.iter().all(|block| {
@@ -14585,7 +14724,7 @@ fn main() -> i32 {
         let owned_main = owned_program
             .fns
             .iter()
-            .find(|function| function.name == "main")
+            .find(|function| function.name.as_str() == "main")
             .expect("owned-source main");
         assert!(
             owned_main
@@ -14631,7 +14770,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             let (capture, action_block) = function
                 .blocks
@@ -14641,7 +14780,9 @@ fn main() -> i32 = 0
                         let Stmt::Let(_, Rvalue::Call(callee, args)) = statement else {
                             return None;
                         };
-                        if !callee.starts_with(&format!("{name}$lambda")) {
+                        if !direct_program_name(callee)
+                            .is_some_and(|callee| callee.starts_with(&format!("{name}$lambda")))
+                        {
                             return None;
                         }
                         let Operand::Value(capture) = args.last()? else {
@@ -14671,7 +14812,7 @@ fn main() -> i32 = 0
         let selected = program
             .fns
             .iter()
-            .find(|function| function.name == "selected")
+            .find(|function| function.name.as_str() == "selected")
             .expect("selected function");
         assert!(
             selected.blocks.iter().filter(|block| block.id != selected.entry).all(|block| {
@@ -14716,7 +14857,7 @@ fn bad() -> i32 {
         let bad = program
             .fns
             .iter()
-            .find(|function| function.name == "bad")
+            .find(|function| function.name.as_str() == "bad")
             .expect("bad function");
         let entry = bad
             .blocks
@@ -14742,7 +14883,7 @@ fn bad() -> i32 {
         let malformed_bad = hir
             .fns
             .iter_mut()
-            .find(|function| function.name == "bad")
+            .find(|function| function.name.as_str() == "bad")
             .expect("malformed bad function");
         let hir::Stmt::Break { accepted, .. } = &mut malformed_bad.body.stmts[0] else {
             panic!("bad first statement must remain a checked break");
@@ -14752,7 +14893,7 @@ fn bad() -> i32 {
         let malformed_bad = malformed
             .fns
             .iter()
-            .find(|function| function.name == "bad")
+            .find(|function| function.name.as_str() == "bad")
             .expect("lowered malformed bad function");
         assert_eq!(
             malformed_bad.blocks.len(),
@@ -14829,7 +14970,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             assert!(
                 function.blocks.iter().flat_map(|block| &block.stmts).all(
@@ -14844,7 +14985,7 @@ fn main() -> i32 = 0
         let nested = program
             .fns
             .iter()
-            .find(|function| function.name == "nested_break")
+            .find(|function| function.name.as_str() == "nested_break")
             .expect("nested_break function");
         let str_stores = nested
             .blocks
@@ -14902,7 +15043,7 @@ fn main() -> i32 = 0
         let mixed = program
             .fns
             .iter()
-            .find(|function| function.name == "mixed_if")
+            .find(|function| function.name.as_str() == "mixed_if")
             .expect("mixed_if function");
         let mut str_stores = mixed
             .slots
@@ -14939,7 +15080,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             assert!(
                 function
@@ -14965,7 +15106,7 @@ fn main() -> i32 = 0
             program
                 .fns
                 .iter()
-                .find(|f| f.name == "output")
+                .find(|f| f.name.as_str() == "output")
                 .expect("output function")
                 .ret
         };
@@ -14981,7 +15122,7 @@ fn main() -> i32 = 0
         });
         let mut program = Program {
             fns: vec![Function {
-                name: "main".to_string(),
+                name: ProgramCall::from_validated("main"),
                 params: vec![],
                 param_modes: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
@@ -14997,7 +15138,7 @@ fn main() -> i32 = 0
                     stmts: vec![Stmt::Let(
                         0,
                         Rvalue::Closure {
-                            lifted: "unused".to_string(),
+                            lifted: ProgramCall::from_validated("unused"),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(1)],
                             signature: FnSignatureFacts {
@@ -15086,7 +15227,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert!(
                 function
@@ -15101,7 +15242,7 @@ fn main() -> i32 = 0
             let function = program
                 .fns
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert!(
                 function
@@ -15136,10 +15277,10 @@ fn main() -> i32 = 0
         let p = lower(
             "fn u() {}\nfn take(x: ()) {}\nfn tail() { return u() }\nfn main() -> i32 {\n  a := u()\n  f := u\n  b := f()\n  empty := {}\n  looped := loop { break u() }\n  take(u())\n  take(empty)\n  take(looped)\n  tail()\n  return 0\n}\n",
         );
-        let main = p.fns.iter().find(|f| f.name == "main").expect("main MIR");
+        let main = p.fns.iter().find(|f| f.name.as_str() == "main").expect("main MIR");
         let stmts: Vec<&Stmt> = main.blocks.iter().flat_map(|b| &b.stmts).collect();
         assert!(
-            stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::Call(name, _)) if name == "u")),
+            stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::Call(name, _)) if direct_program_name(name) == Some("u"))),
             "the direct Unit call must remain for its effects:\n{}",
             print::function_to_string(main)
         );
@@ -15161,12 +15302,12 @@ fn main() -> i32 = 0
         }
         assert!(
             stmts.iter().any(
-                |s| matches!(s, Stmt::Let(_, Rvalue::Call(name, args)) if name == "take" && matches!(args.as_slice(), [Operand::Const(Const::Unit)]))
+                |s| matches!(s, Stmt::Let(_, Rvalue::Call(name, args)) if direct_program_name(name) == Some("take") && matches!(args.as_slice(), [Operand::Const(Const::Unit)]))
             ),
             "a Unit call argument must be Const::Unit:\n{}",
             print::function_to_string(main)
         );
-        let tail = p.fns.iter().find(|f| f.name == "tail").expect("tail MIR");
+        let tail = p.fns.iter().find(|f| f.name.as_str() == "tail").expect("tail MIR");
         assert!(
             tail.blocks.iter().any(|b| matches!(b.term, Term::Return(None))),
             "an explicit Unit return must keep the void ABI:\n{}",
@@ -15179,7 +15320,7 @@ fn main() -> i32 = 0
         let p = lower(
             "import std.process\nfn quit() {\n  s := \"x\".clone()\n  return process.abort()\n}\nfn main() -> i32 = 0\n",
         );
-        let quit = p.fns.iter().find(|f| f.name == "quit").expect("quit MIR");
+        let quit = p.fns.iter().find(|f| f.name.as_str() == "quit").expect("quit MIR");
         assert!(
             quit.blocks.iter().any(|b| matches!(b.term, Term::Unreachable)),
             "process.abort must retain its diverging terminator:\n{}",
@@ -15204,7 +15345,7 @@ fn main() -> i32 = 0
             "partial_tuple",
             "partial_struct",
         ] {
-            let f = p.fns.iter().find(|f| f.name == name).expect("call test MIR");
+            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("call test MIR");
             assert!(
                 f.blocks
                     .iter()
@@ -15215,7 +15356,7 @@ fn main() -> i32 = 0
             );
             assert!(
                 f.blocks.iter().flat_map(|b| &b.stmts).all(|s| {
-                    !matches!(s, Stmt::Let(_, Rvalue::Call(callee, _)) if matches!(callee.as_str(), "take" | "take_tuple" | "take_pair"))
+                    !matches!(s, Stmt::Let(_, Rvalue::Call(callee, _)) if matches!(direct_program_name(callee), Some("take" | "take_tuple" | "take_pair")))
                         && !matches!(s, Stmt::Let(_, Rvalue::CallIndirect { .. }))
                 }),
                 "{name} must not emit the outer call after the later argument returns:\n{}",
@@ -15230,7 +15371,7 @@ fn main() -> i32 = 0
             "fn make() -> string {\n  return task_group { s := \"hello\".clone(); s }\n}\nfn take(s: string) -> i64 = s.len()\nfn call() -> i64 = take(task_group { s := \"world\".clone(); s })\nfn main() -> i32 = 0\n",
         );
         for name in ["make", "call"] {
-            let f = p.fns.iter().find(|f| f.name == name).expect("task_group move MIR");
+            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("task_group move MIR");
             let cleared_live_flag = f.slots.iter().enumerate().any(|(slot, ty)| {
                 *ty == Ty::Bool
                     && f.blocks
@@ -15277,7 +15418,7 @@ fn main() -> i32 = 0
              }\n\
              fn main() -> i32 = mixed() as i32\n",
         );
-        let f = p.fns.iter().find(|f| f.name == "mixed").expect("mixed match MIR");
+        let f = p.fns.iter().find(|f| f.name.as_str() == "mixed").expect("mixed match MIR");
         assert!(
             f.blocks.iter().flat_map(|block| &block.stmts).any(
                 |stmt| matches!(
@@ -15300,7 +15441,7 @@ fn main() -> i32 = 0
              }\n\
              fn main() -> i32 = wildcard() as i32\n",
         );
-        let f = p.fns.iter().find(|f| f.name == "wildcard").expect("wildcard match MIR");
+        let f = p.fns.iter().find(|f| f.name.as_str() == "wildcard").expect("wildcard match MIR");
         assert!(
             f.blocks.iter().flat_map(|block| &block.stmts).any(
                 |stmt| matches!(
@@ -15322,7 +15463,7 @@ fn main() -> i32 = 0
             ("partial", "direct struct let"),
             ("partial_array", "fixed Move-struct array let"),
         ] {
-            let partial = p.fns.iter().find(|f| f.name == name).expect("partial aggregate MIR");
+            let partial = p.fns.iter().find(|f| f.name.as_str() == name).expect("partial aggregate MIR");
             assert!(
                 partial
                     .blocks
@@ -15334,7 +15475,7 @@ fn main() -> i32 = 0
             );
         }
 
-        let joined = p.fns.iter().find(|f| f.name == "joined").expect("joined MIR");
+        let joined = p.fns.iter().find(|f| f.name.as_str() == "joined").expect("joined MIR");
         let forwards_runtime_flag = joined.blocks.iter().any(|block| {
             let stores_struct = block.stmts.iter().any(
                 |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(_)) if matches!(joined.slots[*slot as usize], Ty::Struct(_))),
@@ -15356,7 +15497,7 @@ fn main() -> i32 = 0
         let p = lower(
             "Wrap { xs: array<i64> }\nfn main() -> i32 {\n  return [Wrap { xs: [1, 2].to_array() }].count() as i32\n}\n",
         );
-        let main = p.fns.iter().find(|f| f.name == "main").expect("main MIR");
+        let main = p.fns.iter().find(|f| f.name.as_str() == "main").expect("main MIR");
         assert!(
             main.blocks.iter().flat_map(|block| &block.stmts).any(
                 |stmt| matches!(
@@ -15377,7 +15518,7 @@ fn main() -> i32 = 0
         );
 
         let assert_no_post_clear_reload = |name: &str, marker: &dyn Fn(&Stmt) -> bool| {
-            let f = p.fns.iter().find(|f| f.name == name).expect("ownership test MIR");
+            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("ownership test MIR");
             let block = f
                 .blocks
                 .iter()
@@ -15445,7 +15586,7 @@ fn main() -> i32 = 0
             matches!(stmt, Stmt::Let(_, Rvalue::MakeTuple { .. }))
         });
         assert_no_post_clear_reload("structured", &|stmt| {
-            matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_))))
+            matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name.as_str() == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_))))
         });
         assert_no_post_clear_reload("enumed", &|stmt| {
             matches!(stmt, Stmt::Let(_, Rvalue::MakeEnum { .. }))
@@ -15454,7 +15595,7 @@ fn main() -> i32 = 0
             matches!(stmt, Stmt::Let(_, Rvalue::ResultIsOk(_)))
         });
 
-        let arena_exit = p.fns.iter().find(|f| f.name == "arena_exit").expect("arena exit MIR");
+        let arena_exit = p.fns.iter().find(|f| f.name.as_str() == "arena_exit").expect("arena exit MIR");
         assert!(
             arena_exit.blocks.iter().any(|block| {
                 block.stmts.windows(2).any(|pair| {
@@ -15479,7 +15620,7 @@ fn main() -> i32 = 0
         let p = lower(
             "E { Bad }\nfn make() -> array<i64> = [1].to_array()\nfn load() -> Result<array<i64>, E> = Ok(make())\nfn convert(e: E) -> Error = Error.Code(1)\nfn early(c: bool) -> i32 {\n  mapped := load().map_err({\n    if c { return 0 }\n    convert\n  })\n  return 1\n}\nfn run(c: bool) -> Result<i64, Error> {\n  arena {\n    mut r: Result<array<i64>, E> := Ok(make())\n    if c {\n      r = Ok([2].to_array())\n    }\n    mapped := r.map_err(convert)\n    xs := mapped?\n    return Ok(xs.sum())\n  }\n}\nfn main() -> i32 = 0\n",
         );
-        let early = p.fns.iter().find(|f| f.name == "early").expect("early MIR");
+        let early = p.fns.iter().find(|f| f.name.as_str() == "early").expect("early MIR");
         assert!(
             early
                 .blocks
@@ -15490,7 +15631,7 @@ fn main() -> i32 = 0
             print::function_to_string(early)
         );
 
-        let run = p.fns.iter().find(|f| f.name == "run").expect("run MIR");
+        let run = p.fns.iter().find(|f| f.name.as_str() == "run").expect("run MIR");
         let stores_dynamic_result_flag = run.blocks.iter().any(|block| {
             block.stmts.windows(2).any(|pair| {
                 matches!(
@@ -15525,8 +15666,8 @@ fn main() -> i32 = 0
                 vec![Ty::DynArray(scalar_of(i64_ty())), Ty::String],
             ),
         ] {
-            let dynamic = p.fns.iter().find(|f| f.name == name).expect("dynamic aggregate MIR");
-            let take = p.fns.iter().find(|f| f.name == callee).expect("aggregate consumer MIR");
+            let dynamic = p.fns.iter().find(|f| f.name.as_str() == name).expect("dynamic aggregate MIR");
+            let take = p.fns.iter().find(|f| f.name.as_str() == callee).expect("aggregate consumer MIR");
             let aggregate_ty = take.slots[take.params[0] as usize];
             let has_aggregate_owner = dynamic.blocks.iter().any(|block| {
                 block.stmts.windows(2).any(|pair| {
@@ -15562,7 +15703,7 @@ fn main() -> i32 = 0
                     .blocks
                     .iter()
                     .flat_map(|block| &block.stmts)
-                    .all(|stmt| !matches!(stmt, Stmt::Let(_, Rvalue::Call(called, _)) if called == callee)),
+                    .all(|stmt| !matches!(stmt, Stmt::Let(_, Rvalue::Call(called, _)) if direct_program_name(called) == Some(callee))),
                 "{name}'s outer call must not be emitted after its later argument returns:\n{}",
                 print::function_to_string(dynamic)
             );
@@ -15574,10 +15715,10 @@ fn main() -> i32 = 0
         let p = lower(
             "fn use(s: str) {}\nfn f() {\n  use(\"first\".clone())\n  use(\"second\".clone())\n}\nfn main() -> i32 = 0\n",
         );
-        let f = p.fns.iter().find(|f| f.name == "f").expect("borrowed Unit call MIR");
+        let f = p.fns.iter().find(|f| f.name.as_str() == "f").expect("borrowed Unit call MIR");
         let rendered = print::function_to_string(f);
-        let first_call = rendered.find("call use").expect("first use call");
-        let second_call = rendered.rfind("call use").expect("second use call");
+        let first_call = rendered.find("call program use").expect("first use call");
+        let second_call = rendered.rfind("call program use").expect("second use call");
         let first_drop = rendered[first_call..].find("drop ").map(|offset| first_call + offset).expect("first temporary drop");
         assert!(
             first_call < first_drop && first_drop < second_call,
@@ -15590,7 +15731,7 @@ fn main() -> i32 = 0
         let p = lower(
             "fn take() -> string {\n  s := \"x\".clone()\n  return s\n}\nfn main() -> i32 = take().len() as i32\n",
         );
-        let take = p.fns.iter().find(|f| f.name == "take").expect("take MIR");
+        let take = p.fns.iter().find(|f| f.name.as_str() == "take").expect("take MIR");
         assert!(
             take.blocks.iter().flat_map(|b| &b.stmts).all(|stmt| !matches!(stmt, Stmt::Drop(_))),
             "a definitely moved local must not retain a destructor edge:\n{}",
@@ -15603,7 +15744,7 @@ fn main() -> i32 = 0
         let p = lower(
             "fn keep() -> i64 {\n  s := \"x\".clone()\n  return s.len()\n}\nfn main() -> i32 = keep() as i32\n",
         );
-        let keep = p.fns.iter().find(|f| f.name == "keep").expect("keep MIR");
+        let keep = p.fns.iter().find(|f| f.name.as_str() == "keep").expect("keep MIR");
         assert_eq!(
             keep.blocks
                 .iter()

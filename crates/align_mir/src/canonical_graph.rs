@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use align_ast::ParamMode;
 use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
@@ -9,6 +10,16 @@ use super::{Program, function_embedded_types, remap_function_embedded_types};
 #[derive(Clone, Debug)]
 pub struct FunctionTypeDef {
     pub params: Vec<(ParamMode, Scalar)>,
+    pub ret: Ty,
+    pub return_borrow: hir::ReturnBorrowSummary,
+    pub return_region: hir::ReturnRegionSummary,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramExtern {
+    pub name: ProgramCall,
+    pub params: Vec<Ty>,
+    pub param_modes: Vec<ParamMode>,
     pub ret: Ty,
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
@@ -38,12 +49,22 @@ impl ProgramCall {
         Ok(Self(value.into()))
     }
 
+    pub(super) fn from_validated(value: &str) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+}
+
+impl fmt::Display for ProgramCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
