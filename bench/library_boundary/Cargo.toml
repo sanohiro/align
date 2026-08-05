@@ -8,6 +8,7 @@ publish = false
 align_driver = { path = "../../crates/align_driver" }
 align_interface = { path = "../../crates/align_interface" }
 align_mir = { path = "../../crates/align_mir" }
+align_sema = { path = "../../crates/align_sema" }
 align_span = { path = "../../crates/align_span" }
 
 [workspace]

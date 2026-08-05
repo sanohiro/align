@@ -14,6 +14,7 @@ pub struct FunctionTypeDef {
     pub ret: Ty,
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
 #[derive(Clone, Debug)]
@@ -24,6 +25,7 @@ pub struct ProgramExtern {
     pub ret: Ty,
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -176,6 +178,7 @@ impl SourceShapeView for CanonicalTypeView<'_> {
                         ret: &definition.ret,
                         return_borrow: &definition.return_borrow,
                         return_region: &definition.return_region,
+                        return_cleanup: definition.return_cleanup,
                     })
             }
         }
@@ -359,14 +362,12 @@ impl<'a> GraphValidator<'a> {
                 ret,
                 return_borrow,
                 return_region,
+                return_cleanup,
             } => {
                 let count_ordinal = self.field_ordinal();
                 self.validate_count(params.len(), count_ordinal);
-                for &(mode, value) in params {
-                    let mode_ordinal = self.field_ordinal();
-                    if !matches!(mode, ParamMode::ByValue | ParamMode::Out) {
-                        self.candidate(mode_ordinal, CanonicalGraphError::InvalidGraph);
-                    }
+                for &(_, value) in params {
+                    self.field_ordinal();
                     self.scan_scalar(value, &mut references, None);
                 }
                 self.scan_ty(*ret, &mut references, None);
@@ -374,6 +375,21 @@ impl<'a> GraphValidator<'a> {
                 let region_ordinal = self.scan_region_summary(return_region, params.len());
                 if !summaries_agree(return_borrow, return_region) {
                     self.candidate(region_ordinal, CanonicalGraphError::InvalidSummary);
+                }
+                let expected_cleanup = if align_sema::needs_drop_flag(
+                    *ret,
+                    self.view.structs,
+                    self.view.tuples,
+                    self.view.enums,
+                    self.view.tagged_types,
+                ) {
+                    hir::ReturnCleanupAbi::DynamicBit
+                } else {
+                    hir::ReturnCleanupAbi::None
+                };
+                let cleanup_ordinal = self.field_ordinal();
+                if return_cleanup != expected_cleanup {
+                    self.candidate(cleanup_ordinal, CanonicalGraphError::InvalidGraph);
                 }
             }
         }
@@ -694,7 +710,7 @@ impl<'a> GraphValidator<'a> {
         let summary_ordinal = self.field_ordinal();
         let count_ordinal = self.field_ordinal();
         self.validate_count(roots.len(), count_ordinal);
-        if roots.is_empty() {
+        if roots.is_empty() && captures.is_empty() {
             self.candidate(count_ordinal, CanonicalGraphError::InvalidSummary);
         }
         let mut previous = None;
@@ -707,11 +723,13 @@ impl<'a> GraphValidator<'a> {
         }
         let captures_count = self.field_ordinal();
         self.validate_count(captures.len(), captures_count);
-        if !captures.is_empty() {
-            self.candidate(captures_count, CanonicalGraphError::InvalidSummary);
-        }
-        for _ in captures {
-            self.field_ordinal();
+        let mut previous = None;
+        for &capture in captures {
+            let ordinal = self.field_ordinal();
+            if previous.is_some_and(|value| value >= capture) {
+                self.candidate(ordinal, CanonicalGraphError::InvalidSummary);
+            }
+            previous = Some(capture);
         }
         summary_ordinal
     }
@@ -908,22 +926,30 @@ impl CanonicalFnAbi {
         ret: Ty,
         borrow: &hir::ReturnBorrowSummary,
         region: &hir::ReturnRegionSummary,
+        cleanup: hir::ReturnCleanupAbi,
         program: &Program,
     ) -> Result<Self, CanonicalCodecError> {
         let count = checked_count(params.len())?;
         validate_function_summaries(borrow, region, params.len())?;
-        if params
-            .iter()
-            .any(|(mode, _)| !matches!(mode, ParamMode::ByValue | ParamMode::Out))
-        {
-            return Err(CanonicalCodecError::InvalidGraph);
-        }
-
         let mut canonical_params = Vec::with_capacity(params.len());
         for &(mode, ty) in params {
             canonical_params.push((mode, CanonicalTy::from_program(ty, program)?));
         }
         let canonical_ret = CanonicalTy::from_program(ret, program)?;
+        let expected_cleanup = if align_sema::needs_drop_flag(
+            ret,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        ) {
+            hir::ReturnCleanupAbi::DynamicBit
+        } else {
+            hir::ReturnCleanupAbi::None
+        };
+        if cleanup != expected_cleanup {
+            return Err(CanonicalCodecError::InvalidGraph);
+        }
         let mut out = Vec::new();
         out.push(1);
         out.extend(count.to_le_bytes());
@@ -934,6 +960,7 @@ impl CanonicalFnAbi {
         out.extend(canonical_ret.as_bytes());
         encode_borrow_summary(&mut out, borrow)?;
         encode_region_summary(&mut out, region)?;
+        encode_return_cleanup(&mut out, cleanup);
         Ok(Self(out.into_boxed_slice()))
     }
 
@@ -967,9 +994,9 @@ fn validate_function_summaries(
     fn valid(roots: &[u32], captures: &[u32], params: usize) -> bool {
         u32::try_from(roots.len()).is_ok()
             && u32::try_from(captures.len()).is_ok()
-            && !roots.is_empty()
-            && captures.is_empty()
+            && (!roots.is_empty() || !captures.is_empty())
             && roots.windows(2).all(|pair| pair[0] < pair[1])
+            && captures.windows(2).all(|pair| pair[0] < pair[1])
             && roots.iter().all(|&root| (root as usize) < params)
     }
 
@@ -1261,6 +1288,7 @@ fn decode_node(cursor: &mut DecodeCursor<'_>) -> Result<DecodedNode, CanonicalCo
                 ret: decode_ty(cursor)?,
                 return_borrow: decode_borrow_summary(cursor)?,
                 return_region: decode_region_summary(cursor)?,
+                return_cleanup: decode_return_cleanup(cursor)?,
             }))
         }
         _ => Err(CanonicalCodecError::UnknownTag),
@@ -1608,15 +1636,13 @@ pub(super) fn canonical_fn_abi_record_len(bytes: &[u8]) -> Result<usize, Canonic
     }
     let count = cursor.count(7)?;
     for _ in 0..count {
-        let mode = decode_param_mode(&mut cursor)?;
-        if matches!(mode, ParamMode::Borrow | ParamMode::BorrowMut) {
-            return Err(CanonicalCodecError::InvalidGraph);
-        }
+        let _mode = decode_param_mode(&mut cursor)?;
         decode_nested_canonical_type(&mut cursor)?;
     }
     decode_nested_canonical_type(&mut cursor)?;
     let borrow = decode_borrow_summary(&mut cursor)?;
     let region = decode_region_summary(&mut cursor)?;
+    decode_return_cleanup(&mut cursor)?;
     validate_function_summaries(&borrow, &region, count)?;
     Ok(cursor.offset)
 }
@@ -1863,9 +1889,27 @@ fn encode_node(
             ty(out, definition.ret, ordinal)?;
             encode_borrow_summary(out, &definition.return_borrow)?;
             encode_region_summary(out, &definition.return_region)?;
+            encode_return_cleanup(out, definition.return_cleanup);
             Ok(())
         }
     })
+}
+
+fn encode_return_cleanup(out: &mut Vec<u8>, value: hir::ReturnCleanupAbi) {
+    out.push(match value {
+        hir::ReturnCleanupAbi::None => 0,
+        hir::ReturnCleanupAbi::DynamicBit => 1,
+    });
+}
+
+fn decode_return_cleanup(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<hir::ReturnCleanupAbi, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(hir::ReturnCleanupAbi::None),
+        1 => Ok(hir::ReturnCleanupAbi::DynamicBit),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
 }
 
 fn encode_borrow_summary(
@@ -2035,9 +2079,8 @@ fn encode_param_mode(out: &mut Vec<u8>, mode: ParamMode) -> Result<(), Canonical
     match mode {
         ParamMode::ByValue => out.push(0),
         ParamMode::Out => out.push(1),
-        ParamMode::Borrow | ParamMode::BorrowMut => {
-            return Err(CanonicalGraphError::InvalidGraph);
-        }
+        ParamMode::Borrow => out.push(2),
+        ParamMode::BorrowMut => out.push(3),
     }
     Ok(())
 }
@@ -2541,6 +2584,7 @@ mod tests {
                 ret: definition.ret,
                 return_borrow: definition.return_borrow.clone(),
                 return_region: definition.return_region.clone(),
+                return_cleanup: definition.return_cleanup,
             })
             .collect()
     }
@@ -3153,10 +3197,11 @@ mod tests {
             Ty::Unit,
             &hir::ReturnBorrowSummary::None,
             &hir::ReturnRegionSummary::None,
+            hir::ReturnCleanupAbi::None,
             &program,
         )
         .unwrap();
-        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 56, 0, 0]);
+        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 56, 0, 0, 0]);
         assert_eq!(CanonicalFnAbi::decode(abi.as_bytes()).unwrap(), abi);
 
         let params = [(ParamMode::ByValue, Ty::Fn(0))];
@@ -3171,6 +3216,7 @@ mod tests {
                 params: vec![0],
                 captures: vec![],
             },
+            hir::ReturnCleanupAbi::None,
             &program,
         )
         .unwrap();
@@ -3236,39 +3282,39 @@ mod tests {
         error(&recursive, CanonicalCodecError::InvalidGraph);
 
         let duplicate_function = [
-            1, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 52, 0, 0, 0, 0,
+            1, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&duplicate_function, CanonicalCodecError::DuplicateMember);
 
-        let unreachable_function = [1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 56];
+        let unreachable_function = [1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 56];
         error(
             &unreachable_function,
             CanonicalCodecError::NonCanonicalOrder,
         );
 
         let invalid_summary = [
-            1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
+            1, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&invalid_summary, CanonicalCodecError::InvalidSummary);
 
         let unit = [1, 0, 0, 0, 0, 56];
-        let mut invalid_mode = vec![1, 1, 0, 0, 0, 2];
+        let mut invalid_mode = vec![1, 1, 0, 0, 0, 4];
         invalid_mode.extend(unit);
         invalid_mode.extend(unit);
         invalid_mode.extend([0, 0]);
         assert_eq!(
             CanonicalFnAbi::decode(&invalid_mode),
-            Err(CanonicalCodecError::InvalidGraph)
+            Err(CanonicalCodecError::UnknownTag)
         );
-        let mut invalid_mode_then_truncated = vec![1, 1, 0, 0, 0, 2];
+        let mut invalid_mode_then_truncated = vec![1, 1, 0, 0, 0, 4];
         invalid_mode_then_truncated.extend(unit);
         assert_eq!(
             CanonicalFnAbi::decode(&invalid_mode_then_truncated),
-            Err(CanonicalCodecError::InvalidGraph)
+            Err(CanonicalCodecError::UnknownTag)
         );
         let mut abi_trailing = vec![1, 0, 0, 0, 0];
         abi_trailing.extend(unit);
-        abi_trailing.extend([0, 0, 0xff]);
+        abi_trailing.extend([0, 0, 0, 0xff]);
         assert_eq!(
             CanonicalFnAbi::decode(&abi_trailing),
             Err(CanonicalCodecError::TrailingBytes)
@@ -3624,13 +3670,10 @@ mod tests {
         for value in [Ty::Param(0), Ty::IntVar(0), Ty::FloatVar(0), Ty::Error] {
             error!(encoded_ty(value), CanonicalGraphError::InvalidGraph);
         }
-        for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
-            error!(
-                encode_param_mode(&mut out, mode),
-                CanonicalGraphError::InvalidGraph
-            );
-            assert_eq!(out, [0xa5, 0x5a]);
-        }
+        let mut modes = Vec::new();
+        encode_param_mode(&mut modes, ParamMode::Borrow).unwrap();
+        encode_param_mode(&mut modes, ParamMode::BorrowMut).unwrap();
+        assert_eq!(modes, [2, 3]);
         error!(
             prim(&mut out, PrimScalar::Int(i(24))),
             CanonicalGraphError::InvalidWidth
@@ -3669,6 +3712,7 @@ mod tests {
             ret: Ty::Unit,
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
         };
         assert_eq!(definition.params, [(ParamMode::Out, Scalar::Bool)]);
         assert_eq!(definition.ret, Ty::Unit);

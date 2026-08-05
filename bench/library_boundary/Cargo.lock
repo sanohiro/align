@@ -9,6 +9,7 @@ dependencies = [
  "align_driver",
  "align_interface",
  "align_mir",
+ "align_sema",
  "align_span",
 ]
 

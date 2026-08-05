@@ -45,6 +45,7 @@ fn interface_fixture() -> InterfaceSummary {
             ret: named("i64"),
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
             generic_body: None,
         });
@@ -212,6 +213,7 @@ fn import_validation_fixture() -> InterfaceSummary {
                 params: vec![0],
                 captures: Vec::new(),
             },
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
             generic_body: None,
         })
@@ -493,16 +495,182 @@ fn run_provenance() {
     println!("mir-continuation-lowering\t{milliseconds:.3}\tms/lower\t{block_count}\tblocks");
 }
 
+fn return_fixture(kind: &str, calls: u64) -> String {
+    let (producer, consume) = match kind {
+        "copy-return-control" => (
+            "fn produce(value: i64) -> i64 = value\n",
+            "fn consume(value: i64) -> i64 = value\n",
+        ),
+        "move-return-none" => (
+            "fn produce(_: i64) -> Option<string> = None\n",
+            "fn consume(value: Option<string>) -> i64 = match value { Some(text) => text.len() None => 0 }\n",
+        ),
+        "move-return-some" => (
+            "fn produce(_: i64) -> Option<string> = Some(\"owned\".clone())\n",
+            "fn consume(value: Option<string>) -> i64 = match value { Some(text) => text.len() None => 0 }\n",
+        ),
+        "move-return-err" => (
+            "fn produce(_: i64) -> Result<string, string> = Err(\"owned\".clone())\n",
+            "fn consume(value: Result<string, string>) -> i64 = match value { Ok(text) => text.len() Err(text) => text.len() }\n",
+        ),
+        _ => unreachable!("closed benchmark row"),
+    };
+    format!(
+        "{producer}{consume}\
+         fn main() -> i32 {{\n\
+         \u{20}\u{20}mut index: i64 := 0\n\
+         \u{20}\u{20}mut total: i64 := 0\n\
+         \u{20}\u{20}loop {{\n\
+         \u{20}\u{20}\u{20}\u{20}if index == {calls} {{ break }}\n\
+         \u{20}\u{20}\u{20}\u{20}total = total + consume(produce(index))\n\
+         \u{20}\u{20}\u{20}\u{20}index = index + 1\n\
+         \u{20}\u{20}}}\n\
+         \u{20}\u{20}if total < 0 {{ return 1 }}\n\
+         \u{20}\u{20}return 0\n\
+         }}\n"
+    )
+}
+
+fn compile_call_fixture(
+    directory: &std::path::Path,
+    row: &str,
+    source: &str,
+) -> std::path::PathBuf {
+    let mut source_map = align_span::SourceMap::new();
+    let checked = align_driver::check(&mut source_map, &format!("{row}.align"), source);
+    assert!(
+        !checked.diags.has_errors(),
+        "{row} fixture must check:\n{}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let mir = align_driver::lower_to_mir(&checked.hir);
+    let object = directory.join(format!("{row}.o"));
+    let executable = directory.join(row);
+    align_driver::emit_object_file(
+        &mir,
+        &object,
+        align_driver::BuildTarget::Baseline,
+        align_driver::Profile::Release,
+        &[],
+        false,
+    )
+    .unwrap_or_else(|error| panic!("{row} object emission failed: {error}"));
+    align_driver::link_executable(
+        &object,
+        &executable,
+        &mir.link_libs,
+        align_driver::Profile::Release,
+    )
+    .unwrap_or_else(|error| panic!("{row} link failed: {error}"));
+    executable
+}
+
+fn run_call_rows(
+    group: &str,
+    rows: &[&str],
+    calls: u64,
+    fixture: fn(&str, u64) -> String,
+) {
+    assert!(align_driver::backend_available(), "{group} benchmark requires the LLVM backend");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "align-library-boundary-{group}-{}-{unique}", std::process::id()
+    ));
+    std::fs::create_dir(&directory).expect("create benchmark directory");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(directory.clone());
+
+    for &row in rows {
+        let source = fixture(row, calls);
+        let executable = compile_call_fixture(&directory, row, &source);
+        let minimum = Duration::from_millis(750);
+        let start = Instant::now();
+        let mut processes = 0_u64;
+        while start.elapsed() < minimum {
+            let status = std::process::Command::new(&executable)
+                .status()
+                .unwrap_or_else(|error| panic!("{row} execution failed: {error}"));
+            assert!(status.success(), "{row} returned {status}");
+            processes += 1;
+        }
+        let elapsed = start.elapsed();
+        let nanoseconds = elapsed.as_secs_f64() * 1_000_000_000.0
+            / (calls * processes) as f64;
+        println!("{row}\t{nanoseconds:.3}\tns/call\t{processes}\tprocesses");
+    }
+}
+
+fn run_move_return() {
+    const ROWS: [&str; 4] = [
+        "copy-return-control",
+        "move-return-none",
+        "move-return-some",
+        "move-return-err",
+    ];
+    run_call_rows("move-return", &ROWS, 100_000, return_fixture);
+}
+
+fn borrow_fixture(kind: &str, calls: u64) -> String {
+    match kind {
+        "by-value-call-control" => format!(
+            "fn inspect(value: i64) -> i64 = value + 1\n\
+             fn main() -> i32 {{ mut index: i64 := 0; mut total: i64 := 0; loop {{ if index == {calls} {{ break }}; total = total + inspect(index); index = index + 1 }}; if total < 0 {{ return 1 }}; return 0 }}\n"
+        ),
+        "shared-borrow-call" => format!(
+            "fn inspect(borrow value: string) -> i64 = value.len()\n\
+             fn main() -> i32 {{ value := \"shared\".clone(); mut index: i64 := 0; mut total: i64 := 0; loop {{ if index == {calls} {{ break }}; total = total + inspect(value); index = index + 1 }}; if total < 0 {{ return 1 }}; return 0 }}\n"
+        ),
+        "exclusive-copy-control" => format!(
+            "fn increment(value: i64) -> i64 = value + 1\n\
+             fn main() -> i32 {{ mut index: i64 := 0; mut value: i64 := 0; loop {{ if index == {calls} {{ break }}; value = increment(value); index = index + 1 }}; if value != {calls} {{ return 1 }}; return 0 }}\n"
+        ),
+        "exclusive-copy-call" => format!(
+            "fn increment(borrow mut value: i64) {{ value = value + 1 }}\n\
+             fn main() -> i32 {{ mut index: i64 := 0; mut value: i64 := 0; loop {{ if index == {calls} {{ break }}; increment(value); index = index + 1 }}; if value != {calls} {{ return 1 }}; return 0 }}\n"
+        ),
+        "exclusive-move-replace" => format!(
+            "fn replace(borrow mut value: string) {{ value = \"replacement\".clone() }}\n\
+             fn main() -> i32 {{ mut index: i64 := 0; mut value := \"initial\".clone(); loop {{ if index == {calls} {{ break }}; replace(value); index = index + 1 }}; if value.len() != 11 {{ return 1 }}; return 0 }}\n"
+        ),
+        _ => unreachable!("closed borrowed-call benchmark row"),
+    }
+}
+
+fn run_shared_borrow() {
+    const ROWS: [&str; 2] = ["by-value-call-control", "shared-borrow-call"];
+    run_call_rows("shared-borrow", &ROWS, 100_000, borrow_fixture);
+}
+
+fn run_exclusive_borrow() {
+    const ROWS: [&str; 3] = [
+        "exclusive-copy-control",
+        "exclusive-copy-call",
+        "exclusive-move-replace",
+    ];
+    run_call_rows("exclusive-borrow", &ROWS, 100_000, borrow_fixture);
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("interface") => run_interface(),
         Some("provenance") => run_provenance(),
+        Some("move-return") => run_move_return(),
+        Some("shared-borrow") => run_shared_borrow(),
+        Some("exclusive-borrow") => run_exclusive_borrow(),
         Some(other) => {
             eprintln!("unknown library-boundary benchmark group `{other}`");
             std::process::exit(2);
         }
         None => {
-            eprintln!("usage: run.sh interface|provenance");
+            eprintln!("usage: run.sh interface|provenance|move-return|shared-borrow|exclusive-borrow");
             std::process::exit(2);
         }
     }

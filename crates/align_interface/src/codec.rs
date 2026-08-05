@@ -18,7 +18,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -99,12 +99,14 @@ fn write_type(w: &mut Writer, t: &IType) {
             ret,
             return_borrow,
             return_region,
+            return_cleanup,
         } => {
             w.u8(2);
             w.seq(params, write_param);
             write_type(w, ret);
             write_return_borrow(w, return_borrow);
             write_return_region(w, return_region);
+            write_return_cleanup(w, *return_cleanup);
         }
     }
 }
@@ -159,6 +161,13 @@ fn write_effect(w: &mut Writer, e: Effect) {
     });
 }
 
+fn write_return_cleanup(w: &mut Writer, value: align_sema::hir::ReturnCleanupAbi) {
+    w.u8(match value {
+        align_sema::hir::ReturnCleanupAbi::None => 0,
+        align_sema::hir::ReturnCleanupAbi::DynamicBit => 1,
+    });
+}
+
 fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.str(&f.name);
     write_type_params(w, &f.type_params);
@@ -166,6 +175,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_type(w, &f.ret);
     write_return_borrow(w, &f.return_borrow);
     write_return_region(w, &f.return_region);
+    write_return_cleanup(w, f.return_cleanup);
     write_effect(w, f.effect);
     w.opt_str(&f.generic_body);
 }
@@ -357,7 +367,8 @@ fn read_type(r: &mut Reader<'_>) -> Result<IType, DecodeError> {
             let ret = Box::new(read_type(r)?);
             let return_borrow = read_return_borrow(r, params.len())?;
             let return_region = read_return_region(r, params.len())?;
-            Ok(IType::Fn { params, ret, return_borrow, return_region })
+            let return_cleanup = read_return_cleanup(r)?;
+            Ok(IType::Fn { params, ret, return_borrow, return_region, return_cleanup })
         }
         tag => Err(DecodeError::BadTag { what: "type", tag }),
     }
@@ -453,6 +464,16 @@ fn read_effect(r: &mut Reader<'_>) -> Result<Effect, DecodeError> {
     }
 }
 
+fn read_return_cleanup(
+    r: &mut Reader<'_>,
+) -> Result<align_sema::hir::ReturnCleanupAbi, DecodeError> {
+    match r.u8()? {
+        0 => Ok(align_sema::hir::ReturnCleanupAbi::None),
+        1 => Ok(align_sema::hir::ReturnCleanupAbi::DynamicBit),
+        tag => Err(DecodeError::BadTag { what: "return cleanup ABI", tag }),
+    }
+}
+
 fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let name = r.str()?;
     let type_params = read_type_params(r)?;
@@ -460,6 +481,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let ret = read_type(r)?;
     let return_borrow = read_return_borrow(r, params.len())?;
     let return_region = read_return_region(r, params.len())?;
+    let return_cleanup = read_return_cleanup(r)?;
     let effect = read_effect(r)?;
     let generic_body = r.opt_str()?;
     Ok(IFnSig {
@@ -469,6 +491,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         ret,
         return_borrow,
         return_region,
+        return_cleanup,
         effect,
         generic_body,
     })

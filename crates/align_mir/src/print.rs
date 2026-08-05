@@ -51,12 +51,13 @@ fn fn_to_string(out: &mut String, f: &Function) {
         .collect();
     let _ = writeln!(
         out,
-        "fn {}({}) -> {} borrow={:?} region={:?} {{",
+        "fn {}({}) -> {} borrow={:?} region={:?} cleanup={:?} {{",
         f.name,
         params.join(", "),
         ty_name(f.ret),
         f.return_borrow,
-        f.return_region
+        f.return_region,
+        f.return_cleanup
     );
     for b in &f.blocks {
         block_to_string(out, b);
@@ -175,6 +176,15 @@ fn block_to_string(out: &mut String, b: &Block) {
         Term::Return(None) => {
             let _ = writeln!(out, "    return");
         }
+        Term::ReturnWithCleanup(returned) => {
+            let (value, cleanup) = returned.as_ref();
+            let _ = writeln!(
+                out,
+                "    return_with_cleanup {}, {}",
+                operand_str(value),
+                operand_str(cleanup)
+            );
+        }
         Term::Unreachable => {
             let _ = writeln!(out, "    unreachable");
         }
@@ -226,6 +236,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 }
             }
         }
+        Rvalue::CallWithCleanup(call) => {
+            let crate::DirectCallWithCleanup { target, args, cleanup } = call.as_ref();
+            let a: Vec<String> = args.iter().map(operand_str).collect();
+            format!("call_with_cleanup program {target}({}) -> %{cleanup}", a.join(", "))
+        }
         Rvalue::FnAddr { target, signature } => {
             format!("fn_addr {target} signature={signature:?}")
         }
@@ -247,6 +262,21 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!(
                 "call_indirect {}({}) signature={signature:?}",
+                operand_str(callee),
+                a.join(", ")
+            )
+        }
+        Rvalue::CallIndirectWithCleanup(call) => {
+            let crate::IndirectCallWithCleanup {
+                callee,
+                args,
+                signature,
+                cleanup,
+                ..
+            } = call.as_ref();
+            let a: Vec<String> = args.iter().map(operand_str).collect();
+            format!(
+                "call_indirect_with_cleanup {}({}) signature={signature:?} -> %{cleanup}",
                 operand_str(callee),
                 a.join(", ")
             )
@@ -819,6 +849,15 @@ fn operand_str(op: &Operand) -> String {
         Operand::Const(Const::Unit) => "()".to_string(),
         Operand::Value(v) => format!("%{v}"),
         Operand::Arg(i) => format!("arg{i}"),
+        Operand::BorrowedPlace(place) => {
+            let suffix = place
+                .path
+                .iter()
+                .map(|field| format!(".{field}"))
+                .collect::<String>();
+            format!("borrow slot{}{}", place.slot, suffix)
+        }
+        Operand::BorrowedCleanupArg(index) => format!("arg{index}.cleanup"),
     }
 }
 

@@ -768,8 +768,29 @@ impl<'a> Parser<'a> {
         self.expect(&TokKind::LParen, "'('");
         let mut params = Vec::new();
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
-            let mode = if self.eat_ident_keyword("out") {
+            // Parameter modes are weak keywords. Treat them as modes only when the complete
+            // mode + name + `:` shape is present, so `out: region` and `borrow: T` remain valid
+            // by-value parameter declarations.
+            let has_out_mode = matches!(self.peek(), TokKind::Ident(name) if name == "out")
+                && matches!(self.peek_at(1), TokKind::Ident(_))
+                && matches!(self.peek_at(2), TokKind::Colon);
+            let has_borrow_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
+                && matches!(self.peek_at(1), TokKind::Ident(_))
+                && matches!(self.peek_at(2), TokKind::Colon);
+            let has_borrow_mut_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
+                && matches!(self.peek_at(1), TokKind::Mut)
+                && matches!(self.peek_at(2), TokKind::Ident(_))
+                && matches!(self.peek_at(3), TokKind::Colon);
+            let mode = if has_out_mode {
+                self.bump();
                 ParamMode::Out
+            } else if has_borrow_mut_mode {
+                self.bump();
+                self.bump();
+                ParamMode::BorrowMut
+            } else if has_borrow_mode {
+                self.bump();
+                ParamMode::Borrow
             } else {
                 ParamMode::ByValue
             };
@@ -1816,9 +1837,22 @@ impl<'a> Parser<'a> {
                 // after it; otherwise `fn(out) -> T` continues to name the by-value type `out`.
                 let has_out_mode = matches!(self.peek(), TokKind::Ident(name) if name == "out")
                     && matches!(self.peek_at(1), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
+                let borrow_type_follows = matches!(self.peek_at(1), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
+                let has_borrow_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
+                    && borrow_type_follows;
+                let has_borrow_mut_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
+                    && matches!(self.peek_at(1), TokKind::Mut)
+                    && matches!(self.peek_at(2), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
                 let mode = if has_out_mode {
                     self.bump();
                     ParamMode::Out
+                } else if has_borrow_mut_mode {
+                    self.bump();
+                    self.bump();
+                    ParamMode::BorrowMut
+                } else if has_borrow_mode {
+                    self.bump();
+                    ParamMode::Borrow
                 } else {
                     ParamMode::ByValue
                 };
@@ -1889,15 +1923,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Consume a weak keyword (one that appears as an `Ident`), like `out`.
-    fn eat_ident_keyword(&mut self, kw: &str) -> bool {
-        if let TokKind::Ident(name) = self.peek()
-            && name == kw {
-                self.bump();
-                return true;
-            }
-        false
-    }
 }
 
 #[cfg(test)]
@@ -2021,6 +2046,32 @@ mod tests {
             &sink_params[0].ty,
             Type::Named { path, .. } if path.segments[0].name == "out"
         ));
+    }
+
+    #[test]
+    fn borrowed_parameter_modes_are_contextual() {
+        let (file, errors) = parse(
+            "borrow { value: i64 }\nfn modes(borrow owner: borrow, borrow mut copy: borrow, borrow: borrow, out: borrow) -> i64 = 0\nfn indirect(f: fn(borrow borrow, borrow mut borrow) -> i64) -> i64 = 0\n",
+        );
+        assert!(!errors);
+        let Item::Fn(modes) = &file.items[1] else { panic!("expected modes") };
+        assert_eq!(
+            modes.params.iter().map(|parameter| parameter.mode).collect::<Vec<_>>(),
+            [
+                ParamMode::Borrow,
+                ParamMode::BorrowMut,
+                ParamMode::ByValue,
+                ParamMode::ByValue,
+            ]
+        );
+        assert_eq!(modes.params[2].name.name, "borrow");
+        assert_eq!(modes.params[3].name.name, "out");
+        let Item::Fn(indirect) = &file.items[2] else { panic!("expected indirect") };
+        let Type::Fn { params, .. } = &indirect.params[0].ty else {
+            panic!("expected function type")
+        };
+        assert_eq!(params[0].mode, ParamMode::Borrow);
+        assert_eq!(params[1].mode, ParamMode::BorrowMut);
     }
 
     #[test]

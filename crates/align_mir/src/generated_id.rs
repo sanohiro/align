@@ -546,8 +546,8 @@ mod tests {
         let bool_ty = ty("010000000002");
         let i64_ty = ty("0100000000000140");
         let slice_i64 = ty("01000000000d000140");
-        let empty_abi = abi("01000000000100000000380000");
-        let i64_abi = abi("010100000000010000000000014001000000000001400000");
+        let empty_abi = abi("0100000000010000000038000000");
+        let i64_abi = abi("01010000000001000000000001400100000000000140000000");
 
         let goldens = [
             (
@@ -555,7 +555,7 @@ mod tests {
                     target: call("f"),
                     signature: empty_abi.clone(),
                 },
-                "0100010000006601000000000100000000380000",
+                "010001000000660100000000010000000038000000",
             ),
             (
                 GeneratedId::Closure {
@@ -563,7 +563,7 @@ mod tests {
                     explicit_signature: empty_abi.clone(),
                     captures: vec![bool_ty.clone()],
                 },
-                "0101010000006c0100000000010000000038000001000000010000000002",
+                "0101010000006c010000000001000000003800000001000000010000000002",
             ),
             (
                 GeneratedId::Task {
@@ -598,7 +598,7 @@ mod tests {
             work_weight: 1,
         });
         let expected = hex(
-            "01030001000000000d000140010000000000014001000000000001400100000066010100000000010000000000014001000000000001400000000000000000000001",
+            "01030001000000000d00014001000000000001400100000000000140010000006601010000000001000000000001400100000000000140000000000000000000000001",
         );
         assert_eq!(roundtrip(parallel.clone()), expected);
         assert_eq!(GeneratedId::decode(&expected).unwrap(), parallel);
@@ -644,7 +644,7 @@ mod tests {
                 terminal_input: i64_ty.clone(),
                 terminal_output: i64_ty.clone(),
                 terminal: call("terminal"),
-                terminal_abi: abi("01000000000100000000380000"),
+                terminal_abi: abi("0100000000010000000038000000"),
                 terminal_captures: vec![bool_ty.clone()],
                 stages: stages.clone(),
                 work_weight: 4,
@@ -702,7 +702,7 @@ mod tests {
             terminal_input: ty("010000000038"),
             terminal_output: ty("010000000038"),
             terminal: call("f"),
-            terminal_abi: abi("01000000000100000000380000"),
+            terminal_abi: abi("0100000000010000000038000000"),
             terminal_captures: vec![],
             stages: vec![],
             work_weight: 3,
@@ -717,7 +717,7 @@ mod tests {
     fn deep_generated_identity_codec_is_stack_bounded() {
         let value = GeneratedId::Closure {
             lifted: call("deep"),
-            explicit_signature: abi("01000000000100000000380000"),
+            explicit_signature: abi("0100000000010000000038000000"),
             captures: vec![ty("010000000038"); 4096],
         };
         let bytes = value.to_canonical_bytes().unwrap();

@@ -95,6 +95,7 @@ pub enum IType {
         ret: Box<IType>,
         return_borrow: ReturnBorrowSummary,
         return_region: ReturnRegionSummary,
+        return_cleanup: align_sema::hir::ReturnCleanupAbi,
     },
 }
 
@@ -124,6 +125,7 @@ pub struct IFnSig {
     pub ret: IType,
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
+    pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
     /// For a generic `pub` template: the declaration's source text (the body is part of the
@@ -231,6 +233,7 @@ fn convert_type(t: &align_ast::Type) -> IType {
             ret: Box::new(convert_type(ret)),
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
         },
     }
 }
@@ -244,6 +247,72 @@ fn convert_ret(ret: &Option<align_ast::Type>) -> IType {
     match ret {
         Some(t) => convert_type(t),
         None => unit_type(),
+    }
+}
+
+fn apply_function_cleanup_metadata(
+    interface: &mut IType,
+    resolved: align_sema::Ty,
+    program: &align_sema::hir::Program,
+) {
+    match (interface, resolved) {
+        (
+            IType::Fn {
+                params,
+                ret,
+                return_cleanup,
+                ..
+            },
+            align_sema::Ty::Fn(id),
+        ) => {
+            let Some(definition) = program.fn_types.get(id as usize) else {
+                return;
+            };
+            *return_cleanup = definition.return_cleanup;
+            for (parameter, &(_, scalar)) in params.iter_mut().zip(&definition.params) {
+                apply_function_cleanup_metadata(
+                    &mut parameter.ty,
+                    align_sema::scalar_to_ty(scalar),
+                    program,
+                );
+            }
+            apply_function_cleanup_metadata(ret, definition.ret, program);
+        }
+        (IType::Tuple(elements), align_sema::Ty::Tuple(id)) => {
+            if let Some(definition) = program.tuples.get(id as usize) {
+                for (element, &scalar) in elements.iter_mut().zip(&definition.elems) {
+                    apply_function_cleanup_metadata(
+                        element,
+                        align_sema::scalar_to_ty(scalar),
+                        program,
+                    );
+                }
+            }
+        }
+        (IType::Named { args, .. }, resolved) => {
+            let actuals: Vec<align_sema::Ty> = match resolved {
+                align_sema::Ty::Option(value)
+                | align_sema::Ty::Box(value)
+                | align_sema::Ty::Slice(value)
+                | align_sema::Ty::DynArray(value)
+                | align_sema::Ty::ArrayBuilder(value)
+                | align_sema::Ty::Task(value)
+                | align_sema::Ty::Array(value, _)
+                | align_sema::Ty::Vec(value, _)
+                | align_sema::Ty::Mask(value, _) => {
+                    vec![align_sema::scalar_to_ty(value)]
+                }
+                align_sema::Ty::Result(ok, err) => vec![
+                    align_sema::scalar_to_ty(ok),
+                    align_sema::scalar_to_ty(err),
+                ],
+                _ => Vec::new(),
+            };
+            for (argument, actual) in args.iter_mut().zip(actuals) {
+                apply_function_cleanup_metadata(argument, actual, program);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -302,19 +371,22 @@ pub fn build_summaries_with_effects(
         .into_iter()
         .map(|(k, v)| (k, v.into()))
         .collect();
-    let return_provenance: HashMap<&str, (&ReturnBorrowSummary, &ReturnRegionSummary)> = program
+    let return_provenance: HashMap<
+        &str,
+        (&ReturnBorrowSummary, &ReturnRegionSummary, align_sema::hir::ReturnCleanupAbi),
+    > = program
         .fns
         .iter()
         .map(|function| {
             (
                 function.name.as_str(),
-                (&function.return_borrow, &function.return_region),
+                (&function.return_borrow, &function.return_region, function.return_cleanup),
             )
         })
         .chain(program.imported_fns.iter().map(|function| {
             (
                 function.name.as_str(),
-                (&function.return_borrow, &function.return_region),
+                (&function.return_borrow, &function.return_region, function.return_cleanup),
             )
         }))
         .collect();
@@ -348,28 +420,56 @@ pub fn build_summaries_with_effects(
                             effects.get(&canonical).copied().unwrap_or(Effect::Impure)
                         };
                         let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
-                        let (return_borrow, return_region) = if is_generic {
-                            (ReturnBorrowSummary::None, ReturnRegionSummary::None)
+                        let (return_borrow, return_region, return_cleanup) = if is_generic {
+                            (
+                                ReturnBorrowSummary::None,
+                                ReturnRegionSummary::None,
+                                align_sema::hir::ReturnCleanupAbi::None,
+                            )
                         } else {
                             return_provenance
                                 .get(canonical.as_str())
-                                .map(|(borrow, region)| ((*borrow).clone(), (*region).clone()))
-                                .unwrap_or((ReturnBorrowSummary::None, ReturnRegionSummary::None))
+                                .map(|(borrow, region, cleanup)| {
+                                    ((*borrow).clone(), (*region).clone(), *cleanup)
+                                })
+                                .unwrap_or((
+                                    ReturnBorrowSummary::None,
+                                    ReturnRegionSummary::None,
+                                    align_sema::hir::ReturnCleanupAbi::None,
+                                ))
                         };
+                        let mut params = fd
+                            .params
+                            .iter()
+                            .map(|parameter| IParam {
+                                mode: parameter.mode,
+                                ty: convert_type(&parameter.ty),
+                            })
+                            .collect::<Vec<_>>();
+                        let mut ret = convert_ret(&fd.ret);
+                        if !is_generic
+                            && let Some(function) =
+                                program.fns.iter().find(|function| function.name == canonical)
+                        {
+                            for (parameter, local) in params.iter_mut().zip(&function.params) {
+                                if let Some(local) = function.locals.get(*local as usize) {
+                                    apply_function_cleanup_metadata(
+                                        &mut parameter.ty,
+                                        local.ty,
+                                        program,
+                                    );
+                                }
+                            }
+                            apply_function_cleanup_metadata(&mut ret, function.ret, program);
+                        }
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
-                            params: fd
-                                .params
-                                .iter()
-                                .map(|p| IParam {
-                                    mode: p.mode,
-                                    ty: convert_type(&p.ty),
-                                })
-                                .collect(),
-                            ret: convert_ret(&fd.ret),
+                            params,
+                            ret,
                             return_borrow,
                             return_region,
+                            return_cleanup,
                             effect,
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -379,14 +479,33 @@ pub fn build_summaries_with_effects(
                 align_ast::Item::Struct(sd) => {
                     if is_pub(sd.vis) {
                         let is_generic = !sd.type_params.is_empty();
+                        let mut fields = sd
+                            .fields
+                            .iter()
+                            .map(|f| (f.name.name.clone(), convert_type(&f.ty)))
+                            .collect::<Vec<_>>();
+                        if !is_generic {
+                            let canonical = mangle(&m.path, m.is_entry, &sd.name.name);
+                            if let Some(definition) = program
+                                .structs
+                                .iter()
+                                .find(|definition| definition.source_name == canonical)
+                            {
+                                for ((_, interface), resolved) in
+                                    fields.iter_mut().zip(&definition.fields)
+                                {
+                                    apply_function_cleanup_metadata(
+                                        interface,
+                                        resolved.ty,
+                                        program,
+                                    );
+                                }
+                            }
+                        }
                         structs.push(IStructDef {
                             name: sd.name.name.clone(),
                             type_params: convert_type_params(&sd.type_params),
-                            fields: sd
-                                .fields
-                                .iter()
-                                .map(|f| (f.name.name.clone(), convert_type(&f.ty)))
-                                .collect(),
+                            fields,
                             align: sd.align,
                             c_repr: sd.c_repr,
                             generic_body: is_generic.then(|| safe_slice(src, sd.span)),
@@ -397,16 +516,42 @@ pub fn build_summaries_with_effects(
                 align_ast::Item::Enum(ed) => {
                     if is_pub(ed.vis) {
                         let is_generic = !ed.type_params.is_empty();
+                        let mut variants = ed
+                            .variants
+                            .iter()
+                            .map(|v| {
+                                (
+                                    v.name.name.clone(),
+                                    v.payload.iter().map(convert_type).collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if !is_generic {
+                            let canonical = mangle(&m.path, m.is_entry, &ed.name.name);
+                            if let Some(definition) = program
+                                .enums
+                                .iter()
+                                .find(|definition| definition.source_name == canonical)
+                            {
+                                for ((_, interface_payload), resolved_variant) in
+                                    variants.iter_mut().zip(&definition.variants)
+                                {
+                                    for (interface, &resolved) in
+                                        interface_payload.iter_mut().zip(&resolved_variant.payload)
+                                    {
+                                        apply_function_cleanup_metadata(
+                                            interface,
+                                            align_sema::scalar_to_ty(resolved),
+                                            program,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         enums.push(IEnumDef {
                             name: ed.name.name.clone(),
                             type_params: convert_type_params(&ed.type_params),
-                            variants: ed
-                                .variants
-                                .iter()
-                                .map(|v| {
-                                    (v.name.name.clone(), v.payload.iter().map(convert_type).collect())
-                                })
-                                .collect(),
+                            variants,
                             generic_body: is_generic.then(|| safe_slice(src, ed.span)),
                         });
                     }
@@ -690,8 +835,8 @@ fn render_enum(e: &IEnumDef) -> String {
     out
 }
 
-/// A decoded interface may contain parameter-mode tags reserved for later compiler slices. L2b
-/// consumes canonical return summaries, while `Borrow`/`BorrowMut` remain disabled until L2d/L2e.
+/// Semantic compatibility failures found after the canonical interface codec has decoded a
+/// structurally valid summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
     ReservedLocalType(String),
@@ -708,13 +853,14 @@ pub enum ImportCompatibilityError {
     GenericCLayoutUnsupported(String),
     GenericBodySyntax(String),
     GenericBodyMismatch(String),
-    UnsupportedParamMode(ParamMode),
+    BorrowParamNotMove,
     ReturnSummaryOnNonBorrowingType,
     ReturnSummaryRootCannotBorrow(u32),
     ReturnSummaryCaptureRoot,
     ReturnSummaryDisagreement,
     ReturnSummaryOnUnsupportedSignature,
     ReturnSummaryGenerativeCapabilityGraph,
+    ReturnCleanupMismatch,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
@@ -769,8 +915,8 @@ impl std::fmt::Display for ImportCompatibilityError {
                     "generic interface declaration `{name}` disagrees with its structured record"
                 )
             }
-            ImportCompatibilityError::UnsupportedParamMode(mode) => {
-                write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
+            ImportCompatibilityError::BorrowParamNotMove => {
+                write!(f, "interface borrowed parameter does not have a provably Move type")
             }
             ImportCompatibilityError::ReturnSummaryOnNonBorrowingType => {
                 write!(
@@ -807,6 +953,9 @@ impl std::fmt::Display for ImportCompatibilityError {
                     f,
                     "return provenance capability validation found a generative recursive type graph"
                 )
+            }
+            ImportCompatibilityError::ReturnCleanupMismatch => {
+                write!(f, "interface return-cleanup metadata disagrees with its return type")
             }
         }
     }
@@ -991,7 +1140,33 @@ impl BorrowFacts {
 struct CapabilityAnalysis<'a> {
     index: LocalDefinitionIndex<'a>,
     borrow: Vec<BorrowFacts>,
+    ownership: Vec<OwnershipFacts>,
     growth: Vec<Vec<bool>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OwnershipFacts {
+    intrinsic: bool,
+    unknown: bool,
+    params: Vec<bool>,
+}
+
+impl OwnershipFacts {
+    fn empty(param_count: usize) -> Self {
+        Self {
+            intrinsic: false,
+            unknown: false,
+            params: vec![false; param_count],
+        }
+    }
+
+    fn union(&mut self, other: &Self) {
+        self.intrinsic |= other.intrinsic;
+        self.unknown |= other.unknown;
+        for (current, incoming) in self.params.iter_mut().zip(&other.params) {
+            *current |= *incoming;
+        }
+    }
 }
 
 impl<'a> CapabilityAnalysis<'a> {
@@ -1006,15 +1181,124 @@ impl<'a> CapabilityAnalysis<'a> {
             .iter()
             .map(|definition| vec![true; definition.type_params().len()])
             .collect();
+        let ownership = index
+            .definitions
+            .iter()
+            .map(|definition| OwnershipFacts::empty(definition.type_params().len()))
+            .collect();
         let mut analysis = Self {
             index,
             borrow,
+            ownership,
             growth,
         };
         analysis.solve_borrow();
+        analysis.solve_ownership();
         analysis.solve_growth();
         analysis.reject_generative_cycles()?;
         Ok(analysis)
+    }
+
+    fn eval_ownership(
+        &self,
+        ty: &IType,
+        type_params: &[ITypeParam],
+        summaries: &[OwnershipFacts],
+    ) -> OwnershipFacts {
+        let mut result = OwnershipFacts::empty(type_params.len());
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if args.is_empty()
+                        && let Some(index) = type_params
+                            .iter()
+                            .position(|parameter| parameter.name == *path)
+                    {
+                        result.params[index] = true;
+                        continue;
+                    }
+                    match path.as_str() {
+                        "Option" | "Result" => {
+                            work.extend(args);
+                            continue;
+                        }
+                        "array" | "array_builder" | "string" | "reader" | "writer"
+                        | "buffer" | "file" | "regex" | "captures" | "tcp_conn"
+                        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
+                        | "response_builder" | "http_stream" => {
+                            result.intrinsic = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if builtin_capability(path).is_some() {
+                        continue;
+                    }
+                    if let Some(index) = self.index.local(path) {
+                        let summary = &summaries[index];
+                        result.intrinsic |= summary.intrinsic;
+                        result.unknown |= summary.unknown;
+                        for (position, dependent) in summary.params.iter().copied().enumerate() {
+                            if dependent
+                                && let Some(argument) = args.get(position)
+                            {
+                                work.push(argument);
+                            }
+                        }
+                    } else if path.contains('.') {
+                        result.unknown = true;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn solve_ownership(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.index.definitions.len() {
+                let definition = self.index.definitions[index];
+                let mut next = OwnershipFacts::empty(definition.type_params().len());
+                for value in definition.values() {
+                    next.union(&self.eval_ownership(
+                        value,
+                        definition.type_params(),
+                        &self.ownership,
+                    ));
+                }
+                if next != self.ownership[index] {
+                    self.ownership[index] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn return_cleanup(&self, ty: &IType, type_params: &[ITypeParam]) -> Option<align_sema::hir::ReturnCleanupAbi> {
+        let facts = self.eval_ownership(ty, type_params, &self.ownership);
+        if facts.unknown || facts.params.iter().any(|dependent| *dependent) {
+            None
+        } else if facts.intrinsic {
+            Some(align_sema::hir::ReturnCleanupAbi::DynamicBit)
+        } else {
+            Some(align_sema::hir::ReturnCleanupAbi::None)
+        }
+    }
+
+    fn is_move(&self, ty: &IType, type_params: &[ITypeParam]) -> Option<bool> {
+        let facts = self.eval_ownership(ty, type_params, &self.ownership);
+        if facts.unknown {
+            None
+        } else {
+            Some(facts.intrinsic || facts.params.iter().any(|dependent| *dependent))
+        }
     }
 
     fn eval_borrow(
@@ -1413,13 +1697,6 @@ fn validate_import_shapes(
     Ok(())
 }
 
-fn validate_import_param_mode(param: &IParam) -> Result<(), ImportCompatibilityError> {
-    if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
-        return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
-    }
-    Ok(())
-}
-
 fn validate_import_summary_header(
     borrow: &ReturnBorrowSummary,
     region: &ReturnRegionSummary,
@@ -1462,10 +1739,8 @@ fn validate_import_type_headers(ty: &IType) -> Result<(), ImportCompatibilityErr
                 ret,
                 return_borrow,
                 return_region,
+                return_cleanup: _,
             } => {
-                for param in params {
-                    validate_import_param_mode(param)?;
-                }
                 validate_import_summary_header(return_borrow, return_region, false)?;
                 work.push(ret);
                 work.extend(params.iter().rev().map(|param| &param.ty));
@@ -1480,7 +1755,6 @@ fn validate_import_headers(
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
         for param in &function.params {
-            validate_import_param_mode(param)?;
             validate_import_type_headers(&param.ty)?;
         }
         validate_import_type_headers(&function.ret)?;
@@ -1720,7 +1994,7 @@ fn validate_import_summaries(
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            let Some((_, &may_borrow)) = params
+            let Some((parameter, &may_borrow)) = params
                 .get(index as usize)
                 .zip(param_may_borrow.get(index as usize))
             else {
@@ -1728,7 +2002,9 @@ fn validate_import_summaries(
                     index,
                 ));
             };
-            if !may_borrow {
+            if !may_borrow
+                && !matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+            {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
@@ -1738,9 +2014,45 @@ fn validate_import_summaries(
     Ok(())
 }
 
-/// Validate that a decoded interface uses only the currently enabled semantic subset. Codec
-/// validation has already proved canonical return summaries; this gate still rejects later borrow
-/// parameter modes before reconstructing imported source.
+fn validate_return_cleanup_metadata(
+    ty: &IType,
+    type_params: &[ITypeParam],
+    analysis: &CapabilityAnalysis<'_>,
+) -> Result<(), ImportCompatibilityError> {
+    let mut work = vec![ty];
+    while let Some(current) = work.pop() {
+        match current {
+            IType::Named { args, .. } => work.extend(args.iter().rev()),
+            IType::Tuple(elements) => work.extend(elements.iter().rev()),
+            IType::Fn {
+                params,
+                ret,
+                return_cleanup,
+                ..
+            } => {
+                for parameter in params {
+                    if parameter.mode == ParamMode::Borrow
+                        && analysis.is_move(&parameter.ty, type_params) != Some(true)
+                    {
+                        return Err(ImportCompatibilityError::BorrowParamNotMove);
+                    }
+                }
+                if let Some(expected) = analysis.return_cleanup(ret, type_params)
+                    && *return_cleanup != expected
+                {
+                    return Err(ImportCompatibilityError::ReturnCleanupMismatch);
+                }
+                work.push(ret);
+                work.extend(params.iter().rev().map(|parameter| &parameter.ty));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a decoded interface uses the enabled semantic subset. Codec validation has
+/// already proved canonical return summaries; this gate proves ownership-dependent mode facts
+/// before reconstructing imported source.
 pub fn validate_for_import(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
@@ -1751,6 +2063,27 @@ pub fn validate_for_import(
     let analysis = CapabilityAnalysis::new(index)?;
 
     for function in &summary.fns {
+        for parameter in &function.params {
+            if parameter.mode == ParamMode::Borrow
+                && analysis.is_move(&parameter.ty, &function.type_params) != Some(true)
+            {
+                return Err(ImportCompatibilityError::BorrowParamNotMove);
+            }
+        }
+        if function.type_params.is_empty()
+            && let Some(expected) = analysis.return_cleanup(&function.ret, &[])
+            && function.return_cleanup != expected
+        {
+            return Err(ImportCompatibilityError::ReturnCleanupMismatch);
+        }
+        for parameter in &function.params {
+            validate_return_cleanup_metadata(
+                &parameter.ty,
+                &function.type_params,
+                &analysis,
+            )?;
+        }
+        validate_return_cleanup_metadata(&function.ret, &function.type_params, &analysis)?;
         validate_import_summaries(
             &function.params,
             &function.ret,
@@ -1759,6 +2092,22 @@ pub fn validate_for_import(
             &analysis,
             &function.type_params,
         )?;
+    }
+    for structure in &summary.structs {
+        if structure.type_params.is_empty() {
+            for (_, field) in &structure.fields {
+                validate_return_cleanup_metadata(field, &[], &analysis)?;
+            }
+        }
+    }
+    for enumeration in &summary.enums {
+        if enumeration.type_params.is_empty() {
+            for (_, payload) in &enumeration.variants {
+                for ty in payload {
+                    validate_return_cleanup_metadata(ty, &[], &analysis)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1873,6 +2222,7 @@ pub fn summary_return_provenance(
             (
                 function.return_borrow.clone(),
                 function.return_region.clone(),
+                function.return_cleanup,
             ),
         );
     }

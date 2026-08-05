@@ -750,6 +750,58 @@ fn parameter_mode_and_return_summaries_have_canonical_codec_identity() {
 }
 
 #[test]
+fn return_cleanup_metadata_is_exact_for_functions_and_nested_function_values() {
+    let mut summary = one(
+        "pub Route { owned: fn() -> string, copied: fn() -> i64 }\n\
+         pub fn owned() -> string = \"owned\".clone()\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let owned = summary.fns.iter().find(|function| function.name == "owned").unwrap();
+    assert_eq!(
+        owned.return_cleanup,
+        align_sema::hir::ReturnCleanupAbi::DynamicBit
+    );
+    let fields = &summary.structs.iter().find(|definition| definition.name == "Route").unwrap().fields;
+    assert!(matches!(
+        &fields[0].1,
+        IType::Fn {
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::DynamicBit,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &fields[1].1,
+        IType::Fn {
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
+            ..
+        }
+    ));
+    assert_eq!(validate_for_import(&summary), Ok(()));
+
+    summary.fns.iter_mut().find(|function| function.name == "owned").unwrap().return_cleanup =
+        align_sema::hir::ReturnCleanupAbi::None;
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::ReturnCleanupMismatch)
+    );
+
+    let mut nested = one(
+        "pub Route { owned: fn() -> string, copied: fn() -> i64 }\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let IType::Fn { return_cleanup, .. } = &mut nested.structs[0].fields[1].1 else {
+        panic!("expected copied function field");
+    };
+    *return_cleanup = align_sema::hir::ReturnCleanupAbi::DynamicBit;
+    assert_eq!(
+        validate_for_import(&nested),
+        Err(ImportCompatibilityError::ReturnCleanupMismatch)
+    );
+}
+
+#[test]
 fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     let mut non_borrowing_return =
         one("pub fn inspect(value: str) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
@@ -961,6 +1013,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
     let root = named("A", vec![named("i64", vec![])]);
     summary.fns[0].params[0].ty = root.clone();
     summary.fns[0].ret = root;
+    summary.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::DynamicBit;
     assert_eq!(
         validate_for_import(&summary),
         Ok(()),
@@ -999,6 +1052,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
     );
     finite.fns[0].params[0].ty = root.clone();
     finite.fns[0].ret = root;
+    finite.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::None;
     assert_eq!(
         validate_for_import(&finite),
         Ok(()),
@@ -1028,6 +1082,7 @@ fn semantic_import_distinguishes_transformed_generic_cycle_instantiations() {
     let root = named("FiniteConstant", vec![named("i64", vec![])]);
     finite_constant.fns[0].params[0].ty = root.clone();
     finite_constant.fns[0].ret = root;
+    finite_constant.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::None;
     assert_eq!(
         validate_for_import(&finite_constant),
         Ok(()),
@@ -1285,6 +1340,7 @@ fn semantic_import_growth_transport_distinguishes_exposure_and_convergence() {
                 ret: Box::new(parameter("T")),
                 return_borrow: ReturnBorrowSummary::None,
                 return_region: ReturnRegionSummary::None,
+                return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             },
         ),
     ] {
@@ -1747,7 +1803,7 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
         Err(ImportCompatibilityError::UnresolvedBareType(
             "Missing".to_string()
         )),
-        "complete type shape precedes the later unsupported-mode header gate"
+        "complete type shape precedes ownership-dependent mode validation"
     );
 
     let mut qualified_local = base.clone();
@@ -1786,6 +1842,7 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
             params: vec![0],
             captures: vec![],
         },
+        return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
         return_region: ReturnRegionSummary::None,
     };
     assert_eq!(
@@ -1968,6 +2025,7 @@ fn semantic_import_validates_nested_function_type_summaries() {
             params: vec![0],
             captures: vec![],
         },
+        return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
     };
     assert_eq!(
         validate_for_import(&summary),
@@ -2045,19 +2103,26 @@ fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
 }
 
 #[test]
-fn known_future_parameter_mode_round_trips_but_semantic_import_rejects() {
-    for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
-        let mut summary =
-            one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
-        summary.fns[0].params[0].mode = mode;
+fn borrowed_parameter_modes_round_trip_and_import() {
+    for source in [
+        "pub fn inspect(borrow value: string) -> i64 = value.len()\nfn main() -> i32 = 0\n",
+        "pub fn increment(borrow mut value: i64) { value = value + 1 }\nfn main() -> i32 = 0\n",
+    ] {
+        let mut summary = one(source).remove(0);
         rehash(&mut summary);
-        let decoded = deserialize(&serialize(&summary)).expect("known future mode tag round-trips");
+        let decoded = deserialize(&serialize(&summary)).expect("borrowed mode tag round-trips");
         assert_eq!(decoded, summary);
-        assert_eq!(
-            validate_for_import(&decoded),
-            Err(ImportCompatibilityError::UnsupportedParamMode(mode))
-        );
+        assert_eq!(validate_for_import(&decoded), Ok(()));
     }
+
+    let mut invalid =
+        one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    invalid.fns[0].params[0].mode = ParamMode::Borrow;
+    rehash(&mut invalid);
+    assert_eq!(
+        validate_for_import(&invalid),
+        Err(ImportCompatibilityError::BorrowParamNotMove)
+    );
 }
 
 #[test]
@@ -2112,7 +2177,7 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "02000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000000000000000000000000000000"
+        "03000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2128,19 +2193,28 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
         Err(DecodeError::BadTag { what: "parameter mode", tag: 0xff })
     );
 
-    // This one-function surface ends with the function's borrow tag, region tag, effect, generic
-    // body option, then the three empty top-level type/const sequences (16 bytes total).
+    // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
+    // effect, generic body option, then the empty top-level type/const sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 16] = 0xff;
+    bad_borrow[surface.len() - 17] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 15] = 0xff;
+    bad_region[surface.len() - 16] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
+    );
+    let mut bad_cleanup = serialize(&summary);
+    bad_cleanup[surface.len() - 15] = 0xff;
+    assert_eq!(
+        deserialize(&bad_cleanup),
+        Err(DecodeError::BadTag {
+            what: "return cleanup ABI",
+            tag: 0xff,
+        })
     );
 }
 

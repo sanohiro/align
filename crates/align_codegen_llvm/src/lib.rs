@@ -685,6 +685,7 @@ struct ProgramSignature {
     ret: Ty,
     borrow: hir::ReturnBorrowSummary,
     region: hir::ReturnRegionSummary,
+    cleanup: hir::ReturnCleanupAbi,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1034,6 +1035,7 @@ fn build_module<'c>(
             &enum_types,
             &tagged_types,
             &tuple_types,
+            program,
             exports,
         );
         program_funcs.insert(f.name.clone(), fv);
@@ -1058,6 +1060,7 @@ fn build_module<'c>(
             &enum_types,
             &tagged_types,
             &tuple_types,
+            program,
         );
         program_funcs.insert(imp.name.clone(), fv);
     }
@@ -1177,6 +1180,7 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_borrow_param_contracts_at(ctx, thunk, &declaration.signature.modes, 1);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
@@ -1233,6 +1237,7 @@ fn build_module<'c>(
             ret: declaration.signature.ret,
             borrow: declaration.signature.borrow.clone(),
             region: declaration.signature.region.clone(),
+            cleanup: declaration.signature.cleanup,
         };
         let id = GeneratedId::Closure {
             lifted: lifted.clone(),
@@ -1266,6 +1271,7 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_borrow_param_contracts_at(ctx, thunk, explicit_modes, 1);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
@@ -1453,6 +1459,7 @@ fn build_module<'c>(
             f,
             func,
             slots: HashMap::new(),
+            borrow_mut_cleanup_ptrs: HashMap::new(),
             values: HashMap::new(),
             stack_header_slots: stack_headers.slots,
             stack_header_new_values: stack_headers.new_values,
@@ -1512,6 +1519,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         ret: Ty,
         borrow: &'a hir::ReturnBorrowSummary,
         region: &'a hir::ReturnRegionSummary,
+        cleanup: hir::ReturnCleanupAbi,
         allow_out: bool,
         allow_return_roots: bool,
     }
@@ -1528,6 +1536,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             ret,
             borrow,
             region,
+            cleanup,
             allow_out,
             allow_return_roots,
         } = facts;
@@ -1539,10 +1548,26 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             )));
         }
         type_graph.check_ty(ret)?;
+        let expected_cleanup = if align_sema::needs_drop_flag(
+            ret,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        ) {
+            hir::ReturnCleanupAbi::DynamicBit
+        } else {
+            hir::ReturnCleanupAbi::None
+        };
+        if cleanup != expected_cleanup {
+            return Err(CodegenError::Lowering(format!(
+                "{owner} return cleanup ABI disagrees with its return type"
+            )));
+        }
         for &ty in param_types {
             type_graph.check_ty(ty)?;
         }
-        for mode in modes {
+        for (&mode, &ty) in modes.iter().zip(param_types) {
             match mode {
                 align_ast::ParamMode::ByValue => {}
                 align_ast::ParamMode::Out if allow_out => {}
@@ -1551,11 +1576,20 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         "{owner} uses `out` in a function-value ABI"
                     )));
                 }
-                align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => {
-                    return Err(CodegenError::Lowering(format!(
-                        "{owner} uses parameter mode {mode:?} before its ABI is enabled"
-                    )));
+                align_ast::ParamMode::Borrow => {
+                    if !align_sema::needs_drop_flag(
+                        ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    ) {
+                        return Err(CodegenError::Lowering(format!(
+                            "{owner} uses {mode:?} with a non-Move parameter type"
+                        )));
+                    }
                 }
+                align_ast::ParamMode::BorrowMut => {}
             }
         }
         let validate_summary =
@@ -1578,11 +1612,6 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 {
                     return Err(CodegenError::Lowering(format!(
                         "{owner} has an out-of-range {kind} parameter root"
-                    )));
-                }
-                if !captures.is_empty() {
-                    return Err(CodegenError::Lowering(format!(
-                        "{owner} has {kind} capture roots before L2b-b"
                     )));
                 }
                 Ok(())
@@ -1617,7 +1646,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 || !matches!(region, hir::ReturnRegionSummary::None))
         {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has return roots before function-value provenance lands in L2b-b"
+                "{owner} cannot carry return provenance across an unanalyzed extern boundary"
             )));
         }
         if let hir::ReturnBorrowSummary::Roots { params, .. } = borrow {
@@ -1634,13 +1663,19 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             }
             for &root in params {
                 let ty = param_types[root as usize];
-                if !align_sema::ty_may_borrow(
-                    ty,
-                    &program.structs,
-                    &program.tuples,
-                    &program.enums,
-                    &program.tagged_types,
-                ) {
+                let borrowed_owner = matches!(
+                    modes[root as usize],
+                    align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut
+                );
+                if !borrowed_owner
+                    && !align_sema::ty_may_borrow(
+                        ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    )
+                {
                     return Err(CodegenError::Lowering(format!(
                         "{owner} return provenance root {root} has type {ty:?}, which cannot supply a borrow"
                     )));
@@ -1739,10 +1774,19 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         Ok(())
     }
 
+    type NamedSignature<'a> = (
+        Vec<Ty>,
+        Ty,
+        &'a [align_ast::ParamMode],
+        &'a hir::ReturnBorrowSummary,
+        &'a hir::ReturnRegionSummary,
+        hir::ReturnCleanupAbi,
+    );
+
     fn named_signature<'a>(
         program: &'a Program,
         name: &ProgramCall,
-    ) -> Option<(Vec<Ty>, Ty, &'a [align_ast::ParamMode])> {
+    ) -> Option<NamedSignature<'a>> {
         if let Some(function) = program.fns.iter().find(|function| &function.name == name) {
             return Some((
                 function
@@ -1752,6 +1796,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     .collect::<Option<Vec<_>>>()?,
                 function.ret,
                 &function.param_modes,
+                &function.return_borrow,
+                &function.return_region,
+                function.return_cleanup,
             ));
         }
         if let Some(function) = program
@@ -1763,6 +1810,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 function.params.clone(),
                 function.ret,
                 &function.param_modes,
+                &function.return_borrow,
+                &function.return_region,
+                function.return_cleanup,
             ));
         }
         program
@@ -1770,12 +1820,15 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             .iter()
             .find(|function| &function.name == name)
             .map(|function| {
-            (
-                function.params.clone(),
-                function.ret,
-                function.param_modes.as_slice(),
-            )
-        })
+                (
+                    function.params.clone(),
+                    function.ret,
+                    function.param_modes.as_slice(),
+                    &function.return_borrow,
+                    &function.return_region,
+                    function.return_cleanup,
+                )
+            })
     }
 
     /// Validate every MIR type reference and the complete inline layout graph before any semantic
@@ -2336,6 +2389,42 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if !f.borrow_mut_cleanup_slots.is_empty()
+            && f.borrow_mut_cleanup_slots.len() != f.params.len()
+        {
+            return Err(CodegenError::Lowering(format!(
+                "function `{}` has a malformed BorrowMut cleanup vector",
+                f.name
+            )));
+        }
+        for (index, (mode, ty)) in f
+            .param_modes
+            .iter()
+            .zip(&param_types)
+            .enumerate()
+        {
+            let expected = *mode == align_ast::ParamMode::BorrowMut
+                && align_sema::needs_drop_flag(
+                    *ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                );
+            let cleanup = f
+                .borrow_mut_cleanup_slots
+                .get(index)
+                .copied()
+                .flatten();
+            if cleanup.is_some() != expected
+                || cleanup.is_some_and(|slot| f.slots.get(slot as usize) != Some(&Ty::Bool))
+            {
+                return Err(CodegenError::Lowering(format!(
+                    "function `{}` parameter {index} has malformed BorrowMut cleanup storage",
+                    f.name
+                )));
+            }
+        }
         check_signature_facts(
             SignatureFacts {
                 owner: &format!("function `{}`", f.name),
@@ -2344,6 +2433,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 ret: f.ret,
                 borrow: &f.return_borrow,
                 region: &f.return_region,
+                cleanup: f.return_cleanup,
                 allow_out: true,
                 allow_return_roots: true,
             },
@@ -2366,7 +2456,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 };
                 match rvalue {
                     Rvalue::FnAddr { target, signature } => {
-                        let Some((param_types, ret, modes)) =
+                        let Some((param_types, ret, modes, borrow, region, cleanup)) =
                             named_signature(program, target)
                         else {
                             return Err(callable_target_error(target));
@@ -2379,16 +2469,18 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 ret,
                                 borrow: &signature.return_borrow,
                                 region: &signature.return_region,
+                                cleanup: signature.return_cleanup,
                                 allow_out: false,
-                                allow_return_roots: false,
+                                allow_return_roots: true,
                             },
                             program,
                             &mut type_graph,
                         )?;
-                        // L2b-a1 deliberately leaves function-value return summaries at `None`;
-                        // indirect calls retain the all-compatible-input fallback. L2b-b attaches
-                        // target-relative roots and restores exact summary equality here.
-                        if signature.param_modes != modes {
+                        if signature.param_modes != modes
+                            || &signature.return_borrow != borrow
+                            || &signature.return_region != region
+                            || signature.return_cleanup != cleanup
+                        {
                             return Err(callable_target_error(target));
                         }
                     }
@@ -2459,8 +2551,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 ret: target.ret,
                                 borrow: &signature.return_borrow,
                                 region: &signature.return_region,
+                                cleanup: signature.return_cleanup,
                                 allow_out: false,
-                                allow_return_roots: false,
+                                allow_return_roots: true,
                             },
                             program,
                             &mut type_graph,
@@ -2468,35 +2561,80 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         if signature.param_modes != target_modes
                             || signature.return_borrow != target.return_borrow
                             || signature.return_region != target.return_region
+                            || signature.return_cleanup != target.return_cleanup
                         {
                             return Err(callable_target_error(lifted));
                         }
                     }
                     Rvalue::CallIndirect {
+                        args,
                         param_tys,
                         ret_ty,
                         signature,
                         ..
-                    } => check_signature_facts(
-                        SignatureFacts {
+                    } => {
+                        if !operands_match_modes(args, &signature.param_modes, param_tys, program) {
+                            return Err(callable_metadata_error());
+                        }
+                        check_signature_facts(SignatureFacts {
                             owner: "indirect call",
                             modes: &signature.param_modes,
                             param_types: param_tys,
                             ret: *ret_ty,
                             borrow: &signature.return_borrow,
                             region: &signature.return_region,
+                            cleanup: signature.return_cleanup,
                             allow_out: false,
-                            allow_return_roots: false,
-                        },
-                        program,
-                        &mut type_graph,
-                    )?,
+                            allow_return_roots: true,
+                        }, program, &mut type_graph)?;
+                    }
+                    Rvalue::CallIndirectWithCleanup(call) => {
+                        let align_mir::IndirectCallWithCleanup {
+                            param_tys,
+                            args,
+                            ret_ty,
+                            signature,
+                            cleanup,
+                            ..
+                        } = call.as_ref();
+                        if f.value_tys.get(*cleanup as usize) != Some(&Ty::Bool) {
+                            return Err(callable_metadata_error());
+                        }
+                        if !operands_match_modes(args, &signature.param_modes, param_tys, program) {
+                            return Err(callable_metadata_error());
+                        }
+                        check_signature_facts(
+                            SignatureFacts {
+                                owner: "indirect call",
+                                modes: &signature.param_modes,
+                                param_types: param_tys,
+                                ret: *ret_ty,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                cleanup: signature.return_cleanup,
+                                allow_out: false,
+                                allow_return_roots: true,
+                            },
+                            program,
+                            &mut type_graph,
+                        )?;
+                    }
                     _ => {}
                 }
             }
         }
     }
     for ext in &program.externs {
+        if ext
+            .param_modes
+            .iter()
+            .any(|mode| *mode != align_ast::ParamMode::ByValue)
+        {
+            return Err(CodegenError::Lowering(format!(
+                "extern function `{}` uses a non-by-value parameter mode at the C boundary",
+                ext.name
+            )));
+        }
         check_signature_facts(
             SignatureFacts {
                 owner: &format!("extern function `{}`", ext.name),
@@ -2505,6 +2643,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 ret: ext.ret,
                 borrow: &ext.return_borrow,
                 region: &ext.return_region,
+                cleanup: ext.return_cleanup,
                 allow_out: false,
                 allow_return_roots: false,
             },
@@ -2526,6 +2665,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 ret: import.ret,
                 borrow: &import.return_borrow,
                 region: &import.return_region,
+                cleanup: import.return_cleanup,
                 allow_out: true,
                 allow_return_roots: true,
             },
@@ -2613,6 +2753,7 @@ fn program_signature(function: &Function) -> Result<ProgramSignature, CodegenErr
         ret: function.ret,
         borrow: function.return_borrow.clone(),
         region: function.return_region.clone(),
+        cleanup: function.return_cleanup,
     })
 }
 
@@ -2670,12 +2811,36 @@ fn canonical_signature(
         signature.ret,
         &signature.borrow,
         &signature.region,
+        signature.cleanup,
         program,
     ))
 }
 
 fn canonical_ty(ty: Ty, program: &Program) -> Result<CanonicalTy, CodegenError> {
     canonical_metadata(CanonicalTy::from_program(ty, program))
+}
+
+fn source_ty_matches(actual: Ty, expected: Ty, program: &Program) -> Result<bool, CodegenError> {
+    if actual == expected {
+        return Ok(true);
+    }
+    Ok(canonical_ty(actual, program)? == canonical_ty(expected, program)?)
+}
+
+fn source_tys_match(
+    actual: &[Ty],
+    expected: &[Ty],
+    program: &Program,
+) -> Result<bool, CodegenError> {
+    if actual.len() != expected.len() {
+        return Ok(false);
+    }
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        if !source_ty_matches(actual, expected, program)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn callable_metadata_error() -> CodegenError {
@@ -3037,7 +3202,45 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
             .get(*index as usize)
             .and_then(|slot| function.slots.get(*slot as usize))
             .copied(),
+        Operand::BorrowedPlace(place) => function
+            .slots
+            .get(place.slot as usize)
+            .map(|_| place.ty),
+        Operand::BorrowedCleanupArg(_) => Some(Ty::Bool),
     }
+}
+
+fn operands_match_modes(
+    args: &[Operand],
+    modes: &[align_ast::ParamMode],
+    types: &[Ty],
+    program: &Program,
+) -> bool {
+    args.len() == modes.len()
+        && modes.len() == types.len()
+        && args
+            .iter()
+            .zip(modes)
+            .zip(types)
+            .all(|((argument, mode), ty)| match (argument, mode) {
+                (Operand::BorrowedPlace(place), align_ast::ParamMode::Borrow) => {
+                    place.cleanup.is_none()
+                }
+                (Operand::BorrowedPlace(place), align_ast::ParamMode::BorrowMut) => {
+                    let move_pointee = align_sema::needs_drop_flag(
+                        *ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    );
+                    place.cleanup.is_some() == move_pointee
+                        && (!move_pointee || place.path.is_empty())
+                }
+                (Operand::BorrowedPlace(_), _) => false,
+                (_, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut) => false,
+                _ => true,
+            })
 }
 
 fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, program: &Program) -> bool {
@@ -3190,6 +3393,7 @@ fn callable_declarations(
                 ret: function.ret,
                 borrow: function.return_borrow.clone(),
                 region: function.return_region.clone(),
+                cleanup: function.return_cleanup,
             },
         )?;
     }
@@ -3204,8 +3408,12 @@ fn callable_declarations(
                 ret: function.ret,
                 borrow: function.return_borrow.clone(),
                 region: function.return_region.clone(),
+                cleanup: function.return_cleanup,
             },
         )?;
+    }
+    for declaration in declarations.values() {
+        canonical_signature(&declaration.signature, program)?;
     }
     Ok(declarations)
 }
@@ -3235,6 +3443,7 @@ fn callable_preflight(
                             .is_some_and(|(args, ret)| {
                                 direct_runtime_key_is_valid(*key, args, ret, program)
                             })
+                            || args.iter().any(|argument| matches!(argument, Operand::BorrowedPlace(_)))
                         {
                             return Err(CodegenError::Lowering(
                                 "callable metadata invalid:InvalidGraph".to_owned(),
@@ -3250,8 +3459,65 @@ fn callable_preflight(
                             .map(|operand| preflight_operand_ty(function, operand))
                             .collect::<Option<Vec<_>>>();
                         let result = function.value_tys.get(*value as usize).copied();
-                        if argument_types.as_deref() != Some(declaration.signature.params.as_slice())
-                            || result != Some(declaration.signature.ret)
+                        let types_match = match argument_types.as_deref() {
+                            Some(actual) => {
+                                source_tys_match(actual, &declaration.signature.params, program)?
+                            }
+                            None => false,
+                        };
+                        let result_matches = match result {
+                            Some(actual) => {
+                                source_ty_matches(actual, declaration.signature.ret, program)?
+                            }
+                            None => false,
+                        };
+                        if !types_match
+                            || !operands_match_modes(
+                                args,
+                                &declaration.signature.modes,
+                                &declaration.signature.params,
+                                program,
+                            )
+                            || !result_matches
+                            || declaration.signature.cleanup != hir::ReturnCleanupAbi::None
+                        {
+                            return Err(callable_target_error(target));
+                        }
+                    }
+                    Rvalue::CallWithCleanup(call) => {
+                        let align_mir::DirectCallWithCleanup { target, args, cleanup } = call.as_ref();
+                        let Some(declaration) = declarations.get(target) else {
+                            return Err(callable_target_error(target));
+                        };
+                        let argument_types = args
+                            .iter()
+                            .map(|operand| preflight_operand_ty(function, operand))
+                            .collect::<Option<Vec<_>>>();
+                        let result = function.value_tys.get(*value as usize).copied();
+                        let cleanup_ty = function.value_tys.get(*cleanup as usize).copied();
+                        let types_match = match argument_types.as_deref() {
+                            Some(actual) => {
+                                source_tys_match(actual, &declaration.signature.params, program)?
+                            }
+                            None => false,
+                        };
+                        let result_matches = match result {
+                            Some(actual) => {
+                                source_ty_matches(actual, declaration.signature.ret, program)?
+                            }
+                            None => false,
+                        };
+                        if !types_match
+                            || !operands_match_modes(
+                                args,
+                                &declaration.signature.modes,
+                                &declaration.signature.params,
+                                program,
+                            )
+                            || !result_matches
+                            || cleanup_ty != Some(Ty::Bool)
+                            || declaration.signature.cleanup
+                                != hir::ReturnCleanupAbi::DynamicBit
                         {
                             return Err(callable_target_error(target));
                         }
@@ -3264,6 +3530,7 @@ fn callable_preflight(
                             || signature.param_modes != declaration.signature.modes
                             || signature.return_borrow != declaration.signature.borrow
                             || signature.return_region != declaration.signature.region
+                            || signature.return_cleanup != declaration.signature.cleanup
                         {
                             return Err(callable_target_error(target));
                         }
@@ -3321,6 +3588,7 @@ fn callable_preflight(
                             || signature.param_modes != explicit_modes
                             || signature.return_borrow != declaration.signature.borrow
                             || signature.return_region != declaration.signature.region
+                            || signature.return_cleanup != declaration.signature.cleanup
                             || captures
                                 .iter()
                                 .zip(capture_tys)
@@ -3334,6 +3602,7 @@ fn callable_preflight(
                             ret: declaration.signature.ret,
                             borrow: declaration.signature.borrow.clone(),
                             region: declaration.signature.region.clone(),
+                            cleanup: declaration.signature.cleanup,
                         };
                         generated.push(GeneratedId::Closure {
                             lifted: lifted.clone(),
@@ -4309,6 +4578,43 @@ fn abi_map_ty<'c>(
     }
 }
 
+fn align_return_type<'c>(
+    ctx: &'c Context,
+    value: BasicTypeEnum<'c>,
+    cleanup: hir::ReturnCleanupAbi,
+) -> BasicTypeEnum<'c> {
+    match cleanup {
+        hir::ReturnCleanupAbi::None => value,
+        hir::ReturnCleanupAbi::DynamicBit => ctx
+            .struct_type(&[value, ctx.bool_type().into()], false)
+            .into(),
+    }
+}
+
+fn abi_param_type<'c>(
+    ctx: &'c Context,
+    value: BasicTypeEnum<'c>,
+    mode: align_ast::ParamMode,
+    move_pointee: bool,
+) -> BasicMetadataTypeEnum<'c> {
+    match mode {
+        align_ast::ParamMode::Borrow => {
+            ctx.ptr_type(AddressSpace::default()).into()
+        }
+        align_ast::ParamMode::BorrowMut if move_pointee => ctx
+            .struct_type(
+                &[
+                    ctx.ptr_type(AddressSpace::default()).into(),
+                    ctx.ptr_type(AddressSpace::default()).into(),
+                ],
+                false,
+            )
+            .into(),
+        align_ast::ParamMode::BorrowMut => ctx.ptr_type(AddressSpace::default()).into(),
+        align_ast::ParamMode::ByValue | align_ast::ParamMode::Out => value.into(),
+    }
+}
+
 // The type-table + `exports` parameters are each independently threaded through from `build_module`
 // (no natural grouping struct exists yet for "the type tables"); splitting them into a bag-of-fields
 // struct would obscure more than it clarifies for a single call site.
@@ -4322,6 +4628,7 @@ fn declare_fn<'c>(
     enum_types: &[StructType<'c>],
     tagged_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
+    program: &Program,
     exports: &[String],
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
@@ -4330,15 +4637,31 @@ fn declare_fn<'c>(
     let param_types: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
-        .map(|s| map(f.slots[*s as usize]).into())
+        .zip(&f.param_modes)
+        .map(|(s, mode)| {
+            let ty = f.slots[*s as usize];
+            abi_param_type(
+                ctx,
+                map(ty),
+                *mode,
+                align_sema::needs_drop_flag(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ),
+            )
+        })
         .collect();
     let fn_ty = if f.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
-        map(f.ret).fn_type(&param_types, false)
+        align_return_type(ctx, map(f.ret), f.return_cleanup).fn_type(&param_types, false)
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
+    mark_borrow_param_contracts(ctx, fv, &f.param_modes);
     // Every Align program function is module-private (internal) EXCEPT:
     //  - the C entry: an `-> i32` `main` keeps the symbol name `main` and IS the C entry (`crt0`
     //    resolves it by name), so it must stay external. A `Result`- or `Unit`-returning main body
@@ -4374,6 +4697,7 @@ fn declare_fn<'c>(
 /// value as their aggregate type; scalars/views via `abi_type`), so the call type matches the
 /// owning unit's definition and the linker binds them. Linkage stays external (an undefined symbol
 /// cannot be internal); `nounwind` matches the Align contract every program function carries.
+#[allow(clippy::too_many_arguments)] // mirrors declare_fn across the same ABI type tables
 fn declare_imported_fn<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -4382,20 +4706,64 @@ fn declare_imported_fn<'c>(
     enum_types: &[StructType<'c>],
     tagged_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
+    program: &Program,
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
     };
-    let param_types: Vec<BasicMetadataTypeEnum> =
-        imp.params.iter().map(|&ty| map(ty).into()).collect();
+    let param_types: Vec<BasicMetadataTypeEnum> = imp
+        .params
+        .iter()
+        .zip(&imp.param_modes)
+        .map(|(&ty, &mode)| {
+            abi_param_type(
+                ctx,
+                map(ty),
+                mode,
+                align_sema::needs_drop_flag(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ),
+            )
+        })
+        .collect();
     let fn_ty = if imp.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
-        map(imp.ret).fn_type(&param_types, false)
+        align_return_type(ctx, map(imp.ret), imp.return_cleanup).fn_type(&param_types, false)
     };
     let fv = module.add_function(&encoded_program_symbol(&imp.name), fn_ty, None);
     mark_nounwind(ctx, fv);
+    mark_borrow_param_contracts(ctx, fv, &imp.param_modes);
     fv
+}
+
+fn mark_borrow_param_contracts(
+    ctx: &Context,
+    function: FunctionValue<'_>,
+    modes: &[align_ast::ParamMode],
+) {
+    mark_borrow_param_contracts_at(ctx, function, modes, 0);
+}
+
+fn mark_borrow_param_contracts_at(
+    ctx: &Context,
+    function: FunctionValue<'_>,
+    modes: &[align_ast::ParamMode],
+    offset: u32,
+) {
+    for (index, mode) in modes.iter().copied().enumerate() {
+        if mode != align_ast::ParamMode::Borrow {
+            continue;
+        }
+        let location = inkwell::attributes::AttributeLoc::Param(index as u32 + offset);
+        add_enum_attr(ctx, function, location, "nonnull");
+        add_valued_enum_attr(ctx, function, location, "captures", CAPTURES_NONE);
+        add_enum_attr(ctx, function, location, "readonly");
+    }
 }
 
 /// Mark a function `nounwind`: Align functions never unwind — errors are `Result` values and a
@@ -4794,6 +5162,9 @@ struct FnGen<'c, 'a> {
     f: &'a Function,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
+    /// Hidden caller cleanup-bit pointers for whole-Move `BorrowMut` parameters, keyed by their
+    /// logical parameter slots.
+    borrow_mut_cleanup_ptrs: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     values: HashMap<ValueId, BasicValueEnum<'c>>,
     /// Conservative whole-MIR proof for builder headers whose pointer never leaves its defining
     /// function/local. Each selected local gets one reusable 64-byte entry alloca; new/load value
@@ -4985,6 +5356,11 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
                             }
                         }
+                        Rvalue::CallWithCleanup(call) => {
+                            for op in &call.args {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
                         // A hoisted `str_finder` plan (doc-13 §6.6) never holds a builder header; its
                         // needle/plan/haystack operands are `str` views / an opaque plan pointer.
                         // Audit them anyway (a header can never be one, so this only ever passes) so
@@ -5000,6 +5376,12 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         Rvalue::CallIndirect { callee, args, .. } => {
                             reject_header_operand(callee, &load_defs, &owner, &mut bad);
                             for op in args {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
+                        Rvalue::CallIndirectWithCleanup(call) => {
+                            reject_header_operand(&call.callee, &load_defs, &owner, &mut bad);
+                            for op in &call.args {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
                             }
                         }
@@ -5029,8 +5411,15 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                 _ => {}
             }
         }
-        if let Term::Return(Some(op)) = &block.term {
-            reject_header_operand(op, &load_defs, &owner, &mut bad);
+        match &block.term {
+            Term::Return(Some(op)) => {
+                reject_header_operand(op, &load_defs, &owner, &mut bad);
+            }
+            Term::ReturnWithCleanup(returned) => {
+                reject_header_operand(&returned.0, &load_defs, &owner, &mut bad);
+                reject_header_operand(&returned.1, &load_defs, &owner, &mut bad);
+            }
+            _ => {}
         }
     }
 
@@ -6053,6 +6442,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let entry = self.blocks[self.f.entry as usize];
         self.builder.position_at_end(entry);
         for (i, ty) in self.f.slots.iter().enumerate() {
+            if let Some(parameter) = self.f.params.iter().position(|slot| *slot as usize == i)
+                && matches!(
+                    self.f.param_modes.get(parameter),
+                    Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                )
+            {
+                let incoming = self
+                    .func
+                    .get_nth_param(parameter as u32)
+                    .ok_or_else(|| self.err(format!("borrowed parameter {parameter} is missing")))?;
+                let pointer = if self
+                    .f
+                    .borrow_mut_cleanup_slots
+                    .get(parameter)
+                    .copied()
+                    .flatten()
+                    .is_some()
+                {
+                    let aggregate = incoming.into_struct_value();
+                    let pointer = self
+                        .builder
+                        .build_extract_value(aggregate, 0, "borrow.mut.ptr")
+                        .map_err(|error| self.err(error))?
+                        .into_pointer_value();
+                    let cleanup = self
+                        .builder
+                        .build_extract_value(aggregate, 1, "borrow.mut.cleanup.ptr")
+                        .map_err(|error| self.err(error))?
+                        .into_pointer_value();
+                    self.borrow_mut_cleanup_ptrs.insert(i as Slot, cleanup);
+                    pointer
+                } else {
+                    incoming.into_pointer_value()
+                };
+                self.slots.insert(i as Slot, pointer);
+                continue;
+            }
             let llty = self.llvm_type(*ty);
             let ptr = self
                 .builder
@@ -6133,6 +6559,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
                 Stmt::Store(slot, op) => {
+                    let incoming_borrow = match op {
+                        Operand::Arg(index) => matches!(
+                            self.f.param_modes.get(*index as usize),
+                            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                        ),
+                        _ => false,
+                    };
+                    if incoming_borrow {
+                        continue;
+                    }
                     let val = self.operand(op)?;
                     let ptr = self.slots[slot];
                     self.builder.build_store(ptr, val).map_err(|e| self.err(e))?;
@@ -6629,15 +7065,80 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
             }
             Term::Return(Some(op)) => {
+                if self.f.return_cleanup != hir::ReturnCleanupAbi::None {
+                    return Err(self.err("dynamic-cleanup function returned without cleanup bit"));
+                }
+                self.writeback_borrow_mut_cleanup()?;
                 let v = self.operand(op)?;
                 self.builder.build_return(Some(&v)).map_err(|e| self.err(e))?;
             }
             Term::Return(None) => {
+                if self.f.return_cleanup != hir::ReturnCleanupAbi::None {
+                    return Err(self.err("dynamic-cleanup function returned no value or cleanup bit"));
+                }
+                self.writeback_borrow_mut_cleanup()?;
                 self.builder.build_return(None).map_err(|e| self.err(e))?;
+            }
+            Term::ReturnWithCleanup(returned) => {
+                let (value, cleanup) = returned.as_ref();
+                if self.f.return_cleanup != hir::ReturnCleanupAbi::DynamicBit {
+                    return Err(self.err("copy-return function carried an extra cleanup bit"));
+                }
+                self.writeback_borrow_mut_cleanup()?;
+                let value = self.operand(value)?;
+                let cleanup = self.operand(cleanup)?.into_int_value();
+                let return_ty = align_return_type(
+                    self.ctx,
+                    self.llvm_type(self.f.ret),
+                    hir::ReturnCleanupAbi::DynamicBit,
+                )
+                .into_struct_type();
+                let with_value = self
+                    .builder
+                    .build_insert_value(return_ty.const_zero(), value, 0, "ret.value")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let result = self
+                    .builder
+                    .build_insert_value(with_value, cleanup, 1, "ret.cleanup")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_return(Some(&result))
+                    .map_err(|e| self.err(e))?;
             }
             Term::Unreachable => {
                 self.builder.build_unreachable().map_err(|e| self.err(e))?;
             }
+        }
+        Ok(())
+    }
+
+    fn writeback_borrow_mut_cleanup(&self) -> Result<(), CodegenError> {
+        for (index, cleanup_slot) in self.f.borrow_mut_cleanup_slots.iter().enumerate() {
+            let Some(cleanup_slot) = cleanup_slot else { continue };
+            let parameter_slot = *self
+                .f
+                .params
+                .get(index)
+                .ok_or_else(|| self.err("borrowed cleanup parameter is missing"))?;
+            let destination = self
+                .borrow_mut_cleanup_ptrs
+                .get(&parameter_slot)
+                .copied()
+                .ok_or_else(|| self.err("borrowed cleanup writeback pointer is missing"))?;
+            let source = self
+                .slots
+                .get(cleanup_slot)
+                .copied()
+                .ok_or_else(|| self.err("borrowed cleanup proxy slot is missing"))?;
+            let value = self
+                .builder
+                .build_load(self.ctx.bool_type(), source, "borrow.cleanup.out")
+                .map_err(|error| self.err(error))?;
+            self.builder
+                .build_store(destination, value)
+                .map_err(|error| self.err(error))?;
         }
         Ok(())
     }
@@ -10047,6 +10548,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(call.try_as_basic_value().basic());
             }
             Rvalue::Call(DirectCall::Program(name), args) => {
+                let declaration = self
+                    .callable_preflight
+                    .declarations
+                    .get(name)
+                    .ok_or_else(|| callable_target_error(name))?;
+                if declaration.signature.cleanup != hir::ReturnCleanupAbi::None {
+                    return Err(self.err("dynamic-cleanup call omitted its cleanup result"));
+                }
                 let callee = self
                     .program_funcs
                     .get(name)
@@ -10112,6 +10621,46 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Ok(Some(sv));
                 }
                 return Ok(cs.try_as_basic_value().basic());
+            }
+            Rvalue::CallWithCleanup(call) => {
+                let align_mir::DirectCallWithCleanup { target, args, cleanup } = call.as_ref();
+                let declaration = self
+                    .callable_preflight
+                    .declarations
+                    .get(target)
+                    .ok_or_else(|| callable_target_error(target))?;
+                if declaration.signature.cleanup != hir::ReturnCleanupAbi::DynamicBit
+                    || self.extern_abi.contains_key(target)
+                {
+                    return Err(self.err("call carried an unexpected cleanup result"));
+                }
+                let callee = self
+                    .program_funcs
+                    .get(target)
+                    .copied()
+                    .ok_or_else(|| callable_target_error(target))?;
+                let argv = args
+                    .iter()
+                    .map(|operand| self.operand(operand).map(Into::into))
+                    .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
+                let returned = self
+                    .builder
+                    .build_call(callee, &argv, "call.cleanup")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("dynamic-cleanup call returned void"))?
+                    .into_struct_value();
+                let value = self
+                    .builder
+                    .build_extract_value(returned, 0, "call.value")
+                    .map_err(|error| self.err(error))?;
+                let flag = self
+                    .builder
+                    .build_extract_value(returned, 1, "call.cleanup.bit")
+                    .map_err(|error| self.err(error))?;
+                self.values.insert(*cleanup, flag);
+                return Ok(Some(value));
             }
             Rvalue::FnAddr { target, .. } => {
                 // A non-capturing function value: `{ thunk_ptr, null_env }`.
@@ -10195,6 +10744,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     ret: declaration.signature.ret,
                     borrow: declaration.signature.borrow.clone(),
                     region: declaration.signature.region.clone(),
+                    cleanup: declaration.signature.cleanup,
                 };
                 let id = GeneratedId::Closure {
                     lifted: lifted.clone(),
@@ -10222,13 +10772,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::CallIndirect { callee, args, param_tys, ret_ty, .. } => {
+                let Rvalue::CallIndirect { signature, .. } = rv else { unreachable!() };
+                if signature.return_cleanup != hir::ReturnCleanupAbi::None {
+                    return Err(self.err("dynamic-cleanup indirect call omitted its cleanup result"));
+                }
                 // Extract `{ fn_ptr, env_ptr }` and call with the env-ABI `fn(env, args)`.
                 let clos = self.operand(callee)?.into_struct_value();
                 let fn_ptr = self.builder.build_extract_value(clos, 0, "cf").map_err(|e| self.err(e))?.into_pointer_value();
                 let env = self.builder.build_extract_value(clos, 1, "ce").map_err(|e| self.err(e))?;
                 let mut param_meta: Vec<BasicMetadataTypeEnum> =
                     vec![self.ctx.ptr_type(AddressSpace::default()).into()];
-                param_meta.extend(param_tys.iter().map(|t| BasicMetadataTypeEnum::from(self.llvm_type(*t))));
+                param_meta.extend(param_tys.iter().zip(&signature.param_modes).map(|(ty, mode)| {
+                    abi_param_type(
+                        self.ctx,
+                        self.llvm_type(*ty),
+                        *mode,
+                        align_sema::needs_drop_flag(
+                            *ty,
+                            &self.program.structs,
+                            &self.program.tuples,
+                            &self.program.enums,
+                            &self.program.tagged_types,
+                        ),
+                    )
+                }));
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
                 for o in args {
                     argv.push(inkwell::values::BasicMetadataValueEnum::from(self.operand(o)?));
@@ -10250,6 +10817,86 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_indirect_call(fn_ty, fn_ptr, &argv, "icall")
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
+            }
+            Rvalue::CallIndirectWithCleanup(call) => {
+                let align_mir::IndirectCallWithCleanup {
+                callee,
+                args,
+                param_tys,
+                ret_ty,
+                signature,
+                cleanup,
+                } = call.as_ref();
+                if signature.return_cleanup != hir::ReturnCleanupAbi::DynamicBit
+                    || *ret_ty == Ty::Unit
+                {
+                    return Err(self.err("indirect call carried an unexpected cleanup result"));
+                }
+                let clos = self.operand(callee)?.into_struct_value();
+                let fn_ptr = self
+                    .builder
+                    .build_extract_value(clos, 0, "cf")
+                    .map_err(|e| self.err(e))?
+                    .into_pointer_value();
+                let env = self
+                    .builder
+                    .build_extract_value(clos, 1, "ce")
+                    .map_err(|e| self.err(e))?;
+                let mut param_meta: Vec<BasicMetadataTypeEnum> =
+                    vec![self.ctx.ptr_type(AddressSpace::default()).into()];
+                param_meta.extend(
+                    param_tys
+                        .iter()
+                        .zip(&signature.param_modes)
+                        .map(|(ty, mode)| {
+                            abi_param_type(
+                                self.ctx,
+                                self.llvm_type(*ty),
+                                *mode,
+                                align_sema::needs_drop_flag(
+                                    *ty,
+                                    &self.program.structs,
+                                    &self.program.tuples,
+                                    &self.program.enums,
+                                    &self.program.tagged_types,
+                                ),
+                            )
+                        }),
+                );
+                let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
+                for operand in args {
+                    argv.push(inkwell::values::BasicMetadataValueEnum::from(
+                        self.operand(operand)?,
+                    ));
+                }
+                let return_ty = align_return_type(
+                    self.ctx,
+                    self.llvm_type(*ret_ty),
+                    hir::ReturnCleanupAbi::DynamicBit,
+                );
+                let returned = self
+                    .builder
+                    .build_indirect_call(
+                        return_ty.fn_type(&param_meta, false),
+                        fn_ptr,
+                        &argv,
+                        "icall.cleanup",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("dynamic-cleanup indirect call returned void"))?
+                    .into_struct_value();
+                let value = self
+                    .builder
+                    .build_extract_value(returned, 0, "icall.value")
+                    .map_err(|e| self.err(e))?;
+                let flag = self
+                    .builder
+                    .build_extract_value(returned, 1, "icall.cleanup.bit")
+                    .map_err(|e| self.err(e))?;
+                self.values.insert(*cleanup, flag);
+                return Ok(Some(value));
             }
         };
         Ok(Some(v))
@@ -12400,7 +13047,65 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .copied()
                     .ok_or_else(|| self.err(format!("parameter index {index} references missing slot {slot}")))
             }
+            Operand::BorrowedPlace(place) => self.checked_borrowed_place_ty(place),
+            Operand::BorrowedCleanupArg(index) => {
+                self.f
+                    .borrow_mut_cleanup_slots
+                    .get(*index as usize)
+                    .copied()
+                    .flatten()
+                    .map(|_| Ty::Bool)
+                    .ok_or_else(|| self.err(format!("parameter {index} has no borrowed cleanup bit")))
+            }
         }
+    }
+
+    fn checked_borrowed_place_ty(
+        &self,
+        place: &align_mir::BorrowedPlace,
+    ) -> Result<Ty, CodegenError> {
+        let mut ty = self
+            .f
+            .slots
+            .get(place.slot as usize)
+            .copied()
+            .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)))?;
+        for &field in &place.path {
+            let Ty::Struct(id) = ty else {
+                return Err(self.err("borrowed place field path crosses a non-struct type"));
+            };
+            ty = self
+                .structs
+                .get(id as usize)
+                .and_then(|definition| definition.fields.get(field as usize))
+                .map(|field| field.ty)
+                .ok_or_else(|| self.err("borrowed place field path is out of bounds"))?;
+        }
+        if ty != place.ty {
+            return Err(self.err("borrowed place type disagrees with its field path"));
+        }
+        if place
+            .cleanup
+            .is_some_and(|slot| self.f.slots.get(slot as usize) != Some(&Ty::Bool))
+        {
+            return Err(self.err("borrowed place cleanup slot is missing or not bool"));
+        }
+        Ok(ty)
+    }
+
+    fn borrowed_place_ptr(
+        &self,
+        place: &align_mir::BorrowedPlace,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        self.checked_borrowed_place_ty(place)?;
+        if place.path.is_empty() {
+            return self
+                .slots
+                .get(&place.slot)
+                .copied()
+                .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)));
+        }
+        self.field_path_ptr(place.slot, &place.path)
     }
 
     /// Read an operand's LLVM value. **Fallible on purpose:** the two non-constant forms look the
@@ -12431,6 +13136,54 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .func
                 .get_nth_param(*i)
                 .ok_or_else(|| self.err(format!("parameter index {i} is out of range")))?,
+            Operand::BorrowedPlace(place) => {
+                let pointer = self.borrowed_place_ptr(place)?;
+                if let Some(cleanup) = place.cleanup {
+                    let cleanup_pointer = self
+                        .slots
+                        .get(&cleanup)
+                        .copied()
+                        .ok_or_else(|| self.err(format!("borrowed cleanup slot {cleanup} is missing")))?;
+                    let pair = self.ctx.struct_type(
+                        &[
+                            self.ctx.ptr_type(AddressSpace::default()).into(),
+                            self.ctx.ptr_type(AddressSpace::default()).into(),
+                        ],
+                        false,
+                    );
+                    let with_pointer = self
+                        .builder
+                        .build_insert_value(pair.get_poison(), pointer, 0, "borrow.mut.pair.ptr")
+                        .map_err(|error| self.err(error))?;
+                    self.builder
+                        .build_insert_value(
+                            with_pointer,
+                            cleanup_pointer,
+                            1,
+                            "borrow.mut.pair.cleanup",
+                        )
+                        .map_err(|error| self.err(error))?
+                        .into_struct_value()
+                        .into()
+                } else {
+                    pointer.into()
+                }
+            }
+            Operand::BorrowedCleanupArg(index) => {
+                let slot = *self
+                    .f
+                    .params
+                    .get(*index as usize)
+                    .ok_or_else(|| self.err(format!("parameter index {index} is out of range")))?;
+                let pointer = self
+                    .borrow_mut_cleanup_ptrs
+                    .get(&slot)
+                    .copied()
+                    .ok_or_else(|| self.err(format!("parameter {index} has no cleanup pointer")))?;
+                self.builder
+                    .build_load(self.ctx.bool_type(), pointer, "borrow.cleanup.in")
+                    .map_err(|error| self.err(error))?
+            }
         })
     }
 }
@@ -12553,6 +13306,7 @@ mod tests {
             ret: Ty::Int(IntTy { bits: 64, signed: true }),
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
         });
         let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, false, &[], None).unwrap();
         assert_eq!(declarations(&per_unit), expected);
@@ -12593,6 +13347,7 @@ mod tests {
             ret,
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
         };
         let mut internal_program = mir("fn main() -> i32 = 0\n");
         internal_program.externs = vec![
@@ -12686,6 +13441,93 @@ mod tests {
             error.to_string(),
             "lowering failed: native extern ABI mismatch:616c69676e5f72745f617267735f6275696c64",
         );
+    }
+
+    #[test]
+    fn malformed_c_extern_borrow_modes_fail_before_abi_lowering() {
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+            let mut program = mir(
+                "extern \"C\" fn consume(value: i64)\nfn main() -> i32 = 0\n",
+            );
+            program.externs[0].param_modes[0] = mode;
+            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a C declaration cannot carry an Align borrow ABI");
+            assert_lowering(
+                error,
+                "extern function `consume` uses a non-by-value parameter mode at the C boundary",
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_borrowed_place_type_fails_before_llvm_call_emission() {
+        let mut program = mir(
+            "fn inspect(borrow value: string) -> i64 = value.len()\n\
+             fn main() -> i32 { value := \"align\".clone(); return inspect(value) as i32 }\n",
+        );
+        let mut changed = false;
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), args)) = statement
+                    else {
+                        continue;
+                    };
+                    if target.as_str() == "inspect"
+                        && let Operand::BorrowedPlace(place) = &mut args[0]
+                    {
+                        place.ty = Ty::Bool;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the borrowed call operand");
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a borrowed place with a forged type must fail closed");
+        assert_lowering(error, "callable target invalid:696e7370656374");
+    }
+
+    #[test]
+    fn malformed_move_borrow_mut_cleanup_fails_before_llvm_call_emission() {
+        let source = "fn replace(borrow mut value: string) { value = \"new\".clone() }\n\
+                      fn main() -> i32 { mut value := \"old\".clone(); replace(value); return 0 }\n";
+        let mut callee = mir(source);
+        let replace = callee
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "replace")
+            .expect("replace function");
+        replace.borrow_mut_cleanup_slots[0] = None;
+        let error = emit_llvm_ir(&callee, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a Move BorrowMut callee needs its cleanup proxy");
+        assert_lowering(
+            error,
+            "function `replace` parameter 0 has malformed BorrowMut cleanup storage",
+        );
+
+        let mut caller = mir(source);
+        let mut changed = false;
+        for function in &mut caller.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), args)) = statement
+                    else {
+                        continue;
+                    };
+                    if target.as_str() == "replace"
+                        && let Operand::BorrowedPlace(place) = &mut args[0]
+                    {
+                        place.cleanup = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the exclusive borrowed call operand");
+        let error = emit_llvm_ir(&caller, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a Move BorrowMut call needs the caller cleanup slot");
+        assert_lowering(error, "callable target invalid:7265706c616365");
     }
 
     #[test]
@@ -13323,8 +14165,10 @@ mod tests {
             name: program_call("main"),
             params: vec![],
             param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             ret: i32_ty,
             slots,
             slot_align,
@@ -13397,9 +14241,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![Ty::Tagged(7)],
@@ -13437,9 +14283,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![Ty::Fn(0)],
@@ -13451,11 +14299,12 @@ mod tests {
                             lifted: program_call("unused"),
                             captures: vec![],
                             capture_tys: vec![Ty::Tagged(7)],
-                            signature: align_mir::FnSignatureFacts {
+                            signature: Box::new(align_mir::FnSignatureFacts {
                                 param_modes: vec![],
                                 return_borrow: hir::ReturnBorrowSummary::None,
                                 return_region: hir::ReturnRegionSummary::None,
-                            },
+                                return_cleanup: hir::ReturnCleanupAbi::None,
+                            }),
                         },
                     )],
                     stmt_lines: vec![(0, 0)],
@@ -13490,9 +14339,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![i32_ty],
@@ -13537,9 +14388,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![Ty::Tagged(0)],
@@ -13588,9 +14441,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![Ty::Tagged(0)],
@@ -13664,9 +14519,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys: vec![],
@@ -13771,6 +14628,7 @@ mod tests {
             .push(align_ast::ParamMode::ByValue);
         header_cycle.fns[0].slots.push(cyclic_ty);
         header_cycle.fns[0].ret = cyclic_ty;
+        header_cycle.fns[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
         header_cycle.fns[0].return_borrow = hir::ReturnBorrowSummary::Roots {
             params: vec![0],
             captures: vec![],
@@ -13913,9 +14771,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![Ty::Tagged(0)],
                 slot_align: vec![None],
                 value_tys: vec![],
@@ -13953,9 +14813,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![Ty::Tuple(0)],
                 slot_align: vec![None],
                 value_tys: vec![],
@@ -13991,9 +14853,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![Ty::Tuple(0)],
                 slot_align: vec![None],
                 value_tys: vec![],
@@ -14047,9 +14911,11 @@ mod tests {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i32_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![],
                 slot_align: vec![],
                 value_tys,
@@ -14167,9 +15033,11 @@ mod tests {
             name: program_call("u"),
             params: vec![],
             param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Unit,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![],
             slot_align: vec![],
             value_tys: vec![],
@@ -14203,9 +15071,11 @@ mod tests {
             name: program_call("return_str"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Str,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty],
             slot_align: vec![None],
             value_tys: vec![Ty::Str],
@@ -14252,9 +15122,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty],
             slot_align: vec![None],
             value_tys: vec![i64_ty],
@@ -14306,9 +15178,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![string_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14357,9 +15231,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14402,9 +15278,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14448,9 +15326,11 @@ mod tests {
             name: program_call("keep"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Bool,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![input_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14462,9 +15342,11 @@ mod tests {
             name: program_call("finish"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![wrong_output_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14515,9 +15397,11 @@ mod tests {
             name: program_call("finish"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![str_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14572,9 +15456,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14613,9 +15499,11 @@ mod tests {
             name: program_call("return_i64"),
             params: vec![0, 1],
             param_modes: vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![i64_ty, i64_ty],
             slot_align: vec![None, None],
             value_tys: vec![],
@@ -14658,9 +15546,11 @@ mod tests {
             name: program_call("return_u64"),
             params: vec![0],
             param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![u64_ty],
             slot_align: vec![None],
             value_tys: vec![],
@@ -14796,9 +15686,11 @@ mod tests {
                 name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
                 param_modes: if count_arg { vec![align_ast::ParamMode::ByValue] } else { vec![] },
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: if count_arg { vec![Ty::Int(IntTy { bits: 64, signed: true })] } else { vec![] },
                 slot_align: if count_arg { vec![None] } else { vec![] },
                 value_tys: vec![value_ty],
@@ -14851,9 +15743,11 @@ mod tests {
                 name: program_call("arena_allocation_probe"),
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![i64_ty],
                 slot_align: vec![None],
                 value_tys: vec![Ty::ArenaHandle, Ty::Box(Scalar::Str)],
@@ -14895,9 +15789,11 @@ mod tests {
                 name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },
                 param_modes: if dynamic { vec![align_ast::ParamMode::ByValue] } else { vec![] },
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: if dynamic { vec![i64_ty] } else { vec![] },
                 slot_align: if dynamic { vec![None] } else { vec![] },
                 value_tys: vec![Ty::ArenaHandle, Ty::Box(Scalar::Int(IntTy { bits: 8, signed: false }))],
@@ -15696,9 +16592,11 @@ mod tests {
             name: program_call("future_wrapper"),
             params: vec![],
             param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             ret: Ty::Unit,
+            return_cleanup: hir::ReturnCleanupAbi::None,
             slots: vec![Ty::Builder],
             slot_align: vec![None],
             value_tys: vec![Ty::Builder, Ty::Builder, Ty::Unit],
@@ -16170,9 +17068,11 @@ mod tests {
                 name: program_call(name),
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 ret: i64_ty,
+                return_cleanup: hir::ReturnCleanupAbi::None,
                 slots: vec![i64_ty],
                 slot_align: vec![None],
                 value_tys: vec![i64_ty],
@@ -16245,6 +17145,7 @@ mod tests {
             ret: i64_ty,
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
         });
         let conflict = emit_llvm_ir(&conflict, &BuildTarget::Baseline, false, &[], None)
             .expect_err("stored and extern declarations cannot share one logical target");
@@ -16296,6 +17197,7 @@ mod tests {
             ret: Ty::Unit,
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
         });
         let text = emit_llvm_ir(&fn_value, &BuildTarget::Baseline, false, &[], None)
             .expect("an occupied generated candidate must probe deterministically");

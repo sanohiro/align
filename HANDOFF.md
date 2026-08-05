@@ -5,21 +5,21 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ The C-A canonical callable capability is complete
-through am-c3. MIR now separates typed program and runtime direct targets, LLVM
-program identities are encoded consistently across whole-program, per-unit,
-export, main-wrapper, and ThinLTO paths, and every generated callable family uses
-canonical collected identity plus deterministic collision probing. No public
-`pkg.db` surface exists yet.
+_Last updated: 2026-08-05._ The C-B borrow/ownership capability is complete
+through L2e. Direct, captured, imported, and function-value returns preserve
+exact owner provenance; recursively Move returns carry a path-selected cleanup
+bit; and shared/exclusive parameters preserve caller ownership, replacement,
+generation invalidation, and whole/per-unit ABI parity. No public `pkg.db`
+surface exists yet.
 
 The remaining compiler plan uses consumer-complete capability waves rather
 than one PR per dormant acceptance cell:
 
 ```text
 C-A canonical callable closure  complete through c3
-C-B borrow/ownership closure    af/ar/ap/t/b + L2c/L2d/L2e
+C-B borrow/ownership closure    complete through L2e
 
-after C-B, in parallel:
+next independent waves:
 F-A native resources             L3
 F-B region materialization       L4 + L6
 F-C static artifacts             L5
@@ -924,12 +924,11 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-C-A closes the canonical callable plan from c2a2b through c3 as one consumer-complete wave. The
-next implementation is C-B: direct, captured, and imported return-provenance closure through
-L2b-b, followed in the same ownership capability by Move-return cleanup and shared/exclusive
-borrow consumers through L2e. Reopen the C-B closure matrix before coding and preserve the exact
-control-flow/type-reconciliation matrix in the repository instructions. F-A/F-B/F-C begin only
-after C-B.
+C-B closes direct, captured, imported, and function-value return provenance together with
+path-selected Move-return cleanup and shared/exclusive borrow consumers through L2e. The next
+independent implementation waves are F-A native resources (L3), F-B region materialization
+(L4 + L6), and F-C static artifacts (L5). Each reopens its owning closure matrix before coding;
+F-D package integration begins only after F-A/F-B and the complete F-C prerequisite gate.
 
 The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
