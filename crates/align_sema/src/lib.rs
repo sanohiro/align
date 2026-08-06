@@ -18460,6 +18460,7 @@ impl<'a> MoveCheck<'a> {
                     match &current.kind {
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if !block.stmts.is_empty()
@@ -18518,7 +18519,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             child,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             child_consuming,
                             child_direct,
                             Post::BlockExprSequence {
@@ -18533,6 +18537,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18562,7 +18567,10 @@ impl<'a> MoveCheck<'a> {
                         {
                             (
                                 index,
-                                matches!(&current.kind, ExprKind::Arena(_)),
+                                matches!(
+                                    &current.kind,
+                                    ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                                ),
                                 false,
                                 false,
                                 Post::BlockPairAfterIndex {
@@ -18576,7 +18584,10 @@ impl<'a> MoveCheck<'a> {
                         } else {
                             (
                                 value,
-                                matches!(&current.kind, ExprKind::Arena(_)),
+                                matches!(
+                                    &current.kind,
+                                    ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                                ),
                                 false,
                                 false,
                                 Post::BlockPairAfterValue {
@@ -18592,6 +18603,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18630,7 +18642,10 @@ impl<'a> MoveCheck<'a> {
                         {
                             (
                                 index,
-                                matches!(&current.kind, ExprKind::Arena(_)),
+                                matches!(
+                                    &current.kind,
+                                    ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                                ),
                                 false,
                                 false,
                                 Post::BlockPairAfterIndex {
@@ -18644,7 +18659,10 @@ impl<'a> MoveCheck<'a> {
                         } else {
                             (
                                 value,
-                                matches!(&current.kind, ExprKind::Arena(_)),
+                                matches!(
+                                    &current.kind,
+                                    ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                                ),
                                 true,
                                 true,
                                 Post::BlockPairAfterValue {
@@ -18660,6 +18678,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18693,7 +18712,10 @@ impl<'a> MoveCheck<'a> {
                         );
                         (
                             value,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             !self_assign,
                             !self_assign,
                             Post::BlockAssignField {
@@ -18706,6 +18728,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18721,7 +18744,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             value,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             false,
                             false,
                             Post::None,
@@ -18729,6 +18755,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18747,7 +18774,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             init,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             true,
                             true,
                             Post::BlockLetTuple { locals, init },
@@ -18755,6 +18785,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18775,7 +18806,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             value,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             true,
                             true,
                             Post::BlockBreak {
@@ -18786,6 +18820,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18801,7 +18836,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             init,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             true,
                             true,
                             Post::BlockLet {
@@ -18812,6 +18850,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18831,7 +18870,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             value,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             true,
                             true,
                             Post::BlockAssign {
@@ -18844,6 +18886,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::Block(block)
                     | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -18859,7 +18902,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (
                             value,
-                            matches!(&current.kind, ExprKind::Arena(_)),
+                            matches!(
+                                &current.kind,
+                                ExprKind::Arena(_) | ExprKind::NamedArena { .. }
+                            ),
                             true,
                             true,
                             Post::BlockReturn(value),
@@ -18893,7 +18939,7 @@ impl<'a> MoveCheck<'a> {
                         };
                         (child, false, false, false, Post::None)
                     }
-                    ExprKind::Arena(block)
+                    ExprKind::Arena(block) | ExprKind::NamedArena { block, .. }
                         if block.stmts.is_empty() && block.value.is_some() =>
                     {
                         (
@@ -18904,7 +18950,7 @@ impl<'a> MoveCheck<'a> {
                             Post::None,
                         )
                     }
-                    ExprKind::Arena(block)
+                    ExprKind::Arena(block) | ExprKind::NamedArena { block, .. }
                         if block.value.is_none()
                             && matches!(
                                 block.stmts.as_slice(),
@@ -20004,6 +20050,7 @@ impl<'a> MoveCheck<'a> {
                                 match &wrapper.kind {
                                     ExprKind::Block(block)
                                     | ExprKind::Arena(block)
+                                    | ExprKind::NamedArena { block, .. }
                                     | ExprKind::TaskGroup(block)
                                     | ExprKind::Unsafe(block) => match &block.stmts[0] {
                                         Stmt::AssignIndex { index, .. }
@@ -20409,6 +20456,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::IndexField { .. } => return false,
                 ExprKind::Block(block)
                 | ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
                 | ExprKind::TaskGroup(block)
                 | ExprKind::Unsafe(block)
                 | ExprKind::Loop { body: block, .. }

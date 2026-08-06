@@ -126,9 +126,30 @@ fn clone_in_llvm_uses_the_explicit_region_and_guards_the_native_length() {
     );
     assert!(llvm.contains("call ptr @align_rt_arena_alloc("), "clone_in skipped the explicit arena:\n{llvm}");
     assert!(llvm.contains("icmp slt i64"), "clone_in did not reject a negative native length:\n{llvm}");
+    assert!(llvm.contains("icmp ugt i64"), "clone_in did not reject a target-oversized native length:\n{llvm}");
     assert!(llvm.contains("call void @align_rt_alloc_size_fail("), "clone_in omitted the allocation-size failure edge:\n{llvm}");
     assert!(!llvm.contains("call { ptr, i64 } @align_rt_str_clone("), "clone_in selected heap clone:\n{llvm}");
     assert!(!llvm.contains("call ptr @align_rt_alloc("), "clone_in called the heap allocator:\n{llvm}");
+}
+
+#[test]
+fn named_arena_statement_body_still_checks_moved_places() {
+    let src = "fn main() -> i32 {\n  mut values: array_builder<i64> := array_builder()\n  values.push(1)\n  mut built := values.build()\n  moved := built\n  arena out { built[0] = 2 }\n  return moved.len() as i32\n}\n";
+    let diags = check_diagnostics("fb-region-named-arena-moved-place", src);
+    assert!(
+        diags.contains("use of moved value 'built'"),
+        "named arena skipped MoveCheck for a statement body:\n{diags}"
+    );
+}
+
+#[test]
+fn region_builder_admits_a_zero_sized_plain_layout() {
+    let src = "Empty { }\nfn main() -> i32 {\n  arena out {\n    mut values: array_builder<Empty> := array_builder(out)\n    return 0\n  }\n}\n";
+    assert_no_errors(
+        "fb-region-zero-sized-layout",
+        src,
+        "a zero-sized RegionPlain builder layout should type-check",
+    );
 }
 
 #[test]

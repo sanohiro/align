@@ -11860,7 +11860,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 "clonein.neg",
             )
             .map_err(|e| self.err(e))?;
-        self.guard_allocation_size(negative)?;
+        let pointer_bits = self.target_data.get_pointer_byte_size(None) * 8;
+        let target_isize_max = if pointer_bits >= 64 {
+            i64::MAX as u64
+        } else {
+            (1u64 << (pointer_bits - 1)) - 1
+        };
+        let too_large = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGT,
+                len,
+                self.ctx.i64_type().const_int(target_isize_max, false),
+                "clonein.large",
+            )
+            .map_err(|e| self.err(e))?;
+        let invalid = self
+            .builder
+            .build_or(negative, too_large, "clonein.invalid")
+            .map_err(|e| self.err(e))?;
+        self.guard_allocation_size(invalid)?;
         let one = self.ctx.i64_type().const_int(1, false);
         let dst = self
             .builder

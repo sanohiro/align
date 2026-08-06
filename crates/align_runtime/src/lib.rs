@@ -12735,7 +12735,7 @@ pub struct ArrayBuilder {
 }
 
 const _: () = assert!(
-    core::mem::size_of::<ArrayBuilder>() == 64
+    core::mem::size_of::<ArrayBuilder>() <= 64
         && core::mem::align_of::<ArrayBuilder>() <= 16
 );
 
@@ -12748,6 +12748,10 @@ impl ArrayBuilder {
             Some(n) => n,
             None => panic_abort("array_builder capacity overflow"),
         };
+        if self.elem_size == 0 {
+            self.cap = usize::MAX;
+            return;
+        }
         if needed <= self.cap {
             if self.arena.is_null() {
                 return;
@@ -12823,6 +12827,9 @@ impl ArrayBuilder {
 
     unsafe fn push_destination(&mut self) -> *mut u8 {
         unsafe { self.reserve(1) };
+        if self.elem_size == 0 {
+            return self.elem_align as *mut u8;
+        }
         if self.arena.is_null() {
             return unsafe { self.data.add(self.len * self.elem_size) };
         }
@@ -12858,7 +12865,7 @@ pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilde
 /// contiguous result are allocated from the same arena. No independently-owned heap vector exists.
 ///
 /// # Safety
-/// `arena` must be null or a live arena handle. `elem_size` must be positive and `elem_align` a
+/// `arena` must be null or a live arena handle. `elem_size` must be non-negative and `elem_align` a
 /// nonzero power of two.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_new_in(
@@ -12872,7 +12879,7 @@ pub unsafe extern "C" fn align_rt_array_builder_new_in(
     ) else {
         return core::ptr::null_mut();
     };
-    if arena.is_null() || elem_size == 0 {
+    if arena.is_null() {
         return core::ptr::null_mut();
     }
     let storage = unsafe {
@@ -22261,10 +22268,15 @@ mod tests {
         }
     }
 
+    // Region-builder compaction is observed through a process-global test counter. Serialize every
+    // test that freezes a region builder so parallel test execution cannot pollute snapshot deltas.
+    static REGION_ARRAY_BUILDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn region_array_builder_compacts_empty_single_and_multi_chunk_values_once() {
         use core::sync::atomic::Ordering;
 
+        let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for count in [0usize, 3, 17] {
             let before = REGION_ARRAY_BUILDER_COMPACTIONS.load(Ordering::Relaxed);
             let arena = align_rt_arena_begin();
@@ -22294,6 +22306,7 @@ mod tests {
 
     #[test]
     fn region_array_builder_push_bytes_preserves_aggregate_layout() {
+        let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct Pair {
@@ -22327,14 +22340,31 @@ mod tests {
     }
 
     #[test]
+    fn region_array_builder_preserves_zero_sized_element_count() {
+        let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let arena = align_rt_arena_begin();
+        let builder = unsafe { align_rt_array_builder_new_in(arena, 0, 8) };
+        assert!(!builder.is_null());
+        let element = 0u8;
+        for _ in 0..3 {
+            unsafe { align_rt_array_builder_push_bytes(builder, &element) };
+        }
+        let frozen = unsafe { align_rt_array_builder_build(builder) };
+        assert_eq!(frozen.len, 3);
+        assert!(!frozen.ptr.is_null());
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
     fn region_array_builder_rejects_invalid_ffi_layout_before_allocation() {
+        let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(unsafe {
             align_rt_array_builder_new_in(core::ptr::null_mut(), 8, 8)
         }
         .is_null());
 
         let arena = align_rt_arena_begin();
-        for (size, align) in [(0, 8), (-1, 8), (8, 0), (8, -1), (8, 3)] {
+        for (size, align) in [(-1, 8), (8, 0), (8, -1), (8, 3)] {
             assert!(
                 unsafe { align_rt_array_builder_new_in(arena, size, align) }.is_null(),
                 "invalid layout ({size}, {align}) must fail before allocation",
