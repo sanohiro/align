@@ -18,10 +18,18 @@ pub use align_interface::{Hash128, InterfaceSummary};
 
 pub mod cache;
 pub mod explain;
+pub mod static_inputs;
 
 pub use cache::{
     cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
     CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
+};
+
+pub use static_inputs::{
+    compose_codegen_impl_hash, metadata_logical_path, metadata_path, resolve_inline_static_input,
+    resolve_static_file, snapshot_checked_metadata, CheckedMetadataInput, MetadataState,
+    ResolvedStaticInput, StaticConsumerKind, StaticInput, StaticInputError, StaticInputManifest,
+    STATIC_INPUT_MANIFEST_FORMAT_VERSION, STATIC_INPUT_MANIFEST_MAGIC,
 };
 
 /// Result of running the pipeline through sema.
@@ -757,6 +765,34 @@ pub fn build_codegen_key(
         pgo_mode: pgo,
         unit: unit.to_string(),
     })
+}
+
+/// Build the same S3 codegen key while folding a validated L5 static-input manifest into the
+/// producer implementation identity. A static-input edit therefore misses only the producer object;
+/// callers keep the existing codegen cache and do not create a parallel Query cache.
+#[allow(clippy::too_many_arguments)]
+pub fn build_codegen_key_with_static_inputs(
+    unit: &str,
+    impl_hash: Hash128,
+    dep_interface_hashes: &[(String, Hash128)],
+    static_inputs: &StaticInputManifest,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+    pgo: cache::PgoKey,
+) -> Result<CodegenKey, String> {
+    let static_digest = static_inputs.action_key().map_err(|error| error.to_string())?;
+    build_codegen_key(
+        unit,
+        compose_codegen_impl_hash(impl_hash, static_digest),
+        dep_interface_hashes,
+        target,
+        profile,
+        exports,
+        rt_lto,
+        pgo,
+    )
 }
 
 /// Emit one unit's object **through the codegen cache** (`docs/impl/10-cache-first-optimization.md`).

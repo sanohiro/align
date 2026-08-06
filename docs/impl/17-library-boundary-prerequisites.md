@@ -557,7 +557,8 @@ cause a file read or missing-file diagnostic.
 Only `File` entries are read before a frontend-cache lookup. `Inline` bytes come from the already
 parsed unit; they still use this tagged record for artifact/action-key canonicalization and can never
 request filesystem I/O. Canonical list order is source tag (`File = 0`, `Inline = 1`), then UTF-8
-payload bytes, then consumer kind; content hashes never decide ordering.
+payload bytes, then consumer kind, then descriptor ID as the tie-breaker for two descriptors sharing
+one source; content hashes never decide ordering.
 
 The producer action identity includes the unit source/import digest plus this list. At the shipped
 cache boundary, name resolution/frontend still runs before the list is first produced, and
@@ -4272,6 +4273,31 @@ source-to-wire bytes and rewrite spans are reconstructed from the occurrence tab
 and checked nullability are correlated with the Row contract, and PostgreSQL parameter options must
 name a declared Params field. `review_findings_are_closed_at_the_artifact_boundary` owns the six
 regressions; the existing independent byte encoder and goldens remain the canonical-byte owners.
+
+#### L5b static-input registration/manifest implementation closure matrix
+
+L5b consumes the L5a artifact model at the driver boundary. It owns only the deterministic input
+registration and cache-index substrate; parser/sema constructor recognition remains the next
+consumer that supplies resolved descriptor identities. The public driver API is still useful before
+that consumer exists: a future frontend can register a resolved `File` or decoded `Inline` record,
+derive the exact checked-metadata paths, and pass the manifest digest into the existing codegen-key
+builder without a second cache or filesystem policy.
+
+The capability intentionally keeps its formatted implementation above the ordinary 1,000-line
+hand-written threshold: path/root policy, metadata dependency identity, the canonical manifest
+codec, revalidation, and the single codegen-key consumer share one failure boundary and one owner
+suite. Splitting any of those pieces would duplicate source/metadata identity and malformed-byte
+proof while leaving no stable consumer between the producer and cache-index seams.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| descriptor/source formation | Validate non-empty descriptor IDs, `Query`/`Command` kind, tagged `File`/`Inline` identity, producer-derived content hashes, and canonical source/kind/descriptor ordering. Inline registration consumes decoded bytes only and never accepts a filesystem path; constructor identity discovery remains deferred. | `inline_does_not_resolve_a_file_and_identity_is_descriptor_bound`, `manifest_codec_is_canonical_and_fail_closed`, unsorted/duplicate decode rejection, and source inventory for the deferred constructor consumer |
+| path resolution and ownership | Resolve path-free sibling `.sql` or an explicit literal relative to the defining `.align` directory; reject absolute paths, NUL/backslash/lexical `..`, non-regular files, missing files, and canonical symlink escapes outside the project root. Return exact bytes with no newline normalization. | `resolves_sibling_and_registers_root_relative_source` plus `explicit_path_rejects_root_escape_and_symlink_escape`; the source inventory shows no ambient env/scan and the resolver maps read failures before publication |
+| text and diagnostics | Validate UTF-8 and reject the first embedded NUL before artifact generation; register valid file bytes in `SourceMap` under root-relative `/` spelling and return the byte offset for diagnostics. | `invalid_text_reports_utf8_and_first_nul`, `resolves_sibling_and_registers_root_relative_source`, and the invalid-descriptor no-partial-SourceMap assertion |
+| metadata dependency | Derive exactly one `.align-db/{sqlite|postgres}/{Hash128::of(descriptor_id.as_bytes()).to_hex()}.json` path per permitted driver; never scan the directory. Snapshot `Missing` or `Present(content_hash, format_version)` and validate each manifest entry against its descriptor/driver-derived path. | `metadata_paths_are_exact_and_checkout_root_independent`, `metadata_snapshot_and_revalidation_track_missing_present_and_change`, `metadata_parent_symlink_cannot_escape_project_root`, and the manifest path validator; directory scanning is absent by source inventory |
+| manifest bytes | Encode magic `ALIGNINP`, version, source/import resolution digest, sorted static inputs, content hashes, and sorted checked-metadata states with bounded little-endian length prefixes. Decode untrusted bytes fail-closed on bad magic/version/tag, truncation, invalid UTF-8, duplicate/order, derived metadata-path mismatch, and trailing bytes. Content hashes are producer-derived at registration and opaque in the manifest record. | test-only reference encoder plus semantic↔byte round trip; corruption matrix and bounded-length owner |
+| revalidation and action identity | Revalidate every exact `File` and metadata path before a pre-frontend hit; `Inline` never reads a file. Creation/deletion/content/format changes return a stale result. Manifest canonical digest composes with the existing codegen key through one helper, so checkout-root spelling and filesystem mtimes do not enter identity. | `file_deletion_is_a_manifest_stale_result`, `metadata_snapshot_and_revalidation_track_missing_present_and_change`, `equivalent_checkout_roots_have_identical_manifest_identity`, `codegen_identity_includes_static_inputs_without_path_or_mtime`, and the cache first-diff owner |
+| allocation/side effects | Resolver owns only bounded byte buffers and caller-provided SourceMap entries; no process-global state, runtime/native call, directory enumeration, or partial manifest publication. Errors occur before a consumer can publish an artifact. | source safety sweep, malformed-length tests, no-FFI inventory, and failure-path no-write owner |
 
 ### L6 — region plain-struct builder
 

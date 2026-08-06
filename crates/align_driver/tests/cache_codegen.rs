@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_codegen_key, build_per_unit, emit_llvm_ir, emit_object_cached, link_objects, BuildTarget,
-    CacheContext, CacheOutcome, FirstDiff, Hash128, PgoKey, Profile,
+    build_codegen_key, build_codegen_key_with_static_inputs, build_per_unit, emit_llvm_ir,
+    emit_object_cached, link_objects, BuildTarget, CacheContext, CacheOutcome, FirstDiff, Hash128,
+    PgoKey, Profile, StaticInputManifest,
 };
 use align_mir::print::program_to_string;
 use align_span::SourceMap;
@@ -645,6 +646,24 @@ fn json_scan_copy_row_codegen_key_identity_owner() {
         key.full_digest(),
         compiler_variant.full_digest(),
         "full cache actions must remain isolated by compiler build identity"
+    );
+
+    let static_key = build_codegen_key_with_static_inputs(
+        &unit.unit,
+        unit.summary.impl_hash,
+        &unit.dep_interface_hashes,
+        &StaticInputManifest::empty(Hash128 { lo: 91, hi: 92 }),
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+        PgoKey::Off,
+    )
+    .expect("build static-input codegen key");
+    assert_eq!(
+        key.first_diff(&static_key),
+        FirstDiff::MirDigest,
+        "static input identity must invalidate the producer through the existing MIR key component"
     );
 }
 
