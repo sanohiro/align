@@ -71,6 +71,34 @@ fn region_capability_cannot_be_returned() {
 }
 
 #[test]
+fn region_capability_cannot_be_stored_or_mutably_borrowed() {
+    for (name, src) in [
+        (
+            "fb-region-local-inferred",
+            "fn main() -> i32 {\n  arena out {\n    alias := out\n    return 0\n  }\n}\n",
+        ),
+        (
+            "fb-region-local-mutable",
+            "fn main() -> i32 {\n  arena out {\n    mut alias: region := out\n    return 0\n  }\n}\n",
+        ),
+    ] {
+        let diags = check_diagnostics(name, src);
+        assert!(
+            diags.contains("cannot be stored in an ordinary local"),
+            "expected region-storage rejection, got:\n{diags}"
+        );
+    }
+
+    let mutable_parameter =
+        "fn overwrite(borrow mut out: region) { out = out }\nfn main() -> i32 = 0\n";
+    let diags = check_diagnostics("fb-region-param-mutable", mutable_parameter);
+    assert!(
+        diags.contains("must be passed by value"),
+        "expected mutable-region-parameter rejection, got:\n{diags}"
+    );
+}
+
+#[test]
 fn clone_in_uses_the_region_passed_through_an_ordinary_function() {
     if !backend_available() {
         return;

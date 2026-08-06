@@ -398,6 +398,23 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
     assert_one_header_mutation("stored-parameter-mode", &base, |program| {
         program.fns[0].param_modes[0] = align_ast::ParamMode::BorrowMut;
     });
+
+    let mut mutable_region = declaration_header_program();
+    let function = &mut mutable_region.fns[0];
+    function.locals.truncate(1);
+    function.locals[0].ty = Ty::ArenaHandle;
+    function.locals[0].is_mut = true;
+    function.param_modes[0] = align_ast::ParamMode::BorrowMut;
+    function.ret = Ty::Unit;
+    function.return_borrow = ReturnBorrowSummary::None;
+    function.return_region = ReturnRegionSummary::None;
+    function.body.stmts.clear();
+    function.body.value = Some(Box::new(hir::Expr {
+        kind: hir::ExprKind::Unit,
+        ty: Ty::Unit,
+        span: function.span,
+    }));
+    assert_header_rejected("mutable-region-parameter", &mutable_region);
     assert_one_header_mutation("stored-parameter-name", &base, |program| {
         program.fns[0].locals[0].name = "bad-name".to_string();
     });
@@ -10923,6 +10940,36 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    let mut reject = program.clone();
+    let function = reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_named_region_materialization")
+        .expect("named region fixture is present");
+    function.locals.push(body_test_local(
+        1,
+        "alias",
+        Ty::ArenaHandle,
+        false,
+        false,
+    ));
+    let expression = function
+        .body
+        .value
+        .as_deref_mut()
+        .expect("named region fixture has a value");
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    block.stmts.push(hir::Stmt::Let {
+        local: 1,
+        init: native_local(0, Ty::ArenaHandle),
+    });
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "an ordinary local must not store a region capability"
+    );
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(

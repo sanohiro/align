@@ -22476,6 +22476,12 @@ impl<'a, 't> Checker<'a, 't> {
 
         let mut params = Vec::new();
         for (p, ty) in f.params.iter().zip(param_tys) {
+            if ty == Ty::ArenaHandle && p.mode != ast::ParamMode::ByValue {
+                self.diags.error(
+                    "a region capability parameter must be passed by value; it cannot be `out`, `borrow`, or `borrow mut`".to_string(),
+                    p.ty.span(),
+                );
+            }
             // An `out` parameter is a writable output buffer — only a `slice<T>` (a borrow the
             // callee writes back through). Mark its local mutable so `dst[i] = v` is allowed.
             if p.mode.is_out() && !matches!(ty, Ty::Slice(_) | Ty::Error) {
@@ -22501,7 +22507,8 @@ impl<'a, 't> Checker<'a, 't> {
             let id = self.declare(
                 &p.name.name,
                 ty,
-                p.mode.is_out() || p.mode == ast::ParamMode::BorrowMut,
+                ty != Ty::ArenaHandle
+                    && (p.mode.is_out() || p.mode == ast::ParamMode::BorrowMut),
             );
             if let Some(spelling) = self.json_scan_row_source_spelling(&p.ty) {
                 self.json_scan_local_spellings.insert(id, spelling);
@@ -22604,7 +22611,14 @@ impl<'a, 't> Checker<'a, 't> {
                     };
                     let initializer_spelling = self.json_scan_source_spelling_of_expr(&init);
                     self.json_scan_source_spelling = saved_json_scan_source_spelling;
-                    let local_ty = ann.unwrap_or(init.ty);
+                    let mut local_ty = ann.unwrap_or(init.ty);
+                    if self.resolve(local_ty) == Ty::ArenaHandle {
+                        self.diags.error(
+                            "a region capability cannot be stored in an ordinary local; pass it as a function parameter or use the binding introduced by `arena name {}` directly".to_string(),
+                            name.span,
+                        );
+                        local_ty = Ty::Error;
+                    }
                     self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     if let Some(spelling) = annotation_spelling.or(initializer_spelling) {

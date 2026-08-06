@@ -540,7 +540,7 @@ fn mode_is_valid(
                 &program.tagged_types,
             )
         }
-        align_ast::ParamMode::BorrowMut => true,
+        align_ast::ParamMode::BorrowMut => ty != Ty::ArenaHandle,
     }
 }
 
@@ -2440,6 +2440,7 @@ struct BodyValidator<'a> {
     statements: HashMap<usize, BodyFlow>,
     arms: HashMap<usize, BodyFlow>,
     binding_counts: HashMap<(usize, hir::LocalId), usize>,
+    region_bindings: HashSet<(usize, hir::LocalId)>,
     producer_exprs: HashMap<usize, ProducerFlow>,
     producer_blocks: HashMap<usize, ProducerFlow>,
 }
@@ -2474,6 +2475,7 @@ impl<'a> BodyValidator<'a> {
             statements: HashMap::new(),
             arms: HashMap::new(),
             binding_counts: HashMap::new(),
+            region_bindings: HashSet::new(),
             producer_exprs: HashMap::new(),
             producer_blocks: HashMap::new(),
         }
@@ -2617,16 +2619,27 @@ impl<'a> BodyValidator<'a> {
                 .copied()
                 .unwrap_or(0);
             if parameters.contains(&local.id) {
+                let mode = function
+                    .params
+                    .iter()
+                    .position(|id| *id == local.id)
+                    .and_then(|index| function.param_modes.get(index));
                 count == 0
+                    && (local.ty != Ty::ArenaHandle
+                        || (mode == Some(&align_ast::ParamMode::ByValue) && !local.is_mut))
             } else if self.allow_implicit_local_params {
                 // Dormant body fixtures predate the am-b4 activation contract and may model an
                 // otherwise unbound local as an implicit parameter. Production validation never
                 // enables this compatibility path.
                 count <= 1
+                    && (local.ty != Ty::ArenaHandle
+                        || self.region_bindings.contains(&(function_index, local.id)))
             } else {
                 // Every production nonparameter local is introduced exactly once by Let,
                 // LetTuple, or a match payload. Reject even an unused orphan table record.
                 count == 1
+                    && (local.ty != Ty::ArenaHandle
+                        || self.region_bindings.contains(&(function_index, local.id)))
             }
         })
     }
@@ -5217,6 +5230,9 @@ impl<'a> BodyValidator<'a> {
                 || binding.is_mut
                 || !self.record_binding(context.function, *local)
             {
+                return false;
+            }
+            if !self.region_bindings.insert((context.function, *local)) {
                 return false;
             }
         }
