@@ -31,6 +31,7 @@ pub use static_inputs::{
     ResolvedStaticInput, StaticConsumerKind, StaticInput, StaticInputError, StaticInputManifest,
     STATIC_INPUT_MANIFEST_FORMAT_VERSION, STATIC_INPUT_MANIFEST_MAGIC,
 };
+pub use align_interface::DriverRestriction;
 
 /// Result of running the pipeline through sema.
 pub struct Checked {

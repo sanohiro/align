@@ -6,7 +6,7 @@
 //! this module then resolves one exact file (or keeps decoded inline bytes), snapshots the exact
 //! checked-metadata paths, and produces a fail-closed manifest/action digest.
 
-use align_interface::{Driver, Hash128, SqlSourceIdentity};
+use align_interface::{Driver, DriverRestriction, Hash128, SqlSourceIdentity};
 use align_span::{FileId, SourceMap};
 use std::cmp::Ordering;
 use std::fs;
@@ -46,6 +46,7 @@ pub struct StaticInput {
     pub source: SqlSourceIdentity,
     pub content_hash: Hash128,
     pub consumer_kind: StaticConsumerKind,
+    pub driver_restriction: DriverRestriction,
     pub checked_metadata: Vec<CheckedMetadataInput>,
 }
 
@@ -377,6 +378,7 @@ fn make_input(
     source: SqlSourceIdentity,
     bytes: Vec<u8>,
     consumer_kind: StaticConsumerKind,
+    driver_restriction: DriverRestriction,
 ) -> Result<StaticInput, StaticInputError> {
     validate_descriptor_id(&descriptor_id)?;
     match &source {
@@ -426,6 +428,7 @@ fn make_input(
         source,
         content_hash: Hash128::of(&bytes),
         consumer_kind,
+        driver_restriction,
         checked_metadata: Vec::new(),
     })
 }
@@ -436,6 +439,7 @@ pub fn resolve_static_file(
     path_literal: Option<&str>,
     descriptor_id: impl Into<String>,
     consumer_kind: StaticConsumerKind,
+    driver_restriction: DriverRestriction,
     source_map: Option<&mut SourceMap>,
 ) -> Result<ResolvedStaticInput, StaticInputError> {
     let descriptor_id = descriptor_id.into();
@@ -463,6 +467,7 @@ pub fn resolve_static_file(
         },
         bytes.clone(),
         consumer_kind,
+        driver_restriction,
     )?;
     let text = std::str::from_utf8(&bytes).map_err(|_| StaticInputError::InvalidUtf8 {
         logical_path: logical.clone(),
@@ -480,6 +485,7 @@ pub fn resolve_inline_static_input(
     descriptor_id: impl Into<String>,
     decoded_sql: &str,
     consumer_kind: StaticConsumerKind,
+    driver_restriction: DriverRestriction,
 ) -> Result<ResolvedStaticInput, StaticInputError> {
     let descriptor_id = descriptor_id.into();
     let bytes = decoded_sql.as_bytes().to_vec();
@@ -490,6 +496,7 @@ pub fn resolve_inline_static_input(
         },
         bytes.clone(),
         consumer_kind,
+        driver_restriction,
     )?;
     Ok(ResolvedStaticInput {
         input,
@@ -521,11 +528,14 @@ pub fn snapshot_checked_metadata(
             })
         }
         Ok(_) => Err(StaticInputError::NotRegularFile(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CheckedMetadataInput {
-            driver,
-            logical_path: logical,
-            state: MetadataState::Missing,
-        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_metadata_parent_inside(&root, &path)?;
+            Ok(CheckedMetadataInput {
+                driver,
+                logical_path: logical,
+                state: MetadataState::Missing,
+            })
+        }
         Err(error) => Err(StaticInputError::Io {
             path,
             message: error.to_string(),
@@ -593,6 +603,31 @@ fn read_metadata_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, StaticInputE
     })
 }
 
+fn ensure_metadata_parent_inside(root: &Path, path: &Path) -> Result<(), StaticInputError> {
+    let mut current = path.parent();
+    while let Some(candidate) = current {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                let canonical = fs::canonicalize(candidate).map_err(|e| StaticInputError::Io {
+                    path: candidate.to_path_buf(),
+                    message: e.to_string(),
+                })?;
+                return ensure_inside(root, &canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = candidate.parent();
+            }
+            Err(error) => {
+                return Err(StaticInputError::Io {
+                    path: candidate.to_path_buf(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_metadata_entry(
     entry: &CheckedMetadataInput,
     descriptor_id: &str,
@@ -618,6 +653,7 @@ fn validate_input(input: &StaticInput) -> Result<(), StaticInputError> {
     validate_descriptor_id(&input.descriptor_id)?;
     match &input.source {
         SqlSourceIdentity::File { logical_path } => {
+            validate_text_field(logical_path, "file logical path")?;
             if logical_path.is_empty()
                 || logical_path.starts_with('/')
                 || logical_path.contains('\\')
@@ -651,9 +687,20 @@ fn validate_input(input: &StaticInput) -> Result<(), StaticInputError> {
             "too many checked metadata entries".to_string(),
         ));
     }
+    let expected_drivers = input.driver_restriction.drivers();
+    if input.checked_metadata.len() != expected_drivers.len() {
+        return Err(StaticInputError::NonCanonical(
+            "checked metadata does not cover every permitted driver".to_string(),
+        ));
+    }
     let mut previous_driver = None;
-    for entry in &input.checked_metadata {
+    for (entry, expected_driver) in input.checked_metadata.iter().zip(expected_drivers) {
         validate_text_field(&entry.logical_path, "metadata logical path")?;
+        if entry.driver != *expected_driver {
+            return Err(StaticInputError::NonCanonical(
+                "checked metadata is not in permitted-driver order".to_string(),
+            ));
+        }
         validate_metadata_entry(entry, &input.descriptor_id)?;
         if let Some(previous) = previous_driver
             && entry.driver <= previous
@@ -815,7 +862,10 @@ fn revalidate_metadata(
             Some((Hash128::of(&bytes), format_version))
         }
         Ok(_) => return Err(StaticInputError::NotRegularFile(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_metadata_parent_inside(root, &path)?;
+            None
+        }
         Err(error) => {
             return Err(StaticInputError::Io {
                 path,
@@ -873,6 +923,7 @@ fn write_input(writer: &mut Writer, input: &StaticInput) -> Result<(), StaticInp
     }
     writer.h128(input.content_hash);
     writer.u8(input.consumer_kind as u8);
+    writer.u8(input.driver_restriction as u8);
     writer.seq_len(input.checked_metadata.len())?;
     for entry in &input.checked_metadata {
         writer.u8(entry.driver as u8);
@@ -919,6 +970,17 @@ fn read_input(reader: &mut Reader<'_>) -> Result<StaticInput, StaticInputError> 
             });
         }
     };
+    let driver_restriction = match reader.u8()? {
+        0 => DriverRestriction::AnySupportedDriver,
+        1 => DriverRestriction::SQLiteOnly,
+        2 => DriverRestriction::PostgreSQLOnly,
+        tag => {
+            return Err(StaticInputError::BadTag {
+                what: "driver restriction",
+                tag,
+            });
+        }
+    };
     let checked_metadata = reader.seq(|reader| {
         let driver = match reader.u8()? {
             0 => Driver::SQLite,
@@ -955,6 +1017,7 @@ fn read_input(reader: &mut Reader<'_>) -> Result<StaticInput, StaticInputError> 
         source,
         content_hash,
         consumer_kind,
+        driver_restriction,
         checked_metadata,
     })
 }
@@ -1179,6 +1242,7 @@ mod tests {
             }
             hash(&mut bytes, input.content_hash);
             u8(&mut bytes, input.consumer_kind as u8);
+            u8(&mut bytes, input.driver_restriction as u8);
             u32(
                 &mut bytes,
                 u32::try_from(input.checked_metadata.len()).expect("reference metadata count"),
@@ -1216,6 +1280,7 @@ mod tests {
             None,
             "queries.user.query",
             StaticConsumerKind::Query,
+            DriverRestriction::AnySupportedDriver,
             Some(&mut source_map),
         )
         .expect("sibling SQL");
@@ -1244,6 +1309,7 @@ mod tests {
                 Some("../secret.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::InvalidPath(_))
@@ -1262,6 +1328,7 @@ mod tests {
                 Some("link.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::OutsideProjectRoot(_))
@@ -1273,6 +1340,7 @@ mod tests {
                 Some("/tmp/absolute.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::InvalidPath(_))
@@ -1284,6 +1352,7 @@ mod tests {
                 Some("bad\0.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::InvalidPath(_))
@@ -1295,6 +1364,7 @@ mod tests {
                 Some("bad\\name.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::InvalidPath(_))
@@ -1306,6 +1376,7 @@ mod tests {
                 Some("missing.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::MissingFile(_))
@@ -1318,6 +1389,7 @@ mod tests {
                 Some("directory.sql"),
                 "q",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::NotRegularFile(_))
@@ -1337,6 +1409,7 @@ mod tests {
                 None,
                 "q.query",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::InvalidUtf8 { .. })
@@ -1349,6 +1422,7 @@ mod tests {
                 None,
                 "q.query",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 None
             ),
             Err(StaticInputError::EmbeddedNul {
@@ -1366,6 +1440,7 @@ mod tests {
                 None,
                 "bad\0descriptor",
                 StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
                 Some(&mut source_map),
             ),
             Err(StaticInputError::InvalidDescriptorId)
@@ -1375,9 +1450,13 @@ mod tests {
 
     #[test]
     fn inline_does_not_resolve_a_file_and_identity_is_descriptor_bound() {
-        let resolved =
-            resolve_inline_static_input("q.query", "select 1", StaticConsumerKind::Query)
-                .expect("inline source");
+        let resolved = resolve_inline_static_input(
+            "q.query",
+            "select 1",
+            StaticConsumerKind::Query,
+            DriverRestriction::AnySupportedDriver,
+        )
+        .expect("inline source");
         assert_eq!(resolved.resolved_path, None);
         assert_eq!(resolved.source_map_file, None);
         assert_eq!(
@@ -1388,7 +1467,12 @@ mod tests {
         );
         assert_eq!(resolved.input.content_hash, Hash128::of(b"select 1"));
         assert!(matches!(
-            resolve_inline_static_input("q.query", "bad\0sql", StaticConsumerKind::Query),
+            resolve_inline_static_input(
+                "q.query",
+                "bad\0sql",
+                StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
+            ),
             Err(StaticInputError::EmbeddedNul { offset: 3, .. })
         ));
     }
@@ -1397,9 +1481,14 @@ mod tests {
     fn metadata_snapshot_and_revalidation_track_missing_present_and_change() {
         let root = temp_root("metadata");
         let id = "q.query";
-        let input = resolve_inline_static_input(id, "select 1", StaticConsumerKind::Query)
-            .expect("inline input")
-            .input;
+        let input = resolve_inline_static_input(
+            id,
+            "select 1",
+            StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
+        )
+        .expect("inline input")
+        .input;
         let missing = snapshot_checked_metadata(&root, id, Driver::SQLite).expect("missing state");
         assert_eq!(missing.state, MetadataState::Missing);
         let manifest = StaticInputManifest::new(
@@ -1465,16 +1554,64 @@ mod tests {
             snapshot_checked_metadata(&root, id, Driver::SQLite),
             Err(StaticInputError::OutsideProjectRoot(_))
         ));
+
+        let missing_root = temp_root("metadata-link-missing");
+        let missing_outside = temp_root("metadata-link-missing-outside");
+        create_dir_all(missing_outside.join(".align-db")).expect("outside metadata directory");
+        std::os::unix::fs::symlink(
+            missing_outside.join(".align-db"),
+            missing_root.join(".align-db"),
+        )
+        .expect("missing metadata directory symlink");
+        assert!(matches!(
+            snapshot_checked_metadata(&missing_root, id, Driver::SQLite),
+            Err(StaticInputError::OutsideProjectRoot(_))
+        ));
+        let input = resolve_inline_static_input(
+            id,
+            "select 1",
+            StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
+        )
+        .expect("missing metadata input")
+        .input;
+        let manifest = StaticInputManifest::new(
+            Hash128 { lo: 3, hi: 4 },
+            vec![StaticInput {
+                checked_metadata: vec![metadata(id, Driver::SQLite, MetadataState::Missing)],
+                ..input
+            }],
+        )
+        .expect("missing metadata manifest");
+        assert!(matches!(
+            manifest.revalidate(&missing_root),
+            Err(StaticInputError::OutsideProjectRoot(_))
+        ));
     }
 
     #[test]
     fn manifest_codec_is_canonical_and_fail_closed() {
-        let input = resolve_inline_static_input("z.command", "delete", StaticConsumerKind::Command)
-            .expect("command input")
-            .input;
-        let mut other = resolve_inline_static_input("a.query", "select", StaticConsumerKind::Query)
-            .expect("query input")
-            .input;
+        let mut input = resolve_inline_static_input(
+            "z.command",
+            "delete",
+            StaticConsumerKind::Command,
+            DriverRestriction::SQLiteOnly,
+        )
+        .expect("command input")
+        .input;
+        input.checked_metadata = vec![metadata(
+            "z.command",
+            Driver::SQLite,
+            MetadataState::Missing,
+        )];
+        let mut other = resolve_inline_static_input(
+            "a.query",
+            "select",
+            StaticConsumerKind::Query,
+            DriverRestriction::PostgreSQLOnly,
+        )
+        .expect("query input")
+        .input;
         other.checked_metadata = vec![metadata(
             "a.query",
             Driver::PostgreSQL,
@@ -1552,6 +1689,33 @@ mod tests {
             StaticInputManifest::new(Hash128 { lo: 7, hi: 8 }, vec![bad_metadata]),
             Err(StaticInputError::NonCanonical(_))
         ));
+        let mut omitted_metadata = manifest
+            .inputs
+            .iter()
+            .find(|input| !input.checked_metadata.is_empty())
+            .expect("metadata-bearing input")
+            .clone();
+        omitted_metadata.checked_metadata.clear();
+        assert!(matches!(
+            StaticInputManifest::new(Hash128 { lo: 7, hi: 8 }, vec![omitted_metadata]),
+            Err(StaticInputError::NonCanonical(_))
+        ));
+        let mut wrong_order = resolve_inline_static_input(
+            "any.query",
+            "select",
+            StaticConsumerKind::Query,
+            DriverRestriction::AnySupportedDriver,
+        )
+        .expect("any-driver input")
+        .input;
+        wrong_order.checked_metadata = vec![
+            metadata("any.query", Driver::PostgreSQL, MetadataState::Missing),
+            metadata("any.query", Driver::SQLite, MetadataState::Missing),
+        ];
+        assert!(matches!(
+            StaticInputManifest::new(Hash128 { lo: 7, hi: 8 }, vec![wrong_order]),
+            Err(StaticInputError::NonCanonical(_))
+        ));
         let mut unsorted = manifest.clone();
         unsorted.inputs.swap(0, 1);
         assert!(matches!(
@@ -1588,12 +1752,19 @@ mod tests {
             None,
             "q.query",
             StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
             None,
         )
         .expect("file input")
         .input;
-        let manifest =
-            StaticInputManifest::new(Hash128 { lo: 1, hi: 2 }, vec![input]).expect("manifest");
+        let manifest = StaticInputManifest::new(
+            Hash128 { lo: 1, hi: 2 },
+            vec![StaticInput {
+                checked_metadata: vec![metadata("q.query", Driver::SQLite, MetadataState::Missing)],
+                ..input
+            }],
+        )
+        .expect("manifest");
         std::fs::remove_file(sql).expect("delete SQL source");
         assert!(matches!(
             manifest.revalidate(&root),
@@ -1635,6 +1806,7 @@ mod tests {
             None,
             "q.query",
             StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
             None,
         )
         .expect("first checkout")
@@ -1645,14 +1817,27 @@ mod tests {
             None,
             "q.query",
             StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
             None,
         )
         .expect("second checkout")
         .input;
-        let first = StaticInputManifest::new(Hash128 { lo: 1, hi: 2 }, vec![first])
-            .expect("first manifest");
-        let second = StaticInputManifest::new(Hash128 { lo: 1, hi: 2 }, vec![second])
-            .expect("second manifest");
+        let first = StaticInputManifest::new(
+            Hash128 { lo: 1, hi: 2 },
+            vec![StaticInput {
+                checked_metadata: vec![metadata("q.query", Driver::SQLite, MetadataState::Missing)],
+                ..first
+            }],
+        )
+        .expect("first manifest");
+        let second = StaticInputManifest::new(
+            Hash128 { lo: 1, hi: 2 },
+            vec![StaticInput {
+                checked_metadata: vec![metadata("q.query", Driver::SQLite, MetadataState::Missing)],
+                ..second
+            }],
+        )
+        .expect("second manifest");
         assert_eq!(
             first.canonical_bytes().expect("first bytes"),
             second.canonical_bytes().expect("second bytes")
