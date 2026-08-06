@@ -4,33 +4,33 @@
 //! pipeline as library functions. Both the `alignc` binary (`main.rs`) and the
 //! integration tests call this.
 
+pub use align_codegen_llvm::{BuildTarget, DebugInfo, ObjectFormat, Profile, target_object_format};
 use align_diag::{Diagnostics, Severity};
-use align_span::SourceMap;
-pub use align_codegen_llvm::{
-    target_object_format, BuildTarget, DebugInfo, ObjectFormat, Profile,
-};
-/// The lowered MIR program type (re-exported so callers can name it without depending on
-/// `align_mir` directly).
-pub use align_mir::Program as MirProgram;
 /// M15 interface-summary types (re-exported so callers can name the [`check_per_unit`] result without
 /// depending on `align_interface` directly).
 pub use align_interface::{Hash128, InterfaceSummary};
+/// The lowered MIR program type (re-exported so callers can name it without depending on
+/// `align_mir` directly).
+pub use align_mir::Program as MirProgram;
+use align_span::SourceMap;
 
 pub mod cache;
 pub mod explain;
 pub mod static_inputs;
 
 pub use cache::{
-    cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
-    CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
+    BackendKey, CACHE_KEY_FORMAT_VERSION, CacheContext, CacheLookup, CacheOutcome, CacheStage,
+    CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, cas_blob_path, clear_cache,
 };
 
 pub use static_inputs::{
-    compose_codegen_impl_hash, metadata_logical_path, metadata_path, resolve_inline_static_input,
-    resolve_static_file, snapshot_checked_metadata, CheckedMetadataInput, MetadataState,
-    ResolvedStaticInput, StaticConsumerKind, StaticInput, StaticInputError, StaticInputManifest,
-    STATIC_INPUT_MANIFEST_FORMAT_VERSION, STATIC_INPUT_MANIFEST_MAGIC,
+    CheckedMetadataInput, MetadataState, ResolvedStaticInput, STATIC_INPUT_MANIFEST_FORMAT_VERSION,
+    STATIC_INPUT_MANIFEST_MAGIC, StaticConsumerKind, StaticInput, StaticInputError,
+    StaticInputManifest, compose_codegen_impl_hash, metadata_logical_path, metadata_path,
+    resolve_inline_static_input, resolve_static_file, snapshot_checked_metadata,
 };
+// Keep the driver selector types alongside the resolver so callers do not need
+// to depend on the interface crate just to construct a static input request.
 pub use align_interface::{Driver, DriverRestriction};
 
 /// Result of running the pipeline through sema.
@@ -59,7 +59,9 @@ struct LoadedUnit {
 
 // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
 fn user_import(p: &align_ast::Path) -> bool {
-    p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
+    p.segments
+        .first()
+        .is_some_and(|s| s.name != "core" && s.name != "std")
 }
 
 /// The pkg-foundation import-edge rules (F0 of `impl/15-pkg-web-plan.md`; `open-questions.md`
@@ -76,7 +78,12 @@ fn user_import(p: &align_ast::Path) -> bool {
 /// not reach back into the consuming project's own modules (which would compile in one tree and
 /// nowhere else, and inverts the dependency arrow). `core`/`std` are already allowed (filtered out
 /// before this runs), so the only rejection here is a `pkg.*` module importing a project module.
-fn check_pkg_import_edge(importer: &str, imported: &[&str], span: align_span::Span, diags: &mut Diagnostics) {
+fn check_pkg_import_edge(
+    importer: &str,
+    imported: &[&str],
+    span: align_span::Span,
+    diags: &mut Diagnostics,
+) {
     let modpath = imported.join(".");
     // D7 — the `internal` path rule (first `internal` segment governs).
     if let Some(pos) = imported.iter().position(|s| *s == "internal") {
@@ -107,7 +114,12 @@ fn check_pkg_import_edge(importer: &str, imported: &[&str], span: align_span::Sp
 /// lexer -> parser for the entry file plus its transitively-imported **user** modules, plus the
 /// cyclic-import (DAG) check. The shared front half of [`check`] and [`build_interface_summaries`];
 /// behavior-identical to the former inline loader.
-fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Diagnostics) -> Vec<LoadedUnit> {
+fn load_units(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    diags: &mut Diagnostics,
+) -> Vec<LoadedUnit> {
     let entry_dir = std::path::Path::new(name).parent().map(|p| p.to_path_buf());
 
     // The entry module's own name is its `module` decl, or `main` by default.
@@ -127,7 +139,8 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
         src: src.to_string(),
         file: name.to_string(),
     }];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::from([entry_path.clone()]);
 
     // Edges of the module import graph (`importer path` -> `(imported modpath, import span)`),
     // collected for every `import` seen below regardless of the `seen` dedup — the dedup exists
@@ -141,15 +154,23 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
     let mut i = 0;
     while i < loaded.len() {
         let cur_path = loaded[i].path.clone();
-        let imports: Vec<align_ast::Path> =
-            loaded[i].ast.imports.iter().filter(|p| user_import(p)).cloned().collect();
+        let imports: Vec<align_ast::Path> = loaded[i]
+            .ast
+            .imports
+            .iter()
+            .filter(|p| user_import(p))
+            .cloned()
+            .collect();
         i += 1;
         for imp in imports {
             // The dotted module path (`util.math`) and the matching file path under the entry
             // directory (`util/math.align`): each segment is a directory, the last names the file.
             let segs: Vec<&str> = imp.segments.iter().map(|s| s.name.as_str()).collect();
             let modpath = segs.join(".");
-            edges.entry(cur_path.clone()).or_default().push((modpath.clone(), imp.span));
+            edges
+                .entry(cur_path.clone())
+                .or_default()
+                .push((modpath.clone(), imp.span));
             // pkg-foundation import-edge rules (F0): the `internal` path rule + pkg-layering. Checked
             // per edge (before the `seen` dedup) so an illegal importer is caught even when the target
             // module was already loaded via a legal edge.
@@ -158,7 +179,10 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
                 continue; // already loaded (shared / cyclic import)
             }
             let Some(dir) = &entry_dir else {
-                diags.error(format!("cannot resolve `import {modpath}`: the entry file has no directory"), imp.span);
+                diags.error(
+                    format!("cannot resolve `import {modpath}`: the entry file has no directory"),
+                    imp.span,
+                );
                 continue;
             };
             let mut file_path = dir.clone();
@@ -169,7 +193,13 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
             let msrc = match std::fs::read_to_string(&file_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    diags.error(format!("cannot find module `{modpath}` (expected {}): {e}", file_path.display()), imp.span);
+                    diags.error(
+                        format!(
+                            "cannot find module `{modpath}` (expected {}): {e}",
+                            file_path.display()
+                        ),
+                        imp.span,
+                    );
                     continue;
                 }
             };
@@ -177,11 +207,22 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
             let toks = align_lexer::tokenize(fid, &msrc, diags);
             let mast = align_parser::parse_file(toks, diags);
             // The file must declare the full `module util.math` (path ↔ filename agreement).
-            let declared = mast.module.as_ref().map(|m| m.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."));
+            let declared = mast.module.as_ref().map(|m| {
+                m.segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
             if declared.as_deref() != Some(modpath.as_str()) {
                 diags.error(
-                    format!("module file `{}` must declare `module {modpath}` (found {})", file_path.display(),
-                        declared.map(|d| format!("`module {d}`")).unwrap_or_else(|| "no module declaration".to_string())),
+                    format!(
+                        "module file `{}` must declare `module {modpath}` (found {})",
+                        file_path.display(),
+                        declared
+                            .map(|d| format!("`module {d}`"))
+                            .unwrap_or_else(|| "no module declaration".to_string())
+                    ),
                     imp.span,
                 );
             }
@@ -211,7 +252,12 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let loaded = load_units(source_map, name, src, &mut diags);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
-        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
+        .map(|l| align_sema::Module {
+            path: l.path.clone(),
+            file: &l.ast,
+            is_entry: l.is_entry,
+            interface_only: false,
+        })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
 
@@ -232,15 +278,22 @@ pub fn build_interface_summaries(
     let loaded = load_units(source_map, name, src, &mut diags);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
-        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
+        .map(|l| align_sema::Module {
+            path: l.path.clone(),
+            file: &l.ast,
+            is_entry: l.is_entry,
+            interface_only: false,
+        })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
     if diags.has_errors() {
         return (Vec::new(), diags);
     }
     let mir = lower_to_mir(&hir);
-    let sources: std::collections::HashMap<String, String> =
-        loaded.iter().map(|l| (l.path.clone(), l.src.clone())).collect();
+    let sources: std::collections::HashMap<String, String> = loaded
+        .iter()
+        .map(|l| (l.path.clone(), l.src.clone()))
+        .collect();
     let summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
     (summaries, diags)
 }
@@ -286,7 +339,13 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 .imports
                 .iter()
                 .filter(|p| user_import(p))
-                .map(|p| p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."))
+                .map(|p| {
+                    p.segments
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
                 .filter(|d| by_path.contains_key(d.as_str()))
                 .collect();
             (l.path.clone(), deps)
@@ -319,7 +378,11 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     // Bottom-up (dependency-first) order: DFS post-order from the entry unit. All loaded units are
     // reachable from the entry (they were loaded by following its imports). A `visited` guard makes
     // this terminate even if S0's cycle check already flagged a cycle (a best-effort order then).
-    let entry = loaded.iter().find(|l| l.is_entry).map(|l| l.path.clone()).unwrap_or_default();
+    let entry = loaded
+        .iter()
+        .find(|l| l.is_entry)
+        .map(|l| l.path.clone())
+        .unwrap_or_default();
     let mut order: Vec<String> = Vec::new();
     {
         let mut visited = std::collections::HashSet::new();
@@ -351,8 +414,10 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
     // Per-unit compilation artifacts, keyed by unit path: (summary, per-unit MIR, is_entry). Populated
     // only for cleanly-checked units; assembled bottom-up into `PerUnitArtifact`s at the end.
-    let mut mirs: HashMap<String, (align_interface::InterfaceSummary, MirProgram, bool)> = HashMap::new();
-    let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
+    let mut mirs: HashMap<String, (align_interface::InterfaceSummary, MirProgram, bool)> =
+        HashMap::new();
+    let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> =
+        Vec::new();
     // Cache of each dependency's synthesized interface AST, keyed by module path. Rendered and
     // parsed exactly once per dependency (not once per importer): `summary_to_source` is called
     // with the DEP'S OWN transitive closure, never the importer's, so the rendered source (and
@@ -362,7 +427,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let mut interface_ast_cache: HashMap<String, align_ast::File> = HashMap::new();
 
     for unit_path in &order {
-        let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
+        let Some(u) = by_path.get(unit_path.as_str()).copied() else {
+            continue;
+        };
         let tdeps = transitive(unit_path, &direct_deps);
 
         // The S3 cache key input: this unit's transitive dependency interface hashes.
@@ -380,7 +447,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         let mut external_resources = align_sema::ExternalResourceFacts::new();
         let mut external_resource_hooks = align_sema::ExternalResourceHookFacts::new();
         for d in &tdeps {
-            let Some(dep_summary) = summaries.get(d) else { continue };
+            let Some(dep_summary) = summaries.get(d) else {
+                continue;
+            };
             if !interface_ast_cache.contains_key(d) {
                 // Render using `d`'s OWN transitive closure (never the importer's `tdeps`): that
                 // is what makes the rendered source, and therefore the parsed AST, independent of
@@ -390,8 +459,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 let source = match align_interface::summary_to_source(dep_summary, &d_tdep_refs) {
                     Ok(source) => source,
                     Err(error) => {
-                        let fid =
-                            source_map.add_file(format!("<interface:{d}>"), String::new());
+                        let fid = source_map.add_file(format!("<interface:{d}>"), String::new());
                         diags.error(
                             format!("cannot import interface `{d}`: {error}"),
                             align_span::Span::new(fid, 0, 0),
@@ -498,7 +566,10 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     // the FULL per-order list (an entry for every unit, clean or not) — that is the S1b dev-verb
     // contract `check_per_unit` returns unchanged; each clean unit's artifact carries its own copy.
     let dep_hashes_by_unit: HashMap<&str, &Vec<(String, align_interface::Hash128)>> =
-        dep_interface_hashes.iter().map(|(u, h)| (u.as_str(), h)).collect();
+        dep_interface_hashes
+            .iter()
+            .map(|(u, h)| (u.as_str(), h))
+            .collect();
     let units: Vec<PerUnitArtifact> = order
         .iter()
         .filter_map(|p| {
@@ -518,7 +589,11 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         .collect();
 
     let _ = summaries; // superseded by `units[*].summary`; retained above only for the walk's seeding.
-    PerUnitWalk { units, dep_interface_hashes, diags }
+    PerUnitWalk {
+        units,
+        dep_interface_hashes,
+        diags,
+    }
 }
 
 /// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
@@ -570,7 +645,11 @@ pub fn build_per_unit_located(source_map: &mut SourceMap, name: &str, src: &str)
 pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitCheck {
     let walk = walk_per_unit(source_map, name, src, false);
     let summaries = walk.units.into_iter().map(|u| u.summary).collect();
-    PerUnitCheck { summaries, dep_interface_hashes: walk.dep_interface_hashes, diags: walk.diags }
+    PerUnitCheck {
+        summaries,
+        dep_interface_hashes: walk.dep_interface_hashes,
+        diags: walk.diags,
+    }
 }
 
 /// Reject a cyclic module import graph (`check`'s `edges` map: importer path -> `(imported
@@ -660,14 +739,20 @@ pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
 /// M15 S2b per-unit lowering **with source locations** — [`lower_to_mir_per_unit`] plus populated
 /// `Block::stmt_lines` (`align_mir::lower_program_per_unit_located`). Used by `explain-opt`, which
 /// compiles each unit in isolation and needs the debug locations for LLVM's per-unit remarks.
-pub fn lower_to_mir_per_unit_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
+pub fn lower_to_mir_per_unit_located(
+    hir: &align_sema::Program,
+    source_map: &SourceMap,
+) -> align_mir::Program {
     align_mir::lower_program_per_unit_located(hir, source_map)
 }
 
 /// Lower to MIR with source locations (each statement records the line/col it came from), for
 /// `explain-opt` / debug-info emission. Identical to [`lower_to_mir`] but with populated
 /// `stmt_lines`.
-pub fn lower_to_mir_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
+pub fn lower_to_mir_located(
+    hir: &align_sema::Program,
+    source_map: &SourceMap,
+) -> align_mir::Program {
     align_mir::lower_program_located(hir, source_map)
 }
 
@@ -711,8 +796,16 @@ pub fn rt_lto_bitcode() -> &'static [u8] {
     RT_LTO_BITCODE
 }
 
-pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
+pub fn emit_object_file(
+    mir: &align_mir::Program,
+    obj: &std::path::Path,
+    target: BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+) -> Result<(), String> {
+    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto))
+        .map_err(|e| e.to_string())
 }
 
 /// Build the S3 codegen cache key (`docs/impl/10-cache-first-optimization.md` §6.2) for one unit. The
@@ -783,7 +876,9 @@ pub fn build_codegen_key_with_static_inputs(
     rt_lto: bool,
     pgo: cache::PgoKey,
 ) -> Result<CodegenKey, String> {
-    let static_digest = static_inputs.action_key().map_err(|error| error.to_string())?;
+    let static_digest = static_inputs
+        .action_key()
+        .map_err(|error| error.to_string())?;
     build_codegen_key(
         unit,
         compose_codegen_impl_hash(impl_hash, static_digest),
@@ -830,8 +925,19 @@ pub fn emit_object_cached(
     }
     // The `emit-obj` verb has no `--pgo-*` surface (PGO is `build`/`run`/`size` only), so this path is
     // always `PgoKey::Off` — a non-PGO object, keyed disjoint from any instrumented/use object.
-    let key = build_codegen_key(unit, impl_hash, dep_interface_hashes, &target, profile, exports, rt_lto, cache::PgoKey::Off)?;
-    cache.codegen(&key, obj, |out| emit_object_file(mir, out, target.clone(), profile, exports, rt_lto))
+    let key = build_codegen_key(
+        unit,
+        impl_hash,
+        dep_interface_hashes,
+        &target,
+        profile,
+        exports,
+        rt_lto,
+        cache::PgoKey::Off,
+    )?;
+    cache.codegen(&key, obj, |out| {
+        emit_object_file(mir, out, target.clone(), profile, exports, rt_lto)
+    })
 }
 
 /// The aggregated result of [`codegen_units_parallel`]: the per-unit cache outcomes (DAG-ordered) plus,
@@ -913,7 +1019,10 @@ pub fn codegen_units_parallel(
         PgoMode::Instrument => (cache::PgoKey::Instrument, PgoMode::Instrument),
         PgoMode::Use(p) => {
             let bytes = std::fs::read(p).map_err(|e| {
-                format!("--pgo-use: cannot read profile data file '{}': {e}", p.display())
+                format!(
+                    "--pgo-use: cannot read profile data file '{}': {e}",
+                    p.display()
+                )
             })?;
             let digest = Hash128::of(&bytes);
             let staged = StagedProfdata::new(&bytes)?;
@@ -934,17 +1043,36 @@ pub fn codegen_units_parallel(
     let mut misses: Vec<usize> = Vec::new();
     for (i, unit) in units.iter().enumerate() {
         if enabled {
-            let key = build_codegen_key(&unit.unit, unit.summary.impl_hash, &unit.dep_interface_hashes, target, profile, &[], rt_lto, pgo_key)?;
+            let key = build_codegen_key(
+                &unit.unit,
+                unit.summary.impl_hash,
+                &unit.dep_interface_hashes,
+                target,
+                profile,
+                &[],
+                rt_lto,
+                pgo_key,
+            )?;
             match cache.lookup(&key, &obj_paths[i]) {
                 cache::CacheLookup::Hit(o) => outcomes[i] = Some(o),
                 cache::CacheLookup::Miss { reason } => {
-                    outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: reason });
+                    outcomes[i] = Some(CacheOutcome {
+                        stage: CacheStage::Codegen,
+                        unit: unit.unit.clone(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
                     misses.push(i);
                 }
             }
             keys[i] = Some(key);
         } else {
-            outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: None });
+            outcomes[i] = Some(CacheOutcome {
+                stage: CacheStage::Codegen,
+                unit: unit.unit.clone(),
+                hit: false,
+                miss_reason: None,
+            });
             misses.push(i);
         }
     }
@@ -971,39 +1099,48 @@ pub fn codegen_units_parallel(
         let results = std::sync::Mutex::new(Vec::<(usize, UnitPgoRun)>::new());
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
-                scope.spawn(|| loop {
-                    // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
-                    // between units — an in-progress emit is never interrupted. Codegen errors are rare
-                    // (sema already validated in the walk), so this mainly bounds the wasted work when a
-                    // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
-                    // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
-                    // hint that publishes no data (errors ride the Mutex, and the final read
-                    // happens-after the scope join).
-                    if failed.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    if k >= misses.len() {
-                        break;
-                    }
-                    let i = misses[k];
-                    let unit = &units[i];
-                    // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
-                    // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
-                    // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
-                    // staleness warnings + profile-match tally ride the return.
-                    match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
-                        Err(e) => {
-                            errors.lock().expect("codegen error lock").push((i, e));
-                            failed.store(true, Ordering::Relaxed);
-                            continue;
+                scope.spawn(|| {
+                    loop {
+                        // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
+                        // between units — an in-progress emit is never interrupted. Codegen errors are rare
+                        // (sema already validated in the walk), so this mainly bounds the wasted work when a
+                        // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
+                        // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
+                        // hint that publishes no data (errors ride the Mutex, and the final read
+                        // happens-after the scope join).
+                        if failed.load(Ordering::Relaxed) {
+                            break;
                         }
-                        Ok(run) => {
-                            results.lock().expect("pgo result lock").push((i, run));
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= misses.len() {
+                            break;
                         }
-                    }
-                    if let Some(key) = &keys[i] {
-                        cache.publish_after_miss(key, &obj_paths[i]);
+                        let i = misses[k];
+                        let unit = &units[i];
+                        // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
+                        // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
+                        // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
+                        // staleness warnings + profile-match tally ride the return.
+                        match emit_unit_object(
+                            &unit.mir,
+                            &obj_paths[i],
+                            target,
+                            profile,
+                            rt_lto,
+                            &effective_pgo,
+                        ) {
+                            Err(e) => {
+                                errors.lock().expect("codegen error lock").push((i, e));
+                                failed.store(true, Ordering::Relaxed);
+                                continue;
+                            }
+                            Ok(run) => {
+                                results.lock().expect("pgo result lock").push((i, run));
+                            }
+                        }
+                        if let Some(key) = &keys[i] {
+                            cache.publish_after_miss(key, &obj_paths[i]);
+                        }
                     }
                 });
             }
@@ -1045,7 +1182,10 @@ pub fn codegen_units_parallel(
     drop(staged_profdata);
 
     Ok(UnitCodegen {
-        outcomes: outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect(),
+        outcomes: outcomes
+            .into_iter()
+            .map(|o| o.expect("every unit gets an outcome in phase 1"))
+            .collect(),
         pgo_warnings,
         pgo_matched,
         pgo_total,
@@ -1078,16 +1218,30 @@ fn emit_unit_object(
     let action = match pgo {
         PgoMode::Off => {
             emit_object_file(mir, obj, target.clone(), profile, &[], rt_lto)?;
-            return Ok(UnitPgoRun { warnings: Vec::new(), matched_fns: 0, total_fns: 0 });
+            return Ok(UnitPgoRun {
+                warnings: Vec::new(),
+                matched_fns: 0,
+                total_fns: 0,
+            });
         }
         PgoMode::Instrument => align_codegen_llvm::pgo::PgoAction::Instrument,
         PgoMode::Use(p) => align_codegen_llvm::pgo::PgoAction::Use(p.as_path()),
     };
     let report = align_codegen_llvm::emit_object_pgo(
-        mir, obj, target, profile, &[], rt_lto_bytes(rt_lto), action,
+        mir,
+        obj,
+        target,
+        profile,
+        &[],
+        rt_lto_bytes(rt_lto),
+        action,
     )
     .map_err(|e| e.to_string())?;
-    Ok(UnitPgoRun { warnings: report.warnings, matched_fns: report.matched_fns, total_fns: report.total_fns })
+    Ok(UnitPgoRun {
+        warnings: report.warnings,
+        matched_fns: report.matched_fns,
+        total_fns: report.total_fns,
+    })
 }
 
 // ---- instrument-PGO surface (`--pgo-instrument` / `--pgo-use`) ----------------
@@ -1116,16 +1270,24 @@ impl StagedProfdata {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let dir = base.join(format!(".align-pgo-profdata-{}-{stamp}-{nonce}", std::process::id()));
+            let dir = base.join(format!(
+                ".align-pgo-profdata-{}-{stamp}-{nonce}",
+                std::process::id()
+            ));
             match std::fs::create_dir(&dir) {
                 Ok(()) => {
                     let file = dir.join("staged.profdata");
-                    std::fs::write(&file, bytes)
-                        .map_err(|e| format!("--pgo-use: cannot stage profile data snapshot: {e}"))?;
+                    std::fs::write(&file, bytes).map_err(|e| {
+                        format!("--pgo-use: cannot stage profile data snapshot: {e}")
+                    })?;
                     return Ok(StagedProfdata { dir, file });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("--pgo-use: cannot create profile snapshot dir: {e}")),
+                Err(e) => {
+                    return Err(format!(
+                        "--pgo-use: cannot create profile snapshot dir: {e}"
+                    ));
+                }
             }
         }
         Err("--pgo-use: could not create a unique profile snapshot directory".to_string())
@@ -1176,19 +1338,35 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     const MAGIC: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
     const MAGIC_SWAPPED: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
     if !path.exists() {
-        return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
+        return Err(format!(
+            "--pgo-use: profile data file '{}' does not exist",
+            path.display()
+        ));
     }
     if !path.is_file() {
-        return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
+        return Err(format!(
+            "--pgo-use: profile data path '{}' is not a regular file",
+            path.display()
+        ));
     }
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
+    let mut f = std::fs::File::open(path).map_err(|e| {
+        format!(
+            "--pgo-use: cannot read profile data file '{}': {e}",
+            path.display()
+        )
+    })?;
     let mut head = [0u8; 8];
-    let n = f
-        .read(&mut head)
-        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
+    let n = f.read(&mut head).map_err(|e| {
+        format!(
+            "--pgo-use: cannot read profile data file '{}': {e}",
+            path.display()
+        )
+    })?;
     if n == 0 {
-        return Err(format!("--pgo-use: profile data file '{}' is empty", path.display()));
+        return Err(format!(
+            "--pgo-use: profile data file '{}' is empty",
+            path.display()
+        ));
     }
     if n < 8 || (head != MAGIC && head != MAGIC_SWAPPED) {
         return Err(format!(
@@ -1220,8 +1398,14 @@ pub fn profile_runtime_archive(target: &BuildTarget) -> Result<std::path::PathBu
     let format = target_object_format()?;
     // Flat-layout name first, per-target-runtime name (`libclang_rt.profile.a`) second.
     let candidates: Vec<String> = match format {
-        ObjectFormat::MachO => vec!["libclang_rt.profile_osx.a".to_string(), "libclang_rt.profile.a".to_string()],
-        ObjectFormat::Elf => vec![format!("libclang_rt.profile-{arch}.a"), "libclang_rt.profile.a".to_string()],
+        ObjectFormat::MachO => vec![
+            "libclang_rt.profile_osx.a".to_string(),
+            "libclang_rt.profile.a".to_string(),
+        ],
+        ObjectFormat::Elf => vec![
+            format!("libclang_rt.profile-{arch}.a"),
+            "libclang_rt.profile.a".to_string(),
+        ],
     };
     let clang = llvm_tool("clang").ok_or_else(|| {
         "--pgo-instrument: clang (clang-22) not found on PATH — needed to locate the profile \
@@ -1233,7 +1417,8 @@ pub fn profile_runtime_archive(target: &BuildTarget) -> Result<std::path::PathBu
             .arg(format!("-print-file-name={name}"))
             .output()
             .map_err(|e| format!("--pgo-instrument: cannot launch {}: {e}", clang.display()))?;
-        let resolved = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        let resolved =
+            std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
         // A resolved absolute path that exists is a hit; the bare-name echo (relative, or the name
         // itself) means this candidate is not present — try the next.
         if resolved.is_absolute() && resolved.exists() {
@@ -1262,7 +1447,11 @@ fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, Str
         ObjectFormat::Elf => 0u8,
         ObjectFormat::MachO => 1u8,
     };
-    Ok(ThinTargetIdentity { rt, object_format, llvm_version: align_codegen_llvm::llvm_version() })
+    Ok(ThinTargetIdentity {
+        rt,
+        object_format,
+        llvm_version: align_codegen_llvm::llvm_version(),
+    })
 }
 
 /// Build the phase-1 **prelink** cache key: today's codegen key minus the pure backend/target knobs
@@ -1404,24 +1593,29 @@ pub fn build_thin_lto(
     jobs: usize,
 ) -> Result<ThinLtoBuild, String> {
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
-    assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
+    assert!(
+        units.len() >= 2,
+        "N=1 must skip ThinLTO entirely (caller's responsibility)"
+    );
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
 
     let enabled = cache.is_enabled();
-    let identity = if enabled { Some(resolve_thin_identity(target)?) } else { None };
+    let identity = if enabled {
+        Some(resolve_thin_identity(target)?)
+    } else {
+        None
+    };
     let n = units.len();
     let ids: Vec<String> = units.iter().map(|u| u.unit.clone()).collect();
-    let unit_index: std::collections::HashMap<&str, usize> =
-        ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-    let bc_paths: Vec<std::path::PathBuf> =
-        (0..n).map(|i| staging.join(format!("unit{i}.prelink.bc"))).collect();
-    let unit_exports = |i: usize| -> &[String] {
-        if units[i].is_entry {
-            exports
-        } else {
-            &[]
-        }
-    };
+    let unit_index: std::collections::HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let bc_paths: Vec<std::path::PathBuf> = (0..n)
+        .map(|i| staging.join(format!("unit{i}.prelink.bc")))
+        .collect();
+    let unit_exports = |i: usize| -> &[String] { if units[i].is_entry { exports } else { &[] } };
 
     // ---- Phase 1: prelink (parallel over misses) --------------------------------------------------
     let mut prelink_keys: Vec<Option<cache::PrelinkKey>> = (0..n).map(|_| None).collect();
@@ -1483,8 +1677,12 @@ pub fn build_thin_lto(
     // feeds each importer's backend key.
     let mut prelink_digests: Vec<Hash128> = Vec::with_capacity(n);
     for path in &bc_paths {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("ThinLTO: cannot read prelink bitcode {}: {e}", path.display()))?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            format!(
+                "ThinLTO: cannot read prelink bitcode {}: {e}",
+                path.display()
+            )
+        })?;
         prelink_digests.push(Hash128::of(&bytes));
     }
 
@@ -1501,8 +1699,15 @@ pub fn build_thin_lto(
         .map_err(|e| format!("ThinLTO thin-link failed: {e}"))?;
 
     // Per-unit slices of the thin-link decision set (kept for both the backend key and the shim call).
-    let inbound: Vec<Vec<align_codegen_llvm::thinlto::ImportEdge>> =
-        (0..n).map(|i| plan.imports.iter().filter(|e| e.dest == ids[i]).cloned().collect()).collect();
+    let inbound: Vec<Vec<align_codegen_llvm::thinlto::ImportEdge>> = (0..n)
+        .map(|i| {
+            plan.imports
+                .iter()
+                .filter(|e| e.dest == ids[i])
+                .cloned()
+                .collect()
+        })
+        .collect();
 
     // ---- Phase 3: backend (parallel over misses) --------------------------------------------------
     let mut backend_keys: Vec<Option<cache::BackendKey>> = (0..n).map(|_| None).collect();
@@ -1510,16 +1715,26 @@ pub fn build_thin_lto(
     let mut backend_misses: Vec<usize> = Vec::new();
     for i in 0..n {
         if let Some(id) = &identity {
-            let inbound_key: Vec<cache::InboundImport> =
-                inbound[i].iter().map(|e| (e.src.clone(), e.guid, e.is_definition)).collect();
-            let outbound: Vec<u64> =
-                plan.exports.iter().filter(|e| e.module == ids[i]).map(|e| e.guid).collect();
+            let inbound_key: Vec<cache::InboundImport> = inbound[i]
+                .iter()
+                .map(|e| (e.src.clone(), e.guid, e.is_definition))
+                .collect();
+            let outbound: Vec<u64> = plan
+                .exports
+                .iter()
+                .filter(|e| e.module == ids[i])
+                .map(|e| e.guid)
+                .collect();
             let src_digests: Vec<(String, Hash128)> = {
                 let mut srcs: Vec<&str> = inbound[i].iter().map(|e| e.src.as_str()).collect();
                 srcs.sort_unstable();
                 srcs.dedup();
                 srcs.iter()
-                    .filter_map(|s| unit_index.get(s).map(|&j| ((*s).to_string(), prelink_digests[j])))
+                    .filter_map(|s| {
+                        unit_index
+                            .get(s)
+                            .map(|&j| ((*s).to_string(), prelink_digests[j]))
+                    })
                     .collect()
             };
             let key = build_backend_key(
@@ -1575,9 +1790,20 @@ pub fn build_thin_lto(
     })?;
 
     let mut outcomes: Vec<CacheOutcome> = Vec::with_capacity(2 * n);
-    outcomes.extend(prelink_outcomes.into_iter().map(|o| o.expect("prelink outcome per unit")));
-    outcomes.extend(backend_outcomes.into_iter().map(|o| o.expect("backend outcome per unit")));
-    Ok(ThinLtoBuild { outcomes, prelink_bc: bc_paths })
+    outcomes.extend(
+        prelink_outcomes
+            .into_iter()
+            .map(|o| o.expect("prelink outcome per unit")),
+    );
+    outcomes.extend(
+        backend_outcomes
+            .into_iter()
+            .map(|o| o.expect("backend outcome per unit")),
+    );
+    Ok(ThinLtoBuild {
+        outcomes,
+        prelink_bc: bc_paths,
+    })
 }
 
 /// Run a ThinLTO phase's MISSES in parallel via the shared atomic-claim pattern (mirrors
@@ -1598,18 +1824,20 @@ where
     let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
-            scope.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let k = next.fetch_add(1, Ordering::Relaxed);
-                if k >= misses.len() {
-                    break;
-                }
-                let i = misses[k];
-                if let Err(e) = produce(i) {
-                    errors.lock().expect("thin phase error lock").push((i, e));
-                    failed.store(true, Ordering::Relaxed);
+            scope.spawn(|| {
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= misses.len() {
+                        break;
+                    }
+                    let i = misses[k];
+                    if let Err(e) = produce(i) {
+                        errors.lock().expect("thin phase error lock").push((i, e));
+                        failed.store(true, Ordering::Relaxed);
+                    }
                 }
             });
         }
@@ -1626,8 +1854,15 @@ where
 /// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
 /// export-roots list as [`emit_object_file`].
-pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool, exports: &[String], rt_lto: bool) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
+pub fn emit_llvm_ir(
+    mir: &align_mir::Program,
+    target: BuildTarget,
+    optimized: bool,
+    exports: &[String],
+    rt_lto: bool,
+) -> Result<String, String> {
+    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports, rt_lto_bytes(rt_lto))
+        .map_err(|e| e.to_string())
 }
 
 /// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).
@@ -1648,7 +1883,12 @@ pub fn unknown_exports<'a>(mir: &align_mir::Program, exports: &'a [String]) -> V
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too. Being a
 /// Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m` on ELF; on Mach-O
 /// they are libSystem re-exports — see [`support_libs`]).
-pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+pub fn link_executable(
+    obj: &std::path::Path,
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+) -> Result<(), String> {
     link_objects(&[obj], exe, link_libs, profile)
 }
 
@@ -1656,7 +1896,12 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
-pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+pub fn link_objects(
+    objs: &[&std::path::Path],
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+) -> Result<(), String> {
     link_objects_inner(objs, exe, link_libs, profile, None)
 }
 
@@ -1677,7 +1922,13 @@ pub fn link_objects_instrumented(
     link_objects_inner(objs, exe, link_libs, profile, Some(profile_rt))
 }
 
-fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
+fn link_objects_inner(
+    objs: &[&std::path::Path],
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+    profile_rt: Option<&std::path::Path>,
+) -> Result<(), String> {
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
     let mut cmd = std::process::Command::new("cc");
@@ -1738,9 +1989,7 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     for lib in link_libs {
         cmd.arg(format!("-l{lib}"));
     }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("cannot launch cc: {e}"))?;
+    let status = cmd.status().map_err(|e| format!("cannot launch cc: {e}"))?;
     if !status.success() {
         return Err(link_failure_message(status.code(), link_libs));
     }
@@ -1755,7 +2004,10 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
             .status()
             .map_err(|e| format!("cannot launch strip: {e}"))?;
         if !strip_status.success() {
-            return Err(format!("strip failed (exit code {:?})", strip_status.code()));
+            return Err(format!(
+                "strip failed (exit code {:?})",
+                strip_status.code()
+            ));
         }
     }
     Ok(())
@@ -1856,7 +2108,10 @@ fn runtime_archive() -> Result<std::path::PathBuf, String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "executable has no parent directory".to_string())?;
-    for cand in [dir.join("libalign_runtime.a"), dir.join("../libalign_runtime.a")] {
+    for cand in [
+        dir.join("libalign_runtime.a"),
+        dir.join("../libalign_runtime.a"),
+    ] {
         if cand.exists() {
             ensure_archive_fresh(&cand)?;
             return Ok(cand);
@@ -1894,7 +2149,11 @@ pub fn runtime_src_digest(dir: &std::path::Path) -> Option<String> {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs") {
-                let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 files.push((rel, path));
             }
         }
@@ -1908,7 +2167,10 @@ pub fn runtime_src_digest(dir: &std::path::Path) -> Option<String> {
         buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         buf.extend_from_slice(&bytes);
     }
-    Some(format!("{:016x}", align_hash::wyhash(&buf, RUNTIME_SRC_DIGEST_SEED)))
+    Some(format!(
+        "{:016x}",
+        align_hash::wyhash(&buf, RUNTIME_SRC_DIGEST_SEED)
+    ))
 }
 
 /// The content digest of the runtime archive bytes (`docs/impl/10-cache-first-optimization.md` §6.3):
@@ -1917,7 +2179,8 @@ pub fn runtime_src_digest(dir: &std::path::Path) -> Option<String> {
 /// exists. A `touch` of the archive leaves this unchanged (content-addressed); rebuilt bytes change it.
 pub fn runtime_archive_digest() -> Result<Hash128, String> {
     let archive = runtime_archive()?;
-    let bytes = std::fs::read(&archive).map_err(|e| format!("cannot read {}: {e}", archive.display()))?;
+    let bytes =
+        std::fs::read(&archive).map_err(|e| format!("cannot read {}: {e}", archive.display()))?;
     Ok(Hash128::of(&bytes))
 }
 
@@ -1989,56 +2252,94 @@ mod tests {
     #[test]
     fn staged_profdata_is_a_distinct_copy_of_the_exact_bytes_and_self_cleans() {
         let bytes = b"MERGED-PROFDATA-BYTES-v1".to_vec();
-        let user_path = std::env::temp_dir().join(format!("align-pgo-user-{}.profdata", std::process::id()));
+        let user_path =
+            std::env::temp_dir().join(format!("align-pgo-user-{}.profdata", std::process::id()));
         std::fs::write(&user_path, &bytes).unwrap();
 
         let staged_file;
         {
             let staged = StagedProfdata::new(&bytes).expect("stage");
             // Distinct from the user path — a rewrite of `user_path` can never reach libLLVM.
-            assert_ne!(staged.path(), user_path.as_path(), "staged copy must not be the user path");
+            assert_ne!(
+                staged.path(),
+                user_path.as_path(),
+                "staged copy must not be the user path"
+            );
             // Byte-identical to the digested input — the exact bytes `PgoKey::Use(digest)` keys.
-            assert_eq!(std::fs::read(staged.path()).unwrap(), bytes, "staged bytes must equal the digested bytes");
-            assert_eq!(Hash128::of(&std::fs::read(staged.path()).unwrap()), Hash128::of(&bytes));
+            assert_eq!(
+                std::fs::read(staged.path()).unwrap(),
+                bytes,
+                "staged bytes must equal the digested bytes"
+            );
+            assert_eq!(
+                Hash128::of(&std::fs::read(staged.path()).unwrap()),
+                Hash128::of(&bytes)
+            );
             staged_file = staged.path().to_path_buf();
             assert!(staged_file.exists());
         }
         // RAII: dropped snapshot leaves nothing behind.
-        assert!(!staged_file.exists(), "the staged snapshot is removed on drop");
+        assert!(
+            !staged_file.exists(),
+            "the staged snapshot is removed on drop"
+        );
 
         // Two snapshots of the same bytes get distinct private paths (per-invocation uniqueness).
         let a = StagedProfdata::new(&bytes).expect("stage a");
         let b = StagedProfdata::new(&bytes).expect("stage b");
-        assert_ne!(a.path(), b.path(), "each invocation stages to a unique path");
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "each invocation stages to a unique path"
+        );
 
         let _ = std::fs::remove_file(&user_path);
     }
 
     #[test]
     fn runtime_src_digest_is_content_based_and_mtime_independent() {
-        let root = std::env::temp_dir().join(format!("align-driver-srcdigest-{}-{:p}", std::process::id(), &0u8 as *const _));
+        let root = std::env::temp_dir().join(format!(
+            "align-driver-srcdigest-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
         let sub = root.join("nested");
         std::fs::create_dir_all(&sub).expect("create temp tree");
 
         // Empty (no `.rs`) → a digest of the empty buffer (Some, deterministic). A non-`.rs` is ignored.
         std::fs::write(root.join("notes.txt"), b"x").unwrap();
         let empty = runtime_src_digest(&root);
-        assert!(empty.is_some(), ".txt is not counted; the empty-`.rs` tree still digests");
+        assert!(
+            empty.is_some(),
+            ".txt is not counted; the empty-`.rs` tree still digests"
+        );
 
         // Add `.rs` at two levels → a specific content digest.
         std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
         std::fs::write(sub.join("b.rs"), b"fn b() {}").unwrap();
         let d1 = runtime_src_digest(&root).expect("digest");
-        assert_ne!(Some(&d1), empty.as_ref(), "adding source changes the digest");
+        assert_ne!(
+            Some(&d1),
+            empty.as_ref(),
+            "adding source changes the digest"
+        );
 
         // A pure `touch` (rewrite identical bytes, new mtime) leaves the digest UNCHANGED — the
         // papercut fix: content, not mtime, drives staleness.
         std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
-        assert_eq!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "identical content → identical digest (mtime-independent)");
+        assert_eq!(
+            runtime_src_digest(&root).as_deref(),
+            Some(d1.as_str()),
+            "identical content → identical digest (mtime-independent)"
+        );
 
         // A content CHANGE flips the digest (keeps the teeth).
         std::fs::write(root.join("a.rs"), b"fn a() { let _ = 1; }").unwrap();
-        assert_ne!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "changed content → changed digest");
+        assert_ne!(
+            runtime_src_digest(&root).as_deref(),
+            Some(d1.as_str()),
+            "changed content → changed digest"
+        );
 
         // A missing directory yields None (read_dir fails; not a panic).
         assert_eq!(runtime_src_digest(&root.join("does-not-exist")), None);
@@ -2055,7 +2356,10 @@ mod tests {
         }
         let src = std::path::Path::new(RUNTIME_SRC_DIR);
         if let Some(current) = runtime_src_digest(src) {
-            assert_eq!(current, BAKED_RUNTIME_SRC_DIGEST, "lib recompute must equal build.rs's baked digest (algorithm/seed drift)");
+            assert_eq!(
+                current, BAKED_RUNTIME_SRC_DIGEST,
+                "lib recompute must equal build.rs's baked digest (algorithm/seed drift)"
+            );
         }
     }
 
@@ -2063,13 +2367,22 @@ mod tests {
     fn hygiene_flags_are_pinned_per_format() {
         // The flag tables ARE the linker policy — pin the exact spellings so a drive-by edit
         // cannot silently change what every `alignc build` passes to the linker.
-        assert_eq!(hygiene_flags(ObjectFormat::Elf), ["-Wl,--gc-sections", "-Wl,--as-needed"]);
-        assert_eq!(hygiene_flags(ObjectFormat::MachO), ["-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"]);
+        assert_eq!(
+            hygiene_flags(ObjectFormat::Elf),
+            ["-Wl,--gc-sections", "-Wl,--as-needed"]
+        );
+        assert_eq!(
+            hygiene_flags(ObjectFormat::MachO),
+            ["-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"]
+        );
     }
 
     #[test]
     fn support_libs_are_pinned_per_format() {
-        assert_eq!(support_libs(ObjectFormat::Elf), ["-lpthread", "-ldl", "-lm"]);
+        assert_eq!(
+            support_libs(ObjectFormat::Elf),
+            ["-lpthread", "-ldl", "-lm"]
+        );
         assert_eq!(support_libs(ObjectFormat::MachO), [] as [&str; 0]);
     }
 
@@ -2078,11 +2391,20 @@ mod tests {
         // No gated library involved → the plain error, no note.
         let plain = link_failure_message(Some(1), &["m".to_string()]);
         assert!(plain.starts_with("link failed"));
-        assert!(!plain.contains("LIBRARY_PATH"), "no hint without a gated lib:\n{plain}");
+        assert!(
+            !plain.contains("LIBRARY_PATH"),
+            "no hint without a gated lib:\n{plain}"
+        );
         // A gated library (Homebrew keg-only class) → the LIBRARY_PATH hint is appended.
         let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()]);
-        assert!(hinted.contains("LIBRARY_PATH"), "gated libs get the hint:\n{hinted}");
-        assert!(hinted.contains("/opt/homebrew/opt/openssl@3/lib"), "hint shows an example path:\n{hinted}");
+        assert!(
+            hinted.contains("LIBRARY_PATH"),
+            "gated libs get the hint:\n{hinted}"
+        );
+        assert!(
+            hinted.contains("/opt/homebrew/opt/openssl@3/lib"),
+            "hint shows an example path:\n{hinted}"
+        );
     }
 
     #[test]
@@ -2105,7 +2427,10 @@ mod tests {
 
         // 2. A stale prefix (no such file) falls through to the PATH probe; a name that exists
         //    nowhere yields None (the caller degrades to a note).
-        assert_eq!(llvm_tool_in(Some(&prefix), "llvm-definitely-not-a-tool"), None);
+        assert_eq!(
+            llvm_tool_in(Some(&prefix), "llvm-definitely-not-a-tool"),
+            None
+        );
         assert_eq!(llvm_tool_in(None, "llvm-definitely-not-a-tool"), None);
 
         std::fs::remove_dir_all(&root).ok();
