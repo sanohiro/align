@@ -4266,6 +4266,13 @@ boundary and one invalid-input failure domain.
 | ownership and allocation | Codec owns only transient Rust metadata/byte buffers; it creates no Align value, runtime/native object, source registration, cache entry, or process-global state. Reader never trusts lengths for unchecked allocation and never indexes untrusted input directly. | source inventory and malformed large-count/truncation owners; no runtime/FFI calls in the crate diff |
 | ABI and consumers | Export one stable public module for D1 producer/driver code; preserve the existing interface codec/hash types and avoid compiler-known DB syntax in this checkpoint. | `align_interface` unit/integration tests and a compile-time public API smoke test; discovery/cache/descriptor cells explicitly deferred to the next L5 checkpoint |
 
+The bounded review of candidate `e3e77bc4` found six validation gaps; the coherent fix closes them
+at this same boundary. Database-checked Query entries now require evidence and Hash128 identities,
+source-to-wire bytes and rewrite spans are reconstructed from the occurrence table, QueryMeta columns
+and checked nullability are correlated with the Row contract, and PostgreSQL parameter options must
+name a declared Params field. `review_findings_are_closed_at_the_artifact_boundary` owns the six
+regressions; the existing independent byte encoder and goldens remain the canonical-byte owners.
+
 ### L6 — region plain-struct builder
 
 Scope:

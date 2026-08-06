@@ -77,40 +77,22 @@ fn query_fixture() -> StaticQueryArtifact {
     );
     let row_type = CanonicalContract {
         root: named("app.UserRow"),
-        definitions: vec![
-            CanonicalDefinition {
-                path: "app.User".into(),
-                args: Vec::new(),
-                kind: CanonicalDefinitionBody::Struct {
-                    fields: vec![
-                        CanonicalField {
-                            name: "id".into(),
-                            ty: named("i64"),
-                        },
-                        CanonicalField {
-                            name: "name".into(),
-                            ty: named("str"),
-                        },
-                    ],
-                },
+        definitions: vec![CanonicalDefinition {
+            path: "app.UserRow".into(),
+            args: Vec::new(),
+            kind: CanonicalDefinitionBody::Struct {
+                fields: vec![
+                    CanonicalField {
+                        name: "id".into(),
+                        ty: named("i64"),
+                    },
+                    CanonicalField {
+                        name: "name".into(),
+                        ty: named("str"),
+                    },
+                ],
             },
-            CanonicalDefinition {
-                path: "app.UserRow".into(),
-                args: Vec::new(),
-                kind: CanonicalDefinitionBody::Struct {
-                    fields: vec![
-                        CanonicalField {
-                            name: "user".into(),
-                            ty: named("app.User"),
-                        },
-                        CanonicalField {
-                            name: "display_name".into(),
-                            ty: named("str"),
-                        },
-                    ],
-                },
-            },
-        ],
+        }],
     };
     let source_sql = b"SELECT id, name FROM users WHERE id = :id OR name = :pattern\n".to_vec();
     let id_span = span_at(&source_sql, b":id");
@@ -200,9 +182,9 @@ fn query_fixture() -> StaticQueryArtifact {
             metadata_format_version: Some(3),
             metadata_digest: Some(Hash128::of(b"metadata-query")),
             query_evidence: Some(CheckedQueryEvidence {
-                prepare_identity: "postgres:prepare:users".into(),
-                schema_identity: "schema:v1".into(),
-                server_identity: "postgres:16".into(),
+                prepare_identity: Hash128::of(b"prepare-query").to_hex(),
+                schema_identity: Hash128::of(b"schema-v1").to_hex(),
+                server_identity: Hash128::of(b"postgres-16").to_hex(),
                 parameters: vec![
                     CheckedParameterMeta {
                         ordinal: 1,
@@ -803,6 +785,79 @@ fn semantic_validation_rejects_identity_driver_and_policy_drift() {
     let mut artifact = query_fixture();
     artifact.source_sql.push(0);
     artifact.source_sql_hash = Hash128::of(&artifact.source_sql);
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+}
+
+#[test]
+fn review_findings_are_closed_at_the_artifact_boundary() {
+    let mut artifact = query_fixture();
+    artifact.driver_entries[1].checked_metadata.query_evidence = None;
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+
+    let mut artifact = query_fixture();
+    artifact.driver_entries[1].wire_sql =
+        b"SELECT id, name FROM users WHERE id = $9 OR name = $2\n".to_vec();
+    artifact.driver_entries[1].wire_sql_hash = Hash128::of(&artifact.driver_entries[1].wire_sql);
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+
+    let mut artifact = query_fixture();
+    artifact.query_meta_plan.columns[0].source_alias = "wrong".into();
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+
+    let mut artifact = query_fixture();
+    artifact.driver_entries[1]
+        .checked_metadata
+        .query_evidence
+        .as_mut()
+        .unwrap()
+        .columns[0]
+        .nullable = MetaNullability::Yes;
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+
+    let mut artifact = command_fixture();
+    artifact.static_options.push(StaticOption {
+        owner: StaticOptionOwner::PostgreSQL,
+        value: StaticOptionValue::PostgreSQLParameterType {
+            parameter_name: "missing".into(),
+            canonical_type_name: "text".into(),
+        },
+    });
+    artifact
+        .static_options
+        .sort_by_key(|option| match &option.value {
+            StaticOptionValue::Check { .. } => (0u8, String::new()),
+            StaticOptionValue::SQLiteRequireVersionAtLeast { .. } => (1u8, String::new()),
+            StaticOptionValue::PostgreSQLParameterType { parameter_name, .. } => {
+                (2u8, parameter_name.clone())
+            }
+        });
+    assert!(matches!(
+        artifact.validate(),
+        Err(StaticArtifactError::Invalid(_))
+    ));
+
+    let mut artifact = query_fixture();
+    artifact.driver_entries[1]
+        .checked_metadata
+        .query_evidence
+        .as_mut()
+        .unwrap()
+        .prepare_identity = "not-a-hash".into();
     assert!(matches!(
         artifact.validate(),
         Err(StaticArtifactError::Invalid(_))

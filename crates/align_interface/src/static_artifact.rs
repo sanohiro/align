@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const STATIC_ARTIFACT_FORMAT_VERSION: u32 = 1;
 pub const BINDER_ABI_VERSION: u32 = 1;
 pub const DECODER_ABI_VERSION: u32 = 1;
+pub const REWRITE_FORMAT_VERSION: u32 = 1;
 const MAX_TYPE_DEPTH: usize = 256;
 
 #[repr(u8)]
@@ -1001,6 +1002,7 @@ fn common_policy(options: &[StaticOption]) -> Result<CheckPolicy, StaticArtifact
 fn validate_options(
     options: &[StaticOption],
     restriction: DriverRestriction,
+    params: &CanonicalContract,
 ) -> Result<CheckPolicy, StaticArtifactError> {
     let mut previous = None;
     let mut sqlite_native = false;
@@ -1062,6 +1064,28 @@ fn validate_options(
         return Err(invalid(
             "PostgreSQL native options require PostgreSQLOnly restriction",
         ));
+    }
+    if postgres_native {
+        let Some(root) = root_definition(params)? else {
+            return Err(invalid(
+                "PostgreSQL parameter options require a named Params struct",
+            ));
+        };
+        let CanonicalDefinitionBody::Struct { fields } = &root.kind else {
+            return Err(invalid(
+                "PostgreSQL parameter options require a struct Params root",
+            ));
+        };
+        let field_names: HashSet<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        for option in options {
+            if let StaticOptionValue::PostgreSQLParameterType { parameter_name, .. } = &option.value
+                && !field_names.contains(parameter_name.as_str())
+            {
+                return Err(invalid(format!(
+                    "PostgreSQL parameter option names unknown Params field `{parameter_name}`"
+                )));
+            }
+        }
     }
     common_policy(options)
 }
@@ -1127,24 +1151,116 @@ fn validate_meta_plan(
             "QueryMeta parameter count does not match occurrences",
         ));
     }
-    for (index, value) in plan.columns.iter().enumerate() {
-        let expected = u32::try_from(index).map_err(|_| invalid("too many QueryMeta columns"))?;
-        if value.ordinal != expected
-            || value.source_alias.is_empty()
-            || value.logical_type.is_empty()
-        {
-            return Err(invalid(
-                "QueryMeta column ordinals or fields are not canonical",
-            ));
-        }
-    }
-    if let Some(root) = root_definition(row)?
-        && let CanonicalDefinitionBody::Struct { fields } = &root.kind
-        && fields.len() != plan.columns.len()
-    {
+    let Some(root) = root_definition(row)? else {
+        return Err(invalid("Row contract root must be a named struct"));
+    };
+    let CanonicalDefinitionBody::Struct { fields } = &root.kind else {
+        return Err(invalid("Row contract root must be a struct"));
+    };
+    if fields.len() != plan.columns.len() {
         return Err(invalid(
             "QueryMeta column count does not match the Row contract",
         ));
+    }
+    for (index, (value, field)) in plan.columns.iter().zip(fields).enumerate() {
+        let expected = u32::try_from(index).map_err(|_| invalid("too many QueryMeta columns"))?;
+        if value.ordinal != expected
+            || value.source_alias != field.name
+            || value.logical_type != canonical_type_spelling(&field.ty)
+        {
+            return Err(invalid("QueryMeta columns do not match the Row contract"));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_type_spelling(ty: &CanonicalType) -> String {
+    match ty {
+        CanonicalType::Named { path, args } if args.is_empty() => path.clone(),
+        CanonicalType::Named { path, args } => format!(
+            "{path}<{}>",
+            args.iter()
+                .map(canonical_type_spelling)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        CanonicalType::Tuple(elements) => {
+            let contents = elements
+                .iter()
+                .map(canonical_type_spelling)
+                .collect::<Vec<_>>()
+                .join(",");
+            if elements.len() == 1 {
+                format!("({contents},)")
+            } else {
+                format!("({contents})")
+            }
+        }
+        CanonicalType::Fn { params, result } => format!(
+            "fn({}) -> {}",
+            params
+                .iter()
+                .map(canonical_type_spelling)
+                .collect::<Vec<_>>()
+                .join(","),
+            canonical_type_spelling(result)
+        ),
+    }
+}
+
+fn expected_wire(
+    driver: Driver,
+    source_sql: &[u8],
+    occurrences: &[ParameterOccurrence],
+) -> Result<(Vec<u8>, Vec<Span>), StaticArtifactError> {
+    let mut wire_sql = Vec::with_capacity(source_sql.len());
+    let mut wire_spans = Vec::with_capacity(occurrences.len());
+    let mut source_cursor = 0usize;
+    for occurrence in occurrences {
+        let start = usize::try_from(occurrence.source_span.start)
+            .map_err(|_| invalid("parameter occurrence offset does not fit usize"))?;
+        let end = usize::try_from(occurrence.source_span.end)
+            .map_err(|_| invalid("parameter occurrence offset does not fit usize"))?;
+        if start < source_cursor || end < start || end > source_sql.len() {
+            return Err(invalid("parameter occurrence spans are not source ordered"));
+        }
+        let placeholder = format!(":{}", occurrence.source_name);
+        if source_sql.get(start..end) != Some(placeholder.as_bytes()) {
+            return Err(invalid(
+                "parameter occurrence span does not contain its named placeholder",
+            ));
+        }
+        wire_sql.extend_from_slice(&source_sql[source_cursor..start]);
+        let wire_start = u32_len(wire_sql.len())?;
+        match driver {
+            Driver::SQLite => {
+                wire_sql.extend_from_slice(&source_sql[start..end]);
+            }
+            Driver::PostgreSQL => {
+                wire_sql.extend_from_slice(format!("${}", occurrence.protocol_ordinal).as_bytes());
+            }
+        }
+        let wire_end = u32_len(wire_sql.len())?;
+        wire_spans.push(Span {
+            start: wire_start,
+            end: wire_end,
+        });
+        source_cursor = end;
+    }
+    wire_sql.extend_from_slice(&source_sql[source_cursor..]);
+    Ok((wire_sql, wire_spans))
+}
+
+fn validate_identity_hash(value: &str, what: &str) -> Result<(), StaticArtifactError> {
+    if value.len() != 32
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(invalid(format!(
+            "checked Query {what} is not a Hash128 hex identity"
+        )));
     }
     Ok(())
 }
@@ -1152,13 +1268,11 @@ fn validate_meta_plan(
 fn validate_evidence(
     evidence: &CheckedQueryEvidence,
     plan: &QueryMetaPlan,
+    row: &CanonicalContract,
 ) -> Result<(), StaticArtifactError> {
-    if evidence.prepare_identity.is_empty()
-        || evidence.schema_identity.is_empty()
-        || evidence.server_identity.is_empty()
-    {
-        return Err(invalid("checked Query evidence has an empty identity"));
-    }
+    validate_identity_hash(&evidence.prepare_identity, "prepare identity")?;
+    validate_identity_hash(&evidence.schema_identity, "schema identity")?;
+    validate_identity_hash(&evidence.server_identity, "server identity")?;
     if evidence.parameters.len() != plan.parameters.len()
         || evidence.columns.len() != plan.columns.len()
     {
@@ -1173,11 +1287,31 @@ fn validate_evidence(
             return Err(invalid("checked parameter ordinals are not dense"));
         }
     }
+    let Some(root) = root_definition(row)? else {
+        return Err(invalid("Row contract root must be a named struct"));
+    };
+    let CanonicalDefinitionBody::Struct { fields } = &root.kind else {
+        return Err(invalid("Row contract root must be a struct"));
+    };
     for (index, column) in evidence.columns.iter().enumerate() {
         if column.ordinal
             != u32::try_from(index).map_err(|_| invalid("too many checked columns"))?
         {
             return Err(invalid("checked column ordinals are not dense"));
+        }
+        let Some(field) = fields.get(index) else {
+            return Err(invalid("checked column is outside the Row contract"));
+        };
+        let option = matches!(
+            &field.ty,
+            CanonicalType::Named { path, args } if path == "Option" && args.len() == 1
+        );
+        if (column.nullable == MetaNullability::Yes && !option)
+            || (column.nullable == MetaNullability::No && option)
+        {
+            return Err(invalid(
+                "checked column nullability conflicts with the Row contract",
+            ));
         }
     }
     Ok(())
@@ -1246,12 +1380,21 @@ fn validate_driver_entry(
     source_sql: &[u8],
     occurrences: &[ParameterOccurrence],
     params: &CanonicalContract,
+    row: Option<&CanonicalContract>,
     policy: CheckPolicy,
     query: bool,
     query_meta: Option<&QueryMetaPlan>,
 ) -> Result<(), StaticArtifactError> {
     if !restriction.allows(entry.driver) {
         return Err(invalid("driver entry is not permitted by the restriction"));
+    }
+    if entry.rewrite_format_version != REWRITE_FORMAT_VERSION {
+        return Err(invalid("unsupported rewrite format version"));
+    }
+    let (expected_wire, expected_wire_spans) =
+        expected_wire(entry.driver, source_sql, occurrences)?;
+    if entry.wire_sql != expected_wire {
+        return Err(invalid("wire SQL does not match the source rewrite"));
     }
     validate_utf8_sql(&entry.wire_sql, "wire SQL")?;
     if Hash128::of(&entry.wire_sql) != entry.wire_sql_hash {
@@ -1278,6 +1421,11 @@ fn validate_driver_entry(
         previous_wire = Some(rewrite.wire_span.end);
         if rewrite.source_span != occurrences[index].source_span {
             return Err(invalid("rewrite source span does not match its occurrence"));
+        }
+        if rewrite.wire_span != expected_wire_spans[index] {
+            return Err(invalid(
+                "rewrite wire span does not match the source rewrite",
+            ));
         }
     }
     validate_bindings(params, occurrences, &entry.bindings)?;
@@ -1311,11 +1459,18 @@ fn validate_driver_entry(
                 return Err(invalid("DatabaseChecked metadata is incomplete"));
             }
             if query {
-                if let (Some(evidence), Some(plan)) =
-                    (&entry.checked_metadata.query_evidence, query_meta)
-                {
-                    validate_evidence(evidence, plan)?;
-                }
+                let Some(evidence) = &entry.checked_metadata.query_evidence else {
+                    return Err(invalid(
+                        "DatabaseChecked Query metadata has no checked evidence",
+                    ));
+                };
+                let Some(plan) = query_meta else {
+                    return Err(invalid("DatabaseChecked Query has no QueryMeta plan"));
+                };
+                let Some(row) = row else {
+                    return Err(invalid("DatabaseChecked Query has no Row contract"));
+                };
+                validate_evidence(evidence, plan, row)?;
             } else if entry.checked_metadata.query_evidence.is_some() {
                 return Err(invalid("command metadata cannot carry Query evidence"));
             }
@@ -1403,7 +1558,7 @@ fn validate_common_fields(
     } else if row.is_some() {
         return Err(invalid("command artifact carries a Row contract"));
     }
-    let policy = validate_options(options, restriction)?;
+    let policy = validate_options(options, restriction, params)?;
     validate_source_identity(identity, id)?;
     validate_utf8_sql(source_sql, "source SQL")?;
     if Hash128::of(source_sql) != source_sql_hash {
@@ -1434,6 +1589,7 @@ fn validate_common_fields(
             source_sql,
             occurrences,
             params,
+            row.map(|(contract, _)| contract),
             policy,
             query,
             query_meta,
