@@ -4699,6 +4699,40 @@ fn malformed_hir_type_placement_fails_closed() {
 }
 
 #[test]
+fn region_only_array_builder_headers_are_placement_valid() {
+    for (label, element) in [
+        ("str", Scalar::Str),
+        (
+            "bytes",
+            Scalar::Slice(PrimScalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            })),
+        ),
+        ("struct", Scalar::Struct(0)),
+        ("sum", Scalar::Enum(0)),
+        ("option", Scalar::Tagged(0)),
+    ] {
+        let mut program = baseline_program();
+        program.imported_fns.push(ImportedFn {
+            name: format!("dep$push_{label}"),
+            params: vec![Ty::ArrayBuilder(element)],
+            param_modes: vec![align_ast::ParamMode::BorrowMut],
+            ret: Ty::Unit,
+            return_provenance_known: true,
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            effect: FnEffect::Pure,
+        });
+        assert!(
+            validate_hir::type_placement_metadata_is_valid(&program),
+            "region-only array_builder<{label}> header was rejected"
+        );
+    }
+}
+
+#[test]
 fn body_only_header_types_fail_placement_closed() {
     for (label, ty) in [
         ("cli parsed", Ty::CliParsed),

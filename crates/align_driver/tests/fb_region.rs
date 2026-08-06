@@ -279,6 +279,20 @@ fn region_builder_crosses_calls_only_as_borrow_mut() {
     let heap = "fn inspect(borrow values: array_builder<i64>) {}\nfn main() -> i32 {\n  mut values: array_builder<i64> := array_builder()\n  inspect(values)\n  return 0\n}\n";
     let diags = check_diagnostics("fb-heap-builder-shared-call", heap);
     assert!(diags.is_empty(), "heap builder borrow should remain legal:\n{diags}");
+
+    let uncertain = "fn inspect(borrow values: array_builder<i64>) {}\nfn relay(borrow mut values: array_builder<i64>) { inspect(values) }\nfn main() -> i32 = 0\n";
+    let diags = check_diagnostics("fb-incoming-builder-shared-call", uncertain);
+    assert!(
+        diags.contains("may be passed only as `borrow mut`"),
+        "a possibly region-backed incoming builder must fail closed, got:\n{diags}"
+    );
+
+    let heap_only = "fn inspect(borrow values: array_builder<string>) {}\nfn relay(borrow mut values: array_builder<string>) { inspect(values) }\nfn main() -> i32 = 0\n";
+    let diags = check_diagnostics("fb-incoming-heap-builder-shared-call", heap_only);
+    assert!(
+        diags.is_empty(),
+        "a heap-only incoming builder should remain borrowable:\n{diags}"
+    );
 }
 
 #[test]
@@ -302,6 +316,42 @@ fn borrow_mut_builder_helper_preserves_new_view_roots_in_the_caller() {
     assert!(
         diags.contains("invalidated") || diags.contains("borrow") || diags.contains("dependent"),
         "expected retained owner-generation diagnostic, got:\n{diags}"
+    );
+}
+
+#[test]
+fn borrowed_region_builders_reject_callee_local_views() {
+    let incoming = "fn retain_local(borrow mut values: array_builder<str>) {\n  arena inner {\n    temporary := \"short\".clone_in(inner)\n    values.push(temporary)\n  }\n}\nfn main() -> i32 {\n  arena outer {\n    mut values: array_builder<str> := array_builder(outer)\n    retain_local(values)\n    return 0\n  }\n}\n";
+    let diags = check_diagnostics("fb-region-builder-callee-local", incoming);
+    assert!(
+        diags.contains("shorter-lived view") || diags.contains("outlive"),
+        "expected callee-local retained-view diagnostic, got:\n{diags}"
+    );
+
+    let constructed = "fn materialize(out: region) -> i64 {\n  mut values: array_builder<str> := array_builder(out)\n  arena inner {\n    temporary := \"short\".clone_in(inner)\n    values.push(temporary)\n  }\n  return values.build().len()\n}\nfn main() -> i32 {\n  arena out { return materialize(out) as i32 }\n}\n";
+    let diags = check_diagnostics("fb-region-builder-param-local", constructed);
+    assert!(
+        diags.contains("shorter-lived view") || diags.contains("outlive"),
+        "expected parameter-region builder diagnostic, got:\n{diags}"
+    );
+}
+
+#[test]
+fn helper_region_parameter_is_checked_against_the_concrete_builder_region() {
+    let helper = "fn retain_copy(out: region, borrow mut values: array_builder<str>) {\n  values.push(\"copy\".clone_in(out))\n}\n";
+    let valid = format!(
+        "{helper}fn main() -> i32 {{\n  arena outer {{\n    mut values: array_builder<str> := array_builder(outer)\n    retain_copy(outer, values)\n    return values.build().len() as i32\n  }}\n}}\n"
+    );
+    let diags = check_diagnostics("fb-region-builder-param-same", &valid);
+    assert!(diags.is_empty(), "same caller region should remain valid:\n{diags}");
+
+    let invalid = format!(
+        "{helper}fn main() -> i32 {{\n  arena outer {{\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {{ retain_copy(inner, values) }}\n    return 0\n  }}\n}}\n"
+    );
+    let diags = check_diagnostics("fb-region-builder-param-different", &invalid);
+    assert!(
+        diags.contains("shorter-lived view") || diags.contains("outlive"),
+        "expected concrete call-site region diagnostic, got:\n{diags}"
     );
 }
 

@@ -5400,7 +5400,11 @@ fn run_body_analysis_passes(
                 // A chunks header is always malloc-owned; its Region tracks the borrowed source.
                 matches!(ty, Ty::DynSliceArray(_))
                     || drop_individual.get(id).copied().unwrap_or_else(|| {
-                        !matches!(region.get(id).copied().unwrap_or(Region::Static), Region::Arena(_))
+                        !region
+                            .get(id)
+                            .copied()
+                            .unwrap_or(Region::Static)
+                            .is_region_owned()
                     })
             })
             .collect();
@@ -9683,14 +9687,22 @@ impl EffectScan<'_> {
 }
 
 /// A value's inferred lifetime region (Memory Model v2, `impl/08-memory-model-v2.md`).
-/// Total order, longest-lived first: `Static ⊐ Frame ⊐ Arena(1) ⊐ … ⊐ Arena(d)`. Regions are
-/// inferred, never written, and live only in this analysis — they are not part of `Ty`.
+/// Lifetime order, longest-lived first: `Static ⊐ Caller(_) ⊐ Frame ⊐ Arena(1) ⊐ … ⊐
+/// Arena(d)`. `Caller(i)` retains the identity of a region or borrowed-builder parameter while a
+/// function body is checked. Relationships between distinct caller parameters are conditional and
+/// are discharged at the concrete call site. Regions are inferred, never written, and live only in
+/// this analysis — they are not part of `Ty`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Region {
     /// Process / program lifetime: literals, leaked allocations, owned-from-scalar values.
     Static,
+    /// Storage owned by the caller and identified by function-parameter position. It outlives this
+    /// callee's frame and nested arenas, is returnable through the inferred parameter-root summary,
+    /// and is never individually freed by the callee.
+    Caller(u32),
     /// The current function's frame: a view created in-frame over frame-local storage. Cannot
-    /// be returned. (A view *parameter* borrows the caller and is `Static` here — returnable.)
+    /// be returned. View parameters still use the existing root-summary machinery; region and
+    /// borrowed-builder parameters use `Caller` so their caller-owned storage stays explicit.
     /// Frame-local slices additionally use `EscapeState::local_backed_slice` for their dedicated
     /// diagnostic; other frame borrows (for example a `str` view of an owned `string`) use this
     /// region directly.
@@ -9707,8 +9719,9 @@ impl Region {
     fn ord(self) -> u32 {
         match self {
             Region::Static => 0,
-            Region::Frame => 1,
-            Region::Arena(k) => 1 + k,
+            Region::Caller(_) => 1,
+            Region::Frame => 2,
+            Region::Arena(k) => 2 + k,
         }
     }
 
@@ -9716,6 +9729,18 @@ impl Region {
     /// — i.e. `self` lives at least as long as `dst`. This is the single escape rule.
     fn outlives(self, dst: Region) -> bool {
         self.ord() <= dst.ord()
+    }
+
+    /// Whether storage belongs to an explicit lexical region rather than to an individually freed
+    /// allocation. A symbolic caller region is arena-owned from this callee's perspective.
+    fn is_region_owned(self) -> bool {
+        matches!(self, Region::Caller(_) | Region::Arena(_))
+    }
+
+    /// A caller-derived value may cross this function boundary because the inferred return summary
+    /// maps it back to its concrete argument. Frame and local-arena values cannot.
+    fn is_returnable(self) -> bool {
+        matches!(self, Region::Static | Region::Caller(_))
     }
 
     /// The region of a value allocated at arena nesting `depth` (0 = outside any arena, where
@@ -10056,15 +10081,44 @@ impl<'a> EscapeCheck<'a> {
     }
 
     fn check(&mut self) {
-        for &param in &self.f.params {
-            if self.f.locals.get(param as usize).is_some_and(|local| {
-                is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
-                    || ty_tuple_is_move(local.ty, self.tuples)
-            }) {
-                // A by-value Move parameter has already crossed the call boundary and is owned by
-                // this frame. The caller-side transfer check guarantees it is free-standing.
-                self.state.individual.insert(param, true);
-                self.state.individual_may.insert(param, true);
+        for (position, &param) in self.f.params.iter().enumerate() {
+            let Some(local) = self.f.locals.get(param as usize) else {
+                continue;
+            };
+            let borrowed_builder = matches!(local.ty, Ty::ArrayBuilder(_))
+                && matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::BorrowMut)
+                );
+            if local.ty == Ty::ArenaHandle || borrowed_builder {
+                self.state
+                    .region
+                    .insert(param, Region::Caller(position as u32));
+            }
+            if is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
+                || ty_tuple_is_move(local.ty, self.tuples)
+            {
+                // A by-value Move parameter has crossed the call boundary and is free-standing.
+                // A borrowed builder keeps the constructor modes admitted by its element type:
+                // `string` is heap-only, primitive scalars may use either constructor, and the
+                // remaining source element forms are region-only. This keeps a nested helper from
+                // treating a possibly region-backed incoming builder as definitely individual.
+                let (individual, may_individual) = match (borrowed_builder, local.ty) {
+                    (true, Ty::ArrayBuilder(Scalar::String)) => (true, true),
+                    (
+                        true,
+                        Ty::ArrayBuilder(
+                            Scalar::Int(_)
+                            | Scalar::Float(_)
+                            | Scalar::Bool
+                            | Scalar::Char,
+                        ),
+                    ) => (false, true),
+                    (true, Ty::ArrayBuilder(_)) => (false, false),
+                    _ => (true, true),
+                };
+                self.state.individual.insert(param, individual);
+                self.state.individual_may.insert(param, may_individual);
             }
         }
         self.walk_block(&self.f.body, 0);
@@ -10256,10 +10310,7 @@ impl<'a> EscapeCheck<'a> {
                         .get(local)
                         .copied()
                         .unwrap_or_else(|| {
-                            !matches!(
-                                self.region_of(expression, depth),
-                                Region::Arena(_)
-                            )
+                            !self.region_of(expression, depth).is_region_owned()
                         });
                     if !individual {
                         return true;
@@ -10484,9 +10535,10 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// Escape check for a returned value `e` (an explicit `return` or a body's trailing value):
-    /// a region-tracked value must be `Static` (returnable), and a `slice` must not view a local
-    /// array. The region-tracked diagnostic distinguishes a `Frame` borrow of local storage (use
-    /// `.clone()`) from an arena allocation.
+    /// a region-tracked value must be `Static` or caller-derived (returnable through its inferred
+    /// parameter-root summary), and a `slice` must not view a local array. The region-tracked
+    /// diagnostic distinguishes a `Frame` borrow of local storage (use `.clone()`) from an arena
+    /// allocation.
     fn check_return_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
         // The shared `array_builder<T>` type also has an individually owned heap constructor, which
@@ -10505,7 +10557,7 @@ impl<'a> EscapeCheck<'a> {
         // not duplicated. An **arena-backed `bytes` view** (`fs.read_bytes_view`) is *not*
         // local-backed, so it flows to the region branch and gets the "allocated in an arena" message.
         let local_backed = self.mentions_slice(e.ty) && self.slice_is_local(e);
-        if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
+        if self.region_bearing(e.ty) && !r.is_returnable() && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
             } else {
@@ -10528,13 +10580,13 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// Escape check for a `break` value: it leaves the loop just as a returned value leaves the
-    /// function, so it must be `Static` (a Frame/arena view — including a view into a per-iteration
-    /// owned local dropped at the `break` — would dangle). Same rule as [`check_return_escape`],
-    /// with a `break`-specific message.
+    /// function, so it must be `Static` or caller-derived (a Frame/arena view — including a view
+    /// into a per-iteration owned local dropped at the `break` — would dangle). Same rule as
+    /// [`check_return_escape`], with a `break`-specific message.
     fn check_break_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
         let local_backed = self.mentions_slice(e.ty) && self.slice_is_local(e);
-        if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
+        if self.region_bearing(e.ty) && !r.is_returnable() && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot `break` a view that borrows local storage out of the loop (it is dropped at the end of the iteration); use `.clone()` to break an owned value"
             } else {
@@ -10755,10 +10807,7 @@ impl<'a> EscapeCheck<'a> {
                                 .get(local)
                                 .copied()
                                 .unwrap_or_else(|| {
-                                    !matches!(
-                                        self.region_of(expression, depth),
-                                        Region::Arena(_)
-                                    )
+                                    !self.region_of(expression, depth).is_region_owned()
                                 }),
                         ),
                         // A callee cannot return arena-owned storage across its function boundary,
@@ -10906,10 +10955,7 @@ impl<'a> EscapeCheck<'a> {
                         {
                             values.push(true);
                         }
-                        _ => values.push(!matches!(
-                            self.region_of(expression, depth),
-                            Region::Arena(_)
-                        )),
+                        _ => values.push(!self.region_of(expression, depth).is_region_owned()),
                     }
                 }
                 Work::All(children, index) => {
@@ -10963,10 +11009,7 @@ impl<'a> EscapeCheck<'a> {
                                 .get(local)
                                 .copied()
                                 .unwrap_or_else(|| {
-                                    !matches!(
-                                        self.region_of(expression, depth),
-                                        Region::Arena(_)
-                                    )
+                                    !self.region_of(expression, depth).is_region_owned()
                                 }),
                         ),
                         ExprKind::ArrayBuilderNew { region, .. } => {
@@ -11085,10 +11128,7 @@ impl<'a> EscapeCheck<'a> {
                                 0,
                             ));
                         }
-                        _ => values.push(!matches!(
-                            self.region_of(expression, depth),
-                            Region::Arena(_)
-                        )),
+                        _ => values.push(!self.region_of(expression, depth).is_region_owned()),
                     }
                 }
                 Work::All(children, index) => {
@@ -13272,8 +13312,10 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// A helper receiving `borrow mut array_builder<T>` may retain any view-bearing argument in
-    /// that builder. Check the call at the caller's concrete regions; MoveCheck separately carries
-    /// the accepted roots forward so a later owner mutation remains visible.
+    /// that builder. Its own body uses a symbolic [`Region::Caller`] destination to reject local
+    /// frame/arena values; check relationships among incoming parameters at the caller's concrete
+    /// regions. MoveCheck separately carries the accepted roots forward so a later owner mutation
+    /// remains visible.
     fn record_builder_call_modes(
         &mut self,
         args: &'a [Expr],
@@ -13536,8 +13578,8 @@ impl<'a> EscapeCheck<'a> {
                 self.replace_callable_region_path(*root, &path, value, depth);
             }
             Stmt::Return(Some(e)) => {
-                // A returned value escapes to the caller (`Static`): only a `Static`-region
-                // value may be returned (an arena/frame view cannot).
+                // A returned value escapes to the caller: only a `Static` or caller-derived value
+                // may be returned (a callee-local arena/frame view cannot).
                 self.check_return_escape(e, depth);
             }
             Stmt::Return(None) => {}
@@ -40891,7 +40933,11 @@ fn exit_branch(flag: bool) -> i64 {
 
     #[test]
     fn region_lattice_outlives() {
-        // Static ⊐ Frame ⊐ Arena(1) ⊐ Arena(2): longer-lived outlives shorter-lived.
+        // Static ⊐ Caller(_) ⊐ Frame ⊐ Arena(1) ⊐ Arena(2): longer-lived outlives shorter-lived.
+        assert!(Region::Static.outlives(Region::Caller(0)));
+        assert!(Region::Caller(0).outlives(Region::Frame));
+        assert!(Region::Caller(0).outlives(Region::Arena(1)));
+        assert!(Region::Caller(0).outlives(Region::Caller(1)));
         assert!(Region::Static.outlives(Region::Frame));
         assert!(Region::Static.outlives(Region::Arena(1)));
         assert!(Region::Frame.outlives(Region::Arena(1)));
@@ -40899,6 +40945,8 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(Region::Static.outlives(Region::Static));
         // …and not the reverse.
         assert!(!Region::Frame.outlives(Region::Static));
+        assert!(!Region::Frame.outlives(Region::Caller(0)));
+        assert!(!Region::Arena(1).outlives(Region::Caller(0)));
         assert!(!Region::Arena(1).outlives(Region::Frame));
         assert!(!Region::Arena(2).outlives(Region::Arena(1)));
         // `arena(0)` is the leaked / process-lifetime case → Static; deeper = shorter-lived.
@@ -40907,6 +40955,9 @@ fn exit_branch(flag: bool) -> i64 {
         // `shorter` picks the shorter-lived (the one that bounds a view over both).
         assert_eq!(Region::Static.shorter(Region::Arena(1)), Region::Arena(1));
         assert_eq!(Region::Arena(2).shorter(Region::Frame), Region::Arena(2));
+        assert!(Region::Caller(0).is_region_owned());
+        assert!(Region::Caller(0).is_returnable());
+        assert!(!Region::Frame.is_returnable());
     }
 
     #[test]

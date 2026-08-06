@@ -1230,10 +1230,7 @@ impl<'a> PlacementValidator<'a> {
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::Soa(id) => self.soa_ok(id),
-            Ty::ArrayBuilder(element) => matches!(
-                element,
-                Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String
-            ),
+            Ty::ArrayBuilder(element) => self.array_builder_element_ok(element),
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
@@ -1282,6 +1279,25 @@ impl<'a> PlacementValidator<'a> {
             | Ty::Error => false,
             Ty::DynStructArray(_, Layout::Soa) => false,
         }
+    }
+
+    /// Mirror the exact union admitted by source `array_builder<T>` type formation. Constructor
+    /// validation separately selects the heap subset or recursively checks concrete RegionPlain;
+    /// this header gate only proves that the stored scalar graph is a valid source spelling.
+    fn array_builder_element_ok(&self, element: Scalar) -> bool {
+        matches!(
+            element,
+            Scalar::Int(_)
+                | Scalar::Float(_)
+                | Scalar::Bool
+                | Scalar::Char
+                | Scalar::String
+                | Scalar::Str
+                | Scalar::Slice(_)
+                | Scalar::Struct(_)
+                | Scalar::Enum(_)
+                | Scalar::Tagged(_)
+        ) && self.resolve_type_ok(align_sema::scalar_to_ty(element), false)
     }
 
     fn source_function_type_ok(&self, ty: Ty, parameter: bool, return_position: bool) -> bool {
