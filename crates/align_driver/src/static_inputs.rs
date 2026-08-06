@@ -516,6 +516,8 @@ pub fn resolve_inline_static_input(
 ) -> Result<ResolvedStaticInput, StaticInputError> {
     let descriptor_id = descriptor_id.into();
     validate_descriptor_id(&descriptor_id)?;
+    // Apply the shared field bound before copying so oversized inline SQL is
+    // rejected without allocating an unbounded source buffer.
     if decoded_sql.len() > MAX_FIELD_BYTES {
         return Err(StaticInputError::NonCanonical(
             "inline SQL exceeds the field limit".to_string(),
