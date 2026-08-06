@@ -241,6 +241,19 @@ fn canonical_root(project_root: &Path) -> Result<PathBuf, StaticInputError> {
     Ok(root)
 }
 
+fn lexical_absolute(path: &Path) -> Result<PathBuf, StaticInputError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| StaticInputError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })
+    }
+}
+
 fn ensure_inside(root: &Path, path: &Path) -> Result<(), StaticInputError> {
     if path.strip_prefix(root).is_err() {
         Err(StaticInputError::OutsideProjectRoot(path.to_path_buf()))
@@ -266,7 +279,10 @@ fn canonical_defining_file(
     if !canonical.is_file() {
         return Err(StaticInputError::NotRegularFile(canonical));
     }
-    Ok(canonical)
+    // Keep the lexical module path for sibling/explicit linkage. The canonical target above is
+    // used only for containment and regular-file validation; an in-root symlink must not silently
+    // change which sibling directory the source literal names.
+    Ok(candidate)
 }
 
 fn validate_literal_path(raw: &str) -> Result<(), StaticInputError> {
@@ -449,8 +465,14 @@ pub fn resolve_static_file(
 ) -> Result<ResolvedStaticInput, StaticInputError> {
     let descriptor_id = descriptor_id.into();
     validate_descriptor_id(&descriptor_id)?;
+    let lexical_root = lexical_absolute(project_root)?;
     let root = canonical_root(project_root)?;
-    let defining = canonical_defining_file(&root, defining_align_file)?;
+    let lexical_defining = if defining_align_file.is_absolute() {
+        defining_align_file.to_path_buf()
+    } else {
+        lexical_root.join(defining_align_file)
+    };
+    let defining = canonical_defining_file(&root, &lexical_defining)?;
     let candidate = match path_literal {
         None => defining.with_extension("sql"),
         Some(raw) => {
@@ -463,7 +485,7 @@ pub fn resolve_static_file(
                 .join(raw)
         }
     };
-    let logical = logical_path(&root, &candidate)?;
+    let logical = logical_path(&lexical_root, &candidate)?;
     let bytes = read_static_bytes(&root, &candidate, &logical)?;
     let input = make_input(
         descriptor_id,
@@ -493,6 +515,12 @@ pub fn resolve_inline_static_input(
     driver_restriction: DriverRestriction,
 ) -> Result<ResolvedStaticInput, StaticInputError> {
     let descriptor_id = descriptor_id.into();
+    validate_descriptor_id(&descriptor_id)?;
+    if decoded_sql.len() > MAX_FIELD_BYTES {
+        return Err(StaticInputError::NonCanonical(
+            "inline SQL exceeds the field limit".to_string(),
+        ));
+    }
     let bytes = decoded_sql.as_bytes().to_vec();
     let input = make_input(
         descriptor_id.clone(),
@@ -1906,6 +1934,41 @@ mod tests {
         assert_eq!(source_map.get(file_id).src, "select $id\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn in_root_defining_symlink_uses_lexical_module_sibling() {
+        let root = temp_root("defining-link");
+        let alias_dir = root.join("alias");
+        let target_dir = root.join("src");
+        create_dir_all(&alias_dir).expect("alias directory");
+        create_dir_all(&target_dir).expect("target directory");
+        let target_align = target_dir.join("query.align");
+        let alias_align = alias_dir.join("query.align");
+        write(&target_align, "module src.query\n").expect("target align source");
+        write(alias_dir.join("query.sql"), "select lexical").expect("lexical SQL source");
+        write(target_dir.join("query.sql"), "select target").expect("target SQL source");
+        std::os::unix::fs::symlink(&target_align, &alias_align).expect("defining symlink");
+
+        let resolved = resolve_static_file(
+            &root,
+            &alias_align,
+            None,
+            "src.query.query",
+            StaticConsumerKind::Query,
+            DriverRestriction::AnySupportedDriver,
+            None,
+        )
+        .expect("lexical sibling SQL");
+        assert_eq!(resolved.bytes, b"select lexical");
+        assert_eq!(
+            resolved.input.source,
+            SqlSourceIdentity::File {
+                logical_path: "alias/query.sql".into()
+            }
+        );
+        assert_eq!(resolved.resolved_path, Some(alias_dir.join("query.sql")));
+    }
+
     #[test]
     fn explicit_path_rejects_root_escape_and_symlink_escape() {
         let root = temp_root("escape");
@@ -2077,6 +2140,20 @@ mod tests {
                 StaticConsumerKind::Query,
                 DriverRestriction::AnySupportedDriver,
                 None,
+            ),
+            Err(StaticInputError::NonCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_inline_sql_is_rejected_before_buffering() {
+        let sql = "x".repeat(MAX_FIELD_BYTES + 1);
+        assert!(matches!(
+            resolve_inline_static_input(
+                "q.query",
+                &sql,
+                StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
             ),
             Err(StaticInputError::NonCanonical(_))
         ));
