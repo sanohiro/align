@@ -577,147 +577,323 @@ fn parse_metadata_format_version(
         })
 }
 
-const METADATA_TOP_LEVEL_KEYS: &[&str] = &[
-    "format_version",
-    "descriptor_id",
-    "module",
-    "item",
-    "driver",
-    "driver_restriction",
-    "statement_kind",
-    "statement_class",
-    "source_identity",
-    "source_sql_hash",
-    "wire_sql_hash",
-    "rewrite_format_version",
-    "static_options_hash",
-    "params_fingerprint",
-    "row_fingerprint",
-    "schema_fingerprint",
-    "engine_version",
-    "driver_version",
-    "search_path",
-    "extensions",
-    "parameters",
-    "columns",
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetadataJsonKind {
-    Null,
-    Bool,
-    Number,
-    String,
-    Array,
-    Object,
-}
-
 struct MetadataJsonParser<'a> {
     bytes: &'a [u8],
     position: usize,
 }
 
 impl<'a> MetadataJsonParser<'a> {
-    const MAX_DEPTH: usize = 128;
-
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
 
     fn parse_metadata_object(&mut self, descriptor_id: &str, driver: Driver) -> Result<u32, ()> {
         self.expect_byte(b'{')?;
-        for (index, expected_key) in METADATA_TOP_LEVEL_KEYS.iter().enumerate() {
-            if index != 0 {
-                self.expect_byte(b',')?;
-            }
-            let key = self.parse_string()?;
-            if key != expected_key.as_bytes() {
-                return Err(());
-            }
-            self.expect_byte(b':')?;
-            let kind = match index {
-                0 => {
-                    let number = self.parse_number()?;
-                    if number != b"1" {
-                        return Err(());
-                    }
-                    MetadataJsonKind::Number
-                }
-                1 | 4 => {
-                    let value = decode_canonical_json_string(self.parse_string()?)?;
-                    let expected = if index == 1 {
-                        descriptor_id
-                    } else {
-                        driver_dir(driver)
-                    };
-                    if value != expected {
-                        return Err(());
-                    }
-                    MetadataJsonKind::String
-                }
-                _ => self.parse_value(0)?.0,
-            };
-            if !metadata_top_level_kind_is_valid(index, kind) {
-                return Err(());
-            }
+        self.field(true, "format_version")?;
+        if self.parse_u32()? != 1 {
+            return Err(());
         }
+
+        self.field(false, "descriptor_id")?;
+        let metadata_descriptor_id = self.parse_text()?;
+        if metadata_descriptor_id != descriptor_id {
+            return Err(());
+        }
+
+        self.field(false, "module")?;
+        let module = self.parse_text()?;
+        self.field(false, "item")?;
+        let item = self.parse_text()?;
+        let (expected_module, expected_item) = descriptor_id.rsplit_once('.').ok_or(())?;
+        if expected_module.is_empty()
+            || expected_item.is_empty()
+            || module != expected_module
+            || item != expected_item
+        {
+            return Err(());
+        }
+
+        self.field(false, "driver")?;
+        if self.parse_text()?.as_str() != driver_dir(driver) {
+            return Err(());
+        }
+
+        self.field(false, "driver_restriction")?;
+        let driver_restriction = match self.parse_text()?.as_str() {
+            "any_supported_driver" => DriverRestriction::AnySupportedDriver,
+            "sqlite_only" => DriverRestriction::SQLiteOnly,
+            "postgres_only" => DriverRestriction::PostgreSQLOnly,
+            _ => return Err(()),
+        };
+        if !driver_restriction.drivers().contains(&driver) {
+            return Err(());
+        }
+
+        self.field(false, "statement_kind")?;
+        let statement_kind = match self.parse_text()?.as_str() {
+            "query" => MetadataStatementKind::Query,
+            "command" => MetadataStatementKind::Command,
+            _ => return Err(()),
+        };
+
+        self.field(false, "statement_class")?;
+        match self.parse_text()?.as_str() {
+            "select" | "dml" | "ddl" | "native" | "unknown" => {}
+            _ => return Err(()),
+        }
+
+        self.field(false, "source_identity")?;
+        self.parse_source_identity(descriptor_id)?;
+
+        self.field(false, "source_sql_hash")?;
+        self.parse_hash()?;
+        self.field(false, "wire_sql_hash")?;
+        self.parse_hash()?;
+
+        self.field(false, "rewrite_format_version")?;
+        if self.parse_u32()? != 1 {
+            return Err(());
+        }
+
+        self.field(false, "static_options_hash")?;
+        self.parse_hash()?;
+        self.field(false, "params_fingerprint")?;
+        self.parse_hash()?;
+        self.field(false, "row_fingerprint")?;
+        let row_fingerprint = self.parse_optional_hash()?;
+        self.field(false, "schema_fingerprint")?;
+        self.parse_hash()?;
+
+        self.field(false, "engine_version")?;
+        self.parse_text()?;
+        self.field(false, "driver_version")?;
+        self.parse_text()?;
+
+        self.field(false, "search_path")?;
+        let search_path = self.parse_string_array()?;
+        self.field(false, "extensions")?;
+        let extensions_nonempty = self.parse_extensions()?;
+        self.field(false, "parameters")?;
+        self.parse_parameters()?;
+        self.field(false, "columns")?;
+        let column_count = self.parse_columns()?;
+
         self.expect_byte(b'}')?;
         if self.position != self.bytes.len() {
+            return Err(());
+        }
+
+        if (statement_kind == MetadataStatementKind::Query) != row_fingerprint.is_some() {
+            return Err(());
+        }
+        if statement_kind == MetadataStatementKind::Command && column_count != 0 {
+            return Err(());
+        }
+        if driver == Driver::SQLite && (!search_path.is_empty() || extensions_nonempty) {
             return Err(());
         }
         Ok(1)
     }
 
-    fn parse_value(&mut self, depth: usize) -> Result<(MetadataJsonKind, Option<&'a [u8]>), ()> {
-        if depth > Self::MAX_DEPTH {
+    fn field(&mut self, first: bool, expected: &str) -> Result<(), ()> {
+        if !first {
+            self.expect_byte(b',')?;
+        }
+        if self.parse_string()? != expected.as_bytes() {
             return Err(());
         }
-        let byte = *self.bytes.get(self.position).ok_or(())?;
-        match byte {
-            b'{' => {
-                self.parse_object(depth + 1)?;
-                Ok((MetadataJsonKind::Object, None))
-            }
-            b'[' => {
-                self.parse_array(depth + 1)?;
-                Ok((MetadataJsonKind::Array, None))
-            }
-            b'"' => Ok((MetadataJsonKind::String, Some(self.parse_string()?))),
-            b'-' | b'0'..=b'9' => Ok((MetadataJsonKind::Number, Some(self.parse_number()?))),
-            b't' => {
-                self.expect_bytes(b"true")?;
-                Ok((MetadataJsonKind::Bool, None))
-            }
-            b'f' => {
-                self.expect_bytes(b"false")?;
-                Ok((MetadataJsonKind::Bool, None))
-            }
-            b'n' => {
-                self.expect_bytes(b"null")?;
-                Ok((MetadataJsonKind::Null, None))
-            }
-            _ => Err(()),
+        self.expect_byte(b':')
+    }
+
+    fn parse_text(&mut self) -> Result<String, ()> {
+        let value = decode_canonical_json_string(self.parse_string()?)?;
+        if value.len() > MAX_FIELD_BYTES || value.as_bytes().contains(&0) {
+            return Err(());
+        }
+        Ok(value)
+    }
+
+    fn parse_u32(&mut self) -> Result<u32, ()> {
+        let number = self.parse_number()?;
+        if number.first() == Some(&b'-') {
+            return Err(());
+        }
+        let number = std::str::from_utf8(number).map_err(|_| ())?;
+        number
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(())
+    }
+
+    fn parse_i64(&mut self) -> Result<i64, ()> {
+        let number = std::str::from_utf8(self.parse_number()?).map_err(|_| ())?;
+        number.parse::<i64>().map_err(|_| ())
+    }
+
+    fn parse_hash(&mut self) -> Result<(), ()> {
+        let value = self.parse_text()?;
+        if value.len() != 32
+            || !value
+                .as_bytes()
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn parse_optional_hash(&mut self) -> Result<Option<()>, ()> {
+        if self.peek_byte() == Some(b'n') {
+            self.expect_bytes(b"null")?;
+            Ok(None)
+        } else {
+            self.parse_hash()?;
+            Ok(Some(()))
         }
     }
 
-    fn parse_object(&mut self, depth: usize) -> Result<(), ()> {
+    fn parse_optional_text(&mut self) -> Result<Option<String>, ()> {
+        if self.peek_byte() == Some(b'n') {
+            self.expect_bytes(b"null")?;
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_text()?))
+        }
+    }
+
+    fn parse_optional_i64(&mut self) -> Result<Option<i64>, ()> {
+        if self.peek_byte() == Some(b'n') {
+            self.expect_bytes(b"null")?;
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_i64()?))
+        }
+    }
+
+    fn parse_source_identity(&mut self, descriptor_id: &str) -> Result<(), ()> {
         self.expect_byte(b'{')?;
-        let mut keys: Vec<&[u8]> = Vec::new();
-        if self.peek_byte() == Some(b'}') {
+        self.field(true, "kind")?;
+        let kind = self.parse_text()?;
+        match kind.as_str() {
+            "file" => {
+                self.field(false, "logical_path")?;
+                let path = self.parse_text()?;
+                if path.is_empty()
+                    || path.starts_with('/')
+                    || path.contains('\\')
+                    || path
+                        .split('/')
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                {
+                    return Err(());
+                }
+            }
+            "inline" => {
+                self.field(false, "descriptor_id")?;
+                if self.parse_text()? != descriptor_id {
+                    return Err(());
+                }
+            }
+            _ => return Err(()),
+        }
+        self.expect_byte(b'}')
+    }
+
+    fn parse_string_array(&mut self) -> Result<Vec<String>, ()> {
+        self.expect_byte(b'[')?;
+        let mut values = Vec::new();
+        if self.peek_byte() == Some(b']') {
+            self.position += 1;
+            return Ok(values);
+        }
+        loop {
+            if values.len() >= MAX_SEQUENCE {
+                return Err(());
+            }
+            values.push(self.parse_text()?);
+            match self.peek_byte() {
+                Some(b',') => self.position += 1,
+                Some(b']') => {
+                    self.position += 1;
+                    return Ok(values);
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn parse_extensions(&mut self) -> Result<bool, ()> {
+        self.expect_byte(b'[')?;
+        let mut previous: Option<(String, String, Option<String>)> = None;
+        let mut count = 0usize;
+        if self.peek_byte() == Some(b']') {
+            self.position += 1;
+            return Ok(false);
+        }
+        loop {
+            if count >= MAX_SEQUENCE {
+                return Err(());
+            }
+            self.expect_byte(b'{')?;
+            self.field(true, "schema")?;
+            let schema = self.parse_text()?;
+            self.field(false, "name")?;
+            let name = self.parse_text()?;
+            self.field(false, "version")?;
+            let version = self.parse_optional_text()?;
+            self.expect_byte(b'}')?;
+            let current = (schema, name, version);
+            if let Some(previous) = previous.as_ref()
+                && extension_cmp(previous, &current) != Ordering::Less
+            {
+                return Err(());
+            }
+            previous = Some(current);
+            count += 1;
+            match self.peek_byte() {
+                Some(b',') => self.position += 1,
+                Some(b']') => {
+                    self.position += 1;
+                    return Ok(true);
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn parse_parameters(&mut self) -> Result<(), ()> {
+        self.expect_byte(b'[')?;
+        let mut ordinal = 1u32;
+        let mut count = 0usize;
+        if self.peek_byte() == Some(b']') {
             self.position += 1;
             return Ok(());
         }
         loop {
-            let key = self.parse_string()?;
-            if keys.contains(&key) || keys.len() >= MAX_SEQUENCE {
+            if count >= MAX_SEQUENCE {
                 return Err(());
             }
-            keys.push(key);
-            self.expect_byte(b':')?;
-            self.parse_value(depth)?;
+            self.expect_byte(b'{')?;
+            self.field(true, "source_name")?;
+            self.parse_text()?;
+            self.field(false, "protocol_ordinal")?;
+            if self.parse_u32()? != ordinal {
+                return Err(());
+            }
+            self.field(false, "logical_type")?;
+            self.parse_text()?;
+            self.field(false, "native_type")?;
+            self.parse_optional_text()?;
+            self.field(false, "native_type_id")?;
+            self.parse_optional_i64()?;
+            self.expect_byte(b'}')?;
+            ordinal = ordinal.checked_add(1).ok_or(())?;
+            count += 1;
             match self.peek_byte() {
                 Some(b',') => self.position += 1,
-                Some(b'}') => {
+                Some(b']') => {
                     self.position += 1;
                     return Ok(());
                 }
@@ -726,24 +902,50 @@ impl<'a> MetadataJsonParser<'a> {
         }
     }
 
-    fn parse_array(&mut self, depth: usize) -> Result<(), ()> {
+    fn parse_columns(&mut self) -> Result<usize, ()> {
         self.expect_byte(b'[')?;
+        let mut ordinal = 0u32;
+        let mut count = 0usize;
         if self.peek_byte() == Some(b']') {
             self.position += 1;
-            return Ok(());
+            return Ok(0);
         }
-        let mut count = 0usize;
         loop {
             if count >= MAX_SEQUENCE {
                 return Err(());
             }
-            self.parse_value(depth)?;
+            self.expect_byte(b'{')?;
+            self.field(true, "ordinal")?;
+            if self.parse_u32()? != ordinal {
+                return Err(());
+            }
+            self.field(false, "source_alias")?;
+            self.parse_text()?;
+            self.field(false, "logical_type")?;
+            self.parse_text()?;
+            self.field(false, "native_type")?;
+            self.parse_optional_text()?;
+            self.field(false, "native_type_id")?;
+            self.parse_optional_i64()?;
+            self.field(false, "nullable")?;
+            match self.parse_text()?.as_str() {
+                "yes" | "no" | "unknown" => {}
+                _ => return Err(()),
+            }
+            self.field(false, "origin_schema")?;
+            self.parse_optional_text()?;
+            self.field(false, "origin_table")?;
+            self.parse_optional_text()?;
+            self.field(false, "origin_column")?;
+            self.parse_optional_text()?;
+            self.expect_byte(b'}')?;
+            ordinal = ordinal.checked_add(1).ok_or(())?;
             count += 1;
             match self.peek_byte() {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(());
+                    return Ok(count);
                 }
                 _ => return Err(()),
             }
@@ -857,6 +1059,28 @@ impl<'a> MetadataJsonParser<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataStatementKind {
+    Query,
+    Command,
+}
+
+fn extension_cmp(
+    left: &(String, String, Option<String>),
+    right: &(String, String, Option<String>),
+) -> Ordering {
+    left.0
+        .as_bytes()
+        .cmp(right.0.as_bytes())
+        .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+        .then_with(|| match (&left.2, &right.2) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(left), Some(right)) => left.as_bytes().cmp(right.as_bytes()),
+        })
+}
+
 fn decode_canonical_json_string(raw: &[u8]) -> Result<String, ()> {
     let mut decoded = Vec::with_capacity(raw.len());
     let mut position = 0;
@@ -899,17 +1123,6 @@ fn hex_value(byte: u8) -> Option<u32> {
         b'0'..=b'9' => Some(u32::from(byte - b'0')),
         b'a'..=b'f' => Some(u32::from(byte - b'a' + 10)),
         _ => None,
-    }
-}
-
-fn metadata_top_level_kind_is_valid(index: usize, kind: MetadataJsonKind) -> bool {
-    match index {
-        0 | 11 => kind == MetadataJsonKind::Number,
-        1..=7 | 9..=10 | 12..=13 | 15..=17 => kind == MetadataJsonKind::String,
-        8 => kind == MetadataJsonKind::Object,
-        14 => matches!(kind, MetadataJsonKind::Null | MetadataJsonKind::String),
-        18..=21 => kind == MetadataJsonKind::Array,
-        _ => false,
     }
 }
 
@@ -1588,6 +1801,14 @@ mod tests {
         bytes
     }
 
+    fn replace_once(bytes: &mut Vec<u8>, old: &[u8], new: &[u8]) {
+        let start = bytes
+            .windows(old.len())
+            .position(|window| window == old)
+            .expect("metadata test marker");
+        bytes.splice(start..start + old.len(), new.iter().copied());
+    }
+
     fn reference_manifest_bytes(manifest: &StaticInputManifest) -> Vec<u8> {
         fn u8(bytes: &mut Vec<u8>, value: u8) {
             bytes.push(value);
@@ -1985,6 +2206,54 @@ mod tests {
             .set_len((MAX_FIELD_BYTES as u64) + 1)
             .expect("metadata length");
         drop(oversized);
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_parser_rejects_malformed_nested_records() {
+        let root = temp_root("metadata-nested-malformed");
+        let id = "q.query";
+        let path = metadata_path(&root, id, Driver::SQLite).expect("metadata path");
+        create_dir_all(path.parent().expect("metadata directory")).expect("metadata directory");
+
+        let mut source_identity = metadata_json(1, "00000000000000000000000000000000");
+        replace_once(
+            &mut source_identity,
+            b"\"source_identity\":{\"kind\":\"inline\",\"descriptor_id\":\"q.query\"}",
+            b"\"source_identity\":{}",
+        );
+        write(&path, source_identity).expect("malformed source identity");
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+
+        let mut search_path = metadata_json(1, "00000000000000000000000000000000");
+        replace_once(
+            &mut search_path,
+            b"\"search_path\":[]",
+            b"\"search_path\":[0]",
+        );
+        write(&path, search_path).expect("malformed search path");
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+
+        let mut parameters = metadata_json(1, "00000000000000000000000000000000");
+        replace_once(&mut parameters, b"\"parameters\":[]", b"\"parameters\":[0]");
+        write(&path, parameters).expect("malformed parameters");
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+
+        let mut columns = metadata_json(1, "00000000000000000000000000000000");
+        replace_once(&mut columns, b"\"columns\":[]", b"\"columns\":[0]");
+        write(&path, columns).expect("malformed columns");
         assert!(matches!(
             snapshot_checked_metadata(&root, id, Driver::SQLite),
             Err(StaticInputError::MetadataMalformed { .. })
