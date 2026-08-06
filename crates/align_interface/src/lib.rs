@@ -47,11 +47,24 @@
 
 mod codec;
 mod hash;
+pub mod static_artifact;
 
 pub use codec::{
     deserialize, encode_interface_surface, serialize, DecodeError, FORMAT_VERSION,
 };
 pub use hash::Hash128;
+pub use static_artifact::{
+    decode_static_artifact, decode_static_command, decode_static_query, encode_static_command,
+    encode_static_query, static_artifact_digest, BindRetention, BindingEntry, CanonicalContract,
+    CanonicalDefinition, CanonicalDefinitionBody, CanonicalDefinitionKind, CanonicalField,
+    CanonicalType, CanonicalVariant, CheckPolicy, CheckedColumnMeta, CheckedMetadata,
+    CheckedParameterMeta, CheckedQueryEvidence, DeclaredColumnMeta, DeclaredParameterMeta,
+    DecodedSpanEntry, Driver, DriverEntry, DriverRestriction, MetaNullability, MetaStatementClass,
+    ParameterOccurrence, QueryMetaPlan, RewriteEntry, Span, SqlSourceIdentity, StaticArtifact,
+    StaticArtifactError, StaticCommandArtifact, StaticOption, StaticOptionOwner, StaticOptionValue,
+    StaticQueryArtifact, VerificationState, BINDER_ABI_VERSION, DECODER_ABI_VERSION,
+    STATIC_ARTIFACT_FORMAT_VERSION,
+};
 
 use std::collections::{HashMap, HashSet};
 
