@@ -2392,11 +2392,25 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         | Ty::Slice(payload)
                         | Ty::DynArray(payload)
                         | Ty::Task(payload) => self.check_scalar_reference(payload)?,
-                        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(payload)) => {
+                        Ty::ArrayBuilder(payload) => {
                             self.check_scalar_reference(payload)?
                         }
-                        Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(payload))
-                        | Ty::DynAggregateArray(payload) => {
+                        ty @ (Ty::VecArrayBuilder(..)
+                        | Ty::MaskArrayBuilder(..)
+                        | Ty::FixedArrayBuilder(..)
+                        | Ty::FixedStructArrayBuilder(..)
+                        | Ty::DynVecArray(..)
+                        | Ty::DynMaskArray(..)
+                        | Ty::DynFixedArray(..)
+                        | Ty::DynFixedStructArray(..)) => {
+                            let payload = ty
+                                .array_builder_element()
+                                .and_then(|element| match element {
+                                    ArrayBuilderElem::Aggregate(element) => Some(element),
+                                    ArrayBuilderElem::Scalar(_) => None,
+                                })
+                                .or_else(|| ty.dyn_aggregate_array_element())
+                                .expect("matched aggregate type");
                             if !align_sema::region_plain_type_ok(
                                 payload.ty(),
                                 &self.program.structs,
@@ -2606,11 +2620,25 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     }
                     Ty::ArrayBuilder(element) => {
                         key.push_str("AB_");
-                        work.push(SourceAbiKeyWork::Ty(element.ty()));
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(element)));
                     }
-                    Ty::DynAggregateArray(element) => {
+                    ty @ (Ty::VecArrayBuilder(..)
+                    | Ty::MaskArrayBuilder(..)
+                    | Ty::FixedArrayBuilder(..)
+                    | Ty::FixedStructArrayBuilder(..)) => {
+                        key.push_str("AB_");
+                        work.push(SourceAbiKeyWork::Ty(
+                            ty.array_builder_element().expect("matched aggregate builder").ty(),
+                        ));
+                    }
+                    ty @ (Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..)) => {
                         key.push_str("DA_");
-                        work.push(SourceAbiKeyWork::Ty(element.ty()));
+                        work.push(SourceAbiKeyWork::Ty(
+                            ty.dyn_aggregate_array_element().expect("matched aggregate array").ty(),
+                        ));
                     }
                     Ty::Array(payload, count) => {
                         key.push_str(&format!("A{count}_"));
@@ -4262,7 +4290,8 @@ fn scalar_type<'c>(
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
         Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_)
-        | Ty::DynAggregateArray(_) => slice_struct_type(ctx).into(),
+        | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -4394,6 +4423,10 @@ fn abi_type<'c>(
         | Ty::Reader
         | Ty::Buffer
         | Ty::ArrayBuilder(_)
+        | Ty::VecArrayBuilder(..)
+        | Ty::MaskArrayBuilder(..)
+        | Ty::FixedArrayBuilder(..)
+        | Ty::FixedStructArrayBuilder(..)
         | Ty::Regex
         | Ty::Captures
         | Ty::TcpConn
@@ -4407,7 +4440,8 @@ fn abi_type<'c>(
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_)
-        | Ty::DynAggregateArray(_) => slice_struct_type(ctx).into(),
+        | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
             slice_struct_type(ctx).into()
@@ -5561,7 +5595,7 @@ struct ParMapFunctionSignature {
 }
 
 fn is_builder_header_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Builder | Ty::ArrayBuilder(_))
+    ty == Ty::Builder || ty.is_array_builder()
 }
 
 #[derive(Default)]
@@ -7123,7 +7157,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
+                    let z: BasicValueEnum = if ty.is_array_builder() || matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -7237,7 +7271,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.runtime(RuntimeKey::StrFinderFree), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if let Ty::ArrayBuilder(elem) = ty {
+                    } else if let Some(elem) = ty.array_builder_element() {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
                         // builder deep-frees each pushed-not-frozen string first (the same
                         // `free_string_array`-class helper); a scalar builder frees the flat storage.
@@ -11527,6 +11561,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Reader
             | Ty::Buffer
             | Ty::ArrayBuilder(_)
+            | Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)
             | Ty::Regex
             | Ty::Captures
             | Ty::TcpConn
@@ -11550,7 +11588,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_)
-            | Ty::DynAggregateArray(_) => slice_struct_type(self.ctx).into(),
+            | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
@@ -12042,7 +12081,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // borrowed views into the input, not freed here. (A Move-struct element is deep-freed by
                 // the arm above.)
                 Ty::DynArray(_)
-                | Ty::DynAggregateArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
+                | Ty::DynVecArray(..)
+                | Ty::DynMaskArray(..)
+                | Ty::DynFixedArray(..)
+                | Ty::DynFixedStructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::DynSliceArray(_) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
                     let agg = self
                         .builder

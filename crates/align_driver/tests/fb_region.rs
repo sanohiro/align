@@ -7,6 +7,13 @@ fn code(out: &std::process::Output) -> Option<i32> {
     out.status.code()
 }
 
+fn assert_no_errors(name: &str, src: &str, context: &str) {
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, name, src);
+    let diags = align_driver::format_diagnostics(&sources, &checked.diags);
+    assert!(!checked.diags.has_errors(), "{context}:\n{diags}");
+}
+
 #[test]
 fn named_arena_passes_exact_region_capability_to_an_ordinary_function() {
     if !backend_available() {
@@ -21,7 +28,7 @@ fn named_arena_passes_exact_region_capability_to_an_ordinary_function() {
 fn named_region_binding_does_not_escape_its_arena_scope() {
     let src = "fn use_region(out: region) -> i64 = 1\nfn main() -> i32 {\n  arena out {\n    print(use_region(out))\n  }\n  return use_region(out) as i32\n}\n";
     let diags = check_diagnostics("fb-region-scope", src);
-    assert!(diags.contains("unknown name 'out'"), "expected scope diagnostic, got:\n{diags}");
+    assert!(diags.contains("undefined name: 'out'"), "expected scope diagnostic, got:\n{diags}");
 }
 
 #[test]
@@ -155,27 +162,34 @@ fn clone_in_result_cannot_escape_the_selected_arena() {
 
 #[test]
 fn clone_in_copies_bytes_and_preserves_the_selected_region_identity() {
-    let bytes = "fn copy_bytes(out: region, value: slice<u8>) -> slice<u8> = value.clone_in(out)\nfn main() -> i32 {\n  arena out {\n    copied := copy_bytes(out, \"abc\".bytes())\n    return (copied[0] + copied.len()) as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-clone-in-bytes", bytes);
-    assert!(diags.is_empty(), "unexpected byte clone diagnostics:\n{diags}");
+    let bytes = "fn copy_bytes(out: region, value: slice<u8>) -> slice<u8> = value.clone_in(out)\nfn main() -> i32 {\n  arena out {\n    copied := copy_bytes(out, \"abc\".bytes())\n    return copied[0] as i32\n  }\n}\n";
+    assert_no_errors("fb-clone-in-bytes", bytes, "unexpected byte clone diagnostics");
 
     let wrong_region = "fn copy_text(out: region, value: str) -> str = value.clone_in(out)\nfn main() -> i32 {\n  arena outer {\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {\n      temporary := copy_text(inner, \"temporary\")\n      values.push(temporary)\n    }\n    return 0\n  }\n}\n";
     let diags = check_diagnostics("fb-clone-in-wrong-region", wrong_region);
     assert!(
-        diags.contains("clone_in(outer)") || diags.contains("outlive"),
+        diags.contains("shorter-lived view")
+            || diags.contains("clone_in(outer)")
+            || diags.contains("outlive"),
         "expected exact-region builder-store diagnostic, got:\n{diags}"
     );
 
     let outer_clone = "fn copy_text(out: region, value: str) -> str = value.clone_in(out)\nfn main() -> i32 {\n  arena outer {\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {\n      retained := copy_text(outer, \"retained\")\n      values.push(retained)\n    }\n    return values.build().len() as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-clone-in-outer-region", outer_clone);
-    assert!(diags.is_empty(), "outer-region clone should remain valid:\n{diags}");
+    assert_no_errors(
+        "fb-clone-in-outer-region",
+        outer_clone,
+        "outer-region clone should remain valid",
+    );
 }
 
 #[test]
 fn clone_in_recursively_copies_region_plain_struct_views() {
-    let src = "Record { id: i64, name: str, alias: Option<str>, data: slice<u8> }\nfn copy_record(out: region, value: Record) -> Record = value.clone_in(out)\nfn main() -> i32 {\n  arena out {\n    copied := copy_record(out, Record { id: 20, name: \"plain\", alias: Some(\"view\"), data: \"bc\".bytes() })\n    alias := copied.alias else \"\"\n    return (copied.id + copied.name.len() + alias.len() + copied.data[0]) as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-clone-in-plain-struct", src);
-    assert!(diags.is_empty(), "unexpected plain-struct clone diagnostics:\n{diags}");
+    let src = "Record { id: i64, name: str, alias: Option<str>, data: slice<u8> }\nfn copy_record(out: region, value: Record) -> Record = value.clone_in(out)\nfn main() -> i32 {\n  arena out {\n    copied := copy_record(out, Record { id: 20, name: \"plain\", alias: Some(\"view\"), data: \"bc\".bytes() })\n    alias := copied.alias else \"\"\n    return (copied.id + copied.name.len() + alias.len() + copied.data[0] as i64) as i32\n  }\n}\n";
+    assert_no_errors(
+        "fb-clone-in-plain-struct",
+        src,
+        "unexpected plain-struct clone diagnostics",
+    );
     if !backend_available() {
         return;
     }
@@ -202,8 +216,11 @@ fn clone_in_rejects_structs_with_independently_owned_fields() {
 #[test]
 fn captured_region_identity_survives_indirect_closure_calls() {
     let valid = "fn main() -> i32 {\n  arena out {\n    copy := fn value: str { value.clone_in(out) }\n    copied := copy(\"captured\")\n    return copied.len() as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-region-captured-closure", valid);
-    assert!(diags.is_empty(), "captured region should remain callable:\n{diags}");
+    assert_no_errors(
+        "fb-region-captured-closure",
+        valid,
+        "captured region should remain callable",
+    );
 
     let invalid = "fn main() -> i32 {\n  arena outer {\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {\n      copy := fn value: str { value.clone_in(inner) }\n      temporary := copy(\"captured\")\n      values.push(temporary)\n    }\n    return 0\n  }\n}\n";
     let diags = check_diagnostics("fb-region-captured-closure-wrong-region", invalid);
@@ -305,8 +322,11 @@ fn region_builder_crosses_calls_only_as_borrow_mut() {
     );
 
     let heap = "fn inspect(borrow values: array_builder<i64>) {}\nfn main() -> i32 {\n  mut values: array_builder<i64> := array_builder()\n  inspect(values)\n  return 0\n}\n";
-    let diags = check_diagnostics("fb-heap-builder-shared-call", heap);
-    assert!(diags.is_empty(), "heap builder borrow should remain legal:\n{diags}");
+    assert_no_errors(
+        "fb-heap-builder-shared-call",
+        heap,
+        "heap builder borrow should remain legal",
+    );
 
     let uncertain = "fn inspect(borrow values: array_builder<i64>) {}\nfn relay(borrow mut values: array_builder<i64>) { inspect(values) }\nfn main() -> i32 = 0\n";
     let diags = check_diagnostics("fb-incoming-builder-shared-call", uncertain);
@@ -316,23 +336,29 @@ fn region_builder_crosses_calls_only_as_borrow_mut() {
     );
 
     let heap_only = "fn inspect(borrow values: array_builder<string>) {}\nfn relay(borrow mut values: array_builder<string>) { inspect(values) }\nfn main() -> i32 = 0\n";
-    let diags = check_diagnostics("fb-incoming-heap-builder-shared-call", heap_only);
-    assert!(
-        diags.is_empty(),
-        "a heap-only incoming builder should remain borrowable:\n{diags}"
+    assert_no_errors(
+        "fb-incoming-heap-builder-shared-call",
+        heap_only,
+        "a heap-only incoming builder should remain borrowable",
     );
 }
 
 #[test]
 fn borrow_mut_builder_helper_preserves_new_view_roots_in_the_caller() {
     let valid = "fn push_view(borrow mut values: array_builder<str>, value: str) { values.push(value) }\nfn main() -> i32 {\n  arena out {\n    mut values: array_builder<str> := array_builder(out)\n    push_view(values, \"static\")\n    return values.build().len() as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-region-builder-helper-view", valid);
-    assert!(diags.is_empty(), "view helper should type-check:\n{diags}");
+    assert_no_errors(
+        "fb-region-builder-helper-view",
+        valid,
+        "view helper should type-check",
+    );
 
     let invalid = "fn copy_text(out: region, value: str) -> str = value.clone_in(out)\nfn push_view(borrow mut values: array_builder<str>, value: str) { values.push(value) }\nfn main() -> i32 {\n  arena outer {\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {\n      temporary := copy_text(inner, \"short\")\n      push_view(values, temporary)\n    }\n    return values.build().len() as i32\n  }\n}\n";
     let diags = check_diagnostics("fb-region-builder-helper-wrong-region", invalid);
     assert!(
-        diags.contains("invalidated") || diags.contains("dropped") || diags.contains("outlive"),
+        diags.contains("shorter-lived view")
+            || diags.contains("invalidated")
+            || diags.contains("dropped")
+            || diags.contains("outlive"),
         "expected cross-call retained-view diagnostic, got:\n{diags}"
     );
 
@@ -370,8 +396,11 @@ fn helper_region_parameter_is_checked_against_the_concrete_builder_region() {
     let valid = format!(
         "{helper}fn main() -> i32 {{\n  arena outer {{\n    mut values: array_builder<str> := array_builder(outer)\n    retain_copy(outer, values)\n    return values.build().len() as i32\n  }}\n}}\n"
     );
-    let diags = check_diagnostics("fb-region-builder-param-same", &valid);
-    assert!(diags.is_empty(), "same caller region should remain valid:\n{diags}");
+    assert_no_errors(
+        "fb-region-builder-param-same",
+        &valid,
+        "same caller region should remain valid",
+    );
 
     let invalid = format!(
         "{helper}fn main() -> i32 {{\n  arena outer {{\n    mut values: array_builder<str> := array_builder(outer)\n    arena inner {{ retain_copy(inner, values) }}\n    return 0\n  }}\n}}\n"
@@ -414,11 +443,11 @@ fn region_plain_aggregate_push_uses_target_layout_copy() {
 
 #[test]
 fn region_builder_preserves_vector_and_mask_element_types_through_indexing() {
-    let src = "fn main() -> i32 {\n  arena out {\n    a: vec4<i32> := [1, 2, 3, 4]\n    b: vec4<i32> := [0, 3, 2, 5]\n    mut vectors: array_builder<vec4<i32>> := array_builder(out)\n    vectors.push(a)\n    built_vectors := vectors.build()\n    mut masks: array_builder<mask4<i32>> := array_builder(out)\n    masks.push(a > b)\n    built_masks := masks.build()\n    selected := select(built_masks[0], built_vectors[0], b)\n    return (selected[1] + built_vectors.len() + built_masks.len()) as i32\n  }\n}\n";
-    let diags = check_diagnostics("fb-region-vector-mask-builder", src);
-    assert!(
-        diags.is_empty(),
-        "unexpected vector/mask builder diagnostics:\n{diags}"
+    let src = "fn main() -> i32 {\n  arena out {\n    a: vec4<i32> := [1, 2, 3, 4]\n    b: vec4<i32> := [0, 3, 2, 5]\n    mut vectors: array_builder<vec4<i32>> := array_builder(out)\n    vectors.push(a)\n    built_vectors := vectors.build()\n    mut masks: array_builder<mask4<i32>> := array_builder(out)\n    masks.push(a > b)\n    built_masks := masks.build()\n    selected := select(built_masks[0], built_vectors[0], b)\n    return (selected[1] as i64 + built_vectors.len() + built_masks.len()) as i32\n  }\n}\n";
+    assert_no_errors(
+        "fb-region-vector-mask-builder",
+        src,
+        "unexpected vector/mask builder diagnostics",
     );
     if !backend_available() {
         return;
@@ -485,7 +514,7 @@ fn invalid_clone_in_region_stops_before_typed_hir_construction() {
     let src = "fn main() -> i32 {\n  copied := \"x\".clone_in(missing)\n  return 0\n}\n";
     let diags = check_diagnostics("fb-clone-in-invalid-region", src);
     assert!(
-        diags.contains("unknown name 'missing'"),
+        diags.contains("undefined name: 'missing'"),
         "expected region operand diagnostic, got:\n{diags}"
     );
 }

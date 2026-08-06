@@ -19,6 +19,39 @@ fn direct_program_name(call: &DirectCall) -> Option<&str> {
     }
 }
 
+#[test]
+fn aggregate_region_builder_source_survives_the_complete_hir_gate() {
+    for (name, source) in [
+        (
+            "vector-new",
+            "fn main() -> i32 { arena out { mut values: array_builder<vec4<i32>> := array_builder(out)\n return 0 } }\n",
+        ),
+        (
+            "vector-push",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n return 0 } }\n",
+        ),
+        (
+            "vector-build",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n built := values.build()\n return built.len() as i32 } }\n",
+        ),
+        (
+            "vector-index",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n built := values.build()\n return built[0][1] } }\n",
+        ),
+        (
+            "mask-build",
+            "fn main() -> i32 { arena out { a: vec4<i32> := [1, 2, 3, 4]\n b: vec4<i32> := [0, 3, 2, 5]\n mut values: array_builder<mask4<i32>> := array_builder(out)\n values.push(a > b)\n built := values.build()\n selected := select(built[0], a, b)\n return selected[1] } }\n",
+        ),
+    ] {
+        let program = checked_source_program(source);
+        assert!(
+            validate_hir::body_only_metadata_is_valid(&program),
+            "{name}: bodies"
+        );
+        assert_eq!(lower_program(&program).fns.len(), 1, "{name}: lowering");
+    }
+}
+
 fn declaration_header_program() -> hir::Program {
     let mut program = baseline_program();
     let slice_i32 = Ty::Slice(scalar_int(32));
@@ -3484,7 +3517,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
     );
     let span = align_span::Span::new(0, 0, 0);
     let elem = ArrayBuilderElem::Scalar(scalar_int(64));
-    let builder_ty = Ty::ArrayBuilder(elem);
+    let builder_ty = Ty::array_builder(elem);
     let mut drop_individual_exprs = std::collections::HashMap::new();
     drop_individual_exprs.insert(span, true);
     let expr = hir::Expr {
@@ -4749,7 +4782,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
         let mut program = baseline_program();
         program.imported_fns.push(ImportedFn {
             name: format!("dep$push_{label}"),
-            params: vec![Ty::ArrayBuilder(element)],
+            params: vec![Ty::array_builder(element)],
             param_modes: vec![align_ast::ParamMode::BorrowMut],
             ret: Ty::Unit,
             return_provenance_known: true,
@@ -4781,15 +4814,11 @@ fn region_only_array_builder_headers_are_placement_valid() {
             "owned_fixed_array",
             AggregateArrayElem::FixedArray(Scalar::String, 2),
         ),
-        (
-            "unknown_fixed_struct_array",
-            AggregateArrayElem::FixedStructArray(99, 2),
-        ),
     ] {
         let mut program = baseline_program();
         program.imported_fns.push(ImportedFn {
             name: format!("dep$invalid_{label}"),
-            params: vec![Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(element))],
+            params: vec![Ty::array_builder(ArrayBuilderElem::Aggregate(element))],
             param_modes: vec![align_ast::ParamMode::BorrowMut],
             ret: Ty::Unit,
             return_provenance_known: true,
@@ -4800,6 +4829,22 @@ fn region_only_array_builder_headers_are_placement_valid() {
         });
         assert_placement_rejected(label, &program);
     }
+
+    let mut unknown_struct = baseline_program();
+    unknown_struct.imported_fns.push(ImportedFn {
+        name: "dep$invalid_unknown_fixed_struct_array".to_string(),
+        params: vec![Ty::array_builder(ArrayBuilderElem::Aggregate(
+            AggregateArrayElem::FixedStructArray(99, 2),
+        ))],
+        param_modes: vec![align_ast::ParamMode::BorrowMut],
+        ret: Ty::Unit,
+        return_provenance_known: true,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
+        effect: FnEffect::Pure,
+    });
+    assert_rejected("unknown_fixed_struct_array", &unknown_struct);
 }
 
 #[test]
@@ -9487,10 +9532,10 @@ fn hir_body_validator_native() {
                 elem: ArrayBuilderElem::Scalar(Scalar::String),
                 region: None,
             },
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String)),
+            Ty::ArrayBuilder(Scalar::String),
         ),
         Vec::new(),
-        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String))
+        Ty::ArrayBuilder(Scalar::String)
     );
     program.fns.push(body_test_named_function(
         "native_named_region_materialization",
@@ -9516,7 +9561,7 @@ fn hir_body_validator_native() {
                                         Ty::ArenaHandle,
                                     ))),
                                 },
-                                Ty::ArrayBuilder(ArrayBuilderElem::Scalar(scalar_int(64))),
+                                Ty::ArrayBuilder(scalar_int(64)),
                             )),
                         ],
                         value: Some(Box::new(body_test_expr(
@@ -9543,7 +9588,7 @@ fn hir_body_validator_native() {
             hir::ExprKind::ArrayBuilderPush {
                 builder: Box::new(native_local(
                     0,
-                    Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String)),
+                    Ty::ArrayBuilder(Scalar::String),
                 )),
                 value: Box::new(body_test_expr(
                     hir::ExprKind::StrClone(Box::new(native_str())),
@@ -9556,7 +9601,7 @@ fn hir_body_validator_native() {
         vec![body_test_local(
             0,
             "builder",
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String)),
+            Ty::ArrayBuilder(Scalar::String),
             true,
             false,
         )],
@@ -9568,7 +9613,7 @@ fn hir_body_validator_native() {
             hir::ExprKind::ArrayBuilderAppend {
                 builder: Box::new(native_local(
                     0,
-                    Ty::ArrayBuilder(ArrayBuilderElem::Scalar(scalar_int(64))),
+                    Ty::ArrayBuilder(scalar_int(64)),
                 )),
                 data: Box::new(native_local(1, Ty::Slice(scalar_int(64)))),
             },
@@ -9578,7 +9623,7 @@ fn hir_body_validator_native() {
             body_test_local(
                 0,
                 "builder",
-                Ty::ArrayBuilder(ArrayBuilderElem::Scalar(scalar_int(64))),
+                Ty::ArrayBuilder(scalar_int(64)),
                 true,
                 false,
             ),
@@ -9591,21 +9636,21 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(
                 0,
-                Ty::ArrayBuilder(ArrayBuilderElem::Scalar(scalar_int(64))),
+                Ty::ArrayBuilder(scalar_int(64)),
             ))),
             Ty::DynArray(scalar_int(64)),
         ),
         vec![body_test_local(
             0,
             "builder",
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(scalar_int(64))),
+            Ty::ArrayBuilder(scalar_int(64)),
             false,
             false,
         )],
         Ty::DynArray(scalar_int(64))
     );
     let vector_element = AggregateArrayElem::Vec(scalar_int(32), 4);
-    let vector_builder = Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(vector_element));
+    let vector_builder = Ty::array_builder(ArrayBuilderElem::Aggregate(vector_element));
     add!(
         "native_aggregate_array_builder_push",
         body_test_expr(
@@ -9633,10 +9678,10 @@ fn hir_body_validator_native() {
         "native_aggregate_array_builder_build",
         body_test_expr(
             hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(0, vector_builder))),
-            Ty::DynAggregateArray(vector_element),
+            Ty::dyn_aggregate_array(vector_element),
         ),
         vec![body_test_local(0, "builder", vector_builder, false, false)],
-        Ty::DynAggregateArray(vector_element)
+        Ty::dyn_aggregate_array(vector_element)
     );
     add!(
         "native_fs_write_file",
@@ -11014,7 +11059,7 @@ fn hir_body_validator_native() {
         panic!("named region fixture lost its builder")
     };
     *elem = ArrayBuilderElem::Scalar(Scalar::String);
-    builder.ty = Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String));
+    builder.ty = Ty::ArrayBuilder(Scalar::String);
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
@@ -11022,7 +11067,7 @@ fn hir_body_validator_native() {
         &mut reject,
         "native_aggregate_array_builder_build",
     );
-    expression.ty = Ty::DynAggregateArray(AggregateArrayElem::Mask(scalar_int(32), 4));
+    expression.ty = Ty::dyn_aggregate_array(AggregateArrayElem::Mask(scalar_int(32), 4));
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
@@ -12743,7 +12788,7 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
         Ty::Array(Scalar::Bool, 0),
         Ty::Slice(Scalar::Str),
         Ty::DynArray(Scalar::String),
-        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String)),
+        Ty::ArrayBuilder(Scalar::String),
         Ty::Task(Scalar::Struct(0)),
     ] {
         assert_graph_accepted("wrapper-type", &with_return(ty));

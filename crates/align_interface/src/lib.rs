@@ -318,8 +318,23 @@ fn apply_function_cleanup_metadata(
                 | align_sema::Ty::Mask(value, _) => {
                     vec![align_sema::scalar_to_ty(value)]
                 }
-                align_sema::Ty::ArrayBuilder(value) => vec![value.ty()],
-                align_sema::Ty::DynAggregateArray(value) => vec![value.ty()],
+                align_sema::Ty::ArrayBuilder(value) => {
+                    vec![align_sema::scalar_to_ty(value)]
+                }
+                ty @ (align_sema::Ty::VecArrayBuilder(..)
+                | align_sema::Ty::MaskArrayBuilder(..)
+                | align_sema::Ty::FixedArrayBuilder(..)
+                | align_sema::Ty::FixedStructArrayBuilder(..)) => vec![ty
+                    .array_builder_element()
+                    .expect("matched aggregate builder")
+                    .ty()],
+                ty @ (align_sema::Ty::DynVecArray(..)
+                | align_sema::Ty::DynMaskArray(..)
+                | align_sema::Ty::DynFixedArray(..)
+                | align_sema::Ty::DynFixedStructArray(..)) => vec![ty
+                    .dyn_aggregate_array_element()
+                    .expect("matched aggregate array")
+                    .ty()],
                 align_sema::Ty::Result(ok, err) => vec![
                     align_sema::scalar_to_ty(ok),
                     align_sema::scalar_to_ty(err),

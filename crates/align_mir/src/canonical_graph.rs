@@ -688,8 +688,23 @@ impl<'a> GraphValidator<'a> {
             | Ty::Task(value) => {
                 self.scan_scalar(value, references, None)
             }
-            Ty::ArrayBuilder(value) => self.scan_array_builder_elem(value, references),
-            Ty::DynAggregateArray(value) => self.scan_aggregate_array_elem(value, references),
+            Ty::ArrayBuilder(value) => {
+                self.scan_array_builder_elem(ArrayBuilderElem::Scalar(value), references)
+            }
+            value @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => self.scan_array_builder_elem(
+                value.array_builder_element().expect("matched aggregate builder"),
+                references,
+            ),
+            value @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => self.scan_aggregate_array_elem(
+                value.dyn_aggregate_array_element().expect("matched aggregate array"),
+                references,
+            ),
             Ty::Result(ok, err) => {
                 self.scan_scalar(ok, references, inline_from);
                 self.scan_scalar(err, references, inline_from);
@@ -1619,7 +1634,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         23 => Ok(Ty::Writer),
         24 => Ok(Ty::Reader),
         25 => Ok(Ty::Buffer),
-        26 => Ok(Ty::ArrayBuilder(decode_array_builder_elem(cursor)?)),
+        26 => Ok(Ty::array_builder(decode_array_builder_elem(cursor)?)),
         27 => Ok(Ty::StrFinder),
         28 => Ok(Ty::File),
         29 => Ok(Ty::Rng),
@@ -1652,7 +1667,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         56 => Ok(Ty::Unit),
         57 => Ok(Ty::Resource(node(cursor)?)),
         58 => Ok(Ty::ResourceRef(node(cursor)?)),
-        59 => Ok(Ty::DynAggregateArray(decode_aggregate_array_elem(cursor)?)),
+        59 => Ok(Ty::dyn_aggregate_array(decode_aggregate_array_elem(cursor)?)),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1730,31 +1745,6 @@ fn remap_decoded_scalar(
     Ok(())
 }
 
-fn remap_decoded_aggregate_array_elem(
-    value: &mut AggregateArrayElem,
-    resolved: &[(u8, u32)],
-) -> Result<(), CanonicalCodecError> {
-    match value {
-        AggregateArrayElem::Vec(value, _)
-        | AggregateArrayElem::Mask(value, _)
-        | AggregateArrayElem::FixedArray(value, _) => remap_decoded_scalar(value, resolved),
-        AggregateArrayElem::FixedStructArray(id, _) => {
-            *id = resolve_decoded_node(*id, 0, resolved)?;
-            Ok(())
-        }
-    }
-}
-
-fn remap_decoded_array_builder_elem(
-    value: &mut ArrayBuilderElem,
-    resolved: &[(u8, u32)],
-) -> Result<(), CanonicalCodecError> {
-    match value {
-        ArrayBuilderElem::Scalar(value) => remap_decoded_scalar(value, resolved),
-        ArrayBuilderElem::Aggregate(value) => remap_decoded_aggregate_array_elem(value, resolved),
-    }
-}
-
 fn remap_decoded_ty(value: &mut Ty, resolved: &[(u8, u32)]) -> Result<(), CanonicalCodecError> {
     match value {
         Ty::Option(value)
@@ -1765,8 +1755,17 @@ fn remap_decoded_ty(value: &mut Ty, resolved: &[(u8, u32)]) -> Result<(), Canoni
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => remap_decoded_scalar(value, resolved),
-        Ty::ArrayBuilder(value) => remap_decoded_array_builder_elem(value, resolved),
-        Ty::DynAggregateArray(value) => remap_decoded_aggregate_array_elem(value, resolved),
+        Ty::ArrayBuilder(value) => remap_decoded_scalar(value, resolved),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => remap_decoded_scalar(value, resolved),
+        Ty::FixedStructArrayBuilder(id, _) | Ty::DynFixedStructArray(id, _) => {
+            *id = resolve_decoded_node(*id, 0, resolved)?;
+            Ok(())
+        }
         Ty::Result(ok, err) => {
             remap_decoded_scalar(ok, resolved)?;
             remap_decoded_scalar(err, resolved)
@@ -2267,22 +2266,6 @@ fn scalar_nodes(value: Scalar) -> Vec<Node> {
     }
 }
 
-fn aggregate_array_elem_nodes(value: AggregateArrayElem) -> Vec<Node> {
-    match value {
-        AggregateArrayElem::Vec(value, _)
-        | AggregateArrayElem::Mask(value, _)
-        | AggregateArrayElem::FixedArray(value, _) => scalar_nodes(value),
-        AggregateArrayElem::FixedStructArray(id, _) => vec![Node::Struct(id)],
-    }
-}
-
-fn array_builder_elem_nodes(value: ArrayBuilderElem) -> Vec<Node> {
-    match value {
-        ArrayBuilderElem::Scalar(value) => scalar_nodes(value),
-        ArrayBuilderElem::Aggregate(value) => aggregate_array_elem_nodes(value),
-    }
-}
-
 fn type_nodes(value: Ty) -> Vec<Node> {
     match value {
         Ty::Option(value)
@@ -2293,8 +2276,16 @@ fn type_nodes(value: Ty) -> Vec<Node> {
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => scalar_nodes(value),
-        Ty::ArrayBuilder(value) => array_builder_elem_nodes(value),
-        Ty::DynAggregateArray(value) => aggregate_array_elem_nodes(value),
+        Ty::ArrayBuilder(value) => scalar_nodes(value),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => scalar_nodes(value),
+        Ty::FixedStructArrayBuilder(id, _) | Ty::DynFixedStructArray(id, _) => {
+            vec![Node::Struct(id)]
+        }
         Ty::Result(ok, err) => {
             let mut nodes = scalar_nodes(ok);
             nodes.extend(scalar_nodes(err));
@@ -2625,7 +2616,18 @@ fn ty(
             Ty::Buffer => leaf!(25),
             Ty::ArrayBuilder(v) => {
                 out.push(26);
-                array_builder_elem(out, v, ordinal)
+                array_builder_elem(out, ArrayBuilderElem::Scalar(v), ordinal)
+            }
+            value @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => {
+                out.push(26);
+                array_builder_elem(
+                    out,
+                    value.array_builder_element().expect("matched aggregate builder"),
+                    ordinal,
+                )
             }
             Ty::StrFinder => leaf!(27),
             Ty::File => leaf!(28),
@@ -2667,9 +2669,16 @@ fn ty(
             Ty::Unit => leaf!(56),
             Ty::Resource(id) => node!(57, Resource, id),
             Ty::ResourceRef(id) => node!(58, Resource, id),
-            Ty::DynAggregateArray(value) => {
+            value @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => {
                 out.push(59);
-                aggregate_array_elem(out, value, ordinal)
+                aggregate_array_elem(
+                    out,
+                    value.dyn_aggregate_array_element().expect("matched aggregate array"),
+                    ordinal,
+                )
             }
             Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
@@ -2890,15 +2899,13 @@ fn remap_ty_fn(value: &mut Ty, remap: &[Option<u32>]) {
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => remap_scalar_fn(value, remap),
-        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(value)) => remap_scalar_fn(value, remap),
-        Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(value)) | Ty::DynAggregateArray(value) => {
-            match value {
-                AggregateArrayElem::Vec(value, _)
-                | AggregateArrayElem::Mask(value, _)
-                | AggregateArrayElem::FixedArray(value, _) => remap_scalar_fn(value, remap),
-                AggregateArrayElem::FixedStructArray(..) => {}
-            }
-        }
+        Ty::ArrayBuilder(value) => remap_scalar_fn(value, remap),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => remap_scalar_fn(value, remap),
         Ty::Result(ok, err) => {
             remap_scalar_fn(ok, remap);
             remap_scalar_fn(err, remap);
@@ -3449,17 +3456,17 @@ mod tests {
             Ty::Writer,
             Ty::Reader,
             Ty::Buffer,
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::Bool)),
-            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
+            Ty::ArrayBuilder(Scalar::Bool),
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
                 Scalar::Int(i(8)),
                 2,
             ))),
-            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Mask(
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Mask(
                 Scalar::Float(f(32)),
                 4,
             ))),
-            Ty::DynAggregateArray(AggregateArrayElem::FixedArray(Scalar::Bool, 2)),
-            Ty::DynAggregateArray(AggregateArrayElem::FixedStructArray(0, 2)),
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedArray(Scalar::Bool, 2)),
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(0, 2)),
             Ty::StrFinder,
             Ty::File,
             Ty::Rng,
@@ -3558,7 +3565,7 @@ mod tests {
             &program,
         )
         .unwrap();
-        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 56, 0, 0, 0]);
+        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 56, 0, 0, 0]);
         assert_eq!(CanonicalFnAbi::decode(abi.as_bytes()).unwrap(), abi);
 
         let params = [(ParamMode::ByValue, Ty::Fn(0))];
@@ -3620,16 +3627,16 @@ mod tests {
         error(&trailing, CanonicalCodecError::TrailingBytes);
 
         let invalid_utf8 = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_utf8, CanonicalCodecError::InvalidUtf8);
         let embedded_nul = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&embedded_nul, CanonicalCodecError::EmbeddedNul);
 
         let invalid_align = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_align, CanonicalCodecError::InvalidGraph);
 
@@ -3653,7 +3660,7 @@ mod tests {
         error(&recursive, CanonicalCodecError::InvalidGraph);
 
         let duplicate_function = [
-            2, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
+            3, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&duplicate_function, CanonicalCodecError::DuplicateMember);
 
@@ -3664,7 +3671,7 @@ mod tests {
         );
 
         let invalid_summary = [
-            2, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&invalid_summary, CanonicalCodecError::InvalidSummary);
 
@@ -3949,8 +3956,8 @@ mod tests {
             Ty::DynArray(Scalar::Bool) => [16, 2], Ty::DynResponseArray => [17],
             Ty::Str => [18], Ty::String => [19], Ty::ArenaHandle => [20], Ty::Raw => [21],
             Ty::Builder => [22], Ty::Writer => [23], Ty::Reader => [24], Ty::Buffer => [25],
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::Bool)) => [26, 0, 2],
-            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
+            Ty::ArrayBuilder(Scalar::Bool) => [26, 0, 2],
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
                 Scalar::Int(i(8)), 2,
             )))
                 => [26, 1, 0, 0, 1, 8, 2, 0, 0, 0],
@@ -3969,11 +3976,11 @@ mod tests {
             Ty::DictEncoded(1, 2) => [55, 1, 0x10, 0, 0, 2, 0, 0, 0], Ty::Unit => [56],
             Ty::Resource(1) => [57, 1, 0x60, 0, 0],
             Ty::ResourceRef(1) => [58, 1, 0x60, 0, 0],
-            Ty::DynAggregateArray(AggregateArrayElem::FixedArray(Scalar::Bool, 2))
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedArray(Scalar::Bool, 2))
                 => [59, 2, 2, 2, 0, 0, 0],
-            Ty::DynAggregateArray(AggregateArrayElem::Mask(Scalar::Float(f(32)), 4))
+            Ty::dyn_aggregate_array(AggregateArrayElem::Mask(Scalar::Float(f(32)), 4))
                 => [59, 1, 1, 32, 4, 0, 0, 0],
-            Ty::DynAggregateArray(AggregateArrayElem::FixedStructArray(1, 2))
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );
     }

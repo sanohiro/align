@@ -12,7 +12,7 @@
 
 use align_ast::{BinOp, UnOp};
 use align_sema::{
-    AggregateArrayElem, ArrayBuilderElem, DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
     may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
 };
 use align_span::{SourceMap, Span};
@@ -1995,16 +1995,13 @@ fn canonicalize_tagged_types(program: &mut Program) {
             | Ty::Task(s) => {
                 collect_scalar(s, table, reachable)
             }
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(s)) => collect_scalar(s, table, reachable),
-            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(elem))
-            | Ty::DynAggregateArray(elem) => {
-                match elem {
-                    AggregateArrayElem::Vec(s, _)
-                    | AggregateArrayElem::Mask(s, _)
-                    | AggregateArrayElem::FixedArray(s, _) => collect_scalar(s, table, reachable),
-                    AggregateArrayElem::FixedStructArray(..) => {}
-                }
-            }
+            Ty::ArrayBuilder(s) => collect_scalar(s, table, reachable),
+            Ty::VecArrayBuilder(s, _)
+            | Ty::MaskArrayBuilder(s, _)
+            | Ty::FixedArrayBuilder(s, _)
+            | Ty::DynVecArray(s, _)
+            | Ty::DynMaskArray(s, _)
+            | Ty::DynFixedArray(s, _) => collect_scalar(s, table, reachable),
             Ty::Result(ok, err) => {
                 collect_scalar(ok, table, reachable);
                 collect_scalar(err, table, reachable);
@@ -2175,16 +2172,13 @@ fn canonicalize_tagged_types(program: &mut Program) {
             | Ty::Task(s) => {
                 remap_scalar(s, remap)
             }
-            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(s)) => remap_scalar(s, remap),
-            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(elem))
-            | Ty::DynAggregateArray(elem) => {
-                match elem {
-                    AggregateArrayElem::Vec(s, _)
-                    | AggregateArrayElem::Mask(s, _)
-                    | AggregateArrayElem::FixedArray(s, _) => remap_scalar(s, remap),
-                    AggregateArrayElem::FixedStructArray(..) => {}
-                }
-            }
+            Ty::ArrayBuilder(s) => remap_scalar(s, remap),
+            Ty::VecArrayBuilder(s, _)
+            | Ty::MaskArrayBuilder(s, _)
+            | Ty::FixedArrayBuilder(s, _)
+            | Ty::DynVecArray(s, _)
+            | Ty::DynMaskArray(s, _)
+            | Ty::DynFixedArray(s, _) => remap_scalar(s, remap),
             Ty::Result(ok, err) => {
                 remap_scalar(ok, remap);
                 remap_scalar(err, remap);
@@ -8198,8 +8192,15 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         // `array<Struct>` loads a whole struct element; an `array<response>` loads a `response` handle
         // pointer (the receiver-borrow of `rs[i].status()` etc. — `elem_ty` = `HttpResponse`). All by
         // `elem_ty` via `SliceIndex`.
-        Ty::Slice(_) | Ty::DynArray(_)
-        | Ty::DynAggregateArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
+        Ty::Slice(_)
+        | Ty::DynArray(_)
+        | Ty::DynVecArray(..)
+        | Ty::DynMaskArray(..)
+        | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..)
+        | Ty::DynSliceArray(_)
+        | Ty::DynStructArray(..)
+        | Ty::DynResponseArray => {
             let sv = lower_borrowed_owned(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
@@ -14734,7 +14735,13 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         // Keep the human-readable MIR type name element-aware.
         Ty::DynArray(s) => format!("array<{}>", ty_name(align_sema::scalar_to_ty(s))),
-        Ty::DynAggregateArray(elem) => format!("array<{}>", ty_name(elem.ty())),
+        ty @ (Ty::DynVecArray(..)
+        | Ty::DynMaskArray(..)
+        | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..)) => format!(
+            "array<{}>",
+            ty_name(ty.dyn_aggregate_array_element().expect("matched aggregate array").ty())
+        ),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
         Ty::DynResponseArray => "array<response>".to_string(),
@@ -14746,7 +14753,16 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
-        Ty::ArrayBuilder(element) => format!("array_builder<{}>", ty_name(element.ty())),
+        Ty::ArrayBuilder(element) => {
+            format!("array_builder<{}>", ty_name(align_sema::scalar_to_ty(element)))
+        }
+        ty @ (Ty::VecArrayBuilder(..)
+        | Ty::MaskArrayBuilder(..)
+        | Ty::FixedArrayBuilder(..)
+        | Ty::FixedStructArrayBuilder(..)) => format!(
+            "array_builder<{}>",
+            ty_name(ty.array_builder_element().expect("matched aggregate builder").ty())
+        ),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),
