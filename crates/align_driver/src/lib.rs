@@ -31,6 +31,8 @@ pub use static_inputs::{
     ResolvedStaticInput, StaticConsumerKind, StaticInput, StaticInputError, StaticInputManifest,
     STATIC_INPUT_MANIFEST_FORMAT_VERSION, STATIC_INPUT_MANIFEST_MAGIC,
 };
+// Keep the driver selector types alongside the resolver so callers do not need
+// to depend on the interface crate just to construct a static input request.
 pub use align_interface::{Driver, DriverRestriction};
 
 /// Result of running the pipeline through sema.
