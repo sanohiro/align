@@ -10,6 +10,7 @@ use align_interface::{Driver, DriverRestriction, Hash128, SqlSourceIdentity};
 use align_span::{FileId, SourceMap};
 use std::cmp::Ordering;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 pub const STATIC_INPUT_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -356,9 +357,8 @@ fn read_static_bytes(
     if !canonical.is_file() {
         return Err(StaticInputError::NotRegularFile(canonical));
     }
-    let bytes = fs::read(&canonical).map_err(|e| StaticInputError::Io {
-        path: canonical.clone(),
-        message: e.to_string(),
+    let bytes = read_bounded_file(&canonical, || {
+        StaticInputError::NonCanonical(format!("static input exceeds the field limit: {logical}"))
     })?;
     if std::str::from_utf8(&bytes).is_err() {
         return Err(StaticInputError::InvalidUtf8 {
@@ -521,8 +521,9 @@ pub fn snapshot_checked_metadata(
     let path = root.join(logical.replace('/', std::path::MAIN_SEPARATOR_STR));
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
-            let bytes = read_metadata_bytes(&root, &path)?;
-            let format_version = parse_metadata_format_version(&bytes, &logical)?;
+            let bytes = read_metadata_bytes(&root, &path, &logical)?;
+            let format_version =
+                parse_metadata_format_version(&bytes, &logical, descriptor_id, driver)?;
             Ok(CheckedMetadataInput {
                 driver,
                 logical_path: logical,
@@ -551,6 +552,8 @@ pub fn snapshot_checked_metadata(
 fn parse_metadata_format_version(
     bytes: &[u8],
     logical_path: &str,
+    descriptor_id: &str,
+    driver: Driver,
 ) -> Result<u32, StaticInputError> {
     if bytes.len() > MAX_FIELD_BYTES {
         return Err(StaticInputError::MetadataMalformed {
@@ -568,7 +571,7 @@ fn parse_metadata_format_version(
     }
     let mut parser = MetadataJsonParser::new(&bytes[..bytes.len() - 1]);
     parser
-        .parse_metadata_object()
+        .parse_metadata_object(descriptor_id, driver)
         .map_err(|_| StaticInputError::MetadataMalformed {
             logical_path: logical_path.to_string(),
         })
@@ -621,7 +624,7 @@ impl<'a> MetadataJsonParser<'a> {
         Self { bytes, position: 0 }
     }
 
-    fn parse_metadata_object(&mut self) -> Result<u32, ()> {
+    fn parse_metadata_object(&mut self, descriptor_id: &str, driver: Driver) -> Result<u32, ()> {
         self.expect_byte(b'{')?;
         for (index, expected_key) in METADATA_TOP_LEVEL_KEYS.iter().enumerate() {
             if index != 0 {
@@ -632,14 +635,27 @@ impl<'a> MetadataJsonParser<'a> {
                 return Err(());
             }
             self.expect_byte(b':')?;
-            let kind = if index == 0 {
-                let number = self.parse_number()?;
-                if number != b"1" {
-                    return Err(());
+            let kind = match index {
+                0 => {
+                    let number = self.parse_number()?;
+                    if number != b"1" {
+                        return Err(());
+                    }
+                    MetadataJsonKind::Number
                 }
-                MetadataJsonKind::Number
-            } else {
-                self.parse_value(0)?.0
+                1 | 4 => {
+                    let value = decode_canonical_json_string(self.parse_string()?)?;
+                    let expected = if index == 1 {
+                        descriptor_id
+                    } else {
+                        driver_dir(driver)
+                    };
+                    if value != expected {
+                        return Err(());
+                    }
+                    MetadataJsonKind::String
+                }
+                _ => self.parse_value(0)?.0,
             };
             if !metadata_top_level_kind_is_valid(index, kind) {
                 return Err(());
@@ -766,7 +782,8 @@ impl<'a> MetadataJsonParser<'a> {
                             let value = digits.iter().try_fold(0u32, |value, digit| {
                                 Some(value * 16 + hex_value(*digit)?)
                             });
-                            if value.ok_or(())? > 0x1f {
+                            let value = value.ok_or(())?;
+                            if value > 0x1f || matches!(value, 0x08 | 0x09 | 0x0a | 0x0c | 0x0d) {
                                 return Err(());
                             }
                             self.position += 5;
@@ -840,6 +857,43 @@ impl<'a> MetadataJsonParser<'a> {
     }
 }
 
+fn decode_canonical_json_string(raw: &[u8]) -> Result<String, ()> {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut position = 0;
+    while position < raw.len() {
+        if raw[position] != b'\\' {
+            let byte = raw[position];
+            if byte < 0x20 {
+                return Err(());
+            }
+            decoded.push(byte);
+            position += 1;
+            continue;
+        }
+        position += 1;
+        match raw.get(position).copied() {
+            Some(b'"') => decoded.push(b'"'),
+            Some(b'\\') => decoded.push(b'\\'),
+            Some(b'b') => decoded.push(0x08),
+            Some(b'f') => decoded.push(0x0c),
+            Some(b'n') => decoded.push(b'\n'),
+            Some(b'r') => decoded.push(b'\r'),
+            Some(b't') => decoded.push(b'\t'),
+            Some(b'u') => {
+                let digits = raw.get(position + 1..position + 5).ok_or(())?;
+                let value = digits
+                    .iter()
+                    .try_fold(0u32, |value, digit| Some(value * 16 + hex_value(*digit)?));
+                decoded.push(u8::try_from(value.ok_or(())?).map_err(|_| ())?);
+                position += 4;
+            }
+            _ => return Err(()),
+        }
+        position += 1;
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
 fn hex_value(byte: u8) -> Option<u32> {
     match byte {
         b'0'..=b'9' => Some(u32::from(byte - b'0')),
@@ -859,15 +913,49 @@ fn metadata_top_level_kind_is_valid(index: usize, kind: MetadataJsonKind) -> boo
     }
 }
 
-fn read_metadata_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, StaticInputError> {
+fn read_bounded_file(
+    path: &Path,
+    too_large: impl Fn() -> StaticInputError,
+) -> Result<Vec<u8>, StaticInputError> {
+    let file = fs::File::open(path).map_err(|e| StaticInputError::Io {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    let length = file
+        .metadata()
+        .map_err(|e| StaticInputError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?
+        .len();
+    if length > MAX_FIELD_BYTES as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_FIELD_BYTES));
+    file.take(MAX_FIELD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| StaticInputError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+    if bytes.len() > MAX_FIELD_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+fn read_metadata_bytes(
+    root: &Path,
+    path: &Path,
+    logical_path: &str,
+) -> Result<Vec<u8>, StaticInputError> {
     let canonical = fs::canonicalize(path).map_err(|e| StaticInputError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
     ensure_inside(root, &canonical)?;
-    fs::read(&canonical).map_err(|e| StaticInputError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
+    read_bounded_file(&canonical, || StaticInputError::MetadataMalformed {
+        logical_path: logical_path.to_string(),
     })
 }
 
@@ -1144,8 +1232,13 @@ fn revalidate_metadata(
     );
     let current = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
-            let bytes = read_metadata_bytes(root, &path)?;
-            let format_version = parse_metadata_format_version(&bytes, &expected.logical_path)?;
+            let bytes = read_metadata_bytes(root, &path, &expected.logical_path)?;
+            let format_version = parse_metadata_format_version(
+                &bytes,
+                &expected.logical_path,
+                &input.descriptor_id,
+                expected.driver,
+            )?;
             Some((Hash128::of(&bytes), format_version))
         }
         Ok(_) => return Err(StaticInputError::NotRegularFile(path)),
@@ -1745,6 +1838,30 @@ mod tests {
     }
 
     #[test]
+    fn oversized_static_file_is_rejected_before_reading_contents() {
+        let root = temp_root("oversized-sql");
+        let module = root.join("q.align");
+        write(&module, "module q\n").expect("align source");
+        let sql = root.join("q.sql");
+        let file = std::fs::File::create(&sql).expect("oversized SQL");
+        file.set_len((MAX_FIELD_BYTES as u64) + 1)
+            .expect("SQL length");
+        drop(file);
+        assert!(matches!(
+            resolve_static_file(
+                &root,
+                &module,
+                None,
+                "q.query",
+                StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
+                None,
+            ),
+            Err(StaticInputError::NonCanonical(_))
+        ));
+    }
+
+    #[test]
     fn inline_does_not_resolve_a_file_and_identity_is_descriptor_bound() {
         let resolved = resolve_inline_static_input(
             "q.query",
@@ -1845,6 +1962,29 @@ mod tests {
         ));
 
         write(&path, metadata_json(2, "00000000000000000000000000000000")).expect("v2 metadata");
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+
+        let mut mismatched_identity = metadata_json(1, "00000000000000000000000000000000");
+        let marker = b"q.query";
+        let offset = mismatched_identity
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("descriptor identity marker");
+        mismatched_identity[offset] = b'x';
+        write(&path, mismatched_identity).expect("mismatched metadata identity");
+        assert!(matches!(
+            snapshot_checked_metadata(&root, id, Driver::SQLite),
+            Err(StaticInputError::MetadataMalformed { .. })
+        ));
+
+        let oversized = std::fs::File::create(&path).expect("oversized metadata");
+        oversized
+            .set_len((MAX_FIELD_BYTES as u64) + 1)
+            .expect("metadata length");
+        drop(oversized);
         assert!(matches!(
             snapshot_checked_metadata(&root, id, Driver::SQLite),
             Err(StaticInputError::MetadataMalformed { .. })
