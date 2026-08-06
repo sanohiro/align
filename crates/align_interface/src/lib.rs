@@ -312,13 +312,14 @@ fn apply_function_cleanup_metadata(
                 | align_sema::Ty::Box(value)
                 | align_sema::Ty::Slice(value)
                 | align_sema::Ty::DynArray(value)
-                | align_sema::Ty::ArrayBuilder(value)
                 | align_sema::Ty::Task(value)
                 | align_sema::Ty::Array(value, _)
                 | align_sema::Ty::Vec(value, _)
                 | align_sema::Ty::Mask(value, _) => {
                     vec![align_sema::scalar_to_ty(value)]
                 }
+                align_sema::Ty::ArrayBuilder(value) => vec![value.ty()],
+                align_sema::Ty::DynAggregateArray(value) => vec![value.ty()],
                 align_sema::Ty::Result(ok, err) => vec![
                     align_sema::scalar_to_ty(ok),
                     align_sema::scalar_to_ty(err),

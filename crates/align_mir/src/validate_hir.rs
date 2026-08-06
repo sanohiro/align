@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
+use align_sema::{
+    AggregateArrayElem, ArrayBuilderElem, Layout, PrimScalar, Scalar, Ty, hir,
+};
 use align_span::Span;
 
 use super::canonical_graph::Node;
@@ -1229,6 +1231,7 @@ impl<'a> PlacementValidator<'a> {
                 !matches!(element, Scalar::Struct(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
+            Ty::DynAggregateArray(element) => self.aggregate_array_element_ok(element),
             Ty::Soa(id) => self.soa_ok(id),
             Ty::ArrayBuilder(element) => self.array_builder_element_ok(element),
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),
@@ -1284,20 +1287,51 @@ impl<'a> PlacementValidator<'a> {
     /// Mirror the exact union admitted by source `array_builder<T>` type formation. Constructor
     /// validation separately selects the heap subset or recursively checks concrete RegionPlain;
     /// this header gate only proves that the stored scalar graph is a valid source spelling.
-    fn array_builder_element_ok(&self, element: Scalar) -> bool {
-        matches!(
-            element,
-            Scalar::Int(_)
-                | Scalar::Float(_)
-                | Scalar::Bool
-                | Scalar::Char
-                | Scalar::String
-                | Scalar::Str
-                | Scalar::Slice(_)
-                | Scalar::Struct(_)
-                | Scalar::Enum(_)
-                | Scalar::Tagged(_)
-        ) && self.resolve_type_ok(align_sema::scalar_to_ty(element), false)
+    fn aggregate_array_element_ok(&self, element: AggregateArrayElem) -> bool {
+        let shape_ok = match element {
+            AggregateArrayElem::Vec(scalar, lanes)
+            | AggregateArrayElem::Mask(scalar, lanes) => {
+                matches!(lanes, 2 | 4 | 8 | 16)
+                    && matches!(scalar, Scalar::Int(_) | Scalar::Float(_))
+                    && self.resolve_type_ok(element.ty(), false)
+            }
+            AggregateArrayElem::FixedArray(scalar, length) => {
+                length > 0
+                    && !matches!(scalar, Scalar::Struct(_))
+                    && self.scalar_ok(scalar, ScalarPlacement::Collection)
+            }
+            AggregateArrayElem::FixedStructArray(id, length) => {
+                length > 0 && self.program.structs.get(id as usize).is_some()
+            }
+        };
+        shape_ok
+            && align_sema::region_plain_type_ok(
+                element.ty(),
+                &self.program.structs,
+                &self.program.enums,
+                &self.program.tagged_types,
+            )
+    }
+
+    fn array_builder_element_ok(&self, element: ArrayBuilderElem) -> bool {
+        match element {
+            ArrayBuilderElem::Scalar(element) => {
+                matches!(
+                    element,
+                    Scalar::Int(_)
+                        | Scalar::Float(_)
+                        | Scalar::Bool
+                        | Scalar::Char
+                        | Scalar::String
+                        | Scalar::Str
+                        | Scalar::Slice(_)
+                        | Scalar::Struct(_)
+                        | Scalar::Enum(_)
+                        | Scalar::Tagged(_)
+                ) && self.resolve_type_ok(align_sema::scalar_to_ty(element), false)
+            }
+            ArrayBuilderElem::Aggregate(element) => self.aggregate_array_element_ok(element),
+        }
     }
 
     fn source_function_type_ok(&self, ty: Ty, parameter: bool, return_position: bool) -> bool {
@@ -1648,8 +1682,21 @@ impl<'a> Validator<'a> {
             Ty::Box(payload)
             | Ty::Slice(payload)
             | Ty::DynArray(payload)
-            | Ty::ArrayBuilder(payload)
             | Ty::Task(payload) => self.inspect_scalar(payload, Edge::Header, facts),
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(payload)) => {
+                self.inspect_scalar(payload, Edge::Header, facts)
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(payload))
+            | Ty::DynAggregateArray(payload) => match payload {
+                AggregateArrayElem::Vec(scalar, _)
+                | AggregateArrayElem::Mask(scalar, _)
+                | AggregateArrayElem::FixedArray(scalar, _) => {
+                    self.inspect_scalar(scalar, Edge::Header, facts)
+                }
+                AggregateArrayElem::FixedStructArray(id, _) => {
+                    self.push_ref(Node::Struct(id), Edge::Header, facts)
+                }
+            },
             Ty::StructArray(id, _) => self.push_ref(Node::Struct(id), edge, facts),
             Ty::DynStructArray(id, _) | Ty::Soa(id) | Ty::JsonScanner(id) => {
                 self.push_ref(Node::Struct(id), Edge::Header, facts)
@@ -2620,6 +2667,9 @@ impl<'a> BodyValidator<'a> {
             Ty::DynArray(element) => {
                 !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
+            Ty::DynAggregateArray(element) => {
+                self.body_ty_ok(element.ty()) && self.region_plain_ty_ok(element.ty())
+            }
             Ty::DynResponseArray => true,
             Ty::Soa(id) => self.soa_type_ok(id),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
@@ -2631,7 +2681,10 @@ impl<'a> BodyValidator<'a> {
             }
             Ty::Task(payload) => primitive_task_scalar(payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
-            Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(element)) => self.body_scalar_ok(element),
+            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(element)) => {
+                self.body_ty_ok(element.ty()) && self.region_plain_ty_ok(element.ty())
+            }
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),
             Ty::DictEncoded(id, field) => self
                 .program
@@ -2830,8 +2883,18 @@ impl<'a> BodyValidator<'a> {
                         | (Ty::Slice(actual), Ty::Slice(expected))
                         | (Ty::DynArray(actual), Ty::DynArray(expected))
                         | (Ty::Task(actual), Ty::Task(expected))
-                        | (Ty::ArrayBuilder(actual), Ty::ArrayBuilder(expected)) => {
+                        | (
+                            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(actual)),
+                            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(expected)),
+                        ) => {
                             work.push(Pending::Scalar(actual, expected));
+                        }
+                        (
+                            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(actual)),
+                            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(expected)),
+                        )
+                        | (Ty::DynAggregateArray(actual), Ty::DynAggregateArray(expected)) => {
+                            work.push(Pending::Ty(actual.ty(), expected.ty()));
                         }
                         (Ty::Result(actual_ok, actual_err), Ty::Result(expected_ok, expected_err)) => {
                             work.push(Pending::Scalar(actual_ok, expected_ok));
@@ -3840,13 +3903,16 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
-    fn array_builder_elem_ok(&self, elem: Scalar) -> bool {
+    fn array_builder_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        let ArrayBuilderElem::Scalar(elem) = elem else {
+            return false;
+        };
         align_sema::scalar_to_prim(elem).is_some()
             && (elem == Scalar::String || self.scalar_copy_ok(elem))
     }
 
-    fn array_builder_region_elem_ok(&self, elem: Scalar) -> bool {
-        self.region_plain_ty_ok(align_sema::scalar_to_ty(elem))
+    fn array_builder_region_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        self.region_plain_ty_ok(elem.ty())
     }
 
     fn region_plain_ty_ok(&self, ty: Ty) -> bool {
@@ -6500,8 +6566,9 @@ impl<'a> BodyValidator<'a> {
                 };
                 if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
                     || !mutable_local(builder, Ty::ArrayBuilder(elem))
-                    || !self.body_ty_matches(value.ty, align_sema::scalar_to_ty(elem))
-                    || *moves_value != (elem == Scalar::String)
+                    || !self.body_ty_matches(value.ty, elem.ty())
+                    || *moves_value
+                        != matches!(elem, ArrayBuilderElem::Scalar(Scalar::String))
                 {
                     return None;
                 }
@@ -6511,11 +6578,14 @@ impl<'a> BodyValidator<'a> {
                 let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
                     return None;
                 };
+                let ArrayBuilderElem::Scalar(scalar) = elem else {
+                    return None;
+                };
                 if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
-                    || elem == Scalar::String
-                    || !self.scalar_copy_ok(elem)
+                    || scalar == Scalar::String
+                    || !self.scalar_copy_ok(scalar)
                     || !mutable_local(builder, Ty::ArrayBuilder(elem))
-                    || data.ty != Ty::Slice(elem)
+                    || data.ty != Ty::Slice(scalar)
                 {
                     return None;
                 }
@@ -6525,10 +6595,7 @@ impl<'a> BodyValidator<'a> {
                 let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
                     return None;
                 };
-                let result = match elem {
-                    Scalar::Struct(id) => Ty::DynStructArray(id, align_sema::Layout::Aos),
-                    _ => Ty::DynArray(elem),
-                };
+                let result = align_sema::array_builder_result_ty(elem);
                 strict(result, &[builder])
             }
             hir::ExprKind::FsWriteFile { path, data, builder } => {
@@ -7070,6 +7137,7 @@ impl<'a> BodyValidator<'a> {
             // A scanner is owned by the later JSON slice. Keeping it out here also prevents the
             // array reducers from taking the Result<T, Error> scanner ABI by accident.
             Ty::DynStructArray(_, Layout::Soa)
+            | Ty::DynAggregateArray(_)
             | Ty::DynResponseArray
             | Ty::Unit
             | Ty::Str
@@ -7737,6 +7805,7 @@ impl<'a> BodyValidator<'a> {
                         | Ty::String
                         | Ty::Slice(_)
                         | Ty::DynArray(_)
+                        | Ty::DynAggregateArray(_)
                         | Ty::DynStructArray(_, _)
                         | Ty::DynSliceArray(_)
                         | Ty::DynResponseArray
@@ -7764,6 +7833,7 @@ impl<'a> BodyValidator<'a> {
                     Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
                         align_sema::scalar_to_ty(scalar)
                     }
+                    Ty::DynAggregateArray(element) => element.ty(),
                     Ty::DynSliceArray(primitive) => {
                         Ty::Slice(align_sema::prim_to_scalar(primitive))
                     }
@@ -9656,6 +9726,20 @@ pub(crate) fn body_ty_mangle(ty: Ty, program: &hir::Program) -> String {
                     }
                 },
                 Ty::Fn(_) => output.push_str("F_cycle"),
+                Ty::ArrayBuilder(element) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("AB_".to_string()),
+                        Work::Type(element.ty()),
+                    ],
+                ),
+                Ty::DynAggregateArray(element) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("DA_".to_string()),
+                        Work::Type(element.ty()),
+                    ],
+                ),
                 other => output.push_str(&body_simple_ty_name(other)),
             },
         }
@@ -9681,10 +9765,13 @@ fn body_simple_ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
-        Ty::ArrayBuilder(scalar) => format!(
+        Ty::ArrayBuilder(element) => format!(
             "array_builder_{}",
-            body_simple_ty_name(align_sema::scalar_to_ty(scalar))
+            body_simple_ty_name(element.ty())
         ),
+        Ty::DynAggregateArray(element) => {
+            format!("array_{}", body_simple_ty_name(element.ty()))
+        }
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::Regex => "regex".to_string(),

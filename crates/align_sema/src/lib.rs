@@ -300,6 +300,50 @@ pub enum Layout {
     Soa,
 }
 
+/// A concrete non-scalar element of a dynamic array built in an explicit region. Keeping this
+/// descriptor non-recursive preserves [`Ty`]'s compact `Copy` representation while carrying the
+/// exact LLVM layout that a region builder must copy and expose through indexing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AggregateArrayElem {
+    Vec(Scalar, u32),
+    Mask(Scalar, u32),
+    FixedArray(Scalar, u32),
+    FixedStructArray(u32, u32),
+}
+
+impl AggregateArrayElem {
+    pub fn ty(self) -> Ty {
+        match self {
+            Self::Vec(elem, lanes) => Ty::Vec(elem, lanes),
+            Self::Mask(elem, lanes) => Ty::Mask(elem, lanes),
+            Self::FixedArray(elem, length) => Ty::Array(elem, length),
+            Self::FixedStructArray(id, length) => Ty::StructArray(id, length),
+        }
+    }
+}
+
+/// The exact element type retained by `array_builder<T>`. Scalar elements keep the established
+/// heap-builder and dynamic-array representation; aggregate elements are admitted only by the
+/// explicit-region form and freeze to [`Ty::DynAggregateArray`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArrayBuilderElem {
+    Scalar(Scalar),
+    Aggregate(AggregateArrayElem),
+}
+
+impl ArrayBuilderElem {
+    pub fn ty(self) -> Ty {
+        match self {
+            Self::Scalar(elem) => scalar_to_ty(elem),
+            Self::Aggregate(elem) => elem.ty(),
+        }
+    }
+
+    pub fn name(self) -> String {
+        ty_name(self.ty())
+    }
+}
+
 /// sema-internal type representation (`03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
@@ -370,6 +414,9 @@ pub enum Ty {
     /// (`{ T* ptr, i64 len }`) but Move and region-tracked. MMv2 slice 3: produced by a
     /// materializing terminal (`.to_array()`) and (this slice) arena-bump-allocated.
     DynArray(Scalar),
+    /// A dynamic region-owned array whose element is a fixed-layout vector, mask, or fixed array.
+    /// The buffer ABI remains `{ptr,len}`; the descriptor supplies its exact element LLVM type.
+    DynAggregateArray(AggregateArrayElem),
     /// `array<response>` — an *owned*, dynamic-length array of opaque `http response` **Move**
     /// handles, laid out like a slice (`{ response* ptr, i64 len }`), Move but **not** region-tracked
     /// (freshly owned, like `array<string>` — it borrows nothing). Produced **only** by `cl.get_many`
@@ -422,13 +469,13 @@ pub enum Ty {
     Buffer,
     /// `array_builder<T>` (`core`, M12 A6) — a growable typed array builder, the typed member of the
     /// grow-then-freeze family (`builder`->`string`, `buffer`->bytes, this->`array<T>`). An opaque
-    /// owned **Move** handle; the payload [`Scalar`] is the element type. `array_builder()` selects
+    /// owned **Move** handle; [`ArrayBuilderElem`] is the exact element type. `array_builder()` selects
     /// individually owned heap storage for the existing primitive/`string` surface.
     /// `array_builder(out)` selects region-owned chunks for concrete `RegionPlain` elements and
     /// retains view provenance through pushed values. `build()` consumes either form: heap storage
     /// transfers zero-copy, while region chunks compact once in `out`. Never rides an aggregate
     /// (no `Scalar::ArrayBuilder`): bound to one local, like `builder`/`buffer`.
-    ArrayBuilder(Scalar),
+    ArrayBuilder(ArrayBuilderElem),
     /// `str_finder` — a **compiler-internal** prepared substring-search plan (doc-13 §6.6 / §11 P3).
     /// It has **no surface syntax**: it is emitted only by MIR when it recognises the loop-invariant
     /// repeated-needle where-pipeline (`xs.where(fn(s) = s.contains(NEEDLE)).…`), where MIR builds the
@@ -771,6 +818,94 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::RunOutput => Ty::RunOutput,
         Scalar::Fn(fid) => Ty::Fn(fid),
     }
+}
+
+/// Convert one resolved concrete type to the exact element descriptor accepted by an
+/// `array_builder`. Admission by allocation mode and recursive `RegionPlain` validation remains at
+/// the constructor; this conversion only preserves the physical type without truncating it through
+/// [`Scalar`].
+pub fn array_builder_elem(ty: Ty) -> Option<ArrayBuilderElem> {
+    match ty {
+        Ty::Vec(elem, lanes) => Some(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
+            elem, lanes,
+        ))),
+        Ty::Mask(elem, lanes) => Some(ArrayBuilderElem::Aggregate(AggregateArrayElem::Mask(
+            elem, lanes,
+        ))),
+        Ty::Array(elem, length) => Some(ArrayBuilderElem::Aggregate(
+            AggregateArrayElem::FixedArray(elem, length),
+        )),
+        Ty::StructArray(id, length) => Some(ArrayBuilderElem::Aggregate(
+            AggregateArrayElem::FixedStructArray(id, length),
+        )),
+        other => ty_to_scalar(other).map(ArrayBuilderElem::Scalar),
+    }
+}
+
+pub fn array_builder_result_ty(elem: ArrayBuilderElem) -> Ty {
+    match elem {
+        ArrayBuilderElem::Scalar(Scalar::Struct(id)) => Ty::DynStructArray(id, Layout::Aos),
+        ArrayBuilderElem::Scalar(elem) => Ty::DynArray(elem),
+        ArrayBuilderElem::Aggregate(elem) => Ty::DynAggregateArray(elem),
+    }
+}
+
+/// Whether a concrete type can be copied into an explicit region without creating an independent
+/// owner. This is the shared source/HIR boundary predicate; diagnostics use a path-aware mirror in
+/// [`Checker::region_plain_error`].
+pub fn region_plain_type_ok(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut work = vec![ty];
+    let mut seen = HashSet::new();
+    while let Some(ty) = work.pop() {
+        let ty = expand_tagged_ty(ty, tagged_types);
+        if !seen.insert(ty) {
+            continue;
+        }
+        match ty {
+            Ty::Int(_)
+            | Ty::Float(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Unit
+            | Ty::Str
+            | Ty::Vec(..)
+            | Ty::Mask(..) => {}
+            Ty::Slice(Scalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            })) => {}
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Struct(id) => {
+                let Some(definition) = structs.get(id as usize) else {
+                    return false;
+                };
+                work.extend(definition.fields.iter().rev().map(|field| field.ty));
+            }
+            Ty::Enum(id) => {
+                let Some(definition) = enums.get(id as usize) else {
+                    return false;
+                };
+                work.extend(
+                    definition
+                        .variants
+                        .iter()
+                        .rev()
+                        .flat_map(|variant| variant.payload.iter().rev())
+                        .copied()
+                        .map(scalar_to_ty),
+                );
+            }
+            Ty::Array(payload, _) => work.push(scalar_to_ty(payload)),
+            Ty::StructArray(id, _) => work.push(Ty::Struct(id)),
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Expand the reversible type view of a nested tagged payload. Other types pass through unchanged.
@@ -1283,6 +1418,7 @@ pub fn drop_plan(
                     Ty::Box(_)
                         | Ty::Task(_)
                         | Ty::DynArray(_)
+                        | Ty::DynAggregateArray(_)
                         | Ty::DynStructArray(..)
                         | Ty::DynSliceArray(_)
                         | Ty::DynResponseArray
@@ -1440,6 +1576,13 @@ fn ty_mentions_slice(
                 }
             }
             Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::DynAggregateArray(element)
+            | Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(element)) => {
+                work.push(element.ty())
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(element)) => {
+                work.push(scalar_to_ty(element))
+            }
             Ty::Result(ok, err) => {
                 work.push(scalar_to_ty(err));
                 work.push(scalar_to_ty(ok));
@@ -1486,6 +1629,13 @@ fn ty_mentions_resource(
             | Ty::Option(scalar)
             | Ty::Task(scalar)
             | Ty::Box(scalar) => work.push(scalar_to_ty(scalar)),
+            Ty::DynAggregateArray(element)
+            | Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(element)) => {
+                work.push(element.ty())
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(element)) => {
+                work.push(scalar_to_ty(element))
+            }
             Ty::Result(ok, err) => {
                 work.push(scalar_to_ty(err));
                 work.push(scalar_to_ty(ok));
@@ -1580,10 +1730,13 @@ pub fn ty_may_borrow(
                     }
                 }
             }
-            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s)
-            | Ty::ArrayBuilder(s) => {
+            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Task(s) => {
                 work.push(scalar_to_ty(s));
             }
+            Ty::DynAggregateArray(elem) | Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(elem)) => {
+                work.push(elem.ty());
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(elem)) => work.push(scalar_to_ty(elem)),
             Ty::Result(ok, err) => {
                 work.push(scalar_to_ty(ok));
                 work.push(scalar_to_ty(err));
@@ -10104,15 +10257,17 @@ impl<'a> EscapeCheck<'a> {
                 // remaining source element forms are region-only. This keeps a nested helper from
                 // treating a possibly region-backed incoming builder as definitely individual.
                 let (individual, may_individual) = match (borrowed_builder, local.ty) {
-                    (true, Ty::ArrayBuilder(Scalar::String)) => (true, true),
+                    (true, Ty::ArrayBuilder(ArrayBuilderElem::Scalar(Scalar::String))) => {
+                        (true, true)
+                    }
                     (
                         true,
-                        Ty::ArrayBuilder(
+                        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(
                             Scalar::Int(_)
                             | Scalar::Float(_)
                             | Scalar::Bool
                             | Scalar::Char,
-                        ),
+                        )),
                     ) => (false, true),
                     (true, Ty::ArrayBuilder(_)) => (false, false),
                     _ => (true, true),
@@ -10624,7 +10779,8 @@ impl<'a> EscapeCheck<'a> {
                 Ty::Tagged(id),
                 self.tagged_types,
             )),
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => return true,
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_)
+            | Ty::DynAggregateArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => return true,
             // An owned `array<response>` is escape-checked in the same lane as every owned collection.
             // It borrows nothing, so its `region_of` is explicitly `Static` — the check passes and
             // the array is freely returnable (like `array<string>` from `fs.read_dir`); tracking keeps
@@ -13339,7 +13495,7 @@ impl<'a> EscapeCheck<'a> {
             if mode != ast::ParamMode::BorrowMut {
                 continue;
             }
-            if !self.region_bearing(scalar_to_ty(element)) {
+            if !self.region_bearing(element.ty()) {
                 continue;
             }
             for value in args {
@@ -15344,7 +15500,7 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         if !ty_may_borrow(
-            scalar_to_ty(element),
+            element.ty(),
             self.structs,
             self.tuples,
             self.enums,
@@ -21847,6 +22003,14 @@ impl<'a, 't> Checker<'a, 't> {
                     children.push((scalar_to_ty(a), scalar_to_ty(b)));
                     true
                 }
+                (Ty::ArrayBuilder(a), Ty::ArrayBuilder(b)) => {
+                    children.push((a.ty(), b.ty()));
+                    true
+                }
+                (Ty::DynAggregateArray(a), Ty::DynAggregateArray(b)) => {
+                    children.push((a.ty(), b.ty()));
+                    true
+                }
                 (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
                     children.push((scalar_to_ty(a_ok), scalar_to_ty(b_ok)));
                     children.push((scalar_to_ty(a_err), scalar_to_ty(b_err)));
@@ -22012,6 +22176,16 @@ impl<'a, 't> Checker<'a, 't> {
                     Ty::DynArray(payload) => {
                         work.push(Work::Text(">".to_string()));
                         work.push(Work::Type(scalar_to_ty(payload)));
+                        work.push(Work::Text("array<".to_string()));
+                    }
+                    Ty::ArrayBuilder(element) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(element.ty()));
+                        work.push(Work::Text("array_builder<".to_string()));
+                    }
+                    Ty::DynAggregateArray(element) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(element.ty()));
                         work.push(Work::Text("array<".to_string()));
                     }
                     Ty::StructArray(id, len) => {
@@ -29394,18 +29568,22 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         if region.is_some() {
-            if let Some(reason) = self.region_plain_error(scalar_to_ty(elem)) {
+            if let Some(reason) = self.region_plain_error(elem.ty()) {
                 self.diags.error(
-                    format!("array_builder<{}> cannot use region storage: {reason}", scalar_name(elem)),
+                    format!("array_builder<{}> cannot use region storage: {reason}",
+                        elem.name()),
                     span,
                 );
                 return err;
             }
-        } else if !matches!(elem, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String) {
+        } else if !matches!(elem,
+            ArrayBuilderElem::Scalar(
+                Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String)
+        ) {
             self.diags.error(
                 format!(
                     "heap array_builder<{}> requires a Copy scalar or `string`; use `array_builder(out)` for RegionPlain values",
-                    scalar_name(elem)
+                    elem.name()
                 ),
                 span,
             );
@@ -29482,7 +29660,7 @@ impl<'a, 't> Checker<'a, 't> {
         &mut self,
         recv: &ast::Expr,
         method: &str,
-    ) -> Option<(Scalar, Expr)> {
+    ) -> Option<(ArrayBuilderElem, Expr)> {
         let recv_expr = self.check_expr(recv, None);
         let Ty::ArrayBuilder(elem) = self.resolve(recv_expr.ty) else {
             if recv_expr.ty != Ty::Error {
@@ -29525,7 +29703,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.push()' takes 1 argument (the element), got {}", args.len()), span);
             return err;
         };
-        let elem_ty = scalar_to_ty(elem);
+        let elem_ty = elem.ty();
         let value = self.check_expr(v, Some(elem_ty));
         if value.ty == Ty::Error {
             return err;
@@ -29536,7 +29714,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.push()' expects a {} element, got {}", ty_name(elem_ty), ty_name(value.ty)), v.span);
             return err;
         }
-        Expr { kind: ExprKind::ArrayBuilderPush { builder: Box::new(recv_expr), value: Box::new(value), moves_value: elem == Scalar::String }, ty: Ty::Unit, span }
+        Expr { kind: ExprKind::ArrayBuilderPush { builder: Box::new(recv_expr), value: Box::new(value), moves_value: elem == ArrayBuilderElem::Scalar(Scalar::String)}, ty: Ty::Unit, span }
     }
 
     /// `b.append(xs)` (M12 A6) — bulk-append a `slice<T>` of Copy-scalar elements to a growable
@@ -29550,7 +29728,7 @@ impl<'a, 't> Checker<'a, 't> {
         else {
             return err;
         };
-        if elem == Scalar::String {
+        if elem == ArrayBuilderElem::Scalar(Scalar::String) {
             self.diags.error(
                 "'.append()' is not available on an array_builder<string> (append bulk-copies a borrowed slice; a `string` element is added with `push`, which moves it in)".to_string(),
                 span,
@@ -29561,7 +29739,17 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.append()' takes 1 argument (a slice of elements), got {}", args.len()), span);
             return err;
         };
-        let want = Ty::Slice(elem);
+        let ArrayBuilderElem::Scalar(scalar) = elem else {
+            self.diags.error(
+                format!(
+                    "'.append()' is not available on an array_builder<{}>; add fixed-layout aggregate elements with `push`",
+                    elem.name()
+                ),
+                span,
+            );
+            return err;
+        };
+        let want = Ty::Slice(scalar);
         let data = self.check_expr(xs, Some(want));
         if data.ty == Ty::Error {
             return err;
@@ -29588,10 +29776,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.build()' takes no arguments, got {}", args.len()), span);
             return err;
         }
-        let result_ty = match elem {
-            Scalar::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-            _ => Ty::DynArray(elem),
-        };
+        let result_ty = array_builder_result_ty(elem);
         Expr { kind: ExprKind::ArrayBuilderBuild(Box::new(recv_expr)), ty: result_ty, span }
     }
 
@@ -30995,7 +31180,8 @@ impl<'a, 't> Checker<'a, 't> {
         match r.ty {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynAggregateArray(_)
+            | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A `buffer`'s length is its current byte count (the last read's size). Same v1
             // bound-receiver restriction as `.bytes()` (uniform across buffer methods, until Move
             // temporaries drop): reject `buffer(n).len()` on an unbound temporary.
@@ -31072,6 +31258,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+            Ty::DynAggregateArray(elem) => elem.ty(),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
             Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
             // Indexing a struct array yields the whole struct by value (a copy). A plain-data struct
@@ -36719,6 +36906,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
+        Ty::DynAggregateArray(elem) => format!("array<{}>", ty_name(elem.ty())),
         Ty::DynResponseArray => "array<response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
@@ -36733,7 +36921,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
-        Ty::ArrayBuilder(s) => format!("array_builder<{}>", scalar_name(s)),
+        Ty::ArrayBuilder(elem) => format!("array_builder<{}>", elem.name()),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::Regex => "regex".to_string(),
@@ -37034,6 +37222,21 @@ fn resolved_type_source_spelling(
                     next,
                 )
             ),
+            Ty::DynAggregateArray(elem) => format!(
+                "array<{}>",
+                resolved(
+                    elem.ty(),
+                    type_table,
+                    struct_ids,
+                    enum_ids,
+                    struct_source_spellings,
+                    enum_source_spellings,
+                    tagged_types,
+                    tuples,
+                    fn_types,
+                    next,
+                )
+            ),
             Ty::DynResponseArray => "array<response>".to_string(),
             Ty::Box(payload) => format!(
                 "box<{}>",
@@ -37103,8 +37306,8 @@ fn resolved_type_source_spelling(
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
                 "array_builder<{}>",
-                scalar(
-                    elem,
+                resolved(
+                    elem.ty(),
                     type_table,
                     struct_ids,
                     enum_ids,
@@ -38420,33 +38623,57 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            let scalar = match inner {
+            let normalized = match inner {
                 Ty::Error => return Ty::Error,
-                Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                Ty::Option(payload) => Ty::Tagged(intern_tagged_type(
                     cx.tagged_types,
                     hir::TaggedType::Option(payload),
                 )),
-                Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                Ty::Result(ok, err) => Ty::Tagged(intern_tagged_type(
                     cx.tagged_types,
                     hir::TaggedType::Result(ok, err),
                 )),
-                other => match ty_to_scalar(other) {
-                    Some(scalar @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool
-                        | Scalar::Char | Scalar::String | Scalar::Str | Scalar::Slice(_)
-                        | Scalar::Struct(_) | Scalar::Enum(_) | Scalar::Tagged(_))) => scalar,
-                    _ => {
-                        diags.error(
-                            format!(
-                                "array_builder<T> element must be a heap scalar/string or a concrete RegionPlain scalar, view, Option, sum, or struct; got {}",
-                                ty_name(other)
-                            ),
-                            span,
-                        );
-                        return Ty::Error;
-                    }
-                },
+                other => other,
             };
-            Ty::ArrayBuilder(scalar)
+            let Some(elem) = array_builder_elem(normalized) else {
+                diags.error(
+                    format!(
+                        "array_builder<T> element must be a heap scalar/string or a concrete RegionPlain scalar, vector, mask, fixed array, view, Option, sum, or struct; got {}",
+                        ty_name(normalized)
+                    ),
+                    span,
+                );
+                return Ty::Error;
+            };
+            match elem {
+                ArrayBuilderElem::Scalar(
+                    Scalar::Int(_)
+                    | Scalar::Float(_)
+                    | Scalar::Bool
+                    | Scalar::Char
+                    | Scalar::String
+                    | Scalar::Str
+                    | Scalar::Slice(_)
+                    | Scalar::Struct(_)
+                    | Scalar::Enum(_)
+                    | Scalar::Tagged(_),
+                ) => Ty::ArrayBuilder(elem),
+                ArrayBuilderElem::Aggregate(_)
+                    if region_plain_type_ok(elem.ty(), cx.structs, cx.enums, cx.tagged_types) =>
+                {
+                    Ty::ArrayBuilder(elem)
+                }
+                _ => {
+                    diags.error(
+                        format!(
+                            "array_builder<T> element must be a heap scalar/string or a concrete RegionPlain scalar, vector, mask, fixed array, view, Option, sum, or struct; got {}",
+                            elem.name()
+                        ),
+                        span,
+                    );
+                    Ty::Error
+                }
+            }
         }
         // `file` (`std.fs`) — an offset-addressed file Move handle (`fs.create_rw` et al.). A surface
         // type name so it can be threaded through functions (a Move handle; passed by value).
@@ -38662,8 +38889,8 @@ fn resolve_type(
                 }
             }
         }
-        // `array<T>` — an owned, dynamic-length array (MMv2). Currently usable as a return
-        // type so a function can hand back a free-standing owned array.
+        // `array<T>` — a dynamic-length array (MMv2). Scalar and struct elements use the existing
+        // owned representation; fixed-layout aggregate elements use the region-owned result type.
         "array" => {
             let inner = match args {
                 [a] => resolve_type(a, cx, type_params, diags),
@@ -38685,6 +38912,40 @@ fn resolve_type(
                     Ty::Error
                 }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+                Ty::Vec(elem, lanes) => Ty::DynAggregateArray(AggregateArrayElem::Vec(elem, lanes)),
+                Ty::Mask(elem, lanes) => {
+                    Ty::DynAggregateArray(AggregateArrayElem::Mask(elem, lanes))
+                }
+                Ty::Array(elem, length)
+                    if region_plain_type_ok(
+                        inner,
+                        cx.structs,
+                        cx.enums,
+                        cx.tagged_types,
+                    ) =>
+                {
+                    Ty::DynAggregateArray(AggregateArrayElem::FixedArray(elem, length))
+                }
+                Ty::StructArray(id, length)
+                    if region_plain_type_ok(
+                        inner,
+                        cx.structs,
+                        cx.enums,
+                        cx.tagged_types,
+                    ) =>
+                {
+                    Ty::DynAggregateArray(AggregateArrayElem::FixedStructArray(id, length))
+                }
+                Ty::Array(..) | Ty::StructArray(..) => {
+                    diags.error(
+                        format!(
+                            "array<{}> requires a recursively RegionPlain fixed-array element",
+                            ty_name(inner)
+                        ),
+                        span,
+                    );
+                    Ty::Error
+                }
                 _ => match collection_scalar_arg(
                     inner,
                     "array element",
@@ -38990,7 +39251,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // `choices: array<Choice>` shape. The complete struct table and the direct
         // `array<string>` exception are enforced at declaration (pass 0b-2); here we admit the
         // array shape, including the recursively droppable `array<Move-struct>` form.
-        Ty::DynArray(_) | Ty::DynStructArray(..) => {}
+        Ty::DynArray(_) | Ty::DynAggregateArray(_) | Ty::DynStructArray(..) => {}
         _ => return false,
         }
     }

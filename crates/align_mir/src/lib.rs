@@ -12,7 +12,7 @@
 
 use align_ast::{BinOp, UnOp};
 use align_sema::{
-    DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    AggregateArrayElem, ArrayBuilderElem, DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
     may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
 };
 use align_span::{SourceMap, Span};
@@ -1992,8 +1992,19 @@ fn canonicalize_tagged_types(program: &mut Program) {
             | Ty::Box(s)
             | Ty::Slice(s)
             | Ty::DynArray(s)
-            | Ty::ArrayBuilder(s)
-            | Ty::Task(s) => collect_scalar(s, table, reachable),
+            | Ty::Task(s) => {
+                collect_scalar(s, table, reachable)
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(s)) => collect_scalar(s, table, reachable),
+            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(elem))
+            | Ty::DynAggregateArray(elem) => {
+                match elem {
+                    AggregateArrayElem::Vec(s, _)
+                    | AggregateArrayElem::Mask(s, _)
+                    | AggregateArrayElem::FixedArray(s, _) => collect_scalar(s, table, reachable),
+                    AggregateArrayElem::FixedStructArray(..) => {}
+                }
+            }
             Ty::Result(ok, err) => {
                 collect_scalar(ok, table, reachable);
                 collect_scalar(err, table, reachable);
@@ -2161,8 +2172,19 @@ fn canonicalize_tagged_types(program: &mut Program) {
             | Ty::Box(s)
             | Ty::Slice(s)
             | Ty::DynArray(s)
-            | Ty::ArrayBuilder(s)
-            | Ty::Task(s) => remap_scalar(s, remap),
+            | Ty::Task(s) => {
+                remap_scalar(s, remap)
+            }
+            Ty::ArrayBuilder(ArrayBuilderElem::Scalar(s)) => remap_scalar(s, remap),
+            Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(elem))
+            | Ty::DynAggregateArray(elem) => {
+                match elem {
+                    AggregateArrayElem::Vec(s, _)
+                    | AggregateArrayElem::Mask(s, _)
+                    | AggregateArrayElem::FixedArray(s, _) => remap_scalar(s, remap),
+                    AggregateArrayElem::FixedStructArray(..) => {}
+                }
+            }
             Ty::Result(ok, err) => {
                 remap_scalar(ok, remap);
                 remap_scalar(err, remap);
@@ -7959,7 +7981,7 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             });
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ArrayBuilderNew {
-                elem: align_sema::scalar_to_ty(*elem),
+                elem: elem.ty(),
                 region,
             }));
             Operand::Value(v)
@@ -8176,7 +8198,8 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         // `array<Struct>` loads a whole struct element; an `array<response>` loads a `response` handle
         // pointer (the receiver-borrow of `rs[i].status()` etc. — `elem_ty` = `HttpResponse`). All by
         // `elem_ty` via `SliceIndex`.
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
+        Ty::Slice(_) | Ty::DynArray(_)
+        | Ty::DynAggregateArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
             let sv = lower_borrowed_owned(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
@@ -14701,13 +14724,17 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Raw => "raw".to_string(),
         Ty::Resource(id) => format!("resource#{id}"),
         Ty::ResourceRef(id) => format!("resource_ref<resource#{id}>"),
-        Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
+        Ty::Array(element, n) => {
+            format!("array<{}>[{n}]", ty_name(align_sema::scalar_to_ty(element)))
+        }
+        Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::Vec(_, n) => format!("vec{n}"),
         Ty::Mask(_, n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         // Keep the human-readable MIR type name element-aware.
         Ty::DynArray(s) => format!("array<{}>", ty_name(align_sema::scalar_to_ty(s))),
+        Ty::DynAggregateArray(elem) => format!("array<{}>", ty_name(elem.ty())),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
         Ty::DynResponseArray => "array<response>".to_string(),
@@ -14719,7 +14746,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
-        Ty::ArrayBuilder(_) => "array_builder".to_string(),
+        Ty::ArrayBuilder(element) => format!("array_builder<{}>", ty_name(element.ty())),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),

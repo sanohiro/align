@@ -32,7 +32,7 @@ use align_mir::{
     ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
 };
 use align_sema::{
-    DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
+    ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
@@ -2391,8 +2391,25 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         Ty::Box(payload)
                         | Ty::Slice(payload)
                         | Ty::DynArray(payload)
-                        | Ty::ArrayBuilder(payload)
                         | Ty::Task(payload) => self.check_scalar_reference(payload)?,
+                        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(payload)) => {
+                            self.check_scalar_reference(payload)?
+                        }
+                        Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(payload))
+                        | Ty::DynAggregateArray(payload) => {
+                            if !align_sema::region_plain_type_ok(
+                                payload.ty(),
+                                &self.program.structs,
+                                &self.program.enums,
+                                &self.program.tagged_types,
+                            ) {
+                                return Err(Self::invalid(format!(
+                                    "aggregate array element {:?} is not RegionPlain",
+                                    payload.ty()
+                                )));
+                            }
+                            work.push(TypeGraphWork::Ty(payload.ty()));
+                        }
                         Ty::DynStructArray(id, _)
                         | Ty::Soa(id)
                         | Ty::JsonScanner(id) => self.require_struct(id)?,
@@ -2586,6 +2603,14 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     Ty::DynArray(payload) => {
                         key.push('D');
                         work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::ArrayBuilder(element) => {
+                        key.push_str("AB_");
+                        work.push(SourceAbiKeyWork::Ty(element.ty()));
+                    }
+                    Ty::DynAggregateArray(element) => {
+                        key.push_str("DA_");
+                        work.push(SourceAbiKeyWork::Ty(element.ty()));
                     }
                     Ty::Array(payload, count) => {
                         key.push_str(&format!("A{count}_"));
@@ -4236,7 +4261,8 @@ fn scalar_type<'c>(
         // array views) lowers to the slice struct.
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_)
+        | Ty::DynAggregateArray(_) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -4380,7 +4406,8 @@ fn abi_type<'c>(
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
-        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_)
+        | Ty::DynAggregateArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
             slice_struct_type(ctx).into()
@@ -7217,9 +7244,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
                         // slot was nulled at `build`'s move site).
                         let stack = self.stack_header_slots.contains(slot);
-                        let free_key = if elem == align_sema::Scalar::String && stack {
+                        let string_elem =
+                            elem == ArrayBuilderElem::Scalar(align_sema::Scalar::String);
+                        let free_key = if string_elem && stack {
                             RuntimeKey::ArrayBuilderFreeStringsStack
-                        } else if elem == align_sema::Scalar::String {
+                        } else if string_elem {
                             RuntimeKey::ArrayBuilderFreeStrings
                         } else if stack {
                             RuntimeKey::ArrayBuilderFreeStack
@@ -8383,13 +8412,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(result_ty);
                 self.builder
                     .build_load(ty, ep, "idx")
                     .map_err(|e| self.err(e))?
@@ -10978,13 +11001,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_extract_value(agg, 0, "ptr")
                     .map_err(|e| self.err(e))?
                     .into_pointer_value();
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(result_ty);
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -11532,7 +11549,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .array_type(n)
             .into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_)
+            | Ty::DynAggregateArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
@@ -12023,7 +12041,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // one flat free — no per-element deep free — and `array<Struct>`'s `str` fields are
                 // borrowed views into the input, not freed here. (A Move-struct element is deep-freed by
                 // the arm above.)
-                Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
+                Ty::DynArray(_)
+                | Ty::DynAggregateArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
                     let agg = self
                         .builder

@@ -385,6 +385,26 @@ fn region_plain_aggregate_push_uses_target_layout_copy() {
 }
 
 #[test]
+fn region_builder_preserves_vector_and_mask_element_types_through_indexing() {
+    let src = "fn main() -> i32 {\n  arena out {\n    a: vec4<i32> := [1, 2, 3, 4]\n    b: vec4<i32> := [0, 3, 2, 5]\n    mut vectors: array_builder<vec4<i32>> := array_builder(out)\n    vectors.push(a)\n    built_vectors := vectors.build()\n    mut masks: array_builder<mask4<i32>> := array_builder(out)\n    masks.push(a > b)\n    built_masks := masks.build()\n    selected := select(built_masks[0], built_vectors[0], b)\n    return (selected[1] + built_vectors.len() + built_masks.len()) as i32\n  }\n}\n";
+    let diags = check_diagnostics("fb-region-vector-mask-builder", src);
+    assert!(
+        diags.is_empty(),
+        "unexpected vector/mask builder diagnostics:\n{diags}"
+    );
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("fb-region-vector-mask-builder", src);
+    assert_eq!(
+        code(&out),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn region_parameters_and_builder_helpers_match_whole_and_per_unit_compilation() {
     let lib = "module regionlib\npub fn copy_text(out: region, value: str) -> str = value.clone_in(out)\npub fn push_value(borrow mut values: array_builder<i64>, value: i64) { values.push(value) }\npub fn build_value(out: region, value: i64) -> array<i64> {\n  mut values: array_builder<i64> := array_builder(out)\n  push_value(values, value)\n  return values.build()\n}\n";
     let main = "import regionlib\nfn main() -> i32 {\n  arena out {\n    copied := regionlib.copy_text(out, \"unit\")\n    built := regionlib.build_value(out, 38)\n    return (built[0] + copied.len()) as i32\n  }\n}\n";
@@ -396,6 +416,18 @@ fn region_parameters_and_builder_helpers_match_whole_and_per_unit_compilation() 
     }
     let out = build_per_unit_multi("fb-region-per-unit-run", &files, "main.align").link_and_run();
     assert_eq!(code(&out), Some(42), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn vector_builder_descriptor_matches_whole_and_per_unit_compilation() {
+    let lib = "module regionvectors\npub fn build_value(out: region, value: vec4<i32>) -> array<vec4<i32>> {\n  mut values: array_builder<vec4<i32>> := array_builder(out)\n  values.push(value)\n  return values.build()\n}\n";
+    let main = "import regionvectors\nfn main() -> i32 {\n  arena out {\n    value: vec4<i32> := [4, 5, 6, 7]\n    built := regionvectors.build_value(out, value)\n    return built[0][2]\n  }\n}\n";
+    let files = [("regionvectors.align", lib), ("main.align", main)];
+    let checked = assert_same_verdict("fb-region-vector-per-unit", &files, "main.align");
+    assert!(
+        !checked.diags.has_errors(),
+        "vector builder descriptor diverged between whole and per-unit compilation"
+    );
 }
 
 #[test]

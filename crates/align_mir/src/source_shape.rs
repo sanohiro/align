@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use align_ast::ParamMode;
-use align_sema::{Scalar, Ty, hir};
+use align_sema::{AggregateArrayElem, ArrayBuilderElem, Scalar, Ty, hir};
 
 use super::canonical_graph::Node;
 
@@ -382,6 +382,41 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
         }
     }
 
+    fn aggregate_array_elems_equal(
+        &mut self,
+        left: AggregateArrayElem,
+        right: AggregateArrayElem,
+    ) -> bool {
+        match (left, right) {
+            (AggregateArrayElem::Vec(left, a), AggregateArrayElem::Vec(right, b))
+            | (AggregateArrayElem::Mask(left, a), AggregateArrayElem::Mask(right, b))
+            | (AggregateArrayElem::FixedArray(left, a), AggregateArrayElem::FixedArray(right, b)) => {
+                a == b && self.scalars_equal(left, right)
+            }
+            (
+                AggregateArrayElem::FixedStructArray(left, a),
+                AggregateArrayElem::FixedStructArray(right, b),
+            ) => a == b && self.queue_equal(Node::Struct(left), Node::Struct(right)),
+            _ => false,
+        }
+    }
+
+    fn array_builder_elems_equal(
+        &mut self,
+        left: ArrayBuilderElem,
+        right: ArrayBuilderElem,
+    ) -> bool {
+        match (left, right) {
+            (ArrayBuilderElem::Scalar(left), ArrayBuilderElem::Scalar(right)) => {
+                self.scalars_equal(left, right)
+            }
+            (ArrayBuilderElem::Aggregate(left), ArrayBuilderElem::Aggregate(right)) => {
+                self.aggregate_array_elems_equal(left, right)
+            }
+            _ => false,
+        }
+    }
+
     fn types_equal(&mut self, left: Ty, right: Ty) -> bool {
         macro_rules! same {
             ($pattern:pat => $body:expr) => {
@@ -413,8 +448,11 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             }
             Ty::Slice(left) => same!(Ty::Slice(right) => self.scalars_equal(left, right)),
             Ty::DynArray(left) => same!(Ty::DynArray(right) => self.scalars_equal(left, right)),
+            Ty::DynAggregateArray(left) => {
+                same!(Ty::DynAggregateArray(right) => self.aggregate_array_elems_equal(left, right))
+            }
             Ty::ArrayBuilder(left) => {
-                same!(Ty::ArrayBuilder(right) => self.scalars_equal(left, right))
+                same!(Ty::ArrayBuilder(right) => self.array_builder_elems_equal(left, right))
             }
             Ty::Task(left) => same!(Ty::Task(right) => self.scalars_equal(left, right)),
             Ty::Tagged(left) => node!(Tagged, Tagged, left),
@@ -507,8 +545,16 @@ fn ty_cost(value: Ty) -> (usize, usize) {
         | Ty::Box(value)
         | Ty::Slice(value)
         | Ty::DynArray(value)
-        | Ty::ArrayBuilder(value)
         | Ty::Task(value) => scalar_cost(value),
+        Ty::ArrayBuilder(ArrayBuilderElem::Scalar(value)) => scalar_cost(value),
+        Ty::ArrayBuilder(ArrayBuilderElem::Aggregate(value)) | Ty::DynAggregateArray(value) => {
+            match value {
+                AggregateArrayElem::Vec(value, _)
+                | AggregateArrayElem::Mask(value, _)
+                | AggregateArrayElem::FixedArray(value, _) => scalar_cost(value),
+                AggregateArrayElem::FixedStructArray(..) => (1, 1),
+            }
+        }
         Ty::Result(left, right) => {
             let left = scalar_cost(left);
             let right = scalar_cost(right);

@@ -834,10 +834,10 @@ merely because its `Ty` matches.
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
 | `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
-| `ArrayBuilderNew` | `env[elem]`: exact admitted Copy scalar or String builder element. `child[]; result ArrayBuilder(elem); new owned allocation; Pure`. |
-| `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value scalar_to_ty(elem); moves_value iff elem==String; result Unit; String consumed, Copy value borrowed, builder mutated; Pure`. |
-| `ArrayBuilderAppend` | `env[]; child[builder,data]`; `SourceMutLocal(ArrayBuilder(copy elem),builder), data Slice(elem); result Unit; data borrowed, builder mutated; Pure`. |
-| `ArrayBuilderBuild` | `env[]; child[builder]`; `ArrayBuilder(elem), consume-any; result DynArray(elem); transfer the complete producer-valid builder buffer once; Pure`. |
+| `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. The heap form admits only primitive Copy scalars or String; the region form requires the descriptor's concrete type to be recursively `RegionPlain`. `child[region?]`; result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. |
+| `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value exact `elem.ty()`; `moves_value` iff `elem == Scalar(String)`; result Unit; String consumed, every RegionPlain value copied with provenance, builder mutated; Pure. |
+| `ArrayBuilderAppend` | `env[]; child[builder,data]`; descriptor must be `Scalar(copy elem)`, `SourceMutLocal(ArrayBuilder(elem),builder), data Slice(elem)`; result Unit; data borrowed, builder mutated; Pure. Aggregate descriptors use `push`. |
+| `ArrayBuilderBuild` | `env[]; child[builder]`; `ArrayBuilder(elem)`, consume-any; result `DynStructArray(id,Aos)` for `Scalar(Struct(id))`, `DynArray(S)` for every other scalar descriptor, or `DynAggregateArray(elem)` for an aggregate descriptor; transfer the complete producer-valid builder buffer once; Pure. |
 | `FsWriteFile` | `env[builder]`; `child[path,data]`; `path Str; builder=false requires byte-view, true requires Builder; result ERR(Unit); both borrowed; Impure`. |
 | `FsExists` | `env[]; child[path]`; `Str; result Bool; borrowed; Impure`. |
 | `FsRemove` | `env[]; child[path]`; `Str; result ERR(Unit); borrowed; Impure`. |

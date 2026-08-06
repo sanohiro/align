@@ -1025,7 +1025,7 @@ pub enum ExprKind {
     /// heap storage and is `Drop`-freed; the explicit-region form owns no independent allocation.
     /// Pure (allocation only), like `BuilderNew`/`BufferNew`.
     ArrayBuilderNew {
-        elem: crate::Scalar,
+        elem: crate::ArrayBuilderElem,
         /// Explicit destination region for `array_builder(out)`. `None` preserves the existing
         /// individually-owned heap form.
         region: Option<Box<Expr>>,
