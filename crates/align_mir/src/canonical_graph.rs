@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use align_ast::ParamMode;
-use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
+use align_sema::{AggregateArrayElem, ArrayBuilderElem, Layout, PrimScalar, Scalar, Ty, hir};
 
 use super::source_shape::{SourceShapeNode, SourceShapeView, source_shape_equal};
 use super::{Program, function_embedded_types, remap_function_embedded_types};
@@ -622,6 +622,57 @@ impl<'a> GraphValidator<'a> {
         }
     }
 
+    fn scan_aggregate_array_elem(
+        &mut self,
+        value: AggregateArrayElem,
+        references: &mut Vec<Node>,
+    ) {
+        self.field_ordinal();
+        match value {
+            AggregateArrayElem::Vec(value, lanes)
+            | AggregateArrayElem::Mask(value, lanes) => {
+                let scalar_ordinal = self.next_ordinal;
+                self.scan_scalar(value, references, None);
+                let lanes_ordinal = self.field_ordinal();
+                if !matches!(value, Scalar::Int(_) | Scalar::Float(_)) {
+                    self.candidate(scalar_ordinal, CanonicalGraphError::InvalidWidth);
+                }
+                if !matches!(lanes, 2 | 4 | 8 | 16) {
+                    self.candidate(lanes_ordinal, CanonicalGraphError::InvalidWidth);
+                }
+            }
+            AggregateArrayElem::FixedArray(value, length) => {
+                self.scan_scalar(value, references, None);
+                let length_ordinal = self.field_ordinal();
+                if length == 0 {
+                    self.candidate(length_ordinal, CanonicalGraphError::InvalidCount);
+                }
+            }
+            AggregateArrayElem::FixedStructArray(id, length) => {
+                let id_ordinal = self.field_ordinal();
+                self.scan_reference(Node::Struct(id), id_ordinal, references);
+                let length_ordinal = self.field_ordinal();
+                if length == 0 {
+                    self.candidate(length_ordinal, CanonicalGraphError::InvalidCount);
+                }
+            }
+        }
+    }
+
+    fn scan_array_builder_elem(
+        &mut self,
+        value: ArrayBuilderElem,
+        references: &mut Vec<Node>,
+    ) {
+        self.field_ordinal();
+        match value {
+            ArrayBuilderElem::Scalar(value) => self.scan_scalar(value, references, None),
+            ArrayBuilderElem::Aggregate(value) => {
+                self.scan_aggregate_array_elem(value, references)
+            }
+        }
+    }
+
     fn scan_ty(
         &mut self,
         value: Ty,
@@ -634,8 +685,26 @@ impl<'a> GraphValidator<'a> {
             Ty::Box(value)
             | Ty::Slice(value)
             | Ty::DynArray(value)
-            | Ty::ArrayBuilder(value)
-            | Ty::Task(value) => self.scan_scalar(value, references, None),
+            | Ty::Task(value) => {
+                self.scan_scalar(value, references, None)
+            }
+            Ty::ArrayBuilder(value) => {
+                self.scan_array_builder_elem(ArrayBuilderElem::Scalar(value), references)
+            }
+            value @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => self.scan_array_builder_elem(
+                value.array_builder_element().expect("matched aggregate builder"),
+                references,
+            ),
+            value @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => self.scan_aggregate_array_elem(
+                value.dyn_aggregate_array_element().expect("matched aggregate array"),
+                references,
+            ),
             Ty::Result(ok, err) => {
                 self.scan_scalar(ok, references, inline_from);
                 self.scan_scalar(err, references, inline_from);
@@ -926,7 +995,7 @@ fn canonical_type_bytes_with_classes(
     }
 
     let mut out = Vec::new();
-    out.push(2);
+    out.push(3);
     out.extend(checked_count(class_order.len())?.to_le_bytes());
     let ordinal = |node: Node| {
         let class = classes
@@ -1161,7 +1230,7 @@ enum DecodedNode {
 
 pub(super) fn canonical_type_record_len(bytes: &[u8]) -> Result<usize, CanonicalCodecError> {
     let mut cursor = DecodeCursor::new(bytes);
-    if cursor.byte()? != 2 {
+    if cursor.byte()? != 3 {
         return Err(CanonicalCodecError::UnsupportedVersion);
     }
     let node_count = cursor.count(1)?;
@@ -1463,6 +1532,58 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
     }
 }
 
+fn decode_aggregate_array_elem(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<AggregateArrayElem, CanonicalCodecError> {
+    let tag = cursor.byte()?;
+    let elem = match tag {
+        0 | 1 => {
+            let scalar = decode_scalar(cursor)?;
+            let lanes = cursor.u32()?;
+            if !matches!(scalar, Scalar::Int(_) | Scalar::Float(_))
+                || !matches!(lanes, 2 | 4 | 8 | 16)
+            {
+                return Err(CanonicalCodecError::InvalidWidth);
+            }
+            if tag == 0 {
+                AggregateArrayElem::Vec(scalar, lanes)
+            } else {
+                AggregateArrayElem::Mask(scalar, lanes)
+            }
+        }
+        2 => {
+            let scalar = decode_scalar(cursor)?;
+            let length = cursor.u32()?;
+            if length == 0 {
+                return Err(CanonicalCodecError::InvalidCount);
+            }
+            AggregateArrayElem::FixedArray(scalar, length)
+        }
+        3 => {
+            let id = cursor.u32()?;
+            let length = cursor.u32()?;
+            if length == 0 {
+                return Err(CanonicalCodecError::InvalidCount);
+            }
+            AggregateArrayElem::FixedStructArray(id, length)
+        }
+        _ => return Err(CanonicalCodecError::UnknownTag),
+    };
+    Ok(elem)
+}
+
+fn decode_array_builder_elem(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<ArrayBuilderElem, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(ArrayBuilderElem::Scalar(decode_scalar(cursor)?)),
+        1 => Ok(ArrayBuilderElem::Aggregate(decode_aggregate_array_elem(
+            cursor,
+        )?)),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
 fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
     let node = |cursor: &mut DecodeCursor<'_>| cursor.u32();
     let tag = cursor.byte()?;
@@ -1513,7 +1634,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         23 => Ok(Ty::Writer),
         24 => Ok(Ty::Reader),
         25 => Ok(Ty::Buffer),
-        26 => Ok(Ty::ArrayBuilder(decode_scalar(cursor)?)),
+        26 => Ok(Ty::array_builder(decode_array_builder_elem(cursor)?)),
         27 => Ok(Ty::StrFinder),
         28 => Ok(Ty::File),
         29 => Ok(Ty::Rng),
@@ -1546,6 +1667,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         56 => Ok(Ty::Unit),
         57 => Ok(Ty::Resource(node(cursor)?)),
         58 => Ok(Ty::ResourceRef(node(cursor)?)),
+        59 => Ok(Ty::dyn_aggregate_array(decode_aggregate_array_elem(cursor)?)),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1629,11 +1751,21 @@ fn remap_decoded_ty(value: &mut Ty, resolved: &[(u8, u32)]) -> Result<(), Canoni
         | Ty::Box(value)
         | Ty::Slice(value)
         | Ty::DynArray(value)
-        | Ty::ArrayBuilder(value)
         | Ty::Task(value)
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => remap_decoded_scalar(value, resolved),
+        Ty::ArrayBuilder(value) => remap_decoded_scalar(value, resolved),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => remap_decoded_scalar(value, resolved),
+        Ty::FixedStructArrayBuilder(id, _) | Ty::DynFixedStructArray(id, _) => {
+            *id = resolve_decoded_node(*id, 0, resolved)?;
+            Ok(())
+        }
         Ty::Result(ok, err) => {
             remap_decoded_scalar(ok, resolved)?;
             remap_decoded_scalar(err, resolved)
@@ -2140,11 +2272,20 @@ fn type_nodes(value: Ty) -> Vec<Node> {
         | Ty::Box(value)
         | Ty::Slice(value)
         | Ty::DynArray(value)
-        | Ty::ArrayBuilder(value)
         | Ty::Task(value)
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => scalar_nodes(value),
+        Ty::ArrayBuilder(value) => scalar_nodes(value),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => scalar_nodes(value),
+        Ty::FixedStructArrayBuilder(id, _) | Ty::DynFixedStructArray(id, _) => {
+            vec![Node::Struct(id)]
+        }
         Ty::Result(ok, err) => {
             let mut nodes = scalar_nodes(ok);
             nodes.extend(scalar_nodes(err));
@@ -2326,6 +2467,56 @@ fn scalar(
     })
 }
 
+fn aggregate_array_elem(
+    out: &mut Vec<u8>,
+    value: AggregateArrayElem,
+    ordinal: &impl Fn(Node) -> Result<u32, CanonicalGraphError>,
+) -> Result<(), CanonicalGraphError> {
+    append_transactional(out, |out| match value {
+        AggregateArrayElem::Vec(elem, lanes) => {
+            out.push(0);
+            scalar(out, elem, ordinal)?;
+            out.extend(lanes.to_le_bytes());
+            Ok(())
+        }
+        AggregateArrayElem::Mask(elem, lanes) => {
+            out.push(1);
+            scalar(out, elem, ordinal)?;
+            out.extend(lanes.to_le_bytes());
+            Ok(())
+        }
+        AggregateArrayElem::FixedArray(elem, length) => {
+            out.push(2);
+            scalar(out, elem, ordinal)?;
+            out.extend(length.to_le_bytes());
+            Ok(())
+        }
+        AggregateArrayElem::FixedStructArray(id, length) => {
+            out.push(3);
+            out.extend(ordinal(Node::Struct(id))?.to_le_bytes());
+            out.extend(length.to_le_bytes());
+            Ok(())
+        }
+    })
+}
+
+fn array_builder_elem(
+    out: &mut Vec<u8>,
+    value: ArrayBuilderElem,
+    ordinal: &impl Fn(Node) -> Result<u32, CanonicalGraphError>,
+) -> Result<(), CanonicalGraphError> {
+    append_transactional(out, |out| match value {
+        ArrayBuilderElem::Scalar(value) => {
+            out.push(0);
+            scalar(out, value, ordinal)
+        }
+        ArrayBuilderElem::Aggregate(value) => {
+            out.push(1);
+            aggregate_array_elem(out, value, ordinal)
+        }
+    })
+}
+
 #[allow(dead_code)]
 fn ty(
     out: &mut Vec<u8>,
@@ -2425,7 +2616,18 @@ fn ty(
             Ty::Buffer => leaf!(25),
             Ty::ArrayBuilder(v) => {
                 out.push(26);
-                scalar(out, v, ordinal)
+                array_builder_elem(out, ArrayBuilderElem::Scalar(v), ordinal)
+            }
+            value @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => {
+                out.push(26);
+                array_builder_elem(
+                    out,
+                    value.array_builder_element().expect("matched aggregate builder"),
+                    ordinal,
+                )
             }
             Ty::StrFinder => leaf!(27),
             Ty::File => leaf!(28),
@@ -2467,6 +2669,17 @@ fn ty(
             Ty::Unit => leaf!(56),
             Ty::Resource(id) => node!(57, Resource, id),
             Ty::ResourceRef(id) => node!(58, Resource, id),
+            value @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => {
+                out.push(59);
+                aggregate_array_elem(
+                    out,
+                    value.dyn_aggregate_array_element().expect("matched aggregate array"),
+                    ordinal,
+                )
+            }
             Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2682,11 +2895,17 @@ fn remap_ty_fn(value: &mut Ty, remap: &[Option<u32>]) {
         | Ty::Box(value)
         | Ty::Slice(value)
         | Ty::DynArray(value)
-        | Ty::ArrayBuilder(value)
         | Ty::Task(value)
         | Ty::Array(value, _)
         | Ty::Vec(value, _)
         | Ty::Mask(value, _) => remap_scalar_fn(value, remap),
+        Ty::ArrayBuilder(value) => remap_scalar_fn(value, remap),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => remap_scalar_fn(value, remap),
         Ty::Result(ok, err) => {
             remap_scalar_fn(ok, remap);
             remap_scalar_fn(err, remap);
@@ -3163,14 +3382,14 @@ mod tests {
     #[test]
     fn canonical_graph_engine() {
         let program = baseline_program();
-        assert_eq!(canonical(Ty::Unit, &program).unwrap(), [2, 0, 0, 0, 0, 56]);
-        assert_eq!(canonical(Ty::Bool, &program).unwrap(), [2, 0, 0, 0, 0, 2]);
+        assert_eq!(canonical(Ty::Unit, &program).unwrap(), [3, 0, 0, 0, 0, 56]);
+        assert_eq!(canonical(Ty::Bool, &program).unwrap(), [3, 0, 0, 0, 0, 2]);
         assert_eq!(
             canonical(Ty::Int(i(64)), &program).unwrap(),
-            [2, 0, 0, 0, 0, 0, 1, 64]
+            [3, 0, 0, 0, 0, 0, 1, 64]
         );
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [2, 1, 0, 0, 0]);
+        assert_eq!(&bytes[..5], [3, 1, 0, 0, 0]);
         assert_eq!(bytes.last(), Some(&0));
     }
 
@@ -3178,9 +3397,9 @@ mod tests {
     fn canonical_type_codec() {
         let program = mir_program(&baseline_program());
         for (root, expected) in [
-            (Ty::Unit, vec![2, 0, 0, 0, 0, 56]),
-            (Ty::Bool, vec![2, 0, 0, 0, 0, 2]),
-            (Ty::Int(i(64)), vec![2, 0, 0, 0, 0, 0, 1, 64]),
+            (Ty::Unit, vec![3, 0, 0, 0, 0, 56]),
+            (Ty::Bool, vec![3, 0, 0, 0, 0, 2]),
+            (Ty::Int(i(64)), vec![3, 0, 0, 0, 0, 0, 1, 64]),
         ] {
             let encoded = CanonicalTy::from_program(root, &program).unwrap();
             assert_eq!(encoded.as_bytes(), expected);
@@ -3238,6 +3457,16 @@ mod tests {
             Ty::Reader,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Bool),
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
+                Scalar::Int(i(8)),
+                2,
+            ))),
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Mask(
+                Scalar::Float(f(32)),
+                4,
+            ))),
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedArray(Scalar::Bool, 2)),
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(0, 2)),
             Ty::StrFinder,
             Ty::File,
             Ty::Rng,
@@ -3336,7 +3565,7 @@ mod tests {
             &program,
         )
         .unwrap();
-        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 56, 0, 0, 0]);
+        assert_eq!(abi.as_bytes(), [1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 56, 0, 0, 0]);
         assert_eq!(CanonicalFnAbi::decode(abi.as_bytes()).unwrap(), abi);
 
         let params = [(ParamMode::ByValue, Ty::Fn(0))];
@@ -3367,33 +3596,47 @@ mod tests {
             assert_eq!(CanonicalTy::decode(bytes), Err(expected), "{bytes:02x?}");
         };
         error(&[], CanonicalCodecError::Truncated);
-        error(&[3], CanonicalCodecError::UnsupportedVersion);
-        error(&[2, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
-        error(&[2, 0, 0, 0, 0, 0, 2, 64], CanonicalCodecError::InvalidBool);
+        error(&[2], CanonicalCodecError::UnsupportedVersion);
+        error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 26, 2], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 26, 1, 4], CanonicalCodecError::UnknownTag);
         error(
-            &[2, 0, 0, 0, 0, 0, 1, 24],
+            &[3, 0, 0, 0, 0, 26, 1, 0, 2, 4, 0, 0, 0],
             CanonicalCodecError::InvalidWidth,
         );
         error(
-            &[2, 0, 0, 0, 0, 50, 0xff, 0xff, 0xff, 0xff],
+            &[3, 0, 0, 0, 0, 59, 2, 2, 0, 0, 0, 0],
+            CanonicalCodecError::InvalidCount,
+        );
+        error(
+            &[3, 0, 0, 0, 0, 59, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+            CanonicalCodecError::InvalidCount,
+        );
+        error(&[3, 0, 0, 0, 0, 0, 2, 64], CanonicalCodecError::InvalidBool);
+        error(
+            &[3, 0, 0, 0, 0, 0, 1, 24],
+            CanonicalCodecError::InvalidWidth,
+        );
+        error(
+            &[3, 0, 0, 0, 0, 50, 0xff, 0xff, 0xff, 0xff],
             CanonicalCodecError::MissingReference,
         );
 
-        let mut trailing = vec![2, 0, 0, 0, 0, 56];
+        let mut trailing = vec![3, 0, 0, 0, 0, 56];
         trailing.push(0);
         error(&trailing, CanonicalCodecError::TrailingBytes);
 
         let invalid_utf8 = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_utf8, CanonicalCodecError::InvalidUtf8);
         let embedded_nul = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&embedded_nul, CanonicalCodecError::EmbeddedNul);
 
         let invalid_align = [
-            2, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'S', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
         ];
         error(&invalid_align, CanonicalCodecError::InvalidGraph);
 
@@ -3417,22 +3660,22 @@ mod tests {
         error(&recursive, CanonicalCodecError::InvalidGraph);
 
         let duplicate_function = [
-            2, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
+            3, 2, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&duplicate_function, CanonicalCodecError::DuplicateMember);
 
-        let unreachable_function = [2, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 56];
+        let unreachable_function = [3, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 0, 0, 0, 56];
         error(
             &unreachable_function,
             CanonicalCodecError::NonCanonicalOrder,
         );
 
         let invalid_summary = [
-            2, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 4, 0, 0, 0, 0, 56, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0,
         ];
         error(&invalid_summary, CanonicalCodecError::InvalidSummary);
 
-        let unit = [2, 0, 0, 0, 0, 56];
+        let unit = [3, 0, 0, 0, 0, 56];
         let mut invalid_mode = vec![1, 1, 0, 0, 0, 4];
         invalid_mode.extend(unit);
         invalid_mode.extend(unit);
@@ -3496,7 +3739,7 @@ mod tests {
         second.ty = Ty::Tuple(1);
         program.structs[0].fields.push(second);
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [2, 3, 0, 0, 0]);
+        assert_eq!(&bytes[..5], [3, 3, 0, 0, 0]);
 
         let mut permuted = program.clone();
         permuted.tuples.swap(0, 1);
@@ -3595,7 +3838,7 @@ mod tests {
             program.structs.push(definition);
         }
         let bytes = canonical(Ty::Struct(0), &program).unwrap();
-        assert_eq!(&bytes[..5], [2, 0, 16, 0, 0]);
+        assert_eq!(&bytes[..5], [3, 0, 16, 0, 0]);
     }
 
     #[test]
@@ -3691,6 +3934,8 @@ mod tests {
             Scalar::HttpServer => [28], Scalar::HttpRequestCtx => [29],
             Scalar::ResponseBuilder => [30], Scalar::HttpStream => [31],
             Scalar::RunOutput => [32], Scalar::Fn(1) => [33, 1, 0x50, 0, 0],
+            Scalar::Resource(1) => [34, 1, 0x60, 0, 0],
+            Scalar::ResourceRef(1) => [35, 1, 0x60, 0, 0],
         );
     }
 
@@ -3711,7 +3956,12 @@ mod tests {
             Ty::DynArray(Scalar::Bool) => [16, 2], Ty::DynResponseArray => [17],
             Ty::Str => [18], Ty::String => [19], Ty::ArenaHandle => [20], Ty::Raw => [21],
             Ty::Builder => [22], Ty::Writer => [23], Ty::Reader => [24], Ty::Buffer => [25],
-            Ty::ArrayBuilder(Scalar::Bool) => [26, 2], Ty::StrFinder => [27],
+            Ty::ArrayBuilder(Scalar::Bool) => [26, 0, 2],
+            Ty::array_builder(ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(
+                Scalar::Int(i(8)), 2,
+            )))
+                => [26, 1, 0, 0, 1, 8, 2, 0, 0, 0],
+            Ty::StrFinder => [27],
             Ty::File => [28], Ty::Rng => [29], Ty::Regex => [30], Ty::Captures => [31],
             Ty::CliCommand => [32], Ty::CliParsed => [33], Ty::TcpConn => [34],
             Ty::TcpListener => [35], Ty::UdpSocket => [36], Ty::Child => [37],
@@ -3724,6 +3974,14 @@ mod tests {
             Ty::Fn(1) => [52, 1, 0x50, 0, 0], Ty::Enum(1) => [53, 1, 0x20, 0, 0],
             Ty::Task(Scalar::Bool) => [54, 2],
             Ty::DictEncoded(1, 2) => [55, 1, 0x10, 0, 0, 2, 0, 0, 0], Ty::Unit => [56],
+            Ty::Resource(1) => [57, 1, 0x60, 0, 0],
+            Ty::ResourceRef(1) => [58, 1, 0x60, 0, 0],
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedArray(Scalar::Bool, 2))
+                => [59, 2, 2, 2, 0, 0, 0],
+            Ty::dyn_aggregate_array(AggregateArrayElem::Mask(Scalar::Float(f(32)), 4))
+                => [59, 1, 1, 32, 4, 0, 0, 0],
+            Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
+                => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );
     }
 

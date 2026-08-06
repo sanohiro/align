@@ -154,6 +154,7 @@ fn discard_expr_tree(root: DiscardExprTask) {
                 }
                 ExprKind::Block(block)
                 | ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
                 | ExprKind::Unsafe(block)
                 | ExprKind::TaskGroup(block)
                 | ExprKind::Loop(block) => pending.push(DiscardExprTask::Block(Box::new(block))),
@@ -294,6 +295,7 @@ fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
         }
         ExprKind::Block(b)
         | ExprKind::Arena(b)
+        | ExprKind::NamedArena { block: b, .. }
         | ExprKind::Unsafe(b)
         | ExprKind::TaskGroup(b)
         | ExprKind::Loop(b) => cap_block_depth(b, d, diags),
@@ -1591,9 +1593,18 @@ impl<'a> Parser<'a> {
             TokKind::Arena => {
                 let start = self.span();
                 self.bump();
+                let name = if matches!(self.peek(), TokKind::Ident(_)) {
+                    self.parse_ident("arena binding")
+                } else {
+                    None
+                };
                 let block = self.parse_block()?;
                 let span = start.merge(self.prev_span());
-                Some(Expr { kind: ExprKind::Arena(block), span })
+                let kind = match name {
+                    Some(name) => ExprKind::NamedArena { name, block },
+                    None => ExprKind::Arena(block),
+                };
+                Some(Expr { kind, span })
             }
             TokKind::Unsafe => {
                 let start = self.span();
@@ -1977,6 +1988,27 @@ mod tests {
         assert_eq!(f.items.len(), 1);
         let Item::Fn(fd) = &f.items[0] else { panic!() };
         assert_eq!(fd.name.name, "main");
+    }
+
+    #[test]
+    fn arena_binding_is_distinct_from_anonymous_arena() {
+        let (file, errors) = parse(
+            "fn main() -> i64 {\n  a := arena { 1 }\n  b := arena out { values: array_builder<i64> := array_builder(out)\n    values.build().len() }\n  return a + b\n}\n",
+        );
+        assert!(!errors);
+        let Item::Fn(function) = &file.items[0] else { panic!("expected function") };
+        let FnBody::Block(body) = &function.body else { panic!("expected block body") };
+        let Stmt::Let { init: anonymous, .. } = &body.stmts[0] else {
+            panic!("expected anonymous arena binding")
+        };
+        assert!(matches!(anonymous.kind, ExprKind::Arena(_)));
+        let Stmt::Let { init: named, .. } = &body.stmts[1] else {
+            panic!("expected named arena binding")
+        };
+        assert!(matches!(
+            &named.kind,
+            ExprKind::NamedArena { name, .. } if name.name == "out"
+        ));
     }
 
     #[test]

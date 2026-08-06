@@ -355,7 +355,6 @@ fn walk_body_records<'a>(
                 | ExprKind::ArrayDictEncode { .. }
                 | ExprKind::ReaderStdin
                 | ExprKind::WriterStd { .. }
-                | ExprKind::ArrayBuilderNew { .. }
                 | ExprKind::TimeNow
                 | ExprKind::TimeInstant
                 | ExprKind::ProcessCpuCount
@@ -387,6 +386,10 @@ fn walk_body_records<'a>(
                 | ExprKind::Len(expr)
                 | ExprKind::ArrayBuilderBuild(expr) => {
                     work.push((BodyRecord::Expr(expr), child_depth));
+                }
+                ExprKind::CloneIn { value, region } => {
+                    work.push((BodyRecord::Expr(value), child_depth));
+                    work.push((BodyRecord::Expr(region), child_depth));
                 }
                 ExprKind::Binary { lhs, rhs, .. }
                 | ExprKind::IntArith { lhs, rhs, .. }
@@ -657,6 +660,7 @@ fn walk_body_records<'a>(
                 ExprKind::TaskGroup(block)
                 | ExprKind::Block(block)
                 | ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
                 | ExprKind::Unsafe(block) => {
                     work.push((BodyRecord::Block(block), child_depth));
                 }
@@ -791,6 +795,11 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(ptr), child_depth));
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::ArrayBuilderNew { region, .. } => {
+                    if let Some(region) = region {
+                        work.push((BodyRecord::Expr(region), child_depth));
+                    }
                 }
                 ExprKind::BuilderNew { capacity } => {
                     if let Some(value) = capacity.as_deref() {
@@ -2212,12 +2221,14 @@ mod tests {
 
                 let mut diagnostics = crate::Diagnostics::new();
                 let named_return_region = std::collections::HashMap::new();
+                let named_param_modes = std::collections::HashMap::new();
                 {
                     let function = &program.fns[0];
                     let mut escape = crate::EscapeCheck {
                         f: function,
                         diags: &mut diagnostics,
                         named_return_region: &named_return_region,
+                        named_param_modes: &named_param_modes,
                         fn_types: &program.fn_types,
                         tuples: &program.tuples,
                         structs: &program.structs,
@@ -2231,6 +2242,7 @@ mod tests {
                         task_group_regions: Vec::new(),
                         allocation_regions: Vec::new(),
                         allocation_region_by_expr: std::collections::HashMap::new(),
+                        region_capabilities: std::collections::HashMap::new(),
                         flow: crate::EscapeFlowCfg::new(),
                         flow_current: 0,
                         loop_exit_blocks: Vec::new(),

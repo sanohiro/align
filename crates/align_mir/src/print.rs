@@ -488,6 +488,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("const_array[{}] : {} = {}", elems.len(), ty_name(*elem), const_elems_str(elems))
         }
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
+        Rvalue::CloneIn { value, handle } => {
+            format!("clone_in({}, {})", operand_str(value), operand_str(handle))
+        }
         Rvalue::StrPredicate { kind, haystack, needle } => {
             let name = match kind {
                 align_sema::hir::StrPredKind::Contains => "str_contains",
@@ -615,7 +618,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))
         }
         Rvalue::BufferAppend { buffer, data } => format!("buffer_append({}, {})", operand_str(buffer), operand_str(data)),
-        Rvalue::ArrayBuilderNew { elem_size } => format!("array_builder_new(elem_size={elem_size})"),
+        Rvalue::ArrayBuilderNew { elem, region } => format!(
+            "array_builder_new(elem={elem:?}, region={})",
+            region.as_ref().map_or_else(|| "heap".to_string(), operand_str)
+        ),
         Rvalue::ArrayBuilderPush { builder, value, .. } => format!("array_builder_push({}, {})", operand_str(builder), operand_str(value)),
         Rvalue::ArrayBuilderPushStr { builder, value } => format!("array_builder_push_str({}, {})", operand_str(builder), operand_str(value)),
         Rvalue::ArrayBuilderAppend { builder, data } => format!("array_builder_append({}, {})", operand_str(builder), operand_str(data)),

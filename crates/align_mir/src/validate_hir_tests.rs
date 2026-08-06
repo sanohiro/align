@@ -1,7 +1,7 @@
 use super::*;
 use crate::validate_hir::{body_core_metadata_is_valid, body_ty_mangle};
 use align_sema::{
-    FloatTy, FnEffect, IntTy, Layout, PrimScalar, Scalar, Ty,
+    AggregateArrayElem, ArrayBuilderElem, FloatTy, FnEffect, IntTy, Layout, PrimScalar, Scalar, Ty,
     hir::{
         self, EnumDef, EnumVariant, FieldDef, FnTy, ImportedFn, ReturnBorrowSummary,
         ReturnRegionSummary, StructDef, TaggedType, TupleDef,
@@ -16,6 +16,39 @@ fn direct_program_name(call: &DirectCall) -> Option<&str> {
     match call {
         DirectCall::Program(target) => Some(target.as_str()),
         DirectCall::Runtime(_) => None,
+    }
+}
+
+#[test]
+fn aggregate_region_builder_source_survives_the_complete_hir_gate() {
+    for (name, source) in [
+        (
+            "vector-new",
+            "fn main() -> i32 { arena out { mut values: array_builder<vec4<i32>> := array_builder(out)\n return 0 } }\n",
+        ),
+        (
+            "vector-push",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n return 0 } }\n",
+        ),
+        (
+            "vector-build",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n built := values.build()\n return built.len() as i32 } }\n",
+        ),
+        (
+            "vector-index",
+            "fn main() -> i32 { arena out { value: vec4<i32> := [1, 2, 3, 4]\n mut values: array_builder<vec4<i32>> := array_builder(out)\n values.push(value)\n built := values.build()\n return built[0][1] } }\n",
+        ),
+        (
+            "mask-build",
+            "fn main() -> i32 { arena out { a: vec4<i32> := [1, 2, 3, 4]\n b: vec4<i32> := [0, 3, 2, 5]\n mut values: array_builder<mask4<i32>> := array_builder(out)\n values.push(a > b)\n built := values.build()\n selected := select(built[0], a, b)\n return selected[1] } }\n",
+        ),
+    ] {
+        let program = checked_source_program(source);
+        assert!(
+            validate_hir::body_only_metadata_is_valid(&program),
+            "{name}: bodies"
+        );
+        assert_eq!(lower_program(&program).fns.len(), 1, "{name}: lowering");
     }
 }
 
@@ -398,6 +431,23 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
     assert_one_header_mutation("stored-parameter-mode", &base, |program| {
         program.fns[0].param_modes[0] = align_ast::ParamMode::BorrowMut;
     });
+
+    let mut mutable_region = declaration_header_program();
+    let function = &mut mutable_region.fns[0];
+    function.locals.truncate(1);
+    function.locals[0].ty = Ty::ArenaHandle;
+    function.locals[0].is_mut = true;
+    function.param_modes[0] = align_ast::ParamMode::BorrowMut;
+    function.ret = Ty::Unit;
+    function.return_borrow = ReturnBorrowSummary::None;
+    function.return_region = ReturnRegionSummary::None;
+    function.body.stmts.clear();
+    function.body.value = Some(Box::new(hir::Expr {
+        kind: hir::ExprKind::Unit,
+        ty: Ty::Unit,
+        span: function.span,
+    }));
+    assert_header_rejected("mutable-region-parameter", &mutable_region);
     assert_one_header_mutation("stored-parameter-name", &base, |program| {
         program.fns[0].locals[0].name = "bad-name".to_string();
     });
@@ -3466,8 +3516,8 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         "the root Block, array-builder Expr, and value need depth three"
     );
     let span = align_span::Span::new(0, 0, 0);
-    let elem = scalar_int(64);
-    let builder_ty = Ty::ArrayBuilder(elem);
+    let elem = ArrayBuilderElem::Scalar(scalar_int(64));
+    let builder_ty = Ty::array_builder(elem);
     let mut drop_individual_exprs = std::collections::HashMap::new();
     drop_individual_exprs.insert(span, true);
     let expr = hir::Expr {
@@ -4696,6 +4746,105 @@ fn malformed_hir_type_placement_fails_closed() {
         return_cleanup: hir::ReturnCleanupAbi::None,
     });
     assert_placement_rejected("view extern return", &extern_view_return);
+}
+
+#[test]
+fn region_only_array_builder_headers_are_placement_valid() {
+    for (label, element) in [
+        ("str", ArrayBuilderElem::Scalar(Scalar::Str)),
+        (
+            "bytes",
+            ArrayBuilderElem::Scalar(Scalar::Slice(PrimScalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            }))),
+        ),
+        ("struct", ArrayBuilderElem::Scalar(Scalar::Struct(0))),
+        ("sum", ArrayBuilderElem::Scalar(Scalar::Enum(0))),
+        ("option", ArrayBuilderElem::Scalar(Scalar::Tagged(0))),
+        (
+            "vector",
+            ArrayBuilderElem::Aggregate(AggregateArrayElem::Vec(scalar_int(32), 4)),
+        ),
+        (
+            "mask",
+            ArrayBuilderElem::Aggregate(AggregateArrayElem::Mask(scalar_int(32), 8)),
+        ),
+        (
+            "fixed_array",
+            ArrayBuilderElem::Aggregate(AggregateArrayElem::FixedArray(Scalar::Str, 3)),
+        ),
+        (
+            "fixed_struct_array",
+            ArrayBuilderElem::Aggregate(AggregateArrayElem::FixedStructArray(0, 2)),
+        ),
+    ] {
+        let mut program = baseline_program();
+        program.imported_fns.push(ImportedFn {
+            name: format!("dep$push_{label}"),
+            params: vec![Ty::array_builder(element)],
+            param_modes: vec![align_ast::ParamMode::BorrowMut],
+            ret: Ty::Unit,
+            return_provenance_known: true,
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            effect: FnEffect::Pure,
+        });
+        assert!(
+            validate_hir::type_placement_metadata_is_valid(&program),
+            "region-only array_builder<{label}> header was rejected"
+        );
+    }
+
+    for (label, element) in [
+        (
+            "non_numeric_vector_lane",
+            AggregateArrayElem::Vec(Scalar::Bool, 4),
+        ),
+        (
+            "unsupported_mask_width",
+            AggregateArrayElem::Mask(scalar_int(32), 3),
+        ),
+        (
+            "empty_fixed_array",
+            AggregateArrayElem::FixedArray(Scalar::Bool, 0),
+        ),
+        (
+            "owned_fixed_array",
+            AggregateArrayElem::FixedArray(Scalar::String, 2),
+        ),
+    ] {
+        let mut program = baseline_program();
+        program.imported_fns.push(ImportedFn {
+            name: format!("dep$invalid_{label}"),
+            params: vec![Ty::array_builder(ArrayBuilderElem::Aggregate(element))],
+            param_modes: vec![align_ast::ParamMode::BorrowMut],
+            ret: Ty::Unit,
+            return_provenance_known: true,
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            effect: FnEffect::Pure,
+        });
+        assert_placement_rejected(label, &program);
+    }
+
+    let mut unknown_struct = baseline_program();
+    unknown_struct.imported_fns.push(ImportedFn {
+        name: "dep$invalid_unknown_fixed_struct_array".to_string(),
+        params: vec![Ty::array_builder(ArrayBuilderElem::Aggregate(
+            AggregateArrayElem::FixedStructArray(99, 2),
+        ))],
+        param_modes: vec![align_ast::ParamMode::BorrowMut],
+        ret: Ty::Unit,
+        return_provenance_known: true,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
+        effect: FnEffect::Pure,
+    });
+    assert_rejected("unknown_fixed_struct_array", &unknown_struct);
 }
 
 #[test]
@@ -9380,18 +9529,67 @@ fn hir_body_validator_native() {
         "native_array_builder_new",
         body_test_expr(
             hir::ExprKind::ArrayBuilderNew {
-                elem: Scalar::String,
+                elem: ArrayBuilderElem::Scalar(Scalar::String),
+                region: None,
             },
             Ty::ArrayBuilder(Scalar::String),
         ),
         Vec::new(),
         Ty::ArrayBuilder(Scalar::String)
     );
+    program.fns.push(body_test_named_function(
+        "native_named_region_materialization",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::NamedArena {
+                    local: 0,
+                    block: hir::Block {
+                        stmts: vec![
+                            hir::Stmt::Expr(body_test_expr(
+                                hir::ExprKind::CloneIn {
+                                    value: Box::new(native_str()),
+                                    region: Box::new(native_local(0, Ty::ArenaHandle)),
+                                },
+                                Ty::Str,
+                            )),
+                            hir::Stmt::Expr(body_test_expr(
+                                hir::ExprKind::ArrayBuilderNew {
+                                    elem: ArrayBuilderElem::Scalar(scalar_int(64)),
+                                    region: Some(Box::new(native_local(
+                                        0,
+                                        Ty::ArenaHandle,
+                                    ))),
+                                },
+                                Ty::ArrayBuilder(scalar_int(64)),
+                            )),
+                        ],
+                        value: Some(Box::new(body_test_expr(
+                            hir::ExprKind::Unit,
+                            Ty::Unit,
+                        ))),
+                    },
+                },
+                Ty::Unit,
+            ))),
+        },
+        vec![body_test_local(
+            0,
+            "out",
+            Ty::ArenaHandle,
+            false,
+            false,
+        )],
+        Ty::Unit,
+    ));
     add!(
         "native_array_builder_push",
         body_test_expr(
             hir::ExprKind::ArrayBuilderPush {
-                builder: Box::new(native_local(0, Ty::ArrayBuilder(Scalar::String))),
+                builder: Box::new(native_local(
+                    0,
+                    Ty::ArrayBuilder(Scalar::String),
+                )),
                 value: Box::new(body_test_expr(
                     hir::ExprKind::StrClone(Box::new(native_str())),
                     Ty::String,
@@ -9413,13 +9611,22 @@ fn hir_body_validator_native() {
         "native_array_builder_append",
         body_test_expr(
             hir::ExprKind::ArrayBuilderAppend {
-                builder: Box::new(native_local(0, Ty::ArrayBuilder(scalar_int(64)))),
+                builder: Box::new(native_local(
+                    0,
+                    Ty::ArrayBuilder(scalar_int(64)),
+                )),
                 data: Box::new(native_local(1, Ty::Slice(scalar_int(64)))),
             },
             Ty::Unit,
         ),
         vec![
-            body_test_local(0, "builder", Ty::ArrayBuilder(scalar_int(64)), true, false),
+            body_test_local(
+                0,
+                "builder",
+                Ty::ArrayBuilder(scalar_int(64)),
+                true,
+                false,
+            ),
             body_test_local(1, "data", Ty::Slice(scalar_int(64)), false, false),
         ],
         Ty::Unit
@@ -9441,6 +9648,40 @@ fn hir_body_validator_native() {
             false,
         )],
         Ty::DynArray(scalar_int(64))
+    );
+    let vector_element = AggregateArrayElem::Vec(scalar_int(32), 4);
+    let vector_builder = Ty::array_builder(ArrayBuilderElem::Aggregate(vector_element));
+    add!(
+        "native_aggregate_array_builder_push",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderPush {
+                builder: Box::new(native_local(0, vector_builder)),
+                value: Box::new(body_test_expr(
+                    hir::ExprKind::VecLit {
+                        elems: (0..4)
+                            .map(|value| {
+                                body_test_expr(hir::ExprKind::Int(value), i32_ty)
+                            })
+                            .collect(),
+                        elem: scalar_int(32),
+                    },
+                    vector_element.ty(),
+                )),
+                moves_value: false,
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "builder", vector_builder, true, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_aggregate_array_builder_build",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(0, vector_builder))),
+            Ty::dyn_aggregate_array(vector_element),
+        ),
+        vec![body_test_local(0, "builder", vector_builder, false, false)],
+        Ty::dyn_aggregate_array(vector_element)
     );
     add!(
         "native_fs_write_file",
@@ -10744,6 +10985,90 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    let mut reject = program.clone();
+    let function = reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_named_region_materialization")
+        .expect("named region fixture is present");
+    function.locals.push(body_test_local(
+        1,
+        "alias",
+        Ty::ArenaHandle,
+        false,
+        false,
+    ));
+    let expression = function
+        .body
+        .value
+        .as_deref_mut()
+        .expect("named region fixture has a value");
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    block.stmts.push(hir::Stmt::Let {
+        local: 1,
+        init: native_local(0, Ty::ArenaHandle),
+    });
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "an ordinary local must not store a region capability"
+    );
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { local, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    *local = 99;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    let hir::Stmt::Expr(clone) = &mut block.stmts[0] else {
+        panic!("named region fixture lost clone_in")
+    };
+    let hir::ExprKind::CloneIn { region, .. } = &mut clone.kind else {
+        panic!("named region fixture lost clone_in")
+    };
+    region.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(
+        &mut reject,
+        "native_named_region_materialization",
+    );
+    let hir::ExprKind::NamedArena { block, .. } = &mut expression.kind else {
+        panic!("named region fixture lost its arena")
+    };
+    let hir::Stmt::Expr(builder) = &mut block.stmts[1] else {
+        panic!("named region fixture lost its builder")
+    };
+    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut builder.kind else {
+        panic!("named region fixture lost its builder")
+    };
+    *elem = ArrayBuilderElem::Scalar(Scalar::String);
+    builder.ty = Ty::ArrayBuilder(Scalar::String);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(
+        &mut reject,
+        "native_aggregate_array_builder_build",
+    );
+    expression.ty = Ty::dyn_aggregate_array(AggregateArrayElem::Mask(scalar_int(32), 4));
+    assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
     reject.fns.push(body_test_named_function(

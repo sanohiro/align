@@ -32,7 +32,7 @@ use align_mir::{
     ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
 };
 use align_sema::{
-    DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
+    ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
     drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
@@ -58,7 +58,10 @@ use inkwell::targets::{
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
 };
-use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue};
+use inkwell::values::{
+    ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
+    PointerValue, StructValue,
+};
 
 pub fn is_available() -> bool {
     true
@@ -2388,8 +2391,39 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         Ty::Box(payload)
                         | Ty::Slice(payload)
                         | Ty::DynArray(payload)
-                        | Ty::ArrayBuilder(payload)
                         | Ty::Task(payload) => self.check_scalar_reference(payload)?,
+                        Ty::ArrayBuilder(payload) => {
+                            self.check_scalar_reference(payload)?
+                        }
+                        ty @ (Ty::VecArrayBuilder(..)
+                        | Ty::MaskArrayBuilder(..)
+                        | Ty::FixedArrayBuilder(..)
+                        | Ty::FixedStructArrayBuilder(..)
+                        | Ty::DynVecArray(..)
+                        | Ty::DynMaskArray(..)
+                        | Ty::DynFixedArray(..)
+                        | Ty::DynFixedStructArray(..)) => {
+                            let payload = ty
+                                .array_builder_element()
+                                .and_then(|element| match element {
+                                    ArrayBuilderElem::Aggregate(element) => Some(element),
+                                    ArrayBuilderElem::Scalar(_) => None,
+                                })
+                                .or_else(|| ty.dyn_aggregate_array_element())
+                                .expect("matched aggregate type");
+                            if !align_sema::region_plain_type_ok(
+                                payload.ty(),
+                                &self.program.structs,
+                                &self.program.enums,
+                                &self.program.tagged_types,
+                            ) {
+                                return Err(Self::invalid(format!(
+                                    "aggregate array element {:?} is not RegionPlain",
+                                    payload.ty()
+                                )));
+                            }
+                            work.push(TypeGraphWork::Ty(payload.ty()));
+                        }
                         Ty::DynStructArray(id, _)
                         | Ty::Soa(id)
                         | Ty::JsonScanner(id) => self.require_struct(id)?,
@@ -2583,6 +2617,28 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     Ty::DynArray(payload) => {
                         key.push('D');
                         work.push(SourceAbiKeyWork::Ty(scalar_to_ty(payload)));
+                    }
+                    Ty::ArrayBuilder(element) => {
+                        key.push_str("AB_");
+                        work.push(SourceAbiKeyWork::Ty(scalar_to_ty(element)));
+                    }
+                    ty @ (Ty::VecArrayBuilder(..)
+                    | Ty::MaskArrayBuilder(..)
+                    | Ty::FixedArrayBuilder(..)
+                    | Ty::FixedStructArrayBuilder(..)) => {
+                        key.push_str("AB_");
+                        work.push(SourceAbiKeyWork::Ty(
+                            ty.array_builder_element().expect("matched aggregate builder").ty(),
+                        ));
+                    }
+                    ty @ (Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..)) => {
+                        key.push_str("DA_");
+                        work.push(SourceAbiKeyWork::Ty(
+                            ty.dyn_aggregate_array_element().expect("matched aggregate array").ty(),
+                        ));
                     }
                     Ty::Array(payload, count) => {
                         key.push_str(&format!("A{count}_"));
@@ -4233,7 +4289,9 @@ fn scalar_type<'c>(
         // array views) lowers to the slice struct.
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_)
+        | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -4365,6 +4423,10 @@ fn abi_type<'c>(
         | Ty::Reader
         | Ty::Buffer
         | Ty::ArrayBuilder(_)
+        | Ty::VecArrayBuilder(..)
+        | Ty::MaskArrayBuilder(..)
+        | Ty::FixedArrayBuilder(..)
+        | Ty::FixedStructArrayBuilder(..)
         | Ty::Regex
         | Ty::Captures
         | Ty::TcpConn
@@ -4377,7 +4439,9 @@ fn abi_type<'c>(
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
-        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_)
+        | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
             slice_struct_type(ctx).into()
@@ -5442,6 +5506,12 @@ fn apply_size_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile)
     }
 }
 
+enum CloneInWork<'c> {
+    Visit(BasicValueEnum<'c>, Ty),
+    RebuildStruct { base: StructValue<'c>, fields: Vec<u32> },
+    RebuildArray { base: ArrayValue<'c>, elements: u32 },
+}
+
 struct FnGen<'c, 'a> {
     ctx: &'c Context,
     module: &'a Module<'c>,
@@ -5525,7 +5595,7 @@ struct ParMapFunctionSignature {
 }
 
 fn is_builder_header_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Builder | Ty::ArrayBuilder(_))
+    ty == Ty::Builder || ty.is_array_builder()
 }
 
 #[derive(Default)]
@@ -5548,7 +5618,8 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
         for stmt in &block.stmts {
             if let Stmt::Let(v, rv) = stmt {
                 match rv {
-                    Rvalue::BuilderNew { .. } | Rvalue::ArrayBuilderNew { .. } => {
+                    Rvalue::BuilderNew { .. }
+                    | Rvalue::ArrayBuilderNew { region: None, .. } => {
                         new_defs.insert(*v, f.value_tys[*v as usize]);
                     }
                     Rvalue::Load(slot) if is_builder_header_ty(f.slots[*slot as usize]) => {
@@ -7086,7 +7157,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
+                    let z: BasicValueEnum = if ty.is_array_builder() || matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -7200,16 +7271,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.runtime(RuntimeKey::StrFinderFree), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if let Ty::ArrayBuilder(elem) = ty {
+                    } else if let Some(elem) = ty.array_builder_element() {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
                         // builder deep-frees each pushed-not-frozen string first (the same
                         // `free_string_array`-class helper); a scalar builder frees the flat storage.
                         // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
                         // slot was nulled at `build`'s move site).
                         let stack = self.stack_header_slots.contains(slot);
-                        let free_key = if elem == align_sema::Scalar::String && stack {
+                        let string_elem =
+                            elem == ArrayBuilderElem::Scalar(align_sema::Scalar::String);
+                        let free_key = if string_elem && stack {
                             RuntimeKey::ArrayBuilderFreeStringsStack
-                        } else if elem == align_sema::Scalar::String {
+                        } else if string_elem {
                             RuntimeKey::ArrayBuilderFreeStrings
                         } else if stack {
                             RuntimeKey::ArrayBuilderFreeStack
@@ -8373,13 +8446,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(result_ty);
                 self.builder
                     .build_load(ty, ep, "idx")
                     .map_err(|e| self.err(e))?
@@ -9391,6 +9458,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("str_clone returns a {ptr,len}")
+            }
+            Rvalue::CloneIn { value, handle } => {
+                let ty = self.f.operand_ty(value);
+                let value = self.operand(value)?;
+                let handle = self.operand(handle)?.into_pointer_value();
+                self.clone_in_value(value, ty, handle)?
             }
             Rvalue::StrTrim { kind, recv } => {
                 // Extract the receiver `{ptr,len}` and call the trim; the runtime returns a sub-view
@@ -10962,13 +11035,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_extract_value(agg, 0, "ptr")
                     .map_err(|e| self.err(e))?
                     .into_pointer_value();
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(result_ty);
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -11494,6 +11561,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Reader
             | Ty::Buffer
             | Ty::ArrayBuilder(_)
+            | Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)
             | Ty::Regex
             | Ty::Captures
             | Ty::TcpConn
@@ -11516,7 +11587,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .array_type(n)
             .into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_)
+            | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
@@ -11530,6 +11603,310 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.tagged_types,
             ),
         }
+    }
+
+    /// Clone every view-bearing leaf of a checked `RegionPlain` value into `handle`. The explicit
+    /// worklist is deliberate: nominal graphs and nested tagged values can be deep, and backend
+    /// construction must not recurse on the host stack. Aggregate tags and non-view fields are
+    /// preserved byte-for-value; inactive tagged payloads start zeroed and remain semantically
+    /// unavailable.
+    fn clone_in_value(
+        &mut self,
+        value: BasicValueEnum<'c>,
+        ty: Ty,
+        handle: PointerValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let mut work = vec![CloneInWork::Visit(value, ty)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                CloneInWork::Visit(value, ty) => match ty {
+                    Ty::Str
+                    | Ty::Slice(Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    })) => values.push(self.clone_in_view(value, handle)?),
+                    Ty::Struct(id) => {
+                        let BasicValueEnum::StructValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain struct has a non-struct LLVM value"));
+                        };
+                        let definition = self
+                            .structs
+                            .get(id as usize)
+                            .ok_or_else(|| self.err(format!("clone_in has unknown struct id {id}")))?;
+                        let permutation = self
+                            .field_perm
+                            .get(id as usize)
+                            .ok_or_else(|| self.err(format!("clone_in has no layout for struct id {id}")))?;
+                        if definition.fields.len() != permutation.len() {
+                            return Err(self.err(format!("clone_in struct {id} layout arity mismatch")));
+                        }
+                        let fields: Vec<(u32, Ty)> = definition
+                            .fields
+                            .iter()
+                            .zip(permutation)
+                            .map(|(field, physical)| (*physical, field.ty))
+                            .collect();
+                        let mut children = Vec::with_capacity(fields.len());
+                        for (physical, field_ty) in &fields {
+                            let child = self
+                                .builder
+                                .build_extract_value(base, *physical, "clonein.field")
+                                .map_err(|e| self.err(e))?;
+                            children.push((child, *field_ty));
+                        }
+                        work.push(CloneInWork::RebuildStruct {
+                            base,
+                            fields: fields.iter().map(|(physical, _)| *physical).collect(),
+                        });
+                        work.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|(child, child_ty)| CloneInWork::Visit(child, child_ty)),
+                        );
+                    }
+                    Ty::Option(payload) => {
+                        let BasicValueEnum::StructValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain Option has a non-struct LLVM value"));
+                        };
+                        let child = self
+                            .builder
+                            .build_extract_value(base, 1, "clonein.option")
+                            .map_err(|e| self.err(e))?;
+                        work.push(CloneInWork::RebuildStruct { base, fields: vec![1] });
+                        work.push(CloneInWork::Visit(child, scalar_to_ty(payload)));
+                    }
+                    Ty::Array(payload, elements) => {
+                        let BasicValueEnum::ArrayValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain fixed array has a non-array LLVM value"));
+                        };
+                        let mut children = Vec::with_capacity(elements as usize);
+                        for index in 0..elements {
+                            children.push(
+                                self.builder
+                                    .build_extract_value(base, index, "clonein.element")
+                                    .map_err(|e| self.err(e))?,
+                            );
+                        }
+                        work.push(CloneInWork::RebuildArray { base, elements });
+                        work.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|child| CloneInWork::Visit(child, scalar_to_ty(payload))),
+                        );
+                    }
+                    Ty::StructArray(id, elements) => {
+                        let BasicValueEnum::ArrayValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain fixed struct array has a non-array LLVM value"));
+                        };
+                        let mut children = Vec::with_capacity(elements as usize);
+                        for index in 0..elements {
+                            children.push(
+                                self.builder
+                                    .build_extract_value(base, index, "clonein.struct.element")
+                                    .map_err(|e| self.err(e))?,
+                            );
+                        }
+                        work.push(CloneInWork::RebuildArray { base, elements });
+                        work.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|child| CloneInWork::Visit(child, Ty::Struct(id))),
+                        );
+                    }
+                    Ty::Enum(id) => {
+                        let BasicValueEnum::StructValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain sum has a non-struct LLVM value"));
+                        };
+                        let definition = self
+                            .enums
+                            .get(id as usize)
+                            .ok_or_else(|| self.err(format!("clone_in has unknown sum id {id}")))?;
+                        let fields: Vec<(u32, Ty)> = definition
+                            .variants
+                            .iter()
+                            .flat_map(|variant| {
+                                variant.payload.iter().enumerate().map(move |(index, payload)| {
+                                    (variant.field_base + index as u32, scalar_to_ty(*payload))
+                                })
+                            })
+                            .collect();
+                        let mut children = Vec::with_capacity(fields.len());
+                        for (field, field_ty) in &fields {
+                            children.push((
+                                self.builder
+                                    .build_extract_value(base, *field, "clonein.sum.payload")
+                                    .map_err(|e| self.err(e))?,
+                                *field_ty,
+                            ));
+                        }
+                        work.push(CloneInWork::RebuildStruct {
+                            base,
+                            fields: fields.iter().map(|(field, _)| *field).collect(),
+                        });
+                        work.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|(child, child_ty)| CloneInWork::Visit(child, child_ty)),
+                        );
+                    }
+                    Ty::Tagged(id) => {
+                        let BasicValueEnum::StructValue(base) = value else {
+                            return Err(self.err("clone_in RegionPlain tagged value has a non-struct LLVM value"));
+                        };
+                        let payloads: Vec<(u32, Ty)> = match self.tagged_defs.get(id as usize) {
+                            Some(hir::TaggedType::Option(payload)) => {
+                                vec![(1, scalar_to_ty(*payload))]
+                            }
+                            Some(hir::TaggedType::Result(ok, err)) => vec![
+                                (1, scalar_to_ty(*ok)),
+                                (2, scalar_to_ty(*err)),
+                            ],
+                            None => {
+                                return Err(self.err(format!("clone_in has unknown tagged id {id}")));
+                            }
+                        };
+                        let mut children = Vec::with_capacity(payloads.len());
+                        for (field, field_ty) in &payloads {
+                            children.push((
+                                self.builder
+                                    .build_extract_value(base, *field, "clonein.tagged.payload")
+                                    .map_err(|e| self.err(e))?,
+                                *field_ty,
+                            ));
+                        }
+                        work.push(CloneInWork::RebuildStruct {
+                            base,
+                            fields: payloads.iter().map(|(field, _)| *field).collect(),
+                        });
+                        work.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|(child, child_ty)| CloneInWork::Visit(child, child_ty)),
+                        );
+                    }
+                    _ => values.push(value),
+                },
+                CloneInWork::RebuildStruct { mut base, fields } => {
+                    let start = values
+                        .len()
+                        .checked_sub(fields.len())
+                        .ok_or_else(|| self.err("clone_in struct reconstruction underflow"))?;
+                    let children = values.split_off(start);
+                    for (field, child) in fields.into_iter().zip(children) {
+                        base = self
+                            .builder
+                            .build_insert_value(base, child, field, "clonein.rebuild")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                    }
+                    values.push(base.into());
+                }
+                CloneInWork::RebuildArray { mut base, elements } => {
+                    let count = elements as usize;
+                    let start = values
+                        .len()
+                        .checked_sub(count)
+                        .ok_or_else(|| self.err("clone_in array reconstruction underflow"))?;
+                    let children = values.split_off(start);
+                    for (index, child) in children.into_iter().enumerate() {
+                        base = self
+                            .builder
+                            .build_insert_value(base, child, index as u32, "clonein.array.rebuild")
+                            .map_err(|e| self.err(e))?
+                            .into_array_value();
+                    }
+                    values.push(base.into());
+                }
+            }
+        }
+        if values.len() != 1 {
+            return Err(self.err("clone_in reconstruction did not produce exactly one value"));
+        }
+        values
+            .pop()
+            .ok_or_else(|| self.err("clone_in reconstruction produced no value"))
+    }
+
+    fn clone_in_view(
+        &mut self,
+        value: BasicValueEnum<'c>,
+        handle: PointerValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let BasicValueEnum::StructValue(view) = value else {
+            return Err(self.err("clone_in byte view has a non-view LLVM value"));
+        };
+        let src = self
+            .builder
+            .build_extract_value(view, 0, "cloneinsrc")
+            .map_err(|e| self.err(e))?
+            .into_pointer_value();
+        let len = self
+            .builder
+            .build_extract_value(view, 1, "cloneinlen")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let negative = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SLT,
+                len,
+                self.ctx.i64_type().const_zero(),
+                "clonein.neg",
+            )
+            .map_err(|e| self.err(e))?;
+        let pointer_bits = self.target_data.get_pointer_byte_size(None) * 8;
+        let target_isize_max = if pointer_bits >= 64 {
+            i64::MAX as u64
+        } else {
+            (1u64 << (pointer_bits - 1)) - 1
+        };
+        let too_large = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGT,
+                len,
+                self.ctx.i64_type().const_int(target_isize_max, false),
+                "clonein.large",
+            )
+            .map_err(|e| self.err(e))?;
+        let invalid = self
+            .builder
+            .build_or(negative, too_large, "clonein.invalid")
+            .map_err(|e| self.err(e))?;
+        self.guard_allocation_size(invalid)?;
+        let one = self.ctx.i64_type().const_int(1, false);
+        let dst = self
+            .builder
+            .build_call(
+                self.runtime(RuntimeKey::ArenaAlloc),
+                &[handle.into(), len.into(), one.into()],
+                "cloneinbuf",
+            )
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("arena_alloc returns a pointer")
+            .into_pointer_value();
+        self.builder
+            .build_memcpy(dst, 1, src, 1, len)
+            .map_err(|e| self.err(e))?;
+        let out = self
+            .builder
+            .build_insert_value(slice_struct_type(self.ctx).get_poison(), dst, 0, "cloneinptr")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        Ok(self
+            .builder
+            .build_insert_value(out, len, 1, "cloneinoutlen")
+            .map_err(|e| self.err(e))?
+            .into_struct_value()
+            .into())
     }
 
     /// `&slot[index]` via an array GEP (indices `[0, index]` into the `[N x T]` alloca).
@@ -11722,7 +12099,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // one flat free — no per-element deep free — and `array<Struct>`'s `str` fields are
                 // borrowed views into the input, not freed here. (A Move-struct element is deep-freed by
                 // the arm above.)
-                Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
+                Ty::DynArray(_)
+                | Ty::DynVecArray(..)
+                | Ty::DynMaskArray(..)
+                | Ty::DynFixedArray(..)
+                | Ty::DynFixedStructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::DynSliceArray(_) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
                     let agg = self
                         .builder
@@ -13291,8 +13674,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         match rv {
             // `array_builder<T>()` — open an empty typed builder sized to the element stride.
-            Rvalue::ArrayBuilderNew { elem_size } => {
-                let es = self.ctx.i64_type().const_int(*elem_size as u64, false);
+            Rvalue::ArrayBuilderNew { elem, region } => {
+                let element_type = self.llvm_type(*elem);
+                let es = self.ctx.i64_type().const_int(self.element_allocation_size(element_type), false);
+                let ea = self
+                    .ctx
+                    .i64_type()
+                    .const_int(self.type_align(*elem) as u64, false);
+                if let Some(region) = region {
+                    let arena = self.operand(region)?.into();
+                    let v = self
+                        .builder
+                        .build_call(
+                            self.runtime(RuntimeKey::ArrayBuilderNewIn),
+                            &[arena, es.into(), ea.into()],
+                            "ab.region",
+                        )
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .expect("array_builder_new_in returns a pointer");
+                    return Ok(Some(v));
+                }
                 if let Some(slot) = self.stack_header_new_values.get(&result_id).copied() {
                     let header = self.stack_headers[&slot];
                     let v = self
@@ -13321,6 +13724,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ArrayBuilderPush { builder, value, scalar } => {
                 let bp = self.operand(builder)?.into();
                 let i64t = self.ctx.i64_type();
+                if !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char) {
+                    let value = self.operand(value)?;
+                    let slot = self.alloca_at_entry(self.llvm_type(*scalar), "ab.elem")?;
+                    self.builder.build_store(slot, value).map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::ArrayBuilderPushBytes),
+                            &[bp, slot.into()],
+                            "",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    return Ok(None);
+                }
                 let bits = if matches!(scalar, Ty::Float(_)) {
                     let fv = self.operand(value)?.into_float_value();
                     let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
@@ -13347,8 +13763,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 Ok(None)
             }
-            // `b.append(xs)` — hand the `slice<T>` `{ptr, count}` to the runtime, which bulk-copies
-            // `count` elements at the builder's stored stride.
+            // `b.append(xs)` — hand the `slice<T>` `{ptr, count}` to the runtime, which copies
+            // `count` elements at the builder's stored, target-derived stride.
             Rvalue::ArrayBuilderAppend { builder, data } => {
                 let bp = self.operand(builder)?.into();
                 let (ptr, count) = self.split_str(data)?;

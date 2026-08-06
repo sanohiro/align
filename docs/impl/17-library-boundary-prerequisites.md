@@ -1831,7 +1831,7 @@ The following producer sets are exact:
 | tuple element | Exactly integer, float, bool, char, `Str`, `String`, `DynArray`, or `DynStructArray`; order is significant and duplicate tuple element lists are one interned identity. A Move tuple Drop recursively dispatches each owned element through its concrete type, including deep `array<string>` and `array<Move-struct>` elements. | one positive per kind, deep tuple-drop owner coverage, and all other graph-valid scalar/composite negatives |
 | `Option`/`Result` payload | `scalar_arg(..., allow_param=true)`: `payload-scalar`, with nested `Option`/`Result` interned as `Tagged`; abstract `Param` is template-only. | every payload kind, nested tagged values, and excluded buffer/builder/header/composite twins |
 | box type argument | `scalar_arg(..., allow_param=false)`, then reject `Struct`, `Enum`, every `Scalar::is_move`, and `Str`. The admitted type-formation remainder is integer, float, bool, char, unit, primitive `Slice`, SoA, JSON document, and a concrete non-Move `Tagged` value. This is deliberately broader than value construction: `heap.new` additionally rejects `Slice`, whose borrowed view cannot be stored as an owned box payload. | one type-formation positive for every admitted remainder including `Slice`/SoA/JSON/tagged; `heap.new(Slice)` body negative; struct/enum/owned/`Str`/parameter negatives |
-| slice/dynamic-array type argument | `collection-scalar`. A dynamic struct array instead records its exact struct id and rejects an over-aligned element. Every owned I/O handle, including `File`, is rejected because the generic array Drop path cannot release one handle per element. SoA separately requires a non-empty struct containing only integer, float, bool, char, or `Str` fields. `ArrayBuilder` accepts only integer, float, bool, char, or `String`. | one positive per type-argument family including `Fn`; every explicitly excluded handle/File/nested/over-aligned/SoA-field/builder negative |
+| slice/dynamic-array/builder type argument | `collection-scalar` for slices and established scalar dynamic arrays. A dynamic struct array instead records its exact struct id and rejects an over-aligned element. Every owned I/O handle, including `File`, is rejected because the generic array Drop path cannot release one handle per element. SoA separately requires a non-empty struct containing only integer, float, bool, char, or `Str` fields. `ArrayBuilder` records either an exact scalar descriptor or one of the closed vector, mask, fixed-scalar-array, and fixed-struct-array aggregate descriptors; constructor validation narrows the heap form to primitive Copy scalars/String and the explicit-region form to recursively `RegionPlain` concrete types. | one positive per type-argument family including `Fn`; every explicitly excluded handle/File/nested/over-aligned/SoA-field/builder negative; every builder descriptor positive plus invalid lane, length, scalar, and nominal-id twins |
 | fixed-array literal element | Body-owned, not am-p-owned. A fixed struct array admits an over-aligned struct and records the padded/aligned slot contract. A scalar literal rejects every owned handle including `File`, every slice-bearing non-struct, and a Move enum; all elements have one checked type, `ArrayLit.elem` matches it, and the length fits the stored type. | over-aligned fixed-struct positive; `File` type-formation-positive/literal-negative twin; handle/slice/Move-enum/type/length/pooled-state matrix in am-b2 |
 | vector and mask element | Integer or float with exactly 2, 4, 8, or 16 lanes. | every width/lane endpoint and bool/char/aggregate negatives |
 | annotated `FnTy` type positions | Each parameter is `ty-scalar`. The return is any graph-valid non-`Error` type currently produced by `resolve_type`; the body/call validator separately requires each actual callable origin to satisfy `fn-scalar` parameters and a `fn-scalar`/`Result` return. Mode cardinality/class and summaries belong only to am-h. Imported effect transport belongs to am-h; body-correlated effect cells and parallel eligibility belong only to am-b4. | slice- and buffer-parameter annotation positives, actual fn-value slice negative, Result-return handler, and one type-position mutation per branch |
@@ -2267,7 +2267,7 @@ by am-g-t encode. Definition references, field ordinals/bases, vector lanes, fix
 summary indices, counts, and text lengths are `u32`. No native `usize`, signed integer, enum memory
 layout, padding, or host endianness enters the bytes.
 
-`CanonicalTy` is `version=1:u8 || node_count:u32 || nodes || root_type`. Nodes are assigned ordinals
+`CanonicalTy` is `version=3:u8 || node_count:u32 || nodes || root_type`. Nodes are assigned ordinals
 by first visit in a depth-first walk from the root; struct fields, enum variants/payloads, tuple
 elements, tagged payloads, and function parameters are visited in stored declaration order.
 Repeated and recursive references emit the first assigned `u32` ordinal. The node tags and payloads
@@ -2279,7 +2279,8 @@ are:
 | 1 | enum: source-name, variant count, then each variant name, `field_base:u32`, payload count, and payload scalars |
 | 2 | tuple: element count and scalar elements |
 | 3 | tagged: `0 || option scalar` or `1 || ok scalar || err scalar` |
-| 4 | function: parameter count, each mode and scalar, return type, borrow summary, region summary; no effect or raw fn-table id |
+| 4 | function: parameter count, each mode and scalar, return type, borrow summary, region summary, cleanup ABI; no effect or raw fn-table id |
+| 5 | resource: source name, internal name, declaring module, Drop hook, Drop thunk, representation version, 16-byte Drop-ABI fingerprint, and generic arity |
 
 Struct/enum nodes include nominal `source_name` and their complete reachable shape. They exclude
 origin-aware private `name`. The fingerprint is nominal plus structural: different public nominals
@@ -2301,7 +2302,7 @@ ordinals on first visit. Decoding rebuilds the same partition, rejects two seria
 equivalence class as `DuplicateMember`, and rejects any node/ordinal order different from the
 depth-first first-visit re-encoding as `NonCanonicalOrder`.
 
-The `root_type` tags `0..=56`, in exact order, are:
+The current `root_type` tags `0..=59`, in exact order, are:
 
 ```text
 Int Float Bool Char Option Result Tagged Box Array Vec Mask StructArray DynStructArray Slice Soa
@@ -2309,23 +2310,30 @@ DynSliceArray DynArray DynResponseArray Str String ArenaHandle Raw Builder Write
 ArrayBuilder StrFinder File Rng Regex Captures CliCommand CliParsed TcpConn TcpListener UdpSocket
 Child Command RunOutput HttpRequest HttpResponse HttpClient HttpServer HttpRequestCtx
 ResponseBuilder HttpStream HttpHeaders JsonDoc JsonScanner Struct Tuple Fn Enum Task DictEncoded Unit
+Resource ResourceRef DynAggregateArray
 ```
 
 `Int` is `signed:bool || bits:u8`; `Float` is `bits:u8`. `Bool`, `Char`, the closed handles, `Str`,
 `String`, `Raw`, and `Unit` have no payload. `Option`, `Result`, `Box`, `Array`, `Vec`, `Mask`,
-`Slice`, `DynArray`, `ArrayBuilder`, and `Task` encode their scalar(s), then any `u32` length/lane.
+`Slice`, `DynArray`, and `Task` encode their scalar(s), then any `u32` length/lane.
 `DynSliceArray` encodes a primitive scalar. `StructArray` encodes a struct-node reference and
 length; `DynStructArray` encodes a struct-node reference and layout (`0=Aos`, `1=Soa`); `Soa`,
 `JsonScanner`, and `Struct` encode a struct-node reference. `Tagged`, `Tuple`, `Fn`, and `Enum`
 encode the matching node reference. `DictEncoded` encodes a struct-node reference then field
-ordinal. `DynResponseArray` has no payload.
+ordinal. `Resource` and `ResourceRef` encode a resource-node reference. `DynResponseArray` has no
+payload. `ArrayBuilder` encodes `0 || scalar` or `1 || aggregate-element`; `DynAggregateArray`
+encodes an aggregate element directly. Aggregate-element tags are exactly `0=Vec`, `1=Mask`,
+`2=FixedArray`, and `3=FixedStructArray`; vector/mask records encode scalar then lanes, fixed scalar
+arrays encode scalar then length, and fixed struct arrays encode a struct-node reference then
+length. All lengths and lane counts are `u32`.
 
-Valid scalar tags `0..=33`, in order, are:
+Valid scalar tags `0..=35`, in order, are:
 
 ```text
 Int Float Bool Char Unit Struct String DynArray DynStructArray DynResponseArray Str Slice Enum
 Tagged Soa JsonDoc Reader Writer Buffer Regex Captures CliParsed TcpConn TcpListener UdpSocket
-Child File HttpResponse HttpServer HttpRequestCtx ResponseBuilder HttpStream RunOutput Fn
+Child File HttpResponse HttpServer HttpRequestCtx ResponseBuilder HttpStream RunOutput Fn Resource
+ResourceRef
 ```
 
 Scalar `Int`/`Float` use the same width payloads; `Struct`/`DynStructArray`/`Soa` use a struct-node
@@ -2468,7 +2476,8 @@ The exact `RuntimeKey` set is:
 alloc alloc_size_fail arena_alloc arena_begin arena_end
 array_builder_append array_builder_build array_builder_build_stack array_builder_free
 array_builder_free_stack array_builder_free_strings array_builder_free_strings_stack
-array_builder_init_stack array_builder_new array_builder_push array_builder_push_str
+array_builder_init_stack array_builder_new array_builder_new_in array_builder_push
+array_builder_push_bytes array_builder_push_str
 base64_decode base64_encode base64url_decode base64url_encode bounds_fail
 buffer_append buffer_bytes buffer_free buffer_len buffer_new buffer_put
 builder_finish builder_finish_stack builder_free builder_free_stack builder_init_stack
@@ -2526,10 +2535,10 @@ and four distinct `par-map-probe` exports are verification-only runtime-fixture 
 names remain ordinary program/extern/export spellings. `task-group-probe` adds no unmangled export. The
 four AEAD cross-product symbols are ordinary keys
 rather than a codegen-side string match.
-[`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 281 keyed symbol/type/attribute
+[`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 283 keyed symbol/type/attribute
 records, the five always-built unkeyed records, and the eight verification-only probe records.
-The compiler registry is fixed at 286 base records with no feature or ambient input. The eight
-probe rows extend only the verification-time maximum runtime-export table to 294; they are never a
+The compiler registry is fixed at 288 base records with no feature or ambient input. The eight
+probe rows extend only the verification-time maximum runtime-export table to 296; they are never a
 RuntimeKey, callable declaration, collision reservation, or compatible-extern reuse target.
 Probe-feature runtime builds never link user artifacts. Runtime feature selection affects only
 export-set verification and changes no source acceptance or MIR/interface/artifact/cache identity.
@@ -3303,9 +3312,9 @@ The am-c author-side construction/consumption inventory is exact for the current
 | Class | Producers that must change together | Consumers that must change together |
 |---|---|---|
 | program | validated stored functions, per-unit imports, extern declarations, HIR `Call`, `FnValue`, lifted `Closure`, every scalar/AoS pipeline stage, `reduce`/`any`/`all`, `scan`, `partition`, `sort_by_key`, and parallel terminal/stage callables | MIR print/debug, work-weight scan, tagged-type remap/embedded-type scan, LLVM definition/import/extern declaration registry, direct-call lowering, extern coercion, function-value and closure thunk discovery/lowering, parallel signature checks, whole/per-unit symbol/linkage, explicit exports, and main wrapping |
-| runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 281 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
+| runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 283 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
 | generated | every distinct `FnAddr`, capturing `Closure`, `SpawnTask` result/fallibility pair, `ParMapParallel` materialize/filter count/filter scatter request, and `ParMapReduce` request | pre-body collection/validation, canonical byte sorting/deduplication, global-name reservation/probing, helper declaration/body emission, call-site pointer selection, debug names, and malformed-before-publication rejection |
-| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 286 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
+| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 288 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
 
 The callable applicability matrix is exhaustive; “unavailable” is an invalid hand-built MIR cell,
 not a missing positive owner:
@@ -3335,8 +3344,8 @@ The parallel mode/stage/collection matrix is exact:
 | contains `Filter`, `FilterStrContains`, or `FilterField`, optionally interleaved with `Map`/`Project` | unavailable | unavailable | valid individual record | valid individual record | exactly one otherwise-identical count/scatter pair after dedupe |
 | any unknown stage, invalid ordinal/type/signature, invalid work weight, or other mode/stage combination | reject | reject | reject | reject | reject before reservation |
 
-Canonical-type owners cross every root tag `0..=56`, scalar tag `0..=33`, primitive tag `0..=5`,
-definition tag `0..=4`, parameter mode, summary state, equivalence/non-equivalence class, repeated and
+Canonical-type owners cross every current root tag `0..=59`, scalar tag `0..=35`, primitive tag `0..=5`,
+definition tag `0..=5`, parameter mode, summary state, equivalence/non-equivalence class, repeated and
 recursive reference, shallow/deep graph, and encode/decode direction. Malformed owners mutate one
 version, tag, boolean, width, count, UTF-8/NUL, reference/order, duplicate member/equivalence class,
 empty nominal source, member identifier byte, alignment presence/power/range, enum first/later
@@ -4256,6 +4265,46 @@ Acceptance:
 - no heap allocation occurs in the region form;
 - exactly one compacting element pass occurs;
 - resources/owned heap fields receive compile diagnostics.
+
+The F-B implementation closure matrix is authoritative while L4 and L6 are built. It implements
+the already settled region contract without introducing an ambient allocator or a database-named
+compiler path. Symbolic generic `RegionPlain` bounds remain owned by L7; F-B closes the concrete
+recursive classifier and every runtime/materialization path that L7 will later select after
+monomorphization.
+
+The concrete builder element record is one non-recursive compiler descriptor, not a widening of
+the general `Scalar` payload class. It has exactly these shapes: `Scalar(Scalar)`,
+`Vec(Scalar, lanes)`, `Mask(Scalar, lanes)`, `FixedArray(Scalar, length)`, and
+`FixedStructArray(struct_id, length)`. The last four shapes freeze to one dedicated dynamic
+aggregate-array type carrying the same descriptor; scalar and struct elements retain the existing
+`DynArray` and AoS `DynStructArray` result types. Formation converts the resolved concrete `Ty` once,
+and push, build, indexing, type display, Drop/region analysis, HIR validation, MIR remapping,
+interface reconstruction, and LLVM layout consume that same record. The descriptor preserves
+nominal struct/tagged ids for canonical remapping and is rejected before MIR when a lane scalar,
+width, length, struct id, or result correlation is malformed. Direct source formation closes the
+currently spellable vector/mask shapes; fixed-array descriptors also close monomorphized and
+hand-built-HIR consumers without inventing a second fixed-array surface spelling before L7.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| syntax, binding, and type formation | Parse both `arena {}` and `arena name {}`; bind `name` as the builtin Copy `region` type only for the block; reject construction, mutation, shadowing, storage, unsupported aggregates, FFI, task transfer, and return | parser/formatter round trips; named/anonymous scoping positives; formation and escape diagnostic matrix |
+| exact region identity | Give every named arena and `region` parameter a stable semantic identity; inside a callee keep each caller-owned region or borrowed builder symbolic and distinct from both `Static` and callee-local frame/arena storage, then discharge relationships between distinct symbolic parameters at each concrete call site; preserve returned and captured region ownership through direct/imported/indirect calls, function-value target joins, moved function values, captures, and monomorphization without collapsing distinct caller regions | sema provenance owners for direct, branch, loop, `?`, closure, imported, and function-value return paths; nested-callee-arena rejection for incoming regions/builders; canonical interface and whole/per-unit parity |
+| explicit allocation and `clone_in` | Lower every region allocation with the exact capability operand; `clone_in` copies `str`/`bytes` backing storage and recursively copies view-bearing fields of a `RegionPlain` struct into that region, returns a value tied to `out`, validates each view size before allocation, and performs no heap allocation | exact HIR/MIR operand assertions; scalar/bytes/struct runtime content and lifetime positives; wrong-region, owned-field, and post-region escape negatives; LLVM call inspection |
+| cleanup and exits | Begin each arena once and end it once on every returning completion path, including normal completion, return, `?`, branch, and loop exit; allocation/overflow hard errors remain process-terminating; named and anonymous cleanup are byte-identical apart from storing the bound handle; a borrowed incoming region is never ended by its callee | named/anonymous LLVM cleanup-shape comparison plus the existing arena completion-path owners; whole/per-unit executable parity |
+| concrete `RegionPlain` classification | Recursively accept scalars, `Option`, fixed vectors/masks, fixed arrays, plain structs, and region-valid `str`/`bytes` views; reject resources, refs, raw, functions, builders, independently owned heap fields, and recursive unsupported shapes before execution. Convert every admitted top-level shape to the one exact builder-element descriptor before HIR; never truncate it through `Scalar` | table-driven classifier tests for nested positive/negative shapes and every descriptor discriminator; deterministic first-invalid-field diagnostics; source `vec`/`mask` formation positives; malformed HIR descriptor/result-correlation rejection |
+| region builder formation and ownership | `array_builder<T>(out)` records its exact region and concrete element descriptor, is Move and bound to one mutable local, may be passed only as `borrow mut`, and cannot be stored, returned, captured, moved into a task, or built through an alias. A `borrow mut` builder parameter keeps symbolic caller provenance and the heap-only, region-only, or constructor-dependent allocation bound implied by `T`, so callee-local frame/arena views cannot be retained and a nested helper cannot assume heap ownership. Each concrete call over a view-bearing builder conservatively checks and retains every view-bearing argument root in the caller, so direct and imported helpers cannot erase newly stored provenance. Builder-parameter function values remain outside the existing scalar-only first-class signature surface. | constructor/receiver/mode diagnostic matrix across scalar/vector/mask/fixed-array descriptors; direct/imported Pure helper push positives; callee-local nested-arena, nested-helper allocation-mode, and call-site wrong-region negatives; move/alias/capture/store/build negatives |
+| chunked growth and push provenance | Builder headers and growth chunks allocate only from the selected arena; scalar/Option/plain-struct pushes copy exactly one initialized element; pushed views retain their source provenance, so a current-row view cannot survive `next`, while `clone_in(out)` can | runtime allocation counters and chunk-boundary data checks; sema current-row/clone provenance tests; exact element-layout MIR/LLVM assertions |
+| compacting build | `build` consumes the owned builder, allocates one final contiguous result in the same region, performs exactly one element compaction pass, invalidates the builder, and returns the correctly typed region-tied array | runtime pass counter and 0/1/multi-chunk result tests; move/use-after-build checks; MIR source-nulling and returned-region assertions |
+| failure and early cleanup | Invalid native layouts and overflow are rejected before allocation or copy; allocation exhaustion follows the existing hard-error arena contract; early return, `?`, branch, loop, and unfinished-builder exits leave no independently owned storage, never end a borrowed region, and let the enclosing arena reclaim all chunks | invalid-layout/overflow runtime owners plus the existing arena MIR cleanup-path suite; nested named arenas and helper-call coverage |
+| interfaces, ABI, and cache identity | Serialize `region` parameters, exact return-region summaries, region-builder forms, and every concrete builder/dynamic-result element discriminator canonically; remap embedded nominal ids once; reject malformed metadata and builder/result mismatches before MIR/codegen; keep whole-program and per-unit ABI byte-equivalent | interface codec/hash goldens and corruption tests for each descriptor; declaration-order determinism; whole/per-unit object/link/run parity |
+| end-to-end resource promises | Materialize scalar, Option, vector, mask, and plain-struct arrays through ordinary functions, including recursively plain fields and fixed-array append sources; prove no heap calls in the region form and one compacting element pass without weakening anonymous arena behavior | focused F-B driver suite, applicable runtime/interface/MIR owners, LLVM IR inspection, allocation/pass-count measurement, `scripts/test-pr.sh`, and applicable Clippy |
+
+F-B is intentionally one consumer-complete capability even when it exceeds roughly 1,000
+hand-written changed lines. Splitting named-region formation from its first allocator consumer would
+publish a dormant capability; splitting the builder runtime from provenance would allow accepted
+views to dangle; and splitting compacting build from cleanup would leave no safe, usable result.
+Intermediate commits therefore remain compiling owner-backed checkpoints on one branch rather than
+publishable partial region semantics.
 
 ### L7 — nested generic package APIs and `RegionPlain` bound
 

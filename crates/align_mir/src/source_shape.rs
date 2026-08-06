@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use align_ast::ParamMode;
-use align_sema::{Scalar, Ty, hir};
+use align_sema::{AggregateArrayElem, Scalar, Ty, hir};
 
 use super::canonical_graph::Node;
 
@@ -382,6 +382,25 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
         }
     }
 
+    fn aggregate_array_elems_equal(
+        &mut self,
+        left: AggregateArrayElem,
+        right: AggregateArrayElem,
+    ) -> bool {
+        match (left, right) {
+            (AggregateArrayElem::Vec(left, a), AggregateArrayElem::Vec(right, b))
+            | (AggregateArrayElem::Mask(left, a), AggregateArrayElem::Mask(right, b))
+            | (AggregateArrayElem::FixedArray(left, a), AggregateArrayElem::FixedArray(right, b)) => {
+                a == b && self.scalars_equal(left, right)
+            }
+            (
+                AggregateArrayElem::FixedStructArray(left, a),
+                AggregateArrayElem::FixedStructArray(right, b),
+            ) => a == b && self.queue_equal(Node::Struct(left), Node::Struct(right)),
+            _ => false,
+        }
+    }
+
     fn types_equal(&mut self, left: Ty, right: Ty) -> bool {
         macro_rules! same {
             ($pattern:pat => $body:expr) => {
@@ -413,9 +432,37 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             }
             Ty::Slice(left) => same!(Ty::Slice(right) => self.scalars_equal(left, right)),
             Ty::DynArray(left) => same!(Ty::DynArray(right) => self.scalars_equal(left, right)),
+            left @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => right
+                .dyn_aggregate_array_element()
+                .is_some_and(|right| {
+                    self.aggregate_array_elems_equal(
+                        left.dyn_aggregate_array_element().expect("matched aggregate array"),
+                        right,
+                    )
+                }),
             Ty::ArrayBuilder(left) => {
                 same!(Ty::ArrayBuilder(right) => self.scalars_equal(left, right))
             }
+            left @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => right
+                .array_builder_element()
+                .and_then(|element| match element {
+                    align_sema::ArrayBuilderElem::Aggregate(element) => Some(element),
+                    align_sema::ArrayBuilderElem::Scalar(_) => None,
+                })
+                .is_some_and(|right| {
+                    let align_sema::ArrayBuilderElem::Aggregate(left) =
+                        left.array_builder_element().expect("matched aggregate builder")
+                    else {
+                        unreachable!()
+                    };
+                    self.aggregate_array_elems_equal(left, right)
+                }),
             Ty::Task(left) => same!(Ty::Task(right) => self.scalars_equal(left, right)),
             Ty::Tagged(left) => node!(Tagged, Tagged, left),
             Ty::StructArray(left, a) => {
@@ -507,8 +554,15 @@ fn ty_cost(value: Ty) -> (usize, usize) {
         | Ty::Box(value)
         | Ty::Slice(value)
         | Ty::DynArray(value)
-        | Ty::ArrayBuilder(value)
         | Ty::Task(value) => scalar_cost(value),
+        Ty::ArrayBuilder(value) => scalar_cost(value),
+        Ty::VecArrayBuilder(value, _)
+        | Ty::MaskArrayBuilder(value, _)
+        | Ty::FixedArrayBuilder(value, _)
+        | Ty::DynVecArray(value, _)
+        | Ty::DynMaskArray(value, _)
+        | Ty::DynFixedArray(value, _) => scalar_cost(value),
+        Ty::FixedStructArrayBuilder(..) | Ty::DynFixedStructArray(..) => (1, 1),
         Ty::Result(left, right) => {
             let left = scalar_cost(left);
             let right = scalar_cost(right);
@@ -666,6 +720,18 @@ pub(super) mod tests {
         program.tuples.push(program.tuples[0].clone());
         program.tagged_types.push(program.tagged_types[0]);
         program.fn_types.push(program.fn_types[0].clone());
+        let resource = hir::ResourceDef {
+            name: "pkg$Resource".into(),
+            source_name: "Resource".into(),
+            declaring_module: "pkg".into(),
+            generic_arity: 0,
+            drop_hook: "pkg$drop_resource".into(),
+            drop_thunk: "pkg$drop_resource$thunk".into(),
+            representation_version: 1,
+            drop_abi_fingerprint: [7; 16],
+        };
+        program.resources.push(resource.clone());
+        program.resources.push(resource);
         program
     }
     fn equal(view: &(impl SourceShapeView + ?Sized), left: Node, right: Node) -> bool {

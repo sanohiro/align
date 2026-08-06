@@ -1,0 +1,13 @@
+fn main() -> i32 {
+    arena out {
+        mut values: array_builder<i64> := array_builder(out)
+        mut i := 0
+        loop {
+            values.push(i)
+            i = i + 1
+            if i >= 17 { break }
+        }
+        built := values.build()
+        return (built.sum() + built.len()) as i32
+    }
+}

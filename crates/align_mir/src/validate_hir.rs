@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use align_sema::{Layout, PrimScalar, Scalar, Ty, hir};
+use align_sema::{
+    AggregateArrayElem, ArrayBuilderElem, Layout, PrimScalar, Scalar, Ty, hir,
+};
 use align_span::Span;
 
 use super::canonical_graph::Node;
@@ -538,7 +540,7 @@ fn mode_is_valid(
                 &program.tagged_types,
             )
         }
-        align_ast::ParamMode::BorrowMut => true,
+        align_ast::ParamMode::BorrowMut => ty != Ty::ArenaHandle,
     }
 }
 
@@ -1205,7 +1207,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
-            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw => true,
+            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw | Ty::ArenaHandle => true,
             Ty::Option(payload) => {
                 self.scalar_ok(payload, ScalarPlacement::Payload { allow_param })
             }
@@ -1229,10 +1231,21 @@ impl<'a> PlacementValidator<'a> {
                 !matches!(element, Scalar::Struct(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
+            ty @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => self.aggregate_array_element_ok(
+                ty.dyn_aggregate_array_element().expect("matched aggregate array"),
+            ),
             Ty::Soa(id) => self.soa_ok(id),
-            Ty::ArrayBuilder(element) => matches!(
-                element,
-                Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String
+            Ty::ArrayBuilder(element) => {
+                self.array_builder_element_ok(ArrayBuilderElem::Scalar(element))
+            }
+            ty @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => self.array_builder_element_ok(
+                ty.array_builder_element().expect("matched aggregate builder"),
             ),
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
@@ -1276,7 +1289,6 @@ impl<'a> PlacementValidator<'a> {
             | Ty::DynSliceArray(_)
             | Ty::DynResponseArray
             | Ty::Task(_)
-            | Ty::ArenaHandle
             | Ty::Builder
             | Ty::StrFinder
             | Ty::DictEncoded(..)
@@ -1285,10 +1297,60 @@ impl<'a> PlacementValidator<'a> {
         }
     }
 
+    /// Mirror the exact union admitted by source `array_builder<T>` type formation. Constructor
+    /// validation separately selects the heap subset or recursively checks concrete RegionPlain;
+    /// this header gate only proves that the stored scalar graph is a valid source spelling.
+    fn aggregate_array_element_ok(&self, element: AggregateArrayElem) -> bool {
+        let shape_ok = match element {
+            AggregateArrayElem::Vec(scalar, lanes)
+            | AggregateArrayElem::Mask(scalar, lanes) => {
+                matches!(lanes, 2 | 4 | 8 | 16)
+                    && matches!(scalar, Scalar::Int(_) | Scalar::Float(_))
+                    && self.resolve_type_ok(element.ty(), false)
+            }
+            AggregateArrayElem::FixedArray(scalar, length) => {
+                length > 0
+                    && !matches!(scalar, Scalar::Struct(_))
+                    && self.scalar_ok(scalar, ScalarPlacement::Collection)
+            }
+            AggregateArrayElem::FixedStructArray(id, length) => {
+                length > 0 && self.program.structs.get(id as usize).is_some()
+            }
+        };
+        shape_ok
+            && align_sema::region_plain_type_ok(
+                element.ty(),
+                &self.program.structs,
+                &self.program.enums,
+                &self.program.tagged_types,
+            )
+    }
+
+    fn array_builder_element_ok(&self, element: ArrayBuilderElem) -> bool {
+        match element {
+            ArrayBuilderElem::Scalar(element) => {
+                matches!(
+                    element,
+                    Scalar::Int(_)
+                        | Scalar::Float(_)
+                        | Scalar::Bool
+                        | Scalar::Char
+                        | Scalar::String
+                        | Scalar::Str
+                        | Scalar::Slice(_)
+                        | Scalar::Struct(_)
+                        | Scalar::Enum(_)
+                        | Scalar::Tagged(_)
+                ) && self.resolve_type_ok(align_sema::scalar_to_ty(element), false)
+            }
+            ArrayBuilderElem::Aggregate(element) => self.aggregate_array_element_ok(element),
+        }
+    }
+
     fn source_function_type_ok(&self, ty: Ty, parameter: bool, return_position: bool) -> bool {
         self.resolve_type_ok(ty, false)
             && !(parameter && matches!(ty, Ty::Box(_)))
-            && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_)))
+            && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_) | Ty::ArenaHandle))
     }
 
     fn stored_function_parameter_ok(&self, function: &hir::Fn, index: usize, ty: Ty) -> bool {
@@ -1633,8 +1695,21 @@ impl<'a> Validator<'a> {
             Ty::Box(payload)
             | Ty::Slice(payload)
             | Ty::DynArray(payload)
-            | Ty::ArrayBuilder(payload)
             | Ty::Task(payload) => self.inspect_scalar(payload, Edge::Header, facts),
+            Ty::ArrayBuilder(payload) => {
+                self.inspect_scalar(payload, Edge::Header, facts)
+            }
+            Ty::VecArrayBuilder(scalar, _)
+            | Ty::MaskArrayBuilder(scalar, _)
+            | Ty::FixedArrayBuilder(scalar, _)
+            | Ty::DynVecArray(scalar, _)
+            | Ty::DynMaskArray(scalar, _)
+            | Ty::DynFixedArray(scalar, _) => {
+                self.inspect_scalar(scalar, Edge::Header, facts)
+            }
+            Ty::FixedStructArrayBuilder(id, _) | Ty::DynFixedStructArray(id, _) => {
+                self.push_ref(Node::Struct(id), Edge::Header, facts)
+            }
             Ty::StructArray(id, _) => self.push_ref(Node::Struct(id), edge, facts),
             Ty::DynStructArray(id, _) | Ty::Soa(id) | Ty::JsonScanner(id) => {
                 self.push_ref(Node::Struct(id), Edge::Header, facts)
@@ -2013,6 +2088,10 @@ enum BodyWork<'a> {
 
 enum LocalScopeWork<'a> {
     EnterBlock(&'a hir::Block),
+    EnterNamedBlock {
+        local: hir::LocalId,
+        block: &'a hir::Block,
+    },
     ExitBlock,
     EnterStmt(&'a hir::Stmt),
     Bind {
@@ -2099,6 +2178,19 @@ impl<'a> LocalScopeValidator<'a> {
                         work.push(LocalScopeWork::EnterStmt(statement));
                     }
                 }
+                LocalScopeWork::EnterNamedBlock { local, block } => {
+                    self.scopes.push(Vec::new());
+                    if !self.activate_binding(local, true) {
+                        return false;
+                    }
+                    work.push(LocalScopeWork::ExitBlock);
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(LocalScopeWork::EnterExpr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        work.push(LocalScopeWork::EnterStmt(statement));
+                    }
+                }
                 LocalScopeWork::ExitBlock => {
                     if !self.restore_scope() {
                         return false;
@@ -2151,6 +2243,12 @@ impl<'a> LocalScopeValidator<'a> {
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
                             work.push(LocalScopeWork::EnterBlock(block));
+                        }
+                        hir::ExprKind::NamedArena { local, block } => {
+                            work.push(LocalScopeWork::EnterNamedBlock {
+                                local: *local,
+                                block,
+                            });
                         }
                         hir::ExprKind::If { cond, then, els } => {
                             work.push(LocalScopeWork::EnterBlock(els));
@@ -2355,6 +2453,7 @@ struct BodyValidator<'a> {
     statements: HashMap<usize, BodyFlow>,
     arms: HashMap<usize, BodyFlow>,
     binding_counts: HashMap<(usize, hir::LocalId), usize>,
+    region_bindings: HashSet<(usize, hir::LocalId)>,
     producer_exprs: HashMap<usize, ProducerFlow>,
     producer_blocks: HashMap<usize, ProducerFlow>,
 }
@@ -2389,6 +2488,7 @@ impl<'a> BodyValidator<'a> {
             statements: HashMap::new(),
             arms: HashMap::new(),
             binding_counts: HashMap::new(),
+            region_bindings: HashSet::new(),
             producer_exprs: HashMap::new(),
             producer_blocks: HashMap::new(),
         }
@@ -2532,16 +2632,27 @@ impl<'a> BodyValidator<'a> {
                 .copied()
                 .unwrap_or(0);
             if parameters.contains(&local.id) {
+                let mode = function
+                    .params
+                    .iter()
+                    .position(|id| *id == local.id)
+                    .and_then(|index| function.param_modes.get(index));
                 count == 0
+                    && (local.ty != Ty::ArenaHandle
+                        || (mode == Some(&align_ast::ParamMode::ByValue) && !local.is_mut))
             } else if self.allow_implicit_local_params {
                 // Dormant body fixtures predate the am-b4 activation contract and may model an
                 // otherwise unbound local as an implicit parameter. Production validation never
                 // enables this compatibility path.
                 count <= 1
+                    && (local.ty != Ty::ArenaHandle
+                        || self.region_bindings.contains(&(function_index, local.id)))
             } else {
                 // Every production nonparameter local is introduced exactly once by Let,
                 // LetTuple, or a match payload. Reject even an unused orphan table record.
                 count == 1
+                    && (local.ty != Ty::ArenaHandle
+                        || self.region_bindings.contains(&(function_index, local.id)))
             }
         })
     }
@@ -2582,6 +2693,13 @@ impl<'a> BodyValidator<'a> {
             Ty::DynArray(element) => {
                 !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
+            ty @ (Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)) => {
+                let element = ty.dyn_aggregate_array_element().expect("matched aggregate array");
+                self.body_ty_ok(element.ty()) && self.region_plain_ty_ok(element.ty())
+            }
             Ty::DynResponseArray => true,
             Ty::Soa(id) => self.soa_type_ok(id),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
@@ -2594,6 +2712,13 @@ impl<'a> BodyValidator<'a> {
             Ty::Task(payload) => primitive_task_scalar(payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
             Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
+            ty @ (Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)) => {
+                let element = ty.array_builder_element().expect("matched aggregate builder");
+                self.body_ty_ok(element.ty()) && self.region_plain_ty_ok(element.ty())
+            }
             Ty::JsonScanner(id) => self.program.structs.get(id as usize).is_some(),
             Ty::DictEncoded(id, field) => self
                 .program
@@ -2794,6 +2919,30 @@ impl<'a> BodyValidator<'a> {
                         | (Ty::Task(actual), Ty::Task(expected))
                         | (Ty::ArrayBuilder(actual), Ty::ArrayBuilder(expected)) => {
                             work.push(Pending::Scalar(actual, expected));
+                        }
+                        (Ty::VecArrayBuilder(actual, an), Ty::VecArrayBuilder(expected, en))
+                        | (Ty::MaskArrayBuilder(actual, an), Ty::MaskArrayBuilder(expected, en))
+                        | (Ty::FixedArrayBuilder(actual, an), Ty::FixedArrayBuilder(expected, en))
+                        | (Ty::DynVecArray(actual, an), Ty::DynVecArray(expected, en))
+                        | (Ty::DynMaskArray(actual, an), Ty::DynMaskArray(expected, en))
+                        | (Ty::DynFixedArray(actual, an), Ty::DynFixedArray(expected, en)) => {
+                            if an != en {
+                                return false;
+                            }
+                            work.push(Pending::Scalar(actual, expected));
+                        }
+                        (
+                            Ty::FixedStructArrayBuilder(actual, an),
+                            Ty::FixedStructArrayBuilder(expected, en),
+                        )
+                        | (
+                            Ty::DynFixedStructArray(actual, an),
+                            Ty::DynFixedStructArray(expected, en),
+                        ) => {
+                            if an != en {
+                                return false;
+                            }
+                            work.push(Pending::Ty(Ty::Struct(actual), Ty::Struct(expected)));
                         }
                         (Ty::Result(actual_ok, actual_err), Ty::Result(expected_ok, expected_err)) => {
                             work.push(Pending::Scalar(actual_ok, expected_ok));
@@ -3261,6 +3410,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ResultErr(_)
             | hir::ExprKind::Try(_)
             | hir::ExprKind::Arena(_)
+            | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::Unsafe(_)
             | hir::ExprKind::RawAlloc(_)
             | hir::ExprKind::RawFree(_)
@@ -3272,6 +3422,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BoxGet(_)
             | hir::ExprKind::BoxClone(_)
             | hir::ExprKind::StrClone(_)
+            | hir::ExprKind::CloneIn { .. }
             | hir::ExprKind::StrPredicate { .. }
             | hir::ExprKind::StrTrim { .. }
             | hir::ExprKind::StrBorrow(_)
@@ -3654,7 +3805,13 @@ impl<'a> BodyValidator<'a> {
     fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
         match &expression.kind {
             hir::ExprKind::WriterStd { fd, .. } => matches!(*fd, 1 | 2),
-            hir::ExprKind::ArrayBuilderNew { elem } => self.array_builder_elem_ok(*elem),
+            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+                if region.is_some() {
+                    self.array_builder_region_elem_ok(*elem)
+                } else {
+                    self.array_builder_elem_ok(*elem)
+                }
+            }
             hir::ExprKind::RandShuffle { elem, .. } | hir::ExprKind::RandSample { elem, .. } => {
                 self.rng_elem_ok(*elem)
             }
@@ -3794,9 +3951,52 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
-    fn array_builder_elem_ok(&self, elem: Scalar) -> bool {
+    fn array_builder_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        let ArrayBuilderElem::Scalar(elem) = elem else {
+            return false;
+        };
         align_sema::scalar_to_prim(elem).is_some()
             && (elem == Scalar::String || self.scalar_copy_ok(elem))
+    }
+
+    fn array_builder_region_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        self.region_plain_ty_ok(elem.ty())
+    }
+
+    fn region_plain_ty_ok(&self, ty: Ty) -> bool {
+        let mut work = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(ty) = work.pop() {
+            let ty = align_sema::expand_tagged_ty(ty, &self.program.tagged_types);
+            if !seen.insert(ty) {
+                continue;
+            }
+            match ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str
+                | Ty::Vec(..) | Ty::Mask(..) => {}
+                Ty::Slice(Scalar::Int(align_sema::IntTy {
+                    bits: 8,
+                    signed: false,
+                })) => {}
+                Ty::Option(payload) => work.push(align_sema::scalar_to_ty(payload)),
+                Ty::Struct(id) => {
+                    let Some(definition) = self.program.structs.get(id as usize) else { return false };
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+                Ty::Enum(id) => {
+                    let Some(definition) = self.program.enums.get(id as usize) else { return false };
+                    work.extend(
+                        definition.variants.iter().rev().flat_map(|variant| {
+                            variant.payload.iter().rev().copied().map(align_sema::scalar_to_ty)
+                        }),
+                    );
+                }
+                Ty::Array(payload, _) => work.push(align_sema::scalar_to_ty(payload)),
+                Ty::StructArray(id, _) => work.push(Ty::Struct(id)),
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn rng_elem_ok(&self, elem: Ty) -> bool {
@@ -3924,6 +4124,7 @@ impl<'a> BodyValidator<'a> {
                     match &expression.kind {
                         hir::ExprKind::TaskGroup(block)
                         | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
@@ -3994,6 +4195,7 @@ impl<'a> BodyValidator<'a> {
                 | hir::ExprKind::Try(recv) => work.push(recv),
                 hir::ExprKind::Block(block)
                 | hir::ExprKind::Arena(block)
+                | hir::ExprKind::NamedArena { block, .. }
                 | hir::ExprKind::Unsafe(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push(value);
@@ -4103,6 +4305,7 @@ impl<'a> BodyValidator<'a> {
                     match &expression.kind {
                         hir::ExprKind::TaskGroup(block)
                         | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
@@ -4135,6 +4338,7 @@ impl<'a> BodyValidator<'a> {
                 hir::ExprKind::ReaderBuffered { .. } => return true,
                 hir::ExprKind::Block(block)
                 | hir::ExprKind::Arena(block)
+                | hir::ExprKind::NamedArena { block, .. }
                 | hir::ExprKind::Unsafe(block) => {
                     let Some(value) = block.value.as_deref() else {
                         return false;
@@ -4614,6 +4818,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderToString(expr) => {
                 push_expr!(expr, context.clone());
             }
+            hir::ExprKind::CloneIn { value, region } => {
+                push_expr!(region, context.clone());
+                push_expr!(value, context.clone());
+            }
             hir::ExprKind::Binary { lhs, rhs, .. }
             | hir::ExprKind::IntArith { lhs, rhs, .. } => {
                 push_expr!(rhs, context.clone());
@@ -4690,10 +4898,14 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::TupleIndex { recv, .. } => push_expr!(recv, context.clone()),
             hir::ExprKind::Block(block)
             | hir::ExprKind::Arena(block)
+            | hir::ExprKind::NamedArena { block, .. }
             | hir::ExprKind::Unsafe(block) => {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
-                if matches!(&expression.kind, hir::ExprKind::Arena(_)) {
+                if matches!(
+                    &expression.kind,
+                    hir::ExprKind::Arena(_) | hir::ExprKind::NamedArena { .. }
+                ) {
                     child.arena_depth = child.arena_depth.saturating_add(1);
                 }
                 if matches!(&expression.kind, hir::ExprKind::Unsafe(_)) {
@@ -5039,6 +5251,25 @@ impl<'a> BodyValidator<'a> {
             || context_polymorphic_expression(&expression.kind, falls);
         if !self.body_ty_ok(expression.ty) || !stored_type_matches {
             return false;
+        }
+        if let hir::ExprKind::NamedArena { local, .. } = &expression.kind {
+            let Some(function) = self.program.fns.get(context.function) else {
+                return false;
+            };
+            let Some(binding) = function.locals.get(*local as usize) else {
+                return false;
+            };
+            if binding.id != *local
+                || binding.ty != Ty::ArenaHandle
+                || binding.is_param
+                || binding.is_mut
+                || !self.record_binding(context.function, *local)
+            {
+                return false;
+            }
+            if !self.region_bindings.insert((context.function, *local)) {
+                return false;
+            }
         }
         let Some(producer_flow) = self.producer_expression_flow(expression) else {
             return false;
@@ -5789,6 +6020,10 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
             }
+            hir::ExprKind::NamedArena { block, .. } => {
+                let flow = self.block_flow(block)?;
+                Some((flow.ty, flow.falls, flow.breaks))
+            }
             hir::ExprKind::Unsafe(block) => {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
@@ -5973,6 +6208,20 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(value)?;
                 (flow.ty == Ty::Str).then_some((Ty::String, flow.falls, flow.breaks))
             }
+            hir::ExprKind::CloneIn { value, region } => {
+                let value = self.expr_flow(value)?;
+                let region = self.expr_flow(region)?;
+                let value_ty_ok = matches!(
+                    value.ty,
+                    Ty::Str | Ty::Slice(Scalar::Int(align_sema::IntTy { bits: 8, signed: false }))
+                ) || matches!(value.ty, Ty::Struct(_)) && self.region_plain_ty_ok(value.ty);
+                if !value_ty_ok || region.ty != Ty::ArenaHandle {
+                    return None;
+                }
+                let ty = value.ty;
+                let (falls, breaks) = strict_flow(&[value, region]);
+                Some((ty, falls, breaks))
+            }
             hir::ExprKind::StrPredicate { kind, haystack, needle } => {
                 let left = self.expr_flow(haystack)?;
                 let right = self.expr_flow(needle)?;
@@ -6103,6 +6352,7 @@ impl<'a> BodyValidator<'a> {
             }),
             hir::ExprKind::Block(block)
             | hir::ExprKind::Arena(block)
+            | hir::ExprKind::NamedArena { block, .. }
             | hir::ExprKind::TaskGroup(block)
             | hir::ExprKind::Unsafe(block) => self.producer_block_flow(block),
             hir::ExprKind::If { cond, then, els } => {
@@ -6339,47 +6589,59 @@ impl<'a> BodyValidator<'a> {
                 }
                 strict(Ty::Unit, &[buffer, data])
             }
-            hir::ExprKind::ArrayBuilderNew { elem } => {
-                (self.array_builder_elem_ok(*elem) && expression.ty == Ty::ArrayBuilder(*elem))
-                    .then_some((expression.ty, true, Vec::new()))
+            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+                let valid_elem = if region.is_some() {
+                    self.array_builder_region_elem_ok(*elem)
+                } else {
+                    self.array_builder_elem_ok(*elem)
+                };
+                if !valid_elem || expression.ty != Ty::array_builder(*elem) {
+                    return None;
+                }
+                if let Some(region) = region {
+                    if region.ty != Ty::ArenaHandle {
+                        return None;
+                    }
+                    strict(expression.ty, &[region])
+                } else {
+                    Some((expression.ty, true, Vec::new()))
+                }
             }
             hir::ExprKind::ArrayBuilderPush {
                 builder,
                 value,
                 moves_value,
             } => {
-                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
-                    return None;
-                };
-                if !self.array_builder_elem_ok(elem)
-                    || !mutable_local(builder, Ty::ArrayBuilder(elem))
-                    || value.ty != align_sema::scalar_to_ty(elem)
-                    || *moves_value != (elem == Scalar::String)
+                let elem = self.expr_flow(builder)?.ty.array_builder_element()?;
+                if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
+                    || !mutable_local(builder, Ty::array_builder(elem))
+                    || !self.body_ty_matches(value.ty, elem.ty())
+                    || *moves_value
+                        != matches!(elem, ArrayBuilderElem::Scalar(Scalar::String))
                 {
                     return None;
                 }
                 strict(Ty::Unit, &[builder, value])
             }
             hir::ExprKind::ArrayBuilderAppend { builder, data } => {
-                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
+                let elem = self.expr_flow(builder)?.ty.array_builder_element()?;
+                let ArrayBuilderElem::Scalar(scalar) = elem else {
                     return None;
                 };
-                if !self.array_builder_elem_ok(elem)
-                    || elem == Scalar::String
-                    || !self.scalar_copy_ok(elem)
-                    || !mutable_local(builder, Ty::ArrayBuilder(elem))
-                    || data.ty != Ty::Slice(elem)
+                if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
+                    || scalar == Scalar::String
+                    || !self.scalar_copy_ok(scalar)
+                    || !mutable_local(builder, Ty::array_builder(elem))
+                    || data.ty != Ty::Slice(scalar)
                 {
                     return None;
                 }
                 strict(Ty::Unit, &[builder, data])
             }
             hir::ExprKind::ArrayBuilderBuild(builder) => {
-                let Ty::ArrayBuilder(elem) = self.expr_flow(builder)?.ty else {
-                    return None;
-                };
-                let primitive = align_sema::scalar_to_prim(elem)?;
-                strict(Ty::DynArray(align_sema::prim_to_scalar(primitive)), &[builder])
+                let elem = self.expr_flow(builder)?.ty.array_builder_element()?;
+                let result = align_sema::array_builder_result_ty(elem);
+                strict(result, &[builder])
             }
             hir::ExprKind::FsWriteFile { path, data, builder } => {
                 if path.ty != Ty::Str
@@ -6920,6 +7182,10 @@ impl<'a> BodyValidator<'a> {
             // A scanner is owned by the later JSON slice. Keeping it out here also prevents the
             // array reducers from taking the Result<T, Error> scanner ABI by accident.
             Ty::DynStructArray(_, Layout::Soa)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
             | Ty::DynResponseArray
             | Ty::Unit
             | Ty::Str
@@ -6944,6 +7210,10 @@ impl<'a> BodyValidator<'a> {
             | Ty::ArenaHandle
             | Ty::Builder
             | Ty::ArrayBuilder(_)
+            | Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)
             | Ty::JsonDoc
             | Ty::DictEncoded(_, _)
             | Ty::Writer
@@ -7587,6 +7857,10 @@ impl<'a> BodyValidator<'a> {
                         | Ty::String
                         | Ty::Slice(_)
                         | Ty::DynArray(_)
+                        | Ty::DynVecArray(..)
+                        | Ty::DynMaskArray(..)
+                        | Ty::DynFixedArray(..)
+                        | Ty::DynFixedStructArray(..)
                         | Ty::DynStructArray(_, _)
                         | Ty::DynSliceArray(_)
                         | Ty::DynResponseArray
@@ -7614,6 +7888,13 @@ impl<'a> BodyValidator<'a> {
                     Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
                         align_sema::scalar_to_ty(scalar)
                     }
+                    ty @ (Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..)) => ty
+                        .dyn_aggregate_array_element()
+                        .expect("matched aggregate array")
+                        .ty(),
                     Ty::DynSliceArray(primitive) => {
                         Ty::Slice(align_sema::prim_to_scalar(primitive))
                     }
@@ -8934,6 +9215,11 @@ impl<'a> BodyValidator<'a> {
                 tuple.elems.iter().all(|scalar| self.scalar_copy_ok(*scalar))
             }),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
+            Ty::Vec(scalar, lanes) | Ty::Mask(scalar, lanes) => {
+                valid_vector_lanes(lanes)
+                    && valid_vector_scalar(scalar)
+                    && self.scalar_copy_ok(scalar)
+            }
             Ty::Array(scalar, length) => length > 0 && self.scalar_copy_ok(scalar),
             Ty::StructArray(id, length) => {
                 length > 0
@@ -9068,6 +9354,7 @@ fn context_polymorphic_expression(kind: &hir::ExprKind, falls: bool) -> bool {
                 | hir::ExprKind::Block(_)
                 | hir::ExprKind::Loop { .. }
                 | hir::ExprKind::Arena(_)
+                | hir::ExprKind::NamedArena { .. }
                 | hir::ExprKind::Unsafe(_)
         )
 }
@@ -9505,6 +9792,41 @@ pub(crate) fn body_ty_mangle(ty: Ty, program: &hir::Program) -> String {
                     }
                 },
                 Ty::Fn(_) => output.push_str("F_cycle"),
+                Ty::ArrayBuilder(element) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("AB_".to_string()),
+                        Work::Type(align_sema::scalar_to_ty(element)),
+                    ],
+                ),
+                ty @ (Ty::VecArrayBuilder(..)
+                | Ty::MaskArrayBuilder(..)
+                | Ty::FixedArrayBuilder(..)
+                | Ty::FixedStructArrayBuilder(..)) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("AB_".to_string()),
+                        Work::Type(
+                            ty.array_builder_element()
+                                .expect("matched aggregate builder")
+                                .ty(),
+                        ),
+                    ],
+                ),
+                ty @ (Ty::DynVecArray(..)
+                | Ty::DynMaskArray(..)
+                | Ty::DynFixedArray(..)
+                | Ty::DynFixedStructArray(..)) => push_sequence(
+                    &mut work,
+                    vec![
+                        Work::Text("DA_".to_string()),
+                        Work::Type(
+                            ty.dyn_aggregate_array_element()
+                                .expect("matched aggregate array")
+                                .ty(),
+                        ),
+                    ],
+                ),
                 other => output.push_str(&body_simple_ty_name(other)),
             },
         }
@@ -9524,15 +9846,37 @@ fn body_simple_ty_name(ty: Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::Unit => "()".to_string(),
-        Ty::ArenaHandle => "arena".to_string(),
+        Ty::ArenaHandle => "region".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Builder => "builder".to_string(),
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
-        Ty::ArrayBuilder(scalar) => format!(
+        Ty::ArrayBuilder(element) => format!(
             "array_builder_{}",
-            body_simple_ty_name(align_sema::scalar_to_ty(scalar))
+            body_simple_ty_name(align_sema::scalar_to_ty(element))
+        ),
+        ty @ (Ty::VecArrayBuilder(..)
+        | Ty::MaskArrayBuilder(..)
+        | Ty::FixedArrayBuilder(..)
+        | Ty::FixedStructArrayBuilder(..)) => format!(
+            "array_builder_{}",
+            body_simple_ty_name(
+                ty.array_builder_element()
+                    .expect("matched aggregate builder")
+                    .ty(),
+            )
+        ),
+        ty @ (Ty::DynVecArray(..)
+        | Ty::DynMaskArray(..)
+        | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..)) => format!(
+            "array_{}",
+            body_simple_ty_name(
+                ty.dyn_aggregate_array_element()
+                    .expect("matched aggregate array")
+                    .ty(),
+            )
         ),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),

@@ -408,6 +408,9 @@ pub enum ExprKind {
     Loop(Block),
     /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
     Arena(Block),
+    /// `arena name { ... }` — the same region with an explicit, scope-limited `region`
+    /// capability bound as `name` for allocation in ordinary callees.
+    NamedArena { name: Ident, block: Block },
     /// `unsafe { ... }` — a block in which `raw.*` operations (raw allocation, unchecked casts,
     /// manual free) are permitted. A plain marker block otherwise (no runtime effect); a function
     /// containing one is inferred impure (so it can never be a `par_map` callee).
