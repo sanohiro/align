@@ -3776,6 +3776,49 @@ struct TypeEntry {
 /// qualified `mod.Type` from an importer (with import + `pub` checks).
 type ModTypes = HashMap<String, HashMap<String, TypeEntry>>;
 
+#[derive(Clone, Copy)]
+struct BuiltinNominalAlias {
+    bare: &'static str,
+    explicit: &'static str,
+    canonical: &'static str,
+    required_import: Option<&'static str>,
+}
+
+const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
+    BuiltinNominalAlias {
+        bare: "Error",
+        explicit: "core.Error",
+        canonical: "Error",
+        required_import: None,
+    },
+    BuiltinNominalAlias {
+        bare: "argon2_params",
+        explicit: "crypto.argon2_params",
+        canonical: "argon2_params",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "regex_match",
+        explicit: "regex.regex_match",
+        canonical: "regex_match",
+        required_import: Some("std.regex"),
+    },
+];
+
+fn builtin_nominal_alias_by_bare(name: &str) -> Option<BuiltinNominalAlias> {
+    BUILTIN_NOMINAL_ALIASES
+        .iter()
+        .copied()
+        .find(|alias| alias.bare == name)
+}
+
+fn builtin_nominal_alias_by_explicit(path: &str) -> Option<BuiltinNominalAlias> {
+    BUILTIN_NOMINAL_ALIASES
+        .iter()
+        .copied()
+        .find(|alias| alias.explicit == path)
+}
+
 /// Resolve a type-name path to its canonical key, applying module visibility. A single segment is a
 /// type in `cur_module` (or a builtin reserved type); a dotted `mod.Type` must name an imported module
 /// and a `pub` type. `None` (with a diagnostic, unless the single-segment miss is left to the
@@ -3784,7 +3827,8 @@ type ModTypes = HashMap<String, HashMap<String, TypeEntry>>;
 fn canonical_type_name(
     path: &ast::Path,
     cur_module: &str,
-    imports: &std::collections::HashSet<String>,
+    user_imports: &std::collections::HashSet<String>,
+    builtin_imports: &std::collections::HashSet<String>,
     table: &ModTypes,
     emit_unknown: bool,
     span: Span,
@@ -3793,22 +3837,12 @@ fn canonical_type_name(
     let segs = &path.segments;
     let bare = segs.last().map(|s| s.name.as_str()).unwrap_or("");
     if segs.len() <= 1 {
-        // `Error` is the builtin error sum type — visible everywhere, no import.
-        if bare == "Error" {
-            return Some("Error".to_string());
-        }
-        // `argon2_params` is the builtin std.crypto Argon2 parameters struct — likewise visible
-        // everywhere (a reserved type name), so `argon2_params{...}` is an ordinary struct literal.
-        if bare == "argon2_params" {
-            return Some("argon2_params".to_string());
-        }
-        // `regex_match` is the builtin Copy span returned by `std.regex` searches.
-        if bare == "regex_match" {
-            return Some("regex_match".to_string());
-        }
         match table.get(cur_module).and_then(|m| m.get(bare)) {
             Some(e) => Some(e.canonical.clone()),
             None => {
+                if let Some(alias) = builtin_nominal_alias_by_bare(bare) {
+                    return Some(alias.canonical.to_string());
+                }
                 if emit_unknown {
                     diags.error(format!("unknown type: '{bare}'"), span);
                 }
@@ -3816,6 +3850,23 @@ fn canonical_type_name(
             }
         }
     } else {
+        let explicit = segs
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(alias) = builtin_nominal_alias_by_explicit(&explicit) {
+            if let Some(required) = alias.required_import
+                && !builtin_imports.contains(required)
+            {
+                diags.error(
+                    format!("`{explicit}` requires `import {required}` — the capability is not imported"),
+                    span,
+                );
+                return None;
+            }
+            return Some(alias.canonical.to_string());
+        }
         let mut module = String::new();
         for (i, s) in segs[..segs.len() - 1].iter().enumerate() {
             if i > 0 {
@@ -3823,7 +3874,7 @@ fn canonical_type_name(
             }
             module.push_str(&s.name);
         }
-        if module != cur_module && !imports.contains(&module) {
+        if module != cur_module && !user_imports.contains(&module) {
             diags.error(format!("module `{module}` is not imported (add `import {module}`)"), span);
             return None;
         }
@@ -4941,18 +4992,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ast::Item::Resource(r) => (&r.name.name, r.vis, r.type_params.len(), r.span),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
-            if bare == "Error" {
-                diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
-            }
-            if bare == "argon2_params" {
+            if m.is_entry && builtin_nominal_alias_by_bare(bare).is_some() {
                 diags.error(
-                    "'argon2_params' is a reserved type name (the builtin std.crypto Argon2 parameters struct)".to_string(),
-                    span,
-                );
-            }
-            if bare == "regex_match" {
-                diags.error(
-                    "'regex_match' is a reserved type name (the builtin std.regex match span struct)".to_string(),
+                    format!(
+                        "'{bare}' collides with a compiler-provided builtin type in the unmangled entry namespace"
+                    ),
                     span,
                 );
             }
@@ -5184,6 +5228,19 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             (m.path.as_str(), set)
         })
         .collect();
+    let builtin_imports_by_module: HashMap<&str, std::collections::HashSet<String>> = modules
+        .iter()
+        .map(|m| {
+            let set = m
+                .file
+                .imports
+                .iter()
+                .map(path_str)
+                .filter(|path| BUILTIN_MODULES.contains(&path.as_str()))
+                .collect();
+            (m.path.as_str(), set)
+        })
+        .collect();
 
     // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
     // (variant order must match `ERROR_VARIANT_CODE`). Registered right after the concrete user
@@ -5309,6 +5366,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 &mut TyCx {
                     cur_module: $module,
                     imports: imports_by_module.get(*$module).unwrap_or(&no_imports),
+                    builtin_imports: builtin_imports_by_module.get(*$module).unwrap_or(&no_imports),
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
@@ -5411,6 +5469,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             &mut TyCx {
                 cur_module: $module,
                 imports: $imports,
+                builtin_imports: builtin_imports_by_module
+                    .get(*$module)
+                    .unwrap_or(&no_imports),
                 type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
@@ -5818,7 +5879,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 }
                 let canonical = mangle_fn(&m.path, m.is_entry, bare);
                 let ann_ty = c.ty.as_ref().map(|t| {
-                    let ty = resolve_type(t, tcx!(m.path.as_str(), &no_imports), &[], diags);
+                    let ty = resolve_type(t, tcx!(&m.path.as_str(), &no_imports), &[], diags);
                     match ty {
                         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error => ty,
                         // A top-level aggregate constant is a **static `slice<T>` view** of per-unit
@@ -5957,7 +6018,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            let ty = resolve_type(&p.ty, tcx!(module, imports), &tparams, diags);
+            let ty = resolve_type(&p.ty, tcx!(&module, imports), &tparams, diags);
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
                 && bounds.get(index as usize) != Some(&Bound::RegionPlain)
             {
@@ -5984,7 +6045,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, tcx!(module, imports), &tparams, diags);
+                let r = resolve_type(t, tcx!(&module, imports), &tparams, diags);
                 if let Ty::ArrayBuilder(Scalar::Param(index)) = r
                     && bounds.get(index as usize) != Some(&Bound::RegionPlain)
                 {
@@ -6241,7 +6302,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 let cname = sig.name.name.clone();
                 let mut params: Vec<Ty> = Vec::with_capacity(sig.params.len());
                 for p in &sig.params {
-                    let ty = resolve_type(&p.ty, tcx!(m.path.as_str(), imports), &[], diags);
+                    let ty = resolve_type(&p.ty, tcx!(&m.path.as_str(), imports), &[], diags);
                     // `Ty::Error` already produced a diagnostic in `resolve_type` — don't pile a
                     // second "not FFI-safe" error on the same root cause. A parameter also accepts a
                     // `str`/`slice`/`bytes` view — passed to C as its data pointer (see
@@ -6273,7 +6334,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 }
                 let ret = match &sig.ret {
                     Some(t) => {
-                        let r = resolve_type(t, tcx!(m.path.as_str(), imports), &[], diags);
+                        let r = resolve_type(t, tcx!(&m.path.as_str(), imports), &[], diags);
                         // A `()` (void) return is allowed; otherwise an FFI-safe scalar or a
                         // `layout(C)` struct returned **by value** (SysV register return; codegen
                         // enforces the ABI/target/size limits). (`Ty::Error` already reported.)
@@ -24936,6 +24997,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26305,6 +26367,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26339,6 +26402,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26367,23 +26431,30 @@ impl<'a, 't> Checker<'a, 't> {
     /// Resolve a type-name path to its canonical key (a bare name in `cur_module`, or a qualified
     /// `mod.Type` with import + `pub` checks). Emits a diagnostic on failure.
     fn canonical_type(&mut self, path: &ast::Path, span: Span) -> Option<String> {
-        canonical_type_name(path, &self.cur_module, self.user_imports, self.type_table, true, span, self.diags)
+        canonical_type_name(
+            path,
+            &self.cur_module,
+            self.user_imports,
+            self.imports,
+            self.type_table,
+            true,
+            span,
+            self.diags,
+        )
     }
 
     /// Resolve a bare type name to its canonical key in the current module (or a builtin reserved type),
     /// without emitting an error — for speculative interpretations (e.g. `Name.Variant`) that fall
     /// through to other meanings when `Name` is not a type here.
     fn local_type(&self, bare: &str) -> Option<String> {
-        if bare == "Error" {
-            return Some("Error".to_string());
-        }
-        if bare == "argon2_params" {
-            return Some("argon2_params".to_string());
-        }
-        if bare == "regex_match" {
-            return Some("regex_match".to_string());
-        }
-        self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
+        self.type_table
+            .get(&self.cur_module)
+            .and_then(|types| types.get(bare))
+            .map(|entry| entry.canonical.clone())
+            .or_else(|| {
+                builtin_nominal_alias_by_bare(bare)
+                    .map(|alias| alias.canonical.to_string())
+            })
     }
 
     /// Resolve the receiver of a `Type.Variant` access/constructor to the type's canonical name —
@@ -26407,9 +26478,21 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind
             && let Some(name) = single_name(p) {
                 return Ok(self.local_type(name));
-            }
+        }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
+        if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
+            if let Some(required) = alias.required_import
+                && !self.imports.contains(required)
+            {
+                self.diags.error(
+                    format!("`{flat}` requires `import {required}` — the capability is not imported"),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some(alias.canonical.to_string()));
+        }
         let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
         if module == self.cur_module || !self.user_imports.contains(module) {
             return Ok(None);
@@ -37313,6 +37396,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -40928,6 +41012,9 @@ struct TyCx<'a> {
     cur_module: &'a str,
     /// The user modules `cur_module` imports — a qualified `mod.Type` must name one (or `cur_module`).
     imports: &'a std::collections::HashSet<String>,
+    /// Builtin capability modules imported by `cur_module`. Provider-qualified nominal aliases
+    /// under `std` use this set; `core.Error` is the sole import-free explicit spelling.
+    builtin_imports: &'a std::collections::HashSet<String>,
     /// Every module's bare→(canonical, pub?) type names, for qualified-type resolution.
     type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
@@ -41201,7 +41288,16 @@ fn resolve_type(
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
     // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
     if path.segments.len() > 1 {
-        return match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+        return match canonical_type_name(
+            path,
+            cx.cur_module,
+            cx.imports,
+            cx.builtin_imports,
+            cx.type_table,
+            true,
+            span,
+            diags,
+        ) {
             Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
             None => Ty::Error,
         };
@@ -41737,7 +41833,16 @@ fn resolve_type(
             // Otherwise a user type in the current module (a bare name resolves there). The canonical
             // key handles per-module namespacing; `resolve_user_type` dispatches to struct / enum /
             // generic template.
-            match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+            match canonical_type_name(
+                path,
+                cx.cur_module,
+                cx.imports,
+                cx.builtin_imports,
+                cx.type_table,
+                true,
+                span,
+                diags,
+            ) {
                 Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
                 None => Ty::Error,
             }

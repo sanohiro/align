@@ -196,6 +196,96 @@ fn cross_module_struct_type_is_qualified() {
 }
 
 #[test]
+fn builtin_nominal_aliases_are_namespaced_whole_and_per_unit() {
+    if !backend_available() {
+        return;
+    }
+    let domain = r#"module domain
+import std.crypto
+import std.regex
+
+pub Error { Domain(i32) }
+pub argon2_params { value: i64 }
+pub regex_match { value: i64 }
+
+pub fn local_value(e: Error, p: argon2_params, m: regex_match) -> i64 {
+  return match e { Domain(code) => code as i64 + p.value + m.value }
+}
+
+pub fn builtin_value(p: crypto.argon2_params, m: regex.regex_match, e: core.Error) -> i64 {
+  code := match e { Code(value) => value as i64, _ => 0 }
+  return code + p.parallelism + m.end
+}
+
+pub fn sugar() -> core.Error = error(18)
+"#;
+    let main = r#"module main
+import domain
+
+fn main() -> i32 {
+  local_error := domain.Error.Domain(3)
+  local_params := domain.argon2_params { value: 4 }
+  local_match := domain.regex_match { value: 5 }
+
+  builtin_params := argon2_params { m_cost: 8, t_cost: 1, parallelism: 1, len: 4 }
+  builtin_match := regex_match { start: 0, end: 2 }
+  builtin_error := Error.Code(17)
+  sugar_code := match domain.sugar() { Code(value) => value as i64, _ => 0 }
+
+  return (domain.local_value(local_error, local_params, local_match)
+    + domain.builtin_value(builtin_params, builtin_match, builtin_error)
+    + sugar_code) as i32
+}
+"#;
+    let files = [("domain.align", domain), ("main.align", main)];
+    let diagnostics = check_multi_diagnostics(
+        "mod-builtin-alias-import-use",
+        &files,
+        "main.align",
+    );
+    assert!(
+        !diagnostics.contains("unused import `std.crypto`")
+            && !diagnostics.contains("unused import `std.regex`"),
+        "provider-qualified type paths must count as uses of their capability imports: {diagnostics}"
+    );
+    let whole = build_and_run_multi("mod-builtin-alias-whole", &files, "main.align");
+    let per_unit =
+        build_per_unit_multi("mod-builtin-alias-per-unit", &files, "main.align").link_and_run();
+    assert_eq!(whole.status.code(), Some(50));
+    assert_eq!(per_unit.status.code(), Some(50));
+}
+
+#[test]
+fn builtin_nominal_alias_import_and_entry_collisions_are_exact() {
+    for alias in ["Error", "argon2_params", "regex_match"] {
+        let source = format!("module main\npub {alias} {{ Value }}\nfn main() -> i32 = 0\n");
+        let diagnostics = check_diagnostics(&format!("builtin-alias-entry-{alias}"), &source);
+        assert!(
+            diagnostics.contains("collides with a compiler-provided builtin type in the unmangled entry namespace"),
+            "entry collision for `{alias}` must use the shared diagnostic: {diagnostics}"
+        );
+    }
+
+    let crypto = "module local\npub argon2_params { value: i64 }\npub fn builtin(value: crypto.argon2_params) -> i64 = value.len\n";
+    let regex = "module local\npub regex_match { value: i64 }\npub fn builtin(value: regex.regex_match) -> i64 = value.end\n";
+    let main = "module main\nimport local\nfn main() -> i32 = 0\n";
+    for (name, module, required) in [
+        ("crypto", crypto, "`crypto.argon2_params` requires `import std.crypto`"),
+        ("regex", regex, "`regex.regex_match` requires `import std.regex`"),
+    ] {
+        let diagnostics = check_multi_diagnostics(
+            &format!("builtin-alias-missing-{name}"),
+            &[("local.align", module), ("main.align", main)],
+            "main.align",
+        );
+        assert!(
+            diagnostics.contains(required),
+            "provider-qualified alias must enforce its exact capability import: {diagnostics}"
+        );
+    }
+}
+
+#[test]
 fn a_private_struct_is_not_exportable() {
     // A non-`pub` struct is not visible across modules even when qualified.
     let geom = "module geom\nPoint { x: i64, y: i64 }\n";

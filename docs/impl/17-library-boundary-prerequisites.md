@@ -3639,7 +3639,8 @@ this is not a duplicate definition. Type resolution preserves sema's exact prece
 2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>`, plus the closed
    nominal-alias spellings `core.Error`, `crypto.argon2_params`, and `regex.regex_match`, resolve
    before every qualified user definition. The `crypto` and `regex` forms require the matching std
-   capability in producer source; imported summaries carry that validated capability;
+   capability in producer source; interface reconstruction derives the same imports from those
+   structured public type paths rather than serializing a second identity;
 3. another declared type parameter wins only when used bare and without arguments;
 4. every bare name first resolves through the local-definition index;
 5. only after a local miss, another bare source-builtin spelling resolves to that builtin; and
