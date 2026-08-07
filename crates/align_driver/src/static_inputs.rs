@@ -7,8 +7,12 @@
 //! checked-metadata paths, and produces a fail-closed manifest/action digest.
 
 use align_interface::{Driver, DriverRestriction, Hash128, SqlSourceIdentity};
-use align_span::{FileId, SourceMap};
+use align_sema::{
+    StaticDescriptor, StaticDescriptorConsumer, StaticDescriptorDriver, StaticDescriptorSource,
+};
+use align_span::{FileId, SourceMap, Span};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -57,6 +61,46 @@ pub struct ResolvedStaticInput {
     pub bytes: Vec<u8>,
     pub source_map_file: Option<FileId>,
     pub resolved_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedStaticInputs {
+    pub inputs: Vec<ResolvedStaticInput>,
+    pub manifest: StaticInputManifest,
+}
+
+#[derive(Debug)]
+pub struct StaticDescriptorInputError {
+    pub descriptor_id: String,
+    pub span: Span,
+    pub cause: StaticDescriptorInputErrorCause,
+}
+
+#[derive(Debug)]
+pub enum StaticDescriptorInputErrorCause {
+    InvalidDefiningFile,
+    Input(StaticInputError),
+}
+
+impl std::fmt::Display for StaticDescriptorInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot resolve static descriptor `{}`: ", self.descriptor_id)?;
+        match &self.cause {
+            StaticDescriptorInputErrorCause::InvalidDefiningFile => {
+                write!(f, "its defining source file is not present in SourceMap")
+            }
+            StaticDescriptorInputErrorCause::Input(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for StaticDescriptorInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            StaticDescriptorInputErrorCause::InvalidDefiningFile => None,
+            StaticDescriptorInputErrorCause::Input(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +193,167 @@ impl std::fmt::Display for StaticInputError {
 }
 
 impl std::error::Error for StaticInputError {}
+
+fn descriptor_input_error(
+    descriptor: &StaticDescriptor,
+    cause: StaticDescriptorInputErrorCause,
+) -> StaticDescriptorInputError {
+    StaticDescriptorInputError {
+        descriptor_id: descriptor.descriptor_id.clone(),
+        span: descriptor.constructor_span,
+        cause,
+    }
+}
+
+fn descriptor_consumer(consumer: StaticDescriptorConsumer) -> StaticConsumerKind {
+    match consumer {
+        StaticDescriptorConsumer::Query => StaticConsumerKind::Query,
+        StaticDescriptorConsumer::Command => StaticConsumerKind::Command,
+    }
+}
+
+fn descriptor_driver(driver: StaticDescriptorDriver) -> DriverRestriction {
+    match driver {
+        StaticDescriptorDriver::AnySupportedDriver => DriverRestriction::AnySupportedDriver,
+        StaticDescriptorDriver::SQLiteOnly => DriverRestriction::SQLiteOnly,
+        StaticDescriptorDriver::PostgreSQLOnly => DriverRestriction::PostgreSQLOnly,
+    }
+}
+
+fn permitted_drivers(restriction: DriverRestriction) -> &'static [Driver] {
+    match restriction {
+        DriverRestriction::AnySupportedDriver => &[Driver::SQLite, Driver::PostgreSQL],
+        DriverRestriction::SQLiteOnly => &[Driver::SQLite],
+        DriverRestriction::PostgreSQLOnly => &[Driver::PostgreSQL],
+    }
+}
+
+/// Resolve the complete L5c descriptor inventory through the L5b source/metadata boundary.
+///
+/// Resolution and canonical manifest formation finish before SQL sources are added to `source_map`,
+/// so a late failure cannot publish a partial batch. Shared file identities receive one SourceMap
+/// entry and every descriptor points at that same `FileId`.
+pub fn resolve_static_descriptors(
+    project_root: &Path,
+    source_map: &mut SourceMap,
+    descriptors: &[StaticDescriptor],
+    resolution_digest: Hash128,
+) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
+    let mut descriptor_ids = HashSet::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        if let Err(error) = validate_descriptor_id(&descriptor.descriptor_id) {
+            return Err(descriptor_input_error(
+                descriptor,
+                StaticDescriptorInputErrorCause::Input(error),
+            ));
+        }
+        if !descriptor_ids.insert(descriptor.descriptor_id.as_str()) {
+            return Err(descriptor_input_error(
+                descriptor,
+                StaticDescriptorInputErrorCause::Input(StaticInputError::NonCanonical(
+                    "duplicate descriptor id".to_string(),
+                )),
+            ));
+        }
+    }
+    let mut resolved = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let defining_file = source_map
+            .files()
+            .get(descriptor.constructor_span.file as usize)
+            .map(|file| file.name.clone())
+            .ok_or_else(|| {
+                descriptor_input_error(
+                    descriptor,
+                    StaticDescriptorInputErrorCause::InvalidDefiningFile,
+                )
+            })?;
+        let consumer = descriptor_consumer(descriptor.consumer);
+        let restriction = descriptor_driver(descriptor.driver);
+        let mut input = match &descriptor.source {
+            StaticDescriptorSource::File { path_literal, .. } => resolve_static_file(
+                project_root,
+                Path::new(&defining_file),
+                path_literal.as_deref(),
+                descriptor.descriptor_id.clone(),
+                consumer,
+                restriction,
+                None,
+            ),
+            StaticDescriptorSource::Inline { decoded_sql, .. } => resolve_inline_static_input(
+                descriptor.descriptor_id.clone(),
+                decoded_sql,
+                consumer,
+                restriction,
+            ),
+        }
+        .map_err(|error| {
+            descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
+        })?;
+        input.input.checked_metadata = permitted_drivers(restriction)
+            .iter()
+            .copied()
+            .map(|driver| snapshot_checked_metadata(project_root, &descriptor.descriptor_id, driver))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
+            })?;
+        resolved.push(input);
+    }
+
+    let manifest = match StaticInputManifest::new(
+        resolution_digest,
+        resolved.iter().map(|input| input.input.clone()).collect(),
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let Some(descriptor) = descriptors.first() else {
+                return Ok(ResolvedStaticInputs {
+                    inputs: Vec::new(),
+                    manifest: StaticInputManifest::empty(resolution_digest),
+                });
+            };
+            return Err(descriptor_input_error(
+                descriptor,
+                StaticDescriptorInputErrorCause::Input(error),
+            ));
+        }
+    };
+
+    let mut file_publications = Vec::<(String, String)>::new();
+    let mut publication_index = HashSet::<String>::new();
+    for (descriptor, input) in descriptors.iter().zip(&resolved) {
+        let SqlSourceIdentity::File { logical_path } = &input.input.source else {
+            continue;
+        };
+        if !publication_index.insert(logical_path.clone()) {
+            continue;
+        }
+        let text = std::str::from_utf8(&input.bytes).map_err(|_| {
+            descriptor_input_error(
+                descriptor,
+                StaticDescriptorInputErrorCause::Input(StaticInputError::InvalidUtf8 {
+                    logical_path: logical_path.clone(),
+                }),
+            )
+        })?;
+        file_publications.push((logical_path.clone(), text.to_string()));
+    }
+
+    let mut registered = HashMap::<String, FileId>::new();
+    for (logical_path, text) in file_publications {
+        let file_id = source_map.add_file(logical_path.clone(), text);
+        registered.insert(logical_path, file_id);
+    }
+    for input in &mut resolved {
+        let SqlSourceIdentity::File { logical_path } = &input.input.source else {
+            continue;
+        };
+        input.source_map_file = registered.get(logical_path).copied();
+    }
+
+    Ok(ResolvedStaticInputs { inputs: resolved, manifest })
+}
 
 fn invalid_descriptor_id(id: &str) -> bool {
     id.is_empty() || id.as_bytes().contains(&0) || id.contains('\n') || id.contains('\r')
@@ -1820,6 +2025,253 @@ mod tests {
             logical_path: metadata_logical_path(id, driver).expect("metadata path"),
             state,
         }
+    }
+
+    fn descriptor(
+        file: FileId,
+        id: &str,
+        source: StaticDescriptorSource,
+        driver: StaticDescriptorDriver,
+    ) -> StaticDescriptor {
+        let (unit, item) = id.rsplit_once('.').expect("descriptor id");
+        StaticDescriptor {
+            unit: unit.to_string(),
+            item: item.to_string(),
+            descriptor_id: id.to_string(),
+            is_public: true,
+            consumer: StaticDescriptorConsumer::Query,
+            driver,
+            source,
+            constructor_span: Span::new(file, 0, 1),
+            common_options_span: Span::new(file, 0, 1),
+            native_options_span: None,
+        }
+    }
+
+    #[test]
+    fn descriptor_batch_resolves_files_inline_sql_metadata_and_shared_source_identity() {
+        let root = temp_root("descriptor-batch");
+        let defining = root.join("q.align");
+        write(&defining, "module q\n").expect("defining source");
+        write(root.join("q.sql"), "select 1\n").expect("sibling SQL");
+        create_dir_all(root.join("sql")).expect("SQL directory");
+        write(root.join("sql/explicit.sql"), "select 4\n").expect("explicit SQL");
+        let mut source_map = SourceMap::new();
+        let file = source_map.add_file(defining.display().to_string(), "module q\n".to_string());
+        let descriptors = vec![
+            descriptor(
+                file,
+                "q.first",
+                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorDriver::AnySupportedDriver,
+            ),
+            descriptor(
+                file,
+                "q.second",
+                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorDriver::AnySupportedDriver,
+            ),
+            descriptor(
+                file,
+                "q.third",
+                StaticDescriptorSource::Inline {
+                    decoded_sql: "select 3".to_string(),
+                    literal_span: Span::new(file, 0, 1),
+                },
+                StaticDescriptorDriver::SQLiteOnly,
+            ),
+            descriptor(
+                file,
+                "q.fourth",
+                StaticDescriptorSource::File {
+                    path_literal: Some("sql/explicit.sql".to_string()),
+                    path_span: Some(Span::new(file, 0, 1)),
+                },
+                StaticDescriptorDriver::SQLiteOnly,
+            ),
+            descriptor(
+                file,
+                "q.fifth",
+                StaticDescriptorSource::Inline {
+                    decoded_sql: "select 5".to_string(),
+                    literal_span: Span::new(file, 0, 1),
+                },
+                StaticDescriptorDriver::PostgreSQLOnly,
+            ),
+        ];
+
+        let resolved = resolve_static_descriptors(
+            &root,
+            &mut source_map,
+            &descriptors,
+            Hash128 { lo: 7, hi: 9 },
+        )
+        .expect("resolved descriptor batch");
+        assert_eq!(resolved.inputs.len(), 5);
+        assert_eq!(resolved.manifest.inputs.len(), 5);
+        assert_eq!(
+            source_map.files().len(),
+            3,
+            "the shared SQL file and explicit file are each registered once"
+        );
+        assert_eq!(resolved.inputs[0].source_map_file, resolved.inputs[1].source_map_file);
+        assert!(resolved.inputs[0].source_map_file.is_some());
+        assert_eq!(resolved.inputs[2].source_map_file, None);
+        assert!(resolved.inputs[3].source_map_file.is_some());
+        assert_eq!(resolved.inputs[4].source_map_file, None);
+        assert_eq!(resolved.inputs[0].input.checked_metadata.len(), 2);
+        assert_eq!(resolved.inputs[1].input.checked_metadata.len(), 2);
+        assert_eq!(resolved.inputs[2].input.checked_metadata.len(), 1);
+        assert_eq!(resolved.inputs[3].input.checked_metadata.len(), 1);
+        assert_eq!(resolved.inputs[4].input.checked_metadata.len(), 1);
+        assert_eq!(
+            resolved.inputs[4].input.checked_metadata[0].driver,
+            Driver::PostgreSQL
+        );
+        assert_eq!(
+            resolved
+                .manifest
+                .inputs
+                .iter()
+                .map(|input| input.descriptor_id.as_str())
+                .collect::<Vec<_>>(),
+            ["q.first", "q.second", "q.fourth", "q.fifth", "q.third"]
+        );
+    }
+
+    #[test]
+    fn descriptor_batch_failure_does_not_publish_partial_source_map_entries() {
+        let root = temp_root("descriptor-rollback");
+        let valid = root.join("valid.align");
+        write(&valid, "module valid\n").expect("valid source");
+        write(root.join("valid.sql"), "select 1\n").expect("valid SQL");
+        let missing = root.join("missing.align");
+        let mut source_map = SourceMap::new();
+        let valid_file = source_map.add_file(valid.display().to_string(), String::new());
+        let missing_file = source_map.add_file(missing.display().to_string(), String::new());
+        let descriptors = vec![
+            descriptor(
+                valid_file,
+                "valid.query",
+                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorDriver::SQLiteOnly,
+            ),
+            descriptor(
+                missing_file,
+                "missing.query",
+                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorDriver::SQLiteOnly,
+            ),
+        ];
+        let files_before = source_map.files().len();
+        let error = resolve_static_descriptors(
+            &root,
+            &mut source_map,
+            &descriptors,
+            Hash128 { lo: 1, hi: 2 },
+        )
+        .expect_err("missing defining source must fail");
+        assert_eq!(error.descriptor_id, "missing.query");
+        assert_eq!(source_map.files().len(), files_before);
+
+        let duplicate = descriptor(
+            valid_file,
+            "valid.query",
+            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorDriver::SQLiteOnly,
+        );
+        let duplicate_span = duplicate.constructor_span;
+        let error = resolve_static_descriptors(
+            &root,
+            &mut source_map,
+            &[duplicate.clone(), duplicate],
+            Hash128 { lo: 1, hi: 2 },
+        )
+        .expect_err("duplicate descriptor ids must fail before publication");
+        assert_eq!(error.descriptor_id, "valid.query");
+        assert_eq!(error.span, duplicate_span);
+        assert_eq!(source_map.files().len(), files_before);
+
+        let invalid_id = descriptor(
+            u32::MAX,
+            "bad.\0query",
+            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorDriver::SQLiteOnly,
+        );
+        let invalid_span = invalid_id.constructor_span;
+        let error = resolve_static_descriptors(
+            &root,
+            &mut source_map,
+            &[invalid_id],
+            Hash128 { lo: 1, hi: 2 },
+        )
+        .expect_err("descriptor identity is validated before SourceMap lookup");
+        assert_eq!(error.descriptor_id, "bad.\0query");
+        assert_eq!(error.span, invalid_span);
+        assert!(matches!(
+            error.cause,
+            StaticDescriptorInputErrorCause::Input(StaticInputError::InvalidDescriptorId)
+        ));
+        assert_eq!(source_map.files().len(), files_before);
+    }
+
+    #[test]
+    fn whole_program_and_per_unit_checks_publish_the_same_producer_descriptor() {
+        let root = temp_root("descriptor-parity");
+        create_dir_all(root.join("pkg")).expect("pkg directory");
+        write(
+            root.join("pkg/db.align"),
+            "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n",
+        )
+        .expect("pkg.db source");
+        write(
+            root.join("queries.align"),
+            "module queries\nimport pkg.db\npub fn users() -> i64 = pkg.db.query_file([0])\n",
+        )
+        .expect("query source");
+        let entry = "module main\nimport queries\nfn main() -> i32 = 0\n";
+        let entry_path = root.join("main.align");
+
+        let mut whole_sources = SourceMap::new();
+        let whole = crate::check(
+            &mut whole_sources,
+            entry_path.to_str().expect("entry path"),
+            entry,
+        );
+        assert!(
+            !whole.diags.has_errors(),
+            "whole-program diagnostics: {:?}",
+            whole.diags.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(whole.static_descriptors.len(), 1);
+
+        let mut per_unit_sources = SourceMap::new();
+        let per_unit = crate::build_per_unit(
+            &mut per_unit_sources,
+            entry_path.to_str().expect("entry path"),
+            entry,
+        );
+        assert!(
+            !per_unit.diags.has_errors(),
+            "per-unit diagnostics: {:?}",
+            per_unit.diags.iter().collect::<Vec<_>>()
+        );
+        let query_unit = per_unit
+            .units
+            .iter()
+            .find(|unit| unit.unit == "queries")
+            .expect("query producer unit");
+        assert_eq!(query_unit.static_descriptors.len(), 1);
+        let whole_descriptor = &whole.static_descriptors[0];
+        let per_unit_descriptor = &query_unit.static_descriptors[0];
+        assert_eq!(per_unit_descriptor.descriptor_id, whole_descriptor.descriptor_id);
+        assert_eq!(per_unit_descriptor.source, whole_descriptor.source);
+        assert_eq!(per_unit_descriptor.driver, whole_descriptor.driver);
+        assert!(per_unit
+            .units
+            .iter()
+            .filter(|unit| unit.unit != "queries")
+            .all(|unit| unit.static_descriptors.is_empty()));
     }
 
     fn metadata_json(format_version: u32, source_sql_hash: &str) -> Vec<u8> {
