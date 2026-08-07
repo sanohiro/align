@@ -932,7 +932,7 @@ pub enum ImportCompatibilityError {
     },
     ResourceDropThunk(String),
     ResourceDropAbi(String),
-    BorrowParamNotMove,
+    BorrowParamRegion,
     ReturnSummaryOnNonBorrowingType,
     ReturnSummaryRootCannotBorrow(u32),
     ReturnSummaryCaptureRoot,
@@ -1006,8 +1006,8 @@ impl std::fmt::Display for ImportCompatibilityError {
             ImportCompatibilityError::ResourceDropAbi(name) => {
                 write!(f, "interface resource `{name}` has an unsupported Drop ABI fingerprint")
             }
-            ImportCompatibilityError::BorrowParamNotMove => {
-                write!(f, "interface borrowed parameter does not have a provably Move type")
+            ImportCompatibilityError::BorrowParamRegion => {
+                write!(f, "interface borrows a region capability instead of passing it by value")
             }
             ImportCompatibilityError::ReturnSummaryOnNonBorrowingType => {
                 write!(
@@ -1396,15 +1396,6 @@ impl<'a> CapabilityAnalysis<'a> {
             Some(align_sema::hir::ReturnCleanupAbi::DynamicBit)
         } else {
             Some(align_sema::hir::ReturnCleanupAbi::None)
-        }
-    }
-
-    fn is_move(&self, ty: &IType, type_params: &[ITypeParam]) -> Option<bool> {
-        let facts = self.eval_ownership(ty, type_params, &self.ownership);
-        if facts.unknown {
-            None
-        } else {
-            Some(facts.intrinsic || facts.params.iter().any(|dependent| *dependent))
         }
     }
 
@@ -2191,12 +2182,12 @@ fn validate_return_cleanup_metadata(
                 return_cleanup,
                 ..
             } => {
-                for parameter in params {
-                    if parameter.mode == ParamMode::Borrow
-                        && analysis.is_move(&parameter.ty, type_params) != Some(true)
-                    {
-                        return Err(ImportCompatibilityError::BorrowParamNotMove);
-                    }
+                if params.iter().any(|parameter| {
+                    matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+                        && matches!(&parameter.ty, IType::Named { path, args }
+                            if path == "region" && args.is_empty())
+                }) {
+                    return Err(ImportCompatibilityError::BorrowParamRegion);
                 }
                 if let Some(expected) = analysis.return_cleanup(ret, type_params)
                     && *return_cleanup != expected
@@ -2225,12 +2216,12 @@ pub fn validate_for_import(
     let analysis = CapabilityAnalysis::new(index)?;
 
     for function in &summary.fns {
-        for parameter in &function.params {
-            if parameter.mode == ParamMode::Borrow
-                && analysis.is_move(&parameter.ty, &function.type_params) != Some(true)
-            {
-                return Err(ImportCompatibilityError::BorrowParamNotMove);
-            }
+        if function.params.iter().any(|parameter| {
+            matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+                && matches!(&parameter.ty, IType::Named { path, args }
+                    if path == "region" && args.is_empty())
+        }) {
+            return Err(ImportCompatibilityError::BorrowParamRegion);
         }
         if function.type_params.is_empty()
             && let Some(expected) = analysis.return_cleanup(&function.ret, &[])

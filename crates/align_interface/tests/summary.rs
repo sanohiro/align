@@ -2178,6 +2178,7 @@ fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
 fn borrowed_parameter_modes_round_trip_and_import() {
     for source in [
         "pub fn inspect(borrow value: string) -> i64 = value.len()\nfn main() -> i32 = 0\n",
+        "pub fn inspect(borrow value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
         "pub fn increment(borrow mut value: i64) { value = value + 1 }\nfn main() -> i32 = 0\n",
     ] {
         let mut summary = one(source).remove(0);
@@ -2187,13 +2188,19 @@ fn borrowed_parameter_modes_round_trip_and_import() {
         assert_eq!(validate_for_import(&decoded), Ok(()));
     }
 
-    let mut invalid =
+    let mut copy_borrow =
         one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
-    invalid.fns[0].params[0].mode = ParamMode::Borrow;
-    rehash(&mut invalid);
+    copy_borrow.fns[0].params[0].mode = ParamMode::Borrow;
+    rehash(&mut copy_borrow);
+    assert_eq!(validate_for_import(&copy_borrow), Ok(()));
+
+    let mut borrowed_region =
+        one("pub fn inspect(value: region) -> i64 = 0\nfn main() -> i32 = 0\n").remove(0);
+    borrowed_region.fns[0].params[0].mode = ParamMode::Borrow;
+    rehash(&mut borrowed_region);
     assert_eq!(
-        validate_for_import(&invalid),
-        Err(ImportCompatibilityError::BorrowParamNotMove)
+        validate_for_import(&borrowed_region),
+        Err(ImportCompatibilityError::BorrowParamRegion)
     );
 }
 

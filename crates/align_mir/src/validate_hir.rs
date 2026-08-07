@@ -523,7 +523,7 @@ fn valid_span(span: Span) -> bool {
 }
 
 fn mode_is_valid(
-    program: &hir::Program,
+    _program: &hir::Program,
     mode: align_ast::ParamMode,
     ty: Ty,
     allow_out: bool,
@@ -531,15 +531,7 @@ fn mode_is_valid(
     match mode {
         align_ast::ParamMode::ByValue => true,
         align_ast::ParamMode::Out => allow_out && matches!(ty, Ty::Slice(_)),
-        align_ast::ParamMode::Borrow => {
-            align_sema::needs_drop_flag(
-                ty,
-                &program.structs,
-                &program.tuples,
-                &program.enums,
-                &program.tagged_types,
-            )
-        }
+        align_ast::ParamMode::Borrow => ty != Ty::ArenaHandle,
         align_ast::ParamMode::BorrowMut => ty != Ty::ArenaHandle,
     }
 }
@@ -9311,7 +9303,7 @@ impl<'a> BodyValidator<'a> {
             &self.program.tagged_types,
         );
         match mode {
-            align_ast::ParamMode::Borrow => move_pointee,
+            align_ast::ParamMode::Borrow => argument.ty != Ty::ArenaHandle,
             align_ast::ParamMode::BorrowMut => local.is_mut && !(field && move_pointee),
             _ => false,
         }

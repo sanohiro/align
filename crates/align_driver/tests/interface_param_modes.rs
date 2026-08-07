@@ -184,20 +184,6 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         "unexpected diagnostic: {error}"
     );
 
-    let mut wrong_borrow_type = buffer.mir.clone();
-    let put = wrong_borrow_type
-        .fns
-        .iter_mut()
-        .find(|function| function.name.as_str() == "buffer$put")
-        .expect("put MIR");
-    put.param_modes[0] = ParamMode::Borrow;
-    let error = emit_llvm_ir(&wrong_borrow_type, BuildTarget::Baseline, false, &[], false)
-        .expect_err("shared borrow of a Copy slice must fail");
-    assert!(
-        error.contains("uses Borrow with a non-Move parameter type"),
-        "unexpected diagnostic: {error}"
-    );
-
     let mut malformed_roots = buffer.mir.clone();
     let put = malformed_roots
         .fns
