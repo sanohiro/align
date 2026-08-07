@@ -2623,6 +2623,288 @@ pub struct Module<'f> {
     pub interface_only: bool,
 }
 
+/// One resolved L5 static Query/command descriptor discovered during source checking.
+///
+/// This record is deliberately separate from [`Program`]: L5c publishes the frontend-to-driver
+/// request without changing HIR/MIR or claiming that the D1 runtime descriptor ABI exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticDescriptor {
+    pub unit: String,
+    pub item: String,
+    pub descriptor_id: String,
+    pub is_public: bool,
+    pub consumer: StaticDescriptorConsumer,
+    pub driver: StaticDescriptorDriver,
+    pub source: StaticDescriptorSource,
+    pub constructor_span: Span,
+    pub common_options_span: Span,
+    pub native_options_span: Option<Span>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticDescriptorConsumer {
+    Query,
+    Command,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticDescriptorDriver {
+    AnySupportedDriver,
+    SQLiteOnly,
+    PostgreSQLOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticDescriptorSource {
+    File {
+        path_literal: Option<String>,
+        path_span: Option<Span>,
+    },
+    Inline {
+        decoded_sql: String,
+        literal_span: Span,
+    },
+}
+
+/// The ordinary checked HIR plus the additive L5c descriptor inventory.
+pub struct CheckedProgram {
+    pub program: Program,
+    pub static_descriptors: Vec<StaticDescriptor>,
+}
+
+#[derive(Clone, Copy)]
+struct StaticConstructorSpec {
+    consumer: StaticDescriptorConsumer,
+    driver: StaticDescriptorDriver,
+    file: bool,
+}
+
+fn static_constructor_spec(function: &str) -> Option<StaticConstructorSpec> {
+    use StaticDescriptorConsumer::{Command, Query};
+    use StaticDescriptorDriver::{AnySupportedDriver, PostgreSQLOnly, SQLiteOnly};
+    let (consumer, driver, file) = match function {
+        "pkg.db$query_file" => (Query, AnySupportedDriver, true),
+        "pkg.db$query" => (Query, AnySupportedDriver, false),
+        "pkg.db$command_file" => (Command, AnySupportedDriver, true),
+        "pkg.db$command" => (Command, AnySupportedDriver, false),
+        "pkg.db.sqlite$query_file" => (Query, SQLiteOnly, true),
+        "pkg.db.sqlite$query" => (Query, SQLiteOnly, false),
+        "pkg.db.sqlite$command_file" => (Command, SQLiteOnly, true),
+        "pkg.db.sqlite$command" => (Command, SQLiteOnly, false),
+        "pkg.db.postgres$query_file" => (Query, PostgreSQLOnly, true),
+        "pkg.db.postgres$query" => (Query, PostgreSQLOnly, false),
+        "pkg.db.postgres$command_file" => (Command, PostgreSQLOnly, true),
+        "pkg.db.postgres$command" => (Command, PostgreSQLOnly, false),
+        _ => return None,
+    };
+    Some(StaticConstructorSpec { consumer, driver, file })
+}
+
+fn static_constructor_at(expression: &hir::Expr) -> Option<StaticConstructorSpec> {
+    let hir::ExprKind::Call { func, .. } = &expression.kind else {
+        return None;
+    };
+    static_constructor_spec(func)
+}
+
+fn static_constructor_occurrences(function: &hir::Fn) -> Vec<Span> {
+    hir_depth::body_events(&function.body)
+        .into_iter()
+        .filter_map(|event| {
+            let hir_depth::BodyEvent::ExprEnter(expression) = event else {
+                return None;
+            };
+            static_constructor_at(expression).map(|_| expression.span)
+        })
+        .collect()
+}
+
+fn declaration_has_prior_error(declaration: &ast::FnDecl, diags: &Diagnostics) -> bool {
+    diags.iter().any(|diagnostic| {
+        if diagnostic.severity != align_diag::Severity::Error {
+            return false;
+        }
+        diagnostic.span.is_some_and(|span| {
+            span.file == declaration.span.file
+                && span.lo >= declaration.span.lo
+                && span.hi <= declaration.span.hi
+        })
+    })
+}
+
+fn literal_string(expression: &ast::Expr, what: &str, diags: &mut Diagnostics) -> Option<String> {
+    if let ast::ExprKind::Str(value) = &expression.kind {
+        Some(value.clone())
+    } else {
+        diags.error(format!("a static {what} must be a string literal"), expression.span);
+        None
+    }
+}
+
+fn literal_option_list(expression: &ast::Expr, what: &str, diags: &mut Diagnostics) -> bool {
+    if matches!(expression.kind, ast::ExprKind::ArrayLit(_)) {
+        true
+    } else {
+        diags.error(
+            format!("static {what} must be an explicit option-list literal (use `[]` for none)"),
+            expression.span,
+        );
+        false
+    }
+}
+
+fn static_descriptor_from_root(
+    module: &str,
+    declaration: &ast::FnDecl,
+    root: &ast::Expr,
+    spec: StaticConstructorSpec,
+    diags: &mut Diagnostics,
+) -> Option<StaticDescriptor> {
+    let ast::ExprKind::Call { args, .. } = &root.kind else {
+        return None;
+    };
+    let driver_specific = spec.driver != StaticDescriptorDriver::AnySupportedDriver;
+    let (source, common_index, native_index) = match (spec.file, driver_specific, args.len()) {
+        (true, false, 1) => (
+            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            0,
+            None,
+        ),
+        (true, false, 2) => (
+            StaticDescriptorSource::File {
+                path_literal: literal_string(&args[0], "Query/command path", diags),
+                path_span: Some(args[0].span),
+            },
+            1,
+            None,
+        ),
+        (true, true, 2) => (
+            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            0,
+            Some(1),
+        ),
+        (true, true, 3) => (
+            StaticDescriptorSource::File {
+                path_literal: literal_string(&args[0], "Query/command path", diags),
+                path_span: Some(args[0].span),
+            },
+            1,
+            Some(2),
+        ),
+        (false, false, 2) => (
+            StaticDescriptorSource::Inline {
+                decoded_sql: literal_string(&args[0], "inline SQL", diags)?,
+                literal_span: args[0].span,
+            },
+            1,
+            None,
+        ),
+        (false, true, 3) => (
+            StaticDescriptorSource::Inline {
+                decoded_sql: literal_string(&args[0], "inline SQL", diags)?,
+                literal_span: args[0].span,
+            },
+            1,
+            Some(2),
+        ),
+        _ => {
+            let expected = match (spec.file, driver_specific) {
+                (true, false) => "one option list, or a path literal and one option list",
+                (true, true) => {
+                    "common/native option lists, or a path literal plus common/native option lists"
+                }
+                (false, false) => "an inline SQL literal and one option list",
+                (false, true) => "an inline SQL literal and common/native option lists",
+            };
+            diags.error(format!("this static constructor requires {expected}"), root.span);
+            return None;
+        }
+    };
+    let common = args.get(common_index)?;
+    let common_ok = literal_option_list(common, "common options", diags);
+    let native = native_index.and_then(|index| args.get(index));
+    let native_ok = native
+        .map(|options| literal_option_list(options, "driver options", diags))
+        .unwrap_or(true);
+    let source_ok = match &source {
+        StaticDescriptorSource::File { path_literal, path_span: Some(_) } => path_literal.is_some(),
+        StaticDescriptorSource::File { path_span: None, .. }
+        | StaticDescriptorSource::Inline { .. } => true,
+    };
+    if !source_ok || !common_ok || !native_ok {
+        return None;
+    }
+    let item = declaration.name.name.clone();
+    Some(StaticDescriptor {
+        unit: module.to_string(),
+        descriptor_id: format!("{module}.{item}"),
+        item,
+        is_public: matches!(declaration.vis, ast::Vis::Pub),
+        consumer: spec.consumer,
+        driver: spec.driver,
+        source,
+        constructor_span: root.span,
+        common_options_span: common.span,
+        native_options_span: native.map(|options| options.span),
+    })
+}
+
+fn discover_static_descriptor(
+    module: &str,
+    declaration: &ast::FnDecl,
+    checked: &hir::Fn,
+    lifted: &[hir::Fn],
+    function_was_clean: bool,
+    diags: &mut Diagnostics,
+) -> Option<StaticDescriptor> {
+    const PLACEMENT_ERROR: &str = concat!(
+        "a static Query/command constructor is legal only as the complete `= expr` body of one ",
+        "named zero-argument non-generic descriptor function",
+    );
+    let mut occurrences = static_constructor_occurrences(checked);
+    for closure in lifted {
+        occurrences.extend(static_constructor_occurrences(closure));
+    }
+    if occurrences.is_empty() {
+        return None;
+    }
+
+    let source_root = match &declaration.body {
+        ast::FnBody::Expr(expression) => Some(expression.as_ref()),
+        ast::FnBody::Block(_) => None,
+    };
+    let checked_root = checked.body.value.as_deref();
+    let root_spec = checked_root.and_then(static_constructor_at);
+    let valid_placement = declaration.params.is_empty()
+        && declaration.type_params.is_empty()
+        && checked.body.stmts.is_empty()
+        && occurrences.len() == 1
+        && source_root.is_some()
+        && checked_root.is_some_and(|root| root.span == occurrences[0])
+        && root_spec.is_some();
+    if !valid_placement {
+        for span in occurrences {
+            diags.error(PLACEMENT_ERROR, span);
+        }
+        return None;
+    }
+    let source_root = source_root?;
+    let root_spec = root_spec?;
+    let errors_before = diags.error_count();
+    let descriptor = static_descriptor_from_root(
+        module,
+        declaration,
+        source_root,
+        root_spec,
+        diags,
+    );
+    if !function_was_clean || diags.error_count() != errors_before {
+        None
+    } else {
+        descriptor
+    }
+}
+
 /// The codegen name of a function: plain in the entry module (so `main` stays `main` and single-file
 /// programs are unchanged), `module$fn` elsewhere. Per-module mangling lets two modules define a
 /// function with the same name and is what `pub`/private visibility resolution rewrites calls to.
@@ -3701,6 +3983,21 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     check_program_with_effects(modules, &HashMap::new(), diags)
 }
 
+/// Whole-program checking with the additive L5c resolved static-descriptor inventory.
+pub fn check_program_with_static_descriptors(
+    modules: &[Module],
+    diags: &mut Diagnostics,
+) -> CheckedProgram {
+    check_program_with_all_interface_facts_and_static_descriptors(
+        modules,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        diags,
+    )
+}
+
 /// The imported return-provenance facts of non-generic public functions, keyed by canonical
 /// (mangled) name. The interface codec validates every root before constructing this map.
 pub type ExternalReturnProvenance =
@@ -3771,6 +4068,26 @@ pub fn check_program_with_all_interface_facts(
     external_resource_hooks: &ExternalResourceHookFacts,
     diags: &mut Diagnostics,
 ) -> Program {
+    check_program_with_all_interface_facts_and_static_descriptors(
+        modules,
+        external_effects,
+        external_return_provenance,
+        external_resources,
+        external_resource_hooks,
+        diags,
+    )
+    .program
+}
+
+/// Per-unit-capable checking with all producer facts and the L5c descriptor inventory.
+pub fn check_program_with_all_interface_facts_and_static_descriptors(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    external_return_provenance: &ExternalReturnProvenance,
+    external_resources: &ExternalResourceFacts,
+    external_resource_hooks: &ExternalResourceHookFacts,
+    diags: &mut Diagnostics,
+) -> CheckedProgram {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -5179,6 +5496,7 @@ pub fn check_program_with_all_interface_facts(
     // not checked here but instantiated on demand below (its body is checked per monomorph, like a
     // C++ template — an uninstantiated generic is not type-checked).
     let mut fns: Vec<hir::Fn> = Vec::new();
+    let mut static_descriptors = Vec::new();
     // Generic-function templates by **mangled** name, for monomorphization (the worklist + every
     // call target use mangled names, so the template lookup must too). The value carries the
     // template's module so a monomorph's body resolves its own bare calls in that module.
@@ -5253,6 +5571,8 @@ pub fn check_program_with_all_interface_facts(
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&mangled].bounds.clone();
         let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
+        let function_had_prior_errors = declaration_has_prior_error(f, diags);
+        let errors_before = diags.error_count();
         let mut cx = Checker::new(
             diags,
             &sigs,
@@ -5290,6 +5610,15 @@ pub fn check_program_with_all_interface_facts(
         let mut checked = cx.check_fn(f);
         checked.name = mangled;
         let lifted = std::mem::take(&mut cx.lifted);
+        let instantiations = std::mem::take(&mut cx.instantiations);
+        drop(cx);
+        let function_was_clean =
+            !function_had_prior_errors && diags.error_count() == errors_before;
+        if let Some(descriptor) =
+            discover_static_descriptor(module, f, &checked, &lifted, function_was_clean, diags)
+        {
+            static_descriptors.push(descriptor);
+        }
         if is_template {
             // A generic template is checked here only to validate its body abstractly (`T` is the
             // opaque `Ty::Param`, so an operation needing a capability — arithmetic, a field, … —
@@ -5312,7 +5641,7 @@ pub fn check_program_with_all_interface_facts(
                 is_entry,
                 is_public: matches!(f.vis, ast::Vis::Pub),
             };
-            worklist.extend(cx.instantiations);
+            worklist.extend(instantiations);
             fns.push(checked);
             fns.extend(lifted);
         }
@@ -5467,7 +5796,10 @@ pub fn check_program_with_all_interface_facts(
         diags,
         false,
     );
-    program
+    static_descriptors.sort_by(|left, right| {
+        left.descriptor_id.as_bytes().cmp(right.descriptor_id.as_bytes())
+    });
+    CheckedProgram { program, static_descriptors }
 }
 
 fn return_cleanup_abi(
@@ -40089,6 +40421,242 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    fn check_modules(sources: &[(&str, &str, bool)]) -> (CheckedProgram, Diagnostics) {
+        let mut diagnostics = Diagnostics::new();
+        let files = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (_, source, _))| {
+                let tokens = tokenize(index as u32, source, &mut diagnostics);
+                parse_file(tokens, &mut diagnostics)
+            })
+            .collect::<Vec<_>>();
+        let modules = sources
+            .iter()
+            .zip(&files)
+            .map(|((module, _, is_entry), file)| Module {
+                path: (*module).to_string(),
+                file,
+                is_entry: *is_entry,
+                interface_only: false,
+            })
+            .collect::<Vec<_>>();
+        let checked = check_program_with_static_descriptors(&modules, &mut diagnostics);
+        (checked, diagnostics)
+    }
+
+    #[test]
+    fn static_descriptors_use_resolved_constructor_identity_and_canonical_item_ids() {
+        let common = "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n";
+        let sqlite = concat!(
+            "module pkg.db.sqlite\n",
+            "pub fn command(sql: str, options: slice<i64>, native: slice<i64>) -> i64 = 0\n",
+        );
+        let queries = concat!(
+            "module app.queries\n",
+            "import pkg.db\n",
+            "import pkg.db.sqlite\n",
+            "pub fn users() -> i64 = pkg.db.query_file([0])\n",
+            "fn prune() -> i64 = pkg.db.sqlite.command(\"DELETE FROM sessions\", [0], [0])\n",
+        );
+        let (checked, diagnostics) = check_modules(&[
+            ("pkg.db", common, false),
+            ("pkg.db.sqlite", sqlite, false),
+            ("app.queries", queries, true),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "resolved static descriptors must check cleanly: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            checked
+                .static_descriptors
+                .iter()
+                .map(|descriptor| descriptor.descriptor_id.as_str())
+                .collect::<Vec<_>>(),
+            ["app.queries.prune", "app.queries.users"]
+        );
+        let prune = &checked.static_descriptors[0];
+        assert_eq!(prune.consumer, StaticDescriptorConsumer::Command);
+        assert_eq!(prune.driver, StaticDescriptorDriver::SQLiteOnly);
+        assert!(prune.native_options_span.is_some());
+        assert!(matches!(
+            &prune.source,
+            StaticDescriptorSource::Inline { decoded_sql, .. }
+                if decoded_sql == "DELETE FROM sessions"
+        ));
+        let users = &checked.static_descriptors[1];
+        assert!(users.is_public);
+        assert_eq!(users.driver, StaticDescriptorDriver::AnySupportedDriver);
+        assert!(matches!(
+            users.source,
+            StaticDescriptorSource::File { path_literal: None, path_span: None }
+        ));
+
+        let fake = "module fake\npub fn query_file(options: slice<i64>) -> i64 = 0\n";
+        let user = "module app\nimport fake\nfn ordinary() -> i64 = fake.query_file([0])\n";
+        let (checked, diagnostics) =
+            check_modules(&[("fake", fake, false), ("app", user, true)]);
+        assert!(!diagnostics.has_errors());
+        assert!(checked.static_descriptors.is_empty());
+    }
+
+    #[test]
+    fn static_constructor_identity_table_is_exact_and_complete() {
+        use StaticDescriptorConsumer::{Command, Query};
+        use StaticDescriptorDriver::{AnySupportedDriver, PostgreSQLOnly, SQLiteOnly};
+        let cases = [
+            ("pkg.db$query_file", Query, AnySupportedDriver, true),
+            ("pkg.db$query", Query, AnySupportedDriver, false),
+            ("pkg.db$command_file", Command, AnySupportedDriver, true),
+            ("pkg.db$command", Command, AnySupportedDriver, false),
+            ("pkg.db.sqlite$query_file", Query, SQLiteOnly, true),
+            ("pkg.db.sqlite$query", Query, SQLiteOnly, false),
+            ("pkg.db.sqlite$command_file", Command, SQLiteOnly, true),
+            ("pkg.db.sqlite$command", Command, SQLiteOnly, false),
+            ("pkg.db.postgres$query_file", Query, PostgreSQLOnly, true),
+            ("pkg.db.postgres$query", Query, PostgreSQLOnly, false),
+            ("pkg.db.postgres$command_file", Command, PostgreSQLOnly, true),
+            ("pkg.db.postgres$command", Command, PostgreSQLOnly, false),
+        ];
+        for (name, consumer, driver, file) in cases {
+            let spec = static_constructor_spec(name).expect("canonical constructor");
+            assert_eq!(spec.consumer, consumer, "{name}");
+            assert_eq!(spec.driver, driver, "{name}");
+            assert_eq!(spec.file, file, "{name}");
+        }
+        for name in [
+            "pkg.db$query_files",
+            "pkg.db.sqlite2$query",
+            "app.pkg.db$query",
+            "query",
+        ] {
+            assert!(static_constructor_spec(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn static_file_descriptor_preserves_explicit_decoded_path() {
+        let package = concat!(
+            "module pkg.db.postgres\n",
+            "pub fn query_file(path: str, options: slice<i64>, native: slice<i64>) -> i64 = 0\n",
+        );
+        let query = concat!(
+            "module q\n",
+            "import pkg.db.postgres\n",
+            "pub fn lookup() -> i64 = pkg.db.postgres.query_file(\"sql/look\\nup.sql\", [0], [0])\n",
+        );
+        let (checked, diagnostics) = check_modules(&[
+            ("pkg.db.postgres", package, false),
+            ("q", query, true),
+        ]);
+        assert!(!diagnostics.has_errors());
+        assert_eq!(checked.static_descriptors.len(), 1);
+        let descriptor = &checked.static_descriptors[0];
+        assert_eq!(descriptor.driver, StaticDescriptorDriver::PostgreSQLOnly);
+        assert!(matches!(
+            &descriptor.source,
+            StaticDescriptorSource::File { path_literal: Some(path), path_span: Some(_) }
+                if path == "sql/look\nup.sql"
+        ));
+    }
+
+    #[test]
+    fn static_constructor_placement_is_closed_over_structural_hir() {
+        let package = "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n";
+        let invalid_bodies = [
+            "fn bad(value: i64) -> i64 = pkg.db.query_file([0])",
+            "fn bad<T>() -> i64 = pkg.db.query_file([0])",
+            "fn bad() -> i64 { return pkg.db.query_file([0]) }",
+            "fn bad() -> i64 = pkg.db.query_file([0]) + 1",
+            "fn bad() -> i64 = if true { pkg.db.query_file([0]) } else { pkg.db.query_file([0]) }",
+            "fn bad() -> i64 = [1].map(fn value { pkg.db.query_file([0]) }).sum()",
+        ];
+        for body in invalid_bodies {
+            let source = format!("module q\nimport pkg.db\n{body}\n");
+            let (checked, diagnostics) = check_modules(&[
+                ("pkg.db", package, false),
+                ("q", source.as_str(), true),
+            ]);
+            assert!(checked.static_descriptors.is_empty(), "invalid body: {body}");
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
+                    "legal only as the complete `= expr` body"
+                )),
+                "invalid body must receive the placement diagnostic: {body}: {:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn static_constructor_arguments_are_validated_independently_of_package_signatures() {
+        let cases = [
+            (
+                "pub fn query_file() -> i64 = 0",
+                "pkg.db.query_file()",
+                "requires one option list",
+            ),
+            (
+                "pub fn query_file(path: i64, options: slice<i64>) -> i64 = 0",
+                "pkg.db.query_file(1, [])",
+                "must be a string literal",
+            ),
+            (
+                "pub fn query_file(options: i64) -> i64 = 0",
+                "pkg.db.query_file(1)",
+                "explicit option-list literal",
+            ),
+        ];
+        for (declaration, call, expected) in cases {
+            let package = format!("module pkg.db\n{declaration}\n");
+            let query = format!("module q\nimport pkg.db\nfn bad() -> i64 = {call}\n");
+            let (checked, diagnostics) = check_modules(&[
+                ("pkg.db", package.as_str(), false),
+                ("q", query.as_str(), true),
+            ]);
+            assert!(checked.static_descriptors.is_empty());
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(expected)),
+                "missing `{expected}` diagnostic: {:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_unresolved_functions_never_publish_static_descriptors() {
+        let package = "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n";
+        let invalid = concat!(
+            "module q\n",
+            "import pkg.db\n",
+            "fn bad() -> i64 = pkg.db.query_file([unknown])\n",
+            "fn bad_signature() -> Unknown = pkg.db.query_file([0])\n",
+        );
+        let (checked, diagnostics) = check_modules(&[
+            ("pkg.db", package, false),
+            ("q", invalid, true),
+        ]);
+        assert!(diagnostics.has_errors());
+        assert!(checked.static_descriptors.is_empty());
+
+        let unresolved = "module q\nfn bad() -> i64 = pkg.db.query_file([0])\n";
+        let (checked, diagnostics) = check_modules(&[
+            ("pkg.db", package, false),
+            ("q", unresolved, true),
+        ]);
+        assert!(diagnostics.has_errors());
+        assert!(checked.static_descriptors.is_empty());
+
+        let shadowed = "module q\nfn bad(pkg: i64) -> i64 = pkg.db.query_file([0])\n";
+        let (checked, diagnostics) = check_modules(&[("q", shadowed, true)]);
+        assert!(diagnostics.has_errors());
+        assert!(checked.static_descriptors.is_empty());
     }
 
     #[test]

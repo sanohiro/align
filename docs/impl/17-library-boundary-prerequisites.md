@@ -4318,6 +4318,43 @@ proof while leaving no stable consumer between the producer and cache-index seam
 | P2: inline SQL bypassed the static-input field bound before cloning | Validate the descriptor and decoded inline byte length before allocating the owned byte buffer; cover oversized inline input and preserve the same bounded reader for file inputs. |
 | P2: canonicalizing the defining `.align` changed the sibling base directory for an in-root symlink | Retain the lexical defining path for sibling/explicit candidate construction, while canonicalizing only for containment and regular-file validation; cover an in-root defining symlink whose sibling differs from the target path. |
 
+#### L5c resolved-constructor discovery implementation closure matrix
+
+L5c connects the checked frontend to L5b without yet inventing the D1 `pkg.db` type surface or
+generated descriptor ABI. It observes only calls whose ordinary module/function resolution has
+already produced one of the exact `pkg.db`, `pkg.db.sqlite`, or `pkg.db.postgres` constructor
+identities. The package declaration still supplies the callable signature in this checkpoint; D1
+owns compiler-known generic descriptor type formation, option semantics, SQL scanning, artifact
+production, and generated `QueryStatic`/`CommandStatic` data. L5c therefore changes no HIR/MIR
+variant and publishes no executable database API.
+
+This capability is slightly above the approximate 1,000-line review threshold because discovery,
+whole/per-unit publication, and the L5b bridge form one strict producer-to-consumer chain. Splitting
+them would leave a dormant descriptor inventory or an unowned bridge and would duplicate the same
+identity, failure-atomicity, and parity proof across two PRs; the combined boundary has one semantic
+failure domain and one end-to-end owner matrix.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| resolved identity | Recognize only the twelve exact common/SQLite/PostgreSQL Query/command file/inline callees after normal import, visibility, and local-shadow resolution. Same-spelled user functions, an unimported module, and a local shadow register nothing. | semantic owner with exact-target positives plus same-spelled, unimported, and shadowed negatives |
+| descriptor placement | Inspect every structurally checked source-body occurrence, including unreachable alternatives and lifted closures. Admit exactly one call only when it is the complete `= expr` body of a named zero-argument non-generic function. Reject block, nested, conditional, repeated, argument-taking, generic, and lambda forms before publishing a descriptor. | one parameterized placement owner crossing body form, occurrence count, params, generics, nesting, control flow, and lifted closure cells |
+| constructor inputs | Enforce the exact common/driver and file/inline arities independent of the package declaration. File accepts an absent path or one decoded string literal; inline requires one decoded string literal; every common/native option position is an explicit array literal. Record the defining file, literal span, decoded bytes/path, consumer kind, and driver restriction without reading a file. | arity/source/option-literal owner for all twelve identities, path-free/explicit file, decoded inline, and non-literal rejection |
+| identity and publication | Derive `descriptor_id` only as canonical module path plus item name, retain private/public item status, reject publication from an already-invalid function, and sort the successful descriptor inventory by ID. Two descriptor functions in one module must receive distinct IDs and slots. | two-item identity owner, invalid-subtree no-publication owner, and deterministic ordering assertion |
+| whole/per-unit parity | Return the same descriptor record from whole-program checking and from the real producer unit in interface-backed per-unit checking. Interface-only dependency bodies are never rediscovered by a consumer. | whole/per-unit semantic parity owner with one imported public descriptor |
+| L5b bridge and side effects | Resolve every published File/Inline request through the existing L5b API, snapshot exactly the permitted drivers' metadata paths, construct one canonical manifest, and only then add deduplicated file bytes to `SourceMap`. Any failure returns the descriptor ID/span and publishes neither a manifest nor partial SQL source entries. | end-to-end sibling/explicit/inline manifest owner, two-descriptors-one-file SourceMap dedup owner, metadata-driver coverage, and late-failure no-partial-registration owner |
+
+L5c review finding-to-fix ledger:
+
+| Finding | Class-wide fix and owner closure |
+|---|---|
+| P2: a signature-invalid descriptor function could look clean when only the body-check diagnostic delta was inspected | Gate publication on every earlier error whose span is contained by the declaration as well as on body-check errors; cover an unknown return type whose `Ty::Error` absorbs the body constraint. |
+| P2: two reads of one logical SQL file could disagree while both descriptors received one shared `SourceMap` file | Record the first byte snapshot for every logical file and reject any later descriptor read whose bytes differ before manifest or `SourceMap` publication; cover a deterministic replacement between two reads. |
+
+The next L5 checkpoint consumes these records to form structural Params/Row contracts, scan SQL,
+emit the versioned L5a artifact, and replace the descriptor function body with its producer-owned
+static data/thunk reference. Until that checkpoint, L5c is an additive frontend/driver boundary and
+does not claim that `pkg.db` exists or that a discovered constructor can be lowered and linked.
+
 ### L6 — region plain-struct builder
 
 Scope:

@@ -15,6 +15,9 @@ pub use align_mir::Program as MirProgram;
 /// M15 interface-summary types (re-exported so callers can name the [`check_per_unit`] result without
 /// depending on `align_interface` directly).
 pub use align_interface::{Hash128, InterfaceSummary};
+pub use align_sema::{
+    StaticDescriptor, StaticDescriptorConsumer, StaticDescriptorDriver, StaticDescriptorSource,
+};
 
 pub mod cache;
 pub mod explain;
@@ -27,9 +30,11 @@ pub use cache::{
 
 pub use static_inputs::{
     compose_codegen_impl_hash, metadata_logical_path, metadata_path, resolve_inline_static_input,
-    resolve_static_file, snapshot_checked_metadata, CheckedMetadataInput, MetadataState,
-    ResolvedStaticInput, StaticConsumerKind, StaticInput, StaticInputError, StaticInputManifest,
-    STATIC_INPUT_MANIFEST_FORMAT_VERSION, STATIC_INPUT_MANIFEST_MAGIC,
+    resolve_static_descriptors, resolve_static_file, snapshot_checked_metadata,
+    CheckedMetadataInput, MetadataState, ResolvedStaticInput, ResolvedStaticInputs,
+    StaticConsumerKind, StaticDescriptorInputError, StaticDescriptorInputErrorCause, StaticInput,
+    StaticInputError, StaticInputManifest, STATIC_INPUT_MANIFEST_FORMAT_VERSION,
+    STATIC_INPUT_MANIFEST_MAGIC,
 };
 // Keep the driver selector types alongside the resolver so callers do not need
 // to depend on the interface crate just to construct a static input request.
@@ -38,6 +43,7 @@ pub use align_interface::{Driver, DriverRestriction};
 /// Result of running the pipeline through sema.
 pub struct Checked {
     pub hir: align_sema::Program,
+    pub static_descriptors: Vec<StaticDescriptor>,
     pub diags: Diagnostics,
 }
 
@@ -215,9 +221,13 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
-    let hir = align_sema::check_program(&modules, &mut diags);
+    let checked = align_sema::check_program_with_static_descriptors(&modules, &mut diags);
 
-    Checked { hir, diags }
+    Checked {
+        hir: checked.program,
+        static_descriptors: checked.static_descriptors,
+        diags,
+    }
 }
 
 /// M15 S1a producer entry point: run the frontend for the entry file + its transitively-imported
@@ -353,7 +363,15 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
     // Per-unit compilation artifacts, keyed by unit path: (summary, per-unit MIR, is_entry). Populated
     // only for cleanly-checked units; assembled bottom-up into `PerUnitArtifact`s at the end.
-    let mut mirs: HashMap<String, (align_interface::InterfaceSummary, MirProgram, bool)> = HashMap::new();
+    let mut mirs: HashMap<
+        String,
+        (
+            align_interface::InterfaceSummary,
+            MirProgram,
+            bool,
+            Vec<StaticDescriptor>,
+        ),
+    > = HashMap::new();
     let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
     // Cache of each dependency's synthesized interface AST, keyed by module path. Rendered and
     // parsed exactly once per dependency (not once per importer): `summary_to_source` is called
@@ -440,7 +458,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         });
 
         let mut u_diags = Diagnostics::new();
-        let program = align_sema::check_program_with_all_interface_facts(
+        let checked = align_sema::check_program_with_all_interface_facts_and_static_descriptors(
             &modules,
             &external_effects,
             &external_return_provenance,
@@ -448,6 +466,8 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             &external_resource_hooks,
             &mut u_diags,
         );
+        let program = checked.program;
+        let static_descriptors = checked.static_descriptors;
         let had_errors = u_diags.has_errors();
         for d in u_diags.iter() {
             diags.push(d.clone());
@@ -490,7 +510,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 // skipped codegen. A hit under this hash implies the full backend input is equal.
                 s.impl_hash = align_interface::codegen_impl_hash(&mir);
                 summaries.insert(u.path.clone(), s.clone());
-                mirs.insert(u.path.clone(), (s, mir, u.is_entry));
+                mirs.insert(u.path.clone(), (s, mir, u.is_entry, static_descriptors));
             }
         }
     }
@@ -504,7 +524,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let units: Vec<PerUnitArtifact> = order
         .iter()
         .filter_map(|p| {
-            let (summary, mir, is_entry) = mirs.remove(p)?;
+            let (summary, mir, is_entry, static_descriptors) = mirs.remove(p)?;
             Some(PerUnitArtifact {
                 unit: p.clone(),
                 is_entry,
@@ -515,6 +535,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                     .unwrap_or_else(|| panic!("missing dependency hashes for unit '{p}' — walk order must produce deps first"))
                     .to_vec(),
                 file: by_path.get(p.as_str()).map(|u| u.file.clone()).unwrap_or_default(),
+                static_descriptors,
             })
         })
         .collect();
@@ -536,6 +557,9 @@ pub struct PerUnitArtifact {
     /// The unit's source file path on disk — its basename is what `explain-opt`'s per-unit
     /// `DebugInfo` names, so LLVM's remarks attribute to the right file in the aggregated report.
     pub file: String,
+    /// L5c descriptors owned by this real producer unit. Interface-only dependency bodies are not
+    /// rediscovered in consumers.
+    pub static_descriptors: Vec<StaticDescriptor>,
 }
 
 /// The per-unit compilation result: one artifact per cleanly-checked unit (bottom-up), the FULL
