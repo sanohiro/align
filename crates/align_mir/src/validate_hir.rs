@@ -1231,6 +1231,7 @@ impl<'a> PlacementValidator<'a> {
                 !matches!(element, Scalar::Struct(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
+            Ty::DynSliceArray(element) => valid_prim(element),
             ty @ (Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
             | Ty::DynFixedArray(..)
@@ -1286,7 +1287,6 @@ impl<'a> PlacementValidator<'a> {
             | Ty::FloatVar(_)
             | Ty::Array(_, _)
             | Ty::StructArray(_, _)
-            | Ty::DynSliceArray(_)
             | Ty::DynResponseArray
             | Ty::Task(_)
             | Ty::Builder

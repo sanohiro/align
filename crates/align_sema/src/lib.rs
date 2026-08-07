@@ -24153,7 +24153,13 @@ impl<'a, 't> Checker<'a, 't> {
             _ => None,
         };
         let Some((kind, instance)) = instance else {
-            return subst_param_ty(ty, args, self.tagged_types);
+            return subst_param_ty(
+                ty,
+                args,
+                self.structs,
+                self.enums,
+                self.tagged_types,
+            );
         };
         let concrete_args = instance
             .args
@@ -39101,10 +39107,16 @@ fn is_numeric_literal(e: &Expr) -> bool {
 /// position from a partially substituted one; unresolved `Param` values are temporary and must be
 /// rejected before they reach ordinary expression checking or HIR. Used by call-result typing and
 /// monomorphization.
-fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Ty {
-    // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
-    // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their
-    // element via an interner or `PrimScalar` and are not supported in a nested generic position yet.
+fn subst_param_ty(
+    ty: Ty,
+    args: &[Ty],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &mut Vec<hir::TaggedType>,
+) -> Ty {
+    // Scalar-payload composites use the payload conversion, while collection composites use their
+    // wider element class and reconstruct specialized concrete array representations. Deeper
+    // nominal applications remain outside L7 and are rejected during source type formation.
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
         Ty::Option(s) => Ty::Option(subst_scalar(s, args, tagged_types)),
@@ -39115,17 +39127,22 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
         }
         Ty::Tagged(id) => scalar_to_ty(subst_scalar(Scalar::Tagged(id), args, tagged_types)),
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
-        Ty::Slice(s) => Ty::Slice(subst_scalar(s, args, tagged_types)),
+        Ty::Slice(s) => {
+            let element = subst_collection_element_ty(s, args, tagged_types);
+            collection_scalar_type(element)
+                .map(Ty::Slice)
+                .unwrap_or(Ty::Error)
+        }
         Ty::Array(s, n) => {
-            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
+            let element = subst_collection_element_ty(s, args, tagged_types);
             fixed_array_type(element, n).unwrap_or(Ty::Error)
         }
         Ty::DynArray(s) => {
-            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
-            dynamic_array_type(element).unwrap_or(Ty::Error)
+            let element = subst_collection_element_ty(s, args, tagged_types);
+            dynamic_array_type(element, structs, enums, tagged_types).unwrap_or(Ty::Error)
         }
         Ty::ArrayBuilder(s) => {
-            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
+            let element = subst_collection_element_ty(s, args, tagged_types);
             array_builder_elem(element)
                 .map(Ty::array_builder)
                 .unwrap_or(Ty::Error)
@@ -39135,17 +39152,47 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
     }
 }
 
+/// Substitute one collection element without routing a direct parameter through the narrower
+/// payload-scalar conversion. In particular, function values are collection scalars but are not
+/// Option/Result payload scalars.
+fn subst_collection_element_ty(
+    element: Scalar,
+    args: &[Ty],
+    tagged_types: &mut Vec<hir::TaggedType>,
+) -> Ty {
+    match element {
+        Scalar::Param(index) => args.get(index as usize).copied().unwrap_or(Ty::Error),
+        other => scalar_to_ty(subst_scalar(other, args, tagged_types)),
+    }
+}
+
 /// Form the exact owned dynamic-array representation for one already resolved element type.
 /// Generic `array<T>` templates temporarily use `Ty::DynArray(Scalar::Param(_))`; substitution
 /// must select the same concrete representation ordinary source type formation would have chosen.
-fn dynamic_array_type(element: Ty) -> Option<Ty> {
+fn dynamic_array_type(
+    element: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
     match element {
-        Ty::Struct(id) => Some(Ty::DynStructArray(id, Layout::Aos)),
+        Ty::Struct(id) if structs.get(id as usize)?.align.is_none() => {
+            Some(Ty::DynStructArray(id, Layout::Aos))
+        }
         Ty::Vec(elem, lanes) => Some(Ty::DynVecArray(elem, lanes)),
         Ty::Mask(elem, lanes) => Some(Ty::DynMaskArray(elem, lanes)),
-        Ty::Array(elem, length) => Some(Ty::DynFixedArray(elem, length)),
-        Ty::StructArray(id, length) => Some(Ty::DynFixedStructArray(id, length)),
-        other => ty_to_scalar(other).map(Ty::DynArray),
+        Ty::Array(elem, length)
+            if region_plain_type_ok(element, structs, enums, tagged_types) =>
+        {
+            Some(Ty::DynFixedArray(elem, length))
+        }
+        Ty::StructArray(id, length)
+            if region_plain_type_ok(element, structs, enums, tagged_types) =>
+        {
+            Some(Ty::DynFixedStructArray(id, length))
+        }
+        Ty::Slice(elem) => scalar_to_prim(elem).map(Ty::DynSliceArray),
+        other => collection_scalar_type(other).map(Ty::DynArray),
     }
 }
 
@@ -39155,7 +39202,7 @@ fn dynamic_array_type(element: Ty) -> Option<Ty> {
 fn fixed_array_type(element: Ty, length: u32) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        other => ty_to_scalar(other).map(|scalar| Ty::Array(scalar, length)),
+        other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
 }
 
@@ -39167,6 +39214,7 @@ fn dynamic_array_element_type(array: Ty) -> Option<Ty> {
         Ty::DynMaskArray(element, lanes) => Some(Ty::Mask(element, lanes)),
         Ty::DynFixedArray(element, length) => Some(Ty::Array(element, length)),
         Ty::DynFixedStructArray(id, length) => Some(Ty::StructArray(id, length)),
+        Ty::DynSliceArray(element) => Some(Ty::Slice(prim_to_scalar(element))),
         _ => None,
     }
 }
@@ -39747,13 +39795,53 @@ fn collection_scalar_arg(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
-    match ty {
-        // L7 keeps a collection element symbolic only while checking a generic template.  The
-        // complete call substitution must replace it before an emitted HIR function is formed.
-        Ty::Param(index) => Some(Scalar::Param(index)),
-        Ty::Fn(fid) => Some(Scalar::Fn(fid)),
-        _ => scalar_arg(ty, what, false, tagged_types, span, diags),
+    if let Some(scalar) = collection_scalar_type(ty) {
+        return Some(scalar);
     }
+    scalar_arg(ty, what, false, tagged_types, span, diags)
+}
+
+/// The diagnostic-free twin of [`collection_scalar_arg`], used when a generic application is
+/// materialized. Keep this exact allow-list shared with source type formation: falling back to
+/// [`ty_to_scalar`] alone would admit single-owner handles and omit function values.
+fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
+    // L7 keeps a collection element symbolic only while checking a generic template. The complete
+    // call substitution must replace it before an emitted HIR function is formed.
+    if matches!(ty, Ty::Param(_) | Ty::Fn(_)) {
+        return match ty {
+            Ty::Param(index) => Some(Scalar::Param(index)),
+            Ty::Fn(fid) => Some(Scalar::Fn(fid)),
+            _ => None,
+        };
+    }
+    if matches!(
+        ty,
+        Ty::Buffer
+            | Ty::CliCommand
+            | Ty::HttpRequest
+            | Ty::Command
+            | Ty::Reader
+            | Ty::Writer
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::File
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::HttpStream
+            | Ty::ResponseBuilder
+            | Ty::RunOutput
+            | Ty::HttpHeaders
+    ) {
+        return None;
+    }
+    ty_to_scalar(ty)
 }
 
 /// Intern a tuple type (dedup by element list) into `tuples`, returning its id. Tuples are
@@ -40530,6 +40618,22 @@ fn resolve_type(
                     Ty::Error
                 }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+                // A primitive slice element uses the same owned header-array representation as
+                // `chunks()`. Keeping one canonical `array<slice<P>>` type preserves the source
+                // region through generic argument matching and return substitution.
+                Ty::Slice(element) => match scalar_to_prim(element) {
+                    Some(element) => Ty::DynSliceArray(element),
+                    None => {
+                        collection_scalar_arg(
+                            inner,
+                            "array element",
+                            cx.tagged_types,
+                            span,
+                            diags,
+                        );
+                        Ty::Error
+                    }
+                },
                 Ty::Vec(elem, lanes) => {
                     Ty::dyn_aggregate_array(AggregateArrayElem::Vec(elem, lanes))
                 }
@@ -41246,7 +41350,13 @@ fn instantiate_struct(
     );
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
-        let fty = subst_param_ty(f.ty, args, cx.tagged_types);
+        let fty = subst_param_ty(
+            f.ty,
+            args,
+            cx.structs,
+            cx.enums,
+            cx.tagged_types,
+        );
         if !is_field_ok(fty, cx.tagged_types) {
             diags.error(
                 format!("field '{}' of '{name}' resolves to {}, which is not a valid struct field type yet", f.name, ty_name(fty)),

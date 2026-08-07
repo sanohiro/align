@@ -131,6 +131,38 @@ fn generic_slice_parameter_and_return() {
 }
 
 #[test]
+fn generic_function_value_slice_preserves_collection_scalar_semantics() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn add1(n: i64) -> i64 = n + 1\nfn keep<T>(xs: slice<T>) -> slice<T> = xs\nfn main() -> i32 {\n  callbacks := [add1]\n  kept := keep(callbacks[..])\n  return kept.len() as i32 + 41\n}\n";
+    let out = build_and_run("gen-fn-slice", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_owned_array_preserves_chunk_array_representation() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn concrete(xs: array<slice<i64>>) -> array<slice<i64>> = xs\nfn keep<T>(xs: array<T>) -> array<T> = xs\nfn main() -> i32 {\n  values := [20, 1, 10, 11]\n  chunks := keep(concrete(values.chunks(2)))\n  return (chunks[0].sum() + chunks[1].sum()) as i32\n}\n";
+    let out = build_and_run("gen-chunk-array", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_collection_substitution_rejects_single_owner_handles() {
+    let src = "import std.fs\nfn collect<T>(value: T) -> array<T> = [value].to_array()\npub fn main(args: array<str>) -> Result<(), Error> {\n  file := fs.open_rw(args[0])?\n  collect(file)\n  return Ok(())\n}\n";
+    assert!(check_errs("gen-file-array", src));
+}
+
+#[test]
+fn generic_collection_substitution_rejects_overaligned_struct_elements() {
+    let src = "align(32) Row { value: i64 }\nfn collect<T>(value: T) -> array<T> = [value].to_array()\nfn main() -> i32 {\n  collect(Row { value: 42 })\n  return 0\n}\n";
+    assert!(check_errs("gen-overaligned-array", src));
+}
+
+#[test]
 fn region_plain_bound_builds_a_generic_region_array() {
     if !backend_available() {
         return;
