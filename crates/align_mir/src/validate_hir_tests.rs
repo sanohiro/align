@@ -12818,6 +12818,27 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
     let mut abstract_fn = baseline_program();
     abstract_fn.fn_types[0] = fn_type(Ty::Param(0));
     assert_accepted("unreachable-template-function-type", &abstract_fn);
+    let mut abstract_nominals = baseline_program();
+    abstract_nominals.structs.push(StructDef {
+        name: "TemplateStruct".to_string(),
+        source_name: "TemplateStruct".to_string(),
+        fields: vec![FieldDef {
+            name: "value".to_string(),
+            ty: Ty::Param(0),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    abstract_nominals.enums.push(EnumDef {
+        name: "TemplateEnum".to_string(),
+        source_name: "TemplateEnum".to_string(),
+        variants: vec![hir::EnumVariant {
+            name: "Value".to_string(),
+            payload: vec![Scalar::Param(0)],
+            field_base: 1,
+        }],
+    });
+    assert_accepted("unreachable-template-nominals", &abstract_nominals);
 
     let mut deep_graph = baseline_program();
     deep_graph.structs = (0..4_096)

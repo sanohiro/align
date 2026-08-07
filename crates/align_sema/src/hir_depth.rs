@@ -1111,6 +1111,35 @@ pub(crate) fn expr_postorder_mut(root: &mut Expr) -> Vec<*mut Expr> {
         .collect()
 }
 
+/// Stable child-first statement order below one mutable HIR expression root.
+///
+/// Like [`expr_postorder_mut`], collection completes before the caller mutates any record. This is
+/// used by final table compaction, which must rewrite nominal ids stored directly on statements in
+/// blocks nested below an expression as well as the ids carried by the expressions themselves.
+pub(crate) fn stmt_postorder_mut(root: &mut Expr) -> Vec<*mut Stmt> {
+    let mut events = Vec::new();
+    let root = &*root;
+    let valid = walk_body_records(
+        BodyRecord::Expr(root),
+        usize::MAX,
+        Some(&mut events),
+        None,
+        false,
+        None,
+    );
+    debug_assert!(valid);
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            BodyEvent::StmtExit(statement) => Some(statement as *const Stmt as *mut Stmt),
+            BodyEvent::StmtEnter(_)
+            | BodyEvent::ExprEnter(_)
+            | BodyEvent::ExprExit { .. }
+            | BodyEvent::MatchArmEnter { .. } => None,
+        })
+        .collect()
+}
+
 /// Stable child-first expression order for a shared HIR root.
 pub(crate) fn expr_postorder(root: &Expr) -> Vec<&Expr> {
     let mut events = Vec::new();

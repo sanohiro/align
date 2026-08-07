@@ -2452,17 +2452,18 @@ impl Ty {
     }
 }
 
-/// A builtin generic bound — the only constraints (no user-defined trait bounds). A capability
-/// hierarchy: `Num` ⊃ `Ord` ⊃ `Eq`. `Num` grants arithmetic + ordering + equality, `Ord` grants
-/// ordering + equality, `Eq` grants equality, `Unconstrained` grants nothing (the parameter is
-/// opaque — pass / return / store only). A concrete type argument is checked against the bound at
-/// instantiation.
+/// A builtin generic bound — the only constraints (no user-defined trait bounds). `Num` ⊃ `Ord` ⊃
+/// `Eq` is the scalar-operation hierarchy. `RegionPlain` is an orthogonal closed structural bound
+/// for explicit-region construction and grants no scalar operation. `Unconstrained` grants nothing
+/// (the parameter is opaque — pass / return / store only). A concrete type argument is checked
+/// against the bound at instantiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bound {
     Unconstrained,
     Eq,
     Ord,
     Num,
+    RegionPlain,
 }
 
 impl Bound {
@@ -2481,6 +2482,7 @@ impl Bound {
             Bound::Eq => "Eq",
             Bound::Ord => "Ord",
             Bound::Num => "Num",
+            Bound::RegionPlain => "RegionPlain",
         }
     }
     fn from_name(s: &str) -> Option<Bound> {
@@ -2488,6 +2490,7 @@ impl Bound {
             "Eq" => Some(Bound::Eq),
             "Ord" => Some(Bound::Ord),
             "Num" => Some(Bound::Num),
+            "RegionPlain" => Some(Bound::RegionPlain),
             _ => None,
         }
     }
@@ -2500,6 +2503,9 @@ impl Bound {
             Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str),
             Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str),
             Bound::Num => ty.is_numeric(),
+            // RegionPlain is structural and needs the complete nominal definition tables.  Its
+            // concrete check is owned by generic-call finalization, not this scalar predicate.
+            Bound::RegionPlain => false,
         }
     }
 }
@@ -4296,6 +4302,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         })
         .collect();
     let mut struct_mono: HashMap<String, u32> = HashMap::new();
+    let mut struct_instances: HashMap<u32, GenericNominalInstance> = HashMap::new();
     let mut enums: Vec<hir::EnumDef> = enum_decls
         .iter()
         .map(|(m, e, ed)| {
@@ -4308,6 +4315,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         })
         .collect();
     let mut enum_mono: HashMap<String, u32> = HashMap::new();
+    let mut enum_instances: HashMap<u32, GenericNominalInstance> = HashMap::new();
     let mut resources: Vec<hir::ResourceDef> = resource_decls
         .iter()
         .map(|(module, is_entry, declaration)| {
@@ -4333,6 +4341,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         })
         .collect();
     let mut resource_mono: HashMap<String, u32> = HashMap::new();
+    let mut resource_instances: HashMap<u32, GenericNominalInstance> = HashMap::new();
     // Resolution context for type-declaration passes (0b/0c, templates): a bare field/payload type
     // resolves in the declaring module; a qualified `field: other.Type` resolves against that
     // module's imports. `no_imports` is the fallback for a module with none / not in the map.
@@ -4490,12 +4499,15 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     struct_templates: &est,
                     structs: &mut structs,
                     struct_mono: &mut struct_mono,
+                    struct_instances: &mut struct_instances,
                     enum_templates: &eet,
                     enums: &mut enums,
                     enum_mono: &mut enum_mono,
+                    enum_instances: &mut enum_instances,
                     resource_templates: &ert,
                     resources: &mut resources,
                     resource_mono: &mut resource_mono,
+                    resource_instances: &mut resource_instances,
                     tuples: &mut tuples,
                     fn_types: &mut fn_types,
                     tagged_types: &mut tagged_types,
@@ -4589,12 +4601,15 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 struct_templates: &struct_templates,
                 structs: &mut structs,
                 struct_mono: &mut struct_mono,
+                struct_instances: &mut struct_instances,
                 enum_templates: &enum_templates,
                 enums: &mut enums,
                 enum_mono: &mut enum_mono,
+                enum_instances: &mut enum_instances,
                 resource_templates: &resource_templates,
                 resources: &mut resources,
                 resource_mono: &mut resource_mono,
+                resource_instances: &mut resource_instances,
                 tuples: &mut tuples,
                 fn_types: &mut fn_types,
                 tagged_types: &mut tagged_types,
@@ -5110,7 +5125,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let bound = match &t.bound {
                 None => Bound::Unconstrained,
                 Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
-                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, or `Num`)", id.name), id.span);
+                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, `Num`, or `RegionPlain`)", id.name), id.span);
                     Bound::Unconstrained
                 }),
             };
@@ -5123,7 +5138,19 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, tcx!(module, imports), &tparams, diags));
+            let ty = resolve_type(&p.ty, tcx!(module, imports), &tparams, diags);
+            if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
+                && bounds.get(index as usize) != Some(&Bound::RegionPlain)
+            {
+                diags.error(
+                    format!(
+                        "an abstract `array_builder` element requires the `RegionPlain` bound (declare `<{}: RegionPlain>`)",
+                        tparams.get(index as usize).map(String::as_str).unwrap_or("T")
+                    ),
+                    p.ty.span(),
+                );
+            }
+            params.push(ty);
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -5139,6 +5166,17 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let ret = match &f.ret {
             Some(t) => {
                 let r = resolve_type(t, tcx!(module, imports), &tparams, diags);
+                if let Ty::ArrayBuilder(Scalar::Param(index)) = r
+                    && bounds.get(index as usize) != Some(&Bound::RegionPlain)
+                {
+                    diags.error(
+                        format!(
+                            "an abstract `array_builder` element requires the `RegionPlain` bound (declare `<{}: RegionPlain>`)",
+                            tparams.get(index as usize).map(String::as_str).unwrap_or("T")
+                        ),
+                        t.span(),
+                    );
+                }
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
@@ -5584,13 +5622,16 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             &mut enums,
             &enum_templates,
             &mut enum_mono,
+            &mut enum_instances,
             &resource_templates,
             &mut resources,
             &mut resource_mono,
+            &mut resource_instances,
             error_enum_id,
             &mut structs,
             &struct_templates,
             &mut struct_mono,
+            &mut struct_instances,
             &mut tuples,
             &mut fn_types,
             &mut tagged_types,
@@ -5685,13 +5726,16 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             &mut enums,
             &enum_templates,
             &mut enum_mono,
+            &mut enum_instances,
             &resource_templates,
             &mut resources,
             &mut resource_mono,
+            &mut resource_instances,
             error_enum_id,
             &mut structs,
             &struct_templates,
             &mut struct_mono,
+            &mut struct_instances,
             &mut tuples,
             &mut fn_types,
             &mut tagged_types,
@@ -5787,6 +5831,22 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         fn_types,
         imported_fns,
     };
+    let abstract_nominals = abstract_nominal_instances(
+        &program,
+        &struct_instances,
+        &enum_instances,
+        &resource_instances,
+    );
+    if !compact_abstract_nominal_instances(&mut program, &abstract_nominals) {
+        let span = program
+            .fns
+            .first()
+            .map_or_else(|| Span::new(0, 0, 0), |function| function.span);
+        diags.error(
+            "an abstract generic type survived into an emitted function".to_owned(),
+            span,
+        );
+    }
     assign_return_cleanup_abi(&mut program);
     prepare_local_fn_types(&mut program);
     infer_return_provenance(&mut program);
@@ -5800,6 +5860,493 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         left.descriptor_id.as_bytes().cmp(right.descriptor_id.as_bytes())
     });
     CheckedProgram { program, static_descriptors }
+}
+
+#[derive(Default)]
+struct AbstractNominalIds {
+    structs: HashSet<u32>,
+    enums: HashSet<u32>,
+    resources: HashSet<u32>,
+}
+
+fn abstract_nominal_instances(
+    program: &Program,
+    struct_instances: &HashMap<u32, GenericNominalInstance>,
+    enum_instances: &HashMap<u32, GenericNominalInstance>,
+    resource_instances: &HashMap<u32, GenericNominalInstance>,
+) -> AbstractNominalIds {
+    fn scalar_is_abstract(
+        scalar: Scalar,
+        program: &Program,
+        ids: &AbstractNominalIds,
+        active_tagged: &mut HashSet<u32>,
+    ) -> bool {
+        match scalar {
+            Scalar::Param(_) => true,
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                ids.structs.contains(&id)
+            }
+            Scalar::Enum(id) => ids.enums.contains(&id),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => ids.resources.contains(&id),
+            Scalar::Tagged(id) if active_tagged.insert(id) => {
+                let abstract_ = match program.tagged_types.get(id as usize) {
+                    Some(hir::TaggedType::Option(payload)) => {
+                        scalar_is_abstract(*payload, program, ids, active_tagged)
+                    }
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        scalar_is_abstract(*ok, program, ids, active_tagged)
+                            || scalar_is_abstract(*err, program, ids, active_tagged)
+                    }
+                    None => false,
+                };
+                active_tagged.remove(&id);
+                abstract_
+            }
+            _ => false,
+        }
+    }
+
+    fn ty_is_abstract(ty: Ty, program: &Program, ids: &AbstractNominalIds) -> bool {
+        match ty {
+            Ty::Param(_) => true,
+            Ty::Struct(id)
+            | Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::Soa(id)
+            | Ty::JsonScanner(id)
+            | Ty::FixedStructArrayBuilder(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::DictEncoded(id, _) => ids.structs.contains(&id),
+            Ty::Enum(id) => ids.enums.contains(&id),
+            Ty::Resource(id) | Ty::ResourceRef(id) => ids.resources.contains(&id),
+            Ty::Option(scalar)
+            | Ty::Box(scalar)
+            | Ty::Slice(scalar)
+            | Ty::DynArray(scalar)
+            | Ty::Task(scalar)
+            | Ty::ArrayBuilder(scalar)
+            | Ty::Array(scalar, _)
+            | Ty::Vec(scalar, _)
+            | Ty::Mask(scalar, _)
+            | Ty::VecArrayBuilder(scalar, _)
+            | Ty::MaskArrayBuilder(scalar, _)
+            | Ty::FixedArrayBuilder(scalar, _)
+            | Ty::DynVecArray(scalar, _)
+            | Ty::DynMaskArray(scalar, _)
+            | Ty::DynFixedArray(scalar, _) => scalar_is_abstract(
+                scalar,
+                program,
+                ids,
+                &mut HashSet::new(),
+            ),
+            Ty::Result(ok, err) => {
+                scalar_is_abstract(ok, program, ids, &mut HashSet::new())
+                    || scalar_is_abstract(err, program, ids, &mut HashSet::new())
+            }
+            Ty::Tagged(id) => scalar_is_abstract(
+                Scalar::Tagged(id),
+                program,
+                ids,
+                &mut HashSet::new(),
+            ),
+            _ => false,
+        }
+    }
+
+    let mut ids = AbstractNominalIds::default();
+    loop {
+        let before = ids.structs.len() + ids.enums.len() + ids.resources.len();
+        for (&id, instance) in struct_instances {
+            if instance
+                .args
+                .iter()
+                .any(|&ty| ty_is_abstract(ty, program, &ids))
+            {
+                ids.structs.insert(id);
+            }
+        }
+        for (&id, instance) in enum_instances {
+            if instance
+                .args
+                .iter()
+                .any(|&ty| ty_is_abstract(ty, program, &ids))
+            {
+                ids.enums.insert(id);
+            }
+        }
+        for (&id, instance) in resource_instances {
+            if instance
+                .args
+                .iter()
+                .any(|&ty| ty_is_abstract(ty, program, &ids))
+            {
+                ids.resources.insert(id);
+            }
+        }
+        if before == ids.structs.len() + ids.enums.len() + ids.resources.len() {
+            return ids;
+        }
+    }
+}
+
+struct NominalRemap {
+    structs: Vec<Option<u32>>,
+    enums: Vec<Option<u32>>,
+    resources: Vec<Option<u32>>,
+}
+
+fn compact_abstract_nominal_instances(
+    program: &mut Program,
+    abstract_ids: &AbstractNominalIds,
+) -> bool {
+    if abstract_ids.structs.is_empty()
+        && abstract_ids.enums.is_empty()
+        && abstract_ids.resources.is_empty()
+    {
+        return true;
+    }
+
+    fn table_remap(len: usize, removed: &HashSet<u32>) -> Vec<Option<u32>> {
+        let mut next = 0u32;
+        (0..len)
+            .map(|old| {
+                if removed.contains(&(old as u32)) {
+                    None
+                } else {
+                    let mapped = next;
+                    next += 1;
+                    Some(mapped)
+                }
+            })
+            .collect()
+    }
+
+    let remap = NominalRemap {
+        structs: table_remap(program.structs.len(), &abstract_ids.structs),
+        enums: table_remap(program.enums.len(), &abstract_ids.enums),
+        resources: table_remap(program.resources.len(), &abstract_ids.resources),
+    };
+    let mut candidate = program.clone();
+    let mut valid = true;
+
+    fn remap_id(id: &mut u32, table: &[Option<u32>], valid: &mut bool) {
+        match table.get(*id as usize).copied().flatten() {
+            Some(mapped) => *id = mapped,
+            None => *valid = false,
+        }
+    }
+
+    fn remap_scalar(scalar: &mut Scalar, remap: &NominalRemap, valid: &mut bool) {
+        match scalar {
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                remap_id(id, &remap.structs, valid)
+            }
+            Scalar::Enum(id) => remap_id(id, &remap.enums, valid),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                remap_id(id, &remap.resources, valid)
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_ty(ty: &mut Ty, remap: &NominalRemap, valid: &mut bool) {
+        match ty {
+            Ty::Struct(id)
+            | Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::Soa(id)
+            | Ty::JsonScanner(id)
+            | Ty::FixedStructArrayBuilder(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::DictEncoded(id, _) => remap_id(id, &remap.structs, valid),
+            Ty::Enum(id) => remap_id(id, &remap.enums, valid),
+            Ty::Resource(id) | Ty::ResourceRef(id) => {
+                remap_id(id, &remap.resources, valid)
+            }
+            Ty::Option(scalar)
+            | Ty::Box(scalar)
+            | Ty::Slice(scalar)
+            | Ty::DynArray(scalar)
+            | Ty::Task(scalar)
+            | Ty::ArrayBuilder(scalar)
+            | Ty::Array(scalar, _)
+            | Ty::Vec(scalar, _)
+            | Ty::Mask(scalar, _)
+            | Ty::VecArrayBuilder(scalar, _)
+            | Ty::MaskArrayBuilder(scalar, _)
+            | Ty::FixedArrayBuilder(scalar, _)
+            | Ty::DynVecArray(scalar, _)
+            | Ty::DynMaskArray(scalar, _)
+            | Ty::DynFixedArray(scalar, _) => remap_scalar(scalar, remap, valid),
+            Ty::Result(ok, err) => {
+                remap_scalar(ok, remap, valid);
+                remap_scalar(err, remap, valid);
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_stage(stage: &mut hir::Stage, remap: &NominalRemap, valid: &mut bool) {
+        remap_ty(&mut stage.out_ty, remap, valid);
+    }
+
+    fn remap_array_builder_elem(
+        elem: &mut ArrayBuilderElem,
+        remap: &NominalRemap,
+        valid: &mut bool,
+    ) {
+        match elem {
+            ArrayBuilderElem::Scalar(scalar) => remap_scalar(scalar, remap, valid),
+            ArrayBuilderElem::Aggregate(AggregateArrayElem::FixedStructArray(id, _)) => {
+                remap_id(id, &remap.structs, valid)
+            }
+            ArrayBuilderElem::Aggregate(
+                AggregateArrayElem::Vec(..)
+                | AggregateArrayElem::Mask(..)
+                | AggregateArrayElem::FixedArray(..),
+            ) => {}
+        }
+    }
+
+    fn remap_template_part(
+        part: &mut hir::TemplatePart,
+        remap: &NominalRemap,
+        valid: &mut bool,
+    ) {
+        match part {
+            hir::TemplatePart::OptionStructField { struct_id, .. }
+            | hir::TemplatePart::StructArrayField { struct_id, .. } => {
+                remap_id(struct_id, &remap.structs, valid)
+            }
+            hir::TemplatePart::ScalarArrayField { elem, .. } => {
+                remap_scalar(elem, remap, valid)
+            }
+            hir::TemplatePart::UnionValue { enum_id, .. } => {
+                remap_id(enum_id, &remap.enums, valid)
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_stmt_metadata(stmt: &mut hir::Stmt, remap: &NominalRemap, valid: &mut bool) {
+        match stmt {
+            hir::Stmt::AssignElemField { struct_id, .. }
+            | hir::Stmt::AssignElem { struct_id, .. } => {
+                remap_id(struct_id, &remap.structs, valid)
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_expr_metadata(expr: &mut Expr, remap: &NominalRemap, valid: &mut bool) {
+        remap_ty(&mut expr.ty, remap, valid);
+        match &mut expr.kind {
+            ExprKind::Call { type_args, .. } => {
+                for ty in type_args {
+                    remap_ty(ty, remap, valid);
+                }
+            }
+            ExprKind::EnumValue { enum_id, .. } | ExprKind::JsonDecodeUnion { enum_id, .. } => {
+                remap_id(enum_id, &remap.enums, valid)
+            }
+            ExprKind::StructLit { struct_id, .. }
+            | ExprKind::SoaColumn { struct_id, .. }
+            | ExprKind::ArrayToSoa { struct_id, .. }
+            | ExprKind::ElemField { struct_id, .. }
+            | ExprKind::JsonDecode { struct_id, .. }
+            | ExprKind::JsonDecodeStructArray { struct_id, .. }
+            | ExprKind::JsonDecodeSoa { struct_id, .. }
+            | ExprKind::JsonScan { struct_id, .. }
+            | ExprKind::ArrayGroupAgg { struct_id, .. }
+            | ExprKind::ArrayGroupAggMulti { struct_id, .. }
+            | ExprKind::ArrayDictEncode { struct_id, .. } => {
+                remap_id(struct_id, &remap.structs, valid)
+            }
+            ExprKind::ResourceFromRaw { resource, .. }
+            | ExprKind::ResourceBorrow { resource, .. }
+            | ExprKind::ResourceRaw { resource, .. }
+            | ExprKind::ResourceIntoRaw { resource, .. } => {
+                remap_id(resource, &remap.resources, valid)
+            }
+            ExprKind::ResourceViewFromRaw { resource, view, .. } => {
+                remap_id(resource, &remap.resources, valid);
+                if let hir::ResourceViewKind::Slice(scalar) = view {
+                    remap_scalar(scalar, remap, valid);
+                }
+            }
+            ExprKind::RawLoad { scalar, .. }
+            | ExprKind::ConstArray { elem: scalar, .. }
+            | ExprKind::VecLoad { elem: scalar, .. }
+            | ExprKind::VecStore { elem: scalar, .. }
+            | ExprKind::VecLit { elem: scalar, .. } => remap_scalar(scalar, remap, valid),
+            ExprKind::ArrayBuilderNew { elem, .. } => {
+                remap_array_builder_elem(elem, remap, valid)
+            }
+            ExprKind::ArrayLit { elem, .. }
+            | ExprKind::ArrayScan { elem, .. }
+            | ExprKind::ArrayDot { elem, .. }
+            | ExprKind::ArraySort { elem, .. }
+            | ExprKind::ArrayToArray { elem, .. }
+            | ExprKind::ArrayMapInto { elem, .. }
+            | ExprKind::ArrayPartition { elem, .. }
+            | ExprKind::ArrayParMap { elem, .. }
+            | ExprKind::ArrayChunks { elem, .. }
+            | ExprKind::JsonDecodeArray { elem, .. }
+            | ExprKind::RandShuffle { elem, .. }
+            | ExprKind::RandSample { elem, .. } => remap_ty(elem, remap, valid),
+            ExprKind::ArraySortBy { key_ty, elem, .. } => {
+                remap_ty(key_ty, remap, valid);
+                remap_ty(elem, remap, valid);
+            }
+            ExprKind::JsonDecodeScalar { scalar, .. }
+            | ExprKind::JsonDocAsScalar { scalar, .. } => remap_ty(scalar, remap, valid),
+            ExprKind::Template(parts) => {
+                for part in parts {
+                    remap_template_part(part, remap, valid);
+                }
+            }
+            _ => {}
+        }
+        match &mut expr.kind {
+            ExprKind::ArraySum { stages, .. }
+            | ExprKind::ArrayCount { stages, .. }
+            | ExprKind::ArrayAnyAll { stages, .. }
+            | ExprKind::ArrayMinMax { stages, .. }
+            | ExprKind::ArrayReduce { stages, .. }
+            | ExprKind::ArrayScan { stages, .. }
+            | ExprKind::ArraySort { stages, .. }
+            | ExprKind::ArraySortBy { stages, .. }
+            | ExprKind::ArrayToArray { stages, .. }
+            | ExprKind::ArrayMapInto { stages, .. }
+            | ExprKind::ArrayPartition { stages, .. }
+            | ExprKind::ArrayParMap { stages, .. } => {
+                for stage in stages {
+                    remap_stage(stage, remap, valid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_expr_tree(expr: &mut Expr, remap: &NominalRemap, valid: &mut bool) {
+        for statement in hir_depth::stmt_postorder_mut(expr) {
+            // SAFETY: traversal completed before mutation; metadata rewrites do not change HIR
+            // topology, and the list contains each nested statement once.
+            remap_stmt_metadata(unsafe { &mut *statement }, remap, valid);
+        }
+        for expression in hir_depth::expr_postorder_mut(expr) {
+            // SAFETY: the same stable-pointer contract as Checker::finalize_expr; only type/id
+            // metadata changes here.
+            remap_expr_metadata(unsafe { &mut *expression }, remap, valid);
+        }
+    }
+
+    fn remap_top_stmt(stmt: &mut hir::Stmt, remap: &NominalRemap, valid: &mut bool) {
+        remap_stmt_metadata(stmt, remap, valid);
+        match stmt {
+            hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => {
+                remap_expr_tree(init, remap, valid)
+            }
+            hir::Stmt::Assign { value, .. }
+            | hir::Stmt::AssignVecLane { value, .. }
+            | hir::Stmt::AssignField { value, .. } => remap_expr_tree(value, remap, valid),
+            hir::Stmt::AssignIndex { index, value, .. }
+            | hir::Stmt::AssignElemField { index, value, .. }
+            | hir::Stmt::AssignElem { index, value, .. } => {
+                remap_expr_tree(index, remap, valid);
+                remap_expr_tree(value, remap, valid);
+            }
+            hir::Stmt::Return(value) | hir::Stmt::Break { value, .. } => {
+                if let Some(value) = value {
+                    remap_expr_tree(value, remap, valid);
+                }
+            }
+            hir::Stmt::Expr(expr) => remap_expr_tree(expr, remap, valid),
+        }
+    }
+
+    candidate.structs = candidate
+        .structs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(old, mut definition)| {
+            remap.structs[old].map(|_| {
+                for field in &mut definition.fields {
+                    remap_ty(&mut field.ty, &remap, &mut valid);
+                }
+                definition
+            })
+        })
+        .collect();
+    candidate.enums = candidate
+        .enums
+        .into_iter()
+        .enumerate()
+        .filter_map(|(old, mut definition)| {
+            remap.enums[old].map(|_| {
+                for variant in &mut definition.variants {
+                    for payload in &mut variant.payload {
+                        remap_scalar(payload, &remap, &mut valid);
+                    }
+                }
+                definition
+            })
+        })
+        .collect();
+    candidate.resources = candidate
+        .resources
+        .into_iter()
+        .enumerate()
+        .filter_map(|(old, definition)| remap.resources[old].map(|_| definition))
+        .collect();
+    for definition in &mut candidate.tagged_types {
+        match definition {
+            hir::TaggedType::Option(payload) => remap_scalar(payload, &remap, &mut valid),
+            hir::TaggedType::Result(ok, err) => {
+                remap_scalar(ok, &remap, &mut valid);
+                remap_scalar(err, &remap, &mut valid);
+            }
+        }
+    }
+    for tuple in &mut candidate.tuples {
+        for element in &mut tuple.elems {
+            remap_scalar(element, &remap, &mut valid);
+        }
+    }
+    for function_type in &mut candidate.fn_types {
+        remap_ty(&mut function_type.ret, &remap, &mut valid);
+        for (_, parameter) in &mut function_type.params {
+            remap_scalar(parameter, &remap, &mut valid);
+        }
+    }
+    for function in &mut candidate.fns {
+        remap_ty(&mut function.ret, &remap, &mut valid);
+        for local in &mut function.locals {
+            remap_ty(&mut local.ty, &remap, &mut valid);
+        }
+        for statement in &mut function.body.stmts {
+            remap_top_stmt(statement, &remap, &mut valid);
+        }
+        if let Some(value) = function.body.value.as_deref_mut() {
+            remap_expr_tree(value, &remap, &mut valid);
+        }
+    }
+    for function in &mut candidate.externs {
+        remap_ty(&mut function.ret, &remap, &mut valid);
+        for parameter in &mut function.params {
+            remap_ty(parameter, &remap, &mut valid);
+        }
+    }
+    for function in &mut candidate.imported_fns {
+        remap_ty(&mut function.ret, &remap, &mut valid);
+        for parameter in &mut function.params {
+            remap_ty(parameter, &remap, &mut valid);
+        }
+    }
+    if valid {
+        *program = candidate;
+    }
+    valid
 }
 
 fn return_cleanup_abi(
@@ -22123,9 +22670,11 @@ struct Checker<'a, 't> {
     enum_templates: &'a HashMap<String, EnumTemplate>,
     /// Mangled monomorph name -> `enums` index — the shared monomorph dedup cache.
     enum_mono: &'t mut HashMap<String, u32>,
+    enum_instances: &'t mut HashMap<u32, GenericNominalInstance>,
     resource_templates: &'a HashMap<String, ResourceTemplate>,
     resources: &'t mut Vec<hir::ResourceDef>,
     resource_mono: &'t mut HashMap<String, u32>,
+    resource_instances: &'t mut HashMap<u32, GenericNominalInstance>,
     /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
     error_enum_id: u32,
     /// The id of the builtin `json.kind` enum (the result of `d.kind()` on a `json.doc`, J4).
@@ -22137,6 +22686,7 @@ struct Checker<'a, 't> {
     struct_templates: &'a HashMap<String, StructTemplate>,
     /// Mangled monomorph name -> `structs` index — the shared monomorph dedup cache.
     struct_mono: &'t mut HashMap<String, u32>,
+    struct_instances: &'t mut HashMap<u32, GenericNominalInstance>,
     /// The shared tuple-type interner (anonymous `(T, U, …)` types). A separate lifetime from
     /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
     /// long-lived shared `struct_ids` borrow.
@@ -22293,13 +22843,16 @@ impl<'a, 't> Checker<'a, 't> {
         enums: &'t mut Vec<hir::EnumDef>,
         enum_templates: &'a HashMap<String, EnumTemplate>,
         enum_mono: &'t mut HashMap<String, u32>,
+        enum_instances: &'t mut HashMap<u32, GenericNominalInstance>,
         resource_templates: &'a HashMap<String, ResourceTemplate>,
         resources: &'t mut Vec<hir::ResourceDef>,
         resource_mono: &'t mut HashMap<String, u32>,
+        resource_instances: &'t mut HashMap<u32, GenericNominalInstance>,
         error_enum_id: u32,
         structs: &'t mut Vec<StructDef>,
         struct_templates: &'a HashMap<String, StructTemplate>,
         struct_mono: &'t mut HashMap<String, u32>,
+        struct_instances: &'t mut HashMap<u32, GenericNominalInstance>,
         tuples: &'t mut Vec<hir::TupleDef>,
         fn_types: &'t mut Vec<hir::FnTy>,
         tagged_types: &'t mut Vec<hir::TaggedType>,
@@ -22330,9 +22883,11 @@ impl<'a, 't> Checker<'a, 't> {
             enums,
             enum_templates,
             enum_mono,
+            enum_instances,
             resource_templates,
             resources,
             resource_mono,
+            resource_instances,
             error_enum_id,
             // The builtin `json.kind` enum is registered before any `Checker` is built (right after
             // `Error`), so its id is always present in `enum_ids`.
@@ -22340,6 +22895,7 @@ impl<'a, 't> Checker<'a, 't> {
             structs,
             struct_templates,
             struct_mono,
+            struct_instances,
             tuples,
             fn_types,
             tagged_types,
@@ -22892,15 +23448,16 @@ impl<'a, 't> Checker<'a, 't> {
         // earlier top-level body must not become the saved enclosing state for this function's
         // otherwise independent lambdas.
         self.extern_boundary_error = false;
-        let sig = &self.sigs[&mangled];
+        let sig = self.sigs[&mangled].clone();
         let mut ret = sig.ret;
         let mut param_tys = sig.params.clone();
         // Monomorph mode: substitute the concrete type arguments into the (generic) signature so
         // the param locals and return type are concrete — no `Ty::Param` reaches the body.
         if !self.mono_args.is_empty() {
-            ret = subst_param_ty(ret, &self.mono_args, self.tagged_types);
+            let mono_args = self.mono_args.clone();
+            ret = self.subst_type(ret, &mono_args, f.span);
             for t in &mut param_tys {
-                *t = subst_param_ty(*t, &self.mono_args, self.tagged_types);
+                *t = self.subst_type(*t, &mono_args, f.span);
             }
         }
         if mangled == "main" {
@@ -23440,6 +23997,82 @@ impl<'a, 't> Checker<'a, 't> {
         self.param_bounds.get(i as usize).copied().unwrap_or(Bound::Unconstrained)
     }
 
+    fn generic_param_state_for(&self, ty: Ty, subst: &[Option<Ty>]) -> GenericParamState {
+        let mut state = GenericParamState::default();
+        let mut work = vec![ty];
+        let mut visited = HashSet::new();
+        while let Some(ty) = work.pop() {
+            if !visited.insert(ty) {
+                continue;
+            }
+            match ty {
+                Ty::Param(parameter) => {
+                    if subst.get(parameter as usize).is_some_and(Option::is_some) {
+                        state.bound = true;
+                    } else {
+                        state.unbound = true;
+                    }
+                }
+                Ty::Option(value)
+                | Ty::Box(value)
+                | Ty::Slice(value)
+                | Ty::Array(value, _)
+                | Ty::DynArray(value)
+                | Ty::ArrayBuilder(value)
+                | Ty::Task(value) => work.push(scalar_to_ty(value)),
+                Ty::Result(ok, err) => {
+                    work.push(scalar_to_ty(err));
+                    work.push(scalar_to_ty(ok));
+                }
+                Ty::Tagged(id) => work.push(expand_tagged_ty(Ty::Tagged(id), self.tagged_types)),
+                nominal => {
+                    if let Some((_, instance)) = self.nominal_instance(nominal) {
+                        work.extend(instance.args.into_iter().rev());
+                    }
+                }
+            }
+        }
+        state
+    }
+
+    fn mark_nested_params_for(&self, ty: Ty, nested: &mut [bool]) {
+        let mut work = vec![(ty, false)];
+        let mut visited = HashSet::new();
+        while let Some((ty, inside)) = work.pop() {
+            if !visited.insert((ty, inside)) {
+                continue;
+            }
+            match ty {
+                Ty::Param(parameter) if inside => {
+                    if let Some(slot) = nested.get_mut(parameter as usize) {
+                        *slot = true;
+                    }
+                }
+                Ty::Param(_) => {}
+                Ty::Option(value)
+                | Ty::Box(value)
+                | Ty::Slice(value)
+                | Ty::Array(value, _)
+                | Ty::DynArray(value)
+                | Ty::ArrayBuilder(value)
+                | Ty::Task(value) => work.push((scalar_to_ty(value), true)),
+                Ty::Result(ok, err) => {
+                    work.push((scalar_to_ty(err), true));
+                    work.push((scalar_to_ty(ok), true));
+                }
+                Ty::Tagged(id) => work.push((
+                    expand_tagged_ty(Ty::Tagged(id), self.tagged_types),
+                    true,
+                )),
+                nominal => {
+                    if let Some((_, instance)) = self.nominal_instance(nominal) {
+                        work.extend(instance.args.into_iter().rev().map(|argument| (argument, true)));
+                    }
+                }
+            }
+        }
+    }
+
     /// "operation X on the generic type 'T' requires the `B` bound (`<T: B>`)".
     fn bound_needed_msg(&self, i: u32, what: &str, needed: Bound) -> String {
         let name = self.type_params.get(i as usize).map(|s| s.as_str()).unwrap_or("T");
@@ -23459,12 +24092,15 @@ impl<'a, 't> Checker<'a, 't> {
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
+            struct_instances: self.struct_instances,
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            enum_instances: self.enum_instances,
             resource_templates: self.resource_templates,
             resources: self.resources,
             resource_mono: self.resource_mono,
+            resource_instances: self.resource_instances,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
@@ -23472,9 +24108,110 @@ impl<'a, 't> Checker<'a, 't> {
         let ty = resolve_type(t, &mut cx, &self.type_params, self.diags);
         // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
         if self.mono_args.is_empty() {
-            ty
+            if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
+                && self.param_bound(index) != Bound::RegionPlain
+            {
+                self.diags.error(
+                    self.bound_needed_msg(index, "an abstract `array_builder` element", Bound::RegionPlain),
+                    t.span(),
+                );
+                Ty::Error
+            } else {
+                ty
+            }
         } else {
-            subst_param_ty(ty, &self.mono_args, self.tagged_types)
+            let mono_args = self.mono_args.clone();
+            self.subst_type(ty, &mono_args, t.span())
+        }
+    }
+
+    /// Substitute one generic signature type, including sema-only nominal applications. The free
+    /// scalar substitution helper owns builtin composites; this layer materializes the exact
+    /// struct/sum/resource instance once its ordered application arguments are known.
+    fn subst_type(&mut self, ty: Ty, args: &[Ty], span: Span) -> Ty {
+        let instance = match ty {
+            Ty::Struct(id) => self
+                .struct_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (0u8, instance)),
+            Ty::Enum(id) => self
+                .enum_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (1u8, instance)),
+            Ty::Resource(id) => self
+                .resource_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (2u8, instance)),
+            Ty::ResourceRef(id) => self
+                .resource_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (3u8, instance)),
+            _ => None,
+        };
+        let Some((kind, instance)) = instance else {
+            return subst_param_ty(ty, args, self.tagged_types);
+        };
+        let concrete_args = instance
+            .args
+            .into_iter()
+            .map(|argument| self.subst_type(argument, args, span))
+            .collect::<Vec<_>>();
+        match kind {
+            0 => self
+                .struct_templates
+                .get(&instance.canonical)
+                .cloned()
+                .map(|template| {
+                    Ty::Struct(self.instantiate_struct(
+                        &instance.canonical,
+                        &template,
+                        &concrete_args,
+                        span,
+                    ))
+                })
+                .unwrap_or(Ty::Error),
+            1 => self
+                .enum_templates
+                .get(&instance.canonical)
+                .cloned()
+                .map(|template| {
+                    Ty::Enum(self.instantiate_enum(
+                        &instance.canonical,
+                        &template,
+                        &concrete_args,
+                        span,
+                    ))
+                })
+                .unwrap_or(Ty::Error),
+            2 => self
+                .resource_templates
+                .get(&instance.canonical)
+                .cloned()
+                .map(|template| {
+                    Ty::Resource(self.instantiate_resource(
+                        &instance.canonical,
+                        &template,
+                        &concrete_args,
+                    ))
+                })
+                .unwrap_or(Ty::Error),
+            3 => self
+                .resource_templates
+                .get(&instance.canonical)
+                .cloned()
+                .map(|template| {
+                    Ty::ResourceRef(self.instantiate_resource(
+                        &instance.canonical,
+                        &template,
+                        &concrete_args,
+                    ))
+                })
+                .unwrap_or(Ty::Error),
+            _ => Ty::Error,
         }
     }
 
@@ -24718,17 +25455,54 @@ impl<'a, 't> Checker<'a, 't> {
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
+            struct_instances: self.struct_instances,
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            enum_instances: self.enum_instances,
             resource_templates: self.resource_templates,
             resources: self.resources,
             resource_mono: self.resource_mono,
+            resource_instances: self.resource_instances,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
         };
         instantiate_struct(name, tmpl, args, &mut cx, span, self.diags)
+    }
+
+    fn instantiate_resource(
+        &mut self,
+        name: &str,
+        template: &ResourceTemplate,
+        args: &[Ty],
+    ) -> u32 {
+        let mut cx = TyCx {
+            cur_module: &self.cur_module,
+            imports: self.user_imports,
+            type_table: self.type_table,
+            struct_ids: self.struct_ids,
+            enum_ids: self.enum_ids,
+            resource_ids: self.resource_ids,
+            struct_source_spellings: self.struct_source_spellings,
+            enum_source_spellings: self.enum_source_spellings,
+            struct_templates: self.struct_templates,
+            structs: self.structs,
+            struct_mono: self.struct_mono,
+            struct_instances: self.struct_instances,
+            enum_templates: self.enum_templates,
+            enums: self.enums,
+            enum_mono: self.enum_mono,
+            enum_instances: self.enum_instances,
+            resource_templates: self.resource_templates,
+            resources: self.resources,
+            resource_mono: self.resource_mono,
+            resource_instances: self.resource_instances,
+            tuples: self.tuples,
+            fn_types: self.fn_types,
+            tagged_types: self.tagged_types,
+        };
+        instantiate_resource(name, template, args, &mut cx)
     }
 
     /// Resolve a type-name path to its canonical key (a bare name in `cur_module`, or a qualified
@@ -24888,15 +25662,6 @@ impl<'a, 't> Checker<'a, 't> {
         let mut args = Vec::with_capacity(tmpl.type_params.len());
         for (i, s) in subst.iter().enumerate() {
             let concrete = s.map(|t| self.finalize(t)).unwrap_or(Ty::Error);
-            if matches!(concrete, Ty::Param(_)) {
-                // The field value's type is a (generic function's) type parameter — constructing a
-                // generic struct from inside a generic function. Deferred (see `resolve_type`).
-                self.diags.error(
-                    format!("constructing a generic struct ('{name}') with a type parameter inside a generic function is not supported yet"),
-                    span,
-                );
-                return err;
-            }
             if matches!(concrete, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error) {
                 self.diags.error(
                     format!("cannot infer type parameter '{}' of '{name}' from the fields", tmpl.type_params[i]),
@@ -25947,8 +26712,8 @@ impl<'a, 't> Checker<'a, 't> {
                 .enumerate()
                 .map(|(index, value)| value.unwrap_or(Ty::Param(index as u32)))
                 .collect();
-            let substituted = subst_param_ty(declared, &known_args, self.tagged_types);
-            let slot_state = generic_param_state(declared, &subst, self.tagged_types);
+            let substituted = self.subst_type(declared, &known_args, a.span);
+            let slot_state = self.generic_param_state_for(declared, &subst);
             if slot_state.bound && slot_state.unbound {
                 self.diags.error(
                     format!(
@@ -26010,7 +26775,7 @@ impl<'a, 't> Checker<'a, 't> {
         // can still infer its type from the call's context (the 4c-1 return-context behavior).
         let mut nested = vec![false; type_params.len()];
         for t in param_tys.iter().chain(std::iter::once(&ret)) {
-            mark_nested_params(*t, &mut nested, self.tagged_types);
+            self.mark_nested_params_for(*t, &mut nested);
         }
         for (p, &is_nested) in nested.iter().enumerate() {
             if !is_nested {
@@ -26036,7 +26801,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        let result_ty = subst_param_ty(ret, &type_args, self.tagged_types);
+        let result_ty = self.subst_type(ret, &type_args, span);
         self.constrain(result_ty, expected, span);
         // A generic call is an inference boundary: if any argument or the result constraint failed,
         // return the error sentinel instead of attaching the partially checked arguments to a HIR
@@ -26093,6 +26858,29 @@ impl<'a, 't> Checker<'a, 't> {
         context: GenericMatchContext,
     ) {
         let a = self.resolve(actual);
+        let declared_nominal = self.nominal_instance(declared);
+        let actual_nominal = self.nominal_instance(a);
+        if let (Some((declared_kind, declared_instance)), Some((actual_kind, actual_instance))) =
+            (declared_nominal, actual_nominal)
+            && declared_kind == actual_kind
+            && declared_instance.canonical == actual_instance.canonical
+            && declared_instance.args.len() == actual_instance.args.len()
+        {
+            for (declared_arg, actual_arg) in declared_instance
+                .args
+                .into_iter()
+                .zip(actual_instance.args)
+            {
+                self.match_param_in_context(
+                    declared_arg,
+                    actual_arg,
+                    subst,
+                    span,
+                    context,
+                );
+            }
+            return;
+        }
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
             (Ty::Tagged(_), _) => self.match_param_in_context(
@@ -26116,6 +26904,56 @@ impl<'a, 't> Checker<'a, 't> {
                 self.match_scalar_param_in_context(dok, aok, subst, span, context);
                 self.match_scalar_param_in_context(derr, aerr, subst, span, context);
             }
+            (Ty::DynArray(declared_element), actual) => {
+                if let Some(actual_element) = dynamic_array_element_type(actual) {
+                    if let Scalar::Param(parameter) = declared_element {
+                        self.bind_param(parameter, actual_element, subst, span);
+                    } else {
+                        match context {
+                            GenericMatchContext::Argument => {
+                                self.unify(actual_element, scalar_to_ty(declared_element), span);
+                            }
+                            GenericMatchContext::ExpectedReturn => {
+                                self.unify(scalar_to_ty(declared_element), actual_element, span);
+                            }
+                        }
+                    }
+                } else {
+                    match context {
+                        GenericMatchContext::Argument => {
+                            self.unify(actual, declared, span);
+                        }
+                        GenericMatchContext::ExpectedReturn => {
+                            self.unify(declared, actual, span);
+                        }
+                    }
+                }
+            }
+            (Ty::ArrayBuilder(declared_element), actual) => {
+                if let Some(actual_element) = actual.array_builder_element().map(ArrayBuilderElem::ty) {
+                    if let Scalar::Param(parameter) = declared_element {
+                        self.bind_param(parameter, actual_element, subst, span);
+                    } else {
+                        match context {
+                            GenericMatchContext::Argument => {
+                                self.unify(actual_element, scalar_to_ty(declared_element), span);
+                            }
+                            GenericMatchContext::ExpectedReturn => {
+                                self.unify(scalar_to_ty(declared_element), actual_element, span);
+                            }
+                        }
+                    }
+                } else {
+                    match context {
+                        GenericMatchContext::Argument => {
+                            self.unify(actual, declared, span);
+                        }
+                        GenericMatchContext::ExpectedReturn => {
+                            self.unify(declared, actual, span);
+                        }
+                    }
+                }
+            }
             (Ty::Slice(ds), Ty::Slice(asc))
             | (Ty::Box(ds), Ty::Box(asc))
             | (Ty::Array(ds, _), Ty::Array(asc, _))
@@ -26128,6 +26966,32 @@ impl<'a, 't> Checker<'a, 't> {
                     GenericMatchContext::ExpectedReturn => self.unify(declared, a, span),
                 };
             }
+        }
+    }
+
+    fn nominal_instance(&self, ty: Ty) -> Option<(u8, GenericNominalInstance)> {
+        match ty {
+            Ty::Struct(id) => self
+                .struct_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (0, instance)),
+            Ty::Enum(id) => self
+                .enum_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (1, instance)),
+            Ty::Resource(id) => self
+                .resource_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (2, instance)),
+            Ty::ResourceRef(id) => self
+                .resource_instances
+                .get(&id)
+                .cloned()
+                .map(|instance| (3, instance)),
+            _ => None,
         }
     }
 
@@ -27883,7 +28747,29 @@ impl<'a, 't> Checker<'a, 't> {
                 ));
             }
         }
-        let scalar = match self.resolve(elem_ty) {
+        let resolved_elem = self.resolve(elem_ty);
+        if let Ty::Struct(id) = resolved_elem {
+            if struct_is_move(id, self.structs, self.enums, self.tagged_types) {
+                self.diags.error(
+                    format!(
+                        "`{}` cannot be copied into a fixed array from a value expression — construct each Move element in place",
+                        self.ty_display(resolved_elem)
+                    ),
+                    span,
+                );
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+            }
+            return Expr {
+                kind: ExprKind::ArrayLit {
+                    elems: checked,
+                    elem: Ty::Struct(id),
+                    pooled: false,
+                },
+                ty: Ty::StructArray(id, n),
+                span,
+            };
+        }
+        let scalar = match resolved_elem {
             Ty::Fn(fid) => Scalar::Fn(fid),
             other => self.payload_scalar(other, "array element", false, span),
         };
@@ -30116,7 +31002,11 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         if region.is_some() {
-            if let Some(reason) = self.region_plain_error(elem.ty()) {
+            let abstract_region_plain = matches!(elem, ArrayBuilderElem::Scalar(Scalar::Param(index))
+                if self.param_bound(index) == Bound::RegionPlain);
+            if !abstract_region_plain
+                && let Some(reason) = self.region_plain_error(elem.ty())
+            {
                 self.diags.error(
                     format!("array_builder<{}> cannot use region storage: {reason}",
                         elem.name()),
@@ -35455,12 +36345,15 @@ impl<'a, 't> Checker<'a, 't> {
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
+            struct_instances: self.struct_instances,
             enum_templates: self.enum_templates,
             enums: self.enums,
             enum_mono: self.enum_mono,
+            enum_instances: self.enum_instances,
             resource_templates: self.resource_templates,
             resources: self.resources,
             resource_mono: self.resource_mono,
+            resource_instances: self.resource_instances,
             tuples: self.tuples,
             fn_types: self.fn_types,
             tagged_types: self.tagged_types,
@@ -36126,21 +37019,30 @@ impl<'a, 't> Checker<'a, 't> {
                     for t in type_args.iter_mut() {
                         *t = self.finalize(*t);
                     }
-                    // A `Param` type argument means this call sits inside a generic *template* and
-                    // is parameterized by the enclosing `T`; it is instantiated (and recorded) when
-                    // the template itself is monomorphized — skip it here (the template HIR is
-                    // discarded). An `IntVar`/`FloatVar` never survives `finalize` (it defaults), and
-                    // a truly uninferable parameter already errored in `check_generic_call`.
-                    let abstract_call = type_args.iter().any(|t| matches!(t, Ty::Param(_)));
+                    // A type argument that contains a `Param`, including through a generic nominal
+                    // application, belongs to the enclosing generic template. It is instantiated
+                    // when that template is monomorphized, so the discarded abstract HIR records no
+                    // worklist item. An `IntVar`/`FloatVar` never survives `finalize` (it defaults),
+                    // and a truly uninferable parameter already errored in `check_generic_call`.
+                    let abstract_call = type_args
+                        .iter()
+                        .any(|&ty| self.generic_param_state_for(ty, &[]).unbound);
                     if !abstract_call && !type_args.contains(&Ty::Error) {
                         // Resolve a nested-`Param` result type (`Option<T>` → `Option<i32>`).
-                        recomputed = Some(subst_param_ty(cur_ty, type_args, self.tagged_types));
+                        recomputed = Some(self.subst_type(cur_ty, type_args, span));
                         // Each concrete type argument must satisfy its parameter's bound.
                         if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
-                                if !bound.satisfied_by(*arg) {
+                                let failure = if *bound == Bound::RegionPlain {
+                                    self.region_plain_error(*arg)
+                                } else if bound.satisfied_by(*arg) {
+                                    None
+                                } else {
+                                    Some(format!("{} is outside the bound's scalar domain", self.ty_display(*arg)))
+                                };
+                                if let Some(reason) = failure {
                                     self.diags.error(
-                                        format!("type argument {} = `{}` does not satisfy the `{}` bound of '{func}'", i + 1, self.ty_display(*arg), bound.name()),
+                                        format!("type argument {} = `{}` does not satisfy the `{}` bound of '{func}': {reason}", i + 1, self.ty_display(*arg), bound.name()),
                                         span,
                                     );
                                 }
@@ -38214,9 +39116,58 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
         Ty::Tagged(id) => scalar_to_ty(subst_scalar(Scalar::Tagged(id), args, tagged_types)),
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => Ty::Slice(subst_scalar(s, args, tagged_types)),
-        Ty::Array(s, n) => Ty::Array(subst_scalar(s, args, tagged_types), n),
+        Ty::Array(s, n) => {
+            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
+            fixed_array_type(element, n).unwrap_or(Ty::Error)
+        }
+        Ty::DynArray(s) => {
+            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
+            dynamic_array_type(element).unwrap_or(Ty::Error)
+        }
+        Ty::ArrayBuilder(s) => {
+            let element = scalar_to_ty(subst_scalar(s, args, tagged_types));
+            array_builder_elem(element)
+                .map(Ty::array_builder)
+                .unwrap_or(Ty::Error)
+        }
         Ty::Task(s) => Ty::Task(subst_scalar(s, args, tagged_types)),
         other => other,
+    }
+}
+
+/// Form the exact owned dynamic-array representation for one already resolved element type.
+/// Generic `array<T>` templates temporarily use `Ty::DynArray(Scalar::Param(_))`; substitution
+/// must select the same concrete representation ordinary source type formation would have chosen.
+fn dynamic_array_type(element: Ty) -> Option<Ty> {
+    match element {
+        Ty::Struct(id) => Some(Ty::DynStructArray(id, Layout::Aos)),
+        Ty::Vec(elem, lanes) => Some(Ty::DynVecArray(elem, lanes)),
+        Ty::Mask(elem, lanes) => Some(Ty::DynMaskArray(elem, lanes)),
+        Ty::Array(elem, length) => Some(Ty::DynFixedArray(elem, length)),
+        Ty::StructArray(id, length) => Some(Ty::DynFixedStructArray(id, length)),
+        other => ty_to_scalar(other).map(Ty::DynArray),
+    }
+}
+
+/// Form the exact fixed-array representation after a generic literal element is substituted.
+/// A template temporarily represents `[value: T]` as `Ty::Array(Param, N)`; a struct argument must
+/// select the dedicated inline `StructArray` form before body analysis and MIR validation.
+fn fixed_array_type(element: Ty, length: u32) -> Option<Ty> {
+    match element {
+        Ty::Struct(id) => Some(Ty::StructArray(id, length)),
+        other => ty_to_scalar(other).map(|scalar| Ty::Array(scalar, length)),
+    }
+}
+
+fn dynamic_array_element_type(array: Ty) -> Option<Ty> {
+    match array {
+        Ty::DynArray(element) => Some(scalar_to_ty(element)),
+        Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
+        Ty::DynVecArray(element, lanes) => Some(Ty::Vec(element, lanes)),
+        Ty::DynMaskArray(element, lanes) => Some(Ty::Mask(element, lanes)),
+        Ty::DynFixedArray(element, length) => Some(Ty::Array(element, length)),
+        Ty::DynFixedStructArray(id, length) => Some(Ty::StructArray(id, length)),
+        _ => None,
     }
 }
 
@@ -38297,50 +39248,19 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
 /// Mark every type parameter that appears **nested** in a composite (not a bare `Ty::Param`):
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
-fn mark_nested_params(ty: Ty, nested: &mut [bool], tagged_types: &[hir::TaggedType]) {
-    let mut work = Vec::new();
-    match ty {
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
-            work.push(s);
-        }
-        Ty::Result(ok, err) => {
-            work.push(err);
-            work.push(ok);
-        }
-        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
-        _ => {}
-    }
-    let mut visited = HashSet::new();
-    while let Some(scalar) = work.pop() {
-        match scalar {
-            Scalar::Param(p) => {
-                if let Some(slot) = nested.get_mut(p as usize) {
-                    *slot = true;
-                }
-            }
-            Scalar::Tagged(id) if visited.insert(id) => {
-                if let Some(tagged) = tagged_types.get(id as usize) {
-                    match *tagged {
-                        hir::TaggedType::Option(payload) => work.push(payload),
-                        hir::TaggedType::Result(ok, err) => {
-                            work.push(err);
-                            work.push(ok);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     if matches!(ty, Ty::Param(_)) {
         return true;
     }
     let mut work = Vec::new();
     match ty {
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
+        Ty::Option(s)
+        | Ty::Box(s)
+        | Ty::Slice(s)
+        | Ty::Array(s, _)
+        | Ty::DynArray(s)
+        | Ty::ArrayBuilder(s)
+        | Ty::Task(s) => {
             work.push(s);
         }
         Ty::Result(ok, err) => {
@@ -38378,52 +39298,6 @@ fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
 struct GenericParamState {
     bound: bool,
     unbound: bool,
-}
-
-fn generic_param_state(ty: Ty, subst: &[Option<Ty>], tagged_types: &[hir::TaggedType]) -> GenericParamState {
-    let mut state = GenericParamState::default();
-    let mut work = Vec::new();
-    match ty {
-        Ty::Param(p) => {
-            if subst.get(p as usize).is_some_and(Option::is_some) {
-                state.bound = true;
-            } else {
-                state.unbound = true;
-            }
-        }
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => work.push(s),
-        Ty::Result(ok, err) => {
-            work.push(err);
-            work.push(ok);
-        }
-        Ty::Tagged(id) => work.push(Scalar::Tagged(id)),
-        _ => {}
-    }
-    let mut visited = HashSet::new();
-    while let Some(scalar) = work.pop() {
-        match scalar {
-            Scalar::Param(p) => {
-                if subst.get(p as usize).is_some_and(Option::is_some) {
-                    state.bound = true;
-                } else {
-                    state.unbound = true;
-                }
-            }
-            Scalar::Tagged(id) if visited.insert(id) => {
-                if let Some(tagged) = tagged_types.get(id as usize) {
-                    match *tagged {
-                        hir::TaggedType::Option(payload) => work.push(payload),
-                        hir::TaggedType::Result(ok, err) => {
-                            work.push(err);
-                            work.push(ok);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    state
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
@@ -38874,6 +39748,9 @@ fn collection_scalar_arg(
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
     match ty {
+        // L7 keeps a collection element symbolic only while checking a generic template.  The
+        // complete call substitution must replace it before an emitted HIR function is formed.
+        Ty::Param(index) => Some(Scalar::Param(index)),
         Ty::Fn(fid) => Some(Scalar::Fn(fid)),
         _ => scalar_arg(ty, what, false, tagged_types, span, diags),
     }
@@ -38975,6 +39852,15 @@ struct ResourceTemplate {
     drop_abi_fingerprint: [u8; 16],
 }
 
+/// Sema-only identity for an application of a generic nominal type. Abstract instances may carry
+/// `Ty::Param` arguments while a template is checked; emitted monomorphs always point at instances
+/// whose argument list is fully concrete. This metadata is deliberately not part of HIR or MIR.
+#[derive(Clone, Debug)]
+struct GenericNominalInstance {
+    canonical: String,
+    args: Vec<Ty>,
+}
+
 /// The mutable + shared type-resolution context threaded through [`resolve_type`]: the concrete
 /// struct / enum tables (grown with monomorph instances), the generic templates + their monomorph
 /// caches, and the tuple / `Ty::Fn` interners.
@@ -38999,18 +39885,133 @@ struct TyCx<'a> {
     structs: &'a mut Vec<StructDef>,
     /// Mangled monomorph name (`Pair$i32`) -> `structs` index — dedups monomorph instances.
     struct_mono: &'a mut HashMap<String, u32>,
+    struct_instances: &'a mut HashMap<u32, GenericNominalInstance>,
     /// Generic sum-type templates, by name (not in `enums` — they carry `Scalar::Param` payloads).
     enum_templates: &'a HashMap<String, EnumTemplate>,
     /// Concrete enum table; monomorph instances of generic sum types are appended here.
     enums: &'a mut Vec<hir::EnumDef>,
     /// Mangled monomorph name (`Opt$i32`) -> `enums` index — dedups monomorph instances.
     enum_mono: &'a mut HashMap<String, u32>,
+    enum_instances: &'a mut HashMap<u32, GenericNominalInstance>,
     resource_templates: &'a HashMap<String, ResourceTemplate>,
     resources: &'a mut Vec<hir::ResourceDef>,
     resource_mono: &'a mut HashMap<String, u32>,
+    resource_instances: &'a mut HashMap<u32, GenericNominalInstance>,
     tuples: &'a mut Vec<hir::TupleDef>,
     fn_types: &'a mut Vec<hir::FnTy>,
     tagged_types: &'a mut Vec<hir::TaggedType>,
+}
+
+/// Whether `ty` is itself a generic nominal application whose ordered arguments still contain an
+/// enclosing template parameter. L7 admits that application at the top level of a signature, but
+/// deliberately rejects putting it under another nominal or builtin container until recursive
+/// application substitution is part of the public closure.
+fn abstract_nominal_application(ty: Ty, cx: &TyCx<'_>) -> bool {
+    fn contains_param(
+        ty: Ty,
+        cx: &TyCx<'_>,
+        active_nominals: &mut HashSet<(u8, u32)>,
+        active_tagged: &mut HashSet<u32>,
+    ) -> bool {
+        let scalar_contains_param = |scalar: Scalar,
+                                     active_nominals: &mut HashSet<(u8, u32)>,
+                                     active_tagged: &mut HashSet<u32>| {
+            contains_param(
+                scalar_to_ty(scalar),
+                cx,
+                active_nominals,
+                active_tagged,
+            )
+        };
+        match ty {
+            Ty::Param(_) => true,
+            Ty::Struct(id) | Ty::Enum(id) | Ty::Resource(id) | Ty::ResourceRef(id) => {
+                let (kind, instance) = match ty {
+                    Ty::Struct(_) => (0, cx.struct_instances.get(&id)),
+                    Ty::Enum(_) => (1, cx.enum_instances.get(&id)),
+                    Ty::Resource(_) => (2, cx.resource_instances.get(&id)),
+                    Ty::ResourceRef(_) => (3, cx.resource_instances.get(&id)),
+                    _ => return false,
+                };
+                let Some(instance) = instance else { return false };
+                if !active_nominals.insert((kind, id)) {
+                    return false;
+                }
+                let found = instance.args.iter().any(|&argument| {
+                    contains_param(argument, cx, active_nominals, active_tagged)
+                });
+                active_nominals.remove(&(kind, id));
+                found
+            }
+            Ty::Option(scalar)
+            | Ty::Box(scalar)
+            | Ty::Slice(scalar)
+            | Ty::DynArray(scalar)
+            | Ty::Task(scalar)
+            | Ty::ArrayBuilder(scalar)
+            | Ty::Array(scalar, _)
+            | Ty::Vec(scalar, _)
+            | Ty::Mask(scalar, _)
+            | Ty::VecArrayBuilder(scalar, _)
+            | Ty::MaskArrayBuilder(scalar, _)
+            | Ty::FixedArrayBuilder(scalar, _)
+            | Ty::DynVecArray(scalar, _)
+            | Ty::DynMaskArray(scalar, _)
+            | Ty::DynFixedArray(scalar, _) => {
+                scalar_contains_param(scalar, active_nominals, active_tagged)
+            }
+            Ty::Result(ok, err) => {
+                scalar_contains_param(ok, active_nominals, active_tagged)
+                    || scalar_contains_param(err, active_nominals, active_tagged)
+            }
+            Ty::Tagged(id) if active_tagged.insert(id) => {
+                let found = match cx.tagged_types.get(id as usize) {
+                    Some(hir::TaggedType::Option(payload)) => {
+                        scalar_contains_param(*payload, active_nominals, active_tagged)
+                    }
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        scalar_contains_param(*ok, active_nominals, active_tagged)
+                            || scalar_contains_param(*err, active_nominals, active_tagged)
+                    }
+                    None => false,
+                };
+                active_tagged.remove(&id);
+                found
+            }
+            _ => false,
+        }
+    }
+
+    let nominal = matches!(
+        ty,
+        Ty::Struct(_) | Ty::Enum(_) | Ty::Resource(_) | Ty::ResourceRef(_)
+    );
+    nominal
+        && contains_param(
+            ty,
+            cx,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        )
+}
+
+fn reject_abstract_nominal_container(
+    ty: Ty,
+    container: &str,
+    cx: &TyCx<'_>,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> bool {
+    if !abstract_nominal_application(ty, cx) {
+        return false;
+    }
+    diags.error(
+        format!(
+            "an abstract generic nominal application cannot be nested inside `{container}` yet"
+        ),
+        span,
+    );
+    true
 }
 
 fn resolve_type(
@@ -39221,6 +40222,15 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
+            if reject_abstract_nominal_container(
+                inner,
+                "array_builder",
+                cx,
+                span,
+                diags,
+            ) {
+                return Ty::Error;
+            }
             let normalized = match inner {
                 Ty::Error => return Ty::Error,
                 Ty::Option(payload) => Ty::Tagged(intern_tagged_type(
@@ -39244,6 +40254,7 @@ fn resolve_type(
                 return Ty::Error;
             };
             match elem {
+                ArrayBuilderElem::Scalar(Scalar::Param(_)) => Ty::array_builder(elem),
                 ArrayBuilderElem::Scalar(
                     Scalar::Int(_)
                     | Scalar::Float(_)
@@ -39435,6 +40446,9 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
+            if reject_abstract_nominal_container(inner, "Option", cx, span, diags) {
+                return Ty::Error;
+            }
             match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
@@ -39448,6 +40462,9 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
+            if reject_abstract_nominal_container(inner, "slice", cx, span, diags) {
+                return Ty::Error;
+            }
             match collection_scalar_arg(inner, "slice element", cx.tagged_types, span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
@@ -39497,6 +40514,9 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
+            if reject_abstract_nominal_container(inner, "array", cx, span, diags) {
+                return Ty::Error;
+            }
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
@@ -39569,6 +40589,11 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
+            if reject_abstract_nominal_container(ok, "Result", cx, span, diags)
+                || reject_abstract_nominal_container(err, "Result", cx, span, diags)
+            {
+                return Ty::Error;
+            }
             match (
                 scalar_arg(ok, "Result ok payload", true, cx.tagged_types, span, diags),
                 scalar_arg(
@@ -39726,6 +40751,13 @@ fn instantiate_resource(
         representation_version: tmpl.representation_version,
         drop_abi_fingerprint: tmpl.drop_abi_fingerprint,
     });
+    cx.resource_instances.insert(
+        id,
+        GenericNominalInstance {
+            canonical: name.to_string(),
+            args: args.to_vec(),
+        },
+    );
     cx.resource_mono.insert(mangled, id);
     id
 }
@@ -39789,7 +40821,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Resource(_) | Ty::ResourceRef(_) | Ty::Error => {}
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Resource(_) | Ty::ResourceRef(_) | Ty::Param(_) | Ty::Error => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
@@ -40231,6 +41263,13 @@ fn instantiate_struct(
         align: tmpl.align,
         c_repr: tmpl.c_repr,
     });
+    cx.struct_instances.insert(
+        id,
+        GenericNominalInstance {
+            canonical: name.to_string(),
+            args: args.to_vec(),
+        },
+    );
     let base_spelling = source_path_for_canonical(name, cx.type_table)
         .unwrap_or_else(|| "<struct>".to_string());
     let args_spelling = args
@@ -40260,8 +41299,8 @@ fn instantiate_struct(
 }
 
 /// Resolve + validate the type arguments of a generic struct / sum-type use (`Pair<i32>` /
-/// `Opt<i32>`): arity, no error args, and not a `Param` arg (a generic def parameterized by a
-/// generic *function's* type parameter needs a deferred type — a later slice). `None` on error.
+/// `Opt<i32>`): arity and no error args. L7 also interns an abstract instance when an argument
+/// carries the enclosing generic function's `Param`; that instance is sema-only template state.
 #[allow(clippy::too_many_arguments)]
 fn resolve_generic_args(name: &str, kind: &str, args: &[ast::Type], n_params: usize, cx: &mut TyCx, type_params: &[String], span: Span, diags: &mut Diagnostics) -> Option<Vec<Ty>> {
     if args.is_empty() {
@@ -40278,10 +41317,12 @@ fn resolve_generic_args(name: &str, kind: &str, args: &[ast::Type], n_params: us
     }
     if arg_tys
         .iter()
-        .any(|t| ty_mentions_param(*t, cx.tagged_types))
+        .any(|&ty| abstract_nominal_application(ty, cx))
     {
         diags.error(
-            format!("instantiating a generic {kind} with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
+            format!(
+                "an abstract generic nominal application cannot be nested inside generic {kind} '{name}' yet"
+            ),
             span,
         );
         return None;
@@ -40337,7 +41378,7 @@ fn instantiate_enum(
             // Struct ownership can depend on an enum definition that is still a reserved empty
             // slot while an early monomorph is cached. Validate those graph-dependent shapes once
             // all type and function-driven monomorphization is complete.
-            if !matches!(p, Scalar::Struct(_) | Scalar::DynStructArray(_))
+            if !matches!(p, Scalar::Param(_) | Scalar::Struct(_) | Scalar::DynStructArray(_))
                 && !enum_payload_ok(p, cx.structs, cx.enums, cx.tagged_types)
             {
                 diags.error(
@@ -40354,6 +41395,13 @@ fn instantiate_enum(
         source_name,
         variants,
     });
+    cx.enum_instances.insert(
+        id,
+        GenericNominalInstance {
+            canonical: name.to_string(),
+            args: args.to_vec(),
+        },
+    );
     let base_spelling = source_path_for_canonical(name, cx.type_table)
         .unwrap_or_else(|| "<enum>".to_string());
     let args_spelling = args
@@ -44894,9 +45942,7 @@ fn exit_branch(flag: bool) -> i64 {
         let mut tagged_params = tagged.clone();
         tagged_params[DEPTH - 1] =
             hir::TaggedType::Option(Scalar::Param(0));
-        let mut nested = [false];
-        mark_nested_params(Ty::Tagged(0), &mut nested, &tagged_params);
-        assert!(nested[0]);
+        assert!(ty_mentions_param(Ty::Tagged(0), &tagged_params));
         assert!(ty_mentions_param(Ty::Tagged(0), &tagged_params));
         let mut substituted_tagged = tagged_params;
         let substituted = subst_scalar(
