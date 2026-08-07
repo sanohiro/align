@@ -1,11 +1,78 @@
 module pkg.db
 
 import std.process
+import pkg.db.internal
+import pkg.db.internal.resource
+import pkg.db.internal.descriptor
 
 // Static statement descriptors are compiler-produced Copy values. These source declarations own
 // their public type surface; a constructor body is unreachable after descriptor lowering.
 pub query<P, R> {}
 pub command<P> {}
+
+// One physical database connection. The internal Drop hook owns the closed SQLite/PostgreSQL
+// dispatch; public code never receives its native pointer.
+pub resource conn = pkg.db.internal.resource.drop_conn
+
+// D7 constructs transactions. Q2 publishes the settled type so db.exec has its final closed shape,
+// but no Q2 operation can construct this arm.
+pub resource tx = pkg.db.internal.resource.drop_tx
+
+pub exec {
+  Conn(resource_ref<conn>)
+  Tx(resource_ref<tx>)
+}
+
+pub Driver {
+  SQLite
+  PostgreSQL
+}
+
+pub exec_result {
+  rows_affected: Option<i64>,
+}
+
+pub NativeError {
+  driver: Driver,
+  code: Option<string>,
+  extended_code: Option<i64>,
+  sqlstate: Option<string>,
+  message: string,
+  detail: Option<string>,
+  constraint: Option<string>,
+  table: Option<string>,
+  column: Option<string>,
+}
+
+pub CardinalityError {
+  expected_min: i64,
+  expected_max: i64,
+  observed_at_least: i64,
+}
+
+pub ContractError {
+  query_id: Option<string>,
+  item: string,
+  message: string,
+}
+
+pub Error {
+  Connection(NativeError)
+  Timeout(NativeError)
+  Cancelled(NativeError)
+  NotFound
+  Cardinality(CardinalityError)
+  Constraint(NativeError)
+  Serialization(NativeError)
+  Deadlock(NativeError)
+  SchemaMismatch(ContractError)
+  DriverMismatch(ContractError)
+  Decode(ContractError)
+  Encode(ContractError)
+  InvalidQuery(ContractError)
+  Unsupported(ContractError)
+  Native(NativeError)
+}
 
 pub CheckPolicy {
   DeclaredOnly
@@ -21,6 +88,10 @@ pub CommandOption {
   Check(CheckPolicy)
 }
 
+pub ExecuteOption {
+  TimeoutNs(i64)
+}
+
 pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()
 
 pub fn query<P, R>(sql: str, options: slice<QueryOption>) -> query<P, R> = process.abort()
@@ -28,3 +99,185 @@ pub fn query<P, R>(sql: str, options: slice<QueryOption>) -> query<P, R> = proce
 pub fn command_file<P>(options: slice<CommandOption>) -> command<P> = process.abort()
 
 pub fn command<P>(sql: str, options: slice<CommandOption>) -> command<P> = process.abort()
+
+pub fn exec_conn(borrow c: conn) -> exec = exec.Conn(resource.borrow(c))
+
+pub fn exec_tx(borrow t: tx) -> exec = exec.Tx(resource.borrow(t))
+
+// The common layer owns the closed resource prefix.  Reading only its driver tag keeps the
+// dispatch decision in the package boundary; the native engines still own every connection-state
+// and cleanup rule.  A transaction carries the same prefix when D7 constructs it, so the selected
+// engine can return the settled transaction-unsupported error rather than being mistaken for an
+// unknown driver.
+pub fn driver_tag(target: exec) -> u8 {
+  unsafe {
+    state := match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(reference) => resource.raw(reference)
+    }
+    if state.is_null() { return 0 }
+    return raw.load(state, 4)
+  }
+}
+
+pub fn execute_options_valid(
+  options: slice<ExecuteOption>,
+  query_id: str,
+) -> Result<(), Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(Error.Unsupported(ContractError {
+            query_id: Some(query_id.clone()),
+            item: "db.execute.timeout_ns".clone(),
+            message: "database execution timeout must be positive".clone(),
+          }))
+        }
+        return Err(Error.Unsupported(ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.execute.timeout_ns".clone(),
+          message: "database execution deadlines are not available in this milestone".clone(),
+        }))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+// Used only when an application asks the common surface without importing the corresponding
+// first-party native package.  The generic result keeps the diagnostic an ordinary package value;
+// it is never a compiler panic or an implicit driver selection.
+pub fn unsupported<T>(query_id: str) -> Result<T, Error> {
+  return Err(Error.Unsupported(ContractError {
+    query_id: Some(query_id.clone()),
+    item: "db.execute.driver".clone(),
+    message: "no native database driver is available in this compilation unit".clone(),
+  }))
+}
+
+pub fn execute<P>(
+  target: exec,
+  statement: command<P>,
+  params: P,
+  options: slice<ExecuteOption>,
+) -> Result<exec_result, Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base_valid := version == 1 && kind == 1 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && validate_row.is_null() && decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    execute_options_valid(options, query_id)?
+    driver := driver_tag(target)
+    if driver == 1 {
+      return pkg.db.internal.descriptor.execute_sqlite(statement, target, params, query_id)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.execute_postgres(statement, target, params, query_id)
+    }
+    return unsupported(query_id)
+  }
+}
+
+pub fn one<P, R>(
+  target: exec,
+  statement: query<P, R>,
+  params: P,
+  out: region,
+  options: slice<ExecuteOption>,
+) -> Result<R, Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base_valid := version == 1 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    execute_options_valid(options, query_id)?
+    driver := driver_tag(target)
+    if driver == 1 {
+      return pkg.db.internal.descriptor.one_sqlite(statement, target, params, out, query_id)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.one_postgres(statement, target, params, out, query_id)
+    }
+    return unsupported(query_id)
+  }
+}

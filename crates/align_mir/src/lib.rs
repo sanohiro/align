@@ -423,6 +423,36 @@ pub struct FnSignatureFacts {
     pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
+/// One pointer relocation in an immutable compiler-owned data record.
+///
+/// The record carries its complete non-relocated byte image so MIR remains backend-agnostic and
+/// fingerprintable. A backend replaces each eight-byte zero window named here with the address of
+/// either an immutable byte blob or a program function. Offsets are target-native pointer slots;
+/// producers must validate the target contract before publishing MIR.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticDataRelocation {
+    pub offset: u32,
+    pub target: StaticDataTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticDataTarget {
+    Bytes { bytes: Vec<u8>, nul_terminated: bool },
+    Function(ProgramCall),
+}
+
+/// An immutable, target-native record whose pointer is exposed as `raw`.
+///
+/// Unlike persisted canonical codecs, this representation may contain object relocations. The
+/// byte image fixes every scalar, padding byte, and absent pointer; relocations name only the
+/// pointer-sized windows the object writer fills.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticData {
+    pub bytes: Vec<u8>,
+    pub align: u32,
+    pub relocations: Vec<StaticDataRelocation>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Rvalue {
     Use(Operand),
@@ -462,6 +492,16 @@ pub enum Rvalue {
     /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
     /// result type — no signature table needed).
     CallIndirect {
+        callee: Operand,
+        args: Vec<Operand>,
+        param_tys: Vec<Ty>,
+        ret_ty: Ty,
+        signature: Box<FnSignatureFacts>,
+    },
+    /// An unsafe, typed call through a bare native pointer. Unlike [`Self::CallIndirect`], the
+    /// callee is not an Align closure and therefore receives no environment argument. The complete
+    /// checked signature remains in MIR so the backend only lowers an already-validated ABI.
+    RawCall {
         callee: Operand,
         args: Vec<Operand>,
         param_tys: Vec<Ty>,
@@ -529,8 +569,17 @@ pub enum Rvalue {
     /// `raw.alloc(size)` (unsafe): flat-heap-allocate `size` bytes, yield a `raw` byte pointer.
     /// Manually managed (freed by [`Stmt::RawFree`]); no arena handle, no auto-drop.
     RawAlloc(Operand),
+    /// `raw.null()` (unsafe): the null raw pointer constant for a native ABI argument or sentinel.
+    RawNull,
     /// `raw.load(p, offset)` (unsafe): read the primitive `scalar` at `ptr + offset` bytes.
     RawLoad { ptr: Operand, offset: Operand, scalar: align_sema::Scalar },
+    /// Load one native pointer-sized value from raw memory. This stays distinct from `RawLoad`:
+    /// `raw` is not an aggregate payload [`align_sema::Scalar`], and a descriptor relocation is a
+    /// pointer fact rather than a numeric or `layout(C)` value.
+    RawPointerLoad { ptr: Operand, offset: Operand },
+    /// Load one fixed `{raw data, i64 len}` slot from compiler-owned static descriptor storage and
+    /// expose it as an allocation-free `str` view.
+    StaticDescriptorView { ptr: Operand, offset: u32 },
     /// `raw.offset(p, n)` (unsafe): a new `raw` pointer `ptr + offset` bytes (pointer arithmetic).
     RawOffset { ptr: Operand, offset: Operand },
     /// Safe null test used before transferring a native handle into a resource.
@@ -758,6 +807,10 @@ pub enum Rvalue {
     /// any other scalar as `[N x elem]`. The array-literal analogue of [`Rvalue::StrLit`]: it borrows
     /// nothing, is `Static`, and is never moved or dropped.
     ConstArray { elems: Vec<ConstElem>, elem: Ty },
+    /// A pointer to an immutable relocation-bearing record. This is a general object-data
+    /// primitive: semantics and validation of a particular record belong to its MIR producer;
+    /// codegen only lowers the checked byte image and relocations.
+    StaticData(Box<StaticData>),
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
@@ -1887,6 +1940,12 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                         types.extend(param_tys.iter().copied());
                         types.push(*ret_ty);
                     }
+                    Rvalue::RawCall {
+                        param_tys, ret_ty, ..
+                    } => {
+                        types.extend(param_tys.iter().copied());
+                        types.push(*ret_ty);
+                    }
                     Rvalue::CallIndirectWithCleanup(call) => {
                         types.extend(call.param_tys.iter().copied());
                         types.push(call.ret_ty);
@@ -2313,6 +2372,12 @@ fn remap_function_embedded_types(
                     }
                     Rvalue::Closure { capture_tys, .. } => remap_vec(capture_tys),
                     Rvalue::CallIndirect {
+                        param_tys, ret_ty, ..
+                    } => {
+                        remap_vec(param_tys);
+                        remap_ty(ret_ty, remap);
+                    }
+                    Rvalue::RawCall {
                         param_tys, ret_ty, ..
                     } => {
                         remap_vec(param_tys);
@@ -3518,6 +3583,20 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
     }
 }
 
+/// Give a layout-identical view conversion its declared MIR type while retaining any hidden owner
+/// carried by the source operand. A raw operand reuse would leave the source type in `value_tys`,
+/// so a later direct-call ABI check would reject an otherwise valid `string` -> `str` or
+/// `str` -> `slice<u8>` conversion.
+fn lower_view_retype(b: &mut Builder, operand: Operand, ty: Ty) -> Operand {
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    let value = b.fresh_value(ty);
+    inherit_borrow_owners(b, value, [&operand]);
+    b.push(Stmt::Let(value, Rvalue::Use(operand)));
+    Operand::Value(value)
+}
+
 /// End every hidden owner's liveness after a scalar-only consumer. Flags make this safe for the
 /// non-selected arms of value-carrying control flow and deduplication avoids repeated drops when a
 /// view has flowed through more than one transparent operation.
@@ -4630,6 +4709,8 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
         hir::ExprKind::IntArith { .. }
         | hir::ExprKind::MathOp { .. }
         | hir::ExprKind::RawLoad { .. }
+        | hir::ExprKind::RawPointerLoad { .. }
+        | hir::ExprKind::StaticDescriptorView { .. }
         | hir::ExprKind::RawStore { .. }
         | hir::ExprKind::RawOffset { .. }
         | hir::ExprKind::Cast(_)
@@ -4665,6 +4746,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
         hir::ExprKind::Call { .. } => lower_direct_call(b, e),
         hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
+        hir::ExprKind::RawCall { .. } => lower_raw_call(b, e),
         hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
         hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
@@ -5948,6 +6030,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
             // inner block; the enforcement + impurity were handled in sema.
             hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
+            hir::ExprKind::RawCall { .. } => lower_raw_call(b, e),
+            hir::ExprKind::RawNull => {
+                let v = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(v, Rvalue::RawNull));
+                Operand::Value(v)
+            }
             // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
             hir::ExprKind::RawAlloc(size) => {
                 lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
@@ -5980,6 +6068,35 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         ptr: p,
                         offset: off,
                         scalar: *scalar,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::RawPointerLoad { ptr, offset } => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                lower_required_binding!(
+                    b,
+                    off = lower_expr(b, offset),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(Ty::Raw);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::RawPointerLoad {
+                        ptr: p,
+                        offset: off,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::StaticDescriptorView { ptr, offset } => {
+                lower_required_binding!(b, p = lower_expr(b, ptr), Operand::Const(Const::Unit));
+                let v = b.fresh_value(Ty::Str);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::StaticDescriptorView {
+                        ptr: p,
+                        offset: *offset,
                     },
                 ));
                 Operand::Value(v)
@@ -6363,13 +6480,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
-            // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
-            // `null_moved_source`), so its owner still `Drop`-frees it.
-            hir::ExprKind::StrBorrow(inner) => lower_borrowed_owned(b, inner),
-            // `str.bytes()` is the same zero-cost descriptor retype in the other direction: `str` and
-            // `slice<u8>` both lower as `{ptr,len}`. The HIR node retains borrow provenance; MIR needs
-            // no instruction or runtime call.
-            hir::ExprKind::StrBytes { inner } => lower_expr(b, inner),
+            // the `{ptr,len}` layout. MIR still records the view's distinct source type through
+            // `Use`, while retaining the hidden owner and leaving the `string` unmoved.
+            hir::ExprKind::StrBorrow(inner) => {
+                let operand = lower_borrowed_owned(b, inner);
+                lower_view_retype(b, operand, e.ty)
+            }
+            // `str.bytes()` is the same zero-cost descriptor retype in the other direction. Keep
+            // its `slice<u8>` source type explicit for typed direct/indirect-call validation.
+            hir::ExprKind::StrBytes { inner } => {
+                let operand = lower_expr(b, inner);
+                lower_view_retype(b, operand, e.ty)
+            }
             hir::ExprKind::BuilderNew { capacity } => {
                 let cap = match capacity {
                     Some(c) => lower_required!(b, lower_expr(b, c), Operand::Const(Const::Unit)),
@@ -6877,10 +6999,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         owned_view = lower_borrowed_owned(b, inner),
                         Operand::Const(Const::Unit)
                     );
-                    let v = b.fresh_value(e.ty);
-                    inherit_borrow_owners(b, v, [&owned_view]);
-                    b.push(Stmt::Let(v, Rvalue::Use(owned_view)));
-                    return Operand::Value(v);
+                    return lower_view_retype(b, owned_view, e.ty);
                 }
                 let (slot, n) = array_source_slot(b, inner);
                 if !lowering_continues(b) {
@@ -7357,6 +7476,91 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
     }
     result
+}
+
+/// Lower the closed compiler/package bare-pointer call. This mirrors the ordinary function-value
+/// ownership path but emits no closure environment argument and trusts only the complete checked
+/// signature carried by the HIR node.
+#[inline(never)]
+fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::RawCall {
+        callee,
+        args,
+        param_tys,
+        param_modes,
+        return_borrow,
+        return_region,
+        return_cleanup,
+    } = &e.kind
+    else {
+        unreachable!("lower_raw_call on a non-raw-call expression");
+    };
+    let callee = lower_expr(b, callee);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    let mut operands = Vec::with_capacity(args.len());
+    let mut owners = Vec::with_capacity(args.len());
+    for (index, argument) in args.iter().enumerate() {
+        let borrowed = matches!(
+            param_modes.get(index),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        );
+        let (operand, owner) = if borrowed {
+            (
+                lower_borrowed_place(b, argument, param_modes[index]),
+                Vec::new(),
+            )
+        } else {
+            lower_consumed_call_arg(b, argument)
+        };
+        operands.push(operand);
+        owners.push(owner);
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+    }
+    for (index, argument) in args.iter().enumerate() {
+        if !matches!(
+            param_modes.get(index),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        ) {
+            null_consumed_struct_sources(b, argument);
+        }
+    }
+    for owner in owners.into_iter().flatten() {
+        b.set_drop_flag(owner, false);
+    }
+    let value = b.fresh_value(e.ty);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::RawCall {
+            callee: callee.clone(),
+            args: operands.clone(),
+            param_tys: param_tys.clone(),
+            ret_ty: e.ty,
+            signature: Box::new(FnSignatureFacts {
+                param_modes: param_modes.clone(),
+                return_borrow: return_borrow.clone(),
+                return_region: return_region.clone(),
+                return_cleanup: *return_cleanup,
+            }),
+        },
+    ));
+    if e.ty == Ty::Unit {
+        drop_borrow_owners(b, &callee);
+        for operand in &operands {
+            drop_borrow_owners(b, operand);
+        }
+        Operand::Const(Const::Unit)
+    } else {
+        inherit_borrow_owners(
+            b,
+            value,
+            std::iter::once(&callee).chain(operands.iter()),
+        );
+        Operand::Value(value)
+    }
 }
 
 /// The indirect-call counterpart of [`emit_named_call`]. Function-value calls and the specialized
@@ -14842,6 +15046,276 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    fn check_modules<'a>(sources: &'a [(&'a str, bool, &'a str)]) -> (hir::Program, Diagnostics) {
+        let mut diagnostics = Diagnostics::new();
+        let files = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, source))| {
+                let tokens = tokenize(index as u32, source, &mut diagnostics);
+                parse_file(tokens, &mut diagnostics)
+            })
+            .collect::<Vec<_>>();
+        let modules = sources
+            .iter()
+            .zip(&files)
+            .map(|((path, is_entry, _), file)| align_sema::Module {
+                path: (*path).to_owned(),
+                file,
+                is_entry: *is_entry,
+                interface_only: false,
+            })
+            .collect::<Vec<_>>();
+        let program = align_sema::check_program(&modules, &mut diagnostics);
+        (program, diagnostics)
+    }
+
+    #[test]
+    fn static_descriptor_bridge_retains_concrete_bare_call_abis() {
+        let descriptor = "module pkg.db.internal.descriptor\n";
+        let db = r#"module pkg.db
+import std.process
+import pkg.db.internal.descriptor
+
+pub command<P> {}
+pub query<P, R> {}
+
+pub fn make_command<P>() -> command<P> = process.abort()
+pub fn make_query<P, R>() -> query<P, R> = process.abort()
+
+pub fn bind_command<P>(statement: command<P>, context: raw, params: P) -> i32 {
+  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params) }
+}
+
+pub fn decode_query<P, R>(statement: query<P, R>, context: raw) -> R {
+  unsafe { return pkg.db.internal.descriptor.decode(statement, context) }
+}
+
+pub fn command_id<P>(statement: command<P>) -> str {
+  unsafe { return pkg.db.internal.descriptor.descriptor_id(statement) }
+}
+"#;
+        let main = r#"module main
+import pkg.db
+
+Params { value: i64 }
+Row { value: i64 }
+
+fn main() -> i32 {
+  statement: pkg.db.command<Params> := pkg.db.make_command()
+  query: pkg.db.query<Params, Row> := pkg.db.make_query()
+  params := Params { value: 42 }
+  unsafe {
+    context := raw.alloc(1)
+    status := pkg.db.bind_command(statement, context, params)
+    row := pkg.db.decode_query(query, context)
+    id := pkg.db.command_id(statement)
+    raw.free(context)
+    return status + (row.value as i32) + (id.len() as i32)
+  }
+}
+"#;
+        let (hir, diagnostics) = check_modules(&[
+            ("pkg.db.internal.descriptor", false, descriptor),
+            ("pkg.db", false, db),
+            ("main", true, main),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "descriptor bridge fixture failed: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hir_program_is_valid(&hir),
+            "trusted descriptor HIR must pass the fail-closed validator"
+        );
+        let program = lower_program(&hir);
+        let bind = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str().starts_with("pkg.db$bind_command$"))
+            .expect("concrete command binder");
+        let bind_call = bind
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::RawCall { callee, args, param_tys, ret_ty, signature }) => {
+                    Some((callee, args, param_tys, ret_ty, signature))
+                }
+                _ => None,
+            })
+            .expect("command binder raw call");
+        assert_eq!(bind_call.2.len(), 2);
+        assert_eq!(bind_call.2[0], Ty::Raw);
+        assert!(matches!(bind_call.2[1], Ty::Struct(_)));
+        assert_eq!(
+            bind_call.4.param_modes,
+            [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+        );
+        assert!(matches!(bind_call.1[1], Operand::BorrowedPlace(_)));
+        assert_eq!(
+            *bind_call.3,
+            Ty::Int(align_sema::IntTy {
+                bits: 32,
+                signed: true,
+            })
+        );
+        let bind_callee = match bind_call.0 {
+            Operand::Value(value) => *value,
+            _ => panic!("binder callee must be a loaded pointer"),
+        };
+        assert!(bind.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+            matches!(
+                statement,
+                Stmt::Let(value, Rvalue::RawPointerLoad { offset: Operand::Const(Const::Int(64, _)), .. })
+                    if *value == bind_callee
+            )
+        }));
+
+        let decode = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str().starts_with("pkg.db$decode_query$"))
+            .expect("concrete query decoder");
+        let (decode_result, decode_callee) = decode
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(
+                    _,
+                    Rvalue::RawCall {
+                        callee: Operand::Value(callee),
+                        ret_ty,
+                        signature,
+                        ..
+                    },
+                ) => Some((*ret_ty, *callee, signature)),
+                _ => None,
+            })
+            .map(|(ret, callee, signature)| {
+                assert_eq!(signature.param_modes, [align_ast::ParamMode::ByValue]);
+                (ret, callee)
+            })
+            .expect("query decoder raw call");
+        assert!(matches!(decode_result, Ty::Struct(_)));
+        assert!(decode.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+            matches!(
+                statement,
+                Stmt::Let(value, Rvalue::RawPointerLoad { offset: Operand::Const(Const::Int(88, _)), .. })
+                    if *value == decode_callee
+            )
+        }));
+        let command_id = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str().starts_with("pkg.db$command_id$"))
+            .expect("concrete descriptor-id reader");
+        assert!(command_id
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::StaticDescriptorView { offset: 16, .. })
+                )
+            }));
+    }
+
+    #[test]
+    fn static_descriptor_bridge_is_unavailable_to_application_source() {
+        let descriptor = "module pkg.db.internal.descriptor\n";
+        let main = r#"module main
+import pkg.db.internal.descriptor
+fn main() -> i32 {
+  unsafe { pkg.db.internal.descriptor.data(0) }
+  return 0
+}
+"#;
+        let (_, diagnostics) = check_modules(&[
+            ("pkg.db.internal.descriptor", false, descriptor),
+            ("main", true, main),
+        ]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("compiler-private to `pkg.db`")
+        }));
+    }
+
+    #[test]
+    fn static_descriptor_bridge_accepts_nested_pkg_db_descendant_monomorphs() {
+        let descriptor = "module pkg.db.internal.descriptor\n";
+        let db = r#"module pkg.db
+import std.process
+
+pub command<P> {}
+pub fn make_command<P>() -> command<P> = process.abort()
+"#;
+        let internal = r#"module pkg.db.internal.sqlite
+import pkg.db
+import pkg.db.internal.descriptor
+
+pub fn bind<P>(params: P, statement: pkg.db.command<P>, context: raw) -> i32 {
+  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params) }
+}
+"#;
+        let sqlite = r#"module pkg.db.sqlite
+import pkg.db
+import pkg.db.internal.sqlite
+
+pub fn bind<P>(statement: pkg.db.command<P>, context: raw, params: P) -> i32 =
+  pkg.db.internal.sqlite.bind(params, statement, context)
+"#;
+        let main = r#"module main
+import pkg.db
+import pkg.db.sqlite
+
+Params { value: i64 }
+
+fn main() -> i32 {
+  statement: pkg.db.command<Params> := pkg.db.make_command()
+  unsafe {
+    context := raw.alloc(1)
+    status := pkg.db.sqlite.bind(statement, context, Params { value: 42 })
+    raw.free(context)
+    return status
+  }
+}
+"#;
+        let (hir, diagnostics) = check_modules(&[
+            ("pkg.db.internal.descriptor", false, descriptor),
+            ("pkg.db", false, db),
+            ("pkg.db.internal.sqlite", false, internal),
+            ("pkg.db.sqlite", false, sqlite),
+            ("main", true, main),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "nested descriptor bridge fixture failed: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hir_program_is_valid(&hir),
+            "every pkg.db descendant monomorph must retain descriptor privilege"
+        );
+        let program = lower_program(&hir);
+        assert!(program.fns.iter().any(|function| {
+            function
+                .name
+                .as_str()
+                .starts_with("pkg.db.internal.sqlite$bind$")
+        }));
     }
 
     fn empty_builder() -> Builder {

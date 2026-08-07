@@ -26,8 +26,22 @@ fn unsafe_alloc_free_runs() {
 
 #[test]
 fn raw_op_outside_unsafe_is_rejected() {
-    // `raw.alloc` / `raw.free` are only valid inside an `unsafe {}` block.
+    // `raw.null` / `raw.alloc` / `raw.free` are only valid inside an `unsafe {}` block.
+    assert!(!ok("fn main() -> i32 {\n  p := raw.null()\n  return 0\n}\n"));
     assert!(!ok("fn main() -> i32 {\n  p := raw.alloc(64)\n  raw.free(p)\n  return 0\n}\n"));
+}
+
+#[test]
+fn raw_null_is_an_explicit_native_pointer_sentinel() {
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run(
+        "unsafe-raw-null",
+        "fn main() -> i32 {\n  unsafe {\n    p := raw.null()\n    if p.is_null() { return 42 }\n    return 1\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(42));
+    assert!(!ok("fn main() -> i32 {\n  unsafe {\n    p := raw.null(1)\n    return 0\n  }\n}\n"));
 }
 
 #[test]
@@ -94,6 +108,20 @@ fn raw_store_load_roundtrips_a_float() {
         "fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(8)\n    raw.store(p, 0, 3.5)\n    x: f64 := raw.load(p, 0)\n    raw.free(p)\n    return (x + 0.5) as i32\n  }\n}\n",
     );
     assert_eq!(out.status.code(), Some(4));
+}
+
+#[test]
+fn raw_store_load_roundtrips_a_pointer() {
+    if !backend_available() {
+        return;
+    }
+    // A package-owned native state block can retain a C handle without integer casts. The loaded
+    // pointer still addresses the original allocation; writing through it proves the round trip.
+    let out = build_and_run(
+        "unsafe-load-store-raw",
+        "fn main() -> i32 {\n  unsafe {\n    state := raw.alloc(8)\n    target := raw.alloc(1)\n    raw.store(state, 0, target)\n    loaded: raw := raw.load(state, 0)\n    value: i8 := 42\n    raw.store(loaded, 0, value)\n    result: i8 := raw.load(target, 0)\n    raw.free(target)\n    raw.free(state)\n    return result as i32\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(42));
 }
 
 #[test]

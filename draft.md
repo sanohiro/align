@@ -526,10 +526,9 @@ this equals Unicode scalar order). It is deterministic and locale-free; dictiona
 collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is anything
 `Ord`: a number, a `char`, or a string. Aggregates have no order, exactly as they have no `==`.
 
-> **Current implementation boundary:** the operator and builtin-bound paths are complete for
-> borrowed `str`, but direct comparison of owned `string` values is not implemented yet. Pass
-> each owned string to a `str`-typed helper (the ordinary `string` → `str` borrow coercion) when a
-> comparison is needed. This is an implementation gap, not a change to the language rule above.
+The operator and builtin-bound paths compare owned `string` values through a non-consuming,
+zero-cost `str` borrow. Mixed `string`/`str` operands use the same path; comparison neither moves
+nor allocates.
 
 ### Optional
 
@@ -684,8 +683,8 @@ trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 `RegionPlain` is the one separate closed structural bound used by region-backed construction. It is
 not part of the numeric hierarchy and grants no arithmetic or equality operation.
 
-The current compiler's concrete `Eq`/`Ord` bound satisfaction follows the implementation boundary
-above: `str` is accepted and owned `string` is rejected until its direct comparison lowering lands.
+Concrete `string` and `str` both satisfy `Eq` and `Ord`; an owned value is borrowed, not moved, by
+the comparison inside a monomorphized function.
 
 A type parameter may also appear **nested** in an `Option<T>` / `Result<T, E>`, in a parameter or
 return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T` or
@@ -1786,16 +1785,22 @@ Dangerous operations are only in an `unsafe` block. The `raw.*` surface manages 
 
 ```align
 unsafe {
+  none := raw.null()        // explicit null pointer for a native ABI argument or sentinel
   p := raw.alloc(16)        // 16 bytes → a `raw` pointer
-  raw.store(p, 0, 42)       // write a primitive scalar at a byte offset (type from the value)
+  raw.store(p, 0, 42)       // write a flat value at a byte offset (type from the value)
   x: i64 := raw.load(p, 0)  // read it back (type from the annotation — no turbofish, like decode)
   raw.free(p)               // manual free; a `raw` is Copy and never auto-dropped
 }
 ```
 
-The stored/loaded type is inferred (from the value for `store`, from the expected type for `load`) —
+`raw.null()` is the only null-pointer constructor and is explicit at the unsafe boundary; there is
+no general null value in ordinary Align types. The stored/loaded type is inferred (from the value
+for `store`, from the expected type for `load`) —
 Align has **no turbofish**, so an explicit `raw.op<T>(...)` is not the surface. (An unchecked pointer
-cast / reinterpret is a later `raw.*` op; the flat load/store above is the first cut.) A function
+cast / reinterpret is a later `raw.*` op.) The admitted flat values are primitive scalars, `raw`
+pointers, and eligible non-empty `layout(C)` structs. Storing a `raw` pointer makes package-owned
+native handle tables explicit without converting an address to an integer; loading it requires an
+expected `raw` type just as a scalar load requires its scalar type. A function
 containing `unsafe` is inferred impure, so it can never be a `par_map` callee — the danger stays
 visible and traceable.
 
@@ -1933,10 +1938,10 @@ unsafe {
 }
 ```
 
-Only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load` of a whole
-struct), because only it promises a fixed representation — this is the pointer-based FFI pattern
-(hand C a buffer, read/write structs in it). Its fields must be FFI-mappable scalars (integers,
-floats).
+Among structs, only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load`
+of a whole struct), because only it promises a fixed representation — this is the pointer-based FFI
+pattern (hand C a buffer, read/write structs in it). Primitive scalars and `raw` pointers are the
+other admitted flat values. Its fields must be FFI-mappable scalars (integers, floats).
 
 ### By-value structs (SysV AMD64 only)
 

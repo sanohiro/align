@@ -696,6 +696,16 @@ An extern may therefore be called directly or used by an immediate non-escaping 
 inside `unsafe`, but it cannot become a first-class function value until the language has an
 explicit unsafe-callable type. This keeps foreign execution lexically visible.
 
+Raw memory stores flat values, including `raw` pointers themselves. This is the honest representation
+for a package-owned native handle slot: the address remains an address, its load/store stays visibly
+`unsafe`, and no database or other FFI wrapper needs an integer cast or a compiler/runtime-owned
+handle registry. Safe public resource types still hide that representation and own exactly-once
+cleanup.
+
+Native ABIs also need an actual null pointer. `raw.null()` forms it explicitly inside `unsafe`; it
+does not introduce a second optional-value model into ordinary code. `Option<T>` remains the only
+language-level absence, while raw ABI sentinels remain visible and grep-able at the boundary.
+
 A declared non-Unit return is also a control-flow obligation. The compiler accepts a path only when
 it produces the declared value or provably does not continue; it never repairs reachable
 fallthrough with an ABI-dependent implicit value.

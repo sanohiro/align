@@ -157,6 +157,27 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+#[test]
+fn hir_body_validator_accepts_signed_minimum_only_under_direct_negation() {
+    let source = "fn signed_minimum() -> i64 = -9223372036854775808\nfn main() -> i32 = 0\n";
+    let valid = checked_source_program(source);
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&valid),
+        "the checked INT_MIN unary representation must survive the HIR gate",
+    );
+
+    let mut malformed = valid;
+    let expression = body_value_expression_mut(&mut malformed, "signed_minimum");
+    let hir::ExprKind::Unary { expr, .. } = &expression.kind else {
+        panic!("signed minimum lost its unary HIR representation")
+    };
+    *expression = (**expr).clone();
+    assert!(
+        !validate_hir::body_only_metadata_is_valid(&malformed),
+        "the one-past signed magnitude must fail closed outside direct unary negation",
+    );
+}
+
 fn checked_interface_program(
     provenance: Option<(ReturnBorrowSummary, ReturnRegionSummary)>,
     effect: FnEffect,

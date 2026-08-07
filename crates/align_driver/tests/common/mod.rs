@@ -6,11 +6,11 @@
 #![allow(dead_code, unused_imports)]
 
 pub use align_driver::{
-    backend_available, build_per_unit, build_thin_lto, cas_blob_path, check, check_per_unit,
-    emit_llvm_ir, emit_object_file, link_executable, link_objects, lower_to_mir,
-    lower_to_mir_per_unit, BackendKey, BuildTarget, CacheContext, CacheOutcome, CacheStage,
+    BackendKey, BuildTarget, CACHE_KEY_FORMAT_VERSION, CacheContext, CacheOutcome, CacheStage,
     FirstDiff, Hash128, InboundImport, InterfaceSummary, ObjectFormat, PerUnitArtifact,
-    PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, CACHE_KEY_FORMAT_VERSION,
+    PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, backend_available, build_per_unit,
+    build_thin_lto, cas_blob_path, check, check_per_unit, emit_llvm_ir, emit_object_file,
+    link_executable, link_objects, lower_to_mir, lower_to_mir_per_unit,
 };
 pub use align_span::SourceMap;
 
@@ -87,7 +87,10 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
     let a_obj = dir.join(format!("align-ffic-{pid}-{name}.o"));
     let c_src_path = dir.join(format!("align-ffic-{pid}-{name}.c"));
     let c_obj = dir.join(format!("align-ffic-{pid}-{name}-helper.o"));
-    let exe = dir.join(format!("align-ffic-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
+    let exe = dir.join(format!(
+        "align-ffic-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     struct Cleanup(Vec<PathBuf>);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -96,8 +99,21 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
             }
         }
     }
-    let _guard = Cleanup(vec![a_obj.clone(), c_src_path.clone(), c_obj.clone(), exe.clone()]);
-    emit_object_file(&mir, &a_obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    let _guard = Cleanup(vec![
+        a_obj.clone(),
+        c_src_path.clone(),
+        c_obj.clone(),
+        exe.clone(),
+    ]);
+    emit_object_file(
+        &mir,
+        &a_obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
     std::fs::write(&c_src_path, c_src).expect("write c helper");
     let cc_status = std::process::Command::new("cc")
         .args(["-c", "-O0"])
@@ -166,17 +182,38 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
 /// Object-emit + link + run for an already-lowered program — its own stack frame, so the
 /// (potentially deep) MIR lowering in the caller does not compete with these locals.
 #[inline(never)]
-fn emit_link_run(mir: &align_driver::MirProgram, name: &str, prog_args: &[&str]) -> std::process::Output {
+fn emit_link_run(
+    mir: &align_driver::MirProgram,
+    name: &str,
+    prog_args: &[&str],
+) -> std::process::Output {
     let dir = std::env::temp_dir();
     // Include the process id so two concurrent test-suite runs on one machine (e.g. parallel CI)
     // don't collide on these temp paths.
     let pid = std::process::id();
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
-    let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
-    emit_object_file(mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    let exe = dir.join(format!(
+        "align-test-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let _artifacts = TempArtifacts {
+        obj: obj.clone(),
+        exe: exe.clone(),
+    };
+    emit_object_file(
+        mir,
+        &obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
-    std::process::Command::new(&exe).args(prog_args).output().expect("run")
+    std::process::Command::new(&exe)
+        .args(prog_args)
+        .output()
+        .expect("run")
 }
 
 /// A compiled Align executable plus a guard that removes its object + exe on drop. Returned by
@@ -203,10 +240,24 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
-    let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    let exe = dir.join(format!(
+        "align-test-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    emit_object_file(
+        &mir,
+        &obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
-    BuiltExe { exe: exe.clone(), _artifacts: TempArtifacts { obj, exe } }
+    BuiltExe {
+        exe: exe.clone(),
+        _artifacts: TempArtifacts { obj, exe },
+    }
 }
 
 /// Make a raw HTTP request explicitly **one-shot**: insert `Connection: close` right after its
@@ -247,7 +298,8 @@ pub fn emit_llvm_with_exports(src: &str, exports: &[&str]) -> String {
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &exports, false).expect("emit llvm ir")
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &exports, false)
+        .expect("emit llvm ir")
 }
 
 /// [`emit_llvm_with_exports`] but after the `-O2` pipeline (what LLVM actually left) — for gates
@@ -263,7 +315,8 @@ pub fn emit_llvm_optimized(src: &str, exports: &[&str]) -> String {
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, true, &exports, false).expect("emit optimized llvm ir")
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, true, &exports, false)
+        .expect("emit optimized llvm ir")
 }
 
 /// Whether checking `src` produces any error (for negative tests).
@@ -315,7 +368,11 @@ impl Drop for TempProject {
 /// Compile + run a multi-file program. `files` are `(filename, source)` written to a fresh temp
 /// directory; `entry` is the entry filename. The entry is compiled by path so the driver resolves
 /// `import`s from disk. Asserts it type-checks; returns the program `Output`.
-pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> std::process::Output {
+pub fn build_and_run_multi(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+) -> std::process::Output {
     let proj = TempProject::new(name, files);
     let entry_path = proj.entry(entry);
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
@@ -330,10 +387,108 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     let mir = lower_to_mir(&checked.hir);
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
-    let exe = proj.dir.join(format!("align-mtest-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    let exe = proj.dir.join(format!(
+        "align-mtest-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    emit_object_file(
+        &mir,
+        &obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
+}
+
+/// Compile a multi-file Align program together with one C ABI fixture, link, and run it. The C
+/// object is placed before capability libraries so deterministic native-driver fakes satisfy the
+/// same symbols as the real shared library while the Align declarations still retain their exact
+/// `link(...)` contract.
+pub fn build_and_run_multi_with_c(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    c_src: &str,
+) -> std::process::Output {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, &entry_name, &entry_src);
+    assert!(
+        !walk.diags.has_errors(),
+        "unexpected per-unit errors:\n{}",
+        align_driver::format_diagnostics(&sm, &walk.diags)
+    );
+    let pid = std::process::id();
+    let c_path = proj.dir.join(format!("align-mtest-{pid}-{name}.c"));
+    let c_obj = proj.dir.join(format!("align-mtest-{pid}-{name}-fixture.o"));
+    let exe = proj.dir.join(format!(
+        "align-mtest-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let mut objects = Vec::with_capacity(walk.units.len() + 1);
+    let mut link_libs = Vec::new();
+    for (index, unit) in walk.units.iter().enumerate() {
+        let object = proj
+            .dir
+            .join(format!("align-mtest-{pid}-{name}-unit{index}.o"));
+        emit_object_file(
+            &unit.mir,
+            &object,
+            BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            false,
+        )
+        .unwrap_or_else(|error| panic!("codegen for unit `{}`: {error}", unit.unit));
+        for library in &unit.mir.link_libs {
+            if library != "pq" && !link_libs.contains(library) {
+                link_libs.push(library.clone());
+            }
+        }
+        objects.push(object);
+    }
+    std::fs::write(&c_path, c_src).expect("write C fixture");
+    let cc = std::process::Command::new("cc")
+        .args(["-std=c11", "-c", "-O0"])
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&c_obj)
+        .output()
+        .expect("launch cc");
+    assert!(
+        cc.status.success(),
+        "compiling C fixture failed: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+    objects.push(c_obj);
+    let object_refs: Vec<&std::path::Path> = objects.iter().map(PathBuf::as_path).collect();
+    link_objects(&object_refs, &exe, &link_libs, Profile::Release)
+        .expect("link Align and C fixture");
+    std::process::Command::new(&exe).output().expect("run")
+}
+
+/// Check and lower a multi-file project through the whole-program path, returning its textual MIR.
+/// This keeps package-level reachability assertions on the same path used by [`build_and_run_multi`].
+pub fn whole_mir_multi(name: &str, files: &[(&str, &str)], entry: &str) -> String {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_name, &entry_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
 }
 
 /// A native executable built from a MULTI-file project, with the project directory kept alive for
@@ -362,8 +517,19 @@ pub fn build_exe_multi(name: &str, files: &[(&str, &str)], entry: &str) -> Built
     let mir = lower_to_mir(&checked.hir);
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mexe-{pid}-{name}.o"));
-    let exe = proj.dir.join(format!("align-mexe-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    let exe = proj.dir.join(format!(
+        "align-mexe-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    emit_object_file(
+        &mir,
+        &obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExeMulti { exe, _proj: proj }
 }
@@ -482,7 +648,11 @@ impl PerUnitBuilt {
 
     /// The artifact for the named unit.
     pub fn unit(&self, name: &str) -> &PerUnitArtifact {
-        self.walk.units.iter().find(|u| u.unit == name).unwrap_or_else(|| panic!("unit `{name}` not built"))
+        self.walk
+            .units
+            .iter()
+            .find(|u| u.unit == name)
+            .unwrap_or_else(|| panic!("unit `{name}` not built"))
     }
 }
 
@@ -499,7 +669,11 @@ pub fn build_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> 
         "unexpected per-unit errors:\n{}",
         align_driver::format_diagnostics(&sm, &walk.diags)
     );
-    PerUnitBuilt { walk, dir, _proj: proj }
+    PerUnitBuilt {
+        walk,
+        dir,
+        _proj: proj,
+    }
 }
 
 /// The defined/undefined symbols of an object file via `llvm-nm`, one `(kind, name)` per line
@@ -512,7 +686,11 @@ pub fn nm_symbols(obj: &std::path::Path) -> Option<Vec<(char, String)>> {
         .env("LC_ALL", "C")
         .output()
         .expect("run llvm-nm");
-    assert!(out.status.success(), "llvm-nm failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "llvm-nm failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     let mut syms = Vec::new();
     for line in text.lines() {
@@ -537,7 +715,9 @@ pub fn check_multi_errs(name: &str, files: &[(&str, &str)], entry: &str) -> bool
     let entry_path = proj.entry(entry);
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
     let mut sm = SourceMap::new();
-    check(&mut sm, &entry_path.display().to_string(), &entry_src).diags.has_errors()
+    check(&mut sm, &entry_path.display().to_string(), &entry_src)
+        .diags
+        .has_errors()
 }
 
 /// The rendered diagnostics from checking a multi-file program (`entry` + the other `files`) — the
@@ -573,7 +753,10 @@ pub fn thin_nonce() -> u64 {
 /// A deterministic pseudo-`Hash128` from a seed — for fixed key fields and stand-in profdata digests
 /// in key-algebra tests (no LLVM, no real profile).
 pub fn hh(seed: u64) -> Hash128 {
-    Hash128 { lo: seed, hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
+    Hash128 {
+        lo: seed,
+        hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    }
 }
 
 /// A branch-heavy single-unit program whose biased branch mix is exactly what PGO records; it prints a
@@ -619,19 +802,37 @@ pub fn make_profdata(dir: &Path, src: &str) -> Option<PathBuf> {
     let gen_build = Command::new(env!("CARGO_BIN_EXE_alignc"))
         .env("ALIGNC_CACHE", "off")
         .current_dir(dir)
-        .args(["--pgo-instrument", "--profile", "release", "build", "prog.align"])
+        .args([
+            "--pgo-instrument",
+            "--profile",
+            "release",
+            "build",
+            "prog.align",
+        ])
         .output()
         .ok()?;
     if gen_build.status.code() != Some(0) {
         return None;
     }
     let profraw = dir.join("t.profraw");
-    let run = Command::new(dir.join("prog")).env("LLVM_PROFILE_FILE", &profraw).output().ok()?;
-    if run.status.code().is_none() || !std::fs::metadata(&profraw).map(|m| m.len() > 0).unwrap_or(false) {
+    let run = Command::new(dir.join("prog"))
+        .env("LLVM_PROFILE_FILE", &profraw)
+        .output()
+        .ok()?;
+    if run.status.code().is_none()
+        || !std::fs::metadata(&profraw)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+    {
         return None;
     }
     let profdata = dir.join("t.profdata");
-    let merged = Command::new(&profdata_tool).args(["merge", "-o"]).arg(&profdata).arg(&profraw).output().ok()?;
+    let merged = Command::new(&profdata_tool)
+        .args(["merge", "-o"])
+        .arg(&profdata)
+        .arg(&profraw)
+        .output()
+        .ok()?;
     if !merged.status.success() {
         return None;
     }
@@ -643,8 +844,10 @@ pub fn make_profdata(dir: &Path, src: &str) -> Option<PathBuf> {
 //   C_V1:   helper = x*2 → cval = 20 → bval = 120 → prints 125
 //   C_BODY: helper = x*3 → cval = 30 → bval = 130 → prints 135   (a private-body edit)
 //   C_PUB:  adds a new `pub fn extra()` → flips c's interface hash (a public-surface edit)
-pub const C_V1: &str = "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\n";
-pub const C_BODY: &str = "module c\nfn helper(x: i64) -> i64 = x * 3\npub fn cval() -> i64 = helper(10)\n";
+pub const C_V1: &str =
+    "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\n";
+pub const C_BODY: &str =
+    "module c\nfn helper(x: i64) -> i64 = x * 3\npub fn cval() -> i64 = helper(10)\n";
 pub const C_PUB: &str = "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\npub fn extra() -> i64 = 7\n";
 pub const B_SRC: &str = "module b\nimport c\npub fn bval() -> i64 = c.cval() + 100\n";
 pub const D_SRC: &str = "module d\npub fn dval() -> i64 = 5\n";
@@ -674,10 +877,17 @@ pub struct Proj {
 impl Proj {
     /// A project from explicit `(name, source)` files, with `entry` the entry unit's filename.
     pub fn new(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
-        let dir = std::env::temp_dir().join(format!("align-thin-{}-{tag}-{}", std::process::id(), thin_nonce()));
+        let dir = std::env::temp_dir().join(format!(
+            "align-thin-{}-{tag}-{}",
+            std::process::id(),
+            thin_nonce()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir project");
-        let proj = Proj { dir, entry: entry.to_string() };
+        let proj = Proj {
+            dir,
+            entry: entry.to_string(),
+        };
         for (name, src) in files {
             proj.write(name, src);
         }
@@ -730,7 +940,15 @@ pub fn thin_build(proj: &Proj, cache: &CacheContext, jobs: usize) -> ThinBuilt {
     std::fs::create_dir_all(&staging).expect("mkdir staging");
     let objs: Vec<PathBuf> = (0..n).map(|i| staging.join(format!("o{i}.o"))).collect();
     let build = build_thin_lto(
-        &walk.units, &objs, cache, &BuildTarget::Baseline, Profile::Release, &[], false, &staging, jobs,
+        &walk.units,
+        &objs,
+        cache,
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+        &staging,
+        jobs,
     )
     .expect("thin-lto build");
     // First-seen (DAG-order) union of every unit's capability link libs.
@@ -771,10 +989,16 @@ impl ThinBuilt {
         self.outcomes.iter().all(|o| !o.hit)
     }
     pub fn unit_index(&self, unit: &str) -> usize {
-        self.units.iter().position(|u| u == unit).expect("unit present")
+        self.units
+            .iter()
+            .position(|u| u == unit)
+            .expect("unit present")
     }
     pub fn obj_bytes(&self) -> Vec<Vec<u8>> {
-        self.objs.iter().map(|p| std::fs::read(p).expect("read obj")).collect()
+        self.objs
+            .iter()
+            .map(|p| std::fs::read(p).expect("read obj"))
+            .collect()
     }
     fn link_to(&self, proj: &Proj) -> PathBuf {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();

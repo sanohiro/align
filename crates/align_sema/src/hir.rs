@@ -592,10 +592,31 @@ pub enum ExprKind {
     /// `raw.alloc(size)` — allocate `size` bytes on the flat heap, yielding a `raw` byte pointer.
     /// `unsafe`-only; the caller owns the memory and must `raw.free` it (no auto-drop).
     RawAlloc(Box<Expr>),
+    /// `raw.null()` — construct the null raw pointer for an explicit native ABI argument or
+    /// sentinel. `unsafe`-only; safe code may hold and test the resulting Copy `raw` value.
+    RawNull,
     /// `raw.free(p)` — free a `raw` pointer previously returned by `raw.alloc`. `unsafe`-only.
     RawFree(Box<Expr>),
     /// `raw.load(p, offset)` — read a primitive `scalar` value at byte `offset` from `p`. `unsafe`-only.
     RawLoad { ptr: Box<Expr>, offset: Box<Expr>, scalar: crate::Scalar },
+    /// Load one pointer-sized `raw` value. Public `raw.load` constructs this with a dynamic offset;
+    /// the compiler-private pkg.db descriptor bridge uses the same general operation with a fixed
+    /// validated thunk/header offset.
+    RawPointerLoad { ptr: Box<Expr>, offset: Box<Expr> },
+    /// Compiler-trusted `{raw data, i64 len}` load from one fixed static descriptor string slot.
+    /// The resulting `str` views producer-owned process-lifetime data and allocates nothing.
+    StaticDescriptorView { ptr: Box<Expr>, offset: u32 },
+    /// Compiler-trusted call through a bare native function pointer. The full logical signature is
+    /// retained here and in MIR; unlike a function value, the callee has no closure environment.
+    RawCall {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        param_tys: Vec<Ty>,
+        param_modes: Vec<align_ast::ParamMode>,
+        return_borrow: ReturnBorrowSummary,
+        return_region: ReturnRegionSummary,
+        return_cleanup: ReturnCleanupAbi,
+    },
     /// `raw.store(p, offset, v)` — write the primitive scalar `value` at byte `offset` of `p`. Yields
     /// unit. `unsafe`-only.
     RawStore { ptr: Box<Expr>, offset: Box<Expr>, value: Box<Expr> },

@@ -6,7 +6,7 @@ Every guarantee so far — no dangling views, no double-free, no data races in `
 
 ## `unsafe {}` and `raw.*`
 
-`raw` is a bare pointer type; the five `raw.*` operations are the only way to touch one, and they are legal **only** inside `unsafe`:
+`raw` is a bare pointer type; the six `raw.*` operations are the only way to touch one, and they are legal **only** inside `unsafe`:
 
 ```align
 fn main() -> i32 {
@@ -23,7 +23,12 @@ fn main() -> i32 {
 }
 ```
 
-`alloc` / `free` / `load` / `store` / `offset` — that is the entire unsafe vocabulary. No pointer arithmetic operators, no casts-through-pointers dialect: five named operations you can grep for. *Holding* a `raw` is safe (it's a Copy value; pass it around freely); only operating on one needs the block.
+`null` / `alloc` / `free` / `load` / `store` / `offset` — that is the entire unsafe vocabulary. No pointer arithmetic operators, no casts-through-pointers dialect: six named operations you can grep for. `raw.null()` is the explicit native-ABI null sentinel; it does not add null to ordinary Align values. *Holding* a `raw` is safe (it's a Copy value; pass it around freely); only operating on one needs the block.
+
+`load` and `store` admit primitive scalars, `raw` pointers, and eligible `layout(C)` structs. A
+native wrapper can therefore keep a C handle in a package-owned state block without casting the
+address to an integer: `raw.store(state, 0, handle)` and `handle: raw := raw.load(state, 0)`. The
+programmer remains responsible for the slot size, pointer validity, and effective type.
 
 What `unsafe` does **not** do: it is a marker, not a mode switch. Arena escape checks, move checking, bounds checks on ordinary types — all still apply inside. And purity inference (chapter [10](10-closures-and-parallelism.md)) marks any function containing `unsafe` as impure, so raw-memory code can never ride into `par_map`.
 
@@ -76,7 +81,7 @@ fn main() -> i32 {
 layout(C) Point { x: i32, y: i32 }      // matches `struct { int32_t x, y; }`
 ```
 
-`layout(C)` structs cross by pointer (through `raw`) or **by value** (SysV x86-64 ABI, ≤16-byte register-class structs — matching clang exactly; larger-by-value is implementation in progress). C-owned memory comes back as `raw` — C pointers carry no length, so nothing pretends to be a view — and you read it with `raw.load` or wrap it in a length you got some honest way.
+`layout(C)` structs cross by pointer (through `raw`) or **by value** (SysV x86-64 ABI, ≤16-byte register-class structs — matching clang exactly; larger-by-value is implementation in progress). C-owned memory comes back as `raw` — C pointers carry no length, so nothing pretends to be a view — and you read its flat values with `raw.load` or wrap it in a length you got some honest way.
 
 ## The discipline
 

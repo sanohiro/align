@@ -1,0 +1,4 @@
+module pkg.db.internal.descriptor
+
+// This module names the compiler-private Query/command descriptor bridge. It intentionally exports
+// no source functions: only checked generic bodies owned by pkg.db may form its trusted operations.

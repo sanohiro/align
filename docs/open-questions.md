@@ -1537,8 +1537,10 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     `align_rt_alloc`/`align_rt_free`; plus **`raw.store(p, off, v)` / `raw.load(p, off)`** — typed
     flat load/store at a byte offset (an i8 GEP + a scalar load/store, element-aligned). **No
     turbofish** (settled convention): the stored type follows the value, the loaded type the expected
-    annotation (`x: i64 := raw.load(p, 0)`, like `json.decode`). Primitive scalars only (int/float/
-    bool/char) — `str`/struct through raw memory is deferred. draft.md §15 was respelled off the old
+    annotation (`x: i64 := raw.load(p, 0)`, like `json.decode`). Admitted flat values are primitive
+    scalars (int/float/bool/char), `raw` pointers, and eligible non-empty `layout(C)` structs; views
+    and other managed values remain rejected. Pointer-valued slots let an FFI package own a native
+    handle without an integer cast or a runtime/compiler handle registry. draft.md §15 was respelled off the old
     `raw.ptr_cast<T>` turbofish example to this inference form. A `raw.*` op outside `unsafe` errors; a function containing
     `unsafe` is inferred **impure** (reusing the single Pure/Impure `EffectScan` flag → never a
     `par_map` callee; "unsafe is visible/traceable"). `raw` is a nameable type (`fn f(p: raw)`).
@@ -1551,6 +1553,10 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     **Pointer arithmetic — `raw.offset(p, n)` DONE (2026-07-01):** advances a `raw` by `n` bytes →
     a new `raw` (a plain, non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined — the
     same GEP the load/store address uses). `hir::ExprKind::RawOffset` / `mir::Rvalue::RawOffset`.
+    **Explicit native null — `raw.null()` SHIPPED:** forms the sole null `raw` pointer for a native
+    ABI argument or sentinel, only inside `unsafe`. This does not create a general null value or a
+    second optional model; ordinary absence remains `Option<T>`, and `p.is_null()` is the explicit
+    boundary test.
     **FFI first slice — DONE (2026-07-01):** `extern "C" fn name(params) -> ret` (and the braced group
     `extern "C" { fn … }`) declares a bodyless foreign function bound to the C symbol; a call is only
     valid inside `unsafe {}` (reuses the `unsafe_depth` gate + `unsafe`→impure inference, exactly like
@@ -2704,11 +2710,11 @@ implementation deltas are noted.
    — FIXED:** sema used to let struct `==` through to codegen, which **panicked** (ICE —
    `align_codegen_llvm` "expected the IntValue variant"). sema now rejects every non-scalar /
    non-string comparison operand up front with a clean diagnostic, via a *positive* allow-list
-   (the `Eq` / `Ord` bound predicate — numbers / `bool` / `char` / `str`, never a fail-open
-   pass-through): struct / tuple / array / slice / sum / `Option` / `Result` / owned `string`
-   `==` `!=` `<` `<=` `>` `>=` are all compile errors, not ICEs (`bool` ordering too — ordering
-   is numbers + `char` only). Owned `string` equality stays deferred (its own "not directly
-   comparable yet" message; only the `str` view is comparable today).
+   (the `Eq` / `Ord` bound predicate — numbers / `bool` / `char` / strings, never a fail-open
+   pass-through): struct / tuple / array / slice / sum / `Option` / `Result` comparisons are all
+   compile errors, not ICEs (`bool` ordering too). **Owned `string` comparison is now complete:**
+   both direct and generic `Eq`/`Ord` paths insert the ordinary non-consuming, zero-cost `str`
+   borrow, and mixed `string`/`str` operands share that lowering.
 4. **No shadowing** (§4 Variables): a name binds once per scope chain — same-scope re-`:=` and
    inner-scope shadowing of a visible binding/parameter are compile errors; disjoint sibling
    blocks may reuse a name. Rationale: rebinding hides a state change (a known human/LLM bug
@@ -2735,8 +2741,8 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    is the consistent completion. **IMPLEMENTED** (`Bound::Ord.satisfied_by` accepts `str`; a
    runtime `align_rt_str_cmp` returns -1/0/1 backing the four ordering operators and the `sort`/
    `sort_by_key` `str`-key comparator — `str_eq` keeps its own length-fast-path for `==`/`!=`).
-   Owned `string` ordering stays deferred with its existing "take a `str` view" diagnostic (the
-   `str` view is the only comparable string form).
+   Owned `string` uses the same runtime comparison through an implicit non-consuming `str` borrow;
+   direct, mixed-view, and generic `Ord` comparisons are implemented.
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
    fallback` yields `Ok`'s value or deliberately discards the error — visible handling, so the
    unhandled-`Result` error never fires on it; no error binding (needing the error *is* the
@@ -4139,7 +4145,7 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 calls; FFI-safe scalars (int/float) + `raw` + `()` return; libc/libm resolve with no extra `-l`.
 See the `unsafe`/`raw` Settled entry above for the full record.
 
-**`layout(C)` struct ABI — slice 1 SHIPPED (2026-07-01):** a `layout(C)` attribute (composes with `align(N)`) pins a struct to a stable, C-compatible flat layout (decl order, natural alignment, no reordering — Align's default, which the marker *locks* and opts into FFI). Only a `layout(C)` struct may be moved through a `raw` pointer — `raw.store`/`raw.load` widened to accept a struct value (no new IR variant; the existing `Scalar::Struct` flows through `RawLoad`/`RawStore`, codegen does an unaligned aggregate load/store). Fields must be int/float. This is the **pointer-based** FFI pattern (hand C a buffer, read/write structs in it).
+**`layout(C)` struct ABI — slice 1 SHIPPED (2026-07-01):** a `layout(C)` attribute (composes with `align(N)`) pins a struct to a stable, C-compatible flat layout (decl order, natural alignment, no reordering — Align's default, which the marker *locks* and opts into FFI). Among structs, only a `layout(C)` struct may be moved through a `raw` pointer — `raw.store`/`raw.load` widened to accept a struct value (no new IR variant; the existing `Scalar::Struct` flows through `RawLoad`/`RawStore`, codegen does an unaligned aggregate load/store). Fields must be int/float. Primitive scalars and `raw` pointers are the other admitted flat values. This is the **pointer-based** FFI pattern (hand C a buffer, read/write structs or native handle slots in it).
 
 **FFI views — SHIPPED (2026-07-01):** a `str`/`slice`/`bytes` view is FFI-safe as an extern **parameter**, lowered to its data pointer (C `char*`/`void*`); the length is passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom, no hidden arg (`is_ffi_safe_param`; codegen `ffi_param_type` + an `extern_params` map that coerces the `{ptr,len}` arg to element 0). Slice element must be an int/float scalar (`slice<str>`/`slice<Struct>` rejected — no settled C element layout). Not a valid return type (a bare pointer has no length → returns stay scalar-only); not NUL-terminated (length-based C fns only).
 

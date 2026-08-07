@@ -1,0 +1,714 @@
+module pkg.db.internal.sqlite
+
+import pkg.db
+import pkg.db.internal.descriptor
+
+extern "C" link("sqlite3") {
+  fn sqlite3_busy_timeout(database: raw, milliseconds: i32) -> i32
+  fn sqlite3_errcode(database: raw) -> i32
+  fn sqlite3_extended_errcode(database: raw) -> i32
+  fn sqlite3_errmsg(database: raw) -> raw
+  fn sqlite3_prepare_v2(database: raw, sql: raw, bytes: i32, statement_out: raw, tail_out: raw) -> i32
+  fn sqlite3_step(statement: raw) -> i32
+  fn sqlite3_finalize(statement: raw) -> i32
+  fn sqlite3_close_v2(database: raw) -> i32
+  fn sqlite3_changes64(database: raw) -> i64
+}
+
+pub SQLITE_OK: i32 := 0
+SQLITE_TIMEOUT_MAX_MS: i64 := 2147483647
+pub SQLITE_ROW: i32 := 100
+pub SQLITE_DONE: i32 := 101
+pub DRIVER_SQLITE: u8 := 1
+CONTEXT_VERSION: u32 := 1
+FAILURE_NATIVE: u8 := 1
+FAILURE_UNSUPPORTED: u8 := 2
+FAILURE_ROW: u8 := 3
+
+pub fn descriptor_error(query_id: str, item: str, message: str) -> pkg.db.Error =
+  pkg.db.Error.Unsupported(pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: item.clone(),
+    message: message.clone(),
+  })
+
+pub fn invalid_descriptor_error() -> pkg.db.Error = pkg.db.Error.InvalidQuery(
+  pkg.db.ContractError {
+    query_id: None,
+    item: "db.descriptor.header".clone(),
+    message: "invalid static database descriptor".clone(),
+  },
+)
+
+pub fn invalid_query_error(query_id: str, item: str, message: str) -> pkg.db.Error =
+  pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: item.clone(),
+    message: message.clone(),
+  })
+
+pub fn driver_mismatch_error(query_id: str) -> pkg.db.Error = pkg.db.Error.DriverMismatch(
+  pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: "db.descriptor.driver".clone(),
+    message: "static database descriptor does not support SQLite".clone(),
+  },
+)
+
+pub fn cardinality_error(minimum: i64, maximum: i64, observed: i64) -> pkg.db.Error =
+  pkg.db.Error.Cardinality(pkg.db.CardinalityError {
+    expected_min: minimum,
+    expected_max: maximum,
+    observed_at_least: observed,
+  })
+
+fn copy_c_string(pointer: raw) -> string {
+  unsafe {
+    if pointer.is_null() { return "".clone() }
+    mut output := buffer(64)
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else "invalid UTF-8 in SQLite error"
+    return text.clone()
+  }
+}
+
+pub fn sqlite_error(database: raw) -> pkg.db.Error {
+  unsafe {
+    primary := sqlite3_errcode(database)
+    extended := sqlite3_extended_errcode(database)
+    mut code_builder := builder()
+    code_builder.write_int(primary)
+    code := code_builder.to_string()
+    message := copy_c_string(sqlite3_errmsg(database))
+    return pkg.db.Error.Connection(pkg.db.NativeError {
+      driver: pkg.db.Driver.SQLite,
+      code: Some(code),
+      extended_code: Some(extended as i64),
+      sqlstate: None,
+      message: message,
+      detail: None,
+      constraint: None,
+      table: None,
+      column: None,
+    })
+  }
+}
+
+pub fn execution_timeout_ms(ns: i64, query_id: str) -> Result<i32, pkg.db.Error> {
+  if ns <= 0 {
+    return Err(descriptor_error(
+      query_id,
+      "sqlite.execute.busy_timeout_ns",
+      "SQLite busy timeout must be positive",
+    ))
+  }
+  mut milliseconds := ns / 1000000
+  if ns % 1000000 != 0 { milliseconds = milliseconds + 1 }
+  if milliseconds > SQLITE_TIMEOUT_MAX_MS {
+    return Err(descriptor_error(
+      query_id,
+      "sqlite.execute.busy_timeout_ns",
+      "SQLite busy timeout exceeds the native i32 millisecond range",
+    ))
+  }
+  return Ok(milliseconds as i32)
+}
+
+pub fn common_options_valid(options: slice<pkg.db.ExecuteOption>, query_id: str) -> Result<(), pkg.db.Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(descriptor_error(
+            query_id,
+            "db.execute.timeout_ns",
+            "database execution timeout must be positive",
+          ))
+        }
+        return Err(descriptor_error(
+          query_id,
+          "db.execute.timeout_ns",
+          "database execution deadlines are not available in this milestone",
+        ))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+pub fn tail_is_empty(pointer: raw) -> bool {
+  unsafe {
+    if pointer.is_null() { return false }
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { return true }
+      if byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32 {
+        i = i + 1
+      } else {
+        if byte == 45 {
+          next: u8 := raw.load(pointer, i + 1)
+          if next == 45 {
+            i = i + 2
+            loop {
+              comment: u8 := raw.load(pointer, i)
+              if comment == 0 { return true }
+              i = i + 1
+              if comment == 10 || comment == 13 { break }
+            }
+          } else { return false }
+        } else {
+          if byte == 47 {
+            next: u8 := raw.load(pointer, i + 1)
+            if next != 42 { return false }
+            i = i + 2
+            mut closed := false
+            loop {
+              comment: u8 := raw.load(pointer, i)
+              if comment == 0 { break }
+              if comment == 42 {
+                after: u8 := raw.load(pointer, i + 1)
+                if after == 47 {
+                  i = i + 2
+                  closed = true
+                  break
+                }
+              }
+              i = i + 1
+            }
+            if !closed { return false }
+          } else { return false }
+        }
+      }
+    }
+  }
+}
+
+pub fn new_context(native: raw) -> raw {
+  unsafe {
+    context := raw.alloc(40)
+    version: u32 := CONTEXT_VERSION
+    driver: u8 := DRIVER_SQLITE
+    clear8: u8 := 0
+    clear16: u16 := 0
+    clear32: u32 := 0
+    raw.store(context, 0, version)
+    raw.store(context, 4, driver)
+    raw.store(context, 5, clear8)
+    raw.store(context, 6, clear16)
+    raw.store(context, 8, native)
+    raw.store(context, 16, clear32)
+    raw.store(context, 20, clear32)
+    raw.store(context, 24, raw.null())
+    raw.store(context, 32, clear32)
+    raw.store(context, 36, clear32)
+    return context
+  }
+}
+
+pub fn free_context(context: raw) {
+  unsafe {
+    if context.is_null() { return }
+    cache: raw := raw.load(context, 24)
+    if !cache.is_null() { raw.free(cache) }
+    raw.free(context)
+  }
+}
+
+pub fn context_error(context: raw, database: raw, query_id: str) -> pkg.db.Error {
+  unsafe {
+    failure: u8 := raw.load(context, 5)
+    if failure == FAILURE_UNSUPPORTED {
+      return descriptor_error(
+        query_id,
+        "db.descriptor.static_option",
+        "static database option is unsupported by the linked SQLite library",
+      )
+    }
+    if failure == FAILURE_ROW {
+      return pkg.db.Error.Decode(pkg.db.ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.row".clone(),
+        message: "SQLite row does not match the static Row contract".clone(),
+      })
+    }
+    return sqlite_error(database)
+  }
+}
+
+pub fn state_for(target: pkg.db.exec) -> raw {
+  unsafe {
+    return match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(_) => raw.null()
+    }
+  }
+}
+
+pub fn sqlite_connection(state: raw) -> raw {
+  unsafe {
+    if state.is_null() { return raw.null() }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    database: raw := raw.load(state, 8)
+    if driver != DRIVER_SQLITE { return raw.null() }
+    if version != 1 || reserved != 0 || closed != 0 || database.is_null() {
+      return raw.null()
+    }
+    return database
+  }
+}
+
+pub fn acquire_lease(state: raw, query_id: str) -> Result<(), pkg.db.Error> {
+  unsafe {
+    active: u8 := raw.load(state, 20)
+    if active != 0 {
+      return Err(descriptor_error(
+        query_id,
+        "sqlite.connection.active_execution",
+        "SQLite connection already has an active execution",
+      ))
+    }
+    active_now: u8 := 1
+    raw.store(state, 20, active_now)
+    return Ok(())
+  }
+}
+
+pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base := version == 1 && kind == 1 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && validate_row.is_null() && decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base && (sqlite_only || postgres_only || portable)
+  }
+}
+
+pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base := version == 1 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base && (sqlite_only || postgres_only || portable)
+  }
+}
+
+pub fn cleanup_execution(
+  state: raw,
+  database: raw,
+  statement: raw,
+  context: raw,
+  restore_timeout: bool,
+  prior_timeout: i32,
+) -> Result<(), pkg.db.Error> {
+  unsafe {
+    finalize_status := if statement.is_null() { SQLITE_OK } else {
+      sqlite3_finalize(statement)
+    }
+    if finalize_status != SQLITE_OK {
+      // Own SQLite's connection-global error before timeout restoration or close can replace it.
+      failure := sqlite_error(database)
+      free_context(context)
+      if restore_timeout {
+        restore_status := sqlite3_busy_timeout(database, prior_timeout)
+        if restore_status != SQLITE_OK { poison_and_close(state, database) }
+      }
+      clear_execution_lease(state)
+      return Err(failure)
+    }
+    free_context(context)
+    if restore_timeout {
+      restore_status := sqlite3_busy_timeout(database, prior_timeout)
+      if restore_status != SQLITE_OK {
+        failure := sqlite_error(database)
+        poison_and_close(state, database)
+        return Err(failure)
+      }
+    }
+    clear_execution_lease(state)
+    return Ok(())
+  }
+}
+
+fn clear_execution_lease(state: raw) {
+  unsafe {
+    clear: u8 := 0
+    raw.store(state, 20, clear)
+  }
+}
+
+fn poison_and_close(state: raw, database: raw) {
+  unsafe {
+    poisoned: u8 := 1
+    raw.store(state, 5, poisoned)
+    raw.store(state, 8, raw.null())
+    clear_execution_lease(state)
+    ignored := sqlite3_close_v2(database)
+  }
+}
+
+pub fn execution_busy_timeout(database: raw, milliseconds: i32) -> i32 {
+  unsafe { return sqlite3_busy_timeout(database, milliseconds) }
+}
+
+pub fn execution_prepare(
+  database: raw,
+  sql: raw,
+  statement_out: raw,
+  tail_out: raw,
+) -> i32 {
+  unsafe { return sqlite3_prepare_v2(database, sql, -1, statement_out, tail_out) }
+}
+
+pub fn execution_step(statement: raw) -> i32 {
+  unsafe { return sqlite3_step(statement) }
+}
+
+pub fn execution_changes(database: raw) -> i64 {
+  unsafe { return sqlite3_changes64(database) }
+}
+
+pub fn execute_prevalidated<P>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.command<P>,
+  query_id: str,
+  timeout: Option<i32>,
+) -> Result<pkg.db.exec_result, pkg.db.Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 1 == 0 { return Err(driver_mismatch_error(query_id)) }
+
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_SQLITE { return Err(driver_mismatch_error(query_id)) }
+    database := sqlite_connection(state)
+    if database.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "SQLite connection is closed or poisoned",
+      ))
+    }
+    context := new_context(raw.null())
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by this execution milestone",
+        )
+      } else { context_error(context, database, query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    lease := acquire_lease(state, query_id)
+    match lease {
+      Err(error) => {
+        free_context(context)
+        return Err(error)
+      }
+      Ok(_) => {}
+    }
+
+    prior_timeout: i32 := raw.load(state, 16)
+    mut restore_timeout := false
+    match timeout {
+      Some(milliseconds) => {
+        restore_timeout = true
+        status := execution_busy_timeout(database, milliseconds)
+        if status != SQLITE_OK {
+          failure := sqlite_error(database)
+          cleaned := cleanup_execution(
+            state, database, raw.null(), context, restore_timeout, prior_timeout,
+          )
+          return Err(failure)
+        }
+      }
+      None => {}
+    }
+
+    statement_out := raw.alloc(8)
+    tail_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    raw.store(tail_out, 0, raw.null())
+    sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    prepare_status := execution_prepare(database, sql, statement_out, tail_out)
+    native_statement: raw := raw.load(statement_out, 0)
+    tail: raw := raw.load(tail_out, 0)
+    raw.free(statement_out)
+    raw.free(tail_out)
+    if prepare_status != SQLITE_OK || native_statement.is_null() {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if !tail_is_empty(tail) {
+      failure := invalid_query_error(
+        query_id,
+        "db.statement.tail",
+        "static command must contain exactly one SQL statement",
+      )
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+
+    raw.store(context, 8, native_statement)
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    step_status := execution_step(native_statement)
+    if step_status == SQLITE_ROW {
+      failure := invalid_query_error(
+        query_id,
+        "db.command.row",
+        "a database command must not produce rows",
+      )
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if step_status != SQLITE_DONE {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    affected := execution_changes(database)
+    cleanup_execution(
+      state, database, native_statement, context, restore_timeout, prior_timeout,
+    )?
+    return Ok(pkg.db.exec_result { rows_affected: Some(affected) })
+  }
+}
+
+pub fn one_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  out: region,
+  query_id: str,
+  timeout: Option<i32>,
+) -> Result<R, pkg.db.Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 1 == 0 { return Err(driver_mismatch_error(query_id)) }
+
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_SQLITE { return Err(driver_mismatch_error(query_id)) }
+    database := sqlite_connection(state)
+    if database.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "SQLite connection is closed or poisoned",
+      ))
+    }
+    context := new_context(raw.null())
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by this execution milestone",
+        )
+      } else { context_error(context, database, query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    lease := acquire_lease(state, query_id)
+    match lease {
+      Err(error) => {
+        free_context(context)
+        return Err(error)
+      }
+      Ok(_) => {}
+    }
+
+    prior_timeout: i32 := raw.load(state, 16)
+    mut restore_timeout := false
+    match timeout {
+      Some(milliseconds) => {
+        restore_timeout = true
+        status := execution_busy_timeout(database, milliseconds)
+        if status != SQLITE_OK {
+          failure := sqlite_error(database)
+          cleaned := cleanup_execution(
+            state, database, raw.null(), context, restore_timeout, prior_timeout,
+          )
+          return Err(failure)
+        }
+      }
+      None => {}
+    }
+
+    statement_out := raw.alloc(8)
+    tail_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    raw.store(tail_out, 0, raw.null())
+    sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    prepare_status := execution_prepare(database, sql, statement_out, tail_out)
+    native_statement: raw := raw.load(statement_out, 0)
+    tail: raw := raw.load(tail_out, 0)
+    raw.free(statement_out)
+    raw.free(tail_out)
+    if prepare_status != SQLITE_OK || native_statement.is_null() {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if !tail_is_empty(tail) {
+      failure := invalid_query_error(
+        query_id,
+        "db.statement.tail",
+        "static Query must contain exactly one SQL statement",
+      )
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+
+    raw.store(context, 8, native_statement)
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    first := execution_step(native_statement)
+    if first == SQLITE_DONE {
+      failure := cardinality_error(1, 1, 0)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if first != SQLITE_ROW {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    validate_status := pkg.db.internal.descriptor.validate_row(statement, context)
+    if validate_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    second := execution_step(native_statement)
+    if second == SQLITE_ROW {
+      failure := cardinality_error(1, 1, 2)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if second != SQLITE_DONE {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    decoded := pkg.db.internal.descriptor.decode(statement, context)
+    cleanup_execution(
+      state, database, native_statement, context, restore_timeout, prior_timeout,
+    )?
+    return Ok(decoded)
+  }
+}

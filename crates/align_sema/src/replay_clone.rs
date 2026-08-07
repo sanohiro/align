@@ -7,6 +7,9 @@
 
 use crate::hir::{self, ExprKind, StageKind, Stmt, TemplatePart};
 
+// The explicit worklist keeps recursive HIR replay off the owner stack. Boxing the Stmt arm
+// would add an allocation to every replayed statement, which defeats that boundary's purpose.
+#[allow(clippy::large_enum_variant)]
 enum CloneValue {
     Expr(hir::Expr),
     Block(hir::Block),
@@ -333,6 +336,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
+        | ExprKind::RawNull
         | ExprKind::HttpClient => kind.clone(),
         ExprKind::Unary { op, expr } => ExprKind::Unary {
             op: *op,
@@ -445,6 +449,31 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             ptr: boxed!(ptr),
             offset: boxed!(offset),
             scalar: *scalar,
+        },
+        ExprKind::RawPointerLoad { ptr, offset } => ExprKind::RawPointerLoad {
+            ptr: boxed!(ptr),
+            offset: boxed!(offset),
+        },
+        ExprKind::StaticDescriptorView { ptr, offset } => ExprKind::StaticDescriptorView {
+            ptr: boxed!(ptr),
+            offset: *offset,
+        },
+        ExprKind::RawCall {
+            callee,
+            args,
+            param_tys,
+            param_modes,
+            return_borrow,
+            return_region,
+            return_cleanup,
+        } => ExprKind::RawCall {
+            callee: boxed!(callee),
+            args: take_exprs(clones, args.len())?,
+            param_tys: param_tys.clone(),
+            param_modes: param_modes.clone(),
+            return_borrow: return_borrow.clone(),
+            return_region: return_region.clone(),
+            return_cleanup: *return_cleanup,
         },
         ExprKind::RawStore { ptr, offset, value } => ExprKind::RawStore {
             ptr: boxed!(ptr),
@@ -1735,6 +1764,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
+        | ExprKind::RawNull
         | ExprKind::HttpClient => {}
         ExprKind::Unary { expr, .. }
         | ExprKind::Cast(expr)
@@ -1746,6 +1776,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::RawAlloc(expr)
         | ExprKind::RawFree(expr)
         | ExprKind::RawIsNull(expr)
+        | ExprKind::StaticDescriptorView { ptr: expr, .. }
         | ExprKind::ResourceBorrow { owner: expr, .. }
         | ExprKind::ResourceRaw {
             reference: expr, ..
@@ -2036,6 +2067,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::CallFnValue { callee, args } => {
             one!(callee);
             many!(args);
+        }
+        ExprKind::RawCall { callee, args, .. } => {
+            one!(callee);
+            many!(args);
+        }
+        ExprKind::RawPointerLoad { ptr, offset } => {
+            one!(ptr);
+            one!(offset);
         }
         ExprKind::Spawn { closure, .. } => one!(closure),
         ExprKind::TaskGroup(block)

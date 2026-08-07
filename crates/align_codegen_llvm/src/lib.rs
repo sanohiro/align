@@ -29,7 +29,8 @@ use align_ast::{BinOp, UnOp};
 use align_mir::{
     Block, CanonicalFnAbi, CanonicalTy, Const, ConstElem, DirectCall, Function, GeneratedId,
     Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode,
-    ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
+    ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, StaticData, StaticDataTarget,
+    Stmt, Term, ValueId,
 };
 use align_sema::{
     ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
@@ -2808,7 +2809,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         }
         for block in &f.blocks {
             for statement in &block.stmts {
-                let Stmt::Let(_, rvalue) = statement else {
+                let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
                 match rvalue {
@@ -2963,6 +2964,82 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         check_signature_facts(
                             SignatureFacts {
                                 owner: "indirect call",
+                                modes: &signature.param_modes,
+                                param_types: param_tys,
+                                ret: *ret_ty,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                cleanup: signature.return_cleanup,
+                                allow_out: false,
+                                allow_return_roots: true,
+                            },
+                            program,
+                            &mut type_graph,
+                        )?;
+                    }
+                    Rvalue::RawNull => {
+                        if f.value_tys.get(*value as usize) != Some(&Ty::Raw) {
+                            return Err(CodegenError::Lowering(
+                                "raw null result metadata invalid".to_owned(),
+                            ));
+                        }
+                    }
+                    Rvalue::RawPointerLoad { ptr, offset } => {
+                        let offset_ty = preflight_operand_ty(f, offset);
+                        if f.value_tys.get(*value as usize) != Some(&Ty::Raw)
+                            || preflight_operand_ty(f, ptr) != Some(Ty::Raw)
+                            || !offset_ty.is_some_and(|ty| matches!(ty, Ty::Int(_)))
+                        {
+                            return Err(CodegenError::Lowering(
+                                "raw pointer load metadata invalid".to_owned(),
+                            ));
+                        }
+                    }
+                    Rvalue::StaticDescriptorView { ptr, offset } => {
+                        if f.value_tys.get(*value as usize) != Some(&Ty::Str)
+                            || preflight_operand_ty(f, ptr) != Some(Ty::Raw)
+                            || !matches!(offset, 16 | 32 | 48)
+                        {
+                            return Err(CodegenError::Lowering(
+                                "static descriptor view metadata invalid".to_owned(),
+                            ));
+                        }
+                    }
+                    Rvalue::RawCall {
+                        callee,
+                        args,
+                        param_tys,
+                        ret_ty,
+                        signature,
+                    } => {
+                        let argument_types = args
+                            .iter()
+                            .map(|operand| preflight_operand_ty(f, operand))
+                            .collect::<Option<Vec<_>>>();
+                        let types_match = match argument_types.as_deref() {
+                            Some(actual) => source_tys_match(actual, param_tys, program)?,
+                            None => false,
+                        };
+                        let result_matches = match f.value_tys.get(*value as usize).copied() {
+                            Some(actual) => source_ty_matches(actual, *ret_ty, program)?,
+                            None => false,
+                        };
+                        if preflight_operand_ty(f, callee) != Some(Ty::Raw)
+                            || !types_match
+                            || !result_matches
+                            || !operands_match_modes(
+                                args,
+                                &signature.param_modes,
+                                param_tys,
+                                program,
+                            )
+                            || signature.return_cleanup != hir::ReturnCleanupAbi::None
+                        {
+                            return Err(callable_metadata_error());
+                        }
+                        check_signature_facts(
+                            SignatureFacts {
+                                owner: "raw indirect call",
                                 modes: &signature.param_modes,
                                 param_types: param_tys,
                                 ret: *ret_ty,
@@ -4063,6 +4140,13 @@ fn callable_preflight(
                             true,
                         )?);
                     }
+                    Rvalue::StaticData(data) => {
+                        validate_static_data_record(
+                            function.value_tys.get(*value as usize).copied(),
+                            data,
+                            &declarations,
+                        )?;
+                    }
                     _ => {}
                 }
             }
@@ -4131,6 +4215,50 @@ fn callable_preflight(
         declarations,
         generated_names,
     })
+}
+
+fn validate_static_data_record(
+    result: Option<Ty>,
+    data: &StaticData,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<(), CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!("static-data record is malformed: {detail}"))
+    };
+    if result != Some(Ty::Raw) {
+        return Err(malformed("result type is not raw"));
+    }
+    if data.bytes.is_empty() {
+        return Err(malformed("byte image is empty"));
+    }
+    if !data.align.is_power_of_two() || data.align > (1 << 29) {
+        return Err(malformed("alignment is not a supported power of two"));
+    }
+    let mut relocations = data.relocations.iter().collect::<Vec<_>>();
+    relocations.sort_by_key(|relocation| relocation.offset);
+    let mut cursor = 0usize;
+    for relocation in relocations {
+        let offset = usize::try_from(relocation.offset)
+            .map_err(|_| malformed("relocation offset does not fit the target"))?;
+        let end = offset
+            .checked_add(8)
+            .ok_or_else(|| malformed("relocation offset overflows"))?;
+        if offset % 8 != 0 || offset < cursor || end > data.bytes.len() {
+            return Err(malformed(
+                "relocation is unaligned, out of bounds, or overlaps",
+            ));
+        }
+        if data.bytes[offset..end].iter().any(|byte| *byte != 0) {
+            return Err(malformed("relocation window is not zero"));
+        }
+        if let StaticDataTarget::Function(target) = &relocation.target
+            && !declarations.contains_key(target)
+        {
+            return Err(callable_target_error(target));
+        }
+        cursor = end;
+    }
+    Ok(())
 }
 
 /// Emit the C `main` for a `Result<(), Error>`- or `Unit`-returning encoded Align main body: call
@@ -5769,6 +5897,19 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
                             }
                         }
+                        Rvalue::RawCall { callee, args, .. } => {
+                            reject_header_operand(callee, &load_defs, &owner, &mut bad);
+                            for op in args {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
+                        Rvalue::RawPointerLoad { ptr, offset } => {
+                            reject_header_operand(ptr, &load_defs, &owner, &mut bad);
+                            reject_header_operand(offset, &load_defs, &owner, &mut bad);
+                        }
+                        Rvalue::StaticDescriptorView { ptr, .. } => {
+                            reject_header_operand(ptr, &load_defs, &owner, &mut bad);
+                        }
                         Rvalue::Closure { captures, .. } => {
                             for op in captures {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
@@ -5778,6 +5919,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         Rvalue::BuilderNew { .. }
                         | Rvalue::ArrayBuilderNew { .. }
                         | Rvalue::Load(_)
+                        | Rvalue::RawNull
                         | Rvalue::StrLit(_)
                         | Rvalue::ConstArray { .. }
                         | Rvalue::StrClone(_)
@@ -8164,6 +8306,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("align_rt_alloc returns a pointer")
             }
+            Rvalue::RawNull => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
             Rvalue::RawLoad { ptr, offset, scalar } => {
                 // `raw.load(p, off)` → load the scalar at `p + off` bytes. GEP by the byte offset,
                 // then load `scalar_type(scalar)`. An arbitrary byte offset may be misaligned for the
@@ -8191,6 +8334,72 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 inst.ok_or_else(|| self.err("raw load is not an instruction"))?.set_alignment(1).map_err(|e| self.err(e))?;
                 loaded
+            }
+            Rvalue::RawPointerLoad { ptr, offset } => {
+                let pointer = self.raw_elem_ptr(ptr, offset)?;
+                let loaded = self
+                    .builder
+                    .build_load(
+                        self.ctx.ptr_type(AddressSpace::default()),
+                        pointer,
+                        "rawptrval",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_pointer_value();
+                loaded
+                    .as_instruction()
+                    .ok_or_else(|| self.err("raw pointer load is not an instruction"))?
+                    .set_alignment(1)
+                    .map_err(|error| self.err(error))?;
+                loaded.into()
+            }
+            Rvalue::StaticDescriptorView { ptr, offset } => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let pointer_offset = Operand::Const(Const::Int(i128::from(*offset), i64_ty));
+                let length_offset = Operand::Const(Const::Int(i128::from(*offset + 8), i64_ty));
+                let pointer_address = self.raw_elem_ptr(ptr, &pointer_offset)?;
+                let data = self
+                    .builder
+                    .build_load(
+                        self.ctx.ptr_type(AddressSpace::default()),
+                        pointer_address,
+                        "descriptor.str.ptr",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_pointer_value();
+                data.as_instruction()
+                    .ok_or_else(|| self.err("static descriptor string pointer is not a load"))?
+                    .set_alignment(1)
+                    .map_err(|error| self.err(error))?;
+                let length_address = self.raw_elem_ptr(ptr, &length_offset)?;
+                let length = self
+                    .builder
+                    .build_load(self.ctx.i64_type(), length_address, "descriptor.str.len")
+                    .map_err(|error| self.err(error))?
+                    .into_int_value();
+                length
+                    .as_instruction()
+                    .ok_or_else(|| self.err("static descriptor string length is not a load"))?
+                    .set_alignment(1)
+                    .map_err(|error| self.err(error))?;
+                let value = self
+                    .builder
+                    .build_insert_value(
+                        slice_struct_type(self.ctx).get_poison(),
+                        data,
+                        0,
+                        "descriptor.str",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(value, length, 1, "descriptor.str")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value()
+                    .into()
             }
             Rvalue::RawOffset { ptr, offset } => {
                 // `raw.offset(p, n)` → `p + n` bytes, as a new `raw` pointer (a plain i8 GEP, no
@@ -9440,6 +9649,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::StaticData(data) => self.static_data_global(data)?.into(),
             Rvalue::StrClone(op) => {
                 // Extract the source `{ptr,len}` view, deep-copy the bytes into a fresh heap
                 // buffer, and yield the owned `string` `{ptr,len}` the runtime returns.
@@ -11440,6 +11650,53 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
             }
+            Rvalue::RawCall {
+                callee,
+                args,
+                param_tys,
+                ret_ty,
+                signature,
+            } => {
+                if signature.return_cleanup != hir::ReturnCleanupAbi::None {
+                    return Err(self.err("raw indirect call cannot return a dynamic cleanup bit"));
+                }
+                let fn_ptr = self.operand(callee)?.into_pointer_value();
+                let param_meta = param_tys
+                    .iter()
+                    .zip(&signature.param_modes)
+                    .map(|(ty, mode)| {
+                        abi_param_type(
+                            self.ctx,
+                            self.llvm_type(*ty),
+                            *mode,
+                            align_sema::needs_drop_flag(
+                                *ty,
+                                &self.program.structs,
+                                &self.program.tuples,
+                                &self.program.enums,
+                                &self.program.tagged_types,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<BasicMetadataTypeEnum>>();
+                let argv = args
+                    .iter()
+                    .map(|operand| self.operand(operand).map(Into::into))
+                    .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
+                if *ret_ty == Ty::Unit {
+                    let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
+                    self.builder
+                        .build_indirect_call(fn_ty, fn_ptr, &argv, "")
+                        .map_err(|error| self.err(error))?;
+                    return Ok(None);
+                }
+                let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
+                let call = self
+                    .builder
+                    .build_indirect_call(fn_ty, fn_ptr, &argv, "raw.call")
+                    .map_err(|error| self.err(error))?;
+                return Ok(call.try_as_basic_value().basic());
+            }
             Rvalue::CallIndirectWithCleanup(call) => {
                 let align_mir::IndirectCallWithCleanup {
                 callee,
@@ -12554,6 +12811,81 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_constant(true);
         mark_private_unnamed_addr(g);
         (g.as_pointer_value(), len)
+    }
+
+    /// Lower a validated MIR static-data record to one private LLVM constant. Pointer relocations
+    /// become pointer-typed fields while the byte gaps retain the producer's exact scalar and
+    /// padding image. MIR producers, not this lowering, own the record's semantic contract.
+    fn static_data_global(
+        &self,
+        data: &StaticData,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        use inkwell::types::BasicType;
+        use inkwell::values::BasicValue;
+
+        if self.target_data.get_pointer_byte_size(None) != 8 {
+            return Err(self.err("static-data records require a 64-bit target pointer ABI"));
+        }
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let mut relocations = data.relocations.iter().collect::<Vec<_>>();
+        relocations.sort_by_key(|relocation| relocation.offset);
+        let mut cursor = 0usize;
+        let mut field_types = Vec::new();
+        let mut field_values = Vec::new();
+        for relocation in relocations {
+            let offset = relocation.offset as usize;
+            if offset < cursor || offset.saturating_add(8) > data.bytes.len() {
+                return Err(self.err("static-data relocation is out of bounds or overlaps"));
+            }
+            if data.bytes[offset..offset + 8].iter().any(|byte| *byte != 0) {
+                return Err(self.err("static-data relocation window is not zero"));
+            }
+            if offset > cursor {
+                let bytes = self.ctx.const_string(&data.bytes[cursor..offset], false);
+                field_types.push(bytes.get_type().as_basic_type_enum());
+                field_values.push(bytes.as_basic_value_enum());
+            }
+            let pointer = match &relocation.target {
+                StaticDataTarget::Bytes { bytes, nul_terminated } => {
+                    let mut contents = bytes.clone();
+                    if *nul_terminated {
+                        contents.push(0);
+                    }
+                    let value = self.ctx.const_string(&contents, false);
+                    let global = self.module.add_global(value.get_type(), None, "static_blob");
+                    global.set_initializer(&value);
+                    global.set_constant(true);
+                    mark_private_unnamed_addr(global);
+                    global.as_pointer_value()
+                }
+                StaticDataTarget::Function(target) => self
+                    .program_funcs
+                    .get(target)
+                    .copied()
+                    .ok_or_else(|| callable_target_error(target))?
+                    .as_global_value()
+                    .as_pointer_value(),
+            };
+            field_types.push(ptr_ty.as_basic_type_enum());
+            field_values.push(pointer.as_basic_value_enum());
+            cursor = offset + 8;
+        }
+        if cursor < data.bytes.len() {
+            let bytes = self.ctx.const_string(&data.bytes[cursor..], false);
+            field_types.push(bytes.get_type().as_basic_type_enum());
+            field_values.push(bytes.as_basic_value_enum());
+        }
+        let record_ty = self.ctx.struct_type(&field_types, false);
+        if self.target_data.get_store_size(&record_ty) != data.bytes.len() as u64 {
+            return Err(self.err("static-data LLVM layout does not match its byte image"));
+        }
+        let record = record_ty.const_named_struct(&field_values);
+        let global = self.module.add_global(record_ty, None, "static_data");
+        global.set_initializer(&record);
+        global.set_constant(true);
+        global.set_alignment(data.align);
+        mark_private_unnamed_addr(global);
+        Ok(global.as_pointer_value())
     }
 
     /// `template "..."` → in-place builder init, a write per piece, then in-place finish → str.
@@ -15309,6 +15641,394 @@ mod tests {
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+    }
+
+    #[test]
+    fn relocation_bearing_static_data_fails_closed_before_llvm() {
+        let emit = |data: StaticData, result: Ty| {
+            codegen_program(
+                vec![Stmt::Let(0, Rvalue::StaticData(Box::new(data)))],
+                vec![result],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+        let valid = StaticData {
+            bytes: vec![0; 16],
+            align: 8,
+            relocations: vec![align_mir::StaticDataRelocation {
+                offset: 0,
+                target: StaticDataTarget::Bytes {
+                    bytes: vec![1, 2, 3],
+                    nul_terminated: true,
+                },
+            }],
+        };
+        assert!(emit(valid.clone(), Ty::Raw).is_ok());
+
+        let rejected = |data, result, expected| {
+            let error = emit(data, result).expect_err("malformed static data must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}`, got `{error}`"
+            );
+        };
+        rejected(valid.clone(), Ty::Int(IntTy { bits: 64, signed: true }), "result type");
+
+        let mut empty = valid.clone();
+        empty.bytes.clear();
+        empty.relocations.clear();
+        rejected(empty, Ty::Raw, "byte image is empty");
+
+        let mut bad_align = valid.clone();
+        bad_align.align = 3;
+        rejected(bad_align, Ty::Raw, "alignment");
+
+        let mut unaligned = valid.clone();
+        unaligned.relocations[0].offset = 1;
+        rejected(unaligned, Ty::Raw, "unaligned");
+
+        let mut nonzero = valid.clone();
+        nonzero.bytes[0] = 1;
+        rejected(nonzero, Ty::Raw, "window is not zero");
+
+        let mut overlap = valid.clone();
+        overlap.relocations.push(overlap.relocations[0].clone());
+        rejected(overlap, Ty::Raw, "overlaps");
+
+        let mut missing_function = valid;
+        missing_function.relocations[0].target =
+            StaticDataTarget::Function(program_call("missing$thunk"));
+        rejected(missing_function, Ty::Raw, "callable target invalid");
+    }
+
+    fn raw_call_program() -> Program {
+        let mut program = mir(
+            "fn target(context: raw, borrow value: i64) -> i64 = value\n\
+             fn main() -> i32 {\n\
+               unsafe {\n\
+                 context := raw.alloc(1)\n\
+                 value := 42\n\
+                 result := target(context, value)\n\
+                 raw.free(context)\n\
+                 return result as i32\n\
+               }\n\
+             }\n",
+        );
+        let main = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "main")
+            .expect("main function");
+        let (block_index, statement_index) = main
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .stmts
+                    .iter()
+                    .position(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), _))
+                                if target.as_str() == "target"
+                        )
+                    })
+                    .map(|statement_index| (block_index, statement_index))
+            })
+            .expect("direct target call");
+        let (result, args) = match &main.blocks[block_index].stmts[statement_index] {
+            Stmt::Let(result, Rvalue::Call(DirectCall::Program(_), args)) => {
+                (*result, args.clone())
+            }
+            _ => unreachable!(),
+        };
+        let descriptor = main.value_tys.len() as ValueId;
+        main.value_tys.push(Ty::Raw);
+        let callee = main.value_tys.len() as ValueId;
+        main.value_tys.push(Ty::Raw);
+        let block = &mut main.blocks[block_index];
+        block.stmts.insert(
+            statement_index,
+            Stmt::Let(
+                descriptor,
+                Rvalue::StaticData(Box::new(StaticData {
+                    bytes: vec![0; 8],
+                    align: 8,
+                    relocations: vec![align_mir::StaticDataRelocation {
+                        offset: 0,
+                        target: StaticDataTarget::Function(program_call("target")),
+                    }],
+                })),
+            ),
+        );
+        block.stmts.insert(
+            statement_index + 1,
+            Stmt::Let(
+                callee,
+                Rvalue::RawPointerLoad {
+                    ptr: Operand::Value(descriptor),
+                    offset: Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                    )),
+                },
+            ),
+        );
+        block.stmts[statement_index + 2] = Stmt::Let(
+            result,
+            Rvalue::RawCall {
+                callee: Operand::Value(callee),
+                args,
+                param_tys: vec![
+                    Ty::Raw,
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                ],
+                ret_ty: Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![
+                        align_ast::ParamMode::ByValue,
+                        align_ast::ParamMode::Borrow,
+                    ],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            },
+        );
+        program
+    }
+
+    fn raw_call_mut(program: &mut Program) -> (&mut Rvalue, ValueId) {
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    if let Stmt::Let(result, rvalue @ Rvalue::RawCall { .. }) = statement {
+                        return (rvalue, *result);
+                    }
+                }
+            }
+        }
+        panic!("raw call fixture");
+    }
+
+    fn raw_pointer_load_mut(program: &mut Program) -> (&mut Rvalue, ValueId) {
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    if let Stmt::Let(result, rvalue @ Rvalue::RawPointerLoad { .. }) = statement {
+                        return (rvalue, *result);
+                    }
+                }
+            }
+        }
+        panic!("raw pointer load fixture");
+    }
+
+    #[test]
+    fn raw_call_has_typed_bare_pointer_abi_and_fails_closed() {
+        let valid = raw_call_program();
+        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, false, &[], None)
+            .expect("valid raw call");
+        assert!(
+            llvm.contains("call i64 %rawptrval(ptr"),
+            "raw call must use the bare two-argument ABI without a closure environment:\n{llvm}",
+        );
+
+        let rejected = |program: &Program| {
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("malformed raw call must fail before LLVM construction");
+            assert!(
+                error.to_string().contains("callable metadata invalid"),
+                "unexpected diagnostic: {error}",
+            );
+        };
+
+        let mut wrong_callee = valid.clone();
+        let (call, _) = raw_call_mut(&mut wrong_callee);
+        let Rvalue::RawCall { callee, .. } = call else { unreachable!() };
+        *callee = Operand::Const(Const::Int(
+            0,
+            Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+        ));
+        rejected(&wrong_callee);
+
+        let mut wrong_argument_type = valid.clone();
+        let (call, _) = raw_call_mut(&mut wrong_argument_type);
+        let Rvalue::RawCall { param_tys, .. } = call else { unreachable!() };
+        param_tys[1] = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        rejected(&wrong_argument_type);
+
+        let mut wrong_mode = valid.clone();
+        let (call, _) = raw_call_mut(&mut wrong_mode);
+        let Rvalue::RawCall { signature, .. } = call else { unreachable!() };
+        signature.param_modes[1] = align_ast::ParamMode::ByValue;
+        rejected(&wrong_mode);
+
+        let mut wrong_result = valid.clone();
+        let (call, _) = raw_call_mut(&mut wrong_result);
+        let Rvalue::RawCall { ret_ty, .. } = call else { unreachable!() };
+        *ret_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        rejected(&wrong_result);
+
+        let mut dynamic_cleanup = valid;
+        let (call, _) = raw_call_mut(&mut dynamic_cleanup);
+        let Rvalue::RawCall { signature, .. } = call else { unreachable!() };
+        signature.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+        rejected(&dynamic_cleanup);
+    }
+
+    #[test]
+    fn raw_pointer_load_fails_closed_before_llvm() {
+        let rejected = |program: &Program| {
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("malformed raw pointer load must fail before LLVM construction");
+            assert!(
+                error.to_string().contains("raw pointer load metadata invalid"),
+                "unexpected diagnostic: {error}",
+            );
+        };
+
+        let valid = raw_call_program();
+        let mut wrong_pointer = valid.clone();
+        let (load, _) = raw_pointer_load_mut(&mut wrong_pointer);
+        let Rvalue::RawPointerLoad { ptr, .. } = load else { unreachable!() };
+        *ptr = Operand::Const(Const::Int(
+            0,
+            Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+        ));
+        rejected(&wrong_pointer);
+
+        let mut wrong_offset = valid.clone();
+        let (load, _) = raw_pointer_load_mut(&mut wrong_offset);
+        let Rvalue::RawPointerLoad { offset, .. } = load else { unreachable!() };
+        *offset = Operand::Const(Const::Bool(false));
+        rejected(&wrong_offset);
+
+        let mut wrong_result = valid;
+        let (_, result) = raw_pointer_load_mut(&mut wrong_result);
+        let main = wrong_result
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "main")
+            .expect("main function");
+        main.value_tys[result as usize] = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        rejected(&wrong_result);
+    }
+
+    #[test]
+    fn raw_null_requires_an_exact_raw_result_before_llvm() {
+        let emit = |result| {
+            codegen_program(
+                vec![Stmt::Let(0, Rvalue::RawNull)],
+                vec![result],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+        assert!(emit(Ty::Raw).is_ok());
+
+        let error = emit(Ty::Int(IntTy {
+            bits: 64,
+            signed: false,
+        }))
+        .expect_err("a malformed raw null result must fail before LLVM construction");
+        assert!(
+            error
+                .to_string()
+                .contains("raw null result metadata invalid"),
+            "unexpected diagnostic: {error}",
+        );
+    }
+
+    #[test]
+    fn static_descriptor_view_is_fixed_and_fails_closed() {
+        let emit = |pointer: Operand, result: Ty, offset: u32| {
+            let mut bytes = vec![0; 32];
+            bytes[24..32].copy_from_slice(&3_i64.to_le_bytes());
+            codegen_program(
+                vec![
+                    Stmt::Let(
+                        0,
+                        Rvalue::StaticData(Box::new(StaticData {
+                            bytes,
+                            align: 8,
+                            relocations: vec![align_mir::StaticDataRelocation {
+                                offset: 16,
+                                target: StaticDataTarget::Bytes {
+                                    bytes: b"db1".to_vec(),
+                                    nul_terminated: true,
+                                },
+                            }],
+                        })),
+                    ),
+                    Stmt::Let(1, Rvalue::StaticDescriptorView { ptr: pointer, offset }),
+                ],
+                vec![Ty::Raw, result],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+        let llvm = emit(Operand::Value(0), Ty::Str, 16).expect("valid descriptor view");
+        assert!(
+            llvm.contains("descriptor.str.ptr") && llvm.contains("descriptor.str.len"),
+            "descriptor view must load exactly its pointer and length:\n{llvm}",
+        );
+
+        let rejected = |pointer, result, offset| {
+            let error = emit(pointer, result, offset)
+                .expect_err("malformed descriptor view must fail before LLVM construction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("static descriptor view metadata invalid"),
+                "unexpected diagnostic: {error}",
+            );
+        };
+        rejected(
+            Operand::Const(Const::Int(
+                0,
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            )),
+            Ty::Str,
+            16,
+        );
+        rejected(Operand::Value(0), Ty::Raw, 16);
+        rejected(Operand::Value(0), Ty::Str, 24);
     }
 
     #[test]

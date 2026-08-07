@@ -1,0 +1,70 @@
+module pkg.db.internal.resource
+
+extern "C" link("sqlite3") {
+  fn sqlite3_close_v2(database: raw) -> i32
+}
+
+extern "C" link("pq") {
+  fn PQfinish(connection: raw)
+}
+
+// The state is private to pkg.db descendants. Its fixed Q2 prefix is:
+//   0: u32 version (= 1)
+//   4: u8  driver (1 = SQLite, 2 = PostgreSQL)
+//   5: u8  poisoned/closed
+//   6: u16 reserved (= 0)
+//   8: raw native connection
+//  16: i32 SQLite busy timeout in native milliseconds
+//  20: u8  active execution lease
+//  21: u8  reserved
+//  22: u16 reserved
+// The native pointer stays an actual pointer. The package never integer-casts it and the runtime
+// owns neither this layout nor either database handle.
+pub fn new_conn_state(driver: u8, native: raw, sqlite_busy_ms: i32) -> raw {
+  unsafe {
+    state := raw.alloc(24)
+    version: u32 := 1
+    clear: u8 := 0
+    reserved: u16 := 0
+    raw.store(state, 0, version)
+    raw.store(state, 4, driver)
+    raw.store(state, 5, clear)
+    raw.store(state, 6, reserved)
+    raw.store(state, 8, native)
+    raw.store(state, 16, sqlite_busy_ms)
+    raw.store(state, 20, clear)
+    raw.store(state, 21, clear)
+    raw.store(state, 22, reserved)
+    return state
+  }
+}
+
+fn drop_state(state: raw) {
+  unsafe {
+    if state.is_null() { return }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    native: raw := raw.load(state, 8)
+    // A malformed private state is still freed, but never dispatched through an untrusted tag.
+    // Both native destructors are null-guarded here so partial construction has one cleanup edge.
+    if version == 1 && !native.is_null() {
+      if driver == 1 {
+        ignored := sqlite3_close_v2(native)
+      } else {
+        if driver == 2 { PQfinish(native) }
+      }
+    }
+    raw.free(state)
+  }
+}
+
+pub fn drop_conn(state: raw) {
+  unsafe { drop_state(state) }
+}
+
+pub fn drop_tx(state: raw) {
+  // D7 extends the private transaction state. Until then a transaction cannot be constructed, but
+  // the settled resource type uses the same fail-closed native dispatch if malformed trusted HIR
+  // ever supplies one.
+  unsafe { drop_state(state) }
+}

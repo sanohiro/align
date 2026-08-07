@@ -185,10 +185,9 @@ library concern), so strings sort and compare. `else` works on `Result` as well 
 the intent triangle is `?` propagates / `else` falls back / `match` inspects. Details:
 `draft.md` §4 / §5 / §12.
 
-Implementation status: comparison operators and `Eq`/`Ord` bounds currently accept borrowed
-`str`; direct owned-`string` comparison is still pending. To compare owned strings today, pass
-them through a `str`-typed helper so the normal `string` → `str` borrow coercion is explicit in
-the program's type flow.
+Comparison operators and `Eq`/`Ord` bounds accept both `str` and owned `string`. An owned operand
+is compared through a non-consuming, zero-cost `str` borrow, including in mixed `string`/`str`
+comparisons and monomorphized generic functions.
 
 ### Generics
 
@@ -576,7 +575,8 @@ Dangerous operations:
 unsafe
 ```
 
-Only inside an unsafe block: the `raw.*` flat-memory ops (`alloc`/`free`/`load`/`store`/`offset`) and
+Only inside an unsafe block: the `raw.*` flat-memory ops
+(`null`/`alloc`/`free`/`load`/`store`/`offset`) and
 a foreign call. A C function is declared `extern "C" fn name(params) -> ret` (or a braced group) and
 called like any other function, but only inside `unsafe` — foreign code is outside the safe core. A
 direct call or non-escaping pipeline/reducer/sort callback requires that lexical `unsafe`
@@ -589,12 +589,20 @@ struct. Returns admit `()`, integer and float scalars, `raw`, and an eligible no
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
 wrappers and borrow C engines via FFI.
 
+`raw.store(p, offset, value)` and `raw.load(p, offset)` move one inferred flat value at a byte
+offset. Store takes its type from `value`; load takes it from the expected result type. Admitted
+values are primitive scalars, `raw` pointers, and eligible non-empty `layout(C)` structs. Pointer
+slots therefore retain native handles without integer casts, while pointer validity, allocation
+size, and effective type remain the enclosing `unsafe` block's obligation.
+`raw.null()` is the sole explicit null-pointer constructor for native ABI arguments and sentinels;
+ordinary Align values still have no null model, and a raw pointer is tested with `p.is_null()`.
+
 A normal (non-`layout(C)`) struct has an **unspecified field order**: the compiler reorders fields by
 descending alignment to eliminate padding (`{ a: i8, b: i64, c: i8 }` → 16 bytes, not 24), a
 by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point { … }`, composes with
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
-order, natural alignment, no reordering). Only such a struct may be written to / read from `raw`
-memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
+order, natural alignment, no reordering). Among structs, only such a struct may be written to / read
+from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
 FFI-mappable scalars. On x86-64 SysV, a `layout(C)` struct in the ABI's register classes and no
 larger than 16 bytes may also cross by value; MEMORY-class/larger structs and other platform ABIs
 remain pointer-only.
