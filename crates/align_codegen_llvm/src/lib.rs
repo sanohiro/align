@@ -1876,20 +1876,14 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         "{owner} uses `out` in a function-value ABI"
                     )));
                 }
-                align_ast::ParamMode::Borrow => {
-                    if !align_sema::needs_drop_flag(
-                        ty,
-                        &program.structs,
-                        &program.tuples,
-                        &program.enums,
-                        &program.tagged_types,
-                    ) {
-                        return Err(CodegenError::Lowering(format!(
-                            "{owner} uses {mode:?} with a non-Move parameter type"
-                        )));
-                    }
+                align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut
+                    if ty == Ty::ArenaHandle =>
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} borrows a region capability instead of passing it by value"
+                    )));
                 }
-                align_ast::ParamMode::BorrowMut => {}
+                align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => {}
             }
         }
         let validate_summary =

@@ -2,8 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+benchmark_target="$repo_root/bench/library_boundary/target"
 if [[ "${1:-}" == "move-return" || "${1:-}" == "shared-borrow" || "${1:-}" == "exclusive-borrow" ]]; then
-  "$repo_root/scripts/cargo.sh" build \
+  CARGO_TARGET_DIR="$benchmark_target" "$repo_root/scripts/cargo.sh" build \
     --quiet \
     --release \
     --manifest-path "$repo_root/Cargo.toml" \

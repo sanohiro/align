@@ -55,7 +55,9 @@ nanoseconds per call. `copy-return-control` is the value-only control; `move-ret
 cost is amortized across the inner loop; the rows are comparative evidence, not timing assertions.
 
 `shared-borrow` compares the `by-value-call-control` row with repeated zero-allocation
-`shared-borrow-call` inspection of one owned string. `exclusive-borrow` compares a by-value Copy
+`shared-borrow-call` inspection of one owned string. Its `copy-aggregate-value-control` and
+`copy-aggregate-shared-borrow` pair compare ordinary by-value transfer with the explicit pointer ABI
+for the same 64-byte Copy aggregate. `exclusive-borrow` compares a by-value Copy
 update (`exclusive-copy-control`) with an in-place Copy update (`exclusive-copy-call`) and records
 the allocation-and-Drop cost of replacing a Move string through the caller cleanup-bit ABI
 (`exclusive-move-replace`). Each row uses the same 100,000-call inner loop.

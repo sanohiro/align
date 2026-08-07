@@ -225,7 +225,8 @@ for this dynamic ownership result.
 The return-borrow summary is not limited to parameters spelled `borrow`. A by-value Copy view such
 as `str`, `slice<T>`, `resource_ref<R>`, or a recursively view-bearing `db.exec` may back the
 returned value and therefore appears in the same parameter-index summary. The `borrow` spelling is
-needed specifically to avoid consuming a Move owner.
+needed to avoid consuming a Move owner or structurally copying stable Copy storage. Ordinary Copy
+arguments remain by value unless the declaration explicitly chooses the no-copy borrow ABI.
 
 `borrow mut` parameters are already explicit invalidation summaries. No second user annotation or
 name-based effect table is allowed.
@@ -3922,7 +3923,7 @@ their first owning slice and remain cumulative gates afterward.
 | L2b-a2-t | `cargo test -p align_sema projected_return_provenance_fails_closed`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
-| L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call` |
+| L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call`, `copy-aggregate-value-control`, `copy-aggregate-shared-borrow` |
 | L2e | `cargo test -p align_driver --test borrowed_params exclusive_`; `cargo test -p align_driver --test out_params --test analysis_coverage` | `bench/library_boundary/run.sh exclusive-borrow`: `exclusive-copy-control`, `exclusive-copy-call`, `exclusive-move-replace` |
 
 The following table is the normative L2b-a1 effect-evaluation inventory, not a claim that one test

@@ -24431,19 +24431,6 @@ impl<'a, 't> Checker<'a, 't> {
                     p.ty.span(),
                 );
             }
-            if p.mode == ast::ParamMode::Borrow
-                && ty != Ty::Error
-                && !matches!(ty, Ty::Param(_))
-                && !ty_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types)
-            {
-                self.diags.error(
-                    format!(
-                        "a borrowed parameter must be a Move type, got {}",
-                        ty_name(ty)
-                    ),
-                    p.ty.span(),
-                );
-            }
             self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(
                 &p.name.name,
@@ -27181,23 +27168,6 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return;
         };
-        if mode == ast::ParamMode::Borrow
-            && !ty_is_move(
-                argument.ty,
-                self.structs,
-                self.tuples,
-                self.enums,
-                self.tagged_types,
-            )
-        {
-            self.diags.error(
-                format!(
-                    "the {mode:?} argument to '{display}' must have a Move type, got {}",
-                    self.ty_display(argument.ty)
-                ),
-                argument.span,
-            );
-        }
         if mode == ast::ParamMode::BorrowMut
             && matches!(argument.kind, ExprKind::Field { .. })
             && ty_is_move(
@@ -41094,19 +41064,6 @@ fn resolve_type(
                     diags.error(
                         format!(
                             "an `out` function-type parameter must be a slice, got {}",
-                            ty_name(pty)
-                        ),
-                        p.ty.span(),
-                    );
-                    return Ty::Error;
-                }
-                if p.mode == ast::ParamMode::Borrow
-                    && !matches!(pty, Ty::Param(_))
-                    && !ty_is_move(pty, cx.structs, cx.tuples, cx.enums, cx.tagged_types)
-                {
-                    diags.error(
-                        format!(
-                            "a borrowed function-type parameter must be a Move type, got {}",
                             ty_name(pty)
                         ),
                         p.ty.span(),
