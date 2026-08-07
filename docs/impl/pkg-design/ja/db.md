@@ -1922,6 +1922,35 @@ production APIを作らず、SQLite pointer validity、libpq full/single-row res
 protocolの1 statement性、parameter/result metadata、nullability evidence、cancel/cleanupを
 実測して記録する。
 
+#### D0実測 — 2026-08-07
+
+Q2 author probeはApple Silicon macOS 26.5.2でconsumed C signatureを
+`-Wall -Wextra -Werror`によりcompileし、Homebrew SQLite 3.53.3とlibpq 18.4をPostgreSQL
+18.4に対して実行した。選択したarm64 dylibはcompatibility version 9の
+`libsqlite3.0.dylib`とversion 5の`libpq.5.dylib`だった。unqualified local `pkg-config`は
+SQLite 3.51.0を報告した一方、明示選択したHomebrew libraryは3.53.3だったため、Q2は
+discovery metadataから推測せずlinked runtime versionをtest/reportする。
+
+SQLiteでは`sqlite3_prepare_v3` tailが最初のterminator直後のbyte 74を指し、comment付き
+tailを再prepareするとsecond statementになった。従ってcomplete tailを走査しwhitespace/comment
+だけを許す。2-row resultは`INTEGER, NULL, INTEGER, TEXT`を報告し、base columnはdeclaration/
+originを持つがexpressionは持たなかった。current-row text pointerは同じrowのread中だけ保持され、
+次のstepでsecond row用に同じaddressがreuseされた。`step`、`reset`、`finalize`は全て失効境界であり、
+Q2は次のstep前にscalarをcacheしnative pointerを保持しない。cross-thread
+`sqlite3_interrupt`はactive stepを`SQLITE_INTERRUPT` (9)にし、finalize後の同じautocommit
+connectionで`SELECT 42`が成功した。
+
+libpqでは`PQexecParams`が`SELECT $1::bigint; SELECT 2`を`PGRES_FATAL_ERROR`/SQLSTATE
+`42601`で拒否した。buffered row bytesはowning `PGresult`をclearするまで別result取得後も有効で、
+single-row modeでもfirst `PGRES_SINGLE_TUPLE` resultを保持したままsecond resultを取得すると
+first bytesは有効だった。terminal resultは0 row、同じ2 fieldの`PGRES_TUPLES_OK`だった。
+base `bigint`はOID 20、nonzero table OID、attribute ordinal 1を返し、expressionはtable/attribute
+zeroだった。`PQgetisnull`はruntime NULLを返すがordinary result APIに完全なdeclared-nullability
+factはないため、D5がorigin/catalog evidenceを結合しproof不能時はfail closedする。
+`PQcancelBlocking`成功後、drainしたresultは`PGRES_FATAL_ERROR`/SQLSTATE `57014`となり、全result
+clear後のidle connectionで`SELECT 42`が成功した。Q2はsynchronous cleanupを所有し、後のpublic
+cancellationはcomplete drain後だけconnectionを再利用する。
+
 ### D1 — fake driver上のgenerated Query/command
 
 #### Q1/D1 implementation closure matrix

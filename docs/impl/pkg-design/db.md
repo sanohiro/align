@@ -3238,6 +3238,49 @@ Read-only/throwaway probes establish:
 - parameter/result metadata and nullability actually available from each engine;
 - cancellation and cleanup behavior.
 
+#### D0 measured evidence — 2026-08-07
+
+The Q2 author probe compiled the exact consumed C signatures with `-Wall -Wextra -Werror` on
+Apple Silicon macOS 26.5.2 and exercised Homebrew SQLite 3.53.3 plus libpq 18.4 against PostgreSQL
+18.4. The selected arm64 dynamic libraries were `libsqlite3.0.dylib` with compatibility version 9
+and `libpq.5.dylib` with compatibility version 5. Unqualified local `pkg-config` advertised SQLite
+3.51.0 while the explicitly selected Homebrew library reported 3.53.3; Q2 must therefore test and
+report the linked library's runtime version rather than infer it from discovery metadata.
+
+The observed SQLite contract was:
+
+- `sqlite3_prepare_v3` compiled with the exact tail-pointer signature and left the tail at byte 74,
+  immediately after the first statement terminator; preparing the comment-prefixed tail produced
+  the second statement. The package must inspect the complete tail and accept only whitespace and
+  comments rather than treating a non-null tail pointer as sufficient.
+- A two-row result reported runtime storage classes `INTEGER, NULL, INTEGER, TEXT`. Base columns
+  exposed declaration and origin names with `ENABLE_COLUMN_METADATA`; the expression exposed
+  neither. The first text pointer remained usable during reads of the current row, the next step
+  reused its address for the second row, and `step`, `reset`, and `finalize` are all pointer
+  invalidation boundaries. Q2 may cache decoded scalar values before the next step but may not
+  retain native column pointers.
+- Cross-thread `sqlite3_interrupt` made the active step return `SQLITE_INTERRUPT` (9). Finalizing
+  that statement left autocommit enabled and the same connection immediately executed `SELECT 42`.
+
+The observed PostgreSQL/libpq contract was:
+
+- `PQexecParams` rejected `SELECT $1::bigint; SELECT 2` with `PGRES_FATAL_ERROR` and SQLSTATE
+  `42601`, confirming extended-query single-statement enforcement in addition to the package's
+  static scanner.
+- A buffered result retained row bytes while a separate result was obtained and until its owning
+  `PGresult` was cleared. In single-row mode, the first `PGRES_SINGLE_TUPLE` bytes remained valid
+  while the second result was obtained because the first result remained owned; the terminal result
+  was `PGRES_TUPLES_OK` with zero rows and the same two fields. Every pointer becomes unusable when
+  its own `PGresult` is cleared.
+- A base `bigint` column reported OID 20, nonzero table OID, and attribute ordinal 1. An expression
+  reported table OID and attribute ordinal zero. `PQgetisnull` supplied runtime NULL state, but the
+  ordinary result API supplied no complete declared-nullability fact. D5 must combine origin and
+  catalog evidence and fail closed when that proof is unavailable.
+- `PQcancelBlocking` succeeded; draining the connection produced `PGRES_FATAL_ERROR` with SQLSTATE
+  `57014`. After all results were cleared, the same idle connection executed `SELECT 42`. Q2 owns
+  synchronous cleanup; the later public cancellation surface may reuse the connection only after
+  the complete result drain.
+
 The deliverable is recorded evidence in this document or a focused audit, not production raw handles.
 
 ### D1 — generated Query/command plans over a fake driver
