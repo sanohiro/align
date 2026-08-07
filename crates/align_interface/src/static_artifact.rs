@@ -171,6 +171,96 @@ pub struct CanonicalContract {
     pub definitions: Vec<CanonicalDefinition>,
 }
 
+impl TryFrom<&align_sema::StaticContract> for CanonicalContract {
+    type Error = StaticArtifactError;
+
+    fn try_from(contract: &align_sema::StaticContract) -> Result<Self, Self::Error> {
+        fn ty(
+            value: &align_sema::StaticContractType,
+        ) -> Result<CanonicalType, StaticArtifactError> {
+            Ok(match value {
+                align_sema::StaticContractType::Named { path, args } => CanonicalType::Named {
+                    path: path.clone(),
+                    args: args.iter().map(ty).collect::<Result<Vec<_>, _>>()?,
+                },
+                align_sema::StaticContractType::FixedArray { .. } => {
+                    return Err(invalid(
+                        "fixed arrays are not part of the static artifact v1 type contract",
+                    ));
+                }
+                align_sema::StaticContractType::Tuple(elements) => {
+                    CanonicalType::Tuple(elements.iter().map(ty).collect::<Result<Vec<_>, _>>()?)
+                }
+                align_sema::StaticContractType::Fn { params, result } => CanonicalType::Fn {
+                    params: params.iter().map(ty).collect::<Result<Vec<_>, _>>()?,
+                    result: Box::new(ty(result)?),
+                },
+            })
+        }
+
+        let mut definitions = contract
+            .definitions
+            .iter()
+            .map(|definition| {
+                Ok(CanonicalDefinition {
+                    path: definition.path.clone(),
+                    args: definition
+                        .args
+                        .iter()
+                        .map(ty)
+                        .collect::<Result<Vec<_>, StaticArtifactError>>()?,
+                    kind: match &definition.kind {
+                        align_sema::StaticContractDefinitionBody::Struct { fields } => {
+                            CanonicalDefinitionBody::Struct {
+                                fields: fields
+                                    .iter()
+                                    .map(|field| {
+                                        Ok(CanonicalField {
+                                            name: field.name.clone(),
+                                            ty: ty(&field.ty)?,
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, StaticArtifactError>>()?,
+                            }
+                        }
+                        align_sema::StaticContractDefinitionBody::Sum { variants } => {
+                            CanonicalDefinitionBody::Sum {
+                                variants: variants
+                                    .iter()
+                                    .map(|variant| {
+                                        Ok(CanonicalVariant {
+                                            name: variant.name.clone(),
+                                            payload: variant
+                                                .payload
+                                                .iter()
+                                                .map(ty)
+                                                .collect::<Result<Vec<_>, StaticArtifactError>>()?,
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, StaticArtifactError>>()?,
+                            }
+                        }
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, StaticArtifactError>>()?;
+        let mut keyed = definitions
+            .drain(..)
+            .map(|definition| Ok((write_definition_key(&definition)?, definition)))
+            .collect::<Result<Vec<_>, StaticArtifactError>>()?;
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        let contract = CanonicalContract {
+            root: ty(&contract.root)?,
+            definitions: keyed
+                .into_iter()
+                .map(|(_, definition)| definition)
+                .collect(),
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub start: u32,
@@ -545,6 +635,17 @@ impl CanonicalContract {
             }
         }
         Ok(())
+    }
+
+    /// Project one field/root type into its exact reachable structural sub-contract.
+    pub fn project(&self, root: &CanonicalType) -> Result<Self, StaticArtifactError> {
+        project_contract(self, root)
+    }
+}
+
+impl CanonicalType {
+    pub fn spelling(&self) -> String {
+        canonical_type_spelling(self)
     }
 }
 
@@ -2275,6 +2376,37 @@ mod tests {
             path: path.to_string(),
             args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn sema_contract_conversion_preserves_the_closed_v1_type_tags() {
+        let contract = align_sema::StaticContract {
+            root: align_sema::StaticContractType::Named {
+                path: "app.Params".into(),
+                args: Vec::new(),
+            },
+            definitions: vec![align_sema::StaticContractDefinition {
+                path: "app.Params".into(),
+                args: Vec::new(),
+                kind: align_sema::StaticContractDefinitionBody::Struct {
+                    fields: vec![align_sema::StaticContractField {
+                        name: "digest".into(),
+                        ty: align_sema::StaticContractType::FixedArray {
+                            element: Box::new(align_sema::StaticContractType::Named {
+                                path: "u8".into(),
+                                args: Vec::new(),
+                            }),
+                            length: 4,
+                        },
+                    }],
+                },
+            }],
+        };
+        assert!(matches!(
+            CanonicalContract::try_from(&contract),
+            Err(StaticArtifactError::Invalid(reason))
+                if reason.contains("not part of the static artifact v1 type contract")
+        ));
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub use static_artifact::{
     ParameterOccurrence, QueryMetaPlan, RewriteEntry, Span, SqlSourceIdentity, StaticArtifact,
     StaticArtifactError, StaticCommandArtifact, StaticOption, StaticOptionOwner, StaticOptionValue,
     StaticQueryArtifact, VerificationState, BINDER_ABI_VERSION, DECODER_ABI_VERSION,
-    STATIC_ARTIFACT_FORMAT_VERSION,
+    REWRITE_FORMAT_VERSION, STATIC_ARTIFACT_FORMAT_VERSION,
 };
 
 use std::collections::{HashMap, HashSet};

@@ -148,6 +148,7 @@ impl SourceShapeView for CanonicalTypeView<'_> {
                 self.structs
                     .get(id as usize)
                     .map(|definition| SourceShapeNode::Struct {
+                        name: &definition.name,
                         source_name: &definition.source_name,
                         align: &definition.align,
                         c_repr: &definition.c_repr,
@@ -280,11 +281,18 @@ impl<'a> GraphValidator<'a> {
         let mut references = Vec::new();
         match shape {
             SourceShapeNode::Struct {
+                name,
                 source_name,
                 align,
                 fields,
-                ..
+                c_repr,
             } => {
+                let static_descriptor = (name.starts_with("pkg.db$query$")
+                    || name.starts_with("pkg.db$command$"))
+                    && matches!(fields, [hir::FieldDef { name, ty: Ty::Raw }]
+                        if name == align_sema::STATIC_DESCRIPTOR_DATA_FIELD)
+                    && align.is_none()
+                    && !*c_repr;
                 let source_ordinal = self.field_ordinal();
                 self.validate_source_name(source_name, source_ordinal);
                 if let Some(align) = *align {
@@ -301,7 +309,9 @@ impl<'a> GraphValidator<'a> {
                 let mut names = HashSet::new();
                 for field in fields {
                     let name_ordinal = self.field_ordinal();
-                    self.validate_identifier(&field.name, name_ordinal);
+                    if !static_descriptor {
+                        self.validate_identifier(&field.name, name_ordinal);
+                    }
                     if !names.insert(field.name.as_str()) {
                         self.candidate(name_ordinal, CanonicalGraphError::DuplicateMember);
                     }

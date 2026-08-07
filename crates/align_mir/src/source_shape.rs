@@ -7,6 +7,7 @@ use super::canonical_graph::Node;
 
 pub(super) enum SourceShapeNode<'a> {
     Struct {
+        name: &'a str,
         source_name: &'a str,
         align: &'a Option<u32>,
         c_repr: &'a bool,
@@ -56,6 +57,7 @@ impl SourceShapeView for hir::Program {
                 self.structs
                     .get(id as usize)
                     .map(|definition| SourceShapeNode::Struct {
+                        name: &definition.name,
                         source_name: &definition.source_name,
                         align: &definition.align,
                         c_repr: &definition.c_repr,
@@ -220,12 +222,14 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
                     align: left_align,
                     c_repr: left_c_repr,
                     fields: left_fields,
+                    ..
                 },
                 SourceShapeNode::Struct {
                     source_name: right_name,
                     align: right_align,
                     c_repr: right_c_repr,
                     fields: right_fields,
+                    ..
                 },
             ) => {
                 if left_name != right_name
@@ -771,6 +775,7 @@ pub(super) mod tests {
             self.0
                 .get(id as usize)
                 .map(|value| SourceShapeNode::Struct {
+                    name: &value.name,
                     source_name: &value.source_name,
                     align: &value.align,
                     c_repr: &value.c_repr,

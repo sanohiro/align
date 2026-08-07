@@ -2631,8 +2631,9 @@ pub struct Module<'f> {
 
 /// One resolved L5 static Query/command descriptor discovered during source checking.
 ///
-/// This record is deliberately separate from [`Program`]: L5c publishes the frontend-to-driver
-/// request without changing HIR/MIR or claiming that the D1 runtime descriptor ABI exists.
+/// This record is deliberately separate from [`Program`]: the frontend publishes the validated
+/// request, then D1's driver-owned post-lowering pass builds the artifact and installs the runtime
+/// descriptor body. Static input bytes never enter semantic body checking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticDescriptor {
     pub unit: String,
@@ -2645,6 +2646,332 @@ pub struct StaticDescriptor {
     pub constructor_span: Span,
     pub common_options_span: Span,
     pub native_options_span: Option<Span>,
+    /// The concrete `P` in `db.query<P, R>` / `db.command<P>`. This is remapped together with HIR
+    /// nominal ids when abstract generic instances are compacted.
+    pub params_ty: Ty,
+    /// The concrete `R` in `db.query<P, R>`. Commands have no result contract.
+    pub row_ty: Option<Ty>,
+    /// Canonical, reachable structural contract for `params_ty`, independent of process-local HIR
+    /// ids. It is produced before descriptor publication and consumed by the artifact boundary.
+    pub params_contract: StaticContract,
+    /// Canonical Query row contract. Commands omit it exactly.
+    pub row_contract: Option<StaticContract>,
+    pub static_options: Vec<StaticDescriptorOption>,
+}
+
+/// Compiler-private field carried by concrete `pkg.db` Query/command descriptor values.
+///
+/// The spelling is outside Align's identifier grammar, so package and application source cannot
+/// construct or inspect it. Consumers still monomorphize the public, fieldless generic declaration
+/// to the same physical ABI, while the producer initializes the pointer from generated static data.
+pub const STATIC_DESCRIPTOR_DATA_FIELD: &str = "$static";
+
+fn static_descriptor_generic_arity(name: &str) -> Option<usize> {
+    match name {
+        "pkg.db$query" => Some(2),
+        "pkg.db$command" => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether this concrete struct is the exact compiler-generated runtime representation of a
+/// `pkg.db.query<P, R>` or `pkg.db.command<P>` value.
+pub fn static_descriptor_struct_is_valid(definition: &hir::StructDef) -> bool {
+    (definition.name.starts_with("pkg.db$query$") || definition.name.starts_with("pkg.db$command$"))
+        && matches!(
+            definition.fields.as_slice(),
+            [hir::FieldDef { name, ty: Ty::Raw }] if name == STATIC_DESCRIPTOR_DATA_FIELD
+        )
+        && definition.align.is_none()
+        && !definition.c_repr
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticCheckPolicy {
+    DeclaredOnly,
+    CheckedOptional,
+    CheckedRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticDescriptorOption {
+    Check(StaticCheckPolicy),
+    SQLiteRequireVersionAtLeast {
+        major: u32,
+        minor: u32,
+        patch: u32,
+    },
+    PostgreSQLParameterType {
+        parameter_name: String,
+        canonical_type_name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StaticContractType {
+    Named {
+        path: String,
+        args: Vec<StaticContractType>,
+    },
+    FixedArray {
+        element: Box<StaticContractType>,
+        length: u32,
+    },
+    Tuple(Vec<StaticContractType>),
+    Fn {
+        params: Vec<StaticContractType>,
+        result: Box<StaticContractType>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticContractField {
+    pub name: String,
+    pub ty: StaticContractType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticContractVariant {
+    pub name: String,
+    pub payload: Vec<StaticContractType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticContractDefinitionBody {
+    Struct {
+        fields: Vec<StaticContractField>,
+    },
+    Sum {
+        variants: Vec<StaticContractVariant>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticContractDefinition {
+    pub path: String,
+    pub args: Vec<StaticContractType>,
+    pub kind: StaticContractDefinitionBody,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticContract {
+    pub root: StaticContractType,
+    pub definitions: Vec<StaticContractDefinition>,
+}
+
+struct StaticContractCx<'a> {
+    type_table: &'a ModTypes,
+    struct_ids: &'a HashMap<String, u32>,
+    enum_ids: &'a HashMap<String, u32>,
+    struct_instances: &'a HashMap<u32, GenericNominalInstance>,
+    enum_instances: &'a HashMap<u32, GenericNominalInstance>,
+    structs: &'a [hir::StructDef],
+    enums: &'a [hir::EnumDef],
+    tagged_types: &'a [hir::TaggedType],
+    tuples: &'a [hir::TupleDef],
+    fn_types: &'a [hir::FnTy],
+}
+
+impl StaticContractCx<'_> {
+    fn named(path: impl Into<String>, args: Vec<StaticContractType>) -> StaticContractType {
+        StaticContractType::Named {
+            path: path.into(),
+            args,
+        }
+    }
+
+    fn canonical_for_id<'a>(
+        id: u32,
+        ids: &'a HashMap<String, u32>,
+        instances: &'a HashMap<u32, GenericNominalInstance>,
+    ) -> Option<&'a str> {
+        instances
+            .get(&id)
+            .map(|instance| instance.canonical.as_str())
+            .or_else(|| {
+                ids.iter().find_map(|(canonical, &candidate)| {
+                    (candidate == id).then_some(canonical.as_str())
+                })
+            })
+    }
+
+    fn nominal(
+        &self,
+        id: u32,
+        is_struct: bool,
+        definitions: &mut Vec<StaticContractDefinition>,
+        visited: &mut HashSet<(bool, u32)>,
+    ) -> Result<StaticContractType, String> {
+        let (ids, instances) = if is_struct {
+            (self.struct_ids, self.struct_instances)
+        } else {
+            (self.enum_ids, self.enum_instances)
+        };
+        let canonical = Self::canonical_for_id(id, ids, instances)
+            .ok_or_else(|| "a static contract names a compiler-only nominal type".to_owned())?;
+        let path = source_path_for_canonical(canonical, self.type_table).ok_or_else(|| {
+            format!("cannot recover the public path of static contract type `{canonical}`")
+        })?;
+        let args = instances
+            .get(&id)
+            .map_or(&[][..], |instance| instance.args.as_slice())
+            .iter()
+            .map(|&argument| self.ty(argument, definitions, visited))
+            .collect::<Result<Vec<_>, _>>()?;
+        let named = Self::named(path.clone(), args.clone());
+        if !visited.insert((is_struct, id)) {
+            return Ok(named);
+        }
+        let kind = if is_struct {
+            let definition = self
+                .structs
+                .get(id as usize)
+                .ok_or_else(|| "a static contract has an invalid struct id".to_owned())?;
+            StaticContractDefinitionBody::Struct {
+                fields: definition
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        Ok(StaticContractField {
+                            name: field.name.clone(),
+                            ty: self.ty(field.ty, definitions, visited)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            }
+        } else {
+            let definition = self
+                .enums
+                .get(id as usize)
+                .ok_or_else(|| "a static contract has an invalid sum-type id".to_owned())?;
+            StaticContractDefinitionBody::Sum {
+                variants: definition
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(StaticContractVariant {
+                            name: variant.name.clone(),
+                            payload: variant
+                                .payload
+                                .iter()
+                                .map(|&payload| {
+                                    self.ty(scalar_to_ty(payload), definitions, visited)
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            }
+        };
+        definitions.push(StaticContractDefinition { path, args, kind });
+        Ok(named)
+    }
+
+    fn ty(
+        &self,
+        ty: Ty,
+        definitions: &mut Vec<StaticContractDefinition>,
+        visited: &mut HashSet<(bool, u32)>,
+    ) -> Result<StaticContractType, String> {
+        let scalar = |value, definitions: &mut Vec<_>, visited: &mut HashSet<_>| {
+            self.ty(scalar_to_ty(value), definitions, visited)
+        };
+        Ok(match ty {
+            Ty::Int(value) => Self::named(value.name(), Vec::new()),
+            Ty::Float(value) => Self::named(value.name(), Vec::new()),
+            Ty::Bool => Self::named("bool", Vec::new()),
+            Ty::Char => Self::named("char", Vec::new()),
+            Ty::Str => Self::named("str", Vec::new()),
+            Ty::String => Self::named("string", Vec::new()),
+            Ty::Unit => Self::named("()", Vec::new()),
+            Ty::Option(value) => Self::named("Option", vec![scalar(value, definitions, visited)?]),
+            Ty::Result(ok, err) => Self::named(
+                "Result",
+                vec![
+                    scalar(ok, definitions, visited)?,
+                    scalar(err, definitions, visited)?,
+                ],
+            ),
+            Ty::Tagged(id) => match self.tagged_types.get(id as usize) {
+                Some(hir::TaggedType::Option(value)) => {
+                    Self::named("Option", vec![scalar(*value, definitions, visited)?])
+                }
+                Some(hir::TaggedType::Result(ok, err)) => Self::named(
+                    "Result",
+                    vec![
+                        scalar(*ok, definitions, visited)?,
+                        scalar(*err, definitions, visited)?,
+                    ],
+                ),
+                None => return Err("a static contract has an invalid tagged-type id".to_owned()),
+            },
+            Ty::Array(value, length) => StaticContractType::FixedArray {
+                element: Box::new(scalar(value, definitions, visited)?),
+                length,
+            },
+            Ty::DynArray(value) => Self::named("array", vec![scalar(value, definitions, visited)?]),
+            Ty::StructArray(id, length) => StaticContractType::FixedArray {
+                element: Box::new(self.nominal(id, true, definitions, visited)?),
+                length,
+            },
+            Ty::DynStructArray(id, _) => {
+                Self::named("array", vec![self.nominal(id, true, definitions, visited)?])
+            }
+            Ty::Slice(value) => Self::named("slice", vec![scalar(value, definitions, visited)?]),
+            Ty::DynSliceArray(value) => Self::named(
+                "array",
+                vec![Self::named(
+                    "slice",
+                    vec![self.ty(scalar_to_ty(prim_to_scalar(value)), definitions, visited)?],
+                )],
+            ),
+            Ty::Struct(id) => self.nominal(id, true, definitions, visited)?,
+            Ty::Enum(id) => self.nominal(id, false, definitions, visited)?,
+            Ty::Tuple(id) => StaticContractType::Tuple(
+                self.tuples
+                    .get(id as usize)
+                    .ok_or_else(|| "a static contract has an invalid tuple id".to_owned())?
+                    .elems
+                    .iter()
+                    .map(|&element| scalar(element, definitions, visited))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Ty::Fn(id) => {
+                let function = self.fn_types.get(id as usize).ok_or_else(|| {
+                    "a static contract has an invalid function-type id".to_owned()
+                })?;
+                StaticContractType::Fn {
+                    params: function
+                        .params
+                        .iter()
+                        .map(|&(_, parameter)| scalar(parameter, definitions, visited))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    result: Box::new(self.ty(function.ret, definitions, visited)?),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "type `{}` is not supported in a static Query contract",
+                    ty_name(ty)
+                ));
+            }
+        })
+    }
+
+    fn contract(&self, root: Ty) -> Result<StaticContract, String> {
+        if !matches!(root, Ty::Struct(_)) {
+            return Err("a static Params/Row contract root must be a named struct".to_owned());
+        }
+        let mut definitions = Vec::new();
+        let root = self.ty(root, &mut definitions, &mut HashSet::new())?;
+        definitions.sort_by(|left, right| {
+            left.path
+                .as_bytes()
+                .cmp(right.path.as_bytes())
+                .then_with(|| left.args.cmp(&right.args))
+        });
+        Ok(StaticContract { root, definitions })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2703,14 +3030,55 @@ fn static_constructor_spec(function: &str) -> Option<StaticConstructorSpec> {
         "pkg.db.postgres$command" => (Command, PostgreSQLOnly, false),
         _ => return None,
     };
-    Some(StaticConstructorSpec { consumer, driver, file })
+    Some(StaticConstructorSpec {
+        consumer,
+        driver,
+        file,
+    })
 }
 
 fn static_constructor_at(expression: &hir::Expr) -> Option<StaticConstructorSpec> {
-    let hir::ExprKind::Call { func, .. } = &expression.kind else {
+    let hir::ExprKind::Call {
+        func, type_args, ..
+    } = &expression.kind
+    else {
         return None;
     };
-    static_constructor_spec(func)
+    if let Some(spec) = static_constructor_spec(func) {
+        return Some(spec);
+    }
+    // Generic package constructors are rewritten to their concrete monomorph symbol before this
+    // discovery pass (`pkg.db$query$Params$Row`). Match only a canonical constructor prefix and
+    // require the exact generic arity when the call retains it. A constructor imported through an
+    // interface summary has already been monomorphized and intentionally carries an empty
+    // `type_args` vector; its compiler-only `$...` symbol plus the descriptor return-type check
+    // below provide the same identity proof.
+    const GENERIC_CONSTRUCTORS: [&str; 12] = [
+        "pkg.db$query_file",
+        "pkg.db$query",
+        "pkg.db$command_file",
+        "pkg.db$command",
+        "pkg.db.sqlite$query_file",
+        "pkg.db.sqlite$query",
+        "pkg.db.sqlite$command_file",
+        "pkg.db.sqlite$command",
+        "pkg.db.postgres$query_file",
+        "pkg.db.postgres$query",
+        "pkg.db.postgres$command_file",
+        "pkg.db.postgres$command",
+    ];
+    GENERIC_CONSTRUCTORS.iter().find_map(|canonical| {
+        let spec = static_constructor_spec(canonical)?;
+        let arity = match spec.consumer {
+            StaticDescriptorConsumer::Query => 2,
+            StaticDescriptorConsumer::Command => 1,
+        };
+        ((type_args.is_empty() || type_args.len() == arity)
+            && func
+                .strip_prefix(canonical)
+                .is_some_and(|suffix| suffix.starts_with('$')))
+        .then_some(spec)
+    })
 }
 
 fn static_constructor_occurrences(function: &hir::Fn) -> Vec<Span> {
@@ -2742,7 +3110,10 @@ fn literal_string(expression: &ast::Expr, what: &str, diags: &mut Diagnostics) -
     if let ast::ExprKind::Str(value) = &expression.kind {
         Some(value.clone())
     } else {
-        diags.error(format!("a static {what} must be a string literal"), expression.span);
+        diags.error(
+            format!("a static {what} must be a string literal"),
+            expression.span,
+        );
         None
     }
 }
@@ -2759,20 +3130,350 @@ fn literal_option_list(expression: &ast::Expr, what: &str, diags: &mut Diagnosti
     }
 }
 
-fn static_descriptor_from_root(
-    module: &str,
-    declaration: &ast::FnDecl,
-    root: &ast::Expr,
+fn canonical_enum_for_id(id: u32, enum_ids: &HashMap<String, u32>) -> Option<&str> {
+    enum_ids
+        .iter()
+        .find_map(|(canonical, &candidate)| (candidate == id).then_some(canonical.as_str()))
+}
+
+fn checked_option_list(
+    root: &hir::Expr,
     spec: StaticConstructorSpec,
+) -> Option<(&hir::Expr, Option<&hir::Expr>)> {
+    let hir::ExprKind::Call { args, .. } = &root.kind else {
+        return None;
+    };
+    let driver_specific = spec.driver != StaticDescriptorDriver::AnySupportedDriver;
+    let (common, native) = match (spec.file, driver_specific, args.len()) {
+        (true, false, 1) => (0, None),
+        (true, false, 2) => (1, None),
+        (true, true, 2) => (0, Some(1)),
+        (true, true, 3) => (1, Some(2)),
+        (false, false, 2) => (1, None),
+        (false, true, 3) => (1, Some(2)),
+        _ => return None,
+    };
+    Some((args.get(common)?, native.and_then(|index| args.get(index))))
+}
+
+fn literal_u32(expression: &hir::Expr) -> Option<u32> {
+    let hir::ExprKind::Int(value) = expression.kind else {
+        return None;
+    };
+    u32::try_from(value).ok()
+}
+
+fn literal_hir_string(expression: &hir::Expr) -> Option<String> {
+    let hir::ExprKind::Str(value) = &expression.kind else {
+        return None;
+    };
+    Some(value.clone())
+}
+
+fn decode_static_options(
+    root: &hir::Expr,
+    spec: StaticConstructorSpec,
+    enum_ids: &HashMap<String, u32>,
+    enums: &[hir::EnumDef],
+    diags: &mut Diagnostics,
+) -> Option<Vec<StaticDescriptorOption>> {
+    fn canonicalize(options: &mut [StaticDescriptorOption]) {
+        options.sort_by(|left, right| {
+            let tag = |option: &StaticDescriptorOption| match option {
+                StaticDescriptorOption::Check(_) => 0u8,
+                StaticDescriptorOption::SQLiteRequireVersionAtLeast { .. } => 1,
+                StaticDescriptorOption::PostgreSQLParameterType { .. } => 2,
+            };
+            tag(left)
+                .cmp(&tag(right))
+                .then_with(|| match (left, right) {
+                    (
+                        StaticDescriptorOption::PostgreSQLParameterType {
+                            parameter_name: left_name,
+                            canonical_type_name: left_type,
+                        },
+                        StaticDescriptorOption::PostgreSQLParameterType {
+                            parameter_name: right_name,
+                            canonical_type_name: right_type,
+                        },
+                    ) => left_name
+                        .cmp(right_name)
+                        .then_with(|| left_type.cmp(right_type)),
+                    _ => std::cmp::Ordering::Equal,
+                })
+        });
+    }
+    fn elements(expression: &hir::Expr) -> Option<&[hir::Expr]> {
+        let expression = match &expression.kind {
+            hir::ExprKind::ArrayToSlice(inner) => inner.as_ref(),
+            _ => expression,
+        };
+        let hir::ExprKind::ArrayLit { elems, .. } = &expression.kind else {
+            return None;
+        };
+        Some(elems)
+    }
+    let Some((common, native)) = checked_option_list(root, spec) else {
+        let expected = match (
+            spec.file,
+            spec.driver != StaticDescriptorDriver::AnySupportedDriver,
+        ) {
+            (true, false) => "one option list, or a path literal and one option list",
+            (true, true) => {
+                "common/native option lists, or a path literal plus common/native option lists"
+            }
+            (false, false) => "an inline SQL literal and one option list",
+            (false, true) => "an inline SQL literal and common/native option lists",
+        };
+        diags.error(
+            format!("this static constructor requires {expected}"),
+            root.span,
+        );
+        return None;
+    };
+    let Some(common_elements) = elements(common) else {
+        diags.error(
+            "static common options must be an explicit option-list literal (use `[]` for none)"
+                .to_owned(),
+            common.span,
+        );
+        return None;
+    };
+    let common_enum = match spec.consumer {
+        StaticDescriptorConsumer::Query => "pkg.db$QueryOption",
+        StaticDescriptorConsumer::Command => "pkg.db$CommandOption",
+    };
+    let mut result = Vec::new();
+    let mut check_seen = false;
+    for option in common_elements {
+        let hir::ExprKind::EnumValue {
+            enum_id,
+            variant,
+            payload,
+        } = &option.kind
+        else {
+            diags.error(
+                "a static common option must be a literal option constructor".to_owned(),
+                option.span,
+            );
+            return None;
+        };
+        if canonical_enum_for_id(*enum_id, enum_ids) != Some(common_enum)
+            || enums
+                .get(*enum_id as usize)
+                .and_then(|definition| definition.variants.get(*variant as usize))
+                .map(|variant| variant.name.as_str())
+                != Some("Check")
+            || payload.len() != 1
+        {
+            diags.error(
+                "this option does not belong to the static common Query/command scope".to_owned(),
+                option.span,
+            );
+            return None;
+        }
+        let hir::ExprKind::EnumValue {
+            enum_id: policy_enum,
+            variant: policy_variant,
+            payload: policy_payload,
+        } = &payload[0].kind
+        else {
+            diags.error(
+                "a static check policy must be a literal policy variant".to_owned(),
+                payload[0].span,
+            );
+            return None;
+        };
+        if canonical_enum_for_id(*policy_enum, enum_ids) != Some("pkg.db$CheckPolicy")
+            || !policy_payload.is_empty()
+        {
+            diags.error(
+                "a static check policy must be a `db.CheckPolicy` variant".to_owned(),
+                payload[0].span,
+            );
+            return None;
+        }
+        let policy = match enums
+            .get(*policy_enum as usize)
+            .and_then(|definition| definition.variants.get(*policy_variant as usize))
+            .map(|variant| variant.name.as_str())
+        {
+            Some("DeclaredOnly") => StaticCheckPolicy::DeclaredOnly,
+            Some("CheckedOptional") => StaticCheckPolicy::CheckedOptional,
+            Some("CheckedRequired") => StaticCheckPolicy::CheckedRequired,
+            _ => {
+                diags.error("unknown static check policy".to_owned(), payload[0].span);
+                return None;
+            }
+        };
+        if std::mem::replace(&mut check_seen, true) {
+            diags.error(
+                "a static Query/command may specify the common Check option only once".to_owned(),
+                option.span,
+            );
+            return None;
+        }
+        result.push(StaticDescriptorOption::Check(policy));
+    }
+    let Some(native) = native else {
+        canonicalize(&mut result);
+        return Some(result);
+    };
+    let native_enum = match (spec.driver, spec.consumer) {
+        (StaticDescriptorDriver::SQLiteOnly, StaticDescriptorConsumer::Query) => {
+            "pkg.db.sqlite$QueryOption"
+        }
+        (StaticDescriptorDriver::SQLiteOnly, StaticDescriptorConsumer::Command) => {
+            "pkg.db.sqlite$CommandOption"
+        }
+        (StaticDescriptorDriver::PostgreSQLOnly, StaticDescriptorConsumer::Query) => {
+            "pkg.db.postgres$QueryOption"
+        }
+        (StaticDescriptorDriver::PostgreSQLOnly, StaticDescriptorConsumer::Command) => {
+            "pkg.db.postgres$CommandOption"
+        }
+        (StaticDescriptorDriver::AnySupportedDriver, _) => return None,
+    };
+    let mut sqlite_version_seen = false;
+    let mut postgres_parameters = HashSet::new();
+    let Some(native_elements) = elements(native) else {
+        diags.error(
+            "static driver options must be an explicit option-list literal (use `[]` for none)"
+                .to_owned(),
+            native.span,
+        );
+        return None;
+    };
+    for option in native_elements {
+        let hir::ExprKind::EnumValue {
+            enum_id,
+            variant,
+            payload,
+        } = &option.kind
+        else {
+            diags.error(
+                "a static driver option must be a literal option constructor".to_owned(),
+                option.span,
+            );
+            return None;
+        };
+        let name = enums
+            .get(*enum_id as usize)
+            .and_then(|definition| definition.variants.get(*variant as usize))
+            .map(|variant| variant.name.as_str());
+        if canonical_enum_for_id(*enum_id, enum_ids) != Some(native_enum) {
+            diags.error(
+                "this option does not belong to the selected static driver scope".to_owned(),
+                option.span,
+            );
+            return None;
+        }
+        match (spec.driver, name, payload.as_slice()) {
+            (
+                StaticDescriptorDriver::SQLiteOnly,
+                Some("RequireVersionAtLeast"),
+                [major, minor, patch],
+            ) => {
+                let Some((major, minor, patch)) = literal_u32(major)
+                    .zip(literal_u32(minor))
+                    .zip(literal_u32(patch))
+                    .map(|((major, minor), patch)| (major, minor, patch))
+                else {
+                    diags.error(
+                        "SQLite static version components must be non-negative u32 literals"
+                            .to_owned(),
+                        option.span,
+                    );
+                    return None;
+                };
+                if std::mem::replace(&mut sqlite_version_seen, true) {
+                    diags.error(
+                        "SQLite RequireVersionAtLeast may be specified only once".to_owned(),
+                        option.span,
+                    );
+                    return None;
+                }
+                result.push(StaticDescriptorOption::SQLiteRequireVersionAtLeast {
+                    major,
+                    minor,
+                    patch,
+                });
+            }
+            (StaticDescriptorDriver::PostgreSQLOnly, Some("ParameterType"), [name, ty]) => {
+                let Some(parameter_name) = literal_hir_string(name) else {
+                    diags.error(
+                        "PostgreSQL static parameter names must be string literals".to_owned(),
+                        name.span,
+                    );
+                    return None;
+                };
+                let Some(canonical_type_name) = literal_hir_string(ty) else {
+                    diags.error(
+                        "PostgreSQL static parameter types must be string literals".to_owned(),
+                        ty.span,
+                    );
+                    return None;
+                };
+                if !postgres_parameters.insert(parameter_name.clone()) {
+                    diags.error(
+                        format!(
+                            "PostgreSQL ParameterType for `{parameter_name}` may be specified only once"
+                        ),
+                        option.span,
+                    );
+                    return None;
+                }
+                result.push(StaticDescriptorOption::PostgreSQLParameterType {
+                    parameter_name,
+                    canonical_type_name,
+                });
+            }
+            _ => {
+                diags.error("unknown static driver option".to_owned(), option.span);
+                return None;
+            }
+        }
+    }
+    canonicalize(&mut result);
+    Some(result)
+}
+
+struct StaticDescriptorBuild<'a> {
+    module: &'a str,
+    declaration: &'a ast::FnDecl,
+    spec: StaticConstructorSpec,
+    params_ty: Ty,
+    row_ty: Option<Ty>,
+    params_contract: StaticContract,
+    row_contract: Option<StaticContract>,
+    static_options: Vec<StaticDescriptorOption>,
+}
+
+fn static_descriptor_from_root(
+    root: &ast::Expr,
+    build: StaticDescriptorBuild<'_>,
     diags: &mut Diagnostics,
 ) -> Option<StaticDescriptor> {
+    let StaticDescriptorBuild {
+        module,
+        declaration,
+        spec,
+        params_ty,
+        row_ty,
+        params_contract,
+        row_contract,
+        static_options,
+    } = build;
     let ast::ExprKind::Call { args, .. } = &root.kind else {
         return None;
     };
     let driver_specific = spec.driver != StaticDescriptorDriver::AnySupportedDriver;
     let (source, common_index, native_index) = match (spec.file, driver_specific, args.len()) {
         (true, false, 1) => (
-            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorSource::File {
+                path_literal: None,
+                path_span: None,
+            },
             0,
             None,
         ),
@@ -2785,7 +3486,10 @@ fn static_descriptor_from_root(
             None,
         ),
         (true, true, 2) => (
-            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorSource::File {
+                path_literal: None,
+                path_span: None,
+            },
             0,
             Some(1),
         ),
@@ -2822,7 +3526,10 @@ fn static_descriptor_from_root(
                 (false, false) => "an inline SQL literal and one option list",
                 (false, true) => "an inline SQL literal and common/native option lists",
             };
-            diags.error(format!("this static constructor requires {expected}"), root.span);
+            diags.error(
+                format!("this static constructor requires {expected}"),
+                root.span,
+            );
             return None;
         }
     };
@@ -2833,8 +3540,13 @@ fn static_descriptor_from_root(
         .map(|options| literal_option_list(options, "driver options", diags))
         .unwrap_or(true);
     let source_ok = match &source {
-        StaticDescriptorSource::File { path_literal, path_span: Some(_) } => path_literal.is_some(),
-        StaticDescriptorSource::File { path_span: None, .. }
+        StaticDescriptorSource::File {
+            path_literal,
+            path_span: Some(_),
+        } => path_literal.is_some(),
+        StaticDescriptorSource::File {
+            path_span: None, ..
+        }
         | StaticDescriptorSource::Inline { .. } => true,
     };
     if !source_ok || !common_ok || !native_ok {
@@ -2852,17 +3564,79 @@ fn static_descriptor_from_root(
         constructor_span: root.span,
         common_options_span: common.span,
         native_options_span: native.map(|options| options.span),
+        params_ty,
+        row_ty,
+        params_contract,
+        row_contract,
+        static_options,
     })
 }
 
-fn discover_static_descriptor(
-    module: &str,
-    declaration: &ast::FnDecl,
-    checked: &hir::Fn,
-    lifted: &[hir::Fn],
+fn static_descriptor_contract_types(
+    return_ty: Ty,
+    spec: StaticConstructorSpec,
+    struct_instances: &HashMap<u32, GenericNominalInstance>,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<(Ty, Option<Ty>)> {
+    let Ty::Struct(id) = return_ty else {
+        diags.error(
+            "a static descriptor function must return `db.query<Params, Row>` or `db.command<Params>`"
+                .to_owned(),
+            span,
+        );
+        return None;
+    };
+    let Some(instance) = struct_instances.get(&id) else {
+        diags.error(
+            "a static descriptor function must return the matching generic `pkg.db` descriptor type"
+                .to_owned(),
+            span,
+        );
+        return None;
+    };
+    let (expected, arity) = match spec.consumer {
+        StaticDescriptorConsumer::Query => ("pkg.db$query", 2),
+        StaticDescriptorConsumer::Command => ("pkg.db$command", 1),
+    };
+    if instance.canonical != expected || instance.args.len() != arity {
+        let surface = match spec.consumer {
+            StaticDescriptorConsumer::Query => "db.query<Params, Row>",
+            StaticDescriptorConsumer::Command => "db.command<Params>",
+        };
+        diags.error(
+            format!("this static constructor's descriptor function must return `{surface}`"),
+            span,
+        );
+        return None;
+    }
+    let params_ty = instance.args[0];
+    let row_ty = (spec.consumer == StaticDescriptorConsumer::Query).then(|| instance.args[1]);
+    Some((params_ty, row_ty))
+}
+
+struct StaticDescriptorDiscovery<'a, 'b> {
+    module: &'a str,
+    declaration: &'a ast::FnDecl,
+    lifted: &'a [hir::Fn],
     function_was_clean: bool,
+    struct_instances: &'a HashMap<u32, GenericNominalInstance>,
+    contract_cx: &'a StaticContractCx<'b>,
+}
+
+fn discover_static_descriptor(
+    checked: &hir::Fn,
+    discovery: StaticDescriptorDiscovery<'_, '_>,
     diags: &mut Diagnostics,
 ) -> Option<StaticDescriptor> {
+    let StaticDescriptorDiscovery {
+        module,
+        declaration,
+        lifted,
+        function_was_clean,
+        struct_instances,
+        contract_cx,
+    } = discovery;
     const PLACEMENT_ERROR: &str = concat!(
         "a static Query/command constructor is legal only as the complete `= expr` body of one ",
         "named zero-argument non-generic descriptor function",
@@ -2895,13 +3669,58 @@ fn discover_static_descriptor(
         return None;
     }
     let source_root = source_root?;
+    let checked_root = checked_root?;
     let root_spec = root_spec?;
     let errors_before = diags.error_count();
-    let descriptor = static_descriptor_from_root(
-        module,
-        declaration,
-        source_root,
+    let (params_ty, row_ty) = static_descriptor_contract_types(
+        checked.ret,
         root_spec,
+        struct_instances,
+        declaration.span,
+        diags,
+    )?;
+    let params_contract = match contract_cx.contract(params_ty) {
+        Ok(contract) => contract,
+        Err(reason) => {
+            diags.error(
+                format!("invalid static Params contract: {reason}"),
+                declaration.span,
+            );
+            return None;
+        }
+    };
+    let row_contract = match row_ty {
+        Some(row_ty) => match contract_cx.contract(row_ty) {
+            Ok(contract) => Some(contract),
+            Err(reason) => {
+                diags.error(
+                    format!("invalid static Row contract: {reason}"),
+                    declaration.span,
+                );
+                return None;
+            }
+        },
+        None => None,
+    };
+    let static_options = decode_static_options(
+        checked_root,
+        root_spec,
+        contract_cx.enum_ids,
+        contract_cx.enums,
+        diags,
+    )?;
+    let descriptor = static_descriptor_from_root(
+        source_root,
+        StaticDescriptorBuild {
+            module,
+            declaration,
+            spec: root_spec,
+            params_ty,
+            row_ty,
+            params_contract,
+            row_contract,
+            static_options,
+        },
         diags,
     );
     if !function_was_clean || diags.error_count() != errors_before {
@@ -5655,9 +6474,30 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         drop(cx);
         let function_was_clean =
             !function_had_prior_errors && diags.error_count() == errors_before;
-        if let Some(descriptor) =
-            discover_static_descriptor(module, f, &checked, &lifted, function_was_clean, diags)
-        {
+        let static_contract_cx = StaticContractCx {
+            type_table: &type_table,
+            struct_ids: &struct_ids,
+            enum_ids: &enum_ids,
+            struct_instances: &struct_instances,
+            enum_instances: &enum_instances,
+            structs: &structs,
+            enums: &enums,
+            tagged_types: &tagged_types,
+            tuples: &tuples,
+            fn_types: &fn_types,
+        };
+        if let Some(descriptor) = discover_static_descriptor(
+            &checked,
+            StaticDescriptorDiscovery {
+                module,
+                declaration: f,
+                lifted: &lifted,
+                function_was_clean,
+                struct_instances: &struct_instances,
+                contract_cx: &static_contract_cx,
+            },
+            diags,
+        ) {
             static_descriptors.push(descriptor);
         }
         if is_template {
@@ -5837,7 +6677,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         &enum_instances,
         &resource_instances,
     );
-    if !compact_abstract_nominal_instances(&mut program, &abstract_nominals) {
+    if !compact_abstract_nominal_instances(
+        &mut program,
+        &mut static_descriptors,
+        &abstract_nominals,
+    ) {
         let span = program
             .fns
             .first()
@@ -5997,6 +6841,7 @@ struct NominalRemap {
 
 fn compact_abstract_nominal_instances(
     program: &mut Program,
+    static_descriptors: &mut [StaticDescriptor],
     abstract_ids: &AbstractNominalIds,
 ) -> bool {
     if abstract_ids.structs.is_empty()
@@ -6027,6 +6872,7 @@ fn compact_abstract_nominal_instances(
         resources: table_remap(program.resources.len(), &abstract_ids.resources),
     };
     let mut candidate = program.clone();
+    let mut candidate_descriptors = static_descriptors.to_vec();
     let mut valid = true;
 
     fn remap_id(id: &mut u32, table: &[Option<u32>], valid: &mut bool) {
@@ -6343,8 +7189,15 @@ fn compact_abstract_nominal_instances(
             remap_ty(parameter, &remap, &mut valid);
         }
     }
+    for descriptor in &mut candidate_descriptors {
+        remap_ty(&mut descriptor.params_ty, &remap, &mut valid);
+        if let Some(row_ty) = &mut descriptor.row_ty {
+            remap_ty(row_ty, &remap, &mut valid);
+        }
+    }
     if valid {
         *program = candidate;
+        static_descriptors.clone_from_slice(&candidate_descriptors);
     }
     valid
 }
@@ -28603,11 +29456,143 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::VecLit { elems: checked, elem: s }, ty: Ty::Vec(s, n), span }
     }
 
-    fn check_array_lit(&mut self, elems: &[ast::Expr], elem_expected: Option<Ty>, span: Span) -> Expr {
+    fn reject_fixed_array_element(&mut self, elem_ty: Ty, span: Span) -> bool {
+        let elem_ty = self.resolve(elem_ty);
+        if ty_mentions_resource(
+            elem_ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            self.diags.error(
+                "a resource or resource_ref cannot be an element of a fixed array".to_string(),
+                span,
+            );
+            return true;
+        }
+        // An owned I/O handle/buffer element would copy one native owner into multiple array slots.
+        if matches!(
+            elem_ty,
+            Ty::Reader
+                | Ty::Writer
+                | Ty::Buffer
+                | Ty::Regex
+                | Ty::Captures
+                | Ty::CliCommand
+                | Ty::CliParsed
+                | Ty::TcpConn
+                | Ty::TcpListener
+                | Ty::UdpSocket
+                | Ty::Child
+                | Ty::File
+                | Ty::HttpRequest
+                | Ty::HttpResponse
+                | Ty::HttpClient
+                | Ty::HttpServer
+                | Ty::HttpRequestCtx
+                | Ty::ResponseBuilder
+                | Ty::HttpStream
+                | Ty::Command
+                | Ty::RunOutput
+        ) {
+            self.diags.error(
+                format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
+                span,
+            );
+            return true;
+        }
+        // A non-struct slice-bearing element needs per-element view-region tracking, including when
+        // the literal is empty: its type still promises a future collectible element domain.
+        if ty_mentions_slice(elem_ty, self.structs, self.tuples, self.tagged_types)
+            && !matches!(elem_ty, Ty::Struct(_))
+        {
+            self.diags.error(
+                format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
+                span,
+            );
+            return true;
+        }
+        if let Ty::Enum(id) = elem_ty
+            && enum_is_move(id, self.structs, self.enums, self.tagged_types)
+        {
+            self.diags.error(
+                format!(
+                    "`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value",
+                    self.ty_display(elem_ty)
+                ),
+                span,
+            );
+            return true;
+        }
+        false
+    }
+
+    fn check_array_lit(
+        &mut self,
+        elems: &[ast::Expr],
+        elem_expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
         if elems.is_empty() {
-            self.diags
-                .error("an empty array literal needs a type annotation (not supported yet)".to_string(), span);
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+            let Some(elem_ty) = elem_expected.map(|ty| self.resolve(ty)) else {
+                self.diags.error(
+                    "an empty array literal needs an expected element type (bind it to a typed slice argument)"
+                        .to_string(),
+                    span,
+                );
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
+            };
+            if elem_ty == Ty::Error {
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
+            }
+            if self.reject_fixed_array_element(elem_ty, span) {
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
+            }
+            if let Ty::Struct(id) = elem_ty {
+                return Expr {
+                    kind: ExprKind::ArrayLit {
+                        elems: Vec::new(),
+                        elem: elem_ty,
+                        pooled: false,
+                    },
+                    ty: Ty::StructArray(id, 0),
+                    span,
+                };
+            }
+            let errors_before = self.diags.error_count();
+            let scalar = match elem_ty {
+                Ty::Fn(id) => Scalar::Fn(id),
+                other => self.payload_scalar(other, "array element", false, span),
+            };
+            if self.diags.error_count() != errors_before {
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
+            }
+            return Expr {
+                kind: ExprKind::ArrayLit {
+                    elems: Vec::new(),
+                    elem: scalar_to_ty(scalar),
+                    pooled: false,
+                },
+                ty: Ty::Array(scalar, 0),
+                span,
+            };
         }
         let n = elems.len() as u32;
         // An array of struct literals → a struct array (AoS).
@@ -28616,20 +29601,21 @@ impl<'a, 't> Checker<'a, 't> {
             let mut sid = None;
             for e in elems {
                 let ast::ExprKind::StructLit { name, fields } = &e.kind else {
-                    self.diags.error("array elements must all be struct literals here".to_string(), e.span);
+                    self.diags.error(
+                        "array elements must all be struct literals here".to_string(),
+                        e.span,
+                    );
                     continue;
                 };
                 let lit = self.check_struct_lit(name, fields, e.span);
                 if let Ty::Struct(id) = lit.ty {
                     match sid {
                         None => sid = Some(id),
-                        Some(prev)
-                            if !self.source_ty_matches(
-                                Ty::Struct(prev),
-                                Ty::Struct(id),
-                            ) =>
-                        {
-                            self.diags.error("array elements must be the same struct type".to_string(), e.span);
+                        Some(prev) if !self.source_ty_matches(Ty::Struct(prev), Ty::Struct(id)) => {
+                            self.diags.error(
+                                "array elements must be the same struct type".to_string(),
+                                e.span,
+                            );
                         }
                         _ => {}
                     }
@@ -28654,7 +29640,11 @@ impl<'a, 't> Checker<'a, 't> {
                                 .to_string(),
                             span,
                         );
-                        Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                        Expr {
+                            kind: ExprKind::Bool(false),
+                            ty: Ty::Error,
+                            span,
+                        }
                     } else {
                         Expr {
                             kind: ExprKind::ArrayLit {
@@ -28667,67 +29657,22 @@ impl<'a, 't> Checker<'a, 't> {
                         }
                     }
                 }
-                None => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+                None => Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                },
             };
         }
         // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
-        if ty_mentions_resource(
-            self.resolve(elem_ty),
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
-            self.diags.error(
-                "a resource or resource_ref cannot be an element of a fixed array".to_string(),
+        if self.reject_fixed_array_element(elem_ty, span) {
+            return Expr {
+                kind: ExprKind::Bool(false),
+                ty: Ty::Error,
                 span,
-            );
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        }
-        // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
-        // field / tuple element): the array read copies the handle by value, so collecting handles
-        // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput) {
-            self.diags.error(
-                format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
-                span,
-            );
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        }
-        // A `slice` view element is deferred, like `box<slice>`: an `array<slice<T>>` literal would
-        // need per-element view-region tracking (each element could borrow a different source). The
-        // only slice values today are `bytes` views (`fs.read_bytes_view` / `buffer.bytes()`); a
-        // literal collecting them is rejected at construction rather than mis-lowered. Checked
-        // transparently through `Result`/`Option`/tuple/struct wrappers so an `array<Option<slice>>`
-        // / `array<Result<slice, Error>>` can't smuggle an arena view past the direct-slice guard
-        // (both are also blocked by the composite-payload rule below — this is defense in depth).
-        if ty_mentions_slice(
-            self.resolve(elem_ty),
-            self.structs,
-            self.tuples,
-            self.tagged_types,
-        ) && !matches!(self.resolve(elem_ty), Ty::Struct(_))
-        {
-            self.diags.error(
-                format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
-                span,
-            );
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        }
-        // A fixed array of a **Move** sum type (an owned-array payload variant, J2) is deferred: its
-        // per-element tag-switched drop has no consumer yet, and a fixed `array<Enum>` is not a
-        // droppable `StructArray`, so admitting it would leak each element's buffer. Reject cleanly —
-        // a Move enum is used as a single value for now.
-        if let Ty::Enum(id) = self.resolve(elem_ty)
-            && enum_is_move(id, self.structs, self.enums, self.tagged_types)
-        {
-            self.diags.error(
-                format!("`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value", self.ty_display(elem_ty)),
-                span,
-            );
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+            };
         }
         let mut checked = vec![first];
         for e in &elems[1..] {
@@ -28742,7 +29687,10 @@ impl<'a, 't> Checker<'a, 't> {
         // element type from a real value like `[a, b]` where `a: i32`, stays silent.)
         if elem_expected.is_none() && n >= DEFAULT_ELEM_LITERAL_ARRAY_LEN {
             let (dflt, narrower) = match self.resolve(elem_ty) {
-                Ty::IntVar(_) => (Some("i64"), "a narrower integer type (e.g. `i32`/`i16`/`i8`)"),
+                Ty::IntVar(_) => (
+                    Some("i64"),
+                    "a narrower integer type (e.g. `i32`/`i16`/`i8`)",
+                ),
                 Ty::FloatVar(_) => (Some("f64"), "`f32`"),
                 _ => (None, ""),
             };
@@ -28763,7 +29711,11 @@ impl<'a, 't> Checker<'a, 't> {
                     ),
                     span,
                 );
-                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
             }
             return Expr {
                 kind: ExprKind::ArrayLit {
@@ -28779,7 +29731,15 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Fn(fid) => Scalar::Fn(fid),
             other => self.payload_scalar(other, "array element", false, span),
         };
-        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar), pooled: false }, ty: Ty::Array(scalar, n), span }
+        Expr {
+            kind: ExprKind::ArrayLit {
+                elems: checked,
+                elem: scalar_to_ty(scalar),
+                pooled: false,
+            },
+            ty: Ty::Array(scalar, n),
+            span,
+        }
     }
 
     /// Collect a pipeline `src.map(f).where(p)…` from the AST: the innermost receiver is
@@ -41348,7 +42308,20 @@ fn instantiate_struct(
         cx.fn_types,
         cx.resources,
     );
-    let mut fields = Vec::with_capacity(tmpl.fields.len());
+    let descriptor_arity = static_descriptor_generic_arity(name);
+    let descriptor_shape_ok = descriptor_arity.is_none()
+        || (tmpl.fields.is_empty() && tmpl.align.is_none() && !tmpl.c_repr);
+    if descriptor_arity.is_some() && !descriptor_shape_ok {
+        diags.error(
+            format!(
+                "compiler-known descriptor type '{name}' must be a fieldless, naturally aligned Align struct"
+            ),
+            span,
+        );
+    }
+    let mut fields = Vec::with_capacity(
+        tmpl.fields.len() + usize::from(descriptor_shape_ok && descriptor_arity.is_some()),
+    );
     for f in &tmpl.fields {
         let fty = subst_param_ty(
             f.ty,
@@ -41364,6 +42337,12 @@ fn instantiate_struct(
             );
         }
         fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
+    }
+    if descriptor_shape_ok && descriptor_arity.is_some() {
+        fields.push(hir::FieldDef {
+            name: STATIC_DESCRIPTOR_DATA_FIELD.to_string(),
+            ty: Ty::Raw,
+        });
     }
     let id = cx.structs.len() as u32;
     cx.structs.push(StructDef {
@@ -41607,17 +42586,30 @@ mod tests {
 
     #[test]
     fn static_descriptors_use_resolved_constructor_identity_and_canonical_item_ids() {
-        let common = "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n";
+        let common = concat!(
+            "module pkg.db\n",
+            "import std.process\n",
+            "pub query<P, R> {}\n",
+            "pub command<P> {}\n",
+            "pub QueryOption { Check(i64) }\n",
+            "pub CommandOption { Check(i64) }\n",
+            "pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()\n",
+        );
         let sqlite = concat!(
             "module pkg.db.sqlite\n",
-            "pub fn command(sql: str, options: slice<i64>, native: slice<i64>) -> i64 = 0\n",
+            "import std.process\n",
+            "import pkg.db\n",
+            "pub CommandOption { RequireVersionAtLeast(u32, u32, u32) }\n",
+            "pub fn command<P>(sql: str, options: slice<pkg.db.CommandOption>, native: slice<CommandOption>) -> pkg.db.command<P> = process.abort()\n",
         );
         let queries = concat!(
             "module app.queries\n",
             "import pkg.db\n",
             "import pkg.db.sqlite\n",
-            "pub fn users() -> i64 = pkg.db.query_file([0])\n",
-            "fn prune() -> i64 = pkg.db.sqlite.command(\"DELETE FROM sessions\", [0], [0])\n",
+            "pub Params { id: i64 }\n",
+            "pub Row { name: str }\n",
+            "pub fn users() -> pkg.db.query<Params, Row> = pkg.db.query_file([])\n",
+            "fn prune() -> pkg.db.command<Params> = pkg.db.sqlite.command(\"DELETE FROM sessions\", [], [])\n",
         );
         let (checked, diagnostics) = check_modules(&[
             ("pkg.db", common, false),
@@ -41641,6 +42633,8 @@ mod tests {
         assert_eq!(prune.consumer, StaticDescriptorConsumer::Command);
         assert_eq!(prune.driver, StaticDescriptorDriver::SQLiteOnly);
         assert!(prune.native_options_span.is_some());
+        assert!(matches!(prune.params_ty, Ty::Struct(_)));
+        assert_eq!(prune.row_ty, None);
         assert!(matches!(
             &prune.source,
             StaticDescriptorSource::Inline { decoded_sql, .. }
@@ -41649,6 +42643,8 @@ mod tests {
         let users = &checked.static_descriptors[1];
         assert!(users.is_public);
         assert_eq!(users.driver, StaticDescriptorDriver::AnySupportedDriver);
+        assert!(matches!(users.params_ty, Ty::Struct(_)));
+        assert!(matches!(users.row_ty, Some(Ty::Struct(_))));
         assert!(matches!(
             users.source,
             StaticDescriptorSource::File { path_literal: None, path_span: None }
@@ -41698,16 +42694,28 @@ mod tests {
 
     #[test]
     fn static_file_descriptor_preserves_explicit_decoded_path() {
+        let root = concat!(
+            "module pkg.db\n",
+            "pub query<P, R> {}\n",
+            "pub QueryOption { Check(i64) }\n",
+        );
         let package = concat!(
             "module pkg.db.postgres\n",
-            "pub fn query_file(path: str, options: slice<i64>, native: slice<i64>) -> i64 = 0\n",
+            "import std.process\n",
+            "import pkg.db\n",
+            "pub QueryOption { ParameterType(str, str) }\n",
+            "pub fn query_file<P, R>(path: str, options: slice<pkg.db.QueryOption>, native: slice<QueryOption>) -> pkg.db.query<P, R> = process.abort()\n",
         );
         let query = concat!(
             "module q\n",
+            "import pkg.db\n",
             "import pkg.db.postgres\n",
-            "pub fn lookup() -> i64 = pkg.db.postgres.query_file(\"sql/look\\nup.sql\", [0], [0])\n",
+            "pub Params { id: i64 }\n",
+            "pub Row { name: str }\n",
+            "pub fn lookup() -> pkg.db.query<Params, Row> = pkg.db.postgres.query_file(\"sql/look\\nup.sql\", [], [])\n",
         );
         let (checked, diagnostics) = check_modules(&[
+            ("pkg.db", root, false),
             ("pkg.db.postgres", package, false),
             ("q", query, true),
         ]);
@@ -41754,24 +42762,27 @@ mod tests {
     fn static_constructor_arguments_are_validated_independently_of_package_signatures() {
         let cases = [
             (
-                "pub fn query_file() -> i64 = 0",
+                "pub fn query_file<P, R>() -> query<P, R> = process.abort()",
                 "pkg.db.query_file()",
                 "requires one option list",
             ),
             (
-                "pub fn query_file(path: i64, options: slice<i64>) -> i64 = 0",
+                "pub fn query_file<P, R>(path: i64, options: slice<i64>) -> query<P, R> = process.abort()",
                 "pkg.db.query_file(1, [])",
                 "must be a string literal",
             ),
             (
-                "pub fn query_file(options: i64) -> i64 = 0",
+                "pub fn query_file<P, R>(options: i64) -> query<P, R> = process.abort()",
                 "pkg.db.query_file(1)",
                 "explicit option-list literal",
             ),
         ];
         for (declaration, call, expected) in cases {
-            let package = format!("module pkg.db\n{declaration}\n");
-            let query = format!("module q\nimport pkg.db\nfn bad() -> i64 = {call}\n");
+            let package =
+                format!("module pkg.db\nimport std.process\npub query<P, R> {{}}\n{declaration}\n");
+            let query = format!(
+                "module q\nimport pkg.db\nParams {{ id: i64 }}\nRow {{ id: i64 }}\nfn bad() -> pkg.db.query<Params, Row> = {call}\n"
+            );
             let (checked, diagnostics) = check_modules(&[
                 ("pkg.db", package.as_str(), false),
                 ("q", query.as_str(), true),
@@ -44552,9 +45563,38 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
-    fn empty_array_literal_errors() {
-        let (_p, d) = check("fn main() -> i32 {\n  return [].sum()\n}\n");
-        assert!(d.has_errors(), "an empty array literal needs a type");
+    fn empty_array_literal_uses_an_expected_slice_element_type() {
+        let (_p, d) = check(
+            "fn use(xs: slice<i32>) -> i32 = 0\nfn main() -> i32 = use([])\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "an expected slice type must determine the empty literal element: {:?}",
+            d.iter().collect::<Vec<_>>()
+        );
+
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  xs: slice<i32> := []\n  return xs.len() as i32\n}\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "a typed slice binding must determine the empty literal element: {:?}",
+            d.iter().collect::<Vec<_>>()
+        );
+
+        let (_p, d) = check("fn main() -> i32 {\n  xs := []\n  return 0\n}\n");
+        assert!(d.has_errors(), "an untyped empty array literal needs an expected type");
+        assert!(d.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("an empty array literal needs an expected element type")));
+
+        let (_p, d) = check(
+            "fn use(xs: slice<slice<i32>>) -> i32 = 0\nfn main() -> i32 = use([])\n",
+        );
+        assert!(d.has_errors(), "empty literals must not widen the array element domain");
+        assert!(d.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("a slice view is a borrow, not collectible")));
     }
 
     #[test]

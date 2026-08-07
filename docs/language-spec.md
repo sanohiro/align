@@ -222,6 +222,11 @@ fn unwrap_or<T>(o: Option<T>, d: T) -> T = o else d
 n := id(5)        // T = i32, monomorphized to id$i32
 ```
 
+A function-local `[]` has no element type of its own. It is accepted only when an enclosing
+`slice<T>` context supplies the exact `T` (for example, a typed parameter or binding), and then
+uses the normal zero-length fixed-array-to-slice borrow with no allocation. An uncontextualized
+empty literal is a compile error.
+
 ### Memory
 
 ```text

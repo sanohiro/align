@@ -11,6 +11,89 @@
 use align_diag::Diagnostics;
 use align_span::{FileId, Span};
 
+/// One exact mapping run from decoded string-literal bytes back to the source bytes that produced
+/// them. Ordinary UTF-8 bytes coalesce; each escape is its own run because source and decoded
+/// widths may differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedStringRun {
+    pub decoded_start: u32,
+    pub decoded_end: u32,
+    pub source_start: u32,
+    pub source_end: u32,
+}
+
+/// Reconstruct the lexer-defined decoded bytes and their exact source runs for one already-valid
+/// string token. `span` includes the opening and closing quote.
+pub fn decoded_string_runs(source: &str, span: Span) -> Option<(String, Vec<DecodedStringRun>)> {
+    let start = usize::try_from(span.lo).ok()?;
+    let end = usize::try_from(span.hi).ok()?;
+    let literal = source.as_bytes().get(start..end)?;
+    if literal.len() < 2 || literal.first() != Some(&b'"') || literal.last() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1usize;
+    let content_end = literal.len() - 1;
+    let mut decoded = String::new();
+    let mut runs = Vec::new();
+    while index < content_end {
+        let source_run_start = index;
+        let decoded_start = decoded.len();
+        if literal[index] != b'\\' {
+            while index < content_end && literal[index] != b'\\' {
+                let width = source
+                    .get(start + index..start + content_end)?
+                    .chars()
+                    .next()?
+                    .len_utf8();
+                if index.checked_add(width)? > content_end {
+                    return None;
+                }
+                decoded.push_str(source.get(start + index..start + index + width)?);
+                index += width;
+            }
+        } else {
+            index += 1;
+            let escaped = *literal.get(index)?;
+            index += 1;
+            let value = match escaped {
+                b'n' => '\n',
+                b't' => '\t',
+                b'r' => '\r',
+                b'0' => '\0',
+                b'\\' => '\\',
+                b'"' => '"',
+                b'\'' => '\'',
+                b'u' => {
+                    if literal.get(index) != Some(&b'{') {
+                        return None;
+                    }
+                    index += 1;
+                    let digits_start = index;
+                    while index < content_end && literal[index].is_ascii_hexdigit() {
+                        index += 1;
+                    }
+                    let digits = literal.get(digits_start..index)?;
+                    if digits.is_empty() || digits.len() > 6 || literal.get(index) != Some(&b'}') {
+                        return None;
+                    }
+                    index += 1;
+                    let digits = std::str::from_utf8(digits).ok()?;
+                    char::from_u32(u32::from_str_radix(digits, 16).ok()?)?
+                }
+                _ => return None,
+            };
+            decoded.push(value);
+        }
+        runs.push(DecodedStringRun {
+            decoded_start: u32::try_from(decoded_start).ok()?,
+            decoded_end: u32::try_from(decoded.len()).ok()?,
+            source_start: span.lo.checked_add(u32::try_from(source_run_start).ok()?)?,
+            source_end: span.lo.checked_add(u32::try_from(index).ok()?)?,
+        });
+    }
+    Some((decoded, runs))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokKind {
     // Literals / identifiers
@@ -776,6 +859,30 @@ mod tests {
             kinds("'\\\"'\n"),
             vec![TokKind::Char('"' as u32), TokKind::End, TokKind::Eof]
         );
+    }
+
+    #[test]
+    fn decoded_string_runs_separate_escape_expansions_from_affine_text() {
+        let source = "before \"ab\\n\\u{1f600}z\" after";
+        let lo = u32::try_from(source.find('"').unwrap()).unwrap();
+        let hi = u32::try_from(source.rfind('"').unwrap() + 1).unwrap();
+        let (decoded, runs) = decoded_string_runs(source, Span::new(0, lo, hi)).unwrap();
+        assert_eq!(decoded, "ab\n😀z");
+        assert_eq!(
+            runs.iter()
+                .map(|run| (
+                    &decoded.as_bytes()[run.decoded_start as usize..run.decoded_end as usize],
+                    &source.as_bytes()[run.source_start as usize..run.source_end as usize],
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (b"ab".as_slice(), b"ab".as_slice()),
+                (b"\n".as_slice(), b"\\n".as_slice()),
+                ("😀".as_bytes(), b"\\u{1f600}".as_slice()),
+                (b"z".as_slice(), b"z".as_slice()),
+            ]
+        );
+        assert!(decoded_string_runs("\"", Span::new(0, 0, 1)).is_none());
     }
 
     #[test]

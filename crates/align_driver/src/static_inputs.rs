@@ -6,7 +6,7 @@
 //! this module then resolves one exact file (or keeps decoded inline bytes), snapshots the exact
 //! checked-metadata paths, and produces a fail-closed manifest/action digest.
 
-use align_interface::{Driver, DriverRestriction, Hash128, SqlSourceIdentity};
+use align_interface::{DecodedSpanEntry, Driver, DriverRestriction, Hash128, SqlSourceIdentity};
 use align_sema::{
     StaticDescriptor, StaticDescriptorConsumer, StaticDescriptorDriver, StaticDescriptorSource,
 };
@@ -59,6 +59,7 @@ pub struct StaticInput {
 pub struct ResolvedStaticInput {
     pub input: StaticInput,
     pub bytes: Vec<u8>,
+    pub decoded_span_map: Vec<DecodedSpanEntry>,
     pub source_map_file: Option<FileId>,
     pub resolved_path: Option<PathBuf>,
 }
@@ -84,7 +85,11 @@ pub enum StaticDescriptorInputErrorCause {
 
 impl std::fmt::Display for StaticDescriptorInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cannot resolve static descriptor `{}`: ", self.descriptor_id)?;
+        write!(
+            f,
+            "cannot resolve static descriptor `{}`: ",
+            self.descriptor_id
+        )?;
         match &self.cause {
             StaticDescriptorInputErrorCause::InvalidDefiningFile => {
                 write!(f, "its defining source file is not present in SourceMap")
@@ -279,18 +284,46 @@ pub fn resolve_static_descriptors(
     let mut resolved = Vec::with_capacity(descriptors.len());
     let mut file_snapshots = HashMap::new();
     for descriptor in descriptors {
-        let defining_file = source_map
+        let defining_source = source_map
             .files()
             .get(descriptor.constructor_span.file as usize)
-            .map(|file| file.name.clone())
+            .map(|file| (file.name.clone(), file.src.clone()))
             .ok_or_else(|| {
                 descriptor_input_error(
                     descriptor,
                     StaticDescriptorInputErrorCause::InvalidDefiningFile,
                 )
             })?;
+        let (defining_file, defining_source_text) = defining_source;
         let consumer = descriptor_consumer(descriptor.consumer);
         let restriction = descriptor_driver(descriptor.driver);
+        let inline_mapping = match &descriptor.source {
+            StaticDescriptorSource::Inline {
+                decoded_sql,
+                literal_span,
+            } => {
+                let Some((decoded, runs)) =
+                    align_lexer::decoded_string_runs(&defining_source_text, *literal_span)
+                else {
+                    return Err(descriptor_input_error(
+                        descriptor,
+                        StaticDescriptorInputErrorCause::Input(StaticInputError::NonCanonical(
+                            "cannot reconstruct the inline SQL literal span map".to_string(),
+                        )),
+                    ));
+                };
+                if decoded != *decoded_sql {
+                    return Err(descriptor_input_error(
+                        descriptor,
+                        StaticDescriptorInputErrorCause::Input(StaticInputError::HashMismatch {
+                            logical_path: descriptor.descriptor_id.clone(),
+                        }),
+                    ));
+                }
+                Some((decoded, runs, *literal_span))
+            }
+            StaticDescriptorSource::File { .. } => None,
+        };
         let mut input = match &descriptor.source {
             StaticDescriptorSource::File { path_literal, .. } => resolve_static_file(
                 project_root,
@@ -309,12 +342,66 @@ pub fn resolve_static_descriptors(
             ),
         }
         .map_err(|error| {
-            descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
+            let span = match (&error, &inline_mapping) {
+                (StaticInputError::EmbeddedNul { offset, .. }, Some((_, runs, literal_span))) => {
+                    runs.iter()
+                        .find(|run| run.decoded_start <= *offset && *offset < run.decoded_end)
+                        .map(|run| {
+                            let decoded_width = run.decoded_end - run.decoded_start;
+                            let source_width = run.source_end - run.source_start;
+                            if decoded_width == source_width {
+                                let source_start = run
+                                    .source_start
+                                    .checked_add(*offset - run.decoded_start)
+                                    .unwrap_or(run.source_start);
+                                Span::new(
+                                    literal_span.file,
+                                    source_start,
+                                    source_start.checked_add(1).unwrap_or(run.source_end),
+                                )
+                            } else {
+                                Span::new(literal_span.file, run.source_start, run.source_end)
+                            }
+                        })
+                        .unwrap_or(descriptor.constructor_span)
+                }
+                _ => descriptor.constructor_span,
+            };
+            StaticDescriptorInputError {
+                descriptor_id: descriptor.descriptor_id.clone(),
+                span,
+                cause: StaticDescriptorInputErrorCause::Input(error),
+            }
         })?;
+        if let Some((decoded, runs, _)) = inline_mapping {
+            if decoded.as_bytes() != input.bytes {
+                return Err(descriptor_input_error(
+                    descriptor,
+                    StaticDescriptorInputErrorCause::Input(StaticInputError::HashMismatch {
+                        logical_path: descriptor.descriptor_id.clone(),
+                    }),
+                ));
+            }
+            input.decoded_span_map = runs
+                .into_iter()
+                .map(|run| DecodedSpanEntry {
+                    decoded_span: align_interface::Span {
+                        start: run.decoded_start,
+                        end: run.decoded_end,
+                    },
+                    defining_file_span: align_interface::Span {
+                        start: run.source_start,
+                        end: run.source_end,
+                    },
+                })
+                .collect();
+        }
         input.input.checked_metadata = permitted_drivers(restriction)
             .iter()
             .copied()
-            .map(|driver| snapshot_checked_metadata(project_root, &descriptor.descriptor_id, driver))
+            .map(|driver| {
+                snapshot_checked_metadata(project_root, &descriptor.descriptor_id, driver)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
@@ -376,7 +463,10 @@ pub fn resolve_static_descriptors(
         input.source_map_file = registered.get(logical_path).copied();
     }
 
-    Ok(ResolvedStaticInputs { inputs: resolved, manifest })
+    Ok(ResolvedStaticInputs {
+        inputs: resolved,
+        manifest,
+    })
 }
 
 fn invalid_descriptor_id(id: &str) -> bool {
@@ -496,6 +586,11 @@ fn canonical_defining_file(
     defining_align_file: &Path,
 ) -> Result<PathBuf, StaticInputError> {
     let candidate = if defining_align_file.is_absolute() {
+        defining_align_file.to_path_buf()
+    } else if root.is_absolute() && defining_align_file.exists() {
+        // CLI entry paths are commonly relative to the current working directory while the
+        // project root has already been canonicalized. Do not prepend that root a second time
+        // (`apps/db` + `apps/db/app/q.align`). Containment is still checked on the canonical path.
         defining_align_file.to_path_buf()
     } else {
         root.join(defining_align_file)
@@ -698,6 +793,8 @@ pub fn resolve_static_file(
     let root = canonical_root(project_root)?;
     let lexical_defining = if defining_align_file.is_absolute() {
         defining_align_file.to_path_buf()
+    } else if project_root.is_absolute() && defining_align_file.exists() {
+        lexical_absolute(defining_align_file)?
     } else {
         lexical_root.join(defining_align_file)
     };
@@ -732,6 +829,7 @@ pub fn resolve_static_file(
     Ok(ResolvedStaticInput {
         input,
         bytes,
+        decoded_span_map: Vec::new(),
         source_map_file,
         resolved_path: Some(candidate),
     })
@@ -765,6 +863,7 @@ pub fn resolve_inline_static_input(
     Ok(ResolvedStaticInput {
         input,
         bytes,
+        decoded_span_map: Vec::new(),
         source_map_file: None,
         resolved_path: None,
     })
@@ -2069,6 +2168,23 @@ mod tests {
             constructor_span: Span::new(file, 0, 1),
             common_options_span: Span::new(file, 0, 1),
             native_options_span: None,
+            params_ty: align_sema::Ty::Unit,
+            row_ty: Some(align_sema::Ty::Unit),
+            params_contract: align_sema::StaticContract {
+                root: align_sema::StaticContractType::Named {
+                    path: "()".to_string(),
+                    args: Vec::new(),
+                },
+                definitions: Vec::new(),
+            },
+            row_contract: Some(align_sema::StaticContract {
+                root: align_sema::StaticContractType::Named {
+                    path: "()".to_string(),
+                    args: Vec::new(),
+                },
+                definitions: Vec::new(),
+            }),
+            static_options: Vec::new(),
         }
     }
 
@@ -2076,23 +2192,30 @@ mod tests {
     fn descriptor_batch_resolves_files_inline_sql_metadata_and_shared_source_identity() {
         let root = temp_root("descriptor-batch");
         let defining = root.join("q.align");
-        write(&defining, "module q\n").expect("defining source");
+        let defining_source = "module q\n\"select 3\"\n\"select 5\"\n";
+        write(&defining, defining_source).expect("defining source");
         write(root.join("q.sql"), "select 1\n").expect("sibling SQL");
         create_dir_all(root.join("sql")).expect("SQL directory");
         write(root.join("sql/explicit.sql"), "select 4\n").expect("explicit SQL");
         let mut source_map = SourceMap::new();
-        let file = source_map.add_file(defining.display().to_string(), "module q\n".to_string());
+        let file = source_map.add_file(defining.display().to_string(), defining_source.to_string());
         let descriptors = vec![
             descriptor(
                 file,
                 "q.first",
-                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorSource::File {
+                    path_literal: None,
+                    path_span: None,
+                },
                 StaticDescriptorDriver::AnySupportedDriver,
             ),
             descriptor(
                 file,
                 "q.second",
-                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorSource::File {
+                    path_literal: None,
+                    path_span: None,
+                },
                 StaticDescriptorDriver::AnySupportedDriver,
             ),
             descriptor(
@@ -2100,7 +2223,7 @@ mod tests {
                 "q.third",
                 StaticDescriptorSource::Inline {
                     decoded_sql: "select 3".to_string(),
-                    literal_span: Span::new(file, 0, 1),
+                    literal_span: Span::new(file, 9, 19),
                 },
                 StaticDescriptorDriver::SQLiteOnly,
             ),
@@ -2118,7 +2241,7 @@ mod tests {
                 "q.fifth",
                 StaticDescriptorSource::Inline {
                     decoded_sql: "select 5".to_string(),
-                    literal_span: Span::new(file, 0, 1),
+                    literal_span: Span::new(file, 20, 30),
                 },
                 StaticDescriptorDriver::PostgreSQLOnly,
             ),
@@ -2138,7 +2261,10 @@ mod tests {
             3,
             "the shared SQL file and explicit file are each registered once"
         );
-        assert_eq!(resolved.inputs[0].source_map_file, resolved.inputs[1].source_map_file);
+        assert_eq!(
+            resolved.inputs[0].source_map_file,
+            resolved.inputs[1].source_map_file
+        );
         assert!(resolved.inputs[0].source_map_file.is_some());
         assert_eq!(resolved.inputs[2].source_map_file, None);
         assert!(resolved.inputs[3].source_map_file.is_some());
@@ -2177,13 +2303,19 @@ mod tests {
             descriptor(
                 valid_file,
                 "valid.query",
-                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorSource::File {
+                    path_literal: None,
+                    path_span: None,
+                },
                 StaticDescriptorDriver::SQLiteOnly,
             ),
             descriptor(
                 missing_file,
                 "missing.query",
-                StaticDescriptorSource::File { path_literal: None, path_span: None },
+                StaticDescriptorSource::File {
+                    path_literal: None,
+                    path_span: None,
+                },
                 StaticDescriptorDriver::SQLiteOnly,
             ),
         ];
@@ -2201,7 +2333,10 @@ mod tests {
         let duplicate = descriptor(
             valid_file,
             "valid.query",
-            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorSource::File {
+                path_literal: None,
+                path_span: None,
+            },
             StaticDescriptorDriver::SQLiteOnly,
         );
         let duplicate_span = duplicate.constructor_span;
@@ -2219,7 +2354,10 @@ mod tests {
         let invalid_id = descriptor(
             u32::MAX,
             "bad.\0query",
-            StaticDescriptorSource::File { path_literal: None, path_span: None },
+            StaticDescriptorSource::File {
+                path_literal: None,
+                path_span: None,
+            },
             StaticDescriptorDriver::SQLiteOnly,
         );
         let invalid_span = invalid_id.constructor_span;
@@ -2285,14 +2423,27 @@ mod tests {
         create_dir_all(root.join("pkg")).expect("pkg directory");
         write(
             root.join("pkg/db.align"),
-            "module pkg.db\npub fn query_file(options: slice<i64>) -> i64 = 0\n",
+            concat!(
+                "module pkg.db\n",
+                "import std.process\n",
+                "pub query<P, R> {}\n",
+                "pub QueryOption { Check(i64) }\n",
+                "pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()\n",
+            ),
         )
         .expect("pkg.db source");
         write(
             root.join("queries.align"),
-            "module queries\nimport pkg.db\npub fn users() -> i64 = pkg.db.query_file([0])\n",
+            concat!(
+                "module queries\n",
+                "import pkg.db\n",
+                "pub Params { id: i64 }\n",
+                "pub Row { name: str }\n",
+                "pub fn users() -> pkg.db.query<Params, Row> = pkg.db.query_file([])\n",
+            ),
         )
         .expect("query source");
+        write(root.join("queries.sql"), "SELECT :id AS name\n").expect("query SQL");
         let entry = "module main\nimport queries\nfn main() -> i32 = 0\n";
         let entry_path = root.join("main.align");
 
@@ -2328,14 +2479,19 @@ mod tests {
         assert_eq!(query_unit.static_descriptors.len(), 1);
         let whole_descriptor = &whole.static_descriptors[0];
         let per_unit_descriptor = &query_unit.static_descriptors[0];
-        assert_eq!(per_unit_descriptor.descriptor_id, whole_descriptor.descriptor_id);
+        assert_eq!(
+            per_unit_descriptor.descriptor_id,
+            whole_descriptor.descriptor_id
+        );
         assert_eq!(per_unit_descriptor.source, whole_descriptor.source);
         assert_eq!(per_unit_descriptor.driver, whole_descriptor.driver);
-        assert!(per_unit
-            .units
-            .iter()
-            .filter(|unit| unit.unit != "queries")
-            .all(|unit| unit.static_descriptors.is_empty()));
+        assert!(
+            per_unit
+                .units
+                .iter()
+                .filter(|unit| unit.unit != "queries")
+                .all(|unit| unit.static_descriptors.is_empty())
+        );
     }
 
     fn metadata_json(format_version: u32, source_sql_hash: &str) -> Vec<u8> {

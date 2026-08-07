@@ -1,0 +1,34 @@
+module pkg.db.postgres
+
+import std.process
+import pkg.db
+
+pub QueryOption {
+  ParameterType(str, str)
+}
+
+pub CommandOption {
+  ParameterType(str, str)
+}
+
+pub fn query_file<P, R>(
+  options: slice<pkg.db.QueryOption>,
+  native: slice<QueryOption>,
+) -> pkg.db.query<P, R> = process.abort()
+
+pub fn query<P, R>(
+  sql: str,
+  options: slice<pkg.db.QueryOption>,
+  native: slice<QueryOption>,
+) -> pkg.db.query<P, R> = process.abort()
+
+pub fn command_file<P>(
+  options: slice<pkg.db.CommandOption>,
+  native: slice<CommandOption>,
+) -> pkg.db.command<P> = process.abort()
+
+pub fn command<P>(
+  sql: str,
+  options: slice<pkg.db.CommandOption>,
+  native: slice<CommandOption>,
+) -> pkg.db.command<P> = process.abort()
