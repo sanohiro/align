@@ -3209,7 +3209,7 @@ L1b Move sum/Option/Result payload completion
 L2a parameter-mode and borrow/region-summary representation and interface identity
 L2b recursive parameter/capture return provenance and function-value joins
 L2c cleanup-ABI record and dynamic bit for recursively Move returns
-L2d shared borrow over reusable Move owners
+L2d shared borrow over stable bound Copy/Move storage
 L2e borrow mut/out, all-peer aliases, Copy/Move replacement, and Pure shaping
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
@@ -3420,14 +3420,14 @@ an untaken record. The binder stops after the first failure.
 `P` may be Copy or Move under the general shared-borrow rule; the generated callback always reads
 the caller's stable storage and never creates a by-value aggregate copy. If `P`, or a Query's `R`,
 contains a shape outside Q2's closed non-null `i64` subset, `validate_static_thunk` returns exact
-`-1_i32` before invoking any field callback. The package initializes the context-owned failure
-record before thunk invocation to
+`-1_i32` before invoking any field callback. That reserved status does not select or preallocate a
+context failure record. After receiving it, the package constructs exactly one owned
 `db.Error.Unsupported(db.ContractError { query_id: Some(id), item: "db.descriptor.shape",
 message: "static database descriptor uses a field shape unsupported by this execution milestone" })`.
-Thus every nonzero status still selects an owned failure record and phase 6 fails before lease or
-native send. Query binder/row-validator/decoder pointers remain non-null but are unreachable after
-that failure. Command row-validator and decoder slots remain null exactly as required by the fixed
-header.
+Supported executions allocate no error. Every other nonzero callback status still selects its
+context-owned first-failure record. Phase 6 fails before lease or native send. Query
+binder/row-validator/decoder pointers remain non-null but are unreachable after that failure.
+Command row-validator and decoder slots remain null exactly as required by the fixed header.
 
 Static-option validation ABI v1 is `fn(context: raw) -> i32`. It visits the Q1 canonical sorted
 option sequence and emits no callback for the common Check option, whose policy/state was already
@@ -3520,7 +3520,7 @@ requires the high-risk review path.
 | `error(c)` could textually bind to a local `Error` | Define the sugar as a direct construction of `core.Error.Code(c)` and test it in a colliding module. | namespaced builtin type identity; error owner |
 | the general alias rule named no complete provider map and tested only `Error` | Close the table over `Error`, `argon2_params`, and `regex_match`, including exact provider spellings and parameterized owner coverage. | namespaced builtin type identity; core/std EN/JA |
 | the exact binder ABI required borrowing Copy `P`, but shared borrow rejected Copy as redundant | Generalize shared borrow to stable bound Copy or Move places, preserve the pointer-to-caller-storage ABI, and keep temporary rejection. Use the same rule for source, function values, interfaces, generated MIR, and whole/per-unit codegen without a database exception. | generated binder/decoder; type and monomorph closure; language borrow owners |
-| Q1 descriptors outside the Q2 scalar subset had no publishable execution header | Make `validate_static_thunk` return `-1_i32` in phase 6 for unsupported `P` or Query `R`, before field callbacks, lease, or send; initialize the context with the exact `db.descriptor.shape` owned `Unsupported` failure. Query keeps non-null but unreachable binder/row/decode thunks; command row/decode slots stay null. | generated binder/decoder; native descriptor ABI; unsupported-shape no-send |
+| Q1 descriptors outside the Q2 scalar subset had no publishable execution header | Make `validate_static_thunk` return reserved `-1_i32` in phase 6 for unsupported `P` or Query `R`, before field callbacks, lease, or send; only after that status does the package construct the exact `db.descriptor.shape` owned `Unsupported` failure. Query keeps non-null but unreachable binder/row/decode thunks; command row/decode slots stay null. | generated binder/decoder; native descriptor ABI; unsupported-shape no-send and supported-success zero-error-allocation owners |
 
 ### D2 — minimal SQLite Query vertical
 

@@ -3616,7 +3616,7 @@ L1b Move sum/Option/Result payload completion — complete
 L2a parameter-mode and borrow/region-summary representation and interface identity
 L2b recursive parameter/capture return provenance and function-value joins
 L2c cleanup-ABI record and dynamic bit for recursively Move returns
-L2d shared borrow over reusable Move owners
+L2d shared borrow over stable bound Copy/Move storage
 L2e borrow mut/out + all-peer aliases + replacement/effect rules
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent views + root transfer
 L4  named arena region capability + clone_in

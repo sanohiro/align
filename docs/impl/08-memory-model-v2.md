@@ -654,9 +654,12 @@ recursive types or arbitrary Move-element collections.
 
 ### 14.2 Borrowed parameter modes and summaries
 
-`borrow x: T` is a shared parameter mode for Move owners. `borrow mut x: T` accepts a writable Move
-or Copy place, updates caller storage, and ends the previous generation. They are not reference
-types and introduce no writable lifetime syntax. `BorrowState` tracks that generation beside the
+`borrow x: T` is a shared parameter mode for stable bound Copy or Move storage. For Copy it makes
+the no-copy pointer ABI explicit while ordinary by-value passing remains the default. `borrow mut
+x: T` accepts a writable Move or Copy place, updates caller storage, and ends the previous
+generation. Neither mode accepts a temporary or rvalue; the language creates no hidden addressable
+temporary. They are not reference types and introduce no writable lifetime syntax. `BorrowState`
+tracks that generation beside the
 existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
 lexically in scope. The call-site exclusivity check scans every peer mode and rejects direct overlap
 or recursively embedded provenance that overlaps the old generation, including distinct holder

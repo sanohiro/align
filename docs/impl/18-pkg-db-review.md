@@ -382,7 +382,9 @@ idea is rejected.
   but the state made from bool/integer/view fields is Copy.
 - **Actual failure:** passing it by value discards mutations, while the declared `borrow mut` form is
   rejected.
-- **Recommendation:** keep shared borrow Move-only, but admit mutable borrow of any writable Move or
+- **Superseded 2026-08-07:** the final language design admits explicit shared borrow of stable bound
+  Copy or Move storage, so the earlier recommendation to keep shared borrow Move-only no longer
+  applies. It still admits mutable borrow of any writable Move or
   Copy place with one pointer-to-caller-storage ABI and generation invalidation.
 - **v1 impact:** blocker for D10; resolved as a general in-place state capability.
 
