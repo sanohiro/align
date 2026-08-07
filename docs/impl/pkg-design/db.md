@@ -3413,9 +3413,11 @@ opaque call-scoped token and may only pass it to the exact package callback
 `pkg.db.internal.bind_i64_v1(context, protocol_ordinal: u32, value: i64) -> i32`; it never loads,
 stores, retains, returns, or frees that pointer. The package creates and owns the execution context,
 validates its private version/driver/ordinal state in the callback, and destroys it after the
-synchronous operation. Zero means success. A nonzero result selects the context-owned failure
-record; the package materializes one owned `db.Error` before native cleanup, and context Drop frees
-an untaken record. The binder stops after the first failure.
+synchronous operation. Every status callback returns exactly `0_i32` on success or `1_i32` after
+recording the context-owned first failure; it never returns a negative value. A generated thunk
+maps any nonzero callback result to `1_i32`, so `-1_i32` remains reserved to the compiler-generated
+unsupported-shape path. The package materializes one selected owned `db.Error` before native
+cleanup, context Drop frees an untaken record, and the binder stops after the first failure.
 
 `P` may be Copy or Move under the general shared-borrow rule; the generated callback always reads
 the caller's stable storage and never creates a by-value aggregate copy. If `P`, or a Query's `R`,
@@ -3424,8 +3426,9 @@ contains a shape outside Q2's closed non-null `i64` subset, `validate_static_thu
 context failure record. After receiving it, the package constructs exactly one owned
 `db.Error.Unsupported(db.ContractError { query_id: Some(id), item: "db.descriptor.shape",
 message: "static database descriptor uses a field shape unsupported by this execution milestone" })`.
-Supported executions allocate no error. Every other nonzero callback status still selects its
-context-owned first-failure record. Phase 6 fails before lease or native send. Query
+Supported executions allocate no error. Exact `1_i32` selects the context-owned first-failure
+record; exact `-1_i32` means only the unsupported-shape case above. No other status is produced by
+a valid v1 thunk. Phase 6 fails before lease or native send. Query
 binder/row-validator/decoder pointers remain non-null but are unreachable after that failure.
 Command row-validator and decoder slots remain null exactly as required by the fixed header.
 
@@ -3438,7 +3441,7 @@ overflow. For PostgreSQL `i64` it calls exactly
 `pkg.db.internal.set_postgres_i64_type_v1(context: raw, protocol_ordinal: u32,
 canonical_type_name: str) -> i32`; Q2 accepts exact `int8`, records OID 20 in the call-scoped
 `PQexecParams` type vector, and returns `Unsupported` for every other requested mapping before send.
-Zero/nonzero, first-failure recording, opaque-context provenance, and immediate stop match the binder
+Exact zero/one status, first-failure recording, opaque-context provenance, and immediate stop match the binder
 ABI. Compiler publication validates exact Q1-option/thunk agreement, so no static option is omitted.
 
 Query row-validation ABI v1 is `fn(context: raw) -> i32`. It first calls exactly
@@ -3446,8 +3449,8 @@ Query row-validation ABI v1 is `fn(context: raw) -> i32`. It first calls exactly
 `pkg.db.internal.validate_i64_v1(context: raw, ordinal: u32, expected_name: str) -> i32` in declared
 ordinal order. The per-column callback checks the exact UTF-8 name bytes, then NULL, then the
 driver-native representation, then full-range `i64` parsing; on success it caches the parsed scalar
-inside the package context. Zero means success. Nonzero selects the same context-owned first-failure
-record as binding, and the generated validator stops immediately. This catches same-typed column
+inside the package context. Zero means success. Exact one selects the same context-owned
+first-failure record as binding, and the generated validator stops immediately. This catches same-typed column
 reordering under `DeclaredOnly` before construction. Decoder ABI v1 is `fn(context: raw) -> R`; it
 may call only `pkg.db.internal.read_i64_v1(context: raw, ordinal: u32) -> i64` after successful
 validation, then writes direct field offsets. `read_i64_v1` reads only the cached validated scalar

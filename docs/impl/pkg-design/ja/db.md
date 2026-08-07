@@ -2042,9 +2042,11 @@ call-scoped tokenとして扱い、exact package callback
 `pkg.db.internal.bind_i64_v1(context, protocol_ordinal: u32, value: i64) -> i32`へ渡す以外に
 load/store/retain/return/freeしない。packageがcontextを作成・所有し、private
 version/driver/ordinal stateをcallback内でvalidateし、synchronous operation後にdestroyする。
-0はsuccess、nonzeroはcontext-owned failure recordを選び、packageがnative cleanup前に1つの
-owned `db.Error`へmaterializeする。untaken recordはcontext Dropがfreeし、binderは最初のfailureで
-停止する。
+全status callbackはsuccessでexact `0_i32`、context-owned first failureをrecordした後にexact
+`1_i32`だけを返しnegative valueを返さない。generated thunkはcallbackの全nonzeroを`1_i32`へ
+mapし、`-1_i32`をcompiler-generated unsupported-shape path専用に保つ。packageがnative cleanup前に
+selected owned `db.Error`を1つmaterializeし、untaken recordはcontext Dropがfreeし、binderは
+最初のfailureで停止する。
 
 `P`はgeneral shared-borrow ruleによりCopy/Moveのどちらでもよい。generated callbackはcallerの
 stable storageを読み、by-value aggregate copyを作らない。`P`またはQueryの`R`がQ2のclosed
@@ -2053,8 +2055,9 @@ non-null `i64` subset外のshapeを含む場合、`validate_static_thunk`はfiel
 行わない。packageはそのstatusを受け取った後にだけexact owned
 `db.Error.Unsupported(db.ContractError { query_id: Some(id), item: "db.descriptor.shape",
 message: "static database descriptor uses a field shape unsupported by this execution milestone" })`
-をconstructする。supported executionはerrorをallocateしない。他のnonzero callback statusは
-従来どおりcontext-owned first-failure recordを選ぶ。phase 6はlease/native send前にfailする。
+をconstructする。supported executionはerrorをallocateしない。exact `1_i32`だけが
+context-owned first-failure recordを選び、exact `-1_i32`だけが上記unsupported shapeを表す。
+valid v1 thunkは他statusを生成しない。phase 6はlease/native send前にfailする。
 Queryのbinder/row-validator/decoder pointerはnon-nullのままunreachableであり、commandの
 row-validator/decoder slotはfixed headerどおりnullである。
 
@@ -2072,8 +2075,8 @@ Query row-validation ABI v1は`fn(context: raw) -> i32`であり、最初にexac
 `pkg.db.internal.validate_row_count_v1(context: raw, expected: u32) -> i32`、次にdeclared ordinal順で
 exact `pkg.db.internal.validate_i64_v1(context: raw, ordinal: u32, expected_name: str) -> i32`を呼ぶ。
 per-column callbackはexact UTF-8 name bytes、NULL、driver-native representation、full-range i64
-parseの順にcheckし、success時だけparsed scalarをpackage contextへcacheする。0はsuccess、nonzeroは
-binderと同じcontext-owned first-failure recordを選びvalidatorは即停止する。Decoder ABI v1は
+parseの順にcheckし、success時だけparsed scalarをpackage contextへcacheする。0はsuccess、exact
+1はbinderと同じcontext-owned first-failure recordを選びvalidatorは即停止する。Decoder ABI v1は
 `fn(context: raw) -> R`で、successful validation後だけ
 `pkg.db.internal.read_i64_v1(context: raw, ordinal: u32) -> i64`を呼びcached validated scalarを
 direct field offsetへwriteする。validation/decodeでもcontextはcall-scoped/non-retainedである。
