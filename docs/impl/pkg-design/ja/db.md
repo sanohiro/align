@@ -1950,16 +1950,32 @@ PRとproducer-only bridgeにproofを重複させるよりintegration riskが低�
 
 Q1 canonical `ALIGNQST`/`ALIGNCST` bytesは変更しない。Q2はdescriptorの1つのcompiler-private
 raw fieldが指すtarget-native、producer-owned `QueryStatic`/`CommandStatic` execution headerを
-追加する。headerはexact ABI version、statement kind、driver mask、descriptor IDと各permitted
-wire SQL entryのstatic `str` view、Q1 plan pointer、direct producer-owned binder pointer、
-Queryだけのdecoder function pointerを持つ。pointer fieldはtarget pointer width、`str`は通常の
-Align `{pointer, i64 length}` ABI、version/kind/maskは`u32`/`u8`/`u8`である。これはobject内の
-relocation-bearing constantであり、persisted codecでもuntrusted runtime inputでもない。
-Binder ABI v1は`fn(context: raw, borrow params: P) -> i32`で、0はsuccess、nonzeroはpackage
-execution contextが既に所有したerrorを表す。Decoder ABI v1は`fn(context: raw) -> R`である。
-packageがrow count、column count、NULL、native scalar representationをvalidateした後だけ、
-infallibleなdirect field-offset constructionを呼ぶ。calling/layout contractを変える場合は既存
-artifact ABI versionとexecution-header versionの両方をincrementする。
+追加する。現在supportするDB targetは全て64-bitである。execution-header v1はalignment 8、
+size 96で、exact layoutは英語originalのoffset 0 version、4 kind、5 mask、6 reserved、8 Q1
+plan、16 ID、32 SQLite SQL、48 PostgreSQL SQL、64 binder、72 validator、80 decoder、88
+QueryMeta、96 endとする。両driver slotは常にSQLite/PostgreSQL順で存在し、mask外slotはexact
+`(null, 0)`、present slotはnon-null/positive lengthでlength外にNUL sentinelを1つ持つ。
+Queryは4 thunk全てを要求し、commandはbinderだけnon-nullで他3つをnullにする。publication前に
+mask/slot/kind/thunk/reservedをcheckし、consumerは最初のload前にversion/kindをcheckする。
+mask 1/2/3についてoffset、relocation、null slot、alignment、total sizeをindependent
+LLVM/object goldenで固定する。
+
+Binder ABI v1は`fn(context: raw, borrow params: P) -> i32`である。producerはcontextをopaqueな
+call-scoped tokenとして扱い、exact package callback
+`pkg.db.internal.bind_i64_v1(context, protocol_ordinal: u32, value: i64) -> i32`へ渡す以外に
+load/store/retain/return/freeしない。packageがcontextを作成・所有し、private
+version/driver/ordinal stateをcallback内でvalidateし、synchronous operation後にdestroyする。
+0はsuccess、nonzeroはcontext-owned failure recordを選び、packageがnative cleanup前に1つの
+owned `db.Error`へmaterializeする。untaken recordはcontext Dropがfreeし、binderは最初のfailureで
+停止する。
+
+Query row-validation ABI v1は`fn(context: raw) -> i32`であり、versioned package callbackだけで
+各ordinalのexact declared field nameとQ2 `i64` native representationを比較しexact column countも
+要求する。`DeclaredOnly`でもsame-typed reorderをconstruction前に検出する。Decoder ABI v1は
+`fn(context: raw) -> R`で、successful validation後だけ
+`pkg.db.internal.read_i64_v1(context, ordinal: u32) -> i64`を呼びdirect field offsetへwriteする。
+validation/decodeでもcontextはcall-scoped/non-retainedである。header/thunk/callback contractを
+変える場合は既存artifact ABI versionとexecution-header/callback versionをincrementする。
 
 このopaque headerのprojection/thunk invocationはcompilerがvalidateした`pkg.db`所有generic
 bodyだけに許可する。trusted operationはconcrete `P`/`R`とcomplete function signatureを持つ
@@ -1972,18 +1988,18 @@ semantic helperやhandleを追加しない。
 | Closure cell | 必要なimplementation closure | Exact owner evidence |
 |---|---|---|
 | public common surface | §4/§6/§13/§15のexact `db.conn`、`db.exec`、`db.Driver`、`db.exec_result`、structured owned error、`db.ExecuteOption`、`exec_conn`、`execute`、`one` shapeと、common/native option sliceを分離したSQLite/PostgreSQL `execute_native`/`one_native`を定義する。Q2 Rowがi64だけでも`one`のexplicit output `region`を維持する。`db.exec`はsettled conn/tx sum shapeを保ち、Q2ではD7までconstruct不能なtransaction armをnative work前にrejectする。 | package whole/per-unit interface golden、両driverのcompiled common/native command/portable Query、wrong option scope/arityとescaped execution viewのcompile-fail |
-| native descriptor ABI | exact Q1 plan bytesを保ったままdescriptorごとに1つのrelocation-bearing `QueryStatic`/`CommandStatic`をemitする。object publication前にheader kind/mask/thunk presenceをvalidateし、public descriptorをone-pointer Copy valueのままにする。SQL-only producer editはunchanged public consumer interfaceを変えずproducer constant/object identityを置換する。 | exact MIR/LLVM header inventory、ABI-version golden、Query/command omission twin、同じ型の2 descriptorのruntime selection、whole/per-unit executable parity |
-| generated binder/decoder | Query/commandのdirect ordinal `i64` binderとQueryだけのdirect ordinal `i64` decoderを生成する。binderはprotocol ordinalを使い最初のpackage-recorded failureで停止する。decoderはpackage validation後だけ実行し、name/map/boxing/reflectionなしで`R`をconstructする。Q2未対応field shapeはnative send前にfailし、後続mappingはD8が所有する。 | 両driverのportable `CAST(:value AS BIGINT)` bind/decode、repeated PostgreSQL placeholder ordinal、field-order twin、unsupported-shape no-send、generated thunk MIR/LLVM inspection |
+| native descriptor ABI | exact Q1 plan bytesと上記fixed 96-byte v1 layoutを保ちdescriptorごとに1つのrelocation-bearing `QueryStatic`/`CommandStatic`をemitする。publication前にversion/reserved/kind/mask/slot/thunk agreementをvalidateしpublic descriptorをone-pointer Copyのままにする。SQL-only editはpublic consumer interfaceを変えずproducer constant/object identityを置換する。 | masks 1/2/3のexact MIR/LLVM/object header/relocation golden、ABI version、null slot、size/alignment、Query/command omission twin、同型2 descriptor runtime selection、whole/per-unit parity |
+| generated binder/decoder | Query/commandのdirect ordinal `i64` binderとQueryだけのvalidation/decoder thunkを生成する。binderはcontextをopaqueに扱い`bind_i64_v1`だけを呼び最初のfailureで停止する。validationはexact count、declared-order UTF-8 field-name bytes、NULL、driver-native `i64` representationをdecoder前にcheckする。decoderは`read_i64_v1`だけを使いname/map/boxing/reflectionなしで`R`をconstructする。Q2未対応shapeはsend前にfailし後続mappingはD8所有。 | 両driverのportable bind/validate/decode、repeated PG ordinal、same-typed alias reorder/name/type/count twin、callback version/context misuse rejection、unsupported no-send、thunk MIR/LLVM inspection |
 | type and monomorph closure | generic instantiation、function-value signature、interface serialization、whole-program/per-unit compilation、cache/implementation identityを通じてconcrete `P`/`R`を保つ。unresolved type、wrong header kind、absent decoder、mismatched thunk signatureをMIR/codegenへ到達させない。 | whole/per-unit Query/command execution、generic mono-key/header-signature golden、malformed HIR/MIR/header rejection owner |
 | connection formation and ownership | SQLite/PostgreSQL descendantがinput/optionsをvalidateし、1つのphysical native connectionと1つのtagged package stateを作りroot `db.conn`をconstructする。ownerのmove/return/replacementでstateは1つのまま、`db.exec`はgeneration-checked `resource_ref`だけを持つ。source nulling、branch/loop join、early `?`、Dropでclose/free exactly once。 | construction、move-in/out、return、replacement、malformed null、early return/`?`、branch/loop join、use-after-move、whole/per-unit producer Drop thunk linkageのresource owner matrix |
-| common validation precedence | driver-global state取得やSQL sendより前にcommon option shape/duration/duplicate、descriptor kind、driver restriction、connection stateをvalidateする。deadline enforcementはD9所有なのでQ2のcommon deadline要求は`Unsupported`。driver mismatchは`Some(query_id)`を持ちexecution/native-call countを増やさない。 | common timeout、wrong kind、mismatch、poisoned/closed state、duplicate optionのordered multi-invalid tableとno-send/no-lease/no-allocation counter |
-| SQLite connection options | §11.2の全`sqlite.ConnectOption`、exact `[]` default、conflict、positive duration、NUL-free path、PRAGMA name grammar/value quoting、duplicate PRAGMA、linked capability rejection、setup failureを実装する。指定されたvalidationはopen/setup前に行い、flag/PRAGMAをdegrade/ignoreしない。 | parameterized option disposition、multi-invalid precedence、open/setup counter、PRAGMA round trip、unsupported-capability injection、failed-open exactly-once cleanup |
-| SQLite execution lease/options | bind/timeout/native workより前にconnection-wide leaseを取得する。`sqlite.ExecuteOption.BusyTimeoutNs`はpositive/uniqueでtracked valueを一時置換し、success、bind error、prepare/step error、0/1/2+ cardinality、Drop unwindの全synchronous return前にrestoreする。second operationはfirst leaseのread/restore前にfailし、restore failureはpoison/closeする。 | overlap table、busy-timeout apply/restore counter、failed-second-operation、success/error/cardinality/early-`?` cleanup、restore-failure poisoning、execution count |
-| SQLite command/query lifecycle | exactly one statementをprepareしtailがwhitespace/commentだけであることを要求し、`i64`をbindし、commandをcompletionまでstepし、nonnegative affected rowsを読む。`one`は最大2回stepする。全pathでlease restore/returnより前にfinalize exactly onceし、primary/extended codeとowned messageはfinalize後も生存する。 | in-memory insert/select、0/1/2+ cardinality、second-statement rejection、bind/prepare/step/finalize fault injection、affected-row case、cleanup後error ownership、direct-libsqlite comparison |
-| PostgreSQL connection options | §12.2の全`postgres.ConnectOption`、exact `[]` default、URL collisionを含むsemantic-key conflict、positive timeout conversion、SSL/target attribute、arbitrary parameter name/valueを実装する。URL/application/parameter stringのU+0000をlibpq前にrejectし、secretをstatic artifactへ入れない。 | option disposition/multi-invalid table、URL/option conflict、embedded-NUL no-call、unreachable/auth owned error、artifact/interface/cache bytesへのsecret非混入 |
+| common validation precedence | driver-global state取得やSQL sendより前にcommon option shape/duration/duplicate、descriptor kind、driver restriction、connection stateをvalidateする。deadlineはD9所有なのでQ2は`Unsupported`。driver mismatchはowned `ContractError`の`Some(query_id)`で、execution/native-call countを増やさない。contract-error allocationを明示的にcount/freeし、error allocationなしはsuccess pathだけのpromiseとする。 | ordered multi-invalid table、no-send/no-lease/native-state counter、common timeout/wrong kind/mismatch/poisoned/closed/duplicateのexact owned-error allocation/drop counter |
+| SQLite connection options | §11.2の全option/default/conflict/NUL/PRAGMA/capability/setup ruleを実装する。positive nsはoverflow-safe ceilingでnative msへ変換し、`1..=1_000_000` nsは1 ms、`i32::MAX` ms超はSQLite前に`Unsupported`。flag/PRAGMAをdegrade/ignoreしない。 | duration 1/1_000_000/1_000_001 ns、`i32::MAX` ms、overflow、option/multi-invalid、open/setup、PRAGMA、capability、failed-open cleanup |
+| SQLite execution lease/options | bind/timeout/native前にleaseを取得する。BusyTimeoutNsはpositive/uniqueでconnectionと同じceiling/overflow ruleを使いtracked native-ms valueを一時置換し、全return/Drop pathでrestoreする。second operationはfirst stateへ触れる前にfailし、restore failureはpoison/close。first operation errorを保存し、cleanup/restore failureは先行errorがないsuccessだけを置換する。 | duration boundary、overlap、apply/restore、failed second、全cleanup、first/cleanup error precedence、poison、execution count |
+| SQLite command/query lifecycle | exactly one statementとwhitespace/comment tail、i64 bind、command completion、command row rejection、nonnegative affected rows、`one`最大2 stepを実装する。全pathでfinalize exactly onceしerror detailを先にownする。finalize errorはfirst-error precedenceに従う。 | insert/select、command-returned-row、0/1/2+、second statement、fault injection、affected rows、first/finalize precedence、error ownership、direct comparison |
+| PostgreSQL connection options | §12.2の全option/default/conflict/SSL/target/parameterを実装する。positive nsはoverflow-safe ceilingで`connect_timeout`秒へ変換し、`1..=1_000_000_000` nsは1、`1_000_000_001`は2、`i32::MAX`秒超はlibpq前に`Unsupported`。accepted valueをexact decimal ASCII+NULにする。NULをlibpq前に拒否しsecretをartifactへ入れない。 | option/multi-invalid、duration boundary/overflow no-call、URL conflict、NUL no-call、owned connection error、secret absence |
 | PostgreSQL execution options/binding | Text `i64` bindingとexact baseline `postgres.ExecuteOption` validationを実装する。unknown/duplicate parameter name、Binary `i64`、unavailable result formatはsend前に`Unsupported`。repeated source nameは1つの`$n`をreuseする。synchronous callがreturnまでparameter transportを所有する。shared bytea codecもここで閉じる。Textは`\\x`とbyteごとのlowercase hex 2桁を生成し、recorded length外にNUL sentinelを置く。Binaryだけがraw bytesとexplicit lengthを公開する。D8まではbyteaをexecutable descriptor shapeにしない。 | format disposition、no-send counter、`CAST($1 AS BIGINT)` execution、repeated-placeholder、embedded zero/high byteを含むindependent Text/Binary bytea golden、parameter buffer allocation/free counter |
-| PostgreSQL result/cardinality | explicit `BufferedFull`を使う。transportは全rowを所有してよいが`one`がvalidate/decodeするのは最大2行。decoder前にresult status、exact column count、NULL、full-range decimal `i64` parseをcheckする。connection reuse/return前に各`PGresult`をclear exactly once。 | 0/1/2+ result、2超rowのdecode-count pin、NULL/type/range/column-count failure、result-clear counter、full-result pointer-lifetime probe、direct-libpq comparison |
-| native error ownership | statement/result cleanup前にSQLite code/messageとPostgreSQL SQLSTATE/message/detail/constraint/table/columnをexact owned `db.NativeError`へcopyする。message parseなしでstable constraint/serialization/deadlock categoryへmapし、Query/command errorは`Some(query_id)`、connection-input errorは`None`。 | finalize/clear/connection Drop後のerror-field golden、SQLSTATE category table、SQLite primary/extended table、Query-less connection error、allocation/drop counter |
+| PostgreSQL result/cardinality | explicit `BufferedFull`。Queryは`PGRES_TUPLES_OK`を要求し`one`のvalidate/decode attemptは最大2行。exact count/name order、NULL、full-range decimal i64をdecoder前にcheckする。Commandは`PGRES_COMMAND_OK`を要求しtuple statusを`InvalidQuery`、nonempty `PQcmdTuples`をnonnegative fitting i64としてclear前にparseする。emptyはNone、malformed/negative/overflowはnative failure。各resultをclear exactly once。 | Query 0/1/2+、decode-count、reorder/name/NULL/type/range/count、command OK/tuple/status、affected empty/zero/positive/malformed/negative/overflow、clear、pointer probe、direct comparison |
+| native error ownership | cleanup前にnative detailをexact owned `db.NativeError`へcopyしmessage parseなしでstable categoryへmapする。Native errorはQuery IDを持たない。`db.ContractError`だけがquery_idを持ち、statement contractは`Some(id)`、Query-less connection inputは`None`。 | cleanup後field golden、SQLSTATE/SQLite table、contract/native identity-shape twin、Query-less error、allocation/drop |
 | FFI/ABI and malformed input | supported targetごとに使用するSQLite/libpq declaration、enum/status constant、pointer/length signedness、destructor order、linked libraryをpinする。negative/overflow length、null-with-positive-length、invalid UTF-8/native text、malformed execution-header/thunk stateをdereference/side effect前にrejectする。 | D0 probe record、compile-time C signature probe、Rust/Align declaration inventory、malformed boundary test、利用可能なASan/Valgrind相当owner、x86_64/ARM64/macOS CI |
 | allocation parity | scalar connect/execute/one successはvisible connection/execution/native objectとPostgreSQL Text parameter storageだけをallocateする。per-row heap allocation、error allocation、runtime dictionary、artifact/source I/Oは禁止する。partial allocationごとにownerとcleanup edgeを1つ持つ。 | success/各injected partial failureのallocation/copy counter、DB runtime helperを含まないemitted-symbol inventory、package対direct driver measurement |
 | required PostgreSQL gate | pinned provisioned `db-postgres` CI jobを追加する。`ALIGN_DB_POSTGRES_REQUIRED=1`はmissing/unreachable configをfailureにし、同じportable Queryを両driverで実行する。local absenceだけは理由付きskip可。native library/server versionをevidenceとして表示する。 | missing URLのrequired-mode self-test、provisioned PostgreSQL job、portable dual-driver integration target、unconditional/required-mode skip branch不在 |
@@ -1994,6 +2010,18 @@ early `?`、Dropそれぞれの1つのcleanup ownerへ対応付ける。header/t
 second SQLite operationがconnection-global stateへ触れる経路、complete validation前のPostgreSQL
 send、driver semanticsのruntime移動が見つかった場合はこのmatrixを再度開き、high-risk review
 pathを要求する。
+
+#### Q2 plan-review finding-to-fix ledger
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| driver maskでheader offsetが変わり得た | both ordered slotを常設したfixed 96-byte/8-aligned layout、canonical absence、thunk nullability、mask 1/2/3 relocation goldenで固定する。 | native descriptor ABI |
+| binder `raw` context layoutが未定義だった | contextをopaque call-scoped tokenにし、generated codeはversioned package callbackだけを呼ぶ。packageだけがown/validate/error materialize/destroyする。 | binder/decoder、FFI/ABI |
+| same-typed reordered aliasをordinal decodeできた | Query validation thunkで両driverのexact count/name bytes/order/NULL/native representationをdecode前に要求する。 | binder/decoder、result lifecycle |
+| PostgreSQL command result semanticsがなかった | `PGRES_COMMAND_OK`、tuple rejection、`PQcmdTuples` parse/range-checkをclear前に固定する。 | PostgreSQL result/cardinality |
+| native errorへ存在しないQuery IDを要求した | settled shapeを保ち、native errorはdetailだけ、contract errorだけがsubject時`Some(query_id)`を持つ。 | native error ownership |
+| zero-allocation validationがowned ContractErrorと矛盾した | no-send/no-lease/native-stateは維持しrequired owned error allocationをcount/freeする。successだけno-error-allocation。 | common precedence、allocation parity |
+| ns conversionがnative timeoutをdisable/overflowし得た | SQLite ms/libpq secへoverflow-safe ceilingしsigned native bound超をlibrary前にreject、全edgeをpinする。 | SQLite/PostgreSQL option |
 
 ### D2 — 最小SQLite vertical
 
