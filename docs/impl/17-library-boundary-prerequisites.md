@@ -4343,6 +4343,13 @@ failure domain and one end-to-end owner matrix.
 | whole/per-unit parity | Return the same descriptor record from whole-program checking and from the real producer unit in interface-backed per-unit checking. Interface-only dependency bodies are never rediscovered by a consumer. | whole/per-unit semantic parity owner with one imported public descriptor |
 | L5b bridge and side effects | Resolve every published File/Inline request through the existing L5b API, snapshot exactly the permitted drivers' metadata paths, construct one canonical manifest, and only then add deduplicated file bytes to `SourceMap`. Any failure returns the descriptor ID/span and publishes neither a manifest nor partial SQL source entries. | end-to-end sibling/explicit/inline manifest owner, two-descriptors-one-file SourceMap dedup owner, metadata-driver coverage, and late-failure no-partial-registration owner |
 
+L5c review finding-to-fix ledger:
+
+| Finding | Class-wide fix and owner closure |
+|---|---|
+| P2: a signature-invalid descriptor function could look clean when only the body-check diagnostic delta was inspected | Gate publication on every earlier error whose span is contained by the declaration as well as on body-check errors; cover an unknown return type whose `Ty::Error` absorbs the body constraint. |
+| P2: two reads of one logical SQL file could disagree while both descriptors received one shared `SourceMap` file | Record the first byte snapshot for every logical file and reject any later descriptor read whose bytes differ before manifest or `SourceMap` publication; cover a deterministic replacement between two reads. |
+
 The next L5 checkpoint consumes these records to form structural Params/Row contracts, scan SQL,
 emit the versioned L5a artifact, and replace the descriptor function body with its producer-owned
 static data/thunk reference. Until that checkpoint, L5c is an additive frontend/driver boundary and

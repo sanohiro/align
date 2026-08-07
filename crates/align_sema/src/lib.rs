@@ -2719,6 +2719,19 @@ fn static_constructor_occurrences(function: &hir::Fn) -> Vec<Span> {
         .collect()
 }
 
+fn declaration_has_prior_error(declaration: &ast::FnDecl, diags: &Diagnostics) -> bool {
+    diags.iter().any(|diagnostic| {
+        if diagnostic.severity != align_diag::Severity::Error {
+            return false;
+        }
+        diagnostic.span.is_some_and(|span| {
+            span.file == declaration.span.file
+                && span.lo >= declaration.span.lo
+                && span.hi <= declaration.span.hi
+        })
+    })
+}
+
 fn literal_string(expression: &ast::Expr, what: &str, diags: &mut Diagnostics) -> Option<String> {
     if let ast::ExprKind::Str(value) = &expression.kind {
         Some(value.clone())
@@ -5558,6 +5571,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&mangled].bounds.clone();
         let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
+        let function_had_prior_errors = declaration_has_prior_error(f, diags);
         let errors_before = diags.error_count();
         let mut cx = Checker::new(
             diags,
@@ -5598,7 +5612,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let lifted = std::mem::take(&mut cx.lifted);
         let instantiations = std::mem::take(&mut cx.instantiations);
         drop(cx);
-        let function_was_clean = diags.error_count() == errors_before;
+        let function_was_clean =
+            !function_had_prior_errors && diags.error_count() == errors_before;
         if let Some(descriptor) =
             discover_static_descriptor(module, f, &checked, &lifted, function_was_clean, diags)
         {
@@ -40621,6 +40636,7 @@ mod tests {
             "module q\n",
             "import pkg.db\n",
             "fn bad() -> i64 = pkg.db.query_file([unknown])\n",
+            "fn bad_signature() -> Unknown = pkg.db.query_file([0])\n",
         );
         let (checked, diagnostics) = check_modules(&[
             ("pkg.db", package, false),

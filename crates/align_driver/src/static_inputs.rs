@@ -228,6 +228,26 @@ fn permitted_drivers(restriction: DriverRestriction) -> &'static [Driver] {
     }
 }
 
+fn record_file_snapshot(
+    resolved: &[ResolvedStaticInput],
+    snapshots: &mut HashMap<String, usize>,
+    input: &ResolvedStaticInput,
+) -> Result<(), StaticInputError> {
+    let SqlSourceIdentity::File { logical_path } = &input.input.source else {
+        return Ok(());
+    };
+    let Some(first_index) = snapshots.get(logical_path).copied() else {
+        snapshots.insert(logical_path.clone(), resolved.len());
+        return Ok(());
+    };
+    match resolved.get(first_index) {
+        Some(first) if first.bytes == input.bytes => Ok(()),
+        Some(_) | None => Err(StaticInputError::HashMismatch {
+            logical_path: logical_path.clone(),
+        }),
+    }
+}
+
 /// Resolve the complete L5c descriptor inventory through the L5b source/metadata boundary.
 ///
 /// Resolution and canonical manifest formation finish before SQL sources are added to `source_map`,
@@ -257,6 +277,7 @@ pub fn resolve_static_descriptors(
         }
     }
     let mut resolved = Vec::with_capacity(descriptors.len());
+    let mut file_snapshots = HashMap::new();
     for descriptor in descriptors {
         let defining_file = source_map
             .files()
@@ -298,6 +319,9 @@ pub fn resolve_static_descriptors(
             .map_err(|error| {
                 descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
             })?;
+        record_file_snapshot(&resolved, &mut file_snapshots, &input).map_err(|error| {
+            descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
+        })?;
         resolved.push(input);
     }
 
@@ -2213,6 +2237,46 @@ mod tests {
             StaticDescriptorInputErrorCause::Input(StaticInputError::InvalidDescriptorId)
         ));
         assert_eq!(source_map.files().len(), files_before);
+    }
+
+    #[test]
+    fn shared_file_snapshot_rejects_bytes_changed_between_descriptor_reads() {
+        let root = temp_root("descriptor-snapshot-change");
+        let defining = root.join("q.align");
+        write(&defining, "module q\n").expect("defining source");
+        write(root.join("q.sql"), "select 1\n").expect("first SQL snapshot");
+        let first = resolve_static_file(
+            &root,
+            &defining,
+            None,
+            "q.first",
+            StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
+            None,
+        )
+        .expect("first file snapshot");
+        write(root.join("q.sql"), "select 2\n").expect("replace SQL snapshot");
+        let second = resolve_static_file(
+            &root,
+            &defining,
+            None,
+            "q.second",
+            StaticConsumerKind::Query,
+            DriverRestriction::SQLiteOnly,
+            None,
+        )
+        .expect("second file snapshot");
+
+        let mut resolved = Vec::new();
+        let mut snapshots = HashMap::new();
+        record_file_snapshot(&resolved, &mut snapshots, &first).expect("first snapshot owner");
+        resolved.push(first);
+        assert_eq!(
+            record_file_snapshot(&resolved, &mut snapshots, &second),
+            Err(StaticInputError::HashMismatch {
+                logical_path: "q.sql".to_string(),
+            })
+        );
     }
 
     #[test]
