@@ -819,6 +819,13 @@ fn option_key(option: &StaticOption) -> Result<Vec<u8>, StaticArtifactError> {
     Ok(w.buf)
 }
 
+/// Hash the exact canonical `sequence<StaticOption>` field encoding.
+pub fn static_options_hash(options: &[StaticOption]) -> Result<Hash128, StaticArtifactError> {
+    let mut writer = Writer::new();
+    writer.seq(options, write_option)?;
+    Ok(Hash128::of(&writer.buf))
+}
+
 fn write_occurrence(
     w: &mut Writer,
     occurrence: &ParameterOccurrence,

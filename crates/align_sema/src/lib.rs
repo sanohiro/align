@@ -27387,12 +27387,23 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_extern_without_unsafe(sig.is_extern, &display, span) {
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let (param_tys, ret, param_modes, json_scan_param_spellings) = (
+        let (mut param_tys, ret, mut param_modes, mut json_scan_param_spellings) = (
             sig.params.clone(),
             sig.ret,
             sig.param_modes.clone(),
             sig.json_scan_param_spellings.clone(),
         );
+        // File-backed static constructors have two canonical source forms: an implicit sibling
+        // `.sql` file, or an explicit leading relative path. Package source declares the implicit
+        // form because Align deliberately has no general overload facility; the compiler-owned
+        // static-constructor contract supplies the one additional `str` parameter here.
+        if static_constructor_spec(&name).is_some_and(|spec| spec.file)
+            && args.len() == param_tys.len() + 1
+        {
+            param_tys.insert(0, Ty::Str);
+            param_modes.insert(0, ast::ParamMode::ByValue);
+            json_scan_param_spellings.insert(0, None);
+        }
         // A generic function: infer the concrete type arguments from the call, then take its own
         // dedicated path (the result type and `type_args` come from the substitution).
         if !sig.type_params.is_empty() {
@@ -42704,7 +42715,7 @@ mod tests {
             "import std.process\n",
             "import pkg.db\n",
             "pub QueryOption { ParameterType(str, str) }\n",
-            "pub fn query_file<P, R>(path: str, options: slice<pkg.db.QueryOption>, native: slice<QueryOption>) -> pkg.db.query<P, R> = process.abort()\n",
+            "pub fn query_file<P, R>(options: slice<pkg.db.QueryOption>, native: slice<QueryOption>) -> pkg.db.query<P, R> = process.abort()\n",
         );
         let query = concat!(
             "module q\n",

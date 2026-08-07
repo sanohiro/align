@@ -55,7 +55,7 @@ pub use codec::{
 pub use hash::Hash128;
 pub use static_artifact::{
     decode_static_artifact, decode_static_command, decode_static_query, encode_static_command,
-    encode_static_query, static_artifact_digest, BindRetention, BindingEntry, CanonicalContract,
+    encode_static_query, static_artifact_digest, static_options_hash, BindRetention, BindingEntry, CanonicalContract,
     CanonicalDefinition, CanonicalDefinitionBody, CanonicalDefinitionKind, CanonicalField,
     CanonicalType, CanonicalVariant, CheckPolicy, CheckedColumnMeta, CheckedMetadata,
     CheckedParameterMeta, CheckedQueryEvidence, DeclaredColumnMeta, DeclaredParameterMeta,

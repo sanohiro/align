@@ -2,11 +2,14 @@
 
 use align_driver::{
     build_per_unit, build_static_artifacts, check, emit_llvm_ir, execute_fake_static,
-    resolve_static_descriptors, BuildTarget, Driver, FakeCardinality, FakeExecutionError,
+    metadata_path, resolve_static_descriptors, BuildTarget, Driver, FakeCardinality, FakeExecutionError,
     FakeStatementKind, FakeValue, GeneratedStaticRuntime, StaticDescriptorInputErrorCause,
     StaticInputError,
 };
-use align_interface::{BindRetention, StaticArtifact};
+use align_interface::{
+    static_options_hash, BindRetention, CheckPolicy, StaticArtifact, StaticOption,
+    StaticOptionOwner, StaticOptionValue, VerificationState,
+};
 use align_span::SourceMap;
 use std::fs::{create_dir_all, write};
 use std::path::{Path, PathBuf};
@@ -106,6 +109,141 @@ fn write_sources(root: &Path) -> (PathBuf, String) {
     (entry_path, entry)
 }
 
+fn checked_query_metadata_json(
+    query: &align_interface::StaticQueryArtifact,
+    driver: Driver,
+    static_options: &[StaticOption],
+) -> Vec<u8> {
+    let entry = query
+        .driver_entries
+        .iter()
+        .find(|entry| entry.driver == driver)
+        .expect("driver entry");
+    let driver_name = match driver {
+        Driver::SQLite => "sqlite",
+        Driver::PostgreSQL => "postgres",
+    };
+    let restriction = match query.driver_restriction {
+        align_interface::DriverRestriction::AnySupportedDriver => "any_supported_driver",
+        align_interface::DriverRestriction::SQLiteOnly => "sqlite_only",
+        align_interface::DriverRestriction::PostgreSQLOnly => "postgres_only",
+    };
+    let statement_class = match query.query_meta_plan.statement_class {
+        align_interface::MetaStatementClass::Select => "select",
+        align_interface::MetaStatementClass::Dml => "dml",
+        align_interface::MetaStatementClass::Ddl => "ddl",
+        align_interface::MetaStatementClass::Native => "native",
+        align_interface::MetaStatementClass::Unknown => "unknown",
+    };
+    let source_identity = match &query.source_identity {
+        align_interface::SqlSourceIdentity::Inline { query_or_command_id } => {
+            format!("{{\"kind\":\"inline\",\"descriptor_id\":\"{query_or_command_id}\"}}")
+        }
+        align_interface::SqlSourceIdentity::File { logical_path } => {
+            format!("{{\"kind\":\"file\",\"logical_path\":\"{logical_path}\"}}")
+        }
+    };
+    let parameters = query
+        .query_meta_plan
+        .parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{{\"source_name\":\"{}\",\"protocol_ordinal\":{},\"logical_type\":\"{}\",\"native_type\":null,\"native_type_id\":null}}",
+                parameter.source_name, parameter.ordinal, parameter.logical_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let columns = query
+        .query_meta_plan
+        .columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{{\"ordinal\":{},\"source_alias\":\"{}\",\"logical_type\":\"{}\",\"native_type\":null,\"native_type_id\":null,\"nullable\":\"unknown\",\"origin_schema\":null,\"origin_table\":null,\"origin_column\":null}}",
+                column.ordinal, column.source_alias, column.logical_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"format_version\":1,\"descriptor_id\":\"{}\",\"module\":\"{}\",\"item\":\"{}\",\"driver\":\"{driver_name}\",\"driver_restriction\":\"{restriction}\",\"statement_kind\":\"query\",\"statement_class\":\"{statement_class}\",\"source_identity\":{source_identity},\"source_sql_hash\":\"{}\",\"wire_sql_hash\":\"{}\",\"rewrite_format_version\":{},\"static_options_hash\":\"{}\",\"params_fingerprint\":\"{}\",\"row_fingerprint\":\"{}\",\"schema_fingerprint\":\"01000000000000000000000000000000\",\"engine_version\":\"test-engine\",\"driver_version\":\"test-driver\",\"search_path\":[],\"extensions\":[],\"parameters\":[{parameters}],\"columns\":[{columns}]}}\n",
+        query.query_id,
+        query.unit,
+        query.item,
+        query.source_sql_hash.to_hex(),
+        entry.wire_sql_hash.to_hex(),
+        entry.rewrite_format_version,
+        static_options_hash(static_options).expect("static options hash").to_hex(),
+        query.params_fingerprint.to_hex(),
+        query.row_fingerprint.to_hex(),
+    )
+    .into_bytes()
+}
+
+fn checked_command_metadata_json(
+    command: &align_interface::StaticCommandArtifact,
+    driver: Driver,
+    static_options: &[StaticOption],
+) -> Vec<u8> {
+    let entry = command
+        .driver_entries
+        .iter()
+        .find(|entry| entry.driver == driver)
+        .expect("driver entry");
+    let fields = match &command.params_type.root {
+        align_interface::CanonicalType::Named { path, args } => command
+            .params_type
+            .definitions
+            .iter()
+            .find(|definition| definition.path == *path && definition.args == *args)
+            .and_then(|definition| match &definition.kind {
+                align_interface::CanonicalDefinitionBody::Struct { fields } => Some(fields),
+                align_interface::CanonicalDefinitionBody::Sum { .. } => None,
+            })
+            .expect("Params fields"),
+        _ => panic!("named Params contract"),
+    };
+    let mut bindings = entry.bindings.iter().collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.protocol_ordinal);
+    let parameters = bindings
+        .iter()
+        .map(|binding| {
+            let field = &fields[binding.params_field_ordinal as usize];
+            format!(
+                "{{\"source_name\":\"{}\",\"protocol_ordinal\":{},\"logical_type\":\"{}\",\"native_type\":null,\"native_type_id\":null}}",
+                binding.source_name,
+                binding.protocol_ordinal,
+                field.ty.spelling()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let source_identity = match &command.source_identity {
+        align_interface::SqlSourceIdentity::Inline { query_or_command_id } => {
+            format!("{{\"kind\":\"inline\",\"descriptor_id\":\"{query_or_command_id}\"}}")
+        }
+        align_interface::SqlSourceIdentity::File { logical_path } => {
+            format!("{{\"kind\":\"file\",\"logical_path\":\"{logical_path}\"}}")
+        }
+    };
+    format!(
+        "{{\"format_version\":1,\"descriptor_id\":\"{}\",\"module\":\"{}\",\"item\":\"{}\",\"driver\":\"sqlite\",\"driver_restriction\":\"sqlite_only\",\"statement_kind\":\"command\",\"statement_class\":\"dml\",\"source_identity\":{source_identity},\"source_sql_hash\":\"{}\",\"wire_sql_hash\":\"{}\",\"rewrite_format_version\":{},\"static_options_hash\":\"{}\",\"params_fingerprint\":\"{}\",\"row_fingerprint\":null,\"schema_fingerprint\":\"01000000000000000000000000000000\",\"engine_version\":\"test-engine\",\"driver_version\":\"test-driver\",\"search_path\":[],\"extensions\":[],\"parameters\":[{parameters}],\"columns\":[]}}\n",
+        command.command_id,
+        command.unit,
+        command.item,
+        command.source_sql_hash.to_hex(),
+        entry.wire_sql_hash.to_hex(),
+        entry.rewrite_format_version,
+        static_options_hash(static_options)
+            .expect("static options hash")
+            .to_hex(),
+        command.params_fingerprint.to_hex(),
+    )
+    .into_bytes()
+}
+
 #[test]
 fn public_surface_whole_and_per_unit() {
     let project = project("surface");
@@ -161,6 +299,267 @@ fn public_surface_whole_and_per_unit() {
         assert_eq!(descriptor.row_contract, whole_descriptor.row_contract);
         assert_eq!(descriptor.static_options, whole_descriptor.static_options);
     }
+}
+
+#[test]
+fn file_constructors_accept_explicit_paths_on_the_shipped_surface() {
+    let project = project("explicit-paths");
+    create_dir_all(project.0.join("app/sql")).expect("SQL directory");
+    write(project.0.join("app/sql/query.sql"), "SELECT :id AS id\n").expect("query SQL");
+    write(project.0.join("app/sql/command.sql"), "UPDATE users SET seen = 1 WHERE id = :id\n")
+        .expect("command SQL");
+    write(
+        project.0.join("app/paths.align"),
+        concat!(
+            "module app.paths\n",
+            "import pkg.db\n",
+            "import pkg.db.sqlite\n",
+            "import pkg.db.postgres\n",
+            "pub Params { id: i64 }\n",
+            "pub Row { id: i64 }\n",
+            "pub fn common_query() -> pkg.db.query<Params, Row> = ",
+            "pkg.db.query_file(\"sql/query.sql\", [])\n",
+            "pub fn common_command() -> pkg.db.command<Params> = ",
+            "pkg.db.command_file(\"sql/command.sql\", [])\n",
+            "pub fn sqlite_query() -> pkg.db.query<Params, Row> = ",
+            "pkg.db.sqlite.query_file(\"sql/query.sql\", [], [])\n",
+            "pub fn postgres_command() -> pkg.db.command<Params> = ",
+            "pkg.db.postgres.command_file(\"sql/command.sql\", [], [])\n",
+        ),
+    )
+    .expect("path module");
+    let entry = "module main\nimport app.paths\nfn main() -> i32 = 0\n";
+    let entry_path = project.0.join("main.align");
+    write(&entry_path, entry).expect("entry");
+    let mut source_map = SourceMap::new();
+    let checked = check(
+        &mut source_map,
+        entry_path.to_str().expect("UTF-8 entry path"),
+        entry,
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "explicit-path diagnostics: {:?}",
+        checked.diags.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(checked.static_descriptors.len(), 4);
+    let resolved = resolve_static_descriptors(
+        &project.0,
+        &mut source_map,
+        &checked.static_descriptors,
+        align_interface::Hash128::of(b"pkg-db-q1-explicit-paths"),
+    )
+    .expect("explicit-path descriptors");
+    assert!(resolved.inputs.iter().all(|input| matches!(
+        &input.input.source,
+        align_interface::SqlSourceIdentity::File { logical_path }
+            if matches!(logical_path.as_str(), "app/sql/query.sql" | "app/sql/command.sql")
+    )));
+}
+
+#[test]
+fn checked_metadata_promotes_current_snapshots_and_obeys_policy_on_stale_data() {
+    let project = project("checked-metadata");
+    create_dir_all(project.0.join("app")).expect("application directory");
+    let module_path = project.0.join("app/checked.align");
+    let optional_source = concat!(
+        "module app.checked\n",
+        "import pkg.db\n",
+        "import pkg.db.sqlite\n",
+        "pub Params { id: i64 }\n",
+        "pub Row { id: i64 }\n",
+        "pub fn query() -> pkg.db.query<Params, Row> = ",
+        "pkg.db.sqlite.query(\"SELECT :id AS id\", ",
+        "[pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedOptional)], [])\n",
+    );
+    write(&module_path, optional_source).expect("checked module");
+    let entry = "module main\nimport app.checked\nfn main() -> i32 = 0\n";
+    let entry_path = project.0.join("main.align");
+    write(&entry_path, entry).expect("entry");
+
+    let build = |seed: &[u8]| {
+        let mut source_map = SourceMap::new();
+        let checked = check(
+            &mut source_map,
+            entry_path.to_str().expect("UTF-8 entry path"),
+            entry,
+        );
+        assert!(
+            !checked.diags.has_errors(),
+            "checked-metadata diagnostics: {:?}",
+            checked.diags.iter().collect::<Vec<_>>()
+        );
+        let resolved = resolve_static_descriptors(
+            &project.0,
+            &mut source_map,
+            &checked.static_descriptors,
+            align_interface::Hash128::of(seed),
+        )
+        .expect("checked-metadata inputs");
+        build_static_artifacts(&checked.static_descriptors, &resolved)
+    };
+
+    let declared = build(b"checked-metadata-declared").expect("optional missing metadata");
+    let StaticArtifact::Query(template) = &declared[0].artifact else {
+        panic!("query artifact")
+    };
+    assert_eq!(
+        template.driver_entries[0].checked_metadata.state,
+        VerificationState::Declared
+    );
+    let optional_metadata = checked_query_metadata_json(template, Driver::SQLite, &template.static_options);
+    let metadata_path = metadata_path(&project.0, "app.checked.query", Driver::SQLite)
+        .expect("metadata path");
+    create_dir_all(metadata_path.parent().expect("metadata directory"))
+        .expect("metadata directory");
+    write(&metadata_path, optional_metadata).expect("optional metadata");
+
+    let checked_optional = build(b"checked-metadata-optional").expect("current optional metadata");
+    let StaticArtifact::Query(query) = &checked_optional[0].artifact else {
+        panic!("query artifact")
+    };
+    let metadata = &query.driver_entries[0].checked_metadata;
+    assert_eq!(metadata.policy, CheckPolicy::CheckedOptional);
+    assert_eq!(metadata.state, VerificationState::DatabaseChecked);
+    assert!(metadata.metadata_digest.is_some());
+    assert!(metadata.query_evidence.is_some());
+
+    let required_source = optional_source.replace("CheckedOptional", "CheckedRequired");
+    let required_options = [StaticOption {
+        owner: StaticOptionOwner::Common,
+        value: StaticOptionValue::Check {
+            policy: CheckPolicy::CheckedRequired,
+        },
+    }];
+    write(
+        &metadata_path,
+        checked_query_metadata_json(template, Driver::SQLite, &required_options),
+    )
+    .expect("required metadata");
+    write(&module_path, &required_source).expect("required source");
+    let checked_required = build(b"checked-metadata-required").expect("current required metadata");
+    let StaticArtifact::Query(query) = &checked_required[0].artifact else {
+        panic!("query artifact")
+    };
+    assert_eq!(
+        query.driver_entries[0].checked_metadata.state,
+        VerificationState::DatabaseChecked
+    );
+
+    write(
+        &module_path,
+        required_source.replace("SELECT :id AS id", "SELECT :id + 1 AS id"),
+    )
+    .expect("stale required source");
+    let required_error = build(b"checked-metadata-stale-required")
+        .expect_err("stale required metadata must fail");
+    assert!(required_error.reason.contains("artifact inputs changed"));
+
+    write(
+        &module_path,
+        optional_source.replace("SELECT :id AS id", "SELECT :id + 1 AS id"),
+    )
+    .expect("stale optional source");
+    let stale_optional = build(b"checked-metadata-stale-optional")
+        .expect("stale optional metadata falls back to declared");
+    let StaticArtifact::Query(query) = &stale_optional[0].artifact else {
+        panic!("query artifact")
+    };
+    assert_eq!(
+        query.driver_entries[0].checked_metadata.state,
+        VerificationState::Declared
+    );
+}
+
+#[test]
+fn checked_command_metadata_promotes_without_query_evidence() {
+    let project = project("checked-command-metadata");
+    create_dir_all(project.0.join("app")).expect("application directory");
+    let module_path = project.0.join("app/checked_command.align");
+    let optional_source = concat!(
+        "module app.checked_command\n",
+        "import pkg.db\n",
+        "import pkg.db.sqlite\n",
+        "pub Params { id: i64 }\n",
+        "pub fn command() -> pkg.db.command<Params> = ",
+        "pkg.db.sqlite.command(\"UPDATE users SET seen = 1 WHERE id = :id\", ",
+        "[pkg.db.CommandOption.Check(pkg.db.CheckPolicy.CheckedOptional)], [])\n",
+    );
+    write(&module_path, optional_source).expect("command module");
+    let entry = "module main\nimport app.checked_command\nfn main() -> i32 = 0\n";
+    let entry_path = project.0.join("main.align");
+    write(&entry_path, entry).expect("entry");
+    let build = |seed: &[u8]| {
+        let mut source_map = SourceMap::new();
+        let checked = check(
+            &mut source_map,
+            entry_path.to_str().expect("UTF-8 entry path"),
+            entry,
+        );
+        assert!(!checked.diags.has_errors());
+        let resolved = resolve_static_descriptors(
+            &project.0,
+            &mut source_map,
+            &checked.static_descriptors,
+            align_interface::Hash128::of(seed),
+        )
+        .expect("command metadata inputs");
+        build_static_artifacts(&checked.static_descriptors, &resolved)
+    };
+    let declared = build(b"checked-command-declared").expect("optional missing metadata");
+    let StaticArtifact::Command(template) = &declared[0].artifact else {
+        panic!("command artifact")
+    };
+    let metadata_path = metadata_path(
+        &project.0,
+        "app.checked_command.command",
+        Driver::SQLite,
+    )
+    .expect("metadata path");
+    create_dir_all(metadata_path.parent().expect("metadata directory"))
+        .expect("metadata directory");
+    write(
+        &metadata_path,
+        checked_command_metadata_json(template, Driver::SQLite, &template.static_options),
+    )
+    .expect("optional command metadata");
+    let checked_optional = build(b"checked-command-optional").expect("current optional metadata");
+    let StaticArtifact::Command(command) = &checked_optional[0].artifact else {
+        panic!("command artifact")
+    };
+    assert_eq!(
+        command.driver_entries[0].checked_metadata.state,
+        VerificationState::DatabaseChecked
+    );
+    assert!(command.driver_entries[0]
+        .checked_metadata
+        .query_evidence
+        .is_none());
+
+    let required_options = [StaticOption {
+        owner: StaticOptionOwner::Common,
+        value: StaticOptionValue::Check {
+            policy: CheckPolicy::CheckedRequired,
+        },
+    }];
+    write(
+        &metadata_path,
+        checked_command_metadata_json(template, Driver::SQLite, &required_options),
+    )
+    .expect("required command metadata");
+    write(
+        &module_path,
+        optional_source.replace("CheckedOptional", "CheckedRequired"),
+    )
+    .expect("required command source");
+    let checked_required = build(b"checked-command-required").expect("current required metadata");
+    let StaticArtifact::Command(command) = &checked_required[0].artifact else {
+        panic!("command artifact")
+    };
+    assert_eq!(
+        command.driver_entries[0].checked_metadata.state,
+        VerificationState::DatabaseChecked
+    );
 }
 
 #[test]

@@ -6,7 +6,10 @@
 //! this module then resolves one exact file (or keeps decoded inline bytes), snapshots the exact
 //! checked-metadata paths, and produces a fail-closed manifest/action digest.
 
-use align_interface::{DecodedSpanEntry, Driver, DriverRestriction, Hash128, SqlSourceIdentity};
+use align_interface::{
+    CheckedColumnMeta, CheckedParameterMeta, DecodedSpanEntry, Driver, DriverRestriction, Hash128,
+    MetaNullability, MetaStatementClass, SqlSourceIdentity,
+};
 use align_sema::{
     StaticDescriptor, StaticDescriptorConsumer, StaticDescriptorDriver, StaticDescriptorSource,
 };
@@ -62,6 +65,52 @@ pub struct ResolvedStaticInput {
     pub decoded_span_map: Vec<DecodedSpanEntry>,
     pub source_map_file: Option<FileId>,
     pub resolved_path: Option<PathBuf>,
+    pub(crate) checked_metadata_records: Vec<ParsedCheckedMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedCheckedMetadata {
+    pub format_version: u32,
+    pub metadata_digest: Hash128,
+    pub driver: Driver,
+    pub driver_restriction: DriverRestriction,
+    pub statement_kind: MetadataStatementKind,
+    pub statement_class: MetaStatementClass,
+    pub source_identity: SqlSourceIdentity,
+    pub source_sql_hash: Hash128,
+    pub wire_sql_hash: Hash128,
+    pub rewrite_format_version: u32,
+    pub static_options_hash: Hash128,
+    pub params_fingerprint: Hash128,
+    pub row_fingerprint: Option<Hash128>,
+    pub schema_fingerprint: Hash128,
+    pub engine_version: String,
+    pub driver_version: String,
+    pub search_path: Vec<String>,
+    pub extensions: Vec<ParsedMetadataExtension>,
+    pub parameters: Vec<ParsedMetadataParameter>,
+    pub columns: Vec<ParsedMetadataColumn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedMetadataExtension {
+    pub schema: String,
+    pub name: String,
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedMetadataParameter {
+    pub source_name: String,
+    pub logical_type: String,
+    pub checked: CheckedParameterMeta,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedMetadataColumn {
+    pub source_alias: String,
+    pub logical_type: String,
+    pub checked: CheckedColumnMeta,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,16 +445,19 @@ pub fn resolve_static_descriptors(
                 })
                 .collect();
         }
-        input.input.checked_metadata = permitted_drivers(restriction)
+        let metadata = permitted_drivers(restriction)
             .iter()
             .copied()
-            .map(|driver| {
-                snapshot_checked_metadata(project_root, &descriptor.descriptor_id, driver)
-            })
+            .map(|driver| snapshot_checked_metadata_record(project_root, &descriptor.descriptor_id, driver))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
             })?;
+        input.input.checked_metadata = metadata.iter().map(|(input, _)| input.clone()).collect();
+        input.checked_metadata_records = metadata
+            .into_iter()
+            .filter_map(|(_, record)| record)
+            .collect();
         record_file_snapshot(&resolved, &mut file_snapshots, &input).map_err(|error| {
             descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
         })?;
@@ -832,6 +884,7 @@ pub fn resolve_static_file(
         decoded_span_map: Vec::new(),
         source_map_file,
         resolved_path: Some(candidate),
+        checked_metadata_records: Vec::new(),
     })
 }
 
@@ -866,6 +919,7 @@ pub fn resolve_inline_static_input(
         decoded_span_map: Vec::new(),
         source_map_file: None,
         resolved_path: None,
+        checked_metadata_records: Vec::new(),
     })
 }
 
@@ -874,31 +928,38 @@ pub fn snapshot_checked_metadata(
     descriptor_id: &str,
     driver: Driver,
 ) -> Result<CheckedMetadataInput, StaticInputError> {
+    snapshot_checked_metadata_record(project_root, descriptor_id, driver).map(|(input, _)| input)
+}
+
+fn snapshot_checked_metadata_record(
+    project_root: &Path,
+    descriptor_id: &str,
+    driver: Driver,
+) -> Result<(CheckedMetadataInput, Option<ParsedCheckedMetadata>), StaticInputError> {
     let logical = metadata_logical_path(descriptor_id, driver)?;
     let root = canonical_root(project_root)?;
     let path = root.join(logical.replace('/', std::path::MAIN_SEPARATOR_STR));
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
             let bytes = read_metadata_bytes(&root, &path, &logical)?;
-            let format_version =
-                parse_metadata_format_version(&bytes, &logical, descriptor_id, driver)?;
-            Ok(CheckedMetadataInput {
+            let record = parse_checked_metadata(&bytes, &logical, descriptor_id, driver)?;
+            Ok((CheckedMetadataInput {
                 driver,
                 logical_path: logical,
                 state: MetadataState::Present {
-                    content_hash: Hash128::of(&bytes),
-                    format_version,
+                    content_hash: record.metadata_digest,
+                    format_version: record.format_version,
                 },
-            })
+            }, Some(record)))
         }
         Ok(_) => Err(StaticInputError::NotRegularFile(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             ensure_metadata_parent_inside(&root, &path)?;
-            Ok(CheckedMetadataInput {
+            Ok((CheckedMetadataInput {
                 driver,
                 logical_path: logical,
                 state: MetadataState::Missing,
-            })
+            }, None))
         }
         Err(error) => Err(StaticInputError::Io {
             path,
@@ -907,12 +968,12 @@ pub fn snapshot_checked_metadata(
     }
 }
 
-fn parse_metadata_format_version(
+fn parse_checked_metadata(
     bytes: &[u8],
     logical_path: &str,
     descriptor_id: &str,
     driver: Driver,
-) -> Result<u32, StaticInputError> {
+) -> Result<ParsedCheckedMetadata, StaticInputError> {
     if bytes.len() > MAX_FIELD_BYTES {
         return Err(StaticInputError::MetadataMalformed {
             logical_path: logical_path.to_string(),
@@ -928,11 +989,13 @@ fn parse_metadata_format_version(
         });
     }
     let mut parser = MetadataJsonParser::new(&bytes[..bytes.len() - 1]);
-    parser
+    let mut record = parser
         .parse_metadata_object(descriptor_id, driver)
         .map_err(|_| StaticInputError::MetadataMalformed {
             logical_path: logical_path.to_string(),
-        })
+        })?;
+    record.metadata_digest = Hash128::of(bytes);
+    Ok(record)
 }
 
 struct MetadataJsonParser<'a> {
@@ -945,10 +1008,15 @@ impl<'a> MetadataJsonParser<'a> {
         Self { bytes, position: 0 }
     }
 
-    fn parse_metadata_object(&mut self, descriptor_id: &str, driver: Driver) -> Result<u32, ()> {
+    fn parse_metadata_object(
+        &mut self,
+        descriptor_id: &str,
+        driver: Driver,
+    ) -> Result<ParsedCheckedMetadata, ()> {
         self.expect_byte(b'{')?;
         self.field(true, "format_version")?;
-        if self.parse_u32()? != 1 {
+        let format_version = self.parse_u32()?;
+        if format_version != 1 {
             return Err(());
         }
 
@@ -995,46 +1063,51 @@ impl<'a> MetadataJsonParser<'a> {
         };
 
         self.field(false, "statement_class")?;
-        match self.parse_text()?.as_str() {
-            "select" | "dml" | "ddl" | "native" | "unknown" => {}
+        let statement_class = match self.parse_text()?.as_str() {
+            "select" => MetaStatementClass::Select,
+            "dml" => MetaStatementClass::Dml,
+            "ddl" => MetaStatementClass::Ddl,
+            "native" => MetaStatementClass::Native,
+            "unknown" => MetaStatementClass::Unknown,
             _ => return Err(()),
-        }
+        };
 
         self.field(false, "source_identity")?;
-        self.parse_source_identity(descriptor_id)?;
+        let source_identity = self.parse_source_identity(descriptor_id)?;
 
         self.field(false, "source_sql_hash")?;
-        self.parse_hash()?;
+        let source_sql_hash = self.parse_hash()?;
         self.field(false, "wire_sql_hash")?;
-        self.parse_hash()?;
+        let wire_sql_hash = self.parse_hash()?;
 
         self.field(false, "rewrite_format_version")?;
-        if self.parse_u32()? != 1 {
+        let rewrite_format_version = self.parse_u32()?;
+        if rewrite_format_version != 1 {
             return Err(());
         }
 
         self.field(false, "static_options_hash")?;
-        self.parse_hash()?;
+        let static_options_hash = self.parse_hash()?;
         self.field(false, "params_fingerprint")?;
-        self.parse_hash()?;
+        let params_fingerprint = self.parse_hash()?;
         self.field(false, "row_fingerprint")?;
         let row_fingerprint = self.parse_optional_hash()?;
         self.field(false, "schema_fingerprint")?;
-        self.parse_hash()?;
+        let schema_fingerprint = self.parse_hash()?;
 
         self.field(false, "engine_version")?;
-        self.parse_text()?;
+        let engine_version = self.parse_text()?;
         self.field(false, "driver_version")?;
-        self.parse_text()?;
+        let driver_version = self.parse_text()?;
 
         self.field(false, "search_path")?;
         let search_path = self.parse_string_array()?;
         self.field(false, "extensions")?;
-        let extensions_nonempty = self.parse_extensions()?;
+        let extensions = self.parse_extensions()?;
         self.field(false, "parameters")?;
-        self.parse_parameters()?;
+        let parameters = self.parse_parameters()?;
         self.field(false, "columns")?;
-        let column_count = self.parse_columns()?;
+        let columns = self.parse_columns()?;
 
         self.expect_byte(b'}')?;
         if self.position != self.bytes.len() {
@@ -1044,13 +1117,34 @@ impl<'a> MetadataJsonParser<'a> {
         if (statement_kind == MetadataStatementKind::Query) != row_fingerprint.is_some() {
             return Err(());
         }
-        if statement_kind == MetadataStatementKind::Command && column_count != 0 {
+        if statement_kind == MetadataStatementKind::Command && !columns.is_empty() {
             return Err(());
         }
-        if driver == Driver::SQLite && (!search_path.is_empty() || extensions_nonempty) {
+        if driver == Driver::SQLite && (!search_path.is_empty() || !extensions.is_empty()) {
             return Err(());
         }
-        Ok(1)
+        Ok(ParsedCheckedMetadata {
+            format_version,
+            metadata_digest: Hash128 { lo: 0, hi: 0 },
+            driver,
+            driver_restriction,
+            statement_kind,
+            statement_class,
+            source_identity,
+            source_sql_hash,
+            wire_sql_hash,
+            rewrite_format_version,
+            static_options_hash,
+            params_fingerprint,
+            row_fingerprint,
+            schema_fingerprint,
+            engine_version,
+            driver_version,
+            search_path,
+            extensions,
+            parameters,
+            columns,
+        })
     }
 
     fn field(&mut self, first: bool, expected: &str) -> Result<(), ()> {
@@ -1089,7 +1183,7 @@ impl<'a> MetadataJsonParser<'a> {
         number.parse::<i64>().map_err(|_| ())
     }
 
-    fn parse_hash(&mut self) -> Result<(), ()> {
+    fn parse_hash(&mut self) -> Result<Hash128, ()> {
         let value = self.parse_text()?;
         if value.len() != 32
             || !value
@@ -1099,16 +1193,17 @@ impl<'a> MetadataJsonParser<'a> {
         {
             return Err(());
         }
-        Ok(())
+        let lo = u64::from_str_radix(&value[..16], 16).map_err(|_| ())?;
+        let hi = u64::from_str_radix(&value[16..], 16).map_err(|_| ())?;
+        Ok(Hash128 { lo, hi })
     }
 
-    fn parse_optional_hash(&mut self) -> Result<Option<()>, ()> {
+    fn parse_optional_hash(&mut self) -> Result<Option<Hash128>, ()> {
         if self.peek_byte() == Some(b'n') {
             self.expect_bytes(b"null")?;
             Ok(None)
         } else {
-            self.parse_hash()?;
-            Ok(Some(()))
+            Ok(Some(self.parse_hash()?))
         }
     }
 
@@ -1130,11 +1225,11 @@ impl<'a> MetadataJsonParser<'a> {
         }
     }
 
-    fn parse_source_identity(&mut self, descriptor_id: &str) -> Result<(), ()> {
+    fn parse_source_identity(&mut self, descriptor_id: &str) -> Result<SqlSourceIdentity, ()> {
         self.expect_byte(b'{')?;
         self.field(true, "kind")?;
         let kind = self.parse_text()?;
-        match kind.as_str() {
+        let identity = match kind.as_str() {
             "file" => {
                 self.field(false, "logical_path")?;
                 let path = self.parse_text()?;
@@ -1147,16 +1242,21 @@ impl<'a> MetadataJsonParser<'a> {
                 {
                     return Err(());
                 }
+                SqlSourceIdentity::File { logical_path: path }
             }
             "inline" => {
                 self.field(false, "descriptor_id")?;
                 if self.parse_text()? != descriptor_id {
                     return Err(());
                 }
+                SqlSourceIdentity::Inline {
+                    query_or_command_id: descriptor_id.to_string(),
+                }
             }
             _ => return Err(()),
-        }
-        self.expect_byte(b'}')
+        };
+        self.expect_byte(b'}')?;
+        Ok(identity)
     }
 
     fn parse_string_array(&mut self) -> Result<Vec<String>, ()> {
@@ -1182,16 +1282,16 @@ impl<'a> MetadataJsonParser<'a> {
         }
     }
 
-    fn parse_extensions(&mut self) -> Result<bool, ()> {
+    fn parse_extensions(&mut self) -> Result<Vec<ParsedMetadataExtension>, ()> {
         self.expect_byte(b'[')?;
         let mut previous: Option<(String, String, Option<String>)> = None;
-        let mut count = 0usize;
+        let mut values = Vec::new();
         if self.peek_byte() == Some(b']') {
             self.position += 1;
-            return Ok(false);
+            return Ok(values);
         }
         loop {
-            if count >= MAX_SEQUENCE {
+            if values.len() >= MAX_SEQUENCE {
                 return Err(());
             }
             self.expect_byte(b'{')?;
@@ -1208,68 +1308,80 @@ impl<'a> MetadataJsonParser<'a> {
             {
                 return Err(());
             }
+            values.push(ParsedMetadataExtension {
+                schema: current.0.clone(),
+                name: current.1.clone(),
+                version: current.2.clone(),
+            });
             previous = Some(current);
-            count += 1;
             match self.peek_byte() {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(true);
+                    return Ok(values);
                 }
                 _ => return Err(()),
             }
         }
     }
 
-    fn parse_parameters(&mut self) -> Result<(), ()> {
+    fn parse_parameters(&mut self) -> Result<Vec<ParsedMetadataParameter>, ()> {
         self.expect_byte(b'[')?;
         let mut ordinal = 1u32;
-        let mut count = 0usize;
+        let mut values = Vec::new();
         if self.peek_byte() == Some(b']') {
             self.position += 1;
-            return Ok(());
+            return Ok(values);
         }
         loop {
-            if count >= MAX_SEQUENCE {
+            if values.len() >= MAX_SEQUENCE {
                 return Err(());
             }
             self.expect_byte(b'{')?;
             self.field(true, "source_name")?;
-            self.parse_text()?;
+            let source_name = self.parse_text()?;
             self.field(false, "protocol_ordinal")?;
             if self.parse_u32()? != ordinal {
                 return Err(());
             }
             self.field(false, "logical_type")?;
-            self.parse_text()?;
+            let logical_type = self.parse_text()?;
             self.field(false, "native_type")?;
-            self.parse_optional_text()?;
+            let native_type = self.parse_optional_text()?;
             self.field(false, "native_type_id")?;
-            self.parse_optional_i64()?;
+            let native_type_id = self.parse_optional_i64()?;
             self.expect_byte(b'}')?;
+            values.push(ParsedMetadataParameter {
+                source_name,
+                logical_type,
+                checked: CheckedParameterMeta {
+                    ordinal,
+                    native_type,
+                    native_type_id,
+                },
+            });
             ordinal = ordinal.checked_add(1).ok_or(())?;
-            count += 1;
             match self.peek_byte() {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(());
+                    return Ok(values);
                 }
                 _ => return Err(()),
             }
         }
     }
 
-    fn parse_columns(&mut self) -> Result<usize, ()> {
+    fn parse_columns(&mut self) -> Result<Vec<ParsedMetadataColumn>, ()> {
         self.expect_byte(b'[')?;
         let mut ordinal = 0u32;
-        let mut count = 0usize;
+        let mut values = Vec::new();
         if self.peek_byte() == Some(b']') {
             self.position += 1;
-            return Ok(0);
+            return Ok(values);
         }
         loop {
-            if count >= MAX_SEQUENCE {
+            if values.len() >= MAX_SEQUENCE {
                 return Err(());
             }
             self.expect_byte(b'{')?;
@@ -1278,32 +1390,46 @@ impl<'a> MetadataJsonParser<'a> {
                 return Err(());
             }
             self.field(false, "source_alias")?;
-            self.parse_text()?;
+            let source_alias = self.parse_text()?;
             self.field(false, "logical_type")?;
-            self.parse_text()?;
+            let logical_type = self.parse_text()?;
             self.field(false, "native_type")?;
-            self.parse_optional_text()?;
+            let native_type = self.parse_optional_text()?;
             self.field(false, "native_type_id")?;
-            self.parse_optional_i64()?;
+            let native_type_id = self.parse_optional_i64()?;
             self.field(false, "nullable")?;
-            match self.parse_text()?.as_str() {
-                "yes" | "no" | "unknown" => {}
+            let nullable = match self.parse_text()?.as_str() {
+                "yes" => MetaNullability::Yes,
+                "no" => MetaNullability::No,
+                "unknown" => MetaNullability::Unknown,
                 _ => return Err(()),
-            }
+            };
             self.field(false, "origin_schema")?;
-            self.parse_optional_text()?;
+            let origin_schema = self.parse_optional_text()?;
             self.field(false, "origin_table")?;
-            self.parse_optional_text()?;
+            let origin_table = self.parse_optional_text()?;
             self.field(false, "origin_column")?;
-            self.parse_optional_text()?;
+            let origin_column = self.parse_optional_text()?;
             self.expect_byte(b'}')?;
+            values.push(ParsedMetadataColumn {
+                source_alias,
+                logical_type,
+                checked: CheckedColumnMeta {
+                    ordinal,
+                    native_type,
+                    native_type_id,
+                    origin_schema,
+                    origin_table,
+                    origin_column,
+                    nullable,
+                },
+            });
             ordinal = ordinal.checked_add(1).ok_or(())?;
-            count += 1;
             match self.peek_byte() {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(count);
+                    return Ok(values);
                 }
                 _ => return Err(()),
             }
@@ -1418,7 +1544,7 @@ impl<'a> MetadataJsonParser<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetadataStatementKind {
+pub(crate) enum MetadataStatementKind {
     Query,
     Command,
 }
@@ -1804,13 +1930,13 @@ fn revalidate_metadata(
     let current = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
             let bytes = read_metadata_bytes(root, &path, &expected.logical_path)?;
-            let format_version = parse_metadata_format_version(
+            let record = parse_checked_metadata(
                 &bytes,
                 &expected.logical_path,
                 &input.descriptor_id,
                 expected.driver,
             )?;
-            Some((Hash128::of(&bytes), format_version))
+            Some((record.metadata_digest, record.format_version))
         }
         Ok(_) => return Err(StaticInputError::NotRegularFile(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
