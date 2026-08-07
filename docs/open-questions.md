@@ -13,6 +13,22 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Builtin type aliases do not monopolize module namespaces (SETTLED 2026-08-07)
+
+**Decision:** a non-entry module may declare a local type whose bare name is also a compiler-
+provided alias. Bare type lookup checks the current module first; the builtin remains explicitly
+nameable by its provider-qualified path, beginning with `core.Error`. Importers use the ordinary
+module-qualified local type (`pkg.db.Error`). An entry-module declaration whose unmangled canonical
+name collides with a builtin remains a compile error. This follows the existing per-module type
+identity instead of adding a `pkg.db` exception or renaming its public structured error sum.
+
+Owner closure crosses same-module bare construction/signatures, qualified importer construction and
+matching, explicit builtin use from the colliding module, unchanged builtin fallback in a module
+without a local declaration, whole/per-unit identity, and entry-collision rejection.
+
+Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
+`docs/design-notes.md`, `docs/impl/pkg-design/db.md`
+
 ### Empty array literals require an expected element type (SETTLED 2026-08-07)
 
 **Decision:** `[]` is legal only where the surrounding expression supplies one exact element type,

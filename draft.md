@@ -585,6 +585,14 @@ category → a small distinct code). `Timeout` is the category for a run/transpo
 timeout); it is produced only by an explicit timeout site, never inferred from an errno. The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
 
+`Error` is the unqualified alias for `core.Error`. A non-entry module may declare its own local
+type named `Error`; inside that module the bare name denotes the local type, while `core.Error`
+continues to name the builtin explicitly. Importers name the local type by its ordinary qualified
+module path, for example `pkg.db.Error`. The entry module cannot declare `Error`, because its
+unmangled type namespace is also the builtin namespace. Other compiler-provided bare type aliases
+follow the same rule: a same-module declaration wins locally and the provider-qualified spelling
+remains available. This is type namespacing, not value shadowing.
+
 A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
 exit-code mapping above is defined only for it. A user-defined error enum at that position is a
 compile error; propagate it with `map_err(to_error)?` to convert to `Error` at the boundary.
@@ -2042,7 +2050,7 @@ fn main() -> i32 {
 }
 ```
 
-`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name.
+`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name. That includes compiler-provided bare type aliases in non-entry modules: a same-module declaration wins locally, the builtin remains available by its provider-qualified spelling such as `core.Error`, and importers use the ordinary module-qualified user type. Entry-module declarations that would collide with an unmangled builtin canonical name remain errors.
 
 A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is a scalar, `str`, or a `slice<T>` of one — so its element type is transitively `pub` by construction) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
 

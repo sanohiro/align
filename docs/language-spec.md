@@ -328,6 +328,12 @@ with `result.map_err(f)`). Error **context is structured, not free-form**: a var
 relevant data (a position, a code), e.g. `ParseError { BadToken(Pos), Eof }` — there is no
 `.with_context("…")` string-chaining.
 
+The builtin's explicit name is `core.Error`; `Error` is its unqualified alias. A non-entry module
+may declare a local `Error`, in which case bare `Error` resolves locally, `core.Error` still names
+the builtin, and importers use the ordinary qualified name such as `pkg.db.Error`. The entry module
+cannot declare a type whose unmangled canonical name collides with a builtin. Other compiler-
+provided bare type aliases follow the same local-first/provider-qualified rule.
+
 The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
 `Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
 forms use an i32-returning C wrapper; exact i32 is the C entry directly. Every other parameter or
@@ -673,6 +679,11 @@ interface (its template is instantiated in importers), so it may reference only 
 items — a private same-module fn/type/const in a generic `pub` body is rejected. The import graph must be a DAG —
 cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
 qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
+
+Bare type lookup first checks a declaration in the current module, then a compiler-provided alias.
+Thus a non-entry module may reuse a builtin's bare type name without taking that name away from any
+other module. The builtin remains available through its provider-qualified spelling
+(`core.Error`), while the entry module still rejects an unmangled canonical collision.
 
 Hermetic input discovery includes reachable `.align` units and exact static files explicitly
 registered by compiler-known constructors. Such a constructor cannot scan directories, run code,

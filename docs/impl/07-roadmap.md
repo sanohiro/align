@@ -42,6 +42,10 @@ run concurrently; F-B combines L4 and L6 so named regions land with a useful
 materialization consumer. Q2 implements both drivers against one common
 surface, Q3 implements both checked-metadata codecs together, Q4a closes
 prepared/transaction reuse, and Q4b closes streaming/cancellation resilience.
+Q2 also closes the general namespaced-builtin type rule required by the
+settled `pkg.db.Error` surface: non-entry local types win bare lookup,
+provider-qualified builtin spellings remain available, and only a true entry
+canonical collision is rejected.
 Q3 starts alongside Q4a after Q2; Q5a/Q5b follow Q3;
 D11 mutation and D12 read-only inspection may be two parallel PRs because they
 are independently useful failure domains. Q6 follows Q4b. The first public
