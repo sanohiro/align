@@ -796,9 +796,11 @@ fn inspect(borrow c: Conn) -> i64
 fn advance(borrow mut rows: Rows) -> Option<Row>
 ```
 
-Shared `borrow` applies to Move types; Copy already passes without consuming ownership. `borrow`
-leaves a Move argument owned by the caller. The callee cannot move, replace, or drop it; a view
-returned from the call is inferred to borrow the exact caller-side owner generation. `borrow mut`
+Shared `borrow` applies to a stable bound Copy or Move place. Copy already passes without consuming
+ownership, but an explicit shared borrow also prevents a potentially large aggregate copy and is
+the typed ABI for producer-generated callbacks. It does not make a temporary addressable. `borrow`
+leaves the argument owned by the caller. The callee cannot move, replace, or drop it; a view returned
+from the call is inferred to borrow the exact caller-side owner generation. `borrow mut`
 accepts a writable Move or Copy place, has exclusive access for the call, and ends the previous
 storage generation. This is required for a Copy state aggregate whose field mutation must update the
 caller rather than a discarded copy. Older views become invalid; a returned view belongs to the
