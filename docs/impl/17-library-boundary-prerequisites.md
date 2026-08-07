@@ -548,6 +548,7 @@ StaticInput
   source = File(root_relative_logical_path) | Inline(query_id)
   content_hash
   consumer_kind
+  driver_restriction
 ```
 
 Registration is based on the resolved callee identity, never a textual path match. A local `db`
@@ -557,7 +558,8 @@ cause a file read or missing-file diagnostic.
 Only `File` entries are read before a frontend-cache lookup. `Inline` bytes come from the already
 parsed unit; they still use this tagged record for artifact/action-key canonicalization and can never
 request filesystem I/O. Canonical list order is source tag (`File = 0`, `Inline = 1`), then UTF-8
-payload bytes, then consumer kind; content hashes never decide ordering.
+payload bytes, then consumer kind, then descriptor ID as the tie-breaker for two descriptors sharing
+one source; content hashes never decide ordering.
 
 The producer action identity includes the unit source/import digest plus this list. At the shipped
 cache boundary, name resolution/frontend still runs before the list is first produced, and
@@ -4272,6 +4274,49 @@ source-to-wire bytes and rewrite spans are reconstructed from the occurrence tab
 and checked nullability are correlated with the Row contract, and PostgreSQL parameter options must
 name a declared Params field. `review_findings_are_closed_at_the_artifact_boundary` owns the six
 regressions; the existing independent byte encoder and goldens remain the canonical-byte owners.
+
+#### L5b static-input registration/manifest implementation closure matrix
+
+L5b consumes the L5a artifact model at the driver boundary. It owns only the deterministic input
+registration and cache-index substrate; parser/sema constructor recognition remains the next
+consumer that supplies resolved descriptor identities. The public driver API is still useful before
+that consumer exists: a future frontend can register a resolved `File` or decoded `Inline` record,
+derive the exact checked-metadata paths, and pass the manifest digest into the existing codegen-key
+builder without a second cache or filesystem policy.
+
+The capability intentionally keeps its formatted implementation above the ordinary 1,000-line
+hand-written threshold: path/root policy, metadata dependency identity, the canonical manifest
+codec, revalidation, and the single codegen-key consumer share one failure boundary and one owner
+suite. Splitting any of those pieces would duplicate source/metadata identity and malformed-byte
+proof while leaving no stable consumer between the producer and cache-index seams.
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| descriptor/source formation | Validate non-empty descriptor IDs, `Query`/`Command` kind, tagged `File`/`Inline` identity, producer-derived content hashes, bounded decoded inline SQL, NUL-free logical identities, descriptor-ID uniqueness independent of source/kind ordering, and canonical source/kind/descriptor ordering. Inline registration consumes decoded bytes only and never accepts a filesystem path; constructor identity discovery remains deferred. | `inline_does_not_resolve_a_file_and_identity_is_descriptor_bound`, oversized-inline owner, `manifest_codec_is_canonical_and_fail_closed`, NUL-bearing file identity rejection, independent duplicate-descriptor rejection, unsorted/duplicate decode rejection, and source inventory for the deferred constructor consumer |
+| path resolution and ownership | Resolve path-free sibling `.sql` or an explicit literal relative to the defining `.align` module's lexical directory; canonicalize the defining and selected files only to validate regular-file status and project-root containment. Reject absolute paths, NUL/backslash/lexical `..`, non-regular files, missing files, and canonical symlink escapes outside the project root. Return exact bytes with no newline normalization. | `resolves_sibling_and_registers_root_relative_source`, `in_root_defining_symlink_uses_lexical_module_sibling`, plus `explicit_path_rejects_root_escape_and_symlink_escape`; the source inventory shows no ambient env/scan and the resolver maps read failures before publication |
+| text and diagnostics | Validate UTF-8 and reject the first embedded NUL before artifact generation; register valid file bytes in `SourceMap` under root-relative `/` spelling and return the byte offset for diagnostics. | `invalid_text_reports_utf8_and_first_nul`, `resolves_sibling_and_registers_root_relative_source`, and the invalid-descriptor no-partial-SourceMap assertion |
+| metadata dependency | Derive exactly one `.align-db/{sqlite|postgres}/{Hash128::of(descriptor_id.as_bytes()).to_hex()}.json` path per permitted driver; never scan the directory. Snapshot `Missing` or `Present(content_hash, format_version)` only after one bounded canonical-JSON parser consumes the complete v1 record (including exact top-level and nested key order, duplicate/unknown-key rejection, exact nested tags/types/ordinals, no trailing bytes, and descriptor/driver identity equality). The bounded reader rejects oversized files before allocation, and the parser enforces the exact control-character escape forms. Require the manifest's entries to cover the exact `driver_restriction` set in driver order, and validate each entry against its descriptor/driver-derived path. | `metadata_paths_are_exact_and_checkout_root_independent`, `metadata_snapshot_and_revalidation_track_missing_present_and_change`, `metadata_parser_consumes_complete_canonical_v1_record`, malformed nested source/search/parameter/column owners, `oversized_static_file_is_rejected_before_reading_contents`, `metadata_parent_symlink_cannot_escape_project_root`, permitted-driver omission/order owners, and the manifest path validator; directory scanning is absent by source inventory |
+| manifest bytes | Encode magic `ALIGNINP`, version, source/import resolution digest, sorted static inputs, content hashes, and sorted checked-metadata states with bounded little-endian length prefixes. Decode untrusted bytes fail-closed on bad magic/version/tag, truncation, invalid UTF-8, NUL-bearing identities, independent duplicate descriptor IDs, duplicate/order, derived metadata-path mismatch, and trailing bytes. Content hashes are producer-derived at registration and opaque in the manifest record. | test-only reference encoder plus semantic↔byte round trip; corruption matrix and bounded-length owner |
+| revalidation and action identity | Revalidate every exact `File` and metadata path before a pre-frontend hit; `Inline` never reads a file. Creation/deletion/content/format changes return a stale result. Manifest canonical digest composes with the existing codegen key through one helper, so checkout-root spelling and filesystem mtimes do not enter identity. | `file_deletion_is_a_manifest_stale_result`, `metadata_snapshot_and_revalidation_track_missing_present_and_change`, `equivalent_checkout_roots_have_identical_manifest_identity`, `codegen_identity_includes_static_inputs_without_path_or_mtime`, and the cache first-diff owner |
+| allocation/side effects | Resolver owns only bounded byte buffers and caller-provided SourceMap entries; no process-global state, runtime/native call, directory enumeration, or partial manifest publication. Errors occur before a consumer can publish an artifact. | source safety sweep, malformed-length tests, no-FFI inventory, and failure-path no-write owner |
+
+#### L5b candidate review finding-to-fix ledger
+
+| Finding | Closure |
+|---|---|
+| P1: a manifest could omit a permitted driver's checked-metadata state because the descriptor's driver set was not represented | Add `driver_restriction` to `StaticInput`, encode/decode it, require exactly that restriction's driver list in canonical order, and cover omission/order plus round-trip owners. |
+| P2: a missing metadata file below an escaping parent symlink was recorded as `Missing` before containment was checked | Walk to the nearest existing metadata parent, canonicalize it, and enforce project-root containment for both snapshot and revalidation; cover present and missing outside-parent symlink owners. |
+| P1: checked metadata accepted a prefix-only JSON/version probe and therefore malformed or v2 files as `Present` | Replace the probe with one bounded canonical-v1 JSON parser that consumes the complete object, rejects unknown/duplicate/out-of-order top-level keys, and checks exact `format_version: 1`; cover malformed suffix, v2, and canonical complete-record owners in snapshot and revalidation. |
+| P1: a metadata file could claim a different descriptor or selected driver at its hash-derived path | Decode the canonical top-level `descriptor_id` and `driver` strings and require equality with the requested descriptor/driver before recording `Present`; cover identity mismatch in the metadata snapshot owner. |
+| P2: metadata and SQL reads allocated the complete file before enforcing the field bound | Open each canonical regular file through one bounded reader that checks the file length and caps the read at `MAX_FIELD_BYTES + 1` before publication; cover oversized metadata and preserve the same rule for static SQL. |
+| P2: canonical metadata accepted `\\u000a` where the v1 codec requires `\\n` | Reject `\\u` forms for the five named control escapes while retaining lowercase `\\u00xx` for the remaining controls; the canonical parser owner covers the escape form. |
+| P2: static-input callers could not name the public `Driver` argument type through `align_driver` | Re-export `Driver` beside `DriverRestriction` and retain the public API owner compile path. |
+| P2: a decoded `File` identity could contain U+0000 | Apply the NUL-free text identity rule to every manifest string before path/key use; cover a decoded NUL-bearing file path. |
+| P2: duplicate descriptor IDs were only rejected when source/kind/order also matched | Add an independent descriptor-ID uniqueness pass before canonical ordering and cover same-ID/different-source and same-ID/different-kind twins. |
+| P1: the canonical metadata parser accepted syntactically valid but schema-invalid nested values | Replace generic nested JSON skipping with exact source-identity, enum, hash, option, array, nested-object, and dense-ordinal validation; enforce command/query and driver-specific semantic constraints, and add malformed source/search/parameter/column owners. |
+| P0 (verified false positive): by-value matching of `MetadataState` was reported as a compile error | Run the owner `cargo check` and static-input tests against the exact candidate; Rust's place-pattern match compiles for this field and no production change is required. |
+| P2: inline SQL bypassed the static-input field bound before cloning | Validate the descriptor and decoded inline byte length before allocating the owned byte buffer; cover oversized inline input and preserve the same bounded reader for file inputs. |
+| P2: canonicalizing the defining `.align` changed the sibling base directory for an in-root symlink | Retain the lexical defining path for sibling/explicit candidate construction, while canonicalizing only for containment and regular-file validation; cover an in-root defining symlink whose sibling differs from the target path. |
 
 ### L6 — region plain-struct builder
 
