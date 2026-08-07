@@ -1,5 +1,12 @@
 # History of Align
 
+## 2026-08-07: shared borrow accepts stable Copy storage
+
+Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by
+default; explicit borrow is the visible no-copy ABI for large structural values and generated typed
+callbacks. Temporaries remain rejected. This removed the need for a `pkg.db`-specific exception in
+the Q2 binder ABI.
+
 ## General library boundaries and Query-centric databases
 
 Database design exposed several gaps that were already recurring in HTTP, networking, process, and

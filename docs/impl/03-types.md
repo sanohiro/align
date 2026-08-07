@@ -284,8 +284,9 @@ dependent-resource parent, or aggregate provenance rooted in the invalidated gen
 the call, including two distinct holder aggregates. The check is structural and never recognizes a
 package-specific Row name. The owner's previous
 generation becomes dead before the call; returned views belong to the new generation. An unbound
-Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move types because
-Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so field mutation
+temporary is rejected for either borrow mode. Shared `Borrow` accepts a stable bound Copy or Move
+place; Copy preserves ownership by value but explicit borrow avoids the structural copy while
+retaining the same checked-place and pointer ABI. `BorrowMut` also accepts a writable Copy place so field mutation
 updates the caller instead of a discarded copy.
 
 Checked HIR infers `ReturnBorrowSummary::Roots { params, captures }` by recursively walking every

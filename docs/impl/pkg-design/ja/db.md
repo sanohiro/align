@@ -2046,6 +2046,13 @@ version/driver/ordinal stateをcallback内でvalidateし、synchronous operation
 owned `db.Error`へmaterializeする。untaken recordはcontext Dropがfreeし、binderは最初のfailureで
 停止する。
 
+`P`はgeneral shared-borrow ruleによりCopy/Moveのどちらでもよい。generated callbackはcallerの
+stable storageを読み、by-value aggregate copyを作らない。descriptorがQ2のclosed non-null `i64`
+subset外のshapeを含む場合、binderまたはvalidatorはfield callbackを呼ぶ前にreserved unsupported
+statusを返す。packageはthunk invocation前にcontext-owned failure recordをexact `Unsupported`で
+initializeするため、全nonzero statusはowned failureを選びnative sendは起きない。そのdescriptorの
+decoderは存在するがfailed validator後はunreachableである。
+
 Static-option validation ABI v1は`fn(context: raw) -> i32`でQ1 canonical sorted option順に訪れる。
 artifact formationで閉じたcommon Checkにはruntime callbackを出さない。SQLiteはexact
 `pkg.db.internal.require_sqlite_version_v1(context: raw, major: u32, minor: u32, patch: u32) -> i32`
@@ -2126,6 +2133,8 @@ pathを要求する。
 | cardinality/row-validation precedenceがdriverでdivergeできた | row0 validate/cache、second detection、singleton decodeの順にし、first invalidをmultiplicityより優先してlater rowをvalidateしない。 | SQLite/PostgreSQL result |
 | encoding checkがfailed connectionをhideできた | PQstatusを先にcheckしnon-OK native errorをown、CONNECTION_OK後だけPQclientEncodingを呼ぶ。 | PostgreSQL connection、native error |
 | Q1 proseにdormant metadata thunk obligationが残った | Q1 capability/measurementをbinder/decoder/QueryMeta planへ統一しmaterializer codeはD12だけにする。 | D12 owner、current ledger |
+| exact binder ABIがCopy `P`のborrowを必要としたがshared borrowはCopyをredundantとしてrejectした | shared borrowをstable bound Copy/Move placeへgeneralizeしpointer-to-caller-storage ABIとtemporary rejectionを保つ。source/function value/interface/generated MIR/whole/per-unit codegenへDB exceptionなしで同じruleを適用する。 | binder/decoder、monomorph closure、language borrow owner |
+| Q2 scalar subset外のQ1 descriptorにpublish可能なexecution headerがなかった | field callback前にreserved unsupported statusを返すnon-null fail-closed binder/validator thunkをemitし、call contextをexact owned `Unsupported` failureでinitializeしてdecoderをunreachableに保つ。 | binder/decoder、descriptor ABI、unsupported no-send |
 | global builtin Error reservationがmodule identityとsettled pkg.db.Error APIに矛盾した | non-entry bare lookupをlocal-firstにしexplicit core.Errorを残す。entry canonical collisionだけrejectしDB special caseを作らない。 | public common surface、namespaced builtin type identity |
 | 最初のnamespace revisionがcore/interface contractと矛盾した | core EN/JAとL2 interface contractを更新する。imported unitのsame-spelled local definitionを受理しsemantic importをlocal-firstにし、producer entry collisionはpublication前にrejectする。 | namespaced builtin type identity、whole/per-unit parity |
 | `core.Error`とcapability import ruleの関係が未定義だった | `core.Error`を常時利用可能なlanguage-syntactic-core pathとし、`import core`は不要かつ無効とする。std-owned explicit spellingは通常のimportを必要としunused-import lintのuseに数える。 | namespaced builtin type identity、explicit import owner |

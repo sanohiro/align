@@ -279,6 +279,11 @@ ownership model. Replacement through `borrow mut` uses the ordinary old-value Dr
 storing a new value, while an unchanged pointee remains caller-owned. Raw ownership transfer is
 limited to a standalone resource root, avoiding hidden per-field cleanup state.
 
+Shared borrow also accepts stable Copy storage. Copy does not need borrow to preserve ownership,
+but it needs the same explicit pointer-to-caller-storage mode when a large structural value or a
+producer-generated typed callback must avoid a hidden by-value copy. This is one general ABI rule,
+not a package exemption, and it still rejects temporaries.
+
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
 compound operation may return a Move output through the same `Result`. Replacing that with numeric

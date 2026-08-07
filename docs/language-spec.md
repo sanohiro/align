@@ -271,8 +271,9 @@ active tag, while construction/extraction moves the payload and clears its old o
 owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
 ownership models. Arbitrary collections of Move elements remain a separate container capability.
 
-Move-typed function parameters may instead be `borrow x: T`; a shared borrow does not consume its
-owner and may return an inferred view of the current generation. `borrow mut x: T` accepts a
+Function parameters may instead be `borrow x: T`; a shared borrow accepts a stable bound Copy or
+Move place, does not consume its owner, avoids a by-value aggregate copy, and may return an inferred
+view of the current generation. It does not make a temporary addressable. `borrow mut x: T` accepts a
 writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
 return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
 Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
