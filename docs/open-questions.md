@@ -3707,9 +3707,10 @@ order are in `impl/17-library-boundary-prerequisites.md` §§2, 4, and 7.
 
 ### Borrowed parameters and package-defined opaque resources — Settled 2026-07-27
 
-Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow is for Move
-types: it preserves caller ownership and may return a view tied to the caller's exact owner
-generation. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
+Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow accepts a
+stable bound Copy or Move place: it preserves caller ownership, avoids a by-value aggregate copy,
+and may return a view tied to the caller's exact owner generation. It never makes a temporary
+addressable. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
 the previous generation, invalidates every older view, and returns any new view in the fresh
 generation. Parameter modes and inferred return-borrow summaries are part of the exported
 interface; `Fn`/`FnTy` also retains every mode and the Move-return cleanup ABI so indirect calls use

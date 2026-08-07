@@ -42,10 +42,68 @@ fn main() -> i32 {
 }
 
 #[test]
-fn shared_rejects_copy_temporary_move_and_aliasing() {
+fn shared_copy_uses_stable_caller_storage_without_a_copy() {
+    let source = "\
+Payload { a: i64, b: i64, c: i64, d: i64 }
+fn scalar(borrow value: i64) -> i64 = value
+fn sum(borrow value: Payload) -> i64 = value.a + value.b + value.c + value.d
+fn apply(f: fn(borrow i64) -> i64, borrow value: i64) -> i64 = f(value)
+fn main() -> i32 {
+  scalar_value := 2
+  payload := Payload { a: 10, b: 10, c: 10, d: 10 }
+  f := scalar
+  if apply(f, scalar_value) + sum(payload) == 42 && scalar_value == 2 && payload.a == 10 { return 42 }
+  return 0
+}
+";
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrow-shared-copy-place", source)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn shared_copy_abi_is_one_nonnull_readonly_pointer() {
+    if !backend_available() {
+        return;
+    }
+    let source = "\
+Payload { a: i64, b: i64, c: i64, d: i64 }
+fn inspect(borrow value: Payload) -> i64 = value.a + value.b + value.c + value.d
+fn main() -> i32 = 0
+";
+    let llvm = emit_llvm_with_exports(source, &["inspect"]);
+    let signature = llvm
+        .lines()
+        .find(|line| line.starts_with("define ") && line.contains("@inspect("))
+        .expect("exported inspect definition");
+    assert!(
+        signature.contains("ptr"),
+        "Copy borrow must use a pointer ABI: {signature}"
+    );
+    assert!(
+        signature.contains("nonnull"),
+        "Copy borrow must remain non-null: {signature}"
+    );
+    assert!(
+        signature.contains("readonly"),
+        "shared Copy borrow must be readonly: {signature}"
+    );
+    assert!(
+        signature.contains("captures(none)"),
+        "a non-returned Copy borrow must not be captured: {signature}"
+    );
+}
+
+#[test]
+fn shared_rejects_temporary_move_and_aliasing() {
     assert!(check_errs(
-        "borrow-shared-copy",
-        "fn inspect(borrow value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
+        "borrow-shared-copy-temp",
+        "fn inspect(borrow value: i64) -> i64 = value\nfn main() -> i32 = inspect(40 + 2) as i32\n",
     ));
     assert!(check_errs(
         "borrow-shared-temp",
@@ -87,6 +145,45 @@ fn main() -> i32 {
 }
 ";
     assert!(check_errs("borrow-shared-view-stale", stale));
+
+    let copy_aggregate = "\
+View { text: str }
+fn project(borrow value: View) -> str = value.text
+fn main() -> i32 {
+  owner := \"align\".clone()
+  text := owner.bytes().as_str() else { return 1 }
+  holder := View { text: text }
+  result := project(holder)
+  if result.len() == 5 && owner.len() == 5 { return 42 }
+  return 0
+}
+";
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrow-shared-copy-view", copy_aggregate)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+    let stale_copy_aggregate = "\
+View { text: str }
+fn project(borrow value: View) -> str = value.text
+fn main() -> i32 {
+  owner := \"align\".clone()
+  text := owner.bytes().as_str() else { return 1 }
+  holder := View { text: text }
+  result := project(holder)
+  moved := owner
+  print(result)
+  print(moved)
+  return 0
+}
+";
+    assert!(check_errs(
+        "borrow-shared-copy-view-stale",
+        stale_copy_aggregate
+    ));
 }
 
 #[test]
@@ -94,11 +191,11 @@ fn shared_imported_call_matches_whole_program() {
     let files = &[
         (
             "views.align",
-            "module views\npub fn size(borrow value: string) -> i64 = value.len()\npub fn view(borrow value: string) -> slice<u8> = value.bytes()\n",
+            "module views\npub fn size(borrow value: string) -> i64 = value.len()\npub fn view(borrow value: string) -> slice<u8> = value.bytes()\npub fn scalar(borrow value: i64) -> i64 = value\n",
         ),
         (
             "main.align",
-            "import views\nfn main() -> i32 { value := \"align\".clone(); bytes := views.view(value); if views.size(value) == 5 && bytes.len() == 5 && value.len() == 5 { return 42 }; return 0 }\n",
+            "import views\nfn main() -> i32 { value := \"align\".clone(); count := 42; bytes := views.view(value); if views.size(value) == 5 && bytes.len() == 5 && value.len() == 5 && views.scalar(count) == 42 && count == 42 { return 42 }; return 0 }\n",
         ),
     ];
     let differential = diff_check_multi("borrow-shared-import", files, "main.align");

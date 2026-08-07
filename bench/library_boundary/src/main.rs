@@ -48,6 +48,7 @@ fn interface_fixture() -> InterfaceSummary {
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
             generic_body: None,
+            resource_hook_body: false,
         });
     }
     let mut summary = InterfaceSummary {
@@ -56,6 +57,7 @@ fn interface_fixture() -> InterfaceSummary {
         structs: Vec::new(),
         enums: Vec::new(),
         consts: Vec::new(),
+        resources: Vec::new(),
         capabilities: Vec::new(),
         interface_hash: Hash128 { lo: 0, hi: 0 },
         impl_hash: Hash128 { lo: 0, hi: 0 },
@@ -216,6 +218,7 @@ fn import_validation_fixture() -> InterfaceSummary {
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
             generic_body: None,
+            resource_hook_body: false,
         })
         .collect();
     InterfaceSummary {
@@ -224,6 +227,7 @@ fn import_validation_fixture() -> InterfaceSummary {
         structs: structures,
         enums: Vec::new(),
         consts: Vec::new(),
+        resources: Vec::new(),
         capabilities: Vec::new(),
         interface_hash: Hash128 { lo: 0, hi: 0 },
         impl_hash: Hash128 { lo: 0, hi: 0 },
@@ -628,6 +632,18 @@ fn borrow_fixture(kind: &str, calls: u64) -> String {
             "fn inspect(borrow value: string) -> i64 = value.len()\n\
              fn main() -> i32 {{ value := \"shared\".clone(); mut index: i64 := 0; mut total: i64 := 0; loop {{ if index == {calls} {{ break }}; total = total + inspect(value); index = index + 1 }}; if total < 0 {{ return 1 }}; return 0 }}\n"
         ),
+        "copy-aggregate-value-control" | "copy-aggregate-shared-borrow" => {
+            let mode = if kind == "copy-aggregate-shared-borrow" {
+                "borrow "
+            } else {
+                ""
+            };
+            format!(
+                "Wide {{ a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }}\n\
+                 fn inspect({mode}value: Wide) -> i64 = value.a + value.b + value.c + value.d + value.e + value.f + value.g + value.h\n\
+                 fn main() -> i32 {{ value := Wide {{ a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 }}; mut index: i64 := 0; mut total: i64 := 0; loop {{ if index == {calls} {{ break }}; total = total + inspect(value); index = index + 1 }}; if total < 0 {{ return 1 }}; return 0 }}\n"
+            )
+        }
         "exclusive-copy-control" => format!(
             "fn increment(value: i64) -> i64 = value + 1\n\
              fn main() -> i32 {{ mut index: i64 := 0; mut value: i64 := 0; loop {{ if index == {calls} {{ break }}; value = increment(value); index = index + 1 }}; if value != {calls} {{ return 1 }}; return 0 }}\n"
@@ -645,7 +661,12 @@ fn borrow_fixture(kind: &str, calls: u64) -> String {
 }
 
 fn run_shared_borrow() {
-    const ROWS: [&str; 2] = ["by-value-call-control", "shared-borrow-call"];
+    const ROWS: [&str; 4] = [
+        "by-value-call-control",
+        "shared-borrow-call",
+        "copy-aggregate-value-control",
+        "copy-aggregate-shared-borrow",
+    ];
     run_call_rows("shared-borrow", &ROWS, 100_000, borrow_fixture);
 }
 
