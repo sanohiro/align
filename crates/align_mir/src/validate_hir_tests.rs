@@ -380,8 +380,14 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
     assert_one_header_mutation("import-main", &base, |program| {
         program.imported_fns[0].name = "main".to_string();
     });
-    assert_one_header_mutation("import-mode", &base, |program| {
-        program.imported_fns[0].param_modes[0] = align_ast::ParamMode::Borrow;
+    let mut imported_copy_borrow = base.clone();
+    imported_copy_borrow.imported_fns[0].param_modes[0] = align_ast::ParamMode::Borrow;
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(&imported_copy_borrow),
+        "an imported shared borrow of Copy slice storage is valid declaration metadata"
+    );
+    assert_one_header_mutation("import-out-type", &base, |program| {
+        program.imported_fns[0].params[0] = Ty::Str;
     });
     assert_one_header_mutation("import-summary-order", &base, |program| {
         program.imported_fns[0].return_region = ReturnRegionSummary::None;
@@ -523,8 +529,14 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
 
     let fn_base = fn_type_header_program();
     assert!(validate_hir::declaration_header_metadata_is_valid(&fn_base));
+    let mut copy_borrow_fn = fn_base.clone();
+    copy_borrow_fn.fn_types[0].params[0].0 = align_ast::ParamMode::Borrow;
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(&copy_borrow_fn),
+        "a function-value shared borrow of Copy str storage is valid declaration metadata"
+    );
     assert_one_header_mutation("fn-type-mode", &fn_base, |program| {
-        program.fn_types[0].params[0].0 = align_ast::ParamMode::Borrow;
+        program.fn_types[0].params[0].0 = align_ast::ParamMode::Out;
     });
     assert_one_header_mutation("fn-type-summary-order", &fn_base, |program| {
         program.fn_types[0].return_borrow = ReturnBorrowSummary::Roots {
