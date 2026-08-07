@@ -3418,12 +3418,16 @@ record; the package materializes one owned `db.Error` before native cleanup, and
 an untaken record. The binder stops after the first failure.
 
 `P` may be Copy or Move under the general shared-borrow rule; the generated callback always reads
-the caller's stable storage and never creates a by-value aggregate copy. If a descriptor contains a
-shape outside Q2's closed non-null `i64` subset, its binder or validator returns the reserved
-unsupported status before invoking any field callback. The package initializes the context-owned
-failure record to the exact `Unsupported` error before thunk invocation, so every nonzero status
-still selects an owned failure record and no native send occurs. The decoder for that descriptor is
-present but unreachable after the failed validator.
+the caller's stable storage and never creates a by-value aggregate copy. If `P`, or a Query's `R`,
+contains a shape outside Q2's closed non-null `i64` subset, `validate_static_thunk` returns exact
+`-1_i32` before invoking any field callback. The package initializes the context-owned failure
+record before thunk invocation to
+`db.Error.Unsupported(db.ContractError { query_id: Some(id), item: "db.descriptor.shape",
+message: "static database descriptor uses a field shape unsupported by this execution milestone" })`.
+Thus every nonzero status still selects an owned failure record and phase 6 fails before lease or
+native send. Query binder/row-validator/decoder pointers remain non-null but are unreachable after
+that failure. Command row-validator and decoder slots remain null exactly as required by the fixed
+header.
 
 Static-option validation ABI v1 is `fn(context: raw) -> i32`. It visits the Q1 canonical sorted
 option sequence and emits no callback for the common Check option, whose policy/state was already
@@ -3516,7 +3520,7 @@ requires the high-risk review path.
 | `error(c)` could textually bind to a local `Error` | Define the sugar as a direct construction of `core.Error.Code(c)` and test it in a colliding module. | namespaced builtin type identity; error owner |
 | the general alias rule named no complete provider map and tested only `Error` | Close the table over `Error`, `argon2_params`, and `regex_match`, including exact provider spellings and parameterized owner coverage. | namespaced builtin type identity; core/std EN/JA |
 | the exact binder ABI required borrowing Copy `P`, but shared borrow rejected Copy as redundant | Generalize shared borrow to stable bound Copy or Move places, preserve the pointer-to-caller-storage ABI, and keep temporary rejection. Use the same rule for source, function values, interfaces, generated MIR, and whole/per-unit codegen without a database exception. | generated binder/decoder; type and monomorph closure; language borrow owners |
-| Q1 descriptors outside the Q2 scalar subset had no publishable execution header | Emit non-null fail-closed binder/validator thunks that return the reserved unsupported status before field callbacks; initialize the call context with the exact owned `Unsupported` failure and keep the decoder unreachable. | generated binder/decoder; native descriptor ABI; unsupported-shape no-send |
+| Q1 descriptors outside the Q2 scalar subset had no publishable execution header | Make `validate_static_thunk` return `-1_i32` in phase 6 for unsupported `P` or Query `R`, before field callbacks, lease, or send; initialize the context with the exact `db.descriptor.shape` owned `Unsupported` failure. Query keeps non-null but unreachable binder/row/decode thunks; command row/decode slots stay null. | generated binder/decoder; native descriptor ABI; unsupported-shape no-send |
 
 ### D2 — minimal SQLite Query vertical
 

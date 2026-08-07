@@ -95,8 +95,8 @@ For `borrow x: T`:
 - moving, replacing, or dropping that owner invalidates the returned value.
 
 The first implementation accepts a bound local or a field place whose owning root is a bound local.
-It rejects an unbound Move temporary at a borrowed parameter because the owner would otherwise need
-a second hidden lifetime-extension rule.
+It rejects every unbound temporary or rvalue at a borrowed parameter because the call requires
+stable caller storage and the language does not create a hidden addressable temporary.
 
 ### 2.3 Mutable borrow
 
