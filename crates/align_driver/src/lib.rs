@@ -21,13 +21,16 @@ pub use align_sema::{
 
 pub mod cache;
 pub mod explain;
+pub mod static_artifacts;
 pub mod static_inputs;
+pub mod static_runtime;
 
 pub use cache::{
     cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
     CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
 };
 
+pub use static_artifacts::{BuiltStaticArtifact, StaticArtifactBuildError, build_static_artifacts};
 pub use static_inputs::{
     compose_codegen_impl_hash, metadata_logical_path, metadata_path, resolve_inline_static_input,
     resolve_static_descriptors, resolve_static_file, snapshot_checked_metadata,
@@ -35,6 +38,13 @@ pub use static_inputs::{
     StaticConsumerKind, StaticDescriptorInputError, StaticDescriptorInputErrorCause, StaticInput,
     StaticInputError, StaticInputManifest, STATIC_INPUT_MANIFEST_FORMAT_VERSION,
     STATIC_INPUT_MANIFEST_MAGIC,
+};
+pub use static_runtime::{
+    FakeBoundValue, FakeCardinality, FakeDecodedField, FakeExecution, FakeExecutionError,
+    FakeStatementKind, FakeValue, GeneratedBindField, GeneratedBindThunk, GeneratedCommandRuntime,
+    GeneratedDecodeField, GeneratedDecodeThunk, GeneratedDriverRuntime, GeneratedQueryMetaThunk,
+    GeneratedQueryRuntime, GeneratedStaticRuntime, GeneratedValueKind, GeneratedValueShape,
+    STATIC_RUNTIME_FORMAT_VERSION, execute_fake_static,
 };
 // Keep the driver selector types alongside the resolver so callers do not need
 // to depend on the interface crate just to construct a static input request.
@@ -45,6 +55,254 @@ pub struct Checked {
     pub hir: align_sema::Program,
     pub static_descriptors: Vec<StaticDescriptor>,
     pub diags: Diagnostics,
+}
+fn static_interface_hash(
+    base: Hash128,
+    unit: &str,
+    descriptors: &[StaticDescriptor],
+) -> Result<Hash128, String> {
+    fn bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+        let len =
+            u32::try_from(value.len()).map_err(|_| "static interface field exceeds u32::MAX")?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(value);
+        Ok(())
+    }
+    let mut public = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.is_public && descriptor.unit == unit)
+        .collect::<Vec<_>>();
+    public.sort_by(|left, right| {
+        left.descriptor_id
+            .as_bytes()
+            .cmp(right.descriptor_id.as_bytes())
+    });
+    if public.is_empty() {
+        return Ok(base);
+    }
+    let mut encoded = b"ALIGNSTI\0".to_vec();
+    encoded.extend_from_slice(&base.lo.to_le_bytes());
+    encoded.extend_from_slice(&base.hi.to_le_bytes());
+    for descriptor in public {
+        bytes(&mut encoded, descriptor.descriptor_id.as_bytes())?;
+        encoded.push(match descriptor.consumer {
+            StaticDescriptorConsumer::Query => 0,
+            StaticDescriptorConsumer::Command => 1,
+        });
+        encoded.push(match descriptor.driver {
+            StaticDescriptorDriver::AnySupportedDriver => 0,
+            StaticDescriptorDriver::SQLiteOnly => 1,
+            StaticDescriptorDriver::PostgreSQLOnly => 2,
+        });
+        let params = align_interface::CanonicalContract::try_from(&descriptor.params_contract)
+            .map_err(|error| error.to_string())?;
+        let params = params.fingerprint().map_err(|error| error.to_string())?;
+        encoded.extend_from_slice(&params.lo.to_le_bytes());
+        encoded.extend_from_slice(&params.hi.to_le_bytes());
+        match &descriptor.row_contract {
+            Some(row) => {
+                encoded.push(1);
+                let row = align_interface::CanonicalContract::try_from(row)
+                    .map_err(|error| error.to_string())?;
+                let row = row.fingerprint().map_err(|error| error.to_string())?;
+                encoded.extend_from_slice(&row.lo.to_le_bytes());
+                encoded.extend_from_slice(&row.hi.to_le_bytes());
+            }
+            None => encoded.push(0),
+        }
+        let has_check = descriptor
+            .static_options
+            .iter()
+            .any(|option| matches!(option, align_sema::StaticDescriptorOption::Check(_)));
+        let option_count = u32::try_from(descriptor.static_options.len() + usize::from(!has_check))
+            .map_err(|_| "too many static descriptor options")?;
+        encoded.extend_from_slice(&option_count.to_le_bytes());
+        if !has_check {
+            encoded.extend_from_slice(&[0, 0]);
+        }
+        for option in &descriptor.static_options {
+            match option {
+                align_sema::StaticDescriptorOption::Check(policy) => {
+                    encoded.extend_from_slice(&[
+                        0,
+                        match policy {
+                            align_sema::StaticCheckPolicy::DeclaredOnly => 0,
+                            align_sema::StaticCheckPolicy::CheckedOptional => 1,
+                            align_sema::StaticCheckPolicy::CheckedRequired => 2,
+                        },
+                    ]);
+                }
+                align_sema::StaticDescriptorOption::SQLiteRequireVersionAtLeast {
+                    major,
+                    minor,
+                    patch,
+                } => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(&major.to_le_bytes());
+                    encoded.extend_from_slice(&minor.to_le_bytes());
+                    encoded.extend_from_slice(&patch.to_le_bytes());
+                }
+                align_sema::StaticDescriptorOption::PostgreSQLParameterType {
+                    parameter_name,
+                    canonical_type_name,
+                } => {
+                    encoded.push(2);
+                    bytes(&mut encoded, parameter_name.as_bytes())?;
+                    bytes(&mut encoded, canonical_type_name.as_bytes())?;
+                }
+            }
+        }
+    }
+    Ok(Hash128::of(&encoded))
+}
+
+fn static_implementation_hash(
+    base: Hash128,
+    manifest: &StaticInputManifest,
+    artifacts: &[BuiltStaticArtifact],
+) -> Result<Hash128, String> {
+    let manifest_digest = manifest.action_key().map_err(|error| error.to_string())?;
+    let mut encoded = b"ALIGNSTP\0".to_vec();
+    encoded.extend_from_slice(&manifest_digest.lo.to_le_bytes());
+    encoded.extend_from_slice(&manifest_digest.hi.to_le_bytes());
+    let mut ordered = artifacts.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.descriptor_id
+            .as_bytes()
+            .cmp(right.descriptor_id.as_bytes())
+    });
+    let count = u32::try_from(ordered.len()).map_err(|_| "too many static artifacts")?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for artifact in ordered {
+        let id = artifact.descriptor_id.as_bytes();
+        let len = u32::try_from(id.len()).map_err(|_| "static descriptor id exceeds u32::MAX")?;
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(id);
+        encoded.extend_from_slice(&artifact.digest.lo.to_le_bytes());
+        encoded.extend_from_slice(&artifact.digest.hi.to_le_bytes());
+    }
+    Ok(compose_codegen_impl_hash(base, Hash128::of(&encoded)))
+}
+
+/// Replace each source-level static descriptor function with the producer-owned immutable data
+/// constructor that D1 executes. The private descriptor field is a raw pointer to a canonical,
+/// codegen-owned byte global; application source cannot spell or inspect that field.
+fn install_static_descriptor_data(
+    mir: &mut align_mir::Program,
+    is_entry: bool,
+    descriptors: &[StaticDescriptor],
+    artifacts: &[BuiltStaticArtifact],
+) -> Result<(), String> {
+    use align_mir::{Block, ConstElem, Operand, Rvalue, Stmt, Term};
+    use align_sema::{IntTy, Scalar, Ty};
+
+    if descriptors.len() != artifacts.len() {
+        return Err("static descriptor/artifact count mismatch".to_string());
+    }
+    let byte_ty = Ty::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    let byte_slice_ty = Ty::Slice(Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    }));
+    let static_constructor_monomorph = |name: &str| {
+        [
+            "pkg.db$query_file$",
+            "pkg.db$query$",
+            "pkg.db$command_file$",
+            "pkg.db$command$",
+            "pkg.db.sqlite$query_file$",
+            "pkg.db.sqlite$query$",
+            "pkg.db.sqlite$command_file$",
+            "pkg.db.sqlite$command$",
+            "pkg.db.postgres$query_file$",
+            "pkg.db.postgres$query$",
+            "pkg.db.postgres$command_file$",
+            "pkg.db.postgres$command$",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    };
+    for descriptor in descriptors {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.descriptor_id == descriptor.descriptor_id)
+            .ok_or_else(|| {
+                format!(
+                    "static descriptor `{}` has no generated artifact",
+                    descriptor.descriptor_id
+                )
+            })?;
+        let symbol = if is_entry {
+            descriptor.item.clone()
+        } else {
+            format!("{}${}", descriptor.unit, descriptor.item)
+        };
+        let function = mir
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == symbol)
+            .ok_or_else(|| format!("static descriptor function `{symbol}` is absent from MIR"))?;
+        if !function.params.is_empty() {
+            return Err(format!(
+                "static descriptor function `{symbol}` unexpectedly has parameters"
+            ));
+        }
+        let Ty::Struct(struct_id) = function.ret else {
+            return Err(format!(
+                "static descriptor function `{symbol}` does not return a struct"
+            ));
+        };
+        let definition = mir.structs.get(struct_id as usize).ok_or_else(|| {
+            format!("static descriptor function `{symbol}` has an unknown return type")
+        })?;
+        if !align_sema::static_descriptor_struct_is_valid(definition) {
+            return Err(format!(
+                "static descriptor function `{symbol}` has an invalid runtime representation"
+            ));
+        }
+        let bytes = artifact
+            .runtime
+            .bytes()
+            .iter()
+            .map(|byte| ConstElem::Int(i128::from(*byte)))
+            .collect();
+        function.params.clear();
+        function.param_modes.clear();
+        function.borrow_mut_cleanup_slots.clear();
+        function.slots = vec![function.ret];
+        function.slot_align = vec![None];
+        function.value_tys = vec![byte_slice_ty, Ty::Raw, function.ret];
+        function.blocks = vec![Block {
+            id: 0,
+            stmts: vec![
+                Stmt::Let(
+                    0,
+                    Rvalue::ConstArray {
+                        elems: bytes,
+                        elem: byte_ty,
+                    },
+                ),
+                Stmt::Let(1, Rvalue::SlicePtr(Operand::Value(0))),
+                Stmt::StoreField(0, vec![0], Operand::Value(1)),
+                Stmt::Let(2, Rvalue::Load(0)),
+            ],
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Value(2))),
+        }];
+        function.entry = 0;
+    }
+    // The source constructor is legal only as the descriptor's complete body. Replacing every such
+    // body therefore removes the only possible call to its consumer-side generic monomorph. Do not
+    // emit a dormant `process.abort` constructor or make a consumer instantiate Query internals.
+    mir.fns
+        .retain(|function| !static_constructor_monomorph(function.name.as_str()));
+    align_mir::recanonicalize_type_tables(mir).map_err(|reason| {
+        format!("generated descriptor MIR has an invalid function-type graph: {reason}")
+    })?;
+    Ok(())
 }
 
 /// lexer -> parser -> sema for the entry file plus its transitively-imported **user** modules
@@ -246,14 +504,33 @@ pub fn build_interface_summaries(
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
-    let hir = align_sema::check_program(&modules, &mut diags);
+    let checked = align_sema::check_program_with_static_descriptors(&modules, &mut diags);
     if diags.has_errors() {
         return (Vec::new(), diags);
     }
+    let hir = checked.program;
     let mir = lower_to_mir(&hir);
-    let sources: std::collections::HashMap<String, String> =
-        loaded.iter().map(|l| (l.path.clone(), l.src.clone())).collect();
-    let summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
+    let sources: std::collections::HashMap<String, String> = loaded
+        .iter()
+        .map(|l| (l.path.clone(), l.src.clone()))
+        .collect();
+    let mut summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
+    for summary in &mut summaries {
+        match static_interface_hash(
+            summary.interface_hash,
+            &summary.unit,
+            &checked.static_descriptors,
+        ) {
+            Ok(hash) => summary.interface_hash = hash,
+            Err(reason) => diags.error(
+                format!("cannot form static descriptor interface identity: {reason}"),
+                align_span::Span::new(0, 0, 0),
+            ),
+        }
+    }
+    if diags.has_errors() {
+        return (Vec::new(), diags);
+    }
     (summaries, diags)
 }
 
@@ -273,6 +550,15 @@ pub struct PerUnitCheck {
     /// The union of every unit's per-unit diagnostics (each unit's diagnostics are emitted once, when
     /// that unit is the unit-under-check; interface-only dependencies emit none).
     pub diags: Diagnostics,
+}
+
+struct PendingPerUnitArtifact {
+    summary: align_interface::InterfaceSummary,
+    mir: MirProgram,
+    is_entry: bool,
+    static_descriptors: Vec<StaticDescriptor>,
+    static_inputs: StaticInputManifest,
+    static_artifacts: Vec<BuiltStaticArtifact>,
 }
 
 /// M15 S1b: check every unit **per-unit**, each against only its own AST plus the interface summaries
@@ -361,17 +647,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     }
 
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
-    // Per-unit compilation artifacts, keyed by unit path: (summary, per-unit MIR, is_entry). Populated
-    // only for cleanly-checked units; assembled bottom-up into `PerUnitArtifact`s at the end.
-    let mut mirs: HashMap<
-        String,
-        (
-            align_interface::InterfaceSummary,
-            MirProgram,
-            bool,
-            Vec<StaticDescriptor>,
-        ),
-    > = HashMap::new();
+    // Per-unit compilation artifacts keyed by unit path. Populated only for cleanly-checked units;
+    // assembled bottom-up into `PerUnitArtifact`s at the end.
+    let mut mirs: HashMap<String, PendingPerUnitArtifact> = HashMap::new();
     let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
     // Cache of each dependency's synthesized interface AST, keyed by module path. Rendered and
     // parsed exactly once per dependency (not once per importer): `summary_to_source` is called
@@ -490,7 +768,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             // linkage, and alignment. The legacy
             // whole-program summary producer still partitions function MIR for its multi-unit
             // inspection surface; only per-unit summaries feed the object cache.
-            let mir = if located {
+            let mut mir = if located {
                 lower_to_mir_per_unit_located(&program, source_map)
             } else {
                 lower_to_mir_per_unit(&program)
@@ -504,13 +782,114 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 &external_effects,
             );
             if let Some(mut s) = built.pop() {
+                // Static-input resolution is keyed by the producer before its descriptor bodies are
+                // replaced. The final implementation hash below fingerprints the exact generated
+                // MIR that codegen receives.
+                let resolution_digest = align_interface::codegen_impl_hash(&mir);
+                match static_interface_hash(s.interface_hash, &u.path, &static_descriptors) {
+                    Ok(hash) => s.interface_hash = hash,
+                    Err(reason) => {
+                        diags.error(
+                            format!("cannot form static descriptor interface identity: {reason}"),
+                            static_descriptors.first().map_or_else(
+                                || align_span::Span::new(0, 0, 0),
+                                |descriptor| descriptor.constructor_span,
+                            ),
+                        );
+                        continue;
+                    }
+                }
+
+                let lexical_project_root = std::path::Path::new(name)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                // Preserve the entry path's lexical spelling (`/var` versus macOS's canonical
+                // `/private/var`, and in-root source symlinks) while making a relative CLI root
+                // absolute so the resolver never prefixes it to an already-rooted SourceMap name.
+                // The static-input boundary canonicalizes separately for containment checks.
+                let project_root = if lexical_project_root.is_absolute() {
+                    lexical_project_root.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map(|current| current.join(lexical_project_root))
+                        .unwrap_or_else(|_| lexical_project_root.to_path_buf())
+                };
+                let resolved = match resolve_static_descriptors(
+                    &project_root,
+                    source_map,
+                    &static_descriptors,
+                    resolution_digest,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        diags.error(error.to_string(), error.span);
+                        continue;
+                    }
+                };
+                let static_artifacts = match build_static_artifacts(&static_descriptors, &resolved)
+                {
+                    Ok(artifacts) => artifacts,
+                    Err(error) => {
+                        let span = static_descriptors
+                            .iter()
+                            .find(|descriptor| descriptor.descriptor_id == error.descriptor_id)
+                            .map_or_else(
+                                || align_span::Span::new(0, 0, 0),
+                                |descriptor| descriptor.constructor_span,
+                            );
+                        diags.error(error.to_string(), span);
+                        continue;
+                    }
+                };
+                if let Err(reason) = install_static_descriptor_data(
+                    &mut mir,
+                    u.is_entry,
+                    &static_descriptors,
+                    &static_artifacts,
+                ) {
+                    diags.error(
+                        format!("cannot generate static descriptor runtime data: {reason}"),
+                        static_descriptors.first().map_or_else(
+                            || align_span::Span::new(0, 0, 0),
+                            |descriptor| descriptor.constructor_span,
+                        ),
+                    );
+                    continue;
+                }
                 // Cache soundness boundary: hash the exact structural MIR program that a miss hands
-                // to codegen. Hashing only stable-printed function bodies omitted type tables and
-                // linkage metadata, so a changed dead function could fail cold while an old key hit
-                // skipped codegen. A hit under this hash implies the full backend input is equal.
+                // to codegen, including generated descriptor bodies and producer-owned data.
                 s.impl_hash = align_interface::codegen_impl_hash(&mir);
+                if !static_descriptors.is_empty() {
+                    match static_implementation_hash(
+                        s.impl_hash,
+                        &resolved.manifest,
+                        &static_artifacts,
+                    ) {
+                        Ok(hash) => s.impl_hash = hash,
+                        Err(reason) => {
+                            diags.error(
+                                format!("cannot form static descriptor implementation identity: {reason}"),
+                                static_descriptors
+                                    .first()
+                                    .map_or_else(|| align_span::Span::new(0, 0, 0), |descriptor| descriptor.constructor_span),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 summaries.insert(u.path.clone(), s.clone());
-                mirs.insert(u.path.clone(), (s, mir, u.is_entry, static_descriptors));
+                mirs.insert(
+                    u.path.clone(),
+                    PendingPerUnitArtifact {
+                        summary: s,
+                        mir,
+                        is_entry: u.is_entry,
+                        static_descriptors,
+                        static_inputs: resolved.manifest,
+                        static_artifacts,
+                    },
+                );
             }
         }
     }
@@ -524,7 +903,14 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let units: Vec<PerUnitArtifact> = order
         .iter()
         .filter_map(|p| {
-            let (summary, mir, is_entry, static_descriptors) = mirs.remove(p)?;
+            let PendingPerUnitArtifact {
+                summary,
+                mir,
+                is_entry,
+                static_descriptors,
+                static_inputs,
+                static_artifacts,
+            } = mirs.remove(p)?;
             Some(PerUnitArtifact {
                 unit: p.clone(),
                 is_entry,
@@ -536,6 +922,8 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                     .to_vec(),
                 file: by_path.get(p.as_str()).map(|u| u.file.clone()).unwrap_or_default(),
                 static_descriptors,
+                static_inputs,
+                static_artifacts,
             })
         })
         .collect();
@@ -560,6 +948,11 @@ pub struct PerUnitArtifact {
     /// L5c descriptors owned by this real producer unit. Interface-only dependency bodies are not
     /// rediscovered in consumers.
     pub static_descriptors: Vec<StaticDescriptor>,
+    /// Canonical static-source and checked-metadata dependency identity for descriptors owned by
+    /// this producer. Empty for ordinary units.
+    pub static_inputs: StaticInputManifest,
+    /// Validated Query/command artifacts owned by this producer, sorted by descriptor identity.
+    pub static_artifacts: Vec<BuiltStaticArtifact>,
 }
 
 /// The per-unit compilation result: one artifact per cleanly-checked unit (bottom-up), the FULL
@@ -998,39 +1391,39 @@ pub fn codegen_units_parallel(
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| loop {
-                    // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
-                    // between units — an in-progress emit is never interrupted. Codegen errors are rare
-                    // (sema already validated in the walk), so this mainly bounds the wasted work when a
-                    // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
-                    // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
-                    // hint that publishes no data (errors ride the Mutex, and the final read
-                    // happens-after the scope join).
-                    if failed.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    if k >= misses.len() {
-                        break;
-                    }
-                    let i = misses[k];
-                    let unit = &units[i];
-                    // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
-                    // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
-                    // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
-                    // staleness warnings + profile-match tally ride the return.
-                    match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
-                        Err(e) => {
-                            errors.lock().expect("codegen error lock").push((i, e));
-                            failed.store(true, Ordering::Relaxed);
-                            continue;
+                        // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
+                        // between units — an in-progress emit is never interrupted. Codegen errors are rare
+                        // (sema already validated in the walk), so this mainly bounds the wasted work when a
+                        // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
+                        // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
+                        // hint that publishes no data (errors ride the Mutex, and the final read
+                        // happens-after the scope join).
+                        if failed.load(Ordering::Relaxed) {
+                            break;
                         }
-                        Ok(run) => {
-                            results.lock().expect("pgo result lock").push((i, run));
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= misses.len() {
+                            break;
                         }
-                    }
-                    if let Some(key) = &keys[i] {
-                        cache.publish_after_miss(key, &obj_paths[i]);
-                    }
+                        let i = misses[k];
+                        let unit = &units[i];
+                        // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
+                        // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
+                        // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
+                        // staleness warnings + profile-match tally ride the return.
+                        match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
+                            Err(e) => {
+                                errors.lock().expect("codegen error lock").push((i, e));
+                                failed.store(true, Ordering::Relaxed);
+                                continue;
+                            }
+                            Ok(run) => {
+                                results.lock().expect("pgo result lock").push((i, run));
+                            }
+                        }
+                        if let Some(key) = &keys[i] {
+                            cache.publish_after_miss(key, &obj_paths[i]);
+                        }
                 });
             }
         });
@@ -1625,18 +2018,18 @@ where
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             scope.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let k = next.fetch_add(1, Ordering::Relaxed);
-                if k >= misses.len() {
-                    break;
-                }
-                let i = misses[k];
-                if let Err(e) = produce(i) {
-                    errors.lock().expect("thin phase error lock").push((i, e));
-                    failed.store(true, Ordering::Relaxed);
-                }
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= misses.len() {
+                        break;
+                    }
+                    let i = misses[k];
+                    if let Err(e) = produce(i) {
+                        errors.lock().expect("thin phase error lock").push((i, e));
+                        failed.store(true, Ordering::Relaxed);
+                    }
             });
         }
     });

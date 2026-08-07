@@ -755,6 +755,8 @@ sqlite.MetaOption.IncludeInternalObjects | IncludeHiddenColumns
 sqlite.ExplainOption.QueryPlan | Bytecode
 ```
 
+`major`、`minor`、`patch`は`u32`である。
+
 初期releaseのconnection sumも次で固定する。
 
 ```text
@@ -815,8 +817,8 @@ Query identityなしの `db.Error.Encode` として拒否し、truncateしない
 ### 12.2 parameter/result format
 
 ```text
-postgres.QueryOption.ParameterType(name, native_type)
-postgres.CommandOption.ParameterType(name, native_type)
+postgres.QueryOption.ParameterType(name, canonical_type_name)
+postgres.CommandOption.ParameterType(name, canonical_type_name)
 postgres.PrepareOption.ParameterOid(name, oid)
 postgres.ExecuteOption.ParameterFormat(name, Text|Binary)
 postgres.ExecuteOption.ResultFormat(Text|Binary)
@@ -828,6 +830,8 @@ postgres.ExplainOption.Analyze
 postgres.ExplainOption.Format(Text|Json)
 postgres.ExplainOption.Verbose/Costs/Buffers/Timing/Settings/Wal(bool)
 ```
+
+`name`と`canonical_type_name`は`str` literalである。
 
 Text formatのbyteaは§5.6.1のexact hex encodingを使い、Binary formatだけがraw byteと
 explicit libpq lengthを使う。未実装のbinary mapping要求はSQL送信前に `Unsupported` とする。
@@ -1872,6 +1876,53 @@ protocolの1 statement性、parameter/result metadata、nullability evidence、c
 実測して記録する。
 
 ### D1 — fake driver上のgenerated Query/command
+
+#### Q1/D1 implementation closure matrix
+
+Q1は1つの実行可能capabilityである。public package declaration、compiler-produced
+artifact、generated binder/decoder/metadata thunk、fake-driver consumerは1つのdescriptor
+ABIとcache identityを共有する。最初のconsumerより前でproducerを分割すると、実行不能な
+static valueを公開するか、同じstructural-contract proofを重複させる。
+このcapabilityは約1,000 hand-written lineのthresholdを意図的に超える。descriptor、artifact、
+runtime data、最初のconsumerを一体にするとdormant seamをなくし、1つのABI/cache boundaryを
+一度だけproveできるため、producer-only PR間で同じproofを繰り返すよりintegration riskが低い。
+
+| Closure cell | 必要なimplementation closure | Exact owner evidence |
+|---|---|---|
+| public source surface | exact generic signatureを持つ`pkg.db`、`pkg.db.sqlite`、`pkg.db.postgres`のQuery/command descriptorとD1 option sumをcheck inする。constructorはcomplete single-expression descriptor bodyのままでraw/native stateを公開しない。file constructorはcompiler-owned constructor signature ruleによりimplicit sibling pathとleading explicit relative pathの両方を受理する。 | `pkg_db_q1::public_surface_whole_and_per_unit`、`pkg_db_q1::file_constructors_accept_explicit_paths_on_the_shipped_surface` |
+| typed semantic descriptor | concrete generic return typeからQuery Params/Rowとcommand Paramsを解決し、post-compaction HIR identityを保持し、literal static optionだけをdecodeする。wrong kind/arity、command Row contract、unresolved type、duplicate/conflicting option、runtime option valueはpublication前にrejectする。 | `pkg_db_q1::typed_descriptor_contract_matrix`、`pkg_db_q1::static_option_rejection_matrix` |
+| artifact formation | resolved static input、reachable structural contract、source identity/bytes、placeholder occurrence、SQLite identity wire SQL、PostgreSQL `$n` rewrite/span、binding ordinal/retention、declared metadata plan、ABI version、checked-metadata snapshotからexact versioned Query/command artifactを作る。current semantic snapshotは`DatabaseChecked`となり、stale Optional evidenceはDeclaredのまま、stale/missing Required evidenceはfailureとなる。byte publication前にvalidateする。 | `pkg_db_q1::artifact_semantics_and_checked_in_goldens`、checked Query/command metadata promotion test、独立なQuery/command byte/digest golden |
+| generated runtime data | artifact formation時にcanonical type nameをclosed value tag、nullability、declaration-order field ordinalへ1回だけ解決する。artifact digest、driver別wire/bind plan、direct binder thunk planを含むproducer-owned immutable `ALIGNQST`/`ALIGNCST` descriptor dataをemitする。Queryだけがordinal decoder thunk planとDeclared QueryMeta materialization planを持つ。runtime field-name lookup、source/artifact I/O、map、dictionary、reflection、consumer-side generic instantiationは禁止する。 | `pkg_db_q1::generated_runtime_data_is_producer_owned`、`pkg_db_q1::fake_driver_query_and_command_end_to_end` |
+| fake-driver execution | 同じgenerated binderでinline/sibling-file Queryとinline/sibling-file commandを各1つ実行し、admitted first-release scalar/nullable Query row shapeを全てdecodeし、1 executionをcountし、Query/commandを区別し、DBなしでbind/decode/cardinality errorを返す。 | `pkg_db_q1::fake_driver_query_and_command_end_to_end`のwhole-program/per-unit modeと`pkg_db_q1::scalar_bind_and_decode_shape_matrix` |
+| interface, implementation, and cache identity | public Params/Row/restriction/static-option editはinterfaceを変える。SQL、rewrite、checked metadata、binder/decoder ABI、private descriptor editはunchanged public consumerをrecompileせずproducer implementation/artifact identityを変える。Query/commandは同じstatement-artifact identity ruleを使い、commandはRow/decoder/QueryMetaだけを省く。 | `pkg_db_q1::interface_impl_cache_invalidation_matrix` |
+| fail-closed and Q1 ownership boundary | malformed SQL UTF-8/NUL/statement shape、malformed placeholder、unmatched Params field、unsupported field type、overflowed offset/count、malformed checked metadata、全artifact corruptionをcodegen/fake execution前にrejectする。Q1はfake inputをborrowしowned fake observationを返し、native resourceは所有しない。generated planはD2/D4 native cleanupを実行したと装わず、各future native driverのexact `BindValue`/`BindCopy` retentionを記録する。 | `pkg_db_q1::malformed_static_query_matrix`、`pkg_db_q1::inline_nul_diagnostic_points_at_the_exact_source_bytes`、fake-driver invalid-plan/error case、既存static-input/artifact corruption suite |
+
+#### Q1 review finding-to-fix ledger
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| checked snapshotがDeclaredのままだった | unchanged L5 input snapshotと並べてparsed semantic recordを保持し、全artifact-bound fieldを比較し、promotion前にexact server/prepare identityをderiveする。Optional/Requiredは指定されたstale/missing branchを通る。 | `pkg_db_q1::checked_metadata_promotes_current_snapshots_and_obeys_policy_on_stale_data`、`pkg_db_q1::checked_command_metadata_promotes_without_query_evidence`、checked-metadata parser/revalidation suite |
+| explicit file pathがordinary arity checkで失敗した | compiler-owned static-constructor signature ruleがexplicit file formだけにexact leading `str` parameterを挿入する。general overloadやpackage declarationの重複は導入しない。 | `pkg_db_q1::file_constructors_accept_explicit_paths_on_the_shipped_surface`、`align_sema::static_file_descriptor_preserves_explicit_decoded_path` |
+| PostgreSQL escape string内をplaceholderとして誤認した | token boundaryの`E'...'`/`e'...'`をbackslash escapeとdoubled quoteを含むescape-aware opaque SQL tokenとして扱う。 | `static_artifacts::tests::scanner_keeps_postgres_escape_strings_opaque` |
+| 全`WITH` statementをSelectに分類した | top-level CTE bodyを追跡し、recursive/multiple CTEを含め、final CTE後の最初のstatement keywordを分類する。 | `static_artifacts::tests::scanner_classifies_the_main_statement_after_ctes` |
+
+author-side matrix-to-diff passでは、全runtime descriptor fieldをartifact producerとfake-driver
+consumerへ対応付け、全accepted Params/Row field classをdirect binder/decoder ownerとmalformed
+twinへ対応付ける。validated artifact identityなしでdescriptorが実行できる場合、またはgenerated
+codeがreflection/name lookupへfallbackする場合はこのmatrixを再度開く。
+
+D1 private runtime-plan prefixはexactであり、別配布のartifact codecではない。両recordは8 byte
+magic（`ALIGNQST`または`ALIGNCST`）、`format_version: u32 = 1`、`u32` length UTF-8
+descriptor ID、artifact `Hash128`（`lo`、次に`hi`）、static-option count/record、driver countで始まる。
+static optionはowner `u8`、value tag `u8`、exact payload（Check policy `u8`、SQLite versionの
+3つの`u32`、またはPostgreSQLの2つの`u32` length UTF-8 string）を格納する。driverはSQLite、
+PostgreSQL順で、`u8` tag、`u32` length wire bytes、dense bind fieldを格納する。bind fieldは
+Params ordinal `u32`、protocol ordinal `u32`、retention `u8`、shape
+`(kind: u8, nullable: u8)`を格納する。Queryは同じshapeのdense decoder field、statement-class
+`u8`、dense declared parameter row、dense declared column rowを続け、commandはdriver record後に
+終わる。全text/byte fieldとsequenceはdescriptor MIR install前に`u32` boundedである。artifact
+validationとruntime-plan formationはcodegen前に完了するため、emitted constantはtrusted producer
+dataである。fake consumerもnon-dense ordinalとzero protocol ordinalをrejectする。
 
 inline/sibling SQLからQueryとcommandのdescriptor/artifactを作り、exact source identityと
 SQLite source/PostgreSQL `$n` wire entry・reverse span map、named occurrence table、

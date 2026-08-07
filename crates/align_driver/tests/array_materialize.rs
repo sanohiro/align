@@ -168,6 +168,21 @@ fn main() -> i32 {
 }
 
 #[test]
+fn expected_slice_type_materializes_an_empty_literal_without_allocation() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn count(xs: slice<i32>) -> i64 = xs.len()
+fn main() -> i32 {
+  xs: slice<i32> := []
+  return count(xs) as i32
+}
+";
+    assert_eq!(build_and_run("arr-empty-slice", src).status.code(), Some(0));
+}
+
+#[test]
 fn struct_array_literal_with_call_elements_is_stored() {
     if !backend_available() {
         return;

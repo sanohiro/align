@@ -113,6 +113,11 @@ one parallel model
 
 Converge on one rather than several competing approaches.
 
+This also applies to empty option lists. `[]` is not a second polymorphic "empty collection" type:
+when a function or binding expects `slice<T>`, that context supplies `T` and the literal follows the
+ordinary fixed-array-to-slice borrow path. With no expected element type it is rejected. The empty
+case allocates nothing and needs no database- or package-specific compiler exception.
+
 This is why **multi-value return is just returning a tuple**, not a separate mechanism. A
 Go-style "multiple return values" feature produces several values that are not themselves a
 value (you can't store, nest, or array them) — a second, special-cased way to hand back more

@@ -1,0 +1,30 @@
+module pkg.db
+
+import std.process
+
+// Static statement descriptors are compiler-produced Copy values. These source declarations own
+// their public type surface; a constructor body is unreachable after descriptor lowering.
+pub query<P, R> {}
+pub command<P> {}
+
+pub CheckPolicy {
+  DeclaredOnly
+  CheckedOptional
+  CheckedRequired
+}
+
+pub QueryOption {
+  Check(CheckPolicy)
+}
+
+pub CommandOption {
+  Check(CheckPolicy)
+}
+
+pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()
+
+pub fn query<P, R>(sql: str, options: slice<QueryOption>) -> query<P, R> = process.abort()
+
+pub fn command_file<P>(options: slice<CommandOption>) -> command<P> = process.abort()
+
+pub fn command<P>(sql: str, options: slice<CommandOption>) -> command<P> = process.abort()

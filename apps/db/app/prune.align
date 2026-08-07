@@ -1,0 +1,7 @@
+module app.prune
+
+import pkg.db
+
+pub Params { id: i64 }
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.command_file([])

@@ -917,6 +917,13 @@ users: array<User>
 
 `array<T>` is owned contiguous memory.
 
+A function-local array literal is fixed storage and normally infers its element type from its
+elements. The empty literal `[]` is accepted only when the surrounding expression supplies one
+exact element type, such as a `slice<Option>` parameter or a `slice<T>` binding annotation. It
+materializes a zero-length fixed array and borrows it through the ordinary array-to-slice path;
+there is no allocation and no special untyped-empty-array value. Without an expected element type,
+`[]` is a compile error.
+
 ### Slice
 
 ```align

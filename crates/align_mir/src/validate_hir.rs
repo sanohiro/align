@@ -655,11 +655,18 @@ impl<'a> NominalLinkValidator<'a> {
             let Ok(id) = u32::try_from(id) else {
                 return false;
             };
+            let members_are_valid = if definition.name.starts_with("pkg.db$query$")
+                || definition.name.starts_with("pkg.db$command$")
+            {
+                align_sema::static_descriptor_struct_is_valid(definition)
+            } else {
+                members_valid(definition.fields.iter().map(|field| field.name.as_str()))
+            };
             if !valid_nominal_text(&definition.name)
                 || !valid_nominal_text(&definition.source_name)
                 || !self.internal_names.insert(definition.name.as_str())
                 || !valid_alignment(definition.align)
-                || !members_valid(definition.fields.iter().map(|field| field.name.as_str()))
+                || !members_are_valid
             {
                 return false;
             }
@@ -819,6 +826,14 @@ impl<'a> PlacementValidator<'a> {
 
     fn struct_fields_valid(&self) -> bool {
         for (id, definition) in self.program.structs.iter().enumerate() {
+            if definition.name.starts_with("pkg.db$query$")
+                || definition.name.starts_with("pkg.db$command$")
+            {
+                if !align_sema::static_descriptor_struct_is_valid(definition) {
+                    return false;
+                }
+                continue;
+            }
             let abstract_node = self.is_abstract(Node::Struct(id as u32));
             for field in &definition.fields {
                 if !self.field_type_ok(field.ty, abstract_node)
@@ -2674,15 +2689,15 @@ impl<'a> BodyValidator<'a> {
             Ty::Box(payload) => {
                 self.body_scalar_ok(payload) && self.placement.box_payload_ok(payload)
             }
-            Ty::Array(element, len) => {
-                len > 0 && !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+            Ty::Array(element, _) => {
+                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
             Ty::Vec(element, lanes) | Ty::Mask(element, lanes) => {
                 matches!(lanes, 2 | 4 | 8 | 16)
                     && matches!(element, Scalar::Int(_) | Scalar::Float(_))
                     && self.body_scalar_ok(element)
             }
-            Ty::StructArray(id, len) => len > 0 && self.program.structs.get(id as usize).is_some(),
+            Ty::StructArray(id, _) => self.program.structs.get(id as usize).is_some(),
             Ty::DynStructArray(id, Layout::Aos) => self.placement.dynamic_struct_array_ok(id),
             Ty::DynStructArray(_, Layout::Soa) => false,
             Ty::Slice(element) => self.body_scalar_ok(element),
@@ -3473,8 +3488,7 @@ impl<'a> BodyValidator<'a> {
                 elem,
                 pooled,
             } => {
-                !elems.is_empty()
-                    && u32::try_from(elems.len()).is_ok()
+                u32::try_from(elems.len()).is_ok()
                     && self.body_ty_ok(*elem)
                     && (!*pooled || self.pooled_array_literal_ok(expression, context))
             }
@@ -5723,8 +5737,7 @@ impl<'a> BodyValidator<'a> {
             } => {
                 let flows = self.expr_flows(elems)?;
                 let length = u32::try_from(elems.len()).ok()?;
-                if elems.is_empty()
-                    || flows.iter().any(|flow| !self.body_ty_matches(flow.ty, *elem))
+                if flows.iter().any(|flow| !self.body_ty_matches(flow.ty, *elem))
                     || !self.array_literal_element_ok(*elem)
                 {
                     return None;

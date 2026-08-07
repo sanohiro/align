@@ -1,0 +1,9 @@
+module app.users
+
+import pkg.db
+
+pub Params { id: i64 }
+pub Row { id: i64, name: str }
+
+pub fn query() -> pkg.db.query<Params, Row> =
+  pkg.db.query("SELECT :id AS id, 'name' AS name WHERE :id = :id", [])

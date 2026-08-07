@@ -13,6 +13,18 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Empty array literals require an expected element type (SETTLED 2026-08-07)
+
+**Decision:** `[]` is legal only where the surrounding expression supplies one exact element type,
+normally a `slice<T>` function parameter or binding annotation. It materializes the ordinary
+zero-length fixed array and takes the existing slice borrow; it does not allocate and does not
+introduce a polymorphic empty-collection value. An uncontextualized `[]` remains a compile error.
+This closes the missing language capability required by explicit `[]` option arguments without a
+package-specific special case.
+
+Record: `draft.md` Array and Slice, `docs/language-spec.md`, `docs/design-notes.md`,
+`docs/impl/19-hir-validation-ledger.md`
+
 ### Non-Unit functions never fall through or return without a value (SETTLED 2026-07-31)
 
 **Decision:** Unit functions alone may use bare `return` or reach an empty block tail. Every

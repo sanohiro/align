@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-05._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-07._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -13,24 +13,25 @@ recursively Move returns carry a path-selected cleanup bit; shared/exclusive
 parameters preserve caller ownership, replacement, generation invalidation,
 and whole/per-unit ABI parity; package-defined native resources have nominal
 identity, checked refs/views, producer-owned cleanup thunks, and exactly-once
-Drop; and named regions now support explicit recursive cloning plus chunked
-`RegionPlain` array construction without a hidden heap vector. No public
-`pkg.db` surface exists yet.
+Drop; named regions support explicit recursive cloning plus chunked `RegionPlain`
+array construction without a hidden heap vector; and the library-boundary
+prerequisites are complete through L7. `pkg.db` Q1/D1 now provides typed static
+Query/command descriptors, exact versioned artifacts, producer-owned ordinal
+bind/decode/metadata plans, whole/per-unit cache identity, and fail-closed fake
+driver execution. Q1 owns no native database resource. The next product wave is
+Q2, one scalar execution vertical across SQLite and PostgreSQL (D2 + D4).
 
-The remaining compiler plan uses consumer-complete capability waves rather
-than one PR per dormant acceptance cell:
+The completed prerequisite waves and current product boundary are:
 
 ```text
 C-A canonical callable closure  complete through c3
 C-B borrow/ownership closure    complete through L2e
 F-A native resources            complete through L3
 F-B region materialization      complete through L4 + L6
-
-next independent waves:
-F-C static artifacts             L5
-
-after F-A/F-B, while also waiting for F-C:
-F-D package integration          L7 + complete prerequisite gate
+F-C static artifacts             complete through L5
+F-D package integration          complete through L7
+Q1 static Query vertical         complete through D1
+next: Q2 dual-driver scalar      D2 + D4
 ```
 
 The exact cell contracts and owner matrices remain in

@@ -1,0 +1,6 @@
+module main
+
+import app.users
+import app.prune
+
+fn main() -> i32 = 0

@@ -1470,6 +1470,8 @@ sqlite.ExplainOption.QueryPlan
 sqlite.ExplainOption.Bytecode
 ```
 
+`major`, `minor`, and `patch` are `u32`.
+
 `RequireVersionAtLeast` is static, pins the descriptor to SQLite, and participates in its public
 semantic contract and artifact. `Persistent`/`Normalize` apply only to preparation.
 `BusyTimeoutNs` temporarily replaces the connection busy timeout for that execution and restores it
@@ -1597,6 +1599,8 @@ postgres.ExplainOption.Timing(bool)
 postgres.ExplainOption.Settings(bool)
 postgres.ExplainOption.Wal(bool)
 ```
+
+`name` and `canonical_type_name` are `str` literals.
 
 `ParameterType` is static, pins the descriptor to PostgreSQL, names a Params field, and participates
 in its public semantic contract and artifact. `ParameterOid` applies only to preparation.
@@ -3183,6 +3187,55 @@ Read-only/throwaway probes establish:
 The deliverable is recorded evidence in this document or a focused audit, not production raw handles.
 
 ### D1 — generated Query/command plans over a fake driver
+
+#### Q1/D1 implementation closure matrix
+
+Q1 is one executable capability. The public package declarations, compiler-produced artifact,
+generated binder/decoder/metadata thunks, and fake-driver consumer share one descriptor ABI and
+one cache identity; splitting any producer before its first consumer would publish a static value
+that cannot execute or would duplicate the same structural-contract proof.
+This capability is deliberately above the roughly 1,000 hand-written-line threshold: keeping the
+descriptor, artifact, runtime data, and first consumer together removes dormant seams and proves
+one ABI/cache boundary once, which is lower integration risk than repeating that proof across
+producer-only PRs.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public source surface | Check in `pkg.db`, `pkg.db.sqlite`, and `pkg.db.postgres` Query/command descriptor and D1 option sums with the exact generic signatures. Constructors remain complete single-expression descriptor bodies and expose no raw/native state. File constructors accept both their implicit sibling path and one explicit leading relative path through the compiler-owned constructor signature rule. | `pkg_db_q1::public_surface_whole_and_per_unit` and `pkg_db_q1::file_constructors_accept_explicit_paths_on_the_shipped_surface` |
+| typed semantic descriptor | Resolve Query Params/Row and command Params from the concrete generic return type, retain their post-compaction HIR identities, and decode only literal static options. Reject wrong descriptor kind/arity, command Row contracts, unresolved types, duplicate/conflicting options, and runtime option values before publication. | `pkg_db_q1::typed_descriptor_contract_matrix` and `pkg_db_q1::static_option_rejection_matrix` |
+| artifact formation | Build the exact versioned Query/command artifact from the resolved static input, reachable structural contracts, source identity/bytes, placeholder occurrences, SQLite identity wire SQL, PostgreSQL `$n` rewrite/spans, binding ordinals/retention, declared metadata plan, ABI versions, and checked-metadata snapshots. A current semantic snapshot becomes `DatabaseChecked`; stale Optional evidence remains Declared and stale/missing Required evidence fails. Validate before publishing bytes. | `pkg_db_q1::artifact_semantics_and_checked_in_goldens`, the checked Query/command metadata promotion tests, plus independent Query/command byte and digest goldens |
+| generated runtime data | Resolve canonical type names once during artifact formation into closed value tags, nullability, and declaration-order field ordinals. Emit producer-owned immutable `ALIGNQST`/`ALIGNCST` descriptor data containing the artifact digest, per-driver wire/bind plans, and direct binder thunk plan; Query additionally carries one ordinal decoder thunk plan and the Declared QueryMeta materialization plan. No runtime field-name lookup, source/artifact I/O, map, dictionary, reflection, or consumer-side generic instantiation is permitted. | `pkg_db_q1::generated_runtime_data_is_producer_owned` inspects the exact MIR/LLVM constants and direct ordinal plans; `pkg_db_q1::fake_driver_query_and_command_end_to_end` invokes the generated bind/decode/meta plans in whole and separate-compilation modes |
+| fake-driver execution | Execute one inline Query, one sibling-file Query, one inline command, and one sibling-file command through the same generated binder; decode every admitted first-release scalar/nullable Query row shape, count one execution, distinguish Query from command, and report bind/decode/cardinality errors without a database. | `pkg_db_q1::fake_driver_query_and_command_end_to_end` in whole-program and per-unit modes, plus `pkg_db_q1::scalar_bind_and_decode_shape_matrix` |
+| interface, implementation, and cache identity | Public Params/Row/restriction/static-option edits change the interface. SQL, rewrite, checked metadata, binder/decoder ABI, and private descriptor edits change producer implementation/artifact identity without recompiling an unchanged public consumer. Query and command use the same statement-artifact identity rules; command omits exactly Row/decoder/QueryMeta. | `pkg_db_q1::interface_impl_cache_invalidation_matrix` |
+| fail-closed and Q1 ownership boundary | Reject malformed SQL UTF-8/NUL/statement shape, malformed placeholders, unmatched Params fields, unsupported field types, overflowed offsets/counts, malformed checked metadata, and every artifact corruption before codegen or fake execution. Q1 borrows fake inputs and returns owned fake observations; it owns no native resource yet. Generated plans record each future native driver's exact `BindValue`/`BindCopy` retention without pretending to exercise D2/D4 native cleanup. | `pkg_db_q1::malformed_static_query_matrix`, `pkg_db_q1::inline_nul_diagnostic_points_at_the_exact_source_bytes`, fake-driver invalid-plan/error cases, and the existing static-input/artifact corruption suites |
+
+#### Q1 review finding-to-fix ledger
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| checked snapshots stayed Declared | Preserve the parsed semantic record beside the unchanged L5 input snapshot, compare every artifact-bound field, and derive the exact server/prepare identities before promotion. Optional and Required now take their specified stale/missing branches. | `pkg_db_q1::checked_metadata_promotes_current_snapshots_and_obeys_policy_on_stale_data`, `pkg_db_q1::checked_command_metadata_promotes_without_query_evidence`, and the checked-metadata parser/revalidation suite |
+| explicit file paths failed ordinary arity checking | Make the compiler-owned static-constructor signature rule insert the exact leading `str` parameter only for the explicit file form; do not introduce general overloads or duplicate package declarations. | `pkg_db_q1::file_constructors_accept_explicit_paths_on_the_shipped_surface` and `align_sema::static_file_descriptor_preserves_explicit_decoded_path` |
+| PostgreSQL escape strings exposed false placeholders | Treat token-boundary `E'...'`/`e'...'` as escape-aware opaque SQL tokens, including backslash-escaped and doubled quotes. | `static_artifacts::tests::scanner_keeps_postgres_escape_strings_opaque` |
+| every `WITH` statement was classified Select | Track top-level CTE bodies and classify the first statement keyword after the final CTE, including recursive and multiple-CTE forms. | `static_artifacts::tests::scanner_classifies_the_main_statement_after_ctes` |
+
+The author-side matrix-to-diff pass must point every runtime descriptor field to its artifact
+producer and fake-driver consumer, and every accepted Params/Row field class to both a direct
+binder/decoder owner and a malformed twin. Q1 reopens this matrix if any descriptor can execute
+without validated artifact identity or if generated code falls back to reflection/name lookup.
+
+The D1 private runtime-plan prefix is exact and is not the separately distributed artifact codec.
+Both records start with an eight-byte magic (`ALIGNQST` or `ALIGNCST`), `format_version: u32 = 1`,
+the descriptor ID as a `u32`-length UTF-8 string, the artifact `Hash128` (`lo`, then `hi`), the
+static-option count and records, and the driver count. Each static option stores owner `u8`, value
+tag `u8`, and its exact payload: Check policy `u8`, three SQLite version `u32` values, or two
+`u32`-length PostgreSQL UTF-8 strings. Each driver is ordered SQLite then PostgreSQL and stores its `u8` tag, `u32`-length
+wire bytes, and dense bind fields. A bind field stores Params ordinal `u32`, protocol ordinal `u32`,
+retention `u8`, then shape `(kind: u8, nullable: u8)`.
+Query then stores dense decoder fields with the same shape, followed by statement-class `u8`, dense
+declared parameter rows, and dense declared column rows; command ends after its driver records.
+Every text/byte field and sequence is `u32` bounded before descriptor MIR is installed. Artifact
+validation and runtime-plan formation complete before codegen, so emitted constants are trusted
+producer data; the fake consumer still rejects non-dense ordinals and zero protocol ordinals.
 
 Before a native database:
 

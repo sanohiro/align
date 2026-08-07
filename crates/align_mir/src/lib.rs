@@ -2245,6 +2245,24 @@ fn canonicalize_tagged_types(program: &mut Program) {
     program.tagged_types = canonical;
 }
 
+/// Rebuild the two id-indexed type tables after a checked post-lowering MIR rewrite changes the
+/// reachable type graph. Normal HIR lowering already performs this step; driver-owned generated
+/// bodies must repeat it before hashing or codegen because replacing a body may remove the final
+/// reference to an interned function or nested tagged type.
+pub fn recanonicalize_type_tables(program: &mut Program) -> Result<(), &'static str> {
+    canonical_graph::canonicalize_function_types(program).map_err(|error| match error {
+        canonical_graph::CanonicalGraphError::EmbeddedNul => "embedded NUL",
+        canonical_graph::CanonicalGraphError::InvalidWidth => "invalid scalar width",
+        canonical_graph::CanonicalGraphError::InvalidCount => "invalid sequence count",
+        canonical_graph::CanonicalGraphError::MissingReference => "missing type reference",
+        canonical_graph::CanonicalGraphError::DuplicateMember => "duplicate member",
+        canonical_graph::CanonicalGraphError::InvalidSummary => "invalid return summary",
+        canonical_graph::CanonicalGraphError::InvalidGraph => "invalid type graph",
+    })?;
+    canonicalize_tagged_types(program);
+    Ok(())
+}
+
 /// Whether `program.tagged_types` is the unique compact canonical table produced by MIR lowering.
 ///
 /// Codegen accepts hand-built and cache-derived MIR as well as normal lowering output. It uses this
