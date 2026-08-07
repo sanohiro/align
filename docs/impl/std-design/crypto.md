@@ -58,9 +58,11 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 ```
 
 **Shipped surface details (implementation record, 2026-07-07, PRs #384–#388):**
-`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a **builtin struct**
-(reserved name, injected like the builtin `Error`; ordinary struct-literal construction and
-typechecking) — m_cost in KiB, t_cost iterations, parallelism lanes, len output bytes; validated
+`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a **builtin struct**.
+Its bare alias is available unless a non-entry module declares a local `argon2_params`; the exact
+builtin spelling there is `crypto.argon2_params`, which requires and counts as a use of
+`import std.crypto`. Ordinary struct-literal construction and typechecking apply. m_cost is in KiB,
+t_cost is iterations, parallelism is lanes, and len is output bytes; validated
 before the engine (`parallelism 1..=2^24-1`, `t_cost 1..=u32max`, `m_cost 8*parallelism..=4 GiB-in-KiB` (= 4,194,304 KiB),
 `len 4..=1 GiB` → `Error.Invalid`; engine `threads` pinned to 1, `OSSL_set_max_threads` deferred).
 AEAD: both ciphers take 32-byte keys and 12-byte nonces (validated as public params →

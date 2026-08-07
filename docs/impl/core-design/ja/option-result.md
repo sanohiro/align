@@ -22,9 +22,14 @@ r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes thro
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
 
-Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; user redeclaration of `Error` rejected
-error(c)                            // sugar: constructs the Code-carrying Error for Err(error(c))
+Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; explicit nameはcore.Error
+error(c)                            // sugar: 常にcore.Error.Code(c)を構築する
 ```
+
+`Error` は常時利用可能な language-syntactic core 型 `core.Error` の unqualified alias である。
+non-entry module は独自の `Error` を宣言でき、その場合 bare lookup は local type を選ぶが、
+`core.Error` と `error(c)` は builtin identity を保持する。unmangled entry module の collision は
+引き続き reject する。`import core` は存在せず、必要でもない。
 
 ## Type & ownership classification
 

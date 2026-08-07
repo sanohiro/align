@@ -15,16 +15,21 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ### Builtin type aliases do not monopolize module namespaces (SETTLED 2026-08-07)
 
-**Decision:** a non-entry module may declare a local type whose bare name is also a compiler-
-provided alias. Bare type lookup checks the current module first; the builtin remains explicitly
-nameable by its provider-qualified path, beginning with `core.Error`. Importers use the ordinary
+**Decision:** a non-entry module may declare a local type whose bare name is also one of the closed
+compiler-provided nominal aliases. Bare type lookup checks the current module first; builtin
+fallback and explicit spellings are exactly `Error` / `core.Error`, `argon2_params` /
+`crypto.argon2_params`, and `regex_match` / `regex.regex_match`. `core.Error` is always-in-scope
+language-syntactic core. The other explicit spellings require `import std.crypto` or
+`import std.regex` and count as uses of those imports. `error(c)` is bound directly to
+`core.Error.Code(c)`, independent of local declarations. Importers use the ordinary
 module-qualified local type (`pkg.db.Error`). An entry-module declaration whose unmangled canonical
-name collides with a builtin remains a compile error. This follows the existing per-module type
+name collides with a table member remains a compile error. This follows the existing per-module type
 identity instead of adding a `pkg.db` exception or renaming its public structured error sum.
 
-Owner closure crosses same-module bare construction/signatures, qualified importer construction and
-matching, explicit builtin use from the colliding module, unchanged builtin fallback in a module
-without a local declaration, whole/per-unit identity, and entry-collision rejection.
+Owner closure is parameterized across all three aliases and crosses same-module bare
+construction/signatures, qualified importer construction and matching, explicit builtin use with
+the exact import rule, unchanged builtin fallback in a module without a local declaration,
+`error(c)` under a local `Error`, whole/per-unit identity, and entry-collision rejection.
 
 Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/pkg-design/db.md`
@@ -3661,7 +3666,7 @@ So this entry **waits on sum types** (4a) and then defines `Error` as a concrete
 
 **4b-1 DONE (the foundation): errors can be user-defined sum types.** `Scalar::Enum(u32)` was added (a sum type is a Copy composite payload, like `Scalar::Struct`), so an enum is now a first-class `Option`/`Result` payload — most importantly **`Result<T, MyError>`** with a user error enum: construct `Err(MyError.Variant(…))`, `match` the `Result` then the error enum, and `?`-propagate it (same `E`). `option_struct_type`/`result_struct_type` (and `scalar_type`/`abi_type`) thread the enum-type table so the aggregate can hold an enum field.
 
-**4b-2 DONE: the canonical `Error` is a builtin sum type.** `Error { NotFound, Invalid, Denied, Code(i32) }` — a real enum registered as a reserved type name (resolved via `enum_ids` like any sum type). `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` is sugar for `Error.Code(c)`); `match` discriminates the categories; `?` propagates. Every fallible builtin (`fs.read_file`, `json.decode`, `io`, `task_group`) now returns `Result<_, Error>`, wrapping its runtime i32 status as `Error.Code(code)`. The **`main` exit mapping**: `Code(c)` → exit `clamp(c)`, a category → `tag + 1` (a small distinct nonzero code). The **task_group** fallible path was reworked to carry the full `Error` across threads: each task gets an `err_slot`, the trampoline writes its `Err` value there and returns 0/1, `tg_wait` returns the lowest-index errored `err_slot` (null if none), `wait()?` builds the `Result` from it. (`Ty::ErrCode`/`Scalar::ErrCode` are now vestigial — only an i32-status alias in the builtin lowerings; removable in a follow-up.) **4b-3 DONE** the explicit **`?` `E → E'` conversion** via `result.map_err(f)` (no implicit coercion). **4b-4 DONE (structured errors) / `.with_context` not adopted** — position-bearing structured errors already work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read); free-form `.with_context` string-chaining was reviewed and dropped as off-philosophy (structured sum-type payloads are the context mechanism — see the bullet above). **So the Error type (4b) is complete** for the planned surface: `Error` is a builtin sum type, user error enums work, `map_err` converts, structured payloads carry context. L1b-a/b add direct recursively Move payloads, including owned strings and multiple owned fields; L1b-c adds nested tagged payload representation.
+**4b-2 DONE: the canonical `Error` is a builtin sum type.** `Error { NotFound, Invalid, Denied, Code(i32) }` — a real enum registered as a compiler-provided nominal alias (resolved via `enum_ids` like any sum type). Its original global-reservation rule was superseded by the 2026-08-07 namespace decision above: non-entry modules may reuse the local name and spell the builtin `core.Error`. `Error.NotFound` / `Error.Code(c)` construct it, while `error(c)` is bound directly to `core.Error.Code(c)`; `match` discriminates the categories; `?` propagates. Every fallible builtin (`fs.read_file`, `json.decode`, `io`, `task_group`) now returns `Result<_, Error>`, wrapping its runtime i32 status as `Error.Code(code)`. The **`main` exit mapping**: `Code(c)` → exit `clamp(c)`, a category → `tag + 1` (a small distinct nonzero code). The **task_group** fallible path was reworked to carry the full `Error` across threads: each task gets an `err_slot`, the trampoline writes its `Err` value there and returns 0/1, `tg_wait` returns the lowest-index errored `err_slot` (null if none), `wait()?` builds the `Result` from it. (`Ty::ErrCode`/`Scalar::ErrCode` are now vestigial — only an i32-status alias in the builtin lowerings; removable in a follow-up.) **4b-3 DONE** the explicit **`?` `E → E'` conversion** via `result.map_err(f)` (no implicit coercion). **4b-4 DONE (structured errors) / `.with_context` not adopted** — position-bearing structured errors already work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read); free-form `.with_context` string-chaining was reviewed and dropped as off-philosophy (structured sum-type payloads are the context mechanism — see the bullet above). **So the Error type (4b) is complete** for the planned surface: `Error` is a builtin sum type, user error enums work, `map_err` converts, structured payloads carry context. L1b-a/b add direct recursively Move payloads, including owned strings and multiple owned fields; L1b-c adds nested tagged payload representation.
 
 **Exit-code residual — SETTLED 2026-07-02: `main`'s `E` is restricted to the builtin `Error`.**
 The `main` wrapper's exit-code lowering (`align_codegen_llvm/src/lib.rs`, the `align_main` wrapper)

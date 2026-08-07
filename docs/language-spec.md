@@ -319,7 +319,8 @@ Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // canonical builtin e
 ```
 
 No exceptions. `E` is any sum type (a domain may use its own error enum). `Error` is the builtin
-error type — construct `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar), `match` it, and at
+error type — construct `Error.NotFound` / `Error.Code(c)`, use `error(c)` as syntax sugar for the
+explicit builtin `core.Error.Code(c)`, `match` it, and at
 `main` it maps to the process exit code. Fallible builtins (`fs.read_file`, `json.decode`, …)
 return `Result<T, Error>`. A fallible `main` (`fn main() -> Result<(), E>`) restricts `E` to the
 builtin `Error` (the only type with a defined exit-code mapping; a user error enum there is a
@@ -328,11 +329,15 @@ with `result.map_err(f)`). Error **context is structured, not free-form**: a var
 relevant data (a position, a code), e.g. `ParseError { BadToken(Pos), Eof }` — there is no
 `.with_context("…")` string-chaining.
 
-The builtin's explicit name is `core.Error`; `Error` is its unqualified alias. A non-entry module
-may declare a local `Error`, in which case bare `Error` resolves locally, `core.Error` still names
-the builtin, and importers use the ordinary qualified name such as `pkg.db.Error`. The entry module
-cannot declare a type whose unmangled canonical name collides with a builtin. Other compiler-
-provided bare type aliases follow the same local-first/provider-qualified rule.
+The compiler-provided nominal aliases are exactly `Error` → `core.Error`, `argon2_params` →
+`crypto.argon2_params`, and `regex_match` → `regex.regex_match`. `core.Error` is language-syntactic
+core and is always available without an import. The other explicit spellings require respectively
+`import std.crypto` and `import std.regex`, and their type references count as uses for the
+unused-import lint. A non-entry module may declare a local type with any of those bare names: bare
+lookup resolves locally, the explicit spelling still names the builtin, and importers use the
+ordinary qualified local name such as `pkg.db.Error`. Without a same-module declaration the bare
+alias retains its builtin meaning. The entry module cannot declare a type whose unmangled canonical
+name collides with one of these builtins.
 
 The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
 `Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
@@ -680,10 +685,11 @@ items — a private same-module fn/type/const in a generic `pub` body is rejecte
 cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
 qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
 
-Bare type lookup first checks a declaration in the current module, then a compiler-provided alias.
-Thus a non-entry module may reuse a builtin's bare type name without taking that name away from any
-other module. The builtin remains available through its provider-qualified spelling
-(`core.Error`), while the entry module still rejects an unmangled canonical collision.
+Bare type lookup first checks a declaration in the current module, then the closed compiler-provided
+alias table defined under Error handling. Thus a non-entry module may reuse a builtin's bare type
+name without taking that name away from any other module. Provider-qualified builtin lookup follows
+that table's exact import rule, while the entry module still rejects an unmangled canonical
+collision.
 
 Hermetic input discovery includes reachable `.align` units and exact static files explicitly
 registered by compiler-known constructors. Such a constructor cannot scan directories, run code,

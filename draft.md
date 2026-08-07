@@ -578,20 +578,31 @@ variable; needing the error *is* the signal to `match`. So each intent has exact
 Error { NotFound, Invalid, Denied, Timeout, Code(i32) }
 ```
 
-Construct it with `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar for `Error.Code(c)`),
+Construct it with `Error.NotFound` / `Error.Code(c)`. `error(c)` is syntax sugar for
+`core.Error.Code(c)` and therefore always constructs the builtin even in a module that declares a
+local `Error`.
 discriminate it with `match`, and at `main` it becomes the process exit code (`Code(c)` → `c`, a
 category → a small distinct code). `Timeout` is the category for a run/transport deadline (a
 `std.process` `run` that overran its `timeout_ns`, or — once shipped — a `std.http`/`std.net` I/O
 timeout); it is produced only by an explicit timeout site, never inferred from an errno. The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
 
-`Error` is the unqualified alias for `core.Error`. A non-entry module may declare its own local
-type named `Error`; inside that module the bare name denotes the local type, while `core.Error`
-continues to name the builtin explicitly. Importers name the local type by its ordinary qualified
-module path, for example `pkg.db.Error`. The entry module cannot declare `Error`, because its
-unmangled type namespace is also the builtin namespace. Other compiler-provided bare type aliases
-follow the same rule: a same-module declaration wins locally and the provider-qualified spelling
-remains available. This is type namespacing, not value shadowing.
+The compiler-provided nominal aliases form this closed table:
+
+| Bare alias | Explicit builtin spelling | Availability of the explicit spelling |
+|---|---|---|
+| `Error` | `core.Error` | language-syntactic core; always in scope and requires no import |
+| `argon2_params` | `crypto.argon2_params` | requires `import std.crypto` |
+| `regex_match` | `regex.regex_match` | requires `import std.regex` |
+
+A non-entry module may declare a local type with any bare alias in this table. Inside that module
+the bare name denotes the local type; in a module without such a declaration the bare alias still
+denotes the builtin. The explicit spelling always denotes the builtin. A `std` explicit spelling
+counts as a use of its required import for the unused-import lint; `core.Error` is part of the
+always-in-scope syntactic core, and `import core` is neither required nor valid. Importers name the
+local type by its ordinary qualified module path, for example `pkg.db.Error`. The entry module
+cannot declare any table member because its unmangled type namespace is also the builtin namespace.
+This is type namespacing, not value shadowing.
 
 A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
 exit-code mapping above is defined only for it. A user-defined error enum at that position is a

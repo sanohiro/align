@@ -849,8 +849,9 @@ converge on this:
 - **Namespaces must remain real at package boundaries.** A compiler-provided bare type alias cannot
   reserve the same word across every vendored module: that would make ordinary qualified APIs such
   as `pkg.db.Error` impossible even though user types already have canonical module identities.
-  Non-entry modules therefore resolve a same-module declaration before a builtin alias, while the
-  builtin keeps an explicit provider-qualified spelling such as `core.Error`. The entry namespace
+  Non-entry modules therefore resolve a same-module declaration before a builtin alias. The closed
+  explicit table is `core.Error` (always in scope), `crypto.argon2_params` (`std.crypto` import), and
+  `regex.regex_match` (`std.regex` import). The entry namespace
   remains unmangled and rejects a true canonical collision. This preserves one lookup rule and does
   not weaken the no-shadowing rule for values.
 

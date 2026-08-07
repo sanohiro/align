@@ -275,7 +275,8 @@ every item below has since completed as recorded in the per-milestone sections, 
      placeholder. **4b-1 DONE (foundation)** — errors can be
      **user-defined sum types**: `Scalar::Enum(u32)` makes an enum a first-class `Option`/`Result`
      payload, so `Result<T, MyError>` works end to end. **4b-2 DONE** — the canonical **`Error` is a
-     builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a reserved type name):
+     builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a compiler-provided bare alias;
+     non-entry modules may reuse the local name and spell the builtin `core.Error`):
      `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` = sugar), `match` discriminates,
      `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the

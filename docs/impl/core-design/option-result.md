@@ -25,9 +25,14 @@ r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes thro
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
 
-Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; user redeclaration of `Error` rejected
-error(c)                            // sugar: constructs the Code-carrying Error for Err(error(c))
+Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; explicit name core.Error
+error(c)                            // sugar: always constructs core.Error.Code(c)
 ```
+
+`Error` is the unqualified alias of the always-in-scope language-syntactic-core type
+`core.Error`. A non-entry module may declare its own `Error`; bare lookup then selects that local
+type while `core.Error` and `error(c)` retain builtin identity. The unmangled entry module still
+rejects the collision. No `import core` exists or is required.
 
 ## Type & ownership classification
 

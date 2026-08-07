@@ -45,7 +45,10 @@ Drop 時に `align_rt_regex_free` で解放する。各メソッドはハンド�
 メソッド呼び出しの前に先へ束縛しておく。
 
 `regex_match` は常に登録される組み込み Copy 構造体で、2 個の `i64` フィールドを持つ。
-範囲は半開区間で、UTF-8 のバイト単位で数える。両端は必ず文字境界なので、
+non-entry module が local `regex_match` を宣言しない限り bare alias を利用できる。collision が
+ある module で builtin を明示する正確な spelling は `regex.regex_match` であり、
+`import std.regex` が必要で、その import の use として数える。範囲は半開区間で、UTF-8 の
+バイト単位で数える。両端は必ず文字境界なので、
 `text[m.start..m.end]` は有効な `str` スライスになる。`str` そのものではなくオフセットを
 返すことで、結果を Copy/Static のまま保ち、regex と入力の双方へのリージョン依存を避ける。
 

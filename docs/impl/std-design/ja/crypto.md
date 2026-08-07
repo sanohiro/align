@@ -31,7 +31,7 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 ```
 
 **実装された表層の詳細（実装記録、2026-07-07、PR #384–#388）:**
-`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` は **組み込み（builtin）構造体** である（予約名であり、builtin の `Error` と同様に注入される。構造体リテラルによる通常の構築と型検査が使える） — m_cost は KiB、t_cost は反復回数、parallelism はレーン数、len は出力バイト数。エンジンに渡す前に検証する（`parallelism 1..=2^24-1`、`t_cost 1..=u32max`、`m_cost 8*parallelism..=4 GiB-in-KiB`(= 4,194,304 KiB)、`len 4..=1 GiB` → 違反時は `Error.Invalid`。エンジンの `threads` は 1 に固定し、`OSSL_set_max_threads` の利用は見送り）。
+`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` は **組み込み（builtin）構造体** である。non-entry module が local `argon2_params` を宣言しない限り bare alias を利用できる。collision がある module で builtin を明示する正確な spelling は `crypto.argon2_params` であり、`import std.crypto` が必要で、その import の use として数える。通常の構造体リテラルによる構築と型検査を使う。m_cost は KiB、t_cost は反復回数、parallelism はレーン数、len は出力バイト数。エンジンに渡す前に検証する（`parallelism 1..=2^24-1`、`t_cost 1..=u32max`、`m_cost 8*parallelism..=4 GiB-in-KiB`(= 4,194,304 KiB)、`len 4..=1 GiB` → 違反時は `Error.Invalid`。エンジンの `threads` は 1 に固定し、`OSSL_set_max_threads` の利用は見送り）。
 AEAD: どちらの暗号も 32 バイトの鍵と 12 バイトの nonce を取る（公開パラメータとして検証し、違反時は `Error.Invalid`）。seal の出力は **結合された** `ciphertext || 16 バイトの tag` を単一のバッファに収めたものである。open は `len >= 16` を要求する。hkdf の `len` は `1..=8160` に制限される（RFC 5869 の L ≤ 255·HashLen）。ダイジェスト / タグの戻り値は、アルゴリズムで固定された長さを持つ動的な `array<u8>` である（固定長の `array<u8; N>` は現状のランタイム戻り値 ABI では表現できないため）。FFI 演算はすべて impure。
 `constant_time_equal` は pure であり、その分岐なしの性質は **コンパイル済みの機械語に照らして検証済み** である（release + debug の逆アセンブル結果において、内容に依存する分岐も、memcmp のイディオムも存在しない）。
 
