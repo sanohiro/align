@@ -970,7 +970,7 @@ QueryStatic
   producer-owned QueryMetaPlan and per-driver checked-evidence pointers
   generated bind thunk
   generated decode thunk
-  generated QueryMeta materialization thunk
+  D12-generated QueryMeta materialization thunk
   per-driver checked-metadata state/fingerprint
 ```
 
@@ -994,9 +994,10 @@ per-row field-name lookup, reflection, boxing, or map allocation.
 The QueryMeta thunk is generated code, not reflection. Given the selected driver, `MetaDetail`, and
 explicit output region, it materializes exactly the Summary/Parameter/Column rows from the
 producer-owned plan and checked-evidence tables. It never reads source files, `.align-db`, interface
-summaries, decoder code, or a database at runtime. D1 emits and tests the table/thunk skeleton for
-Declared Queries; D3/D5 populate checked evidence; D12 exposes the ordinary package call. Commands
-carry no QueryMeta plan or thunk.
+summaries, decoder code, or a database at runtime. D1 emits and tests the producer-owned plan for
+Declared Queries; D3/D5 populate checked evidence; D12 introduces the exact thunk ABI, generated
+code, descriptor-header version, and ordinary package call together with that thunk's first native
+consumer. Commands carry no QueryMeta plan or thunk.
 
 The producer's descriptor function returns the corresponding static pointer. When the item is
 `pub`, its interface exports that descriptor contract. Generated thunks stay in the producer object
@@ -4210,7 +4211,7 @@ Scope:
 - versioned Query/command artifacts and interface summaries;
 - generated `QueryStatic`/`CommandStatic` data skeletons, including per-driver bind plans and checked
   state.
-- structural Params/Row contracts/fingerprints, QueryMeta plan/thunk data, plus binder/decoder ABI
+- structural Params/Row contracts/fingerprints and QueryMeta plan data, plus binder/decoder ABI
   versions in artifact bytes,
   reproducibility checks, and cache keys.
 
@@ -4241,8 +4242,9 @@ Acceptance:
   map; no fake filesystem path enters identity or diagnostics;
 - Query and command both retain source/wire/occurrence/bind/checked/cache identity; command omits
   only Row/result/decode, and command bind never uses reflection;
-- a separately compiled Query's Declared and checked QueryMeta rows come only from its static
-  plan/materialization thunk and remain available without source/interface/artifact file I/O;
+- D1 keeps a separately compiled Query's Declared QueryMeta plan available without
+  source/interface/artifact file I/O; D12 owns the corresponding checked-plan materializer and
+  cross-unit row test;
 - CheckedRequired validates every permitted driver, while CheckedOptional preserves an explicit
   mixed per-driver state;
 - artifact bytes are reproducible across checkout roots and process runs.

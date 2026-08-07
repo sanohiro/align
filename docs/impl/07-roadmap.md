@@ -3655,7 +3655,7 @@ the exact engine/version origin and result-nullability information actually avai
 `NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database,
 including the exact top-level/nested codec, checked-in Query/command byte+digest goldens,
-structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan/thunk, and
+structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan, and
 binder/decoder ABI versions. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
 connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
@@ -3682,7 +3682,9 @@ Summary→Parameter→Column group order, canonical duplicate-constraint `key_or
 same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
 multi-invalid error precedence. The D12 gate compares exact signature notation with the owning API
 table, syntax-checks positional examples, and requires separately compiled Query metadata to come
-from the producer-owned plan/thunk without runtime artifact I/O. D11 and D12 are part
+from the producer-owned plan through the D12-owned exact materializer thunk without runtime artifact
+I/O. D12 introduces that thunk ABI/code and its descriptor-header version with this first consumer;
+D1 does not publish a dormant call edge. D11 and D12 are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database
