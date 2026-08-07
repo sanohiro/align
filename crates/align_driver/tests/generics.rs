@@ -2,8 +2,8 @@
 //! `fn f<T>(...)` is monomorphized per distinct concrete instantiation (`id$i32`, `id$i64`, …):
 //! type arguments are inferred (no turbofish), `Ty::Param` is substituted before the flow analyses
 //! and MIR run, so move/drop and codegen only ever see concrete types. A type parameter is opaque
-//! (operations on it — arithmetic, fields — are rejected; the `Num`/`Ord`/`Eq` constraint model is
-//! a later slice). Uninstantiated generics are not type-checked (like a C++ template).
+//! except for the closed builtin bounds; uninstantiated templates are structurally checked and
+//! concrete monomorphs are checked again before publication.
 
 
 mod common;
@@ -105,10 +105,93 @@ fn uninferable_type_param_rejected() {
 }
 
 #[test]
-fn generic_array_param_rejected() {
-    // A type parameter may only appear in a bare position (skeleton cut): `array<T>` is rejected.
-    let src = "fn f<T>(xs: array<T>) -> i32 = 0\nfn main() -> i32 = 0\n";
-    assert!(check_errs("gen-arrayparam", src));
+fn generic_owned_array_parameter_and_return() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn value(n: i32) -> i32 = n\nfn keep<T>(xs: array<T>) -> array<T> = xs\nfn main() -> i32 {\n  xs := [value(40), value(2)].to_array()\n  ys := keep(xs)\n  return ys[0] + ys[1]\n}\n";
+    let out = build_and_run("gen-arrayparam", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_fixed_array_rejects_copying_a_move_struct_value() {
+    let src = "Boxed { value: string }\nHolder<T> { value: T }\nfn rows<T>(holder: Holder<T>) -> array<T> = [holder.value].to_array()\nfn main() -> i32 { holder := Holder { value: Boxed { value: \"owned\".clone() } }; rows(holder); return 0 }\n";
+    assert!(check_errs("gen-fixed-move-struct", src));
+}
+
+#[test]
+fn generic_slice_parameter_and_return() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn value(n: i32) -> i32 = n\nfn keep<T>(xs: slice<T>) -> slice<T> = xs\nfn main() -> i32 {\n  xs := [value(40), value(2)]\n  ys := keep(xs[..])\n  return ys[0] + ys[1]\n}\n";
+    let out = build_and_run("gen-sliceparam", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_function_value_slice_preserves_collection_scalar_semantics() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn add1(n: i64) -> i64 = n + 1\nfn keep<T>(xs: slice<T>) -> slice<T> = xs\nfn main() -> i32 {\n  callbacks := [add1]\n  kept := keep(callbacks[..])\n  return kept.len() as i32 + 41\n}\n";
+    let out = build_and_run("gen-fn-slice", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_owned_array_preserves_chunk_array_representation() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn concrete(xs: array<slice<i64>>) -> array<slice<i64>> = xs\nfn keep<T>(xs: array<T>) -> array<T> = xs\nfn main() -> i32 {\n  values := [20, 1, 10, 11]\n  chunks := keep(concrete(values.chunks(2)))\n  return (chunks[0].sum() + chunks[1].sum()) as i32\n}\n";
+    let out = build_and_run("gen-chunk-array", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_collection_substitution_rejects_single_owner_handles() {
+    let src = "import std.fs\nfn collect<T>(value: T) -> array<T> = [value].to_array()\npub fn main(args: array<str>) -> Result<(), Error> {\n  file := fs.open_rw(args[0])?\n  collect(file)\n  return Ok(())\n}\n";
+    assert!(check_errs("gen-file-array", src));
+}
+
+#[test]
+fn generic_collection_substitution_rejects_overaligned_struct_elements() {
+    let src = "align(32) Row { value: i64 }\nfn collect<T>(value: T) -> array<T> = [value].to_array()\nfn main() -> i32 {\n  collect(Row { value: 42 })\n  return 0\n}\n";
+    assert!(check_errs("gen-overaligned-array", src));
+}
+
+#[test]
+fn region_plain_bound_builds_a_generic_region_array() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Row { id: i32, name: str }\nfn one<T: RegionPlain>(out: region, value: T) -> array<T> {\n  mut b: array_builder<T> := array_builder(out)\n  b.push(value)\n  return b.build()\n}\nfn all<T: RegionPlain>(out: region, value: T) -> array<T> = one(out, value)\nfn main() -> i32 {\n  arena out {\n    rows := all(out, Row { id: 42, name: \"ok\" })\n    return rows[0].id\n  }\n}\n";
+    let out = build_and_run("gen-region-plain", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn region_plain_bound_rejects_owned_heap_fields() {
+    let src = "Owned { value: string }\nfn one<T: RegionPlain>(out: region, value: T) -> array<T> {\n  mut b: array_builder<T> := array_builder(out)\n  b.push(value)\n  return b.build()\n}\nfn main() -> i32 {\n  arena out {\n    rows := one(out, Owned { value: \"x\".clone() })\n  }\n  return 0\n}\n";
+    assert!(check_errs("gen-region-plain-owned", src));
+}
+
+#[test]
+fn region_plain_builder_remaps_a_concrete_generic_struct_element() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Wrap<T> { value: T }\nfn keep<T>(value: Wrap<T>) -> Wrap<T> = value\nfn one<T: RegionPlain>(out: region, value: T) -> array<T> {\n  mut b: array_builder<T> := array_builder(out)\n  b.push(value)\n  return b.build()\n}\nfn value(n: i32) -> i32 = n\nfn main() -> i32 { arena out { wrapped := keep(Wrap { value: value(42) }); values := one(out, wrapped); return values[0].value } }\n";
+    let out = build_and_run("gen-region-plain-remap", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn region_plain_does_not_grant_equality() {
+    let src = "fn same<T: RegionPlain>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-region-plain-eq", src));
 }
 
 #[test]
@@ -256,6 +339,15 @@ fn generic_box_param_rejected() {
     assert!(check_errs("gen-box", src));
 }
 
+#[test]
+fn deeper_abstract_nominal_applications_are_rejected() {
+    let option = "Wrap<T> { value: T }\nfn keep<T>(value: Option<Wrap<T>>) -> Option<Wrap<T>> = value\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-deep-nominal-option", option));
+
+    let nominal = "Inner<T> { value: T }\nOuter<T> { value: T }\nfn keep<T>(value: Outer<Inner<T>>) -> Outer<Inner<T>> = value\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-deep-nominal-outer", nominal));
+}
+
 // ---- 4c-5: generic structs ----
 
 #[test]
@@ -309,11 +401,19 @@ fn generic_struct_uninferable_rejected() {
 }
 
 #[test]
-fn generic_struct_with_type_param_arg_rejected_for_now() {
-    // A generic struct instantiated with a (generic function's) type parameter — `Pair<T>` inside
-    // `fn mk<T>` — needs a deferred generic-struct type; rejected cleanly for now.
-    let src = "Pair<T> { a: T, b: T }\nfn mk<T>(x: T) -> Pair<T> = Pair { a: x, b: x }\nfn main() -> i32 = 0\n";
-    assert!(check_errs("gen-struct-in-fn", src));
+fn generic_struct_with_type_param_argument() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Pair<T> { a: T, b: T }\nfn mk<T>(x: T) -> Pair<T> = Pair { a: x, b: x }\nfn value(n: i32) -> i32 = n\nfn main() -> i32 {\n  pair := mk(value(21))\n  return pair.a + pair.b\n}\n";
+    let out = build_and_run("gen-struct-in-fn", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn phantom_package_nominal_infers_from_expected_return() {
+    let src = "Query<P, R> { }\nParams { id: i64 }\nRow { value: i64 }\nfn make<P, R>() -> Query<P, R> = make()\nfn keep<P, R>(query: Query<P, R>) -> Query<P, R> = query\nfn main() -> i32 {\n  query: Query<Params, Row> := make()\n  same: Query<Params, Row> := keep(query)\n  return 0\n}\n";
+    assert!(!check_errs("gen-package-phantom", src));
 }
 
 // ---- 4c-6: generic sum types ----
@@ -338,6 +438,65 @@ fn generic_enum_struct_payload() {
     let src = "Point { x: i32, y: i32 }\nBox<T> { Has(T), Empty }\nfn main() -> i32 {\n  b := Box.Has(Point { x: 40, y: 2 })\n  return match b {\n    Has(p) => p.x + p.y\n    Empty => 0\n  }\n}\n";
     let out = build_and_run("gen-enum-box", src);
     assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_sum_application_in_generic_signature() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Wrap<T> { Has(T), Empty }\nfn keep<T>(value: Wrap<T>) -> Wrap<T> = value\nfn value(n: i32) -> i32 = n\nfn main() -> i32 {\n  wrapped := keep(Wrap.Has(value(42)))\n  return match wrapped { Has(n) => n, Empty => 0 }\n}\n";
+    let out = build_and_run("gen-sum-signature", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_resource_application_in_generic_signature() {
+    let internal = "module test.resource.internal\npub fn drop_handle(handle: raw) { unsafe { raw.free(handle) } }\n";
+    let package = "module test.resource\nimport test.resource.internal\npub resource Handle<T> = test.resource.internal.drop_handle\npub fn open() -> Handle<i32> { unsafe { return resource.from_raw(raw.alloc(8)) } }\npub fn keep<T>(owner: Handle<T>) -> Handle<T> = owner\npub fn keep_ref<T>(reference: resource_ref<Handle<T>>) -> resource_ref<Handle<T>> = reference\n";
+    let main = "module main\nimport test.resource\nfn main() -> i32 { owner := test.resource.keep(test.resource.open()); reference := test.resource.keep_ref(resource.borrow(owner)); return 42 }\n";
+    let files = [
+        ("test/resource/internal.align", internal),
+        ("test/resource.align", package),
+        ("main.align", main),
+    ];
+    let checked = assert_same_verdict("gen-resource-signature-check", &files, "main.align");
+    assert!(!checked.diags.has_errors());
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run_multi("gen-resource-signature", &files, "main.align");
+    assert_eq!(out.status.code(), Some(42));
+    assert_eq!(
+        build_per_unit_multi("gen-resource-signature-units", &files, "main.align")
+            .link_and_run()
+            .status
+            .code(),
+        Some(42)
+    );
+}
+
+#[test]
+fn nested_package_generics_match_whole_and_per_unit_compilation() {
+    let package = "module pkg.query\npub Query<P, R> { params: P, row: R }\npub fn make<P, R>(params: P, row: R) -> Query<P, R> = Query { params: params, row: row }\npub fn rows<P, R>(query: Query<P, R>) -> array<R> = [query.row].to_array()\npub fn all<R: RegionPlain>(out: region, value: R) -> array<R> {\n  mut rows: array_builder<R> := array_builder(out)\n  rows.push(value)\n  return rows.build()\n}\n";
+    let main = "module main\nimport pkg.query\nParams { id: i32 }\nRow { value: i32, name: str }\nfn main() -> i32 {\n  query := pkg.query.make(Params { id: 1 }, Row { value: 40, name: \"first\" })\n  heap_rows := pkg.query.rows(query)\n  arena out {\n    region_rows := pkg.query.all(out, Row { value: 2, name: \"second\" })\n    return heap_rows[0].value + region_rows[0].value\n  }\n}\n";
+    let files = [("pkg/query.align", package), ("main.align", main)];
+    let checked = assert_same_verdict("gen-package-units-check", &files, "main.align");
+    assert!(
+        !checked.diags.has_errors(),
+        "nested generic package signatures must survive interface reconstruction"
+    );
+    if !backend_available() {
+        return;
+    }
+    let whole = build_and_run_multi("gen-package-whole", &files, "main.align");
+    assert_eq!(whole.status.code(), Some(42));
+    let per_unit = build_per_unit_multi("gen-package-units", &files, "main.align");
+    assert!(
+        !per_unit.unit("main").mir.fns.is_empty(),
+        "abstract generic state must not empty the consumer MIR"
+    );
+    assert_eq!(per_unit.link_and_run().status.code(), Some(42));
 }
 
 #[test]

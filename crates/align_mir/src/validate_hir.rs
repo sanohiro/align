@@ -1231,6 +1231,7 @@ impl<'a> PlacementValidator<'a> {
                 !matches!(element, Scalar::Struct(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
+            Ty::DynSliceArray(element) => valid_prim(element),
             ty @ (Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
             | Ty::DynFixedArray(..)
@@ -1286,7 +1287,6 @@ impl<'a> PlacementValidator<'a> {
             | Ty::FloatVar(_)
             | Ty::Array(_, _)
             | Ty::StructArray(_, _)
-            | Ty::DynSliceArray(_)
             | Ty::DynResponseArray
             | Ty::Task(_)
             | Ty::Builder
@@ -1835,9 +1835,6 @@ impl<'a> Validator<'a> {
 
     fn root_types_are_concrete(&self) -> bool {
         let mut roots = Vec::new();
-        roots.extend((0..self.program.structs.len()).map(|id| Node::Struct(id as u32)));
-        roots.extend((0..self.program.enums.len()).map(|id| Node::Enum(id as u32)));
-        roots.extend((0..self.program.tuples.len()).map(|id| Node::Tuple(id as u32)));
 
         for function in &self.program.fns {
             for local in &function.locals {
