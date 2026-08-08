@@ -6199,6 +6199,24 @@ impl<'a> BodyValidator<'a> {
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                     }
+                    96 => {
+                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
+                        let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+                        query
+                            && args.len() == 3
+                            && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
+                            && param_modes.as_slice()
+                                == [
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::ByValue,
+                                ]
+                            && matches!(
+                                expression.ty,
+                                Ty::Option(align_sema::Scalar::Struct(id))
+                                    if self.query_meta_type_ok(id)
+                            )
+                    }
                     _ => false,
                 };
                 if !signature_ok {
@@ -9383,6 +9401,8 @@ impl<'a> BodyValidator<'a> {
                     && self.scalar_copy_ok(scalar)
             }
             Ty::Array(scalar, length) => length > 0 && self.scalar_copy_ok(scalar),
+            Ty::Option(payload) => self.scalar_copy_ok(payload),
+            Ty::Result(ok, error) => self.scalar_copy_ok(ok) && self.scalar_copy_ok(error),
             Ty::StructArray(id, length) => {
                 length > 0
                     && self.program.structs.get(id as usize).is_some()
@@ -9496,6 +9516,83 @@ impl<'a> BodyValidator<'a> {
                 let name = function.name.as_str();
                 name.starts_with("pkg.db$") || name.starts_with("pkg.db.")
             })
+    }
+
+    fn unit_enum_ty_ok(&self, ty: Ty, source_name: &str, variants: &[&str]) -> bool {
+        let Ty::Enum(id) = ty else { return false };
+        self.program.enums.get(id as usize).is_some_and(|definition| {
+            definition.source_name == source_name
+                && definition.variants.len() == variants.len()
+                && definition
+                    .variants
+                    .iter()
+                    .zip(variants)
+                    .all(|(variant, name)| variant.name == *name && variant.payload.is_empty())
+        })
+    }
+
+    /// The raw materializer return ABI is structural even though QueryMeta is source-nominal.
+    /// Recheck its complete flat shape so malformed checked HIR cannot attach the trusted source
+    /// name to an ABI-incompatible record or payload enum.
+    fn query_meta_type_ok(&self, id: u32) -> bool {
+        let Some(definition) = self.program.structs.get(id as usize) else { return false };
+        const NAMES: [&str; 24] = [
+            "query_id", "driver", "driver_restriction", "statement_class", "artifact_digest",
+            "state", "metadata_fingerprint", "source_sql_hash", "driver_wire_sql_hash",
+            "rewrite_format_version", "prepare_identity", "schema_identity", "server_identity",
+            "entry", "ordinal", "source_name", "source_alias", "logical_type", "native_type",
+            "native_type_id", "origin_schema", "origin_table", "origin_column", "nullable",
+        ];
+        if definition.source_name != "pkg.db$QueryMeta"
+            || definition.fields.len() != NAMES.len()
+            || definition
+                .fields
+                .iter()
+                .zip(NAMES)
+                .any(|(field, name)| field.name != name)
+        {
+            return false;
+        }
+        let fields = &definition.fields;
+        let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+        let option_i64 = Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true }));
+        fields[0].ty == Ty::Str
+            && self.unit_enum_ty_ok(fields[1].ty, "pkg.db$Driver", &["SQLite", "PostgreSQL"])
+            && self.unit_enum_ty_ok(
+                fields[2].ty,
+                "pkg.db$DriverRestriction",
+                &["AnySupportedDriver", "SQLiteOnly", "PostgreSQLOnly"],
+            )
+            && self.unit_enum_ty_ok(
+                fields[3].ty,
+                "pkg.db$MetaStatementClass",
+                &["Select", "Dml", "Ddl", "Native", "Unknown"],
+            )
+            && fields[4].ty == Ty::Str
+            && self.unit_enum_ty_ok(
+                fields[5].ty,
+                "pkg.db$MetaQueryState",
+                &["Declared", "DatabaseChecked"],
+            )
+            && fields[6].ty == Ty::Option(Scalar::Str)
+            && fields[7].ty == Ty::Str
+            && fields[8].ty == Ty::Str
+            && fields[9].ty == i64_ty
+            && fields[10..=12].iter().all(|field| field.ty == Ty::Option(Scalar::Str))
+            && self.unit_enum_ty_ok(
+                fields[13].ty,
+                "pkg.db$MetaQueryEntry",
+                &["Summary", "Parameter", "Column"],
+            )
+            && fields[14].ty == option_i64
+            && fields[15..=18].iter().all(|field| field.ty == Ty::Option(Scalar::Str))
+            && fields[19].ty == option_i64
+            && fields[20..=22].iter().all(|field| field.ty == Ty::Option(Scalar::Str))
+            && self.unit_enum_ty_ok(
+                fields[23].ty,
+                "pkg.db$MetaNullability",
+                &["Yes", "No", "Unknown"],
+            )
     }
 
     /// Return whether the compiler-private `$static` field belongs to a Query (`true`) or command

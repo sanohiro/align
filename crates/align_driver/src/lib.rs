@@ -25,6 +25,7 @@ pub mod db_prepare_native;
 pub mod db_migrate;
 pub mod db_migrate_native;
 pub mod explain;
+mod query_meta_codegen;
 pub mod static_artifacts;
 pub mod static_inputs;
 pub mod static_runtime;
@@ -47,9 +48,10 @@ use static_inputs::lock_metadata_publication_shared;
 pub use static_runtime::{
     FakeBoundValue, FakeCardinality, FakeDecodedField, FakeExecution, FakeExecutionError,
     FakeStatementKind, FakeValue, GeneratedBindField, GeneratedBindThunk, GeneratedCommandRuntime,
-    GeneratedDecodeField, GeneratedDecodeThunk, GeneratedDriverRuntime, GeneratedQueryMetaThunk,
-    GeneratedQueryRuntime, GeneratedStaticRuntime, GeneratedValueKind, GeneratedValueShape,
-    STATIC_RUNTIME_FORMAT_VERSION, execute_fake_static,
+    GeneratedDecodeField, GeneratedDecodeThunk, GeneratedDriverRuntime, GeneratedMetaDetail,
+    GeneratedQueryMetaEntry, GeneratedQueryMetaRow, GeneratedQueryMetaThunk, GeneratedQueryRuntime,
+    GeneratedStaticRuntime, GeneratedValueKind, GeneratedValueShape, STATIC_RUNTIME_FORMAT_VERSION,
+    execute_fake_static, generated_query_meta_rows,
 };
 // Keep the driver selector types alongside the resolver so callers do not need
 // to depend on the interface crate just to construct a static input request.
@@ -364,6 +366,14 @@ fn install_static_descriptor_data(
         let static_name = program_call(&format!("{symbol}$static_validate_v1"))?;
         let row_name = program_call(&format!("{symbol}$row_validate_v1"))?;
         let decode_name = program_call(&format!("{symbol}$decode_v1"))?;
+        let query_meta_name = if descriptor.consumer == StaticDescriptorConsumer::Query {
+            let (name, function) =
+                query_meta_codegen::generate_query_meta_thunk(mir, &symbol, artifact)?;
+            generated_functions.push(function);
+            Some(name)
+        } else {
+            None
+        };
 
         let mut binder_blocks = Vec::new();
         for (index, field) in emitted_binder_fields.iter().enumerate() {
@@ -584,8 +594,8 @@ fn install_static_descriptor_data(
             exportable: false,
         });
 
-        let mut header = vec![0u8; 96];
-        header[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let mut header = vec![0u8; 104];
+        header[0..4].copy_from_slice(&2u32.to_le_bytes());
         header[4] = match descriptor.consumer {
             StaticDescriptorConsumer::Query => 0,
             StaticDescriptorConsumer::Command => 1,
@@ -655,7 +665,6 @@ fn install_static_descriptor_data(
                 },
             });
         }
-
         if descriptor.consumer == StaticDescriptorConsumer::Query {
             let GeneratedStaticRuntime::Query(runtime) = &artifact.runtime else {
                 return Err("query descriptor has command runtime data".to_string());
@@ -821,6 +830,12 @@ fn install_static_descriptor_data(
             relocations.push(StaticDataRelocation {
                 offset: 88,
                 target: StaticDataTarget::Function(decode_name),
+            });
+        }
+        if let Some(query_meta_name) = query_meta_name {
+            relocations.push(StaticDataRelocation {
+                offset: 96,
+                target: StaticDataTarget::Function(query_meta_name),
             });
         }
 

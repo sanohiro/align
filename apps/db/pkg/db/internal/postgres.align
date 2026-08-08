@@ -307,9 +307,10 @@ pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
     validate_static := pkg.db.internal.descriptor.static_validator(statement)
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
-    base := version == 1 && kind == 1 && reserved == 0 && !q1.is_null()
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base := version == 2 && kind == 1 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && validate_row.is_null() && decode.is_null()
+      && validate_row.is_null() && decode.is_null() && materializer.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -339,9 +340,10 @@ pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
     validate_static := pkg.db.internal.descriptor.static_validator(statement)
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
-    base := version == 1 && kind == 0 && reserved == 0 && !q1.is_null()
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0

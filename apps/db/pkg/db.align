@@ -28,6 +28,223 @@ pub Driver {
   PostgreSQL
 }
 
+pub DriverRestriction {
+  AnySupportedDriver
+  SQLiteOnly
+  PostgreSQLOnly
+}
+
+pub MetaDetail {
+  Names
+  Summary
+  Full
+}
+
+pub MetaTableKind {
+  Table
+  View
+  MaterializedView
+  Native
+}
+
+pub MetaNullability {
+  Yes
+  No
+  Unknown
+}
+
+pub MetaKeyKind {
+  Primary
+  Unique
+  Foreign
+  Check
+  Exclusion
+  Native
+}
+
+pub MetaForeignKeyMatch {
+  Simple
+  Full
+  Partial
+}
+
+pub MetaReferentialAction {
+  NoAction
+  Restrict
+  Cascade
+  SetNull
+  SetDefault
+}
+
+pub MetaIndexTermKind {
+  Key
+  Included
+}
+
+pub MetaSortOrder {
+  Asc
+  Desc
+}
+
+pub MetaNullOrder {
+  First
+  Last
+}
+
+pub MetaQueryState {
+  Declared
+  DatabaseChecked
+}
+
+pub MetaQueryEntry {
+  Summary
+  Parameter
+  Column
+}
+
+pub MetaStatementClass {
+  Select
+  Dml
+  Ddl
+  Native
+  Unknown
+}
+
+pub PlanFormat {
+  Text
+  Json
+  Native
+}
+
+pub SchemaRef {
+  name: str,
+}
+
+pub TableRef {
+  schema: str,
+  name: str,
+}
+
+pub DatabaseMeta {
+  driver: Driver,
+  name: str,
+  engine_version: str,
+  default_schema: Option<str>,
+  encoding: Option<str>,
+  collation: Option<str>,
+  read_only: Option<bool>,
+  transactional_ddl: Option<bool>,
+}
+
+pub SchemaMeta {
+  name: str,
+  owner: Option<str>,
+  visible: bool,
+  system: bool,
+}
+
+pub TableMeta {
+  schema: str,
+  name: str,
+  kind: MetaTableKind,
+  native_kind: Option<str>,
+  owner: Option<str>,
+  comment: Option<str>,
+  estimated_rows: Option<f64>,
+}
+
+pub ColumnMeta {
+  schema: str,
+  table: str,
+  name: str,
+  ordinal: i64,
+  logical_type: Option<str>,
+  native_type: Option<str>,
+  native_type_id: Option<i64>,
+  nullable: MetaNullability,
+  default_sql: Option<str>,
+  generated_sql: Option<str>,
+  identity_kind: Option<str>,
+  collation: Option<str>,
+  comment: Option<str>,
+  origin_schema: Option<str>,
+  origin_table: Option<str>,
+  origin_column: Option<str>,
+}
+
+pub KeyMeta {
+  schema: str,
+  table: str,
+  name: Option<str>,
+  kind: MetaKeyKind,
+  key_ordinal: i64,
+  term_ordinal: i64,
+  local_column: Option<str>,
+  referenced_schema: Option<str>,
+  referenced_table: Option<str>,
+  referenced_column: Option<str>,
+  expression: Option<str>,
+  match_policy: Option<MetaForeignKeyMatch>,
+  on_update: Option<MetaReferentialAction>,
+  on_delete: Option<MetaReferentialAction>,
+  deferrable: Option<bool>,
+  initially_deferred: Option<bool>,
+  validated: Option<bool>,
+}
+
+pub IndexMeta {
+  schema: str,
+  table: str,
+  name: str,
+  unique: Option<bool>,
+  primary_backed: Option<bool>,
+  term_ordinal: i64,
+  term_kind: MetaIndexTermKind,
+  column: Option<str>,
+  expression: Option<str>,
+  predicate: Option<str>,
+  native_method: Option<str>,
+  native_opclass: Option<str>,
+  sort_order: Option<MetaSortOrder>,
+  null_order: Option<MetaNullOrder>,
+  valid: Option<bool>,
+  ready: Option<bool>,
+}
+
+pub QueryMeta {
+  query_id: str,
+  driver: Driver,
+  driver_restriction: DriverRestriction,
+  statement_class: MetaStatementClass,
+  artifact_digest: str,
+  state: MetaQueryState,
+  metadata_fingerprint: Option<str>,
+  source_sql_hash: str,
+  driver_wire_sql_hash: str,
+  rewrite_format_version: i64,
+  prepare_identity: Option<str>,
+  schema_identity: Option<str>,
+  server_identity: Option<str>,
+  entry: MetaQueryEntry,
+  ordinal: Option<i64>,
+  source_name: Option<str>,
+  source_alias: Option<str>,
+  logical_type: Option<str>,
+  native_type: Option<str>,
+  native_type_id: Option<i64>,
+  origin_schema: Option<str>,
+  origin_table: Option<str>,
+  origin_column: Option<str>,
+  nullable: MetaNullability,
+}
+
+pub QueryPlan {
+  driver: Driver,
+  format: PlanFormat,
+  analyzed: bool,
+  body: str,
+}
+
 pub exec_result {
   rows_affected: Option<i64>,
 }
@@ -92,6 +309,15 @@ pub ExecuteOption {
   TimeoutNs(i64)
 }
 
+pub MetaOption {
+  TimeoutNs(i64)
+  IncludeSystem
+}
+
+pub ExplainOption {
+  TimeoutNs(i64)
+}
+
 pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()
 
 pub fn query<P, R>(sql: str, options: slice<QueryOption>) -> query<P, R> = process.abort()
@@ -148,6 +374,162 @@ pub fn execute_options_valid(
   return Ok(())
 }
 
+pub fn meta_query<P, R>(
+  target: exec,
+  statement: query<P, R>,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<QueryMeta>, Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_timeout := false
+    mut saw_system := false
+    mut option_index := 0
+    loop {
+      if option_index >= options.len() { break }
+      match options[option_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.meta.timeout_ns".clone(),
+              message: "database metadata timeout must be positive".clone(),
+            }))
+          }
+          if saw_timeout {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.meta.timeout_ns".clone(),
+              message: "duplicate database metadata timeout".clone(),
+            }))
+          }
+          saw_timeout = true
+        }
+        IncludeSystem => {
+          if saw_system {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.meta.include_system".clone(),
+              message: "duplicate include-system metadata option".clone(),
+            }))
+          }
+          saw_system = true
+        }
+      }
+      option_index = option_index + 1
+    }
+    if saw_timeout {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.meta.timeout_ns".clone(),
+        message: "static Query metadata performs no database wait".clone(),
+      }))
+    }
+    if saw_system {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.meta.include_system".clone(),
+        message: "static Query metadata has no system-object scope".clone(),
+      }))
+    }
+    connection_driver := driver_tag(target)
+    mut driver: u8 := 0
+    if connection_driver == 1 {
+      if mask & 1 == 0 {
+        return Err(Error.DriverMismatch(ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.descriptor.driver".clone(),
+          message: "static database descriptor does not support SQLite".clone(),
+        }))
+      }
+      driver = 0
+    } else {
+      if connection_driver == 2 {
+        if mask & 2 == 0 {
+          return Err(Error.DriverMismatch(ContractError {
+            query_id: Some(query_id.clone()),
+            item: "db.descriptor.driver".clone(),
+            message: "static database descriptor does not support PostgreSQL".clone(),
+          }))
+        }
+        driver = 1
+      } else {
+        return Err(Error.Unsupported(ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.meta.exec".clone(),
+          message: "database metadata requires a live execution target".clone(),
+        }))
+      }
+    }
+
+    mut rows: array_builder<QueryMeta> := array_builder(out)
+    detail_tag: u8 := match detail {
+      Names => 0
+      Summary => 1
+      Full => 2
+    }
+    mut index := 0
+    loop {
+      next := pkg.db.internal.descriptor.materialize_meta(
+        statement, driver, detail_tag, index,
+      )
+      row := next else { break }
+      rows.push(row.clone_in(out))
+      index = index + 1
+    }
+    if index == 0 {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.descriptor.query_meta".clone(),
+        message: "static Query metadata materializer returned no summary row".clone(),
+      }))
+    }
+    return Ok(rows.build())
+  }
+}
+
 // Used only when an application asks the common surface without importing the corresponding
 // first-party native package.  The generic result keeps the diagnostic an ordinary package value;
 // it is never a compiler panic or an implicit driver selection.
@@ -189,9 +571,10 @@ pub fn execute<P>(
     validate_static := pkg.db.internal.descriptor.static_validator(statement)
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
-    base_valid := version == 1 && kind == 1 && reserved == 0 && !q1.is_null()
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base_valid := version == 2 && kind == 1 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && validate_row.is_null() && decode.is_null()
+      && validate_row.is_null() && decode.is_null() && materializer.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -251,9 +634,10 @@ pub fn one<P, R>(
     validate_static := pkg.db.internal.descriptor.static_validator(statement)
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
-    base_valid := version == 1 && kind == 0 && reserved == 0 && !q1.is_null()
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0

@@ -15082,6 +15082,40 @@ import pkg.db.internal.descriptor
 pub command<P> {}
 pub query<P, R> {}
 
+pub Driver { SQLite, PostgreSQL }
+pub DriverRestriction { AnySupportedDriver, SQLiteOnly, PostgreSQLOnly }
+pub MetaStatementClass { Select, Dml, Ddl, Native, Unknown }
+pub MetaQueryState { Declared, DatabaseChecked }
+pub MetaQueryEntry { Summary, Parameter, Column }
+pub MetaNullability { Yes, No, Unknown }
+
+pub QueryMeta {
+  query_id: str,
+  driver: Driver,
+  driver_restriction: DriverRestriction,
+  statement_class: MetaStatementClass,
+  artifact_digest: str,
+  state: MetaQueryState,
+  metadata_fingerprint: Option<str>,
+  source_sql_hash: str,
+  driver_wire_sql_hash: str,
+  rewrite_format_version: i64,
+  prepare_identity: Option<str>,
+  schema_identity: Option<str>,
+  server_identity: Option<str>,
+  entry: MetaQueryEntry,
+  ordinal: Option<i64>,
+  source_name: Option<str>,
+  source_alias: Option<str>,
+  logical_type: Option<str>,
+  native_type: Option<str>,
+  native_type_id: Option<i64>,
+  origin_schema: Option<str>,
+  origin_table: Option<str>,
+  origin_column: Option<str>,
+  nullable: MetaNullability,
+}
+
 pub fn make_command<P>() -> command<P> = process.abort()
 pub fn make_query<P, R>() -> query<P, R> = process.abort()
 
@@ -15091,6 +15125,14 @@ pub fn bind_command<P>(statement: command<P>, context: raw, params: P) -> i32 {
 
 pub fn decode_query<P, R>(statement: query<P, R>, context: raw) -> R {
   unsafe { return pkg.db.internal.descriptor.decode(statement, context) }
+}
+
+pub fn materialize_query<P, R>(
+  statement: query<P, R>, driver: u8, detail: u8, index: i64,
+) -> Option<QueryMeta> {
+  unsafe {
+    return pkg.db.internal.descriptor.materialize_meta(statement, driver, detail, index)
+  }
 }
 
 pub fn command_id<P>(statement: command<P>) -> str {
@@ -15111,6 +15153,7 @@ fn main() -> i32 {
     context := raw.alloc(1)
     status := pkg.db.bind_command(statement, context, params)
     row := pkg.db.decode_query(query, context)
+    metadata := pkg.db.materialize_query(query, 0 as u8, 0 as u8, 0)
     id := pkg.db.command_id(statement)
     raw.free(context)
     return status + (row.value as i32) + (id.len() as i32)
@@ -15212,6 +15255,53 @@ fn main() -> i32 {
                     if *value == decode_callee
             )
         }));
+        let materialize = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str().starts_with("pkg.db$materialize_query$"))
+            .expect("concrete QueryMeta materializer");
+        assert!(materialize
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(
+                        _,
+                        Rvalue::RawCall {
+                            param_tys,
+                            ret_ty: Ty::Option(Scalar::Struct(_)),
+                            signature,
+                            ..
+                        }
+                    ) if param_tys == &[
+                        Ty::Int(align_sema::IntTy { bits: 8, signed: false }),
+                        Ty::Int(align_sema::IntTy { bits: 8, signed: false }),
+                        Ty::Int(align_sema::IntTy { bits: 64, signed: true }),
+                    ] && signature.param_modes == [
+                        align_ast::ParamMode::ByValue,
+                        align_ast::ParamMode::ByValue,
+                        align_ast::ParamMode::ByValue,
+                    ]
+                )
+            }));
+        assert!(materialize
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(
+                        _,
+                        Rvalue::RawPointerLoad {
+                            offset: Operand::Const(Const::Int(96, _)),
+                            ..
+                        }
+                    )
+                )
+            }));
         let command_id = program
             .fns
             .iter()
@@ -15227,6 +15317,18 @@ fn main() -> i32 {
                     Stmt::Let(_, Rvalue::StaticDescriptorView { offset: 16, .. })
                 )
             }));
+
+        let mut malformed = hir.clone();
+        let query_meta = malformed
+            .structs
+            .iter_mut()
+            .find(|definition| definition.source_name == "pkg.db$QueryMeta")
+            .expect("QueryMeta HIR type");
+        query_meta.fields[0].ty = Ty::Bool;
+        assert!(
+            !validate_hir::body_only_metadata_is_valid(&malformed),
+            "an ABI-incompatible QueryMeta record must fail before MIR lowering",
+        );
     }
 
     #[test]

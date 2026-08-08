@@ -7,8 +7,8 @@
 
 use align_interface::{
     BindRetention, CanonicalDefinitionBody, CanonicalField, CanonicalType, CheckPolicy, Driver,
-    Hash128, MetaStatementClass, QueryMetaPlan, StaticArtifact, StaticOption, StaticOptionOwner,
-    StaticOptionValue,
+    DriverRestriction, Hash128, MetaNullability, MetaStatementClass, QueryMetaPlan, StaticArtifact,
+    StaticOption, StaticOptionOwner, StaticOptionValue, VerificationState,
 };
 
 pub const STATIC_RUNTIME_FORMAT_VERSION: u32 = 1;
@@ -58,6 +58,182 @@ pub struct GeneratedDecodeThunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedQueryMetaThunk {
     pub plan: QueryMetaPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedMetaDetail {
+    Names,
+    Summary,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedQueryMetaEntry {
+    Summary,
+    Parameter,
+    Column,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedQueryMetaRow {
+    pub query_id: String,
+    pub driver: Driver,
+    pub driver_restriction: DriverRestriction,
+    pub statement_class: MetaStatementClass,
+    pub artifact_digest: String,
+    pub state: VerificationState,
+    pub metadata_fingerprint: Option<String>,
+    pub source_sql_hash: String,
+    pub driver_wire_sql_hash: String,
+    pub rewrite_format_version: i64,
+    pub prepare_identity: Option<String>,
+    pub schema_identity: Option<String>,
+    pub server_identity: Option<String>,
+    pub entry: GeneratedQueryMetaEntry,
+    pub ordinal: Option<i64>,
+    pub source_name: Option<String>,
+    pub source_alias: Option<String>,
+    pub logical_type: Option<String>,
+    pub native_type: Option<String>,
+    pub native_type_id: Option<i64>,
+    pub origin_schema: Option<String>,
+    pub origin_table: Option<String>,
+    pub origin_column: Option<String>,
+    pub nullable: MetaNullability,
+}
+
+/// Materialize the exact D12 flat Query metadata projection from producer-owned artifact data.
+///
+/// This helper is also the source for the generated native thunk. It never reads a source,
+/// interface, artifact, or checked-metadata file and never contacts a database.
+pub fn generated_query_meta_rows(
+    artifact: &StaticArtifact,
+    artifact_digest: Hash128,
+    driver: Driver,
+    detail: GeneratedMetaDetail,
+) -> Result<Vec<GeneratedQueryMetaRow>, &'static str> {
+    let StaticArtifact::Query(query) = artifact else {
+        return Err("a command has no QueryMeta materializer");
+    };
+    let entry = query
+        .driver_entries
+        .iter()
+        .find(|entry| entry.driver == driver)
+        .ok_or("the selected driver is not permitted by the Query")?;
+    let checked = match entry.checked_metadata.state {
+        VerificationState::Declared => None,
+        VerificationState::DatabaseChecked => Some((
+            entry
+                .checked_metadata
+                .query_evidence
+                .as_ref()
+                .ok_or("DatabaseChecked Query has no checked evidence")?,
+            entry
+                .checked_metadata
+                .metadata_digest
+                .ok_or("DatabaseChecked Query has no metadata fingerprint")?,
+        )),
+    };
+    if let Some((evidence, _)) = checked
+        && (evidence.parameters.len() != query.query_meta_plan.parameters.len()
+            || evidence.columns.len() != query.query_meta_plan.columns.len())
+    {
+        return Err("checked QueryMeta evidence has the wrong shape");
+    }
+
+    let base = |entry_kind: GeneratedQueryMetaEntry| GeneratedQueryMetaRow {
+        query_id: query.query_id.clone(),
+        driver,
+        driver_restriction: query.driver_restriction,
+        statement_class: query.query_meta_plan.statement_class,
+        artifact_digest: artifact_digest.to_hex(),
+        state: entry.checked_metadata.state,
+        metadata_fingerprint: None,
+        source_sql_hash: query.source_sql_hash.to_hex(),
+        driver_wire_sql_hash: entry.wire_sql_hash.to_hex(),
+        rewrite_format_version: i64::from(entry.rewrite_format_version),
+        prepare_identity: None,
+        schema_identity: None,
+        server_identity: None,
+        entry: entry_kind,
+        ordinal: None,
+        source_name: None,
+        source_alias: None,
+        logical_type: None,
+        native_type: None,
+        native_type_id: None,
+        origin_schema: None,
+        origin_table: None,
+        origin_column: None,
+        nullable: MetaNullability::Unknown,
+    };
+
+    let mut summary = base(GeneratedQueryMetaEntry::Summary);
+    if !matches!(detail, GeneratedMetaDetail::Names)
+        && matches!(
+            entry.checked_metadata.state,
+            VerificationState::DatabaseChecked
+        )
+    {
+        summary.metadata_fingerprint = checked.map(|(_, digest)| digest.to_hex());
+    }
+    if matches!(detail, GeneratedMetaDetail::Full)
+        && let Some((evidence, _)) = checked
+    {
+        summary.prepare_identity = Some(evidence.prepare_identity.clone());
+        summary.schema_identity = Some(evidence.schema_identity.clone());
+        summary.server_identity = Some(evidence.server_identity.clone());
+    }
+    let mut rows = vec![summary];
+    if matches!(detail, GeneratedMetaDetail::Names) {
+        return Ok(rows);
+    }
+
+    for (index, declared) in query.query_meta_plan.parameters.iter().enumerate() {
+        let mut row = base(GeneratedQueryMetaEntry::Parameter);
+        row.ordinal = Some(i64::from(declared.ordinal));
+        row.source_name = Some(declared.source_name.clone());
+        row.logical_type = Some(declared.logical_type.clone());
+        if matches!(detail, GeneratedMetaDetail::Full)
+            && let Some((evidence, _)) = checked
+        {
+            let native = evidence
+                .parameters
+                .get(index)
+                .ok_or("checked QueryMeta parameter is absent")?;
+            if native.ordinal != declared.ordinal {
+                return Err("checked QueryMeta parameter ordinal differs from its declaration");
+            }
+            row.native_type = native.native_type.clone();
+            row.native_type_id = native.native_type_id;
+        }
+        rows.push(row);
+    }
+    for (index, declared) in query.query_meta_plan.columns.iter().enumerate() {
+        let mut row = base(GeneratedQueryMetaEntry::Column);
+        row.ordinal = Some(i64::from(declared.ordinal));
+        row.source_alias = Some(declared.source_alias.clone());
+        row.logical_type = Some(declared.logical_type.clone());
+        if matches!(detail, GeneratedMetaDetail::Full)
+            && let Some((evidence, _)) = checked
+        {
+            let native = evidence
+                .columns
+                .get(index)
+                .ok_or("checked QueryMeta column is absent")?;
+            if native.ordinal != declared.ordinal {
+                return Err("checked QueryMeta column ordinal differs from its declaration");
+            }
+            row.native_type = native.native_type.clone();
+            row.native_type_id = native.native_type_id;
+            row.origin_schema = native.origin_schema.clone();
+            row.origin_table = native.origin_table.clone();
+            row.origin_column = native.origin_column.clone();
+            row.nullable = native.nullable;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
