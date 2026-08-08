@@ -2554,6 +2554,141 @@ native success but before the history update, and during error recording on SQLi
 
 Down migrations are optional and are not automatically generated.
 
+### 17.6 Version-1 history, lock, and command contract
+
+D11 owns one persistent history format. It is package operational state, not a Query artifact or a
+normal-build input. SQLite owns the table `__align_migrations_v1`. PostgreSQL owns schema
+`align_internal` and table `align_internal.migrations_v1`. `migrate` may create these objects;
+`status`, `check`, and `repair` never create them. An absent history object means an empty history.
+An existing object with rows or field values outside this exact contract is invalid history rather
+than a surface that the tool upgrades in place.
+
+The logical record is exact:
+
+```text
+format_version: u32 = 1
+version: u32                 # 1 through 9999, primary key
+filename: str                # exact canonical catalog filename
+checksum: str                # lowercase 32-hex Hash128::of(exact file bytes)
+policy: u8                   # 0 Required, 1 Forbidden
+state: u8                    # 0 Applying, 1 Applied, 2 Failed
+completed_statements: u32
+```
+
+The creation DDL is canonical. SQLite executes this exact statement:
+
+```sql
+CREATE TABLE "__align_migrations_v1" (
+  "format_version" INTEGER NOT NULL CHECK (typeof("format_version") = 'integer' AND "format_version" = 1),
+  "version" INTEGER NOT NULL PRIMARY KEY CHECK (typeof("version") = 'integer' AND "version" BETWEEN 1 AND 9999),
+  "filename" TEXT NOT NULL CHECK (typeof("filename") = 'text'),
+  "checksum" TEXT NOT NULL CHECK (typeof("checksum") = 'text' AND length("checksum") = 32),
+  "policy" INTEGER NOT NULL CHECK (typeof("policy") = 'integer' AND "policy" IN (0, 1)),
+  "state" INTEGER NOT NULL CHECK (typeof("state") = 'integer' AND "state" IN (0, 1, 2)),
+  "completed_statements" INTEGER NOT NULL CHECK (typeof("completed_statements") = 'integer' AND "completed_statements" BETWEEN 0 AND 4294967295)
+)
+```
+
+PostgreSQL creates the schema and table in one bootstrap transaction and executes this exact table
+statement after `CREATE SCHEMA "align_internal"`:
+
+```sql
+CREATE TABLE "align_internal"."migrations_v1" (
+  "format_version" integer NOT NULL CHECK ("format_version" = 1),
+  "version" integer NOT NULL PRIMARY KEY CHECK ("version" BETWEEN 1 AND 9999),
+  "filename" text NOT NULL,
+  "checksum" text NOT NULL CHECK (length("checksum") = 32),
+  "policy" integer NOT NULL CHECK ("policy" IN (0, 1)),
+  "state" integer NOT NULL CHECK ("state" IN (0, 1, 2)),
+  "completed_statements" bigint NOT NULL CHECK ("completed_statements" BETWEEN 0 AND 4294967295)
+)
+```
+
+Both absent PostgreSQL objects mean empty history. Exactly one object present is invalid history;
+the tool never adopts a pre-existing schema. Readers validate the exact column order, declared
+types, nullability, primary key, and check constraints through driver catalogs, then validate every
+row's storage/type, exact lowercase checksum spelling, filename/version agreement, and field
+combinations. PostgreSQL `completed_statements` alone is `bigint`; its contract is still the full
+unsigned 32-bit range above. A schema disagreement, unrepresentable native value, or semantic row
+violation fails the command before any mutation. A replaced or weakened table therefore fails closed
+rather than being upgraded.
+`Applying` and `Failed` require `policy = Forbidden` and `completed_statements = 0`. `Applied`
+requires `completed_statements` to equal the driver-screened statement count. Required migrations
+publish only one `Applied` row inside their migration transaction; they never expose Applying or
+Failed. Forbidden migrations expose Applying with zero, then Applied with one after native success;
+best-effort error recording changes only Applying to Failed and leaves zero.
+
+The lock covers history bootstrap/read/validation and the complete operation. SQLite uses a
+persistent empty sibling file formed by appending `.align-migrate.lock` to the exact database path;
+it rejects a symlink/non-regular lock and holds an exclusive OS lock for `migrate`/`repair` or a
+shared OS lock for `status`/`check`. `migrate` and `repair` may create this file without replacing
+an existing path. `status` and `check` never create it: when it is absent they snapshot that absence,
+perform the read-only operation, and reject the result if the path appears before completion. Once
+created, the lock file is never deleted, so this absent-lock guard cannot miss a completed or active
+writer. PostgreSQL holds session advisory lock key
+`(1095518535, 1296647985)` (`ALIG`, `MIG1`) in exclusive or shared mode respectively. Process or
+connection loss releases the OS/advisory lock; the persistent SQLite file is never deleted.
+
+The migration directory is project-root-relative. The entry must be an existing regular,
+non-symlink `.align` file; its lexical parent is the project root. An absolute migration path,
+`..`, a symlinked directory, or canonical escape is rejected before enumeration. A relative SQLite
+target is resolved against that project root; an absolute target remains explicit. The final target
+and lock file may not be symlinks. `migrate` may create the final database and lock file after all
+catalog and policy validation; `repair` may create only a missing lock file; every operation except
+`migrate` requires the database to exist. PostgreSQL
+environment names match `[A-Za-z_][A-Za-z0-9_]*`, must not begin with `PG`, and use the complete URL
+and ambient-`PG*` rejection rules from §16.2.
+
+Validation precedence is one deterministic sequence:
+
+1. decode every argv token as non-empty UTF-8 without U+0000, then reject unknown or duplicate
+   options in source order;
+2. validate the operation-specific required fields, exactly one matching target, repair action,
+   version, and lowercase expected checksum;
+3. validate entry, project-relative catalog containment, then the complete §16.6 catalog;
+4. classify every first-line policy, screen every complete statement, reject an empty file,
+   transaction-control statement, or Forbidden file whose database-authoritative count is not one;
+5. read the one PostgreSQL URL environment value when selected and validate all connection inputs;
+6. open the exact target, acquire its migration lock, read and validate the complete history, then
+   perform the selected operation.
+
+The policy directive is recognized only as the exact first physical line terminated by LF or EOF.
+CRLF or leading bytes do not match it and therefore select the default Required policy. SQL
+screening ignores quoted strings, quoted identifiers, line/block comments, and PostgreSQL
+dollar-quoted bodies. It rejects a top-level statement whose first tokens form `BEGIN`, `START
+TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, or `RELEASE`. SQLite statement
+boundaries, including trigger bodies, use `sqlite3_complete`; PostgreSQL boundaries use the same
+dollar-quote-aware driver scanner. Both drivers finish this complete screening phase before opening
+the target or publishing an Applying row; native execution remains authoritative for SQL validity.
+
+History comparison is version ordered. Every current catalog version produces exactly one status:
+`Pending`, `Applied`, `ChecksumMismatch`, `NameMismatch`, `PolicyMismatch`, `DirtyApplying`, or
+`DirtyFailed`. A history version absent from the current catalog is
+`HistoryOnly`. Identity mismatches take precedence over state tags. A missing earlier Applied row,
+any mismatch/dirty/history-only row, or a non-prefix Applied set blocks `migrate` before
+executing a pending file.
+
+The printed state tags are respectively `pending`, `applied`, `checksum_mismatch`, `name_mismatch`,
+`policy_mismatch`, `dirty_applying`, `dirty_failed`, and `history_only`. `mismatched` counts checksum,
+name, and policy mismatches; the other summary fields count their same-named states. The five summary
+counts therefore cover every printed row exactly once.
+
+All four commands print current catalog rows in version order followed by HistoryOnly rows in
+version order:
+
+```text
+migration version=0001 name=0001_create_users.sql checksum=<32hex> policy=required state=applied
+summary driver=sqlite applied=1 pending=0 dirty=0 mismatched=0 history_only=0
+```
+
+`status` exits successfully after a complete read even when the summary is not current. `check`
+uses the same rows and succeeds only when every catalog row is Applied and there are no other rows.
+Successful `migrate` prints the final all-Applied view. Successful `repair` prints the final view
+after changing exactly one checksum-matching dirty row. Errors and PostgreSQL output never include
+the URL or an environment value. `--accept-applied` records the screened statement count;
+`--clear-dirty` removes only that row. Neither action accepts an Applied row, a non-current version,
+or a current/history checksum different from `--expect-checksum`.
+
 ---
 
 ## 18. Metadata and introspection
@@ -3788,6 +3923,29 @@ Compound Query support is part of the first product contract, not a later ORM en
 - explicit `alignc db migrate/status/check/repair`.
 
 Migration implementation reuses connections/resources but does not change typed Query semantics.
+
+#### Q5a/D11 implementation closure matrix
+
+Q5a is one external-state capability spanning CLI, canonical catalog reuse, driver-owned
+screening/locking, persistent history, migration execution, inspection, and explicit repair. SQLite
+and PostgreSQL land together so history/state/repair semantics cannot drift by driver. This is the
+deliberate mutation half of Q5; D12 remains an independent read-only capability.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| CLI and target identity | Implement the exact migrate/status/check/repair forms and validation precedence in §17.6. Resolve entry, project-relative catalog, and relative SQLite target without cwd discovery; read only the selected non-`PG*` PostgreSQL URL variable after all non-secret validation. | `pkg_db_q5a::migration_cli_rejects_invalid_forms_before_catalog_environment_or_native_work` and path/symlink matrix |
+| catalog and policy screening | Reuse the Q3 `ALIGNMIG` catalog bytes/digest. Parse the exact first physical line, count complete driver statements, and reject empty, transaction-control, NUL, invalid UTF-8, and multi-statement Forbidden files before target mutation. | cumulative Q3 catalog goldens plus `pkg_db_q5a::migration_policy_and_statement_screening_is_exact` |
+| history codec/state reconciliation | Create only the exact §17.6 owned objects during migrate, validate every row and state combination, reconcile in version order, and classify the complete current/extra/mismatch/dirty matrix without panic or silent upgrade. Reject malformed schema or row state before mutation. | `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` for both drivers |
+| overlap exclusion and cleanup | Hold the exact SQLite OS lock or PostgreSQL advisory lock across bootstrap/read/validation and the complete operation. A failed second writer blocks before history/native mutation; every success/error/Drop/process-loss edge releases the lock or connection-owned advisory state. | SQLite two-process exclusion owner and required PostgreSQL concurrent-session owner |
+| Required execution | Under the migration lock, run each Required file and its Applied history insert in one transaction. Any statement/history/commit failure rolls back that complete file with no row; already Applied current prefixes are not re-executed. | SQLite and required PostgreSQL atomic/multi-statement/error/restart owners |
+| Forbidden execution and dirty state | Require one screened statement, insert Applying(0), execute outside a transaction, then record Applied(1). Native error best-effort records Failed(0); loss after native success leaves Applying(0). Either dirty state blocks continuation and is never retried automatically. | both-driver before/after/error-recording fault matrix and execution counters |
+| status/check | Perform no schema/history creation, migration, or repair. Emit exact ordered rows/summary; status succeeds after inspection while check succeeds only for one exact current Applied set. Missing history is empty; missing SQLite target is an input error. | `pkg_db_q5a::status_and_check_are_read_only_and_ordered` for empty/current/pending/mismatch/dirty/history-only states |
+| repair | Require one current version, one action, and exact lowercase checksum matching argv, catalog, and dirty history. Accept records Applied with the screened count; clear removes only the dirty row. Applied, absent, stale, or mismatched rows change nothing. | `pkg_db_q5a::repair_is_dirty_and_checksum_bound` for both actions/drivers |
+| secrets, allocation, and diagnostics | Own copied native errors/history strings before result cleanup, never print a PostgreSQL URL/value, bound all native counts before allocation, reject malformed rows rather than indexing/panicking, and close every statement/result/connection exactly once. | malformed native/history owners, URL redaction owner, self-review FFI checklist, required PostgreSQL CI |
+
+The author-side matrix-to-diff pass must point each cell to one implementation owner and test, plus
+the local 10/100/1000 catalog/history measurement because D11 explicitly promises a scaling record.
+No normal compiler path imports or calls the D11 module.
 
 ### D12 — category-specific metadata and EXPLAIN
 
