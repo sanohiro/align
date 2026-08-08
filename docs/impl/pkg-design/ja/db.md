@@ -1505,7 +1505,10 @@ CREATE TABLE "align_internal"."migrations_v1" (
 PostgreSQL objectが両方absentのときだけempty historyである。一方だけ存在すればinvalid historyで、
 既存schemaをadoptしない。SQLiteは1つのtableの `sqlite_schema.sql` が上のcanonical DDL byteと
 一致することを要求し、`tbl_name` が `__align_migrations_v1` の他の `sqlite_schema` rowを許可しない。
-これにより追加index/trigger/viewとrewritten table formを除外する。PostgreSQLはcurrent role所有の
+さらにそのtableを `tbl_name` とする `sqlite_temp_schema` rowを許可せず、persistent/connection-local
+index、trigger、view、rewritten table formを除外する。全history query/mutationは
+`main.__align_migrations_v1` をexplicit qualifyし、temporary objectによるowned table shadowを防ぐ。
+PostgreSQLはcurrent role所有の
 permanent ordinary heap tableを要求し、partition/inheritance relation、row security、forced row
 security、user trigger、rewrite rule、policy、extra index、generated/default/identity expression、
 non-owner ACL、`align_internal` 内の他のuser-addressable relationを許可しない。唯一のindexは
@@ -1582,11 +1585,11 @@ PostgreSQL dollar-quoted bodyを無視する。top-level first tokenが `BEGIN`�
 SQLite boundaryはtrigger bodyを含め `sqlite3_complete`、PostgreSQLは同じdollar-quote-aware
 driver scannerを使う。両driverともtarget openやApplying publish前にscreeningを完了し、SQL validityは
 native executionがauthoritativeである。
-user SQL後かつ全history insert/update前に、同じlock下でcomplete owned schema/ancillary-object
-inventoryとexpected prefixを再検証する。Requiredはcommit前にnew rowもrereadする。Forbiddenも
-native statement後/final update前に同じ検証を行う。historyをalter/replaceしたりbehaviorをattachする
-SQLはRequired fileをrollbackするかForbidden rowをvisible dirtyに残し、progressをsilent erase/forge
-できない。
+user SQL後かつ全history insert/update前に、同じlock下でcomplete owned persistent/connection-local
+schema/ancillary-object inventoryとexpected prefixを再検証する。Requiredはcommit前にnew rowも
+rereadする。Forbiddenもnative statement後/final update前に同じ検証を行う。historyを
+alter/replace/shadowしたりbehaviorをattachするSQLはRequired fileをrollbackするかForbidden rowを
+visible dirtyに残し、progressをsilent erase/forgeできない。
 
 history comparisonはversion order。current catalog versionごとにexactly oneの `Pending`、`Applied`、
 `NameMismatch`、`ChecksumMismatch`、`PolicyMismatch`、`DirtyApplying`、`DirtyFailed` を生成し、
@@ -2523,7 +2526,7 @@ mutation halfであり、D12は独立したread-only capabilityとして残す�
 |---|---|---|
 | CLI/target identity | §17.6のexact migrate/status/check/repair formとvalidation precedenceを実装する。cwd discoveryなしでentry、project-relative catalog、relative SQLite targetをresolveし、non-secret validation後にselected non-`PG*` PostgreSQL URL variableだけを読む。 | `pkg_db_q5a::migration_cli_rejects_invalid_forms_before_catalog_environment_or_native_work` とpath/symlink matrix |
 | catalog/policy screening | Q3の `ALIGNMIG` catalog byte/digestを再利用する。exact first physical lineをparseしcomplete driver statementをcountし、target mutation前にempty、transaction-control、NUL、invalid UTF-8、multi-statement Forbidden fileをrejectする。 | cumulative Q3 catalog goldenと `pkg_db_q5a::migration_policy_and_statement_screening_is_exact` |
-| history codec/state reconciliation | migrate中だけ§17.6のexact owned objectを作成し、complete table/ancillary-object inventoryと全row/state combinationを検証し、version順でreconcileし、complete current/extra/mismatch/dirty matrixをpanic/silent upgradeなしでclassifyする。malformed schema/row stateはmutation前にrejectする。 | trigger/rule/RLS/default/index/ACL negativeを含む両driverの `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` |
+| history codec/state reconciliation | migrate中だけ§17.6のexact owned objectを作成し、complete persistent/session-local table/ancillary-object inventoryと全row/state combinationを検証し、version順でreconcileし、complete current/extra/mismatch/dirty matrixをpanic/silent upgradeなしでclassifyする。malformed schema/row stateはmutation前にrejectする。 | SQLite TEMP-trigger/shadowとPostgreSQL trigger/rule/RLS/default/index/ACL negativeを含む両driverの `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` |
 | overlap exclusion/cleanup | 全SQLite commandはexact persistent OS-lock inodeを作成可能かつ保持し、全PostgreSQL commandはbootstrap/read/validationとoperation全体でexact advisory keyを保持する。second writerはhistory/native mutation前にblockし、全success/error/Drop/process-loss edgeでlockまたはconnection-owned advisory stateを解放する。 | SQLite absent-lock creation/two-process exclusion ownerとrequired PostgreSQL concurrent-session owner |
 | Required execution | migration lock下で各Required fileとApplied history insertを1 transactionで行う。statement/history failureはcomplete fileをrollbackする。不確定commitはclose/reconnect/relockしexact Applied/absentをclassifyし、same-invocation retryしない。current Applied prefixを再実行しない。 | SQLiteとrequired PostgreSQL atomic/multi-statement/error/restart/outcome-unknown owner |
 | Forbidden execution/dirty state | screened statement 1つを要求し、transaction外execution前にApplying(0)をdurably observeし、Applied(1)をrecordする。native errorはbest-effortでFailed(0)、不確定final publicationはAppliedまたはdirty Applyingへreconcileする。dirty stateは継続をblockし自動retryしない。 | 両driverのbefore/after/error-recording/outcome-unknown fault matrixとexecution counter |
@@ -2544,6 +2547,7 @@ pre-implementation adversarial reviewはsource work前に次のroot-cause class�
 | P1 column/check検証がbehavior-changing attached objectを除外しなかった | SQLite schema-row inventoryとPostgreSQL relation/index/constraint/trigger/rule/RLS/ACL inventoryを閉じ、fail closedする。 |
 | P2 compound mismatchにtotal order/value provenanceがなかった | Name、checksum、policy、native stateを1 total orderとし、全output rowがexact unavailable marker付きcatalog/history fieldを常に持つ。 |
 | P2 validation phase内部のwinnerが未規定だった | token、field、directory、file、statement、connection、schema、historyのtraversal/error precedenceをexactにした。 |
+| P1 revised reviewがSQLite connection-local behaviorを `sqlite_schema` 外に発見した | matrixをpersistent/session-local modifier全体へ再openし、exact `main` qualificationと `sqlite_temp_schema` rejectionでTEMP trigger/shadow pathを閉じた。 |
 
 ### D12 — category metadataとEXPLAIN
 
