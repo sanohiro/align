@@ -1051,7 +1051,15 @@ fn main() -> i32 {
     let mut files = package_files(main);
     files.push(("app/common_command.align", COMMAND));
     files.push(("app/common_query.align", QUERY));
-    let output = build_and_run_multi("pkg-db-q2-common-sqlite", &files, "main.align");
+    let built = build_per_unit_multi("pkg-db-q2-common-sqlite", &files, "main.align");
+    let link_libs = built.link_libs_union();
+    for library in ["pq", "ssl", "crypto"] {
+        assert!(
+            link_libs.iter().any(|linked| linked == library),
+            "common database build must retain libpq dependency `{library}`: {link_libs:?}"
+        );
+    }
+    let output = built.link_and_run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1059,14 +1067,13 @@ fn main() -> i32 {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let built = build_per_unit_multi("pkg-db-q2-common-sqlite-mir", &files, "main.align");
     let main_mir = align_mir::print::program_to_string(&built.unit("main").mir);
     assert!(
-        main_mir.contains("call program pkg.db.internal.sqlite$execute_prevalidated"),
+        main_mir.contains("call_with_cleanup program pkg.db.internal.sqlite$execute_prevalidated$"),
         "common execute did not lower to the SQLite engine:\n{main_mir}"
     );
     assert!(
-        main_mir.contains("call program pkg.db.internal.sqlite$one_prevalidated"),
+        main_mir.contains("call_with_cleanup program pkg.db.internal.sqlite$one_prevalidated$"),
         "common one did not lower to the SQLite engine:\n{main_mir}"
     );
 }

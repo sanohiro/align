@@ -18,6 +18,12 @@ extern "C" link("pq") {
   fn PQgetlength(result: raw, row: i32, column: i32) -> i32
 }
 
+// libpq is built with OpenSSL on supported targets. Keep its native dependency
+// closure explicit because the static runtime can retain TLS references in an
+// ELF link even when the Align program reaches only the common database path.
+extern "C" link("ssl") {}
+extern "C" link("crypto") {}
+
 CONTEXT_VERSION: u32 := 1
 DRIVER_SQLITE: u8 := 1
 DRIVER_POSTGRES: u8 := 2
