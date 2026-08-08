@@ -526,10 +526,9 @@ this equals Unicode scalar order). It is deterministic and locale-free; dictiona
 collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is anything
 `Ord`: a number, a `char`, or a string. Aggregates have no order, exactly as they have no `==`.
 
-> **Current implementation boundary:** the operator and builtin-bound paths are complete for
-> borrowed `str`, but direct comparison of owned `string` values is not implemented yet. Pass
-> each owned string to a `str`-typed helper (the ordinary `string` → `str` borrow coercion) when a
-> comparison is needed. This is an implementation gap, not a change to the language rule above.
+The operator and builtin-bound paths compare owned `string` values through a non-consuming,
+zero-cost `str` borrow. Mixed `string`/`str` operands use the same path; comparison neither moves
+nor allocates.
 
 ### Optional
 
@@ -578,12 +577,31 @@ variable; needing the error *is* the signal to `match`. So each intent has exact
 Error { NotFound, Invalid, Denied, Timeout, Code(i32) }
 ```
 
-Construct it with `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar for `Error.Code(c)`),
+Construct it with `Error.NotFound` / `Error.Code(c)`. `error(c)` is syntax sugar for
+`core.Error.Code(c)` and therefore always constructs the builtin even in a module that declares a
+local `Error`.
 discriminate it with `match`, and at `main` it becomes the process exit code (`Code(c)` → `c`, a
 category → a small distinct code). `Timeout` is the category for a run/transport deadline (a
 `std.process` `run` that overran its `timeout_ns`, or — once shipped — a `std.http`/`std.net` I/O
 timeout); it is produced only by an explicit timeout site, never inferred from an errno. The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
+
+The compiler-provided nominal aliases form this closed table:
+
+| Bare alias | Explicit builtin spelling | Availability of the explicit spelling |
+|---|---|---|
+| `Error` | `core.Error` | language-syntactic core; always in scope and requires no import |
+| `argon2_params` | `crypto.argon2_params` | requires `import std.crypto` |
+| `regex_match` | `regex.regex_match` | requires `import std.regex` |
+
+A non-entry module may declare a local type with any bare alias in this table. Inside that module
+the bare name denotes the local type; in a module without such a declaration the bare alias still
+denotes the builtin. The explicit spelling always denotes the builtin. A `std` explicit spelling
+counts as a use of its required import for the unused-import lint; `core.Error` is part of the
+always-in-scope syntactic core, and `import core` is neither required nor valid. Importers name the
+local type by its ordinary qualified module path, for example `pkg.db.Error`. The entry module
+cannot declare any table member because its unmangled type namespace is also the builtin namespace.
+This is type namespacing, not value shadowing.
 
 A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
 exit-code mapping above is defined only for it. A user-defined error enum at that position is a
@@ -665,8 +683,8 @@ trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 `RegionPlain` is the one separate closed structural bound used by region-backed construction. It is
 not part of the numeric hierarchy and grants no arithmetic or equality operation.
 
-The current compiler's concrete `Eq`/`Ord` bound satisfaction follows the implementation boundary
-above: `str` is accepted and owned `string` is rejected until its direct comparison lowering lands.
+Concrete `string` and `str` both satisfy `Eq` and `Ord`; an owned value is borrowed, not moved, by
+the comparison inside a monomorphized function.
 
 A type parameter may also appear **nested** in an `Option<T>` / `Result<T, E>`, in a parameter or
 return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T` or
@@ -1767,16 +1785,22 @@ Dangerous operations are only in an `unsafe` block. The `raw.*` surface manages 
 
 ```align
 unsafe {
+  none := raw.null()        // explicit null pointer for a native ABI argument or sentinel
   p := raw.alloc(16)        // 16 bytes → a `raw` pointer
-  raw.store(p, 0, 42)       // write a primitive scalar at a byte offset (type from the value)
+  raw.store(p, 0, 42)       // write a flat value at a byte offset (type from the value)
   x: i64 := raw.load(p, 0)  // read it back (type from the annotation — no turbofish, like decode)
   raw.free(p)               // manual free; a `raw` is Copy and never auto-dropped
 }
 ```
 
-The stored/loaded type is inferred (from the value for `store`, from the expected type for `load`) —
+`raw.null()` is the only null-pointer constructor and is explicit at the unsafe boundary; there is
+no general null value in ordinary Align types. The stored/loaded type is inferred (from the value
+for `store`, from the expected type for `load`) —
 Align has **no turbofish**, so an explicit `raw.op<T>(...)` is not the surface. (An unchecked pointer
-cast / reinterpret is a later `raw.*` op; the flat load/store above is the first cut.) A function
+cast / reinterpret is a later `raw.*` op.) The admitted flat values are primitive scalars, `raw`
+pointers, and eligible non-empty `layout(C)` structs. Storing a `raw` pointer makes package-owned
+native handle tables explicit without converting an address to an integer; loading it requires an
+expected `raw` type just as a scalar load requires its scalar type. A function
 containing `unsafe` is inferred impure, so it can never be a `par_map` callee — the danger stays
 visible and traceable.
 
@@ -1914,10 +1938,10 @@ unsafe {
 }
 ```
 
-Only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load` of a whole
-struct), because only it promises a fixed representation — this is the pointer-based FFI pattern
-(hand C a buffer, read/write structs in it). Its fields must be FFI-mappable scalars (integers,
-floats).
+Among structs, only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load`
+of a whole struct), because only it promises a fixed representation — this is the pointer-based FFI
+pattern (hand C a buffer, read/write structs in it). Primitive scalars and `raw` pointers are the
+other admitted flat values. Its fields must be FFI-mappable scalars (integers, floats).
 
 ### By-value structs (SysV AMD64 only)
 
@@ -2044,7 +2068,7 @@ fn main() -> i32 {
 }
 ```
 
-`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name.
+`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name. That includes compiler-provided bare type aliases in non-entry modules: a same-module declaration wins locally, the builtin remains available by its provider-qualified spelling such as `core.Error`, and importers use the ordinary module-qualified user type. Entry-module declarations that would collide with an unmangled builtin canonical name remain errors.
 
 A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is a scalar, `str`, or a `slice<T>` of one — so its element type is transitively `pub` by construction) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
 

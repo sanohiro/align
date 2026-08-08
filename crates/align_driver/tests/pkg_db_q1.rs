@@ -10,6 +10,7 @@ use align_interface::{
     static_options_hash, BindRetention, CheckPolicy, StaticArtifact, StaticOption,
     StaticOptionOwner, StaticOptionValue, VerificationState,
 };
+use align_sema::StaticDescriptorConsumer;
 use align_span::SourceMap;
 use std::fs::{create_dir_all, write};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DB: &str = include_str!("../../../apps/db/pkg/db.align");
 const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
 const POSTGRES: &str = include_str!("../../../apps/db/pkg/db/postgres.align");
+const INTERNAL: &str = include_str!("../../../apps/db/pkg/db/internal.align");
+const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.align");
+const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
+const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
+const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
 
 struct TempProject(PathBuf);
 
@@ -37,9 +43,18 @@ fn project(label: &str) -> TempProject {
         std::process::id()
     ));
     create_dir_all(root.join("pkg/db")).expect("package directories");
+    create_dir_all(root.join("pkg/db/internal")).expect("internal package directories");
     write(root.join("pkg/db.align"), DB).expect("pkg.db");
     write(root.join("pkg/db/sqlite.align"), SQLITE).expect("pkg.db.sqlite");
     write(root.join("pkg/db/postgres.align"), POSTGRES).expect("pkg.db.postgres");
+    write(root.join("pkg/db/internal.align"), INTERNAL).expect("pkg.db internal");
+    write(root.join("pkg/db/internal/resource.align"), RESOURCE).expect("pkg.db resource");
+    write(root.join("pkg/db/internal/descriptor.align"), DESCRIPTOR)
+        .expect("pkg.db descriptor bridge");
+    write(root.join("pkg/db/internal/sqlite.align"), INTERNAL_SQLITE)
+        .expect("pkg.db SQLite execution internals");
+    write(root.join("pkg/db/internal/postgres.align"), INTERNAL_POSTGRES)
+        .expect("pkg.db PostgreSQL execution internals");
     TempProject(root)
 }
 
@@ -979,32 +994,84 @@ fn generated_runtime_data_is_producer_owned() {
                 .iter()
                 .find(|artifact| artifact.descriptor_id == descriptor.descriptor_id)
                 .expect("producer artifact");
+            let Some(align_mir::Stmt::Let(0, align_mir::Rvalue::StaticData(data))) =
+                statements.first()
+            else {
+                panic!("descriptor constructor must start with relocation-bearing static data");
+            };
+            assert_eq!(data.bytes.len(), 96);
+            assert_eq!(data.align, 8);
+            assert_eq!(&data.bytes[0..4], &1u32.to_le_bytes());
+            assert_eq!(data.bytes[4], u8::from(descriptor.consumer == StaticDescriptorConsumer::Command));
+            assert_eq!(&data.bytes[6..8], &[0, 0]);
+            let q1 = data
+                .relocations
+                .iter()
+                .find(|relocation| relocation.offset == 8)
+                .expect("Q1 plan relocation");
             assert!(matches!(
-                statements.first(),
-                Some(align_mir::Stmt::Let(
-                    0,
-                    align_mir::Rvalue::ConstArray { elems, .. }
-                )) if elems.len() == artifact.runtime.bytes().len()
+                &q1.target,
+                align_mir::StaticDataTarget::Bytes {
+                    bytes,
+                    nul_terminated: false,
+                } if bytes == artifact.runtime.bytes()
             ));
+            let thunk_offsets = data
+                .relocations
+                .iter()
+                .filter_map(|relocation| matches!(
+                    relocation.target,
+                    align_mir::StaticDataTarget::Function(_)
+                ).then_some(relocation.offset))
+                .collect::<Vec<_>>();
+            if descriptor.consumer == StaticDescriptorConsumer::Query {
+                assert_eq!(thunk_offsets, vec![64, 72, 80, 88]);
+            } else {
+                assert_eq!(thunk_offsets, vec![64, 72]);
+            }
             assert!(matches!(
                 statements.get(1),
-                Some(align_mir::Stmt::Let(
-                    1,
-                    align_mir::Rvalue::SlicePtr(align_mir::Operand::Value(0))
-                ))
-            ));
-            assert!(matches!(
-                statements.get(2),
                 Some(align_mir::Stmt::StoreField(
                     0,
                     path,
-                    align_mir::Operand::Value(1)
+                    align_mir::Operand::Value(0)
                 )) if path == &[0]
+            ));
+            assert!(matches!(
+                statements.get(2),
+                Some(align_mir::Stmt::Let(1, align_mir::Rvalue::Load(0)))
             ));
             assert!(!statements.iter().any(|statement| matches!(
                 statement,
                 align_mir::Stmt::Let(_, align_mir::Rvalue::Call(..))
             )));
+            let binder = unit
+                .mir
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == format!("{symbol}$static_bind_v1"))
+                .expect("generated binder");
+            assert_eq!(
+                binder.param_modes,
+                vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+            );
+            let static_validator = unit
+                .mir
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == format!("{symbol}$static_validate_v1"))
+                .expect("generated static validator");
+            if descriptor.descriptor_id == "app.users.query" {
+                assert!(matches!(
+                    static_validator.blocks.as_slice(),
+                    [align_mir::Block {
+                        term: align_mir::Term::Return(Some(align_mir::Operand::Const(
+                            align_mir::Const::Int(-1, _)
+                        ))),
+                        ..
+                    }]
+                ));
+            }
             let magic = match &artifact.runtime {
                 GeneratedStaticRuntime::Query(_) => "ALIGNQST",
                 GeneratedStaticRuntime::Command(_) => "ALIGNCST",

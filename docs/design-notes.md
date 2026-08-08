@@ -696,6 +696,16 @@ An extern may therefore be called directly or used by an immediate non-escaping 
 inside `unsafe`, but it cannot become a first-class function value until the language has an
 explicit unsafe-callable type. This keeps foreign execution lexically visible.
 
+Raw memory stores flat values, including `raw` pointers themselves. This is the honest representation
+for a package-owned native handle slot: the address remains an address, its load/store stays visibly
+`unsafe`, and no database or other FFI wrapper needs an integer cast or a compiler/runtime-owned
+handle registry. Safe public resource types still hide that representation and own exactly-once
+cleanup.
+
+Native ABIs also need an actual null pointer. `raw.null()` forms it explicitly inside `unsafe`; it
+does not introduce a second optional-value model into ordinary code. `Option<T>` remains the only
+language-level absence, while raw ABI sentinels remain visible and grep-able at the boundary.
+
 A declared non-Unit return is also a control-flow obligation. The compiler accepts a path only when
 it produces the declared value or provably does not continue; it never repairs reachable
 fallthrough with an ABI-dependent implicit value.
@@ -850,6 +860,15 @@ adds **two path rules and zero new compiler concepts**: a "package" is the modul
 human) vendors under `pkg/`, and the compiler never learns what one is — resolution, visibility,
 effects, escape, and capabilities all carry over from the module system unchanged. Three forces
 converge on this:
+
+- **Namespaces must remain real at package boundaries.** A compiler-provided bare type alias cannot
+  reserve the same word across every vendored module: that would make ordinary qualified APIs such
+  as `pkg.db.Error` impossible even though user types already have canonical module identities.
+  Non-entry modules therefore resolve a same-module declaration before a builtin alias. The closed
+  explicit table is `core.Error` (always in scope), `crypto.argon2_params` (`std.crypto` import), and
+  `regex.regex_match` (`std.regex` import). The entry namespace
+  remains unmangled and rejects a true canonical collision. This preserves one lookup rule and does
+  not weaken the no-shadowing rule for values.
 
 - **Nothing hidden, extended to provenance.** The first import segment is a trust tier
   (`core`/`std`/`pkg`/project), so a file's header shows not just *what* it reaches but *whose* code

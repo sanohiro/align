@@ -1,5 +1,5 @@
 //! `==` / `!=` (and the ordering operators) are defined for **scalars and strings only** — numbers,
-//! `bool`, `char`, and `str` — with **no structural comparison** (`draft.md` §5 "Equality and
+//! `bool`, `char`, `str`, and `string` — with **no structural comparison** (`draft.md` §5 "Equality and
 //! Ordering"). Before this was enforced in sema, comparing a struct / tuple / array / sum value
 //! slipped through to `align_codegen_llvm`, which fed the aggregate to the integer-compare path and
 //! panicked ("expected the IntValue variant") — a compiler ICE on ordinary user input. sema now
@@ -103,22 +103,6 @@ fn main() -> i32 {
 }
 
 #[test]
-fn owned_string_equality_rejected() {
-    // Owned `string` comparison is not implemented yet (only the `str` view is comparable); it would
-    // otherwise ICE on the same integer-compare path. A dedicated "not yet" message, not the generic
-    // structural-equality one.
-    let src = "\
-fn main() -> i32 {
-  a := \"x\".clone()
-  b := \"y\".clone()
-  if a == b { return 1 }
-  return 0
-}
-";
-    assert!(check_msg("string-eq", src).contains("not directly comparable yet"));
-}
-
-#[test]
 fn bool_ordering_rejected() {
     // `bool` has equality but not ordering (ordering = numbers + char + str).
     let src = "\
@@ -148,6 +132,29 @@ fn main() -> i32 {
 }
 ";
     assert!(!check_errs("scalar-cmp-ok", src), "scalar/string comparisons must still type-check");
+}
+
+#[test]
+fn owned_string_comparisons_borrow_without_consuming() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn same<T: Eq>(a: T, b: T) -> bool = a == b
+fn before<T: Ord>(a: T, b: T) -> bool = a < b
+fn main() -> i32 {
+  a := \"alpha\".clone()
+  b := \"alpha\".clone()
+  c := \"beta\".clone()
+  direct := a == b && a != c && a < c && c > b
+  mixed := a == \"alpha\" && \"alpha\" == b
+  generic := same(\"same\".clone(), \"same\".clone()) && before(\"a\".clone(), \"b\".clone())
+  reused := a == b && b < c
+  if direct && mixed && generic && reused { return 17 }
+  return 1
+}
+";
+    assert_eq!(build_and_run("owned-string-cmp", src).status.code(), Some(17));
 }
 
 #[test]

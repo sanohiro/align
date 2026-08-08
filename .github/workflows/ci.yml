@@ -21,6 +21,80 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  db-postgres:
+    name: PostgreSQL integration (required)
+    runs-on: ubuntu-24.04
+    # Keep the server version explicit: this job is the non-skippable D4/Q2 gate.
+    services:
+      postgres:
+        image: postgres:16.4
+        env:
+          POSTGRES_DB: align
+          POSTGRES_USER: align
+          POSTGRES_PASSWORD: align
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U align -d align"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUST_VERSION: 1.96.0
+      ALIGN_DB_POSTGRES_REQUIRED: "1"
+      ALIGN_DB_POSTGRES_URL: postgresql://align:align@127.0.0.1:5432/align
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install LLVM and database libraries
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
+            libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+
+      - name: Build compiler and runtime
+        shell: bash
+        run: scripts/cargo.sh build --workspace --locked
+
+      - name: Print database evidence
+        shell: bash
+        run: |
+          rustc --version
+          "$LLVM_CONFIG" --version
+          pg_config --version
+          psql --version
+          psql "$ALIGN_DB_POSTGRES_URL" -Atqc 'SHOW server_version'
+
+      - name: Required-mode configuration self-test
+        shell: bash
+        run: |
+          set +e
+          env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
+            -p align_driver --test pkg_db_q2 postgres_required_mode_requires_configuration -- --exact
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "required PostgreSQL mode accepted a missing URL" >&2
+            exit 1
+          fi
+
+      - name: Required portable dual-driver integration
+        shell: bash
+        run: |
+          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q2 -- --nocapture
+
   build-and-test:
     name: ${{ matrix.name }}
     strategy:

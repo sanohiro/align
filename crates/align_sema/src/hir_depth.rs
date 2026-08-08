@@ -360,6 +360,7 @@ fn walk_body_records<'a>(
                 | ExprKind::ProcessCpuCount
                 | ExprKind::ProcessAbort
                 | ExprKind::RandSeed
+                | ExprKind::RawNull
                 | ExprKind::HttpClient => {}
                 ExprKind::Unary { expr, .. }
                 | ExprKind::Cast(expr)
@@ -621,6 +622,13 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(lhs), child_depth));
                     work.push((BodyRecord::Expr(rhs), child_depth));
                 }
+                ExprKind::RawPointerLoad { ptr, offset } => {
+                    work.push((BodyRecord::Expr(offset), child_depth));
+                    work.push((BodyRecord::Expr(ptr), child_depth));
+                }
+                ExprKind::StaticDescriptorView { ptr, .. } => {
+                    work.push((BodyRecord::Expr(ptr), child_depth));
+                }
                 ExprKind::MathOp { operands, .. }
                 | ExprKind::Closure {
                     captures: operands, ..
@@ -654,6 +662,10 @@ fn walk_body_records<'a>(
                     );
                 }
                 ExprKind::CallFnValue { callee, args } => {
+                    work.push((BodyRecord::Expr(callee), child_depth));
+                    work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
+                }
+                ExprKind::RawCall { callee, args, .. } => {
                     work.push((BodyRecord::Expr(callee), child_depth));
                     work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
                 }

@@ -43,10 +43,12 @@ regex_match { start: i64, end: i64 }
 receiver cleanup remains restricted at the surface, a caller binds the compiled handle before a
 method call.
 
-`regex_match` is an always-registered builtin Copy struct of two `i64` fields. The span is half-open
-and measured in UTF-8 bytes. Both offsets are character boundaries, so `text[m.start..m.end]` is a
-valid `str` slice. Returning offsets instead of a `str` keeps the result Copy/Static and avoids tying
-its region to both the regex and input.
+`regex_match` is an always-registered builtin Copy struct of two `i64` fields. Its bare alias is
+available unless a non-entry module declares a local `regex_match`; the exact builtin spelling
+there is `regex.regex_match`, which requires and counts as a use of `import std.regex`. The span is
+half-open and measured in UTF-8 bytes. Both offsets are character boundaries, so
+`text[m.start..m.end]` is a valid `str` slice. Returning offsets instead of a `str` keeps the result
+Copy/Static and avoids tying its region to both the regex and input.
 
 `find_at` starts searching at the supplied UTF-8 byte offset. Negative, past-end, or interior-of-code-
 point offsets abort as programmer errors, matching Align's checked range-slice model. End-of-input is

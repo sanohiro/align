@@ -54,6 +54,9 @@ pub use align_interface::{Driver, DriverRestriction};
 pub struct Checked {
     pub hir: align_sema::Program,
     pub static_descriptors: Vec<StaticDescriptor>,
+    /// The source-level module path that owns the entry function. Whole-program descriptor
+    /// installation uses it to distinguish the entry's plain symbols from non-entry mangled ones.
+    pub entry_unit: String,
     pub diags: Diagnostics,
 }
 fn static_interface_hash(
@@ -189,24 +192,72 @@ fn static_implementation_hash(
 /// codegen-owned byte global; application source cannot spell or inspect that field.
 fn install_static_descriptor_data(
     mir: &mut align_mir::Program,
-    is_entry: bool,
+    entry_unit: Option<&str>,
     descriptors: &[StaticDescriptor],
     artifacts: &[BuiltStaticArtifact],
 ) -> Result<(), String> {
-    use align_mir::{Block, ConstElem, Operand, Rvalue, Stmt, Term};
-    use align_sema::{IntTy, Scalar, Ty};
+    use align_ast::{BinOp, ParamMode};
+    use align_mir::{
+        Block, Const, DirectCall, Function, ImportedFn, Operand, ProgramCall, Rvalue, StaticData,
+        StaticDataRelocation, StaticDataTarget, Stmt, Term,
+    };
+    use align_sema::{IntTy, StaticDescriptorConsumer, StaticDescriptorOption, Ty, hir};
 
     if descriptors.len() != artifacts.len() {
         return Err("static descriptor/artifact count mismatch".to_string());
     }
-    let byte_ty = Ty::Int(IntTy {
-        bits: 8,
-        signed: false,
-    });
-    let byte_slice_ty = Ty::Slice(Scalar::Int(IntTy {
-        bits: 8,
-        signed: false,
-    }));
+    let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+    let u32_ty = Ty::Int(IntTy { bits: 32, signed: false });
+    let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+    let none_borrow = hir::ReturnBorrowSummary::None;
+    let none_region = hir::ReturnRegionSummary::None;
+    let no_cleanup = hir::ReturnCleanupAbi::None;
+    let program_call = |name: &str| {
+        ProgramCall::try_from_logical(name)
+            .map_err(|_| format!("generated static descriptor symbol `{name}` is invalid"))
+    };
+    let callback = |name: &str| program_call(&format!("pkg.db.internal${name}"));
+    let bind_callback = callback("bind_i64_v1")?;
+    let sqlite_version_callback = callback("require_sqlite_version_v1")?;
+    let postgres_type_callback = callback("set_postgres_i64_type_v1")?;
+    let row_count_callback = callback("validate_row_count_v1")?;
+    let validate_i64_callback = callback("validate_i64_v1")?;
+    let read_i64_callback = callback("read_i64_v1")?;
+
+    let mut ensure_import = |name: ProgramCall, params: Vec<Ty>, ret: Ty| {
+        if mir.fns.iter().any(|function| function.name == name)
+            || mir.imported_fns.iter().any(|function| function.name == name)
+        {
+            return;
+        }
+        mir.imported_fns.push(ImportedFn {
+            name,
+            param_modes: vec![ParamMode::ByValue; params.len()],
+            params,
+            ret,
+            return_borrow: none_borrow.clone(),
+            return_region: none_region.clone(),
+            return_cleanup: no_cleanup,
+        });
+    };
+    ensure_import(bind_callback.clone(), vec![Ty::Raw, u32_ty, i64_ty], i32_ty);
+    ensure_import(
+        sqlite_version_callback.clone(),
+        vec![Ty::Raw, u32_ty, u32_ty, u32_ty],
+        i32_ty,
+    );
+    ensure_import(
+        postgres_type_callback.clone(),
+        vec![Ty::Raw, u32_ty, Ty::Str],
+        i32_ty,
+    );
+    ensure_import(row_count_callback.clone(), vec![Ty::Raw, u32_ty], i32_ty);
+    ensure_import(
+        validate_i64_callback.clone(),
+        vec![Ty::Raw, u32_ty, Ty::Str],
+        i32_ty,
+    );
+    ensure_import(read_i64_callback.clone(), vec![Ty::Raw, u32_ty], i64_ty);
     let static_constructor_monomorph = |name: &str| {
         [
             "pkg.db$query_file$",
@@ -225,6 +276,7 @@ fn install_static_descriptor_data(
         .iter()
         .any(|prefix| name.starts_with(prefix))
     };
+    let mut generated_functions = Vec::new();
     for descriptor in descriptors {
         let artifact = artifacts
             .iter()
@@ -235,16 +287,21 @@ fn install_static_descriptor_data(
                     descriptor.descriptor_id
                 )
             })?;
-        let symbol = if is_entry {
+        // Whole-program MIR keeps entry-unit functions plain and prefixes every other module;
+        // per-unit MIR follows the same rule for the unit being emitted. The explicit entry-unit
+        // identity prevents a malformed/non-entry descriptor from binding to an unrelated plain
+        // function with the same item name.
+        let symbol = if entry_unit == Some(descriptor.unit.as_str()) {
             descriptor.item.clone()
         } else {
             format!("{}${}", descriptor.unit, descriptor.item)
         };
-        let function = mir
+        let function_index = mir
             .fns
-            .iter_mut()
-            .find(|function| function.name.as_str() == symbol)
+            .iter()
+            .position(|function| function.name.as_str() == symbol)
             .ok_or_else(|| format!("static descriptor function `{symbol}` is absent from MIR"))?;
+        let function = &mir.fns[function_index];
         if !function.params.is_empty() {
             return Err(format!(
                 "static descriptor function `{symbol}` unexpectedly has parameters"
@@ -263,37 +320,532 @@ fn install_static_descriptor_data(
                 "static descriptor function `{symbol}` has an invalid runtime representation"
             ));
         }
-        let bytes = artifact
-            .runtime
-            .bytes()
+        let binder_fields = match &artifact.runtime {
+            GeneratedStaticRuntime::Query(runtime) => &runtime.drivers,
+            GeneratedStaticRuntime::Command(runtime) => &runtime.drivers,
+        };
+        let first_binder = binder_fields
+            .first()
+            .ok_or_else(|| format!("static descriptor `{}` has no driver", descriptor.descriptor_id))?
+            .binder
+            .fields
+            .clone();
+        if binder_fields
             .iter()
-            .map(|byte| ConstElem::Int(i128::from(*byte)))
-            .collect();
+            .any(|driver| driver.binder.fields != first_binder)
+        {
+            return Err(format!(
+                "static descriptor `{}` has driver-dependent binder ordinals",
+                descriptor.descriptor_id
+            ));
+        }
+        let binder_supported = !first_binder.iter().any(|field| {
+            field.shape.kind != GeneratedValueKind::I64 || field.shape.nullable
+        });
+        let row_supported = match &artifact.runtime {
+            GeneratedStaticRuntime::Query(runtime) => !runtime.decoder.fields.iter().any(|field| {
+                field.shape.kind != GeneratedValueKind::I64 || field.shape.nullable
+            }),
+            GeneratedStaticRuntime::Command(_) => true,
+        };
+        let descriptor_supported = binder_supported && row_supported;
+        let emitted_binder_fields = if binder_supported {
+            first_binder.as_slice()
+        } else {
+            &[]
+        };
+
+        let binder_name = program_call(&format!("{symbol}$static_bind_v1"))?;
+        let static_name = program_call(&format!("{symbol}$static_validate_v1"))?;
+        let row_name = program_call(&format!("{symbol}$row_validate_v1"))?;
+        let decode_name = program_call(&format!("{symbol}$decode_v1"))?;
+
+        let mut binder_blocks = Vec::new();
+        for (index, field) in emitted_binder_fields.iter().enumerate() {
+            let field_value = (index * 3) as u32;
+            let status_value = field_value + 1;
+            let success_value = field_value + 2;
+            let next = (index + 1) as u32;
+            let fail = (emitted_binder_fields.len() + index + 1) as u32;
+            binder_blocks.push(Block {
+                id: index as u32,
+                stmts: vec![
+                    Stmt::Let(
+                        field_value,
+                        Rvalue::Field(1, vec![field.params_field_ordinal]),
+                    ),
+                    Stmt::Let(
+                        status_value,
+                        Rvalue::Call(
+                            DirectCall::Program(bind_callback.clone()),
+                            vec![
+                                Operand::Arg(0),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.protocol_ordinal),
+                                    u32_ty,
+                                )),
+                                Operand::Value(field_value),
+                            ],
+                        ),
+                    ),
+                    Stmt::Let(
+                        success_value,
+                        Rvalue::Bin(
+                            BinOp::Eq,
+                            Operand::Value(status_value),
+                            Operand::Const(Const::Int(0, i32_ty)),
+                        ),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Branch(Operand::Value(success_value), next, fail),
+            });
+        }
+        let binder_success = emitted_binder_fields.len() as u32;
+        binder_blocks.push(Block {
+            id: binder_success,
+            stmts: Vec::new(),
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Const(Const::Int(
+                if binder_supported { 0 } else { -1 },
+                i32_ty,
+            )))),
+        });
+        for (index, _) in emitted_binder_fields.iter().enumerate() {
+            binder_blocks.push(Block {
+                id: (emitted_binder_fields.len() + index + 1) as u32,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
+            });
+        }
+        generated_functions.push(Function {
+            name: binder_name.clone(),
+            params: vec![0, 1],
+            param_modes: vec![ParamMode::ByValue, ParamMode::Borrow],
+            borrow_mut_cleanup_slots: vec![None, None],
+            ret: i32_ty,
+            return_borrow: none_borrow.clone(),
+            return_region: none_region.clone(),
+            return_cleanup: no_cleanup,
+            slots: vec![Ty::Raw, descriptor.params_ty],
+            slot_align: vec![None, None],
+            value_tys: emitted_binder_fields
+                .iter()
+                .flat_map(|_| [i64_ty, i32_ty, Ty::Bool])
+                .collect(),
+            blocks: binder_blocks,
+            entry: 0,
+            exportable: false,
+        });
+
+        let mut static_calls: Vec<(ProgramCall, Vec<Operand>, Option<String>)> = Vec::new();
+        for option in descriptor
+            .static_options
+            .iter()
+            .filter(|_| descriptor_supported)
+        {
+            match option {
+                StaticDescriptorOption::Check(_) => {}
+                StaticDescriptorOption::SQLiteRequireVersionAtLeast { major, minor, patch } => {
+                    static_calls.push((
+                        sqlite_version_callback.clone(),
+                        vec![
+                            Operand::Arg(0),
+                            Operand::Const(Const::Int(i128::from(*major), u32_ty)),
+                            Operand::Const(Const::Int(i128::from(*minor), u32_ty)),
+                            Operand::Const(Const::Int(i128::from(*patch), u32_ty)),
+                        ],
+                        None,
+                    ));
+                }
+                StaticDescriptorOption::PostgreSQLParameterType {
+                    parameter_name,
+                    canonical_type_name,
+                } => {
+                    let align_sema::StaticContractType::Named { path, args } =
+                        &descriptor.params_contract.root
+                    else {
+                        return Err("generated parameter contract root is not nominal".to_string());
+                    };
+                    let fields = descriptor
+                        .params_contract
+                        .definitions
+                        .iter()
+                        .find(|definition| definition.path == *path && definition.args == *args)
+                        .and_then(|definition| match &definition.kind {
+                            align_sema::StaticContractDefinitionBody::Struct { fields } => {
+                                Some(fields.as_slice())
+                            }
+                            align_sema::StaticContractDefinitionBody::Sum { .. } => None,
+                        })
+                        .ok_or_else(|| "generated parameter contract is not a struct".to_string())?;
+                    let field = first_binder
+                        .iter()
+                        .find(|field| {
+                            fields
+                                .get(field.params_field_ordinal as usize)
+                                .is_some_and(|field| field.name == *parameter_name)
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "static descriptor `{}` has an unknown PostgreSQL parameter `{parameter_name}`",
+                                descriptor.descriptor_id
+                            )
+                        })?;
+                    static_calls.push((
+                        postgres_type_callback.clone(),
+                        vec![
+                            Operand::Arg(0),
+                            Operand::Const(Const::Int(i128::from(field.protocol_ordinal), u32_ty)),
+                            Operand::Value(0),
+                        ],
+                        Some(canonical_type_name.clone()),
+                    ));
+                }
+            }
+        }
+        let mut static_blocks = Vec::new();
+        let mut static_value_tys = Vec::new();
+        let static_call_count = static_calls.len();
+        for (index, (target, mut args, type_name)) in static_calls.into_iter().enumerate() {
+            let mut stmts = Vec::new();
+            if let Some(canonical_type_name) = type_name {
+                stmts.push(Stmt::Let(
+                    (index * 3) as u32,
+                    Rvalue::StrLit(canonical_type_name),
+                ));
+                *args.last_mut().expect("PostgreSQL option has type name") =
+                    Operand::Value((index * 3) as u32);
+                static_value_tys.push(Ty::Str);
+            } else {
+                static_value_tys.push(Ty::Unit);
+            }
+            let status = (index * 3 + 1) as u32;
+            let success = status + 1;
+            stmts.push(Stmt::Let(status, Rvalue::Call(DirectCall::Program(target), args)));
+            stmts.push(Stmt::Let(
+                success,
+                Rvalue::Bin(
+                    BinOp::Eq,
+                    Operand::Value(status),
+                    Operand::Const(Const::Int(0, i32_ty)),
+                ),
+            ));
+            static_value_tys.extend([i32_ty, Ty::Bool]);
+            static_blocks.push(Block {
+                id: index as u32,
+                stmts,
+                stmt_lines: Vec::new(),
+                term: Term::Branch(
+                    Operand::Value(success),
+                    (index + 1) as u32,
+                    (static_call_count + index + 1) as u32,
+                ),
+            });
+        }
+        let static_count = static_blocks.len();
+        static_blocks.push(Block {
+            id: static_count as u32,
+            stmts: Vec::new(),
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Const(Const::Int(
+                if descriptor_supported { 0 } else { -1 },
+                i32_ty,
+            )))),
+        });
+        for index in 0..static_count {
+            static_blocks.push(Block {
+                id: (static_count + index + 1) as u32,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
+            });
+        }
+        generated_functions.push(Function {
+            name: static_name.clone(),
+            params: vec![0],
+            param_modes: vec![ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![None],
+            ret: i32_ty,
+            return_borrow: none_borrow.clone(),
+            return_region: none_region.clone(),
+            return_cleanup: no_cleanup,
+            slots: vec![Ty::Raw],
+            slot_align: vec![None],
+            value_tys: static_value_tys,
+            blocks: static_blocks,
+            entry: 0,
+            exportable: false,
+        });
+
+        let mut header = vec![0u8; 96];
+        header[0..4].copy_from_slice(&1u32.to_le_bytes());
+        header[4] = match descriptor.consumer {
+            StaticDescriptorConsumer::Query => 0,
+            StaticDescriptorConsumer::Command => 1,
+        };
+        let mut driver_mask = 0u8;
+        let mut sqlite_sql = None;
+        let mut postgres_sql = None;
+        for driver in binder_fields {
+            match driver.driver {
+                Driver::SQLite => {
+                    driver_mask |= 1;
+                    sqlite_sql = Some(driver.wire_sql.clone());
+                }
+                Driver::PostgreSQL => {
+                    driver_mask |= 2;
+                    postgres_sql = Some(driver.wire_sql.clone());
+                }
+            }
+        }
+        header[5] = driver_mask;
+        header[24..32].copy_from_slice(&(descriptor.descriptor_id.len() as i64).to_le_bytes());
+        if let Some(sql) = &sqlite_sql {
+            header[40..48].copy_from_slice(&(sql.len() as i64).to_le_bytes());
+        }
+        if let Some(sql) = &postgres_sql {
+            header[56..64].copy_from_slice(&(sql.len() as i64).to_le_bytes());
+        }
+        let mut relocations = vec![
+            StaticDataRelocation {
+                offset: 8,
+                target: StaticDataTarget::Bytes {
+                    bytes: artifact.runtime.bytes().to_vec(),
+                    nul_terminated: false,
+                },
+            },
+            StaticDataRelocation {
+                offset: 16,
+                target: StaticDataTarget::Bytes {
+                    bytes: descriptor.descriptor_id.as_bytes().to_vec(),
+                    nul_terminated: false,
+                },
+            },
+            StaticDataRelocation {
+                offset: 64,
+                target: StaticDataTarget::Function(binder_name),
+            },
+            StaticDataRelocation {
+                offset: 72,
+                target: StaticDataTarget::Function(static_name),
+            },
+        ];
+        if let Some(sql) = sqlite_sql {
+            relocations.push(StaticDataRelocation {
+                offset: 32,
+                target: StaticDataTarget::Bytes {
+                    bytes: sql,
+                    nul_terminated: true,
+                },
+            });
+        }
+        if let Some(sql) = postgres_sql {
+            relocations.push(StaticDataRelocation {
+                offset: 48,
+                target: StaticDataTarget::Bytes {
+                    bytes: sql,
+                    nul_terminated: true,
+                },
+            });
+        }
+
+        if descriptor.consumer == StaticDescriptorConsumer::Query {
+            let GeneratedStaticRuntime::Query(runtime) = &artifact.runtime else {
+                return Err("query descriptor has command runtime data".to_string());
+            };
+            let mut validation_calls = Vec::new();
+            if row_supported {
+                validation_calls.push((
+                    row_count_callback.clone(),
+                    vec![
+                        Operand::Arg(0),
+                        Operand::Const(Const::Int(runtime.decoder.fields.len() as i128, u32_ty)),
+                    ],
+                    None,
+                ));
+            }
+            for field in runtime.decoder.fields.iter().filter(|_| row_supported) {
+                let expected_name = runtime
+                    .query_meta
+                    .plan
+                    .columns
+                    .get(field.row_field_ordinal as usize)
+                    .ok_or_else(|| "generated row metadata ordinal is out of range".to_string())?
+                    .source_alias
+                    .clone();
+                validation_calls.push((
+                    validate_i64_callback.clone(),
+                    vec![
+                        Operand::Arg(0),
+                        Operand::Const(Const::Int(i128::from(field.row_field_ordinal), u32_ty)),
+                        Operand::Value(0),
+                    ],
+                    Some(expected_name),
+                ));
+            }
+            let mut blocks = Vec::new();
+            let mut values = Vec::new();
+            for (index, (target, mut args, name)) in validation_calls.into_iter().enumerate() {
+                let base = (index * 3) as u32;
+                let mut stmts = Vec::new();
+                if let Some(name) = name {
+                    stmts.push(Stmt::Let(base, Rvalue::StrLit(name)));
+                    *args.last_mut().expect("row callback has name") = Operand::Value(base);
+                    values.push(Ty::Str);
+                } else {
+                    values.push(Ty::Unit);
+                }
+                stmts.push(Stmt::Let(
+                    base + 1,
+                    Rvalue::Call(DirectCall::Program(target), args),
+                ));
+                stmts.push(Stmt::Let(
+                    base + 2,
+                    Rvalue::Bin(
+                        BinOp::Eq,
+                        Operand::Value(base + 1),
+                        Operand::Const(Const::Int(0, i32_ty)),
+                    ),
+                ));
+                values.extend([i32_ty, Ty::Bool]);
+                blocks.push(Block {
+                    id: index as u32,
+                    stmts,
+                    stmt_lines: Vec::new(),
+                    term: Term::Branch(
+                        Operand::Value(base + 2),
+                        (index + 1) as u32,
+                        (runtime.decoder.fields.len() + 2 + index) as u32,
+                    ),
+                });
+            }
+            let success = blocks.len();
+            blocks.push(Block {
+                id: success as u32,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(
+                    if row_supported { 0 } else { -1 },
+                    i32_ty,
+                )))),
+            });
+            for index in 0..success {
+                blocks.push(Block {
+                    id: (success + index + 1) as u32,
+                    stmts: Vec::new(),
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
+                });
+            }
+            generated_functions.push(Function {
+                name: row_name.clone(),
+                params: vec![0],
+                param_modes: vec![ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None],
+                ret: i32_ty,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw],
+                slot_align: vec![None],
+                value_tys: values,
+                blocks,
+                entry: 0,
+                exportable: false,
+            });
+
+            let row_ty = descriptor
+                .row_ty
+                .ok_or_else(|| "query descriptor has no row type".to_string())?;
+            let mut decode_stmts = Vec::new();
+            let mut decode_values = Vec::new();
+            for (index, field) in runtime.decoder.fields.iter().filter(|_| row_supported).enumerate() {
+                decode_values.push(i64_ty);
+                decode_stmts.push(Stmt::Let(
+                    index as u32,
+                    Rvalue::Call(
+                        DirectCall::Program(read_i64_callback.clone()),
+                        vec![
+                            Operand::Arg(0),
+                            Operand::Const(Const::Int(i128::from(field.row_field_ordinal), u32_ty)),
+                        ],
+                    ),
+                ));
+                decode_stmts.push(Stmt::StoreField(
+                    1,
+                    vec![field.row_field_ordinal],
+                    Operand::Value(index as u32),
+                ));
+            }
+            let result_value = decode_values.len() as u32;
+            if row_supported {
+                decode_values.push(row_ty);
+                decode_stmts.push(Stmt::Let(result_value, Rvalue::Load(1)));
+            }
+            generated_functions.push(Function {
+                name: decode_name.clone(),
+                params: vec![0],
+                param_modes: vec![ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None],
+                ret: row_ty,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw, row_ty],
+                slot_align: vec![None, None],
+                value_tys: decode_values,
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: decode_stmts,
+                    stmt_lines: Vec::new(),
+                    term: if row_supported {
+                        Term::Return(Some(Operand::Value(result_value)))
+                    } else {
+                        Term::Unreachable
+                    },
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            relocations.push(StaticDataRelocation {
+                offset: 80,
+                target: StaticDataTarget::Function(row_name),
+            });
+            relocations.push(StaticDataRelocation {
+                offset: 88,
+                target: StaticDataTarget::Function(decode_name),
+            });
+        }
+
+        let function = &mut mir.fns[function_index];
         function.params.clear();
         function.param_modes.clear();
         function.borrow_mut_cleanup_slots.clear();
         function.slots = vec![function.ret];
         function.slot_align = vec![None];
-        function.value_tys = vec![byte_slice_ty, Ty::Raw, function.ret];
+        function.value_tys = vec![Ty::Raw, function.ret];
         function.blocks = vec![Block {
             id: 0,
             stmts: vec![
                 Stmt::Let(
                     0,
-                    Rvalue::ConstArray {
-                        elems: bytes,
-                        elem: byte_ty,
-                    },
+                    Rvalue::StaticData(Box::new(StaticData {
+                        bytes: header,
+                        align: 8,
+                        relocations,
+                    })),
                 ),
-                Stmt::Let(1, Rvalue::SlicePtr(Operand::Value(0))),
-                Stmt::StoreField(0, vec![0], Operand::Value(1)),
-                Stmt::Let(2, Rvalue::Load(0)),
+                Stmt::StoreField(0, vec![0], Operand::Value(0)),
+                Stmt::Let(1, Rvalue::Load(0)),
             ],
             stmt_lines: Vec::new(),
-            term: Term::Return(Some(Operand::Value(2))),
+            term: Term::Return(Some(Operand::Value(1))),
         }];
         function.entry = 0;
     }
+    mir.fns.extend(generated_functions);
     // The source constructor is legal only as the descriptor's complete body. Replacing every such
     // body therefore removes the only possible call to its consumer-side generic monomorph. Do not
     // emit a dormant `process.abort` constructor or make a consumer instantiate Query internals.
@@ -303,6 +855,39 @@ fn install_static_descriptor_data(
         format!("generated descriptor MIR has an invalid function-type graph: {reason}")
     })?;
     Ok(())
+}
+
+/// Lower a checked whole program and install its compiler-owned static descriptor data.
+///
+/// The normal CLI build uses the per-unit path, which installs descriptors while producing each
+/// producer artifact. The whole-program path remains a supported inspection and differential-test
+/// surface, so it needs the same post-lowering descriptor replacement before codegen.
+pub fn lower_to_mir_with_static_descriptors(
+    checked: &Checked,
+    source_map: &mut SourceMap,
+    project_root: &std::path::Path,
+) -> Result<align_mir::Program, String> {
+    let mut mir = lower_to_mir(&checked.hir);
+    if checked.static_descriptors.is_empty() {
+        return Ok(mir);
+    }
+    let resolution_digest = align_interface::codegen_impl_hash(&mir);
+    let resolved = resolve_static_descriptors(
+        project_root,
+        source_map,
+        &checked.static_descriptors,
+        resolution_digest,
+    )
+    .map_err(|error| error.to_string())?;
+    let artifacts = build_static_artifacts(&checked.static_descriptors, &resolved)
+        .map_err(|error| error.to_string())?;
+    install_static_descriptor_data(
+        &mut mir,
+        Some(checked.entry_unit.as_str()),
+        &checked.static_descriptors,
+        &artifacts,
+    )?;
+    Ok(mir)
 }
 
 /// lexer -> parser -> sema for the entry file plus its transitively-imported **user** modules
@@ -484,6 +1069,11 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     Checked {
         hir: checked.program,
         static_descriptors: checked.static_descriptors,
+        entry_unit: loaded
+            .iter()
+            .find(|unit| unit.is_entry)
+            .map(|unit| unit.path.clone())
+            .unwrap_or_else(|| "main".to_string()),
         diags,
     }
 }
@@ -844,7 +1434,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 };
                 if let Err(reason) = install_static_descriptor_data(
                     &mut mir,
-                    u.is_entry,
+                    u.is_entry.then_some(u.path.as_str()),
                     &static_descriptors,
                     &static_artifacts,
                 ) {
@@ -2071,6 +2661,30 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
     link_objects(&[obj], exe, link_libs, profile)
 }
 
+/// Return the link-library list with an ordered supported libpq closure tail.
+///
+/// MIR and per-unit capability unions intentionally preserve first-seen order for deterministic
+/// identity. That order can put a `crypto` request from an unrelated module before `pq`, however;
+/// a static ELF linker has already scanned that archive by the time libpq introduces its symbols.
+/// When `pq` is present, preserve the complete original list and append one dependent-first
+/// closure tail. Repetition is intentional: a library after `pq` may itself introduce OpenSSL or
+/// compression references, so the tail must be after every such suffix library. Programs without
+/// `pq` retain their existing order and therefore keep the established `extern "C" link(...)`
+/// behavior.
+pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
+    const LIBPQ_CLOSURE: [&str; 5] = ["pq", "ssl", "crypto", "zstd", "z"];
+    if !link_libs.iter().any(|library| library == "pq") {
+        return link_libs.to_vec();
+    }
+    let mut ordered = link_libs.to_vec();
+    for library in LIBPQ_CLOSURE {
+        if link_libs.iter().any(|candidate| candidate == library) {
+            ordered.push(library.to_string());
+        }
+    }
+    ordered
+}
+
 /// Link one or more object files (plus the Align runtime and the always-linked C libraries) into an
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
@@ -2099,6 +2713,7 @@ pub fn link_objects_instrumented(
 fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
+    let ordered_link_libs = order_link_libs(link_libs);
     let mut cmd = std::process::Command::new("cc");
     for obj in objs {
         cmd.arg(obj);
@@ -2152,16 +2767,17 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
     // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user
     // declared (validated in sema). All go AFTER the objects/archive that reference them (`-l`
-    // resolves left-to-right against preceding inputs). Each name is a single `-l<name>` argv (no
+    // resolves left-to-right against preceding inputs). The supported libpq closure is normalized
+    // by `order_link_libs` immediately before this loop. Each name is a single `-l<name>` argv (no
     // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
-    for lib in link_libs {
+    for lib in &ordered_link_libs {
         cmd.arg(format!("-l{lib}"));
     }
     let status = cmd
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
     if !status.success() {
-        return Err(link_failure_message(status.code(), link_libs));
+        return Err(link_failure_message(status.code(), &ordered_link_libs));
     }
     // Mach-O strip: ld64 has no `--strip-all`, so the size profiles run the external `strip` on the
     // linked image. `strip` ships with the same Xcode CLT as the `cc`/`ld` above (the existing
@@ -2490,6 +3106,48 @@ mod tests {
     fn support_libs_are_pinned_per_format() {
         assert_eq!(support_libs(ObjectFormat::Elf), ["-lpthread", "-ldl", "-lm"]);
         assert_eq!(support_libs(ObjectFormat::MachO), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn libpq_closure_is_ordered_after_unrelated_crypto_requests() {
+        let input = ["crypto", "z", "zstd", "sqlite3", "pq", "ssl"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order_link_libs(&input),
+            [
+                "crypto",
+                "z",
+                "zstd",
+                "sqlite3",
+                "pq",
+                "ssl",
+                "pq",
+                "ssl",
+                "crypto",
+                "zstd",
+                "z",
+            ]
+        );
+    }
+
+    #[test]
+    fn link_order_without_libpq_is_unchanged() {
+        let input = ["crypto", "z", "zstd"].into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(order_link_libs(&input), input);
+    }
+
+    #[test]
+    fn libpq_closure_preserves_libraries_after_pq() {
+        let input = ["pq", "ldap", "ssl", "crypto"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order_link_libs(&input),
+            ["pq", "ldap", "ssl", "crypto", "pq", "ssl", "crypto"]
+        );
     }
 
     #[test]

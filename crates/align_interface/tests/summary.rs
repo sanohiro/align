@@ -737,6 +737,33 @@ fn resource_metadata_round_trips_and_rejects_each_corruption_class() {
 }
 
 #[test]
+fn summary_source_deduplicates_builtin_and_dependency_imports() {
+    let sums = summaries(&[
+        unit(
+            "lib",
+            false,
+            "module lib\n\
+             import std.crypto\n\
+             import std.regex\n\
+             pub fn builtin_value(p: crypto.argon2_params, m: regex.regex_match) -> i64 = p.parallelism + m.end\n",
+        ),
+        unit("main", true, "module main\nimport lib\nfn main() -> i32 = 0\n"),
+    ]);
+    let summary = find(&sums, "lib");
+    let rendered = summary_to_source(summary, &["std.regex", "std.crypto"]).unwrap();
+    assert_eq!(
+        rendered.lines().filter(|line| *line == "import std.crypto").count(),
+        1,
+        "builtin capability import must not be repeated when it is also a dependency"
+    );
+    assert_eq!(
+        rendered.lines().filter(|line| *line == "import std.regex").count(),
+        1,
+        "builtin capability import must not be repeated when it is also a dependency"
+    );
+}
+
+#[test]
 fn deserialize_unknown_version_fails_closed() {
     let sums = one("pub fn f() -> i64 = 1\nfn main() -> i32 = 0\n");
     let mut bytes = serialize(&sums[0]);
@@ -922,7 +949,14 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
         "owned builtin handles must not be mistaken for generic nominal types"
     );
 
-    for builtin in ["Error", "argon2_params", "regex_match"] {
+    for builtin in [
+        "Error",
+        "core.Error",
+        "argon2_params",
+        "crypto.argon2_params",
+        "regex_match",
+        "regex.regex_match",
+    ] {
         let mut builtin_root = non_borrowing_root.clone();
         builtin_root.fns[0].params[0].ty = IType::Named {
             path: builtin.to_string(),
@@ -956,6 +990,24 @@ fn semantic_import_rejects_disagreeing_l2b_a1_summaries() {
         validate_for_import(&summary),
         Err(ImportCompatibilityError::ReturnSummaryDisagreement)
     );
+}
+
+#[test]
+fn semantic_import_prefers_local_nominals_over_builtin_aliases() {
+    for alias in ["Error", "argon2_params", "regex_match"] {
+        let source = format!(
+            "module alias\npub {alias} {{ view: str }}\npub fn project(value: {alias}) -> str = value.view\n"
+        );
+        let produced = summaries(&[
+            unit("alias", false, source),
+            unit("main", true, "module main\nfn main() -> i32 = 0\n"),
+        ]);
+        assert_eq!(
+            validate_for_import(find(&produced, "alias")),
+            Ok(()),
+            "semantic import must analyze local `{alias}` rather than the non-borrowing builtin alias"
+        );
+    }
 }
 
 #[test]
@@ -1703,59 +1755,27 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
         args,
     };
 
-    for reserved in ["Error", "argon2_params", "regex_match"] {
-        let mut reserved_struct = base.clone();
-        reserved_struct.structs[0].name = reserved.to_string();
+    for alias in ["Error", "argon2_params", "regex_match"] {
+        let mut local_struct = base.clone();
+        local_struct.structs[0].name = alias.to_string();
+        sync_generic_type_bodies(&mut local_struct);
         assert_eq!(
-            validate_for_import(&reserved_struct),
-            Err(ImportCompatibilityError::ReservedLocalType(
-                reserved.to_string()
-            )),
-            "producer-reserved struct name `{reserved}` must reject before type-shape validation"
+            validate_for_import(&local_struct),
+            Ok(()),
+            "non-entry local struct name `{alias}` must remain a valid nominal"
         );
 
-        let mut reserved_enum = base.clone();
+        let mut local_enum = base.clone();
         let mut enumeration =
             one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
-        enumeration.name = reserved.to_string();
-        reserved_enum.enums.push(enumeration);
+        enumeration.name = alias.to_string();
+        local_enum.enums.push(enumeration);
         assert_eq!(
-            validate_for_import(&reserved_enum),
-            Err(ImportCompatibilityError::ReservedLocalType(
-                reserved.to_string()
-            )),
-            "producer-reserved sum-type name `{reserved}` must reject before type-shape validation"
+            validate_for_import(&local_enum),
+            Ok(()),
+            "non-entry local sum-type name `{alias}` must remain a valid nominal"
         );
     }
-
-    let mut reserved_before_duplicate = base.clone();
-    reserved_before_duplicate.structs[0].name = "Error".to_string();
-    reserved_before_duplicate
-        .structs
-        .push(reserved_before_duplicate.structs[0].clone());
-    assert_eq!(
-        validate_for_import(&reserved_before_duplicate),
-        Err(ImportCompatibilityError::ReservedLocalType(
-            "Error".to_string()
-        )),
-        "reserved-local validation precedes duplicate-local validation"
-    );
-
-    let mut later_reserved_after_duplicate = base.clone();
-    later_reserved_after_duplicate
-        .structs
-        .push(later_reserved_after_duplicate.structs[0].clone());
-    let mut reserved_enum =
-        one("pub Choice { A }\nfn main() -> i32 = 0\n").remove(0).enums.remove(0);
-    reserved_enum.name = "Error".to_string();
-    later_reserved_after_duplicate.enums.push(reserved_enum);
-    assert_eq!(
-        validate_for_import(&later_reserved_after_duplicate),
-        Err(ImportCompatibilityError::ReservedLocalType(
-            "Error".to_string()
-        )),
-        "the complete definition set must be scanned for reserved names before an earlier duplicate"
-    );
 
     let mut duplicate_local = base.clone();
     duplicate_local.structs.push(duplicate_local.structs[0].clone());

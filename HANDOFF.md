@@ -1307,7 +1307,8 @@ U+0000 rejection precedence for identifier components. Duplicate constraint name
 `key_ordinal`; its complete key signature includes action/deferral/validation fields. The L5/D1
 artifact has an exact top-level/nested canonical codec, checked-in Query/command byte+digest
 goldens, structural reachable-definition Params/Row fingerprints, every binder/decoder ABI version,
-and a producer-owned QueryMeta plan/thunk. D2 owns SQLite's single active-execution lease. D3/D5 use
+and a producer-owned QueryMeta plan. D12 owns the materializer thunk ABI/code and descriptor-header
+version with its first consumer. D2 owns SQLite's single active-execution lease. D3/D5 use
 the exact derived metadata path, fail-closed canonical JSON/identity codec, explicit schema ID for
 mutable targets, and independent goldens; D3/D11 share the versioned migration/schema-identity
 codec. D0 records the actual

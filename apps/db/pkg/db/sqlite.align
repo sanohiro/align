@@ -2,6 +2,36 @@ module pkg.db.sqlite
 
 import std.process
 import pkg.db
+import pkg.db.internal.resource
+import pkg.db.internal.descriptor
+import pkg.db.internal.sqlite
+
+extern "C" {
+  fn memcpy(destination: raw, source: str, count: i64) -> raw
+}
+
+extern "C" link("sqlite3") {
+  fn sqlite3_open_v2(filename: raw, database_out: raw, flags: i32, vfs: raw) -> i32
+  fn sqlite3_close_v2(database: raw) -> i32
+  fn sqlite3_busy_timeout(database: raw, milliseconds: i32) -> i32
+  fn sqlite3_extended_result_codes(database: raw, enabled: i32) -> i32
+  fn sqlite3_exec(database: raw, sql: raw, callback: raw, argument: raw, error_out: raw) -> i32
+  fn sqlite3_errcode(database: raw) -> i32
+  fn sqlite3_extended_errcode(database: raw) -> i32
+  fn sqlite3_errmsg(database: raw) -> raw
+}
+
+SQLITE_OK: i32 := 0
+SQLITE_OPEN_READONLY: i32 := 1
+SQLITE_OPEN_READWRITE: i32 := 2
+SQLITE_OPEN_CREATE: i32 := 4
+SQLITE_OPEN_URI: i32 := 64
+SQLITE_OPEN_NOMUTEX: i32 := 32768
+SQLITE_OPEN_FULLMUTEX: i32 := 65536
+SQLITE_OPEN_SHAREDCACHE: i32 := 131072
+SQLITE_OPEN_PRIVATECACHE: i32 := 262144
+SQLITE_BUSY_DEFAULT_MS: i32 := 0
+SQLITE_TIMEOUT_MAX_MS: i64 := 2147483647
 
 pub QueryOption {
   RequireVersionAtLeast(u32, u32, u32)
@@ -9,6 +39,146 @@ pub QueryOption {
 
 pub CommandOption {
   RequireVersionAtLeast(u32, u32, u32)
+}
+
+pub ConnectOption {
+  OpenReadOnly
+  OpenReadWrite
+  Create
+  Uri
+  PrivateCache
+  SharedCache
+  NoMutex
+  FullMutex
+  BusyTimeoutNs(i64)
+  Pragma(str, str)
+}
+
+pub ExecuteOption {
+  BusyTimeoutNs(i64)
+}
+
+fn contract_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Unsupported(
+  pkg.db.ContractError {
+    query_id: None,
+    item: item.clone(),
+    message: message.clone(),
+  },
+)
+
+fn contains_nul(value: str) -> bool {
+  bytes := value.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break false }
+    if bytes[i] == 0 { break true }
+    i = i + 1
+  }
+}
+
+fn c_string(value: str) -> raw {
+  unsafe {
+    output := raw.alloc(value.len() + 1)
+    memcpy(output, value, value.len())
+    nul: u8 := 0
+    raw.store(output, value.len(), nul)
+    return output
+  }
+}
+
+fn copy_c_string(pointer: raw) -> string {
+  unsafe {
+    if pointer.is_null() { return "".clone() }
+    mut output := buffer(64)
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else "invalid UTF-8 in SQLite error"
+    return text.clone()
+  }
+}
+
+fn sqlite_error(database: raw) -> pkg.db.Error {
+  unsafe {
+    primary := sqlite3_errcode(database)
+    extended := sqlite3_extended_errcode(database)
+    mut code_builder := builder()
+    code_builder.write_int(primary)
+    code := code_builder.to_string()
+    message := copy_c_string(sqlite3_errmsg(database))
+    return pkg.db.Error.Connection(pkg.db.NativeError {
+      driver: pkg.db.Driver.SQLite,
+      code: Some(code),
+      extended_code: Some(extended as i64),
+      sqlstate: None,
+      message: message,
+      detail: None,
+      constraint: None,
+      table: None,
+      column: None,
+    })
+  }
+}
+
+fn timeout_ms(ns: i64) -> Result<i32, pkg.db.Error> {
+  if ns <= 0 {
+    return Err(contract_error(
+      "sqlite.connect.busy_timeout_ns",
+      "SQLite busy timeout must be positive",
+    ))
+  }
+  mut milliseconds := ns / 1000000
+  if ns % 1000000 != 0 { milliseconds = milliseconds + 1 }
+  if milliseconds > SQLITE_TIMEOUT_MAX_MS {
+    return Err(contract_error(
+      "sqlite.connect.busy_timeout_ns",
+      "SQLite busy timeout exceeds the native i32 millisecond range",
+    ))
+  }
+  return Ok(milliseconds as i32)
+}
+
+fn pragma_name_valid(name: str) -> bool {
+  bytes := name.bytes()
+  if bytes.len() == 0 { return false }
+  first := bytes[0]
+  first_alpha := (first >= 65 && first <= 90) || (first >= 97 && first <= 122)
+  if !first_alpha && first != 95 { return false }
+  mut i := 1
+  loop {
+    if i >= bytes.len() { break true }
+    byte := bytes[i]
+    alpha := (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    digit := byte >= 48 && byte <= 57
+    if !alpha && !digit && byte != 95 { break false }
+    i = i + 1
+  }
+}
+
+fn pragma_sql(name: str, value: str) -> string {
+  mut output := builder()
+  output.write("PRAGMA ")
+  output.write(name)
+  output.write(" = '")
+  bytes := value.bytes()
+  mut start := 0
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break }
+    if bytes[i] == 39 {
+      output.write(value[start..i])
+      output.write("''")
+      start = i + 1
+    }
+    i = i + 1
+  }
+  output.write(value[start..value.len()])
+  output.write("'")
+  return output.to_string()
 }
 
 pub fn query_file<P, R>(
@@ -32,3 +202,287 @@ pub fn command<P>(
   options: slice<pkg.db.CommandOption>,
   native: slice<CommandOption>,
 ) -> pkg.db.command<P> = process.abort()
+
+pub fn connect(path: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, pkg.db.Error> {
+  if contains_nul(path) {
+    return Err(contract_error("sqlite.connect.path", "SQLite path contains U+0000"))
+  }
+
+  mut flags: i32 := SQLITE_OPEN_READWRITE
+  mut saw_read_only := false
+  mut saw_read_write := false
+  mut saw_create := false
+  mut saw_private_cache := false
+  mut saw_shared_cache := false
+  mut saw_no_mutex := false
+  mut saw_full_mutex := false
+  mut saw_busy_timeout := false
+  mut busy_ms: i32 := SQLITE_BUSY_DEFAULT_MS
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      OpenReadOnly => {
+        if saw_read_only || saw_read_write || saw_create {
+          return Err(contract_error(
+            "sqlite.connect.open_mode",
+            "SQLite read-only conflicts with read-write or create",
+          ))
+        }
+        saw_read_only = true
+        flags = (flags & ~SQLITE_OPEN_READWRITE) | SQLITE_OPEN_READONLY
+      }
+      OpenReadWrite => {
+        if saw_read_write || saw_read_only {
+          return Err(contract_error(
+            "sqlite.connect.open_mode",
+            "SQLite read-write conflicts with another open mode",
+          ))
+        }
+        saw_read_write = true
+      }
+      Create => {
+        if saw_create || saw_read_only {
+          return Err(contract_error(
+            "sqlite.connect.create",
+            "SQLite create conflicts with read-only or another create option",
+          ))
+        }
+        saw_create = true
+        flags = flags | SQLITE_OPEN_CREATE
+      }
+      Uri => {
+        if flags & SQLITE_OPEN_URI != 0 {
+          return Err(contract_error("sqlite.connect.uri", "duplicate SQLite URI option"))
+        }
+        flags = flags | SQLITE_OPEN_URI
+      }
+      PrivateCache => {
+        if saw_private_cache || saw_shared_cache {
+          return Err(contract_error(
+            "sqlite.connect.cache",
+            "SQLite private cache conflicts with shared cache or a duplicate option",
+          ))
+        }
+        saw_private_cache = true
+        flags = flags | SQLITE_OPEN_PRIVATECACHE
+      }
+      SharedCache => {
+        if saw_shared_cache || saw_private_cache {
+          return Err(contract_error(
+            "sqlite.connect.cache",
+            "SQLite shared cache conflicts with private cache or a duplicate option",
+          ))
+        }
+        saw_shared_cache = true
+        flags = flags | SQLITE_OPEN_SHAREDCACHE
+      }
+      NoMutex => {
+        if saw_no_mutex || saw_full_mutex {
+          return Err(contract_error(
+            "sqlite.connect.mutex",
+            "SQLite no-mutex conflicts with full-mutex or a duplicate option",
+          ))
+        }
+        saw_no_mutex = true
+        flags = flags | SQLITE_OPEN_NOMUTEX
+      }
+      FullMutex => {
+        if saw_full_mutex || saw_no_mutex {
+          return Err(contract_error(
+            "sqlite.connect.mutex",
+            "SQLite full-mutex conflicts with no-mutex or a duplicate option",
+          ))
+        }
+        saw_full_mutex = true
+        flags = flags | SQLITE_OPEN_FULLMUTEX
+      }
+      BusyTimeoutNs(ns) => {
+        if saw_busy_timeout {
+          return Err(contract_error(
+            "sqlite.connect.busy_timeout_ns",
+            "duplicate SQLite busy timeout",
+          ))
+        }
+        saw_busy_timeout = true
+        busy_ms = timeout_ms(ns)?
+      }
+      Pragma(name, value) => {
+        if !pragma_name_valid(name) {
+          return Err(contract_error(
+            "sqlite.connect.pragma.name",
+            "SQLite PRAGMA name must match [A-Za-z_][A-Za-z0-9_]*",
+          ))
+        }
+        if contains_nul(value) {
+          return Err(contract_error(
+            "sqlite.connect.pragma.value",
+            "SQLite PRAGMA value contains U+0000",
+          ))
+        }
+        mut earlier := 0
+        loop {
+          if earlier >= i { break }
+          match options[earlier] {
+            Pragma(previous, _) => {
+              if previous.eq_ignore_ascii_case(name) {
+                return Err(contract_error(
+                  "sqlite.connect.pragma.name",
+                  "duplicate SQLite PRAGMA name",
+                ))
+              }
+            }
+            _ => {}
+          }
+          earlier = earlier + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  unsafe {
+    filename := c_string(path)
+    database_out := raw.alloc(8)
+    raw.store(database_out, 0, raw.null())
+    status := sqlite3_open_v2(filename, database_out, flags, raw.null())
+    raw.free(filename)
+    database: raw := raw.load(database_out, 0)
+    raw.free(database_out)
+    if status != SQLITE_OK || database.is_null() {
+      if database.is_null() {
+        return Err(contract_error("sqlite.connect.open", "SQLite returned a null connection"))
+      }
+      failure := sqlite_error(database)
+      closed := sqlite3_close_v2(database)
+      return Err(failure)
+    }
+
+    extended_status := sqlite3_extended_result_codes(database, 1)
+    if extended_status != SQLITE_OK {
+      failure := sqlite_error(database)
+      closed := sqlite3_close_v2(database)
+      return Err(failure)
+    }
+    if saw_busy_timeout {
+      timeout_status := sqlite3_busy_timeout(database, busy_ms)
+      if timeout_status != SQLITE_OK {
+        failure := sqlite_error(database)
+        closed := sqlite3_close_v2(database)
+        return Err(failure)
+      }
+    }
+
+    mut pragma_index := 0
+    loop {
+      if pragma_index >= options.len() { break }
+      match options[pragma_index] {
+        Pragma(name, value) => {
+          sql := pragma_sql(name, value)
+          sql_c := c_string(sql)
+          pragma_status := sqlite3_exec(
+            database,
+            sql_c,
+            raw.null(),
+            raw.null(),
+            raw.null(),
+          )
+          raw.free(sql_c)
+          if pragma_status != SQLITE_OK {
+            failure := sqlite_error(database)
+            closed := sqlite3_close_v2(database)
+            return Err(failure)
+          }
+        }
+        _ => {}
+      }
+      pragma_index = pragma_index + 1
+    }
+
+    state := pkg.db.internal.resource.new_conn_state(1, database, busy_ms)
+    connection: pkg.db.conn := resource.from_raw(state)
+    return Ok(connection)
+  }
+}
+
+pub fn execute_native<P>(
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.exec_result, pkg.db.Error> {
+  if !pkg.db.internal.sqlite.command_header_valid(statement) {
+    return Err(pkg.db.internal.sqlite.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    pkg.db.internal.sqlite.common_options_valid(options, query_id)?
+    mut timeout: Option<i32> := None
+    mut i := 0
+    loop {
+      if i >= native.len() { break }
+      match native[i] {
+        BusyTimeoutNs(ns) => {
+          converted := pkg.db.internal.sqlite.execution_timeout_ms(ns, query_id)?
+          match timeout {
+            Some(_) => {
+              return Err(pkg.db.internal.sqlite.descriptor_error(
+                query_id,
+                "sqlite.execute.busy_timeout_ns",
+                "duplicate SQLite busy timeout",
+              ))
+            }
+            None => { timeout = Some(converted) }
+          }
+        }
+      }
+      i = i + 1
+    }
+    return pkg.db.internal.sqlite.execute_prevalidated(
+      target, params, statement, query_id, timeout,
+    )
+  }
+}
+
+pub fn one_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<R, pkg.db.Error> {
+  if !pkg.db.internal.sqlite.query_header_valid(statement) {
+    return Err(pkg.db.internal.sqlite.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    pkg.db.internal.sqlite.common_options_valid(options, query_id)?
+    mut timeout: Option<i32> := None
+    mut i := 0
+    loop {
+      if i >= native.len() { break }
+      match native[i] {
+        BusyTimeoutNs(ns) => {
+          converted := pkg.db.internal.sqlite.execution_timeout_ms(ns, query_id)?
+          match timeout {
+            Some(_) => {
+              return Err(pkg.db.internal.sqlite.descriptor_error(
+                query_id,
+                "sqlite.execute.busy_timeout_ns",
+                "duplicate SQLite busy timeout",
+              ))
+            }
+            None => { timeout = Some(converted) }
+          }
+        }
+      }
+      i = i + 1
+    }
+    result: Result<R, pkg.db.Error> := pkg.db.internal.sqlite.one_prevalidated(
+      target, params, statement, out, query_id, timeout,
+    )
+    return result
+  }
+}

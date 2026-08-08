@@ -112,6 +112,22 @@ fn call_returned_borrowed_slice_consumed_in_place_is_not_freed() {
 }
 
 #[test]
+fn zero_cost_string_views_keep_their_declared_direct_call_types() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"fn str_len(value: str) -> i64 = value.len()
+fn bytes_len(value: slice<u8>) -> i64 = value.len()
+fn main() -> i32 {
+  owned := "align".clone()
+  return (str_len(owned) + bytes_len("db".bytes())) as i32
+}
+"#;
+    let out = build_and_run("zero-cost-string-view-call-types", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn call_returned_owned_array_as_collect_source() {
     if !backend_available() {
         return;

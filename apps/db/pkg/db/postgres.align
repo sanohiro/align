@@ -2,6 +2,23 @@ module pkg.db.postgres
 
 import std.process
 import pkg.db
+import pkg.db.internal.resource
+import pkg.db.internal.descriptor
+import pkg.db.internal.postgres
+
+extern "C" link("pq") {
+  fn PQconninfoParse(connection_info: raw, error_out: raw) -> raw
+  fn PQconninfoFree(options: raw)
+  fn PQfreemem(pointer: raw)
+  fn PQconnectdbParams(keywords: raw, values: raw, expand_dbname: i32) -> raw
+  fn PQstatus(connection: raw) -> i32
+  fn PQclientEncoding(connection: raw) -> i32
+  fn PQfinish(connection: raw)
+}
+
+CONNECTION_OK: i32 := 0
+PG_UTF8: i32 := 6
+PG_TIMEOUT_MAX_SECONDS: i64 := 2147483647
 
 pub QueryOption {
   ParameterType(str, str)
@@ -9,6 +26,320 @@ pub QueryOption {
 
 pub CommandOption {
   ParameterType(str, str)
+}
+
+pub SslMode {
+  Disable
+  Prefer
+  Require
+  VerifyCa
+  VerifyFull
+}
+
+pub TargetSessionAttrs {
+  Any
+  ReadWrite
+  ReadOnly
+  Primary
+  Standby
+}
+
+pub Format {
+  Text
+  Binary
+}
+
+pub ConnectOption {
+  ApplicationName(str)
+  ConnectTimeoutNs(i64)
+  SslMode(SslMode)
+  TargetSessionAttrs(TargetSessionAttrs)
+  Parameter(str, str)
+}
+
+pub ExecuteOption {
+  ParameterFormat(str, Format)
+  ResultFormat(Format)
+}
+
+fn contract_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Unsupported(
+  pkg.db.ContractError {
+    query_id: None,
+    item: item.clone(),
+    message: message.clone(),
+  },
+)
+
+fn encode_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Encode(
+  pkg.db.ContractError {
+    query_id: None,
+    item: item.clone(),
+    message: message.clone(),
+  },
+)
+
+fn contains_nul(value: str) -> bool {
+  bytes := value.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break false }
+    if bytes[i] == 0 { break true }
+    i = i + 1
+  }
+}
+
+fn c_string(value: str) -> raw {
+  unsafe {
+    bytes := value.bytes()
+    output := raw.alloc(bytes.len() + 1)
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      raw.store(output, i, bytes[i])
+      i = i + 1
+    }
+    terminal: u8 := 0
+    raw.store(output, bytes.len(), terminal)
+    return output
+  }
+}
+
+fn c_string_matches(pointer: raw, value: str) -> bool {
+  unsafe {
+    if pointer.is_null() { return false }
+    bytes := value.bytes()
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      mut actual: u8 := raw.load(pointer, i)
+      expected := bytes[i]
+      if actual >= 65 && actual <= 90 { actual = actual + 32 }
+      mut folded_expected := expected
+      if folded_expected >= 65 && folded_expected <= 90 {
+        folded_expected = folded_expected + 32
+      }
+      if actual != folded_expected { return false }
+      i = i + 1
+    }
+    terminal: u8 := raw.load(pointer, bytes.len())
+    return terminal == 0
+  }
+}
+
+fn parsed_has(parsed: raw, key: str) -> bool {
+  unsafe {
+    if parsed.is_null() { return false }
+    mut i := 0
+    loop {
+      option := raw.offset(parsed, i * 56)
+      keyword: raw := raw.load(option, 0)
+      if keyword.is_null() { break }
+      value: raw := raw.load(option, 24)
+      if !value.is_null() && c_string_matches(keyword, key) { return true }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+fn parsed_value(parsed: raw, key: str) -> raw {
+  unsafe {
+    if parsed.is_null() { return raw.null() }
+    mut i := 0
+    loop {
+      option := raw.offset(parsed, i * 56)
+      keyword: raw := raw.load(option, 0)
+      if keyword.is_null() { return raw.null() }
+      value: raw := raw.load(option, 24)
+      if !value.is_null() && c_string_matches(keyword, key) { return value }
+      i = i + 1
+    }
+  }
+}
+
+fn copy_c_string(pointer: raw) -> Result<string, pkg.db.Error> {
+  unsafe {
+    mut output := buffer(64)
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else {
+      return Err(encode_error(
+        "postgres.connect.options",
+        "PostgreSQL startup options are not valid UTF-8",
+      ))
+    }
+    return Ok(text.clone())
+  }
+}
+
+fn ascii_space(byte: u8) -> bool =
+  byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32
+
+fn client_encoding_assignment(token: str, start: i64) -> i32 {
+  bytes := token.bytes()
+  mut equals := start
+  loop {
+    if equals >= bytes.len() { return 0 }
+    if bytes[equals] == 61 { break }
+    equals = equals + 1
+  }
+  if equals - start != 15 { return 2 }
+  expected := "client_encoding".bytes()
+  mut i := 0
+  loop {
+    if i >= 15 { return 1 }
+    mut actual := bytes[start + i]
+    if actual >= 65 && actual <= 90 { actual = actual + 32 }
+    if actual == 45 { actual = 95 }
+    if actual != expected[i] { return 2 }
+    i = i + 1
+  }
+}
+
+fn validate_startup_options(value: str) -> Result<(), pkg.db.Error> {
+  bytes := value.bytes()
+  mut i := 0
+  mut pending_c := false
+  loop {
+    loop {
+      if i >= bytes.len() { break }
+      if !ascii_space(bytes[i]) { break }
+      i = i + 1
+    }
+    if i >= bytes.len() { break }
+    mut token_buffer := buffer(16)
+    loop {
+      if i >= bytes.len() { break }
+      byte := bytes[i]
+      if ascii_space(byte) { break }
+      if byte == 92 {
+        i = i + 1
+        if i >= bytes.len() {
+          return Err(encode_error(
+            "postgres.connect.options",
+            "PostgreSQL startup options end with an incomplete escape",
+          ))
+        }
+        token_buffer.put_u8(bytes[i])
+      } else {
+        token_buffer.put_u8(byte)
+      }
+      i = i + 1
+    }
+    token := token_buffer.bytes().as_str() else {
+      return Err(encode_error(
+        "postgres.connect.options",
+        "PostgreSQL startup options are not valid UTF-8",
+      ))
+    }
+    mut assignment := 2
+    if pending_c {
+      assignment = client_encoding_assignment(token, 0)
+      if assignment == 0 {
+        return Err(encode_error(
+          "postgres.connect.options",
+          "PostgreSQL -c startup option has no assignment",
+        ))
+      }
+      pending_c = false
+    } else if token == "-c" {
+      pending_c = true
+    } else {
+      token_bytes := token.bytes()
+      if token_bytes.len() >= 2 && token_bytes[0] == 45 && token_bytes[1] == 99 {
+        assignment = client_encoding_assignment(token, 2)
+        if assignment == 0 {
+          return Err(encode_error(
+            "postgres.connect.options",
+            "PostgreSQL -c startup option has no assignment",
+          ))
+        }
+      } else if token_bytes.len() >= 2 && token_bytes[0] == 45 && token_bytes[1] == 45 {
+        assignment = client_encoding_assignment(token, 2)
+      }
+    }
+    if assignment == 1 {
+      return Err(contract_error(
+        "postgres.connection.client_encoding",
+        "PostgreSQL client encoding is owned by pkg.db",
+      ))
+    }
+  }
+  if pending_c {
+    return Err(encode_error(
+      "postgres.connect.options",
+      "PostgreSQL -c startup option has no assignment",
+    ))
+  }
+  return Ok(())
+}
+
+fn timeout_seconds_value(ns: i64) -> string {
+  mut seconds := ns / 1000000000
+  if ns % 1000000000 != 0 { seconds = seconds + 1 }
+  if seconds < 2 { seconds = 2 }
+  mut output := builder()
+  output.write_int(seconds)
+  return output.to_string()
+}
+
+fn timeout_valid(ns: i64) -> bool {
+  if ns <= 0 { return false }
+  seconds := ns / 1000000000
+  extra := if ns % 1000000000 != 0 { 1 } else { 0 }
+  return seconds + extra <= PG_TIMEOUT_MAX_SECONDS
+}
+
+fn ssl_mode_value(mode: SslMode) -> str = match mode {
+  Disable => "disable"
+  Prefer => "prefer"
+  Require => "require"
+  VerifyCa => "verify-ca"
+  VerifyFull => "verify-full"
+}
+
+fn target_value(target: TargetSessionAttrs) -> str = match target {
+  Any => "any"
+  ReadWrite => "read-write"
+  ReadOnly => "read-only"
+  Primary => "primary"
+  Standby => "standby"
+}
+
+fn option_key(option: ConnectOption) -> str = match option {
+  ApplicationName(_) => "application_name"
+  ConnectTimeoutNs(_) => "connect_timeout"
+  SslMode(_) => "sslmode"
+  TargetSessionAttrs(_) => "target_session_attrs"
+  Parameter(name, _) => name
+}
+
+fn pair_store(keys: raw, values: raw, index: i64, key: str, value: str) {
+  unsafe {
+    raw.store(keys, index * 8, c_string(key))
+    raw.store(values, index * 8, c_string(value))
+  }
+}
+
+fn free_pairs(keys: raw, values: raw, count: i64) {
+  unsafe {
+    mut i := 0
+    loop {
+      if i >= count { break }
+      key: raw := raw.load(keys, i * 8)
+      value: raw := raw.load(values, i * 8)
+      if !key.is_null() { raw.free(key) }
+      if !value.is_null() { raw.free(value) }
+      i = i + 1
+    }
+    raw.free(keys)
+    raw.free(values)
+  }
 }
 
 pub fn query_file<P, R>(
@@ -32,3 +363,383 @@ pub fn command<P>(
   options: slice<pkg.db.CommandOption>,
   native: slice<CommandOption>,
 ) -> pkg.db.command<P> = process.abort()
+
+pub fn connect(url: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, pkg.db.Error> {
+  if contains_nul(url) {
+    return Err(encode_error("postgres.connect.url", "PostgreSQL URL contains U+0000"))
+  }
+  unsafe {
+    url_c := c_string(url)
+    error_out := raw.alloc(8)
+    raw.store(error_out, 0, raw.null())
+    parsed := PQconninfoParse(url_c, error_out)
+    parse_error: raw := raw.load(error_out, 0)
+    raw.free(error_out)
+    if parsed.is_null() {
+      raw.free(url_c)
+      if !parse_error.is_null() { PQfreemem(parse_error) }
+      return Err(encode_error("postgres.connect.url", "invalid PostgreSQL connection URL"))
+    }
+    if !parse_error.is_null() { PQfreemem(parse_error) }
+    if parsed_has(parsed, "client_encoding") {
+      PQconninfoFree(parsed)
+      raw.free(url_c)
+      return Err(contract_error(
+        "postgres.connection.client_encoding",
+        "PostgreSQL client encoding is owned by pkg.db",
+      ))
+    }
+    url_options_pointer := parsed_value(parsed, "options")
+    if !url_options_pointer.is_null() {
+      parsed_options := copy_c_string(url_options_pointer)
+      match parsed_options {
+        Err(error) => {
+          PQconninfoFree(parsed)
+          raw.free(url_c)
+          return Err(error)
+        }
+        Ok(value) => {
+          validated := validate_startup_options(value)
+          match validated {
+            Err(error) => {
+              PQconninfoFree(parsed)
+              raw.free(url_c)
+              return Err(error)
+            }
+            Ok(_) => {}
+          }
+        }
+      }
+    }
+
+    mut i := 0
+    loop {
+      if i >= options.len() { break }
+      current_key := option_key(options[i])
+      if contains_nul(current_key) {
+        PQconninfoFree(parsed)
+        raw.free(url_c)
+        return Err(encode_error(
+          "postgres.connect.parameter.name",
+          "PostgreSQL connection parameter name contains U+0000",
+        ))
+      }
+      if current_key.eq_ignore_ascii_case("client_encoding") {
+        PQconninfoFree(parsed)
+        raw.free(url_c)
+        return Err(contract_error(
+          "postgres.connection.client_encoding",
+          "PostgreSQL client encoding is owned by pkg.db",
+        ))
+      }
+      if parsed_has(parsed, current_key) {
+        PQconninfoFree(parsed)
+        raw.free(url_c)
+        return Err(contract_error(
+          "postgres.connect.parameter",
+          "PostgreSQL URL and connection option set the same semantic key",
+        ))
+      }
+      mut earlier := 0
+      loop {
+        if earlier >= i { break }
+        if option_key(options[earlier]).eq_ignore_ascii_case(current_key) {
+          PQconninfoFree(parsed)
+          raw.free(url_c)
+          return Err(contract_error(
+            "postgres.connect.parameter",
+            "duplicate PostgreSQL connection parameter",
+          ))
+        }
+        earlier = earlier + 1
+      }
+      match options[i] {
+        ApplicationName(value) => {
+          if contains_nul(value) {
+            PQconninfoFree(parsed)
+            raw.free(url_c)
+            return Err(encode_error(
+              "postgres.connect.application_name",
+              "PostgreSQL application name contains U+0000",
+            ))
+          }
+        }
+        ConnectTimeoutNs(ns) => {
+          if !timeout_valid(ns) {
+            PQconninfoFree(parsed)
+            raw.free(url_c)
+            if ns <= 0 {
+              return Err(contract_error(
+                "postgres.connect.connect_timeout_ns",
+                "PostgreSQL connect timeout must be positive",
+              ))
+            }
+            return Err(contract_error(
+              "postgres.connect.connect_timeout_ns",
+              "PostgreSQL connect timeout exceeds the native i32 second range",
+            ))
+          }
+        }
+        Parameter(_, value) => {
+          if contains_nul(value) {
+            PQconninfoFree(parsed)
+            raw.free(url_c)
+            return Err(encode_error(
+              "postgres.connect.parameter.value",
+              "PostgreSQL connection parameter value contains U+0000",
+            ))
+          }
+          if current_key.eq_ignore_ascii_case("options") {
+            validated := validate_startup_options(value)
+            match validated {
+              Err(error) => {
+                PQconninfoFree(parsed)
+                raw.free(url_c)
+                return Err(error)
+              }
+              Ok(_) => {}
+            }
+          }
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+
+    pair_count := (options.len() as i64) + 2
+    keys := raw.alloc((pair_count + 1) * 8)
+    values := raw.alloc((pair_count + 1) * 8)
+    mut pair_index: i64 := 0
+    pair_store(keys, values, pair_index, "dbname", url)
+    pair_index = pair_index + 1
+    mut option_index := 0
+    loop {
+      if option_index >= options.len() { break }
+      match options[option_index] {
+        ApplicationName(value) => {
+          pair_store(keys, values, pair_index, "application_name", value)
+        }
+        ConnectTimeoutNs(ns) => {
+          converted := timeout_seconds_value(ns)
+          pair_store(keys, values, pair_index, "connect_timeout", converted)
+        }
+        SslMode(mode) => {
+          pair_store(keys, values, pair_index, "sslmode", ssl_mode_value(mode))
+        }
+        TargetSessionAttrs(target) => {
+          pair_store(keys, values, pair_index, "target_session_attrs", target_value(target))
+        }
+        Parameter(name, value) => { pair_store(keys, values, pair_index, name, value) }
+      }
+      pair_index = pair_index + 1
+      option_index = option_index + 1
+    }
+    pair_store(keys, values, pair_index, "client_encoding", "UTF8")
+    pair_index = pair_index + 1
+    raw.store(keys, pair_index * 8, raw.null())
+    raw.store(values, pair_index * 8, raw.null())
+    PQconninfoFree(parsed)
+    raw.free(url_c)
+
+    connection := PQconnectdbParams(keys, values, 1)
+    free_pairs(keys, values, pair_index)
+    if connection.is_null() {
+      return Err(contract_error(
+        "postgres.connect.open",
+        "libpq returned a null PostgreSQL connection",
+      ))
+    }
+    status := PQstatus(connection)
+    if status != CONNECTION_OK {
+      failure := pkg.db.internal.postgres.connection_error(connection)
+      PQfinish(connection)
+      return Err(failure)
+    }
+    if PQclientEncoding(connection) != PG_UTF8 {
+      PQfinish(connection)
+      return Err(contract_error(
+        "postgres.connection.client_encoding",
+        "PostgreSQL client encoding is not UTF-8",
+      ))
+    }
+    state := pkg.db.internal.resource.new_conn_state(2, connection, 0)
+    result: pkg.db.conn := resource.from_raw(state)
+    return Ok(result)
+  }
+}
+
+pub fn execute_native<P>(
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.exec_result, pkg.db.Error> {
+  if !pkg.db.internal.postgres.command_header_valid(statement) {
+    return Err(pkg.db.internal.postgres.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    pkg.db.internal.postgres.common_options_valid(options, query_id)?
+    mut saw_result := false
+    mut native_index := 0
+    loop {
+      if native_index >= native.len() { break }
+      match native[native_index] {
+        ResultFormat(format) => {
+          if saw_result {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id, "postgres.execute.result_format", "duplicate PostgreSQL result format",
+            ))
+          }
+          saw_result = true
+          match format {
+            Binary => {
+              return Err(pkg.db.internal.postgres.descriptor_error(
+                query_id,
+                "postgres.execute.result_format",
+                "binary PostgreSQL results are unavailable for this scalar execution milestone",
+              ))
+            }
+            Text => {}
+          }
+        }
+        ParameterFormat(name, format) => {
+          if pkg.db.internal.postgres.contains_nul(name) {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.execute.parameter_format",
+              "PostgreSQL parameter format name contains U+0000",
+            ))
+          }
+          if !pkg.db.internal.descriptor.parameter_known(statement, name) {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.execute.parameter_format",
+              "unknown PostgreSQL parameter format name",
+            ))
+          }
+          mut earlier := 0
+          loop {
+            if earlier >= native_index { break }
+            match native[earlier] {
+              ParameterFormat(previous, _) => {
+                if previous == name {
+                  return Err(pkg.db.internal.postgres.descriptor_error(
+                    query_id,
+                    "postgres.execute.parameter_format",
+                    "duplicate PostgreSQL parameter format",
+                  ))
+                }
+              }
+              _ => {}
+            }
+            earlier = earlier + 1
+          }
+          match format {
+            Binary => {
+              return Err(pkg.db.internal.postgres.descriptor_error(
+                query_id,
+                "postgres.execute.parameter_format",
+                "binary PostgreSQL i64 parameters are unavailable",
+              ))
+            }
+            Text => {}
+          }
+        }
+      }
+      native_index = native_index + 1
+    }
+    return pkg.db.internal.postgres.execute_prevalidated(target, params, statement, query_id)
+  }
+}
+
+pub fn one_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<R, pkg.db.Error> {
+  if !pkg.db.internal.postgres.query_header_valid(statement) {
+    return Err(pkg.db.internal.postgres.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    pkg.db.internal.postgres.common_options_valid(options, query_id)?
+    mut saw_result := false
+    mut native_index := 0
+    loop {
+      if native_index >= native.len() { break }
+      match native[native_index] {
+        ResultFormat(format) => {
+          if saw_result {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id, "postgres.execute.result_format", "duplicate PostgreSQL result format",
+            ))
+          }
+          saw_result = true
+          match format {
+            Binary => {
+              return Err(pkg.db.internal.postgres.descriptor_error(
+                query_id,
+                "postgres.execute.result_format",
+                "binary PostgreSQL results are unavailable for this scalar execution milestone",
+              ))
+            }
+            Text => {}
+          }
+        }
+        ParameterFormat(name, format) => {
+          if pkg.db.internal.postgres.contains_nul(name) {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.execute.parameter_format",
+              "PostgreSQL parameter format name contains U+0000",
+            ))
+          }
+          if !pkg.db.internal.descriptor.parameter_known(statement, name) {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.execute.parameter_format",
+              "unknown PostgreSQL parameter format name",
+            ))
+          }
+          mut earlier := 0
+          loop {
+            if earlier >= native_index { break }
+            match native[earlier] {
+              ParameterFormat(previous, _) => {
+                if previous == name {
+                  return Err(pkg.db.internal.postgres.descriptor_error(
+                    query_id,
+                    "postgres.execute.parameter_format",
+                    "duplicate PostgreSQL parameter format",
+                  ))
+                }
+              }
+              _ => {}
+            }
+            earlier = earlier + 1
+          }
+          match format {
+            Binary => {
+              return Err(pkg.db.internal.postgres.descriptor_error(
+                query_id,
+                "postgres.execute.parameter_format",
+                "binary PostgreSQL i64 parameters are unavailable",
+              ))
+            }
+            Text => {}
+          }
+        }
+      }
+      native_index = native_index + 1
+    }
+    result: Result<R, pkg.db.Error> := pkg.db.internal.postgres.one_prevalidated(
+      target, params, statement, out, query_id,
+    )
+    return result
+  }
+}

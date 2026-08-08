@@ -281,6 +281,19 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 a.join(", ")
             )
         }
+        Rvalue::RawCall {
+            callee,
+            args,
+            signature,
+            ..
+        } => {
+            let a: Vec<String> = args.iter().map(operand_str).collect();
+            format!(
+                "raw_call {}({}) signature={signature:?}",
+                operand_str(callee),
+                a.join(", ")
+            )
+        }
         Rvalue::Field(slot, path) => format!("_{slot}.{}", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")),
         Rvalue::Select { cond, a, b } => format!("select({}, {}, {})", operand_str(cond), operand_str(a), operand_str(b)),
         Rvalue::SoaColumn { base, struct_id, field } => format!("soa_col(_{base}: struct#{struct_id}, .{field})"),
@@ -313,7 +326,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
         Rvalue::RawAlloc(size) => format!("raw_alloc({})", operand_str(size)),
+        Rvalue::RawNull => "raw_null()".to_string(),
         Rvalue::RawLoad { ptr, offset, .. } => format!("raw_load({}[{}])", operand_str(ptr), operand_str(offset)),
+        Rvalue::RawPointerLoad { ptr, offset } => {
+            format!("raw_pointer_load({}[{}])", operand_str(ptr), operand_str(offset))
+        }
+        Rvalue::StaticDescriptorView { ptr, offset } => {
+            format!("static_descriptor_view({}[{}])", operand_str(ptr), offset)
+        }
         Rvalue::RawOffset { ptr, offset } => format!("raw_offset({}, {})", operand_str(ptr), operand_str(offset)),
         Rvalue::RawIsNull(pointer) => format!("raw_is_null({})", operand_str(pointer)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
@@ -487,6 +507,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
             // Keep the human-readable view value-exact, as for Stmt::StoreConstArray.
             format!("const_array[{}] : {} = {}", elems.len(), ty_name(*elem), const_elems_str(elems))
         }
+        Rvalue::StaticData(data) => format!(
+            "static_data(size={}, align={}, relocs={})",
+            data.bytes.len(),
+            data.align,
+            data.relocations.len()
+        ),
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
         Rvalue::CloneIn { value, handle } => {
             format!("clone_in({}, {})", operand_str(value), operand_str(handle))

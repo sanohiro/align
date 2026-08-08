@@ -1,0 +1,661 @@
+module pkg.db.internal.postgres
+
+import pkg.db
+import pkg.db.internal.descriptor
+
+extern "C" link("pq") {
+  fn PQexecParams(
+    connection: raw,
+    command: raw,
+    parameter_count: i32,
+    parameter_types: raw,
+    parameter_values: raw,
+    parameter_lengths: raw,
+    parameter_formats: raw,
+    result_format: i32,
+  ) -> raw
+  fn PQresultStatus(result: raw) -> i32
+  fn PQntuples(result: raw) -> i32
+  fn PQcmdTuples(result: raw) -> raw
+  fn PQclear(result: raw)
+  fn PQerrorMessage(connection: raw) -> raw
+  fn PQresultErrorField(result: raw, field_code: i32) -> raw
+}
+
+pub DRIVER_POSTGRES: u8 := 2
+CONTEXT_VERSION: u32 := 1
+FAILURE_UNSUPPORTED: u8 := 2
+FAILURE_ROW: u8 := 3
+pub PGRES_COMMAND_OK: i32 := 1
+pub PGRES_TUPLES_OK: i32 := 2
+PGRES_COPY_OUT: i32 := 3
+PGRES_COPY_IN: i32 := 4
+PGRES_TUPLES_CHUNK: i32 := 12
+PGRES_SINGLE_TUPLE: i32 := 9
+PGRES_COPY_BOTH: i32 := 8
+
+fn bytea_hex_digit(value: u8) -> u8 {
+  if value < 10 { return 48 + value }
+  return 87 + value
+}
+
+pub fn bytea_text_length(value: slice<u8>) -> i64 {
+  length := value.len()
+  // The encoded payload also needs a two-byte prefix and one NUL sentinel.  A
+  // negative result is the internal fail-closed marker for an unrepresentable
+  // allocation size; normal byte slices never reach this boundary.
+  if length > 4611686018427387902 { return -1 }
+  return length * 2 + 2
+}
+
+pub fn encode_bytea_text(value: slice<u8>) -> raw {
+  unsafe {
+    input_length := value.len()
+    // `raw.alloc` has no fallible form in the language. Return a null pointer
+    // before any store if the encoded size cannot be represented.
+    encoded_length := bytea_text_length(value)
+    if encoded_length < 0 { return raw.null() }
+    pointer := raw.alloc(encoded_length + 1)
+    raw.store(pointer, 0, 92 as u8)
+    raw.store(pointer, 1, 120 as u8)
+    mut index := 0
+    loop {
+      if index >= input_length { break }
+      byte := value[index]
+      output_offset := index * 2 + 2
+      raw.store(pointer, output_offset, bytea_hex_digit(byte / 16))
+      raw.store(pointer, output_offset + 1, bytea_hex_digit(byte % 16))
+      index = index + 1
+    }
+    raw.store(pointer, encoded_length, 0 as u8)
+    return pointer
+  }
+}
+
+pub fn bytea_binary_length(value: slice<u8>) -> i64 = value.len()
+
+pub fn encode_bytea_binary(value: slice<u8>) -> raw {
+  unsafe {
+    length := value.len()
+    // Keep a non-null allocation for an empty binary value while preserving the
+    // explicit zero length passed to libpq. The sentinel is outside the
+    // recorded byte range.
+    if length >= 9223372036854775807 { return raw.null() }
+    pointer := raw.alloc(length + 1)
+    mut index := 0
+    loop {
+      if index >= length { break }
+      raw.store(pointer, index, value[index])
+      index = index + 1
+    }
+    raw.store(pointer, length, 0 as u8)
+    return pointer
+  }
+}
+
+pub fn free_bytea_buffer(pointer: raw) {
+  unsafe {
+    if !pointer.is_null() { raw.free(pointer) }
+  }
+}
+
+pub fn contains_nul(value: str) -> bool {
+  bytes := value.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break false }
+    if bytes[i] == 0 { break true }
+    i = i + 1
+  }
+}
+
+pub fn descriptor_error(query_id: str, item: str, message: str) -> pkg.db.Error =
+  pkg.db.Error.Unsupported(pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: item.clone(),
+    message: message.clone(),
+  })
+
+pub fn invalid_descriptor_error() -> pkg.db.Error = pkg.db.Error.InvalidQuery(
+  pkg.db.ContractError {
+    query_id: None,
+    item: "db.descriptor.header".clone(),
+    message: "invalid static database descriptor".clone(),
+  },
+)
+
+pub fn invalid_query_error(query_id: str, item: str, message: str) -> pkg.db.Error =
+  pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: item.clone(),
+    message: message.clone(),
+  })
+
+pub fn driver_mismatch_error(query_id: str) -> pkg.db.Error = pkg.db.Error.DriverMismatch(
+  pkg.db.ContractError {
+    query_id: Some(query_id.clone()),
+    item: "db.descriptor.driver".clone(),
+    message: "static database descriptor does not support PostgreSQL".clone(),
+  },
+)
+
+pub fn cardinality_error(observed: i64) -> pkg.db.Error = pkg.db.Error.Cardinality(
+  pkg.db.CardinalityError {
+    expected_min: 1,
+    expected_max: 1,
+    observed_at_least: observed,
+  },
+)
+
+fn copy_c_string(pointer: raw) -> string {
+  unsafe {
+    if pointer.is_null() { return "".clone() }
+    mut output := buffer(64)
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else "invalid UTF-8 in PostgreSQL error"
+    return text.clone()
+  }
+}
+
+fn optional_c_string(pointer: raw) -> Option<string> {
+  if pointer.is_null() { return None }
+  return Some(copy_c_string(pointer))
+}
+
+fn native_detail(connection: raw, result: raw) -> pkg.db.NativeError {
+  unsafe {
+    mut sqlstate: Option<string> := None
+    mut message := copy_c_string(PQerrorMessage(connection))
+    mut detail: Option<string> := None
+    mut constraint: Option<string> := None
+    mut table: Option<string> := None
+    mut column: Option<string> := None
+    if !result.is_null() {
+      state_pointer := PQresultErrorField(result, 67)
+      sqlstate = optional_c_string(state_pointer)
+      message_pointer := PQresultErrorField(result, 77)
+      if !message_pointer.is_null() { message = copy_c_string(message_pointer) }
+      detail = optional_c_string(PQresultErrorField(result, 68))
+      constraint = optional_c_string(PQresultErrorField(result, 110))
+      table = optional_c_string(PQresultErrorField(result, 116))
+      column = optional_c_string(PQresultErrorField(result, 99))
+    }
+    return pkg.db.NativeError {
+      driver: pkg.db.Driver.PostgreSQL,
+      code: None,
+      extended_code: None,
+      sqlstate: sqlstate,
+      message: message,
+      detail: detail,
+      constraint: constraint,
+      table: table,
+      column: column,
+    }
+  }
+}
+
+pub fn connection_error(connection: raw) -> pkg.db.Error {
+  unsafe { return pkg.db.Error.Connection(native_detail(connection, raw.null())) }
+}
+
+pub fn execution_error(connection: raw, result: raw) -> pkg.db.Error {
+  unsafe {
+    state := PQresultErrorField(result, 67)
+    category := sqlstate_category(state)
+    detail := native_detail(connection, result)
+    if category == 1 { return pkg.db.Error.Constraint(detail) }
+    if category == 2 { return pkg.db.Error.Serialization(detail) }
+    if category == 3 { return pkg.db.Error.Deadlock(detail) }
+    if category == 4 { return pkg.db.Error.Cancelled(detail) }
+    return pkg.db.Error.Native(detail)
+  }
+}
+
+fn sqlstate_category(pointer: raw) -> i32 {
+  unsafe {
+    if pointer.is_null() { return 0 }
+    a: u8 := raw.load(pointer, 0)
+    b: u8 := raw.load(pointer, 1)
+    c: u8 := raw.load(pointer, 2)
+    d: u8 := raw.load(pointer, 3)
+    e: u8 := raw.load(pointer, 4)
+    terminal: u8 := raw.load(pointer, 5)
+    if terminal != 0 { return 0 }
+    if a == 50 && b == 51 { return 1 }
+    if a == 52 && b == 48 && c == 48 && d == 48 && e == 49 { return 2 }
+    if a == 52 && b == 48 && c == 80 && d == 48 && e == 49 { return 3 }
+    if a == 53 && b == 55 && c == 48 && d == 49 && e == 52 { return 4 }
+    return 0
+  }
+}
+
+pub fn common_options_valid(
+  options: slice<pkg.db.ExecuteOption>,
+  query_id: str,
+) -> Result<(), pkg.db.Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(descriptor_error(
+            query_id,
+            "db.execute.timeout_ns",
+            "database execution timeout must be positive",
+          ))
+        }
+        return Err(descriptor_error(
+          query_id,
+          "db.execute.timeout_ns",
+          "database execution deadlines are not available in this milestone",
+        ))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+pub fn state_for(target: pkg.db.exec) -> raw {
+  unsafe {
+    return match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(_) => raw.null()
+    }
+  }
+}
+
+pub fn postgres_connection(state: raw) -> raw {
+  unsafe {
+    if state.is_null() { return raw.null() }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    connection: raw := raw.load(state, 8)
+    if driver != DRIVER_POSTGRES { return raw.null() }
+    if version != 1 || reserved != 0 || closed != 0 || connection.is_null() {
+      return raw.null()
+    }
+    return connection
+  }
+}
+
+pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base := version == 1 && kind == 1 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && validate_row.is_null() && decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base && (sqlite_only || postgres_only || portable)
+  }
+}
+
+pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    base := version == 1 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base && (sqlite_only || postgres_only || portable)
+  }
+}
+
+pub fn new_context(connection: raw) -> raw {
+  unsafe {
+    context := raw.alloc(80)
+    version: u32 := CONTEXT_VERSION
+    driver: u8 := DRIVER_POSTGRES
+    clear8: u8 := 0
+    clear16: u16 := 0
+    clear32: u32 := 0
+    raw.store(context, 0, version)
+    raw.store(context, 4, driver)
+    raw.store(context, 5, clear8)
+    raw.store(context, 6, clear16)
+    raw.store(context, 8, connection)
+    raw.store(context, 16, clear32)
+    raw.store(context, 20, clear32)
+    raw.store(context, 24, raw.null())
+    raw.store(context, 32, clear32)
+    raw.store(context, 36, clear32)
+    raw.store(context, 40, raw.null())
+    raw.store(context, 48, raw.null())
+    raw.store(context, 56, raw.null())
+    raw.store(context, 64, raw.null())
+    raw.store(context, 72, clear32)
+    raw.store(context, 76, clear32)
+    return context
+  }
+}
+
+pub fn free_context(context: raw) {
+  unsafe {
+    if context.is_null() { return }
+    cache: raw := raw.load(context, 24)
+    if !cache.is_null() { raw.free(cache) }
+    values: raw := raw.load(context, 40)
+    types: raw := raw.load(context, 48)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    count: u32 := raw.load(context, 72)
+    if !values.is_null() {
+      mut i: u32 := 0
+      loop {
+        if i >= count { break }
+        value: raw := raw.load(values, (i as i64) * 8)
+        if !value.is_null() { raw.free(value) }
+        i = i + 1
+      }
+      raw.free(values)
+    }
+    if !types.is_null() { raw.free(types) }
+    if !lengths.is_null() { raw.free(lengths) }
+    if !formats.is_null() { raw.free(formats) }
+    raw.free(context)
+  }
+}
+
+pub fn context_error(context: raw, connection: raw, result: raw, query_id: str) -> pkg.db.Error {
+  unsafe {
+    failure: u8 := raw.load(context, 5)
+    if failure == FAILURE_UNSUPPORTED {
+      return descriptor_error(
+        query_id,
+        "db.descriptor.static_option",
+        "static database option is unsupported by PostgreSQL Q2 execution",
+      )
+    }
+    if failure == FAILURE_ROW {
+      return pkg.db.Error.Decode(pkg.db.ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.row".clone(),
+        message: "PostgreSQL row does not match the static Row contract".clone(),
+      })
+    }
+    return execution_error(connection, result)
+  }
+}
+
+pub fn clear_result_and_context(result: raw, context: raw) {
+  unsafe {
+    if !result.is_null() { PQclear(result) }
+    free_context(context)
+  }
+}
+
+pub fn execute_params(connection: raw, statement: raw, context: raw) -> raw {
+  unsafe {
+    count: u32 := raw.load(context, 72)
+    types: raw := raw.load(context, 48)
+    values: raw := raw.load(context, 40)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    return PQexecParams(
+      connection,
+      statement,
+      count as i32,
+      types,
+      values,
+      lengths,
+      formats,
+      0,
+    )
+  }
+}
+
+pub fn result_status(result: raw) -> i32 {
+  unsafe { return PQresultStatus(result) }
+}
+
+pub fn result_rows(result: raw) -> i32 {
+  unsafe { return PQntuples(result) }
+}
+
+pub fn command_affected(result: raw) -> raw {
+  unsafe { return PQcmdTuples(result) }
+}
+
+pub fn parse_affected(pointer: raw) -> Result<Option<i64>, ()> {
+  unsafe {
+    if pointer.is_null() { return Err(()) }
+    first: u8 := raw.load(pointer, 0)
+    if first == 0 { return Ok(None) }
+    mut value: i64 := 0
+    mut index := 0
+    loop {
+      byte: u8 := raw.load(pointer, index)
+      if byte == 0 { break }
+      if byte < 48 || byte > 57 { return Err(()) }
+      digit := (byte - 48) as i64
+      if value > (9223372036854775807 - digit) / 10 { return Err(()) }
+      value = value * 10 + digit
+      index = index + 1
+    }
+    return Ok(Some(value))
+  }
+}
+
+pub fn tuple_status(status: i32) -> bool = status == PGRES_TUPLES_OK
+  || status == PGRES_SINGLE_TUPLE || status == PGRES_TUPLES_CHUNK
+  || status == PGRES_COPY_OUT || status == PGRES_COPY_IN || status == PGRES_COPY_BOTH
+
+pub fn execute_prevalidated<P>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.command<P>,
+  query_id: str,
+) -> Result<pkg.db.exec_result, pkg.db.Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 2 == 0 { return Err(driver_mismatch_error(query_id)) }
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_POSTGRES { return Err(driver_mismatch_error(query_id)) }
+    connection := postgres_connection(state)
+    if connection.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "PostgreSQL connection is closed or poisoned",
+      ))
+    }
+    context := new_context(connection)
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by this execution milestone",
+        )
+      } else { context_error(context, connection, raw.null(), query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, connection, raw.null(), query_id)
+      free_context(context)
+      return Err(failure)
+    }
+    sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    result := execute_params(connection, sql, context)
+    if result.is_null() {
+      failure := connection_error(connection)
+      free_context(context)
+      return Err(failure)
+    }
+    status := result_status(result)
+    if status != PGRES_COMMAND_OK {
+      failure := if tuple_status(status) {
+        invalid_query_error(query_id, "db.command.row", "a database command must not produce rows")
+      } else { execution_error(connection, result) }
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    parsed := parse_affected(command_affected(result))
+    match parsed {
+      Err(_) => {
+        failure := execution_error(connection, result)
+        clear_result_and_context(result, context)
+        return Err(failure)
+      }
+      Ok(affected) => {
+        clear_result_and_context(result, context)
+        return Ok(pkg.db.exec_result { rows_affected: affected })
+      }
+    }
+  }
+}
+
+pub fn one_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  out: region,
+  query_id: str,
+) -> Result<R, pkg.db.Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 2 == 0 { return Err(driver_mismatch_error(query_id)) }
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_POSTGRES { return Err(driver_mismatch_error(query_id)) }
+    connection := postgres_connection(state)
+    if connection.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "PostgreSQL connection is closed or poisoned",
+      ))
+    }
+    context := new_context(connection)
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by this execution milestone",
+        )
+      } else { context_error(context, connection, raw.null(), query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, connection, raw.null(), query_id)
+      free_context(context)
+      return Err(failure)
+    }
+    sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    result := execute_params(connection, sql, context)
+    if result.is_null() {
+      failure := connection_error(connection)
+      free_context(context)
+      return Err(failure)
+    }
+    status := result_status(result)
+    if status != PGRES_TUPLES_OK {
+      failure := execution_error(connection, result)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    rows := result_rows(result)
+    if rows < 0 {
+      failure := execution_error(connection, result)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    if rows == 0 {
+      failure := cardinality_error(0)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    raw.store(context, 8, result)
+    row: u32 := 0
+    raw.store(context, 16, row)
+    validate_status := pkg.db.internal.descriptor.validate_row(statement, context)
+    if validate_status != 0 {
+      failure := context_error(context, connection, result, query_id)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    if rows > 1 {
+      failure := cardinality_error(2)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    decoded := pkg.db.internal.descriptor.decode(statement, context)
+    clear_result_and_context(result, context)
+    return Ok(decoded)
+  }
+}

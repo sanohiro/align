@@ -368,7 +368,9 @@ After L1a–L7, the following are ordinary first-party Align package code:
 
 - public handles/descriptors/options/errors/metadata data shapes;
 - the closed common/SQLite/PostgreSQL module API;
-- safe wrappers around private `extern "C" link("sqlite3")` and `link("pq")` declarations;
+- safe wrappers around private `extern "C" link("sqlite3")` and `link("pq")` declarations, with
+  the supported libpq OpenSSL closure declared explicitly through `link("ssl")` and
+  `link("crypto")`;
 - connection/transaction/statement/rows lifecycle code using general resources;
 - driver-specific bind/step/result/metadata calls;
 - Query-local `run`, Pure shaping steps, builders, and output types;
@@ -387,7 +389,11 @@ The compiler/frontend owns only work that cannot be expressed as runtime package
 `align_runtime` needs general helpers only: region-builder chunk/compact allocation, checked
 owner-tied native view construction/UTF-8 validation, and existing arena/allocation primitives. It
 MUST NOT contain SQLite/PostgreSQL Query semantics, SQL parsing, field reflection, or DB handle
-types. Basic driver calls go directly from package-generated code to libsqlite3/libpq.
+types. Basic driver calls go directly from package-generated code to libsqlite3/libpq; the common
+PostgreSQL dispatch also names libssl/libcrypto explicitly so static ELF links retain libpq's TLS
+dependency closure. When `pq` is present, the driver preserves the discovered link list and appends
+one deterministic closure tail (`pq`, `ssl`, `crypto`, then the supported `zstd`/`z` closure) so
+suffix libraries that introduce their own native references are resolved too.
 
 `align_driver` owns explicit tooling (`alignc db prepare`, later migrate/status/check), deterministic
 artifact I/O, and tool-only database/schema setup. The external SQLite/libpq libraries remain the
@@ -509,7 +515,7 @@ producer implementation / StaticQueryArtifact
   per-driver checked-metadata policy/state/digest
   declared QueryMeta plan and per-driver checked evidence
   generated bind and decode thunks
-  generated QueryMeta materialization thunk
+  generated QueryMeta materialization plan
 ```
 
 A static constructor is legal only as the complete single-expression body of one named,
@@ -526,8 +532,11 @@ consumers.
 The runtime descriptor points to immutable producer-owned static data, per-driver wire/binding/
 checked entries, and generated binder/decoder thunks. `P` and `R` are compile-time contracts; there
 is no runtime reflection, per-row field-name lookup, or consumer-side Query-body instantiation.
-The producer-owned QueryMeta table/thunk materializes D12 inspection rows into the caller's region;
-it does not inspect decoder code or open `.align-db` at runtime.
+The producer-owned QueryMeta plan is inert descriptor data before D12. D12 introduces its exact
+materialization thunk ABI and execution-header version together with the first native metadata
+consumer; Q2 does not reserve or populate a dormant function-pointer slot. The eventual thunk
+materializes inspection rows into the caller's region without inspecting decoder code or opening
+`.align-db` at runtime.
 
 ### 5.5 One descriptor, one statement
 
@@ -1626,6 +1635,24 @@ never enter Query artifacts. Durations must be positive. The URL, application na
 parameter name/value must be valid UTF-8 without U+0000; the wrapper rejects an embedded NUL as
 `db.Error.Encode` with no Query identity before calling libpq, never truncates it.
 
+The package owns the connection's client encoding and fixes it to UTF-8. `client_encoding` is a
+reserved semantic key: an explicit URL/keyword occurrence or
+`ConnectOption.Parameter("client_encoding", ...)` conflicts before opening. For the `options`
+connection parameter, the package tokenizes the documented backslash-escaped, space-separated
+startup-option grammar and rejects ASCII-case-insensitive `client_encoding` assignments in
+`-c name=value`, `-cname=value`, or `--name=value` form; `-` and `_` are equivalent while comparing
+the long name. A trailing escape or a `-c` without its assignment is an Encode error before open.
+After the expanded URL entry and every accepted user override, the package appends exact
+`client_encoding=UTF8` to `PQconnectdbParams`, so `PGCLIENTENCODING` cannot supply ambient behavior.
+For a non-null `PGconn`, the package first checks `PQstatus`. Any status other than `CONNECTION_OK`
+copies the native connection error and closes without calling `PQclientEncoding`. Only after
+`CONNECTION_OK` does it require `PQclientEncoding(conn) == PG_UTF8`. A mismatch, including `-1`,
+always closes the connection and returns
+`db.Error.Unsupported(db.ContractError { query_id: None,
+item: "postgres.connection.client_encoding",
+message: "PostgreSQL client encoding is not UTF-8" })`; this branch does not depend on libpq having
+populated an error message. No SQL execution is permitted before this post-connect invariant holds.
+
 `[]` transaction options mean `ReadCommitted`, `ReadWrite`, and non-deferrable. Each transaction
 dimension may occur at most once. PostgreSQL-invalid combinations such as deferrable without
 serializable read-only are rejected before `BEGIN`. `SearchPathOnly` conflicts with
@@ -1793,8 +1820,40 @@ rejected as conflicting
 
 ### 13.4 Precedence
 
-Each driver documents whether an operation-scoped option may override a connection default. The
-recommended rule:
+Validation order is observable and exact. Connection formation performs these phases:
+
+1. validate and parse the explicit connection input;
+2. visit options in source order, validating the current payload and native conversion before
+   registering its tag/semantic key; a duplicate or conflict is reported at its second occurrence;
+3. validate cross-option/capability constraints after the complete list; and
+4. open the native connection and establish post-connect invariants.
+
+The first failing phase wins. Within phase 2 the first failing source-order option wins, regardless
+of whether a later option has a different error. A URL supplies its semantic keys before the first
+PostgreSQL option, so the first colliding option is the conflict owner.
+
+Query/command execution performs these phases before native work:
+
+1. validate the execution-header pointer, ABI, reserved bytes, kind, mask/slot/thunk agreement,
+   `descriptor_id` view, and Q1-plan pointer without acquiring state; only after the complete phase
+   succeeds is descriptor identity trusted;
+2. validate common options in source order, payload before duplicate detection;
+3. validate driver-native options by the same rule;
+4. validate driver restriction;
+5. validate the `db.exec` discriminator, generation, open/poisoned state;
+6. invoke the generated static-option validator; and
+7. acquire the driver execution lease.
+
+An invalid phase-1 descriptor returns
+`db.Error.InvalidQuery(db.ContractError { query_id: None, item: "db.descriptor.header",
+message: "invalid static database descriptor" })`; no untrusted identity bytes enter the error.
+Q2 therefore reports malformed descriptor before timeout/mismatch/closed state, unsupported common
+timeout before mismatch/closed state, mismatch before closed/static-option/overlap errors, and a
+closed state before a static-option failure. Bind/native work begins only after phase 7. The existing
+cleanup rule is separate: the first operation error survives later cleanup errors, while a cleanup
+error replaces success.
+
+Option override semantics remain:
 
 - static Query options describe Query semantics and cannot be overridden incompatibly;
 - prepare options affect statement preparation only;
@@ -1940,8 +1999,9 @@ The semantics are:
 - stable categories for ordinary control flow;
 - `ContractError.query_id` is `Some(id)` whenever validation has a Query/command subject, including
   `meta_query` and Query EXPLAIN. It is `None` only when no Query/command subject exists, such as
-  connection input, transaction-option, or category-metadata validation. `item` names the exact
-  operation and input in both cases;
+  connection input, transaction-option, or category-metadata validation, and when a malformed
+  descriptor header fails before its identity becomes trusted. `item` names the exact operation and
+  input in both cases;
 - driver code/message/detail retained where available;
 - SQLSTATE retained for PostgreSQL;
 - primary/extended result codes retained for SQLite;
@@ -3027,7 +3087,7 @@ The implementation keeps named local measurements for at least:
 - SQLite streamed text/blob bind with transient-copy bytes and allocations separated;
 - PostgreSQL parameter bind + one-row typed decode;
 - file/inline Query/command artifact generation and cold/warm rebuild;
-- structural contract/artifact and QueryMeta thunk bytes/time at 1/10/100 reachable definitions;
+- structural contract/artifact and QueryMeta-plan bytes/time at 1/10/100 reachable definitions;
 - canonical checked-metadata JSON encode/decode/validation at 10/100/1000 columns;
 - SQLite canonical migration catalog fingerprint/replay at 10/100/1000 files;
 - SQLite active-execution lease acquire/release/rejected-overlap overhead;
@@ -3155,7 +3215,7 @@ L1b Move sum/Option/Result payload completion
 L2a parameter-mode and borrow/region-summary representation and interface identity
 L2b recursive parameter/capture return provenance and function-value joins
 L2c cleanup-ABI record and dynamic bit for recursively Move returns
-L2d shared borrow over reusable Move owners
+L2d shared borrow over stable bound Copy/Move storage
 L2e borrow mut/out, all-peer aliases, Copy/Move replacement, and Pure shaping
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
@@ -3176,13 +3236,59 @@ The common generic `rows_stmt<P,R>`/`all<P,R>` implementation does not land befo
 
 Read-only/throwaway probes establish:
 
-- exact libsqlite3 and libpq library/ABI availability on supported targets;
+- exact libsqlite3 and libpq library/ABI availability on supported targets, including libpq's
+  libssl/libcrypto dependency closure;
 - SQLite prepare tail-pointer statement-count behavior;
 - SQLite column pointer validity across `step/reset/finalize`;
 - PostgreSQL extended-query single-statement behavior;
 - libpq full-result and single-row pointer validity;
 - parameter/result metadata and nullability actually available from each engine;
 - cancellation and cleanup behavior.
+
+#### D0 measured evidence — 2026-08-07
+
+The Q2 author probe compiled the exact consumed C signatures with `-Wall -Wextra -Werror` on
+Apple Silicon macOS 26.5.2 and exercised Homebrew SQLite 3.53.3 plus libpq 18.4 against PostgreSQL
+18.4. The selected arm64 dynamic libraries were `libsqlite3.0.dylib` with compatibility version 9
+and `libpq.5.dylib` with compatibility version 5. Unqualified local `pkg-config` advertised SQLite
+3.51.0 while the explicitly selected Homebrew library reported 3.53.3; Q2 must therefore test and
+report the linked library's runtime version rather than infer it from discovery metadata. On the
+supported targets the package declares libpq's libssl/libcrypto TLS dependency closure explicitly;
+it does not rely on transitive linker state to retain those libraries.
+
+The observed SQLite contract was:
+
+- `sqlite3_prepare_v3` compiled with the exact tail-pointer signature and left the tail at byte 74,
+  immediately after the first statement terminator; preparing the comment-prefixed tail produced
+  the second statement. The package must inspect the complete tail and accept only whitespace and
+  comments rather than treating a non-null tail pointer as sufficient.
+- A two-row result reported runtime storage classes `INTEGER, NULL, INTEGER, TEXT`. Base columns
+  exposed declaration and origin names with `ENABLE_COLUMN_METADATA`; the expression exposed
+  neither. The first text pointer remained usable during reads of the current row, the next step
+  reused its address for the second row, and `step`, `reset`, and `finalize` are all pointer
+  invalidation boundaries. Q2 may cache decoded scalar values before the next step but may not
+  retain native column pointers.
+- Cross-thread `sqlite3_interrupt` made the active step return `SQLITE_INTERRUPT` (9). Finalizing
+  that statement left autocommit enabled and the same connection immediately executed `SELECT 42`.
+
+The observed PostgreSQL/libpq contract was:
+
+- `PQexecParams` rejected `SELECT $1::bigint; SELECT 2` with `PGRES_FATAL_ERROR` and SQLSTATE
+  `42601`, confirming extended-query single-statement enforcement in addition to the package's
+  static scanner.
+- A buffered result retained row bytes while a separate result was obtained and until its owning
+  `PGresult` was cleared. In single-row mode, the first `PGRES_SINGLE_TUPLE` bytes remained valid
+  while the second result was obtained because the first result remained owned; the terminal result
+  was `PGRES_TUPLES_OK` with zero rows and the same two fields. Every pointer becomes unusable when
+  its own `PGresult` is cleared.
+- A base `bigint` column reported OID 20, nonzero table OID, and attribute ordinal 1. An expression
+  reported table OID and attribute ordinal zero. `PQgetisnull` supplied runtime NULL state, but the
+  ordinary result API supplied no complete declared-nullability fact. D5 must combine origin and
+  catalog evidence and fail closed when that proof is unavailable.
+- `PQcancelBlocking` succeeded; draining the connection produced `PGRES_FATAL_ERROR` with SQLSTATE
+  `57014`. After all results were cleared, the same idle connection executed `SELECT 42`. Q2 owns
+  synchronous cleanup; the later public cancellation surface may reuse the connection only after
+  the complete result drain.
 
 The deliverable is recorded evidence in this document or a focused audit, not production raw handles.
 
@@ -3191,7 +3297,7 @@ The deliverable is recorded evidence in this document or a focused audit, not pr
 #### Q1/D1 implementation closure matrix
 
 Q1 is one executable capability. The public package declarations, compiler-produced artifact,
-generated binder/decoder/metadata thunks, and fake-driver consumer share one descriptor ABI and
+generated binder/decoder plans, QueryMeta plan, and fake-driver consumer share one descriptor ABI and
 one cache identity; splitting any producer before its first consumer would publish a static value
 that cannot execute or would duplicate the same structural-contract proof.
 This capability is deliberately above the roughly 1,000 hand-written-line threshold: keeping the
@@ -3247,8 +3353,8 @@ Before a native database:
 - preserve exact source SQL identity while generating deterministic SQLite/source and
   PostgreSQL/`$n` wire entries plus reverse span maps;
 - generate the shared Params binder for both kinds and a Query-only decoder thunk;
-- generate the producer-owned Declared QueryMeta plan/materialization thunk without reflection or
-  runtime artifact/source I/O;
+- generate the producer-owned Declared QueryMeta plan without reflection or runtime artifact/source
+  I/O; D12 adds the materialization thunk only with its first consumer;
 - record per-driver `BindValue`/`BindCopy` retention classes for every Params field;
 - exercise named-parameter occurrence tables;
 - decode a fake flat scalar row;
@@ -3264,8 +3370,170 @@ reachable definitions, driver restriction, binder/decoder ABI versions, and per-
 digests independently. They match the independent byte/digest goldens, materialize a separately
 compiled Declared QueryMeta table, compile-fail a command with a Row/decode contract, and prove an
 unchanged public command consumer is not recompiled by a SQL-only producer edit. When this path
-first lands or materially changes, measure generated Query/command binders, the Query
-decoder/metadata thunk, and warm-cache behavior locally.
+first lands or materially changes, measure generated Query/command binder/decoder plans, the
+QueryMeta plan, and warm-cache behavior locally.
+
+#### Q2/D2+D4 implementation closure matrix
+
+Q2 is one dual-driver capability. The common `execute`/`one` surface, the producer-owned native
+descriptor ABI, the connection resource, and both driver consumers land together. Splitting SQLite
+from PostgreSQL would let the first driver define common option, error, cardinality, descriptor, and
+cleanup behavior without its required portability peer. Splitting the descriptor consumer from the
+native packages would publish another dormant compiler seam. The capability is expected to exceed
+roughly 1,000 hand-written lines: one coordinated boundary proves the descriptor/thunk ABI,
+resource cleanup, common error model, and identical scalar surface once, which is less duplicated
+proof and lower integration risk than two driver PRs plus a producer-only bridge.
+
+The Q1 canonical `ALIGNQST`/`ALIGNCST` bytes remain unchanged. Q2 adds a target-native,
+producer-owned `QueryStatic`/`CommandStatic` execution header addressed by the descriptor's one
+compiler-private raw field. All currently supported database targets are 64-bit. Execution-header
+v1 has alignment 8, size 96, and this exact byte layout:
+
+```text
+0   u32 abi_version = 1
+4   u8  statement_kind       // 0 Query, 1 command
+5   u8  driver_mask          // bit 0 SQLite, bit 1 PostgreSQL
+6   u16 reserved = 0
+8   raw q1_plan
+16  str descriptor_id        // pointer at 16, i64 length at 24
+32  str sqlite_wire_sql      // pointer at 32, i64 length at 40
+48  str postgres_wire_sql    // pointer at 48, i64 length at 56
+64  raw binder_thunk
+72  raw validate_static_thunk
+80  raw validate_row_thunk   // null for command
+88  raw decode_row_thunk     // null for command
+96  end
+```
+
+Both driver slots are always present in SQLite/PostgreSQL order. A driver absent from the mask has
+the exact canonical empty slot `(null, 0)`; a present driver has a non-null pointer, positive length,
+and one NUL sentinel outside that length. Query requires all four thunk pointers; command requires
+binder plus static validation and requires the other two to be null. The compiler checks
+mask/slot/kind/thunk/reserved-field agreement before object publication; consumers check version
+and kind before their
+first load. The header is an in-object relocation-bearing constant, not a persisted codec or
+untrusted runtime input. Independent LLVM/object goldens pin every offset, relocation, null slot,
+alignment, and total size for masks 1, 2, and 3. The producer-owned Q1 QueryMeta plan remains outside
+this execution header. D12 adds a new header version and exact materializer ABI only when its native
+metadata consumer lands, rather than publishing a dormant Q2 call edge.
+
+Binder ABI v1 is `fn(context: raw, borrow params: P) -> i32`. The producer treats `context` as an
+opaque call-scoped token and may only pass it to the exact package callback
+`pkg.db.internal.bind_i64_v1(context, protocol_ordinal: u32, value: i64) -> i32`; it never loads,
+stores, retains, returns, or frees that pointer. The package creates and owns the execution context,
+validates its private version/driver/ordinal state in the callback, and destroys it after the
+synchronous operation. Every status callback returns exactly `0_i32` on success or `1_i32` after
+recording the context-owned first failure; it never returns a negative value. A generated thunk
+maps any nonzero callback result to `1_i32`, so `-1_i32` remains reserved to the compiler-generated
+unsupported-shape path. The package materializes one selected owned `db.Error` before native
+cleanup, context Drop frees an untaken record, and the binder stops after the first failure.
+
+`P` may be Copy or Move under the general shared-borrow rule; the generated callback always reads
+the caller's stable storage and never creates a by-value aggregate copy. If `P`, or a Query's `R`,
+contains a shape outside Q2's closed non-null `i64` subset, `validate_static_thunk` returns exact
+`-1_i32` before invoking any field callback. That reserved status does not select or preallocate a
+context failure record. After receiving it, the package constructs exactly one owned
+`db.Error.Unsupported(db.ContractError { query_id: Some(id), item: "db.descriptor.shape",
+message: "static database descriptor uses a field shape unsupported by this execution milestone" })`.
+Supported executions allocate no error. Exact `1_i32` selects the context-owned first-failure
+record; exact `-1_i32` means only the unsupported-shape case above. No other status is produced by
+a valid v1 thunk. Phase 6 fails before lease or native send. Query
+binder/row-validator/decoder pointers remain non-null but are unreachable after that failure.
+Command row-validator and decoder slots remain null exactly as required by the fixed header.
+
+Static-option validation ABI v1 is `fn(context: raw) -> i32`. It visits the Q1 canonical sorted
+option sequence and emits no callback for the common Check option, whose policy/state was already
+closed during artifact formation. For SQLite it calls exactly
+`pkg.db.internal.require_sqlite_version_v1(context: raw, major: u32, minor: u32, patch: u32) -> i32`;
+the package compares the linked `sqlite3_libversion_number()` as a component tuple without arithmetic
+overflow. For PostgreSQL `i64` it calls exactly
+`pkg.db.internal.set_postgres_i64_type_v1(context: raw, protocol_ordinal: u32,
+canonical_type_name: str) -> i32`; Q2 accepts exact `int8`, records OID 20 in the call-scoped
+`PQexecParams` type vector, and returns `Unsupported` for every other requested mapping before send.
+Exact zero/one status, first-failure recording, opaque-context provenance, and immediate stop match the binder
+ABI. Compiler publication validates exact Q1-option/thunk agreement, so no static option is omitted.
+
+Query row-validation ABI v1 is `fn(context: raw) -> i32`. It first calls exactly
+`pkg.db.internal.validate_row_count_v1(context: raw, expected: u32) -> i32`, then calls exactly
+`pkg.db.internal.validate_i64_v1(context: raw, ordinal: u32, expected_name: str) -> i32` in declared
+ordinal order. The per-column callback checks the exact UTF-8 name bytes, then NULL, then the
+driver-native representation, then full-range `i64` parsing; on success it caches the parsed scalar
+inside the package context. Zero means success. Exact one selects the same context-owned
+first-failure record as binding, and the generated validator stops immediately. This catches same-typed column
+reordering under `DeclaredOnly` before construction. Decoder ABI v1 is `fn(context: raw) -> R`; it
+may call only `pkg.db.internal.read_i64_v1(context: raw, ordinal: u32) -> i64` after successful
+validation, then writes direct field offsets. `read_i64_v1` reads only the cached validated scalar
+and is otherwise infallible. The context token has the same call-scoped, non-retained provenance for
+validation/decode. Changing a header, thunk, or callback calling/layout contract increments the
+existing artifact ABI version and the execution-header/callback version.
+
+Only compiler-validated generic bodies owned by `pkg.db` may project this opaque header or invoke
+its thunks. The trusted operations are explicit in HIR/MIR, carry the concrete `P`/`R` and complete
+function signature, and lower to fixed header loads plus an indirect call. They are not
+name/reflection lookups and are unavailable to application source. The backend only lowers this
+MIR contract; SQLite/PostgreSQL option, connection, error, lease, bind, step/result, and cleanup
+semantics remain ordinary first-party Align package code and direct `sqlite3`/`pq` FFI. No database
+semantic helper or handle is added to `align_runtime`.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public common surface | Define the exact §4/§6/§13/§15 `db.conn`, `db.exec`, `db.Driver`, `db.exec_result`, structured owned errors, `db.ExecuteOption`, `exec_conn`, `execute`, and `one` shapes plus the SQLite/PostgreSQL `execute_native`/`one_native` forms with separate common/native option slices. `one` retains its explicit output `region` even though the Q2 row is `i64`-only. `db.exec` preserves the settled conn/tx sum shape; Q2 rejects the unconstructable transaction arm without native work until D7. | package whole/per-unit interface golden; compiled common and native command/portable Query on both drivers; compile-fail wrong option scope/arity and escaped execution view |
+| namespaced builtin type identity | Generalize type lookup rather than renaming `db.Error`. The closed alias/explicit table is `Error`/`core.Error` (always-in-scope syntactic core), `argon2_params`/`crypto.argon2_params` (`import std.crypto`), and `regex_match`/`regex.regex_match` (`import std.regex`). A non-entry same-module declaration wins bare lookup; a local miss falls back to the alias; exact explicit spelling retains builtin identity; std-qualified type use satisfies the unused-import lint; `error(c)` always targets `core.Error.Code(c)`; entry canonical collisions reject. No package name appears in the rule. | parameterized same-module local signatures/constructors for all three aliases; qualified importer construction/match; exact explicit builtin use and missing-import negatives; unchanged bare builtin fallback; local-Error `error(c)`; entry collision rejection; whole/per-unit interface and executable parity |
+| native descriptor ABI | Emit one relocation-bearing `QueryStatic`/`CommandStatic` per descriptor while preserving the exact Q1 plan bytes and fixed 96-byte v1 layout above. Validate version/reserved/kind/mask/slot/thunk and Q1 static-option agreement before object publication; keep the public descriptor a one-pointer Copy value. SQL-only producer edits replace producer constants/object identity without changing an unchanged public consumer interface. Q2 emits no dormant QueryMeta pointer. | exact MIR/LLVM/object header inventory and relocation golden for masks 1/2/3; ABI-version, null-slot, size/alignment goldens; Query/command omission twin; static-option-thunk inventory; QueryMeta-slot absence; two same-typed runtime-selected descriptors; whole/per-unit executable parity |
+| generated binder/decoder | Generate direct ordinal `i64` binders for Query and command plus Query-only validation and decoder thunks. The binder treats context as opaque, calls only `bind_i64_v1`, and stops at its first failure. Validation checks exact column count, exact UTF-8 field-name bytes in declared order, NULL, and driver-native `i64` representation before decoder invocation. Decoder uses only `read_i64_v1` and constructs `R` without names, maps, boxing, or reflection. Unsupported Q2 field shapes fail before native send; later mappings remain owned by D8. | portable `CAST(:value AS BIGINT)` binder/validator/decoder on both drivers, repeated PostgreSQL placeholder ordinal, same-typed alias reorder and name/type/count twins on both drivers, callback version/context misuse rejection, unsupported-shape no-send, and generated thunk MIR/LLVM inspection |
+| type and monomorph closure | Preserve concrete `P`/`R` through generic instantiation, function-value signatures, interface serialization, whole-program compilation, per-unit compilation, and cache/implementation identity. No unresolved type, wrong header kind, absent decoder, or mismatched thunk signature reaches MIR/codegen. | whole/per-unit Query and command execution; generic mono-key/header-signature golden; malformed HIR/MIR/header rejection owners |
+| connection formation and ownership | SQLite/PostgreSQL descendants validate inputs/options, open one physical native connection, allocate one tagged package state, and construct the root `db.conn`. Moving/returning/replacing the owner preserves one state; `db.exec` carries only its generation-checked `resource_ref`; source nulling, branch/loop joins, early `?`, and Drop close/free exactly once. | resource owner matrix for construction, move-in/out, return, replacement, malformed null, early return/`?`, branch/loop joins, use-after-move, and whole/per-unit producer Drop thunk linkage |
+| common validation precedence | Apply §13.4's exact phases: fail-closed header/identity, common option source order, native option source order, restriction, connection state, generated static options, then lease. Q2 returns `Unsupported` for a requested common deadline because D9 owns enforcement. Thus malformed header beats every descriptor-dependent error without reading identity; timeout beats mismatch/closed; mismatch beats closed/static-option/overlap; closed beats static-option/overlap. No losing phase acquires state or sends SQL. Contract-error allocations are explicit and counted/freed; only success promises no error allocation. | complete pairwise multi-invalid winner table across every phase and source-order option twins; malformed-header no-identity/no-embedded-dereference owners; no-send/no-lease/native-state counters; exact owned-error allocation/drop counters |
+| static descriptor options | Invoke the exact generated static-option thunk after a valid matching open connection and before lease/send. Common Check has no runtime callback because Q1 already closes its artifact policy/state. SQLite `RequireVersionAtLeast` compares linked components and PostgreSQL `ParameterType` maps only Q2 `i64` `int8` to OID 20; every unsupported mapping fails before send. | Check-policy no-runtime-call inventory; SQLite below/equal/above/large-u32 version matrix and no-send; PostgreSQL absent/int8/int4, reordered option and repeated-placeholder OID vectors; malformed Q1-option/thunk publication rejection; whole/per-unit parity |
+| SQLite connection options | Implement every §11.2 `sqlite.ConnectOption`, exact `[]` defaults, conflicts, positive-duration rule, NUL-free path, PRAGMA name grammar/value quoting, duplicate PRAGMA rejection, linked-capability rejection, and setup failure. Convert positive nanoseconds to native milliseconds by overflow-safe ceiling division; `1..=1_000_000` ns becomes 1 ms, and a result above `i32::MAX` returns `Unsupported` before SQLite. Validate before open/setup where specified; never silently degrade a flag or PRAGMA. | parameterized option disposition table, duration edges at 1/1_000_000/1_000_001 ns and `i32::MAX` milliseconds, overflow rejection, multi-invalid precedence, open/setup counters, PRAGMA round trip, unsupported-capability injection, and exactly-once failed-open cleanup |
+| SQLite execution lease/options | Acquire the one connection-wide lease before bind/timeout/native work. `sqlite.ExecuteOption.BusyTimeoutNs` is positive, unique, uses the same exact ceiling/overflow rule as connection setup, temporarily replaces the tracked native-millisecond value, and restores before synchronous return on success, bind error, prepare/step error, zero/one/>1 cardinality, and Drop unwinding. A second operation fails before reading/restoring the first lease; restore failure poisons/closes. Preserve the first operation error; a later cleanup/restore failure poisons but replaces success only when no earlier error exists. | duration-boundary owners, overlap table, busy-timeout apply/restore counters, failed-second-operation owner, success/error/cardinality/early-`?` cleanup, first-error/cleanup-error precedence, restore-failure poisoning, and execution count |
+| SQLite command/query lifecycle | Prepare exactly one statement and require only whitespace/comment tail, bind the `i64`, step commands to completion, reject a command that produces a row, and read nonnegative affected rows. For `one`, zero rows is Cardinality; otherwise validate/cache the first row before probing a second, return that first-row validation error immediately if invalid, return Cardinality after a valid first row when a second exists, and decode the cached first row only after the second probe returns DONE. Never validate the second row. Finalize exactly once before lease restoration/return on every path; primary and extended codes plus owned message survive finalize. A finalize error follows the first-error precedence above. | in-memory insert/select vertical; zero/one/>1; two-row malformed-first validation winner and valid-first/malformed-second Cardinality winner; exact step/validator/decoder counts; command-returned-row, second-statement, fault injection, affected rows, first/finalize precedence, error ownership, direct comparison |
+| PostgreSQL connection options | Implement every §12.2 `postgres.ConnectOption`, exact `[]` defaults, source-order semantic-key conflict detection including URL collisions, SSL/target attributes, and arbitrary parameter name/value handling. Convert positive nanoseconds by overflow-safe ceiling to seconds, then apply the cross-version libpq floor: `1..=2_000_000_000` ns encodes 2, `2_000_000_001` encodes 3, and a result above `i32::MAX` returns `Unsupported` before libpq. Encode exact decimal ASCII plus a NUL sentinel. Reject U+0000 before libpq and never place secrets in static artifacts. Reserve direct/`options`-embedded `client_encoding`, append package-owned `UTF8` after all inputs, require `CONNECTION_OK`, then verify `PG_UTF8` before exposing the connection with the exact fallback error above. | option disposition and pairwise/source-order multi-invalid tables; duration edges at 1/1_000_000_000/2_000_000_000/2_000_000_001 ns, libpq floor, overflow no-call; URL/option conflict owners; direct and every accepted `options` spelling of client-encoding rejection; malformed escape; `PGCLIENTENCODING=LATIN1` isolation; null/`CONNECTION_BAD`/OK-encoding-mismatch precedence with encoding-call counters, exact errors, exactly-once close/no-execute; embedded-NUL no-call; unreachable/auth ownership; secret absence |
+| PostgreSQL execution options/binding | Implement Text `i64` binding and exact baseline `postgres.ExecuteOption` validation. Unknown/duplicate parameter names, Binary `i64`, and unavailable result formats return `Unsupported` before send; repeated source names reuse one `$n`. The synchronous call owns parameter transport until return. Close the shared bytea codec now: Text produces `\\x` plus two lowercase hex digits per byte and a NUL sentinel outside its recorded length; Binary alone exposes raw bytes with the explicit length. Q2 does not make bytea an executable descriptor shape before D8. | format disposition table, no-send counters, `CAST($1 AS BIGINT)` execution, repeated-placeholder owner, independent Text/Binary bytea byte goldens including embedded zero/high bytes, and parameter buffer allocation/free counters |
+| PostgreSQL result/cardinality | Use explicit `BufferedFull`. Query requires `PGRES_TUPLES_OK`. `one` applies the same observable order as SQLite despite knowing the buffered count: zero rows is Cardinality; otherwise validate/cache only row zero first, return its validation error before considering additional rows, return Cardinality when row zero is valid and a second row exists, and decode cached row zero only when the total is exactly one. It never validates row one or later. Check exact column count/name order, NULL, and full-range decimal `i64` parsing before decoder invocation. Command requires `PGRES_COMMAND_OK`, rejects every tuple-producing status as `InvalidQuery`, and parses nonempty `PQcmdTuples` as nonnegative decimal fitting `i64` before `PQclear`; empty means `None`, malformed/negative/overflow is a native failure. Clear each `PGresult` exactly once before connection reuse/return. | Query zero/one/>1; two-row malformed-first validation winner and valid-first/malformed-second Cardinality winner; exact validator/decoder counts and no row-one validation; same-typed reorder/name/NULL/type/range/count; command OK/tuple/status and affected empty/zero/positive/malformed/negative/overflow; clear counters; pointer probe; direct comparison |
+| native error ownership | Copy SQLite codes/message and PostgreSQL SQLSTATE/message/detail/constraint/table/column into the exact owned `db.NativeError` before statement/result cleanup. Map stable constraint/serialization/deadlock categories without parsing message text. Native errors contain no Query ID. Only `db.ContractError` carries `query_id`: `Some(id)` after a Query/command identity is trusted, and `None` for Query-less connection input or an invalid header before identity trust. | error-field golden after finalize/clear/connection Drop, SQLSTATE category table, SQLite primary/extended table, contract/native identity-shape twins, malformed-header and Query-less connection errors, and allocation/drop counters |
+| FFI/ABI and malformed input | Pin every used SQLite/libpq declaration, enum/status constant, pointer/length signedness, destructor order, and linked library on all supported targets. Check the descriptor raw pointer for null before its first header load; validate the complete fixed header before following any embedded pointer or invoking any thunk. Reject negative/overflow lengths, null-with-positive-length, invalid UTF-8/native text, and malformed header/thunk state before native side effects. | D0 probe record, compile-time C signature probes, Rust/Align declaration inventory, null/header/embedded-pointer malformed boundary tests, ASan/Valgrind-or-platform owner where available, and x86_64/ARM64/macOS CI |
+| native library dependency closure | Keep the package's native link contract explicit: `sqlite3` for SQLite, `pq` for PostgreSQL, and `ssl` plus `crypto` for the supported libpq TLS closure. The common dispatch may retain both driver paths, so a SQLite-only call must still link a complete, ordered closure on ELF without relying on transitive `DT_NEEDED` discovery; final linking preserves the discovered list and appends the ordered `pq`/`ssl`/`crypto`/`zstd`/`z` tail even when another unit first requests `crypto` or a suffix library introduces further references. | `pkg_db_q2::common_surface_dispatches_to_sqlite_without_driver_cycle` whole/per-unit executable and ordered link inventory; required PostgreSQL integration on Linux |
+| allocation parity | Success for scalar connect/execute/one allocates only the visible connection/execution/native objects and PostgreSQL Text parameter storage required by the driver; no per-row heap allocation, error allocation, runtime dictionary, or artifact/source I/O occurs. Every partial allocation has one owner and one cleanup edge. | allocation/copy counters for success and each injected partial failure, emitted-symbol inventory excluding DB runtime helpers, and package-versus-direct driver measurements |
+| required PostgreSQL gate | Add a pinned provisioned `db-postgres` CI job. The job supplies its ephemeral connection through `ALIGN_DB_POSTGRES_URL` and sets `ALIGN_DB_POSTGRES_REQUIRED=1`; missing or unreachable configuration is a failure and the same portable Query runs against both drivers. Local absence alone may report a reasoned skip. Native libraries and server versions are printed as evidence, while the URL is never embedded in source, artifacts, or logs. | required CI script self-test for missing URL, provisioned PostgreSQL job, portable dual-driver integration target, and no unconditional/required-mode skip branch |
+
+The author-side matrix-to-diff pass must map every acquired native pointer, active lease, timeout
+override, statement/result, parameter buffer, and owned error string to one cleanup owner on success,
+each native error, cardinality exit, early `?`, and Drop. A reviewer finding that changes the header
+or thunk strategy, lets a second SQLite operation touch connection-global state, sends PostgreSQL
+input before complete validation, or moves driver semantics into the runtime reopens this matrix and
+requires the high-risk review path.
+
+#### Q2 plan-review finding-to-fix ledger
+
+| Finding | Root-cause closure | Owner evidence required above |
+|---|---|---|
+| execution-header offsets varied with driver mask | Fix one 96-byte, 8-aligned layout with both ordered driver slots always present, canonical null/zero absence, exact thunk nullability, and masks 1/2/3 relocation goldens. | native descriptor ABI |
+| binder `raw` exposed an undefined cross-unit context layout | Make context an opaque call-scoped token. Generated code calls only versioned package callbacks; package code alone owns, validates, materializes the first failure, and destroys the context. | generated binder/decoder; FFI/ABI and malformed input |
+| ordinal decoding could accept same-typed reordered aliases | Add the Query validation thunk and require exact count, UTF-8 field-name bytes/order, NULL, and native representation before decode on both drivers. | generated binder/decoder; PostgreSQL result/cardinality; SQLite command/query lifecycle |
+| PostgreSQL command result semantics were absent | Require `PGRES_COMMAND_OK`, reject tuple-producing command results, and parse/range-check `PQcmdTuples` before clear. | PostgreSQL result/cardinality |
+| native errors were incorrectly required to carry Query identity | Preserve the settled shape: native errors carry native detail only; contract errors alone carry `Some(query_id)` for a statement subject. | native error ownership |
+| zero-allocation validation contradicted owned `ContractError` | Keep no-send/no-lease/no-native-state assertions while explicitly counting and freeing required owned error allocations; retain the no-error-allocation promise only for success. | common validation precedence; allocation parity |
+| nanosecond conversion could disable or overflow native timeouts | Use overflow-safe ceiling conversion to SQLite milliseconds and libpq seconds, reject values beyond signed native bounds before the library call, and pin all edge values. | SQLite connection/execution options; PostgreSQL connection options |
+| row-validation callback ABI remained implicit | Name and type exact count/i64 callbacks, fix count/ordinal/name/NULL/native/parse order, share the context-owned first-failure status rule, and cache only validated scalars. | generated binder/decoder; FFI/ABI and malformed input |
+| Q2 reserved an unused QueryMeta function pointer without a calling contract | Remove the dormant QueryMeta slot; the consumed static-option validator now occupies the fourth Q2 thunk position in the fixed 96-byte v1 header. Keep the Q1 metadata plan inert until D12 introduces its materializer ABI with the first consumer. | native descriptor ABI; type and monomorph closure |
+| multi-invalid precedence named tests but no winning rule | Make connection and execution validation phase order plus source-order option ownership normative in §13.4 and require every pairwise winner. | common validation precedence; driver connection options |
+| PostgreSQL client encoding could drift from UTF-8 | Reserve direct and startup-option `client_encoding`, append package-owned UTF8 after user inputs, ignore ambient PGCLIENTENCODING, and verify PG_UTF8 before returning the connection. | PostgreSQL connection options; FFI/ABI and malformed input |
+| option validation required untrusted descriptor identity | Validate the complete safety header first; malformed state returns one query-less exact header error, and only a validated ID may enter later option errors. | common validation precedence; FFI/ABI and malformed input |
+| static descriptor options had no Q2 consumer | Add one generated static-option thunk and exact SQLite-version/PostgreSQL-int8 callbacks before lease/send; preserve Check as an artifact-time decision. | static descriptor options; native descriptor ABI |
+| libpq could reinterpret one-second connect timeout as two seconds | Apply the documented cross-version two-second floor after ceiling conversion and pin its boundary. | PostgreSQL connection options |
+| post-connect encoding mismatch had no deterministic error | Always return the exact query-less Unsupported contract error, independent of libpq error-buffer state, before exactly-once close. | PostgreSQL connection options; native error ownership |
+| QueryMeta thunk ownership drifted across plans | Keep the producer-owned plan in D1 and move only materializer ABI/code plus its execution-header version to D12 in every current ledger and plan. | native descriptor ABI; D12 metadata owner |
+| cardinality and row-validation precedence could diverge by driver | Validate/cache row zero first, then detect a second row, then decode only an exact singleton; first-row validation beats multiplicity and no later row is validated. | SQLite command/query lifecycle; PostgreSQL result/cardinality |
+| PostgreSQL encoding check could hide a failed connection | Check `PQstatus` first, preserve/own the native connection error for non-OK status, and call `PQclientEncoding` only after `CONNECTION_OK`. | PostgreSQL connection options; native error ownership |
+| Q1 prose still required a dormant metadata thunk | Replace the remaining Q1 capability and measurement wording with binder/decoder and QueryMeta plans; D12 alone owns materializer code. | D12 metadata owner; current ledgers |
+| global builtin `Error` reservation contradicted module type identity and the settled `pkg.db.Error` API | Make non-entry bare lookup local-first and retain explicit `core.Error`; reject only true entry canonical collisions. Apply the rule to compiler-provided aliases generally, with no database special case. | public common surface; namespaced builtin type identity |
+| the first namespace revision contradicted the core and semantic-interface contracts | Update core EN/JA and the L2 interface contract; imported units accept same-spelled local definitions and semantic import resolves them local-first, while producer entry collisions reject before publication. | namespaced builtin type identity; whole/per-unit parity |
+| `core.Error` had no legal relationship to the capability-import rule | Make it an always-in-scope language-syntactic-core path for which `import core` is neither valid nor required; std-owned explicit spellings retain normal imports and count for the unused-import lint. | namespaced builtin type identity; explicit import owners |
+| `error(c)` could textually bind to a local `Error` | Define the sugar as a direct construction of `core.Error.Code(c)` and test it in a colliding module. | namespaced builtin type identity; error owner |
+| the general alias rule named no complete provider map and tested only `Error` | Close the table over `Error`, `argon2_params`, and `regex_match`, including exact provider spellings and parameterized owner coverage. | namespaced builtin type identity; core/std EN/JA |
+| the exact binder ABI required borrowing Copy `P`, but shared borrow rejected Copy as redundant | Generalize shared borrow to stable bound Copy or Move places, preserve the pointer-to-caller-storage ABI, and keep temporary rejection. Use the same rule for source, function values, interfaces, generated MIR, and whole/per-unit codegen without a database exception. | generated binder/decoder; type and monomorph closure; language borrow owners |
+| Q1 descriptors outside the Q2 scalar subset had no publishable execution header | Make `validate_static_thunk` return reserved `-1_i32` in phase 6 for unsupported `P` or Query `R`, before field callbacks, lease, or send; only after that status does the package construct the exact `db.descriptor.shape` owned `Unsupported` failure. Query keeps non-null but unreachable binder/row/decode thunks; command row/decode slots stay null. | generated binder/decoder; native descriptor ABI; unsupported-shape no-send and supported-success zero-error-allocation owners |
 
 ### D2 — minimal SQLite Query vertical
 

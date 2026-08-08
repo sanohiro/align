@@ -912,7 +912,6 @@ fn render_enum(e: &IEnumDef) -> String {
 /// structurally valid summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
-    ReservedLocalType(String),
     DuplicateLocalType(String),
     DuplicateTypeParameter(String),
     TypeParameterShadowsLocalType(String),
@@ -946,9 +945,6 @@ pub enum ImportCompatibilityError {
 impl std::fmt::Display for ImportCompatibilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImportCompatibilityError::ReservedLocalType(name) => {
-                write!(f, "interface declares producer-reserved local type `{name}`")
-            }
             ImportCompatibilityError::DuplicateLocalType(name) => {
                 write!(f, "interface contains duplicate or ambiguous local type `{name}`")
             }
@@ -1099,29 +1095,6 @@ struct LocalDefinitionIndex<'a> {
 
 impl<'a> LocalDefinitionIndex<'a> {
     fn new(summary: &'a InterfaceSummary) -> Result<Self, ImportCompatibilityError> {
-        for name in summary
-            .structs
-            .iter()
-            .map(|definition| &definition.name)
-            .chain(
-                summary
-                    .enums
-                    .iter()
-                    .map(|definition| &definition.name),
-            )
-            .chain(
-                summary
-                    .resources
-                    .iter()
-                    .map(|definition| &definition.name),
-            )
-        {
-            if is_reserved_local_type_name(name) {
-                return Err(ImportCompatibilityError::ReservedLocalType(
-                    name.clone(),
-                ));
-            }
-        }
         let mut definitions = Vec::with_capacity(
             summary.structs.len() + summary.enums.len() + summary.resources.len(),
         );
@@ -1195,10 +1168,6 @@ impl<'a> LocalDefinitionIndex<'a> {
     }
 }
 
-fn is_reserved_local_type_name(name: &str) -> bool {
-    matches!(name, "Error" | "argon2_params" | "regex_match")
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuiltinCapability {
     BorrowLeaf,
@@ -1219,8 +1188,9 @@ fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
         "box" | "array_builder" => (1, BuiltinCapability::Opaque),
         "buffer" | "file" | "rng" | "regex" | "captures" | "tcp_conn"
         | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
-        | "response_builder" | "http_stream" | "json.kind" | "Error"
-        | "argon2_params" | "regex_match" | "()" | "bool" | "char" | "string"
+        | "response_builder" | "http_stream" | "json.kind" | "Error" | "core.Error"
+        | "argon2_params" | "crypto.argon2_params" | "regex_match"
+        | "regex.regex_match" | "()" | "bool" | "char" | "string"
         | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
         | "f32" | "f64" | "raw" => (0, BuiltinCapability::Opaque),
         _ => {
@@ -1232,6 +1202,21 @@ fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
         }
     };
     Some(result)
+}
+
+fn bare_nominal_alias_prefers_local(path: &str) -> bool {
+    matches!(path, "Error" | "argon2_params" | "regex_match")
+}
+
+fn builtin_capability_after_local(
+    index: &LocalDefinitionIndex<'_>,
+    path: &str,
+) -> Option<(usize, BuiltinCapability)> {
+    if bare_nominal_alias_prefers_local(path) && index.local(path).is_some() {
+        None
+    } else {
+        builtin_capability(path)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1353,7 +1338,7 @@ impl<'a> CapabilityAnalysis<'a> {
                         }
                         _ => {}
                     }
-                    if builtin_capability(path).is_some() {
+                    if builtin_capability_after_local(&self.index, path).is_some() {
                         continue;
                     }
                     if let Some(index) = self.index.local(path) {
@@ -1435,7 +1420,9 @@ impl<'a> CapabilityAnalysis<'a> {
                         result.params[index] = true;
                         continue;
                     }
-                    if let Some((_, capability)) = builtin_capability(path) {
+                    if let Some((_, capability)) =
+                        builtin_capability_after_local(&self.index, path)
+                    {
                         match capability {
                             BuiltinCapability::BorrowLeaf => result.intrinsic = true,
                             BuiltinCapability::Transparent => work.extend(args),
@@ -1483,7 +1470,9 @@ impl<'a> CapabilityAnalysis<'a> {
                         result[index] = true;
                         continue;
                     }
-                    if let Some((_, capability)) = builtin_capability(path) {
+                    if let Some((_, capability)) =
+                        builtin_capability_after_local(&self.index, path)
+                    {
                         if capability == BuiltinCapability::Transparent {
                             work.extend(args);
                         }
@@ -1611,7 +1600,9 @@ impl<'a> CapabilityAnalysis<'a> {
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
-                    if let Some((_, capability)) = builtin_capability(path) {
+                    if let Some((_, capability)) =
+                        builtin_capability_after_local(&self.index, path)
+                    {
                         if capability == BuiltinCapability::Transparent {
                             work.extend(args);
                         }
@@ -1754,7 +1745,9 @@ fn validate_import_type_shape(
                 if args.is_empty() && parameter.is_some() {
                     continue;
                 }
-                let expected = if let Some((arity, _)) = builtin_capability(path) {
+                let expected = if let Some((arity, _)) =
+                    builtin_capability_after_local(index, path)
+                {
                     Some(arity)
                 } else {
                     index
@@ -2325,10 +2318,66 @@ pub fn summary_to_source(
 ) -> Result<String, ImportCompatibilityError> {
     validate_for_import(summary)?;
     let mut out = String::new();
+    let mut builtin_type_imports = std::collections::BTreeSet::<String>::new();
+    let mut collect_type = |root: &IType| {
+        let mut work = vec![root];
+        while let Some(ty) = work.pop() {
+            match ty {
+                IType::Named { path, args } => {
+                    match path.as_str() {
+                        "crypto.argon2_params" => {
+                            builtin_type_imports.insert("std.crypto".to_string());
+                        }
+                        "regex.regex_match" => {
+                            builtin_type_imports.insert("std.regex".to_string());
+                        }
+                        _ => {}
+                    }
+                    work.extend(args);
+                }
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { params, ret, .. } => {
+                    work.push(ret);
+                    work.extend(params.iter().map(|parameter| &parameter.ty));
+                }
+            }
+        }
+    };
+    for structure in &summary.structs {
+        for (_, ty) in &structure.fields {
+            collect_type(ty);
+        }
+    }
+    for enumeration in &summary.enums {
+        for (_, payload) in &enumeration.variants {
+            for ty in payload {
+                collect_type(ty);
+            }
+        }
+    }
+    for function in &summary.fns {
+        for parameter in &function.params {
+            collect_type(&parameter.ty);
+        }
+        collect_type(&function.ret);
+    }
+    for constant in &summary.consts {
+        if let Some(ty) = &constant.ty {
+            collect_type(ty);
+        }
+    }
+    // Render the capability imports and transitive dependency imports from one canonical set. A
+    // dependency can itself be the builtin module required by a public nominal type (for example,
+    // `std.crypto` for `crypto.argon2_params`); emitting both sources separately would synthesize a
+    // duplicate import that sema rejects even though the producer summary is valid.
+    let mut imports = builtin_type_imports;
     for dep in dep_units {
         if *dep != summary.unit {
-            out.push_str(&format!("import {dep}\n"));
+            imports.insert((*dep).to_string());
         }
+    }
+    for import in imports {
+        out.push_str(&format!("import {import}\n"));
     }
     for c in &summary.consts {
         out.push_str("pub ");

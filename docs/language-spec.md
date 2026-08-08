@@ -185,10 +185,9 @@ library concern), so strings sort and compare. `else` works on `Result` as well 
 the intent triangle is `?` propagates / `else` falls back / `match` inspects. Details:
 `draft.md` §4 / §5 / §12.
 
-Implementation status: comparison operators and `Eq`/`Ord` bounds currently accept borrowed
-`str`; direct owned-`string` comparison is still pending. To compare owned strings today, pass
-them through a `str`-typed helper so the normal `string` → `str` borrow coercion is explicit in
-the program's type flow.
+Comparison operators and `Eq`/`Ord` bounds accept both `str` and owned `string`. An owned operand
+is compared through a non-consuming, zero-cost `str` borrow, including in mixed `string`/`str`
+comparisons and monomorphized generic functions.
 
 ### Generics
 
@@ -320,7 +319,8 @@ Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // canonical builtin e
 ```
 
 No exceptions. `E` is any sum type (a domain may use its own error enum). `Error` is the builtin
-error type — construct `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar), `match` it, and at
+error type — construct `Error.NotFound` / `Error.Code(c)`, use `error(c)` as syntax sugar for the
+explicit builtin `core.Error.Code(c)`, `match` it, and at
 `main` it maps to the process exit code. Fallible builtins (`fs.read_file`, `json.decode`, …)
 return `Result<T, Error>`. A fallible `main` (`fn main() -> Result<(), E>`) restricts `E` to the
 builtin `Error` (the only type with a defined exit-code mapping; a user error enum there is a
@@ -328,6 +328,16 @@ compile error — convert with `map_err(to_error)?`). `?` requires the same `E` 
 with `result.map_err(f)`). Error **context is structured, not free-form**: a variant carries the
 relevant data (a position, a code), e.g. `ParseError { BadToken(Pos), Eof }` — there is no
 `.with_context("…")` string-chaining.
+
+The compiler-provided nominal aliases are exactly `Error` → `core.Error`, `argon2_params` →
+`crypto.argon2_params`, and `regex_match` → `regex.regex_match`. `core.Error` is language-syntactic
+core and is always available without an import. The other explicit spellings require respectively
+`import std.crypto` and `import std.regex`, and their type references count as uses for the
+unused-import lint. A non-entry module may declare a local type with any of those bare names: bare
+lookup resolves locally, the explicit spelling still names the builtin, and importers use the
+ordinary qualified local name such as `pkg.db.Error`. Without a same-module declaration the bare
+alias retains its builtin meaning. The entry module cannot declare a type whose unmangled canonical
+name collides with one of these builtins.
 
 The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
 `Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
@@ -565,7 +575,8 @@ Dangerous operations:
 unsafe
 ```
 
-Only inside an unsafe block: the `raw.*` flat-memory ops (`alloc`/`free`/`load`/`store`/`offset`) and
+Only inside an unsafe block: the `raw.*` flat-memory ops
+(`null`/`alloc`/`free`/`load`/`store`/`offset`) and
 a foreign call. A C function is declared `extern "C" fn name(params) -> ret` (or a braced group) and
 called like any other function, but only inside `unsafe` — foreign code is outside the safe core. A
 direct call or non-escaping pipeline/reducer/sort callback requires that lexical `unsafe`
@@ -578,12 +589,20 @@ struct. Returns admit `()`, integer and float scalars, `raw`, and an eligible no
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
 wrappers and borrow C engines via FFI.
 
+`raw.store(p, offset, value)` and `raw.load(p, offset)` move one inferred flat value at a byte
+offset. Store takes its type from `value`; load takes it from the expected result type. Admitted
+values are primitive scalars, `raw` pointers, and eligible non-empty `layout(C)` structs. Pointer
+slots therefore retain native handles without integer casts, while pointer validity, allocation
+size, and effective type remain the enclosing `unsafe` block's obligation.
+`raw.null()` is the sole explicit null-pointer constructor for native ABI arguments and sentinels;
+ordinary Align values still have no null model, and a raw pointer is tested with `p.is_null()`.
+
 A normal (non-`layout(C)`) struct has an **unspecified field order**: the compiler reorders fields by
 descending alignment to eliminate padding (`{ a: i8, b: i64, c: i8 }` → 16 bytes, not 24), a
 by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point { … }`, composes with
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
-order, natural alignment, no reordering). Only such a struct may be written to / read from `raw`
-memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
+order, natural alignment, no reordering). Among structs, only such a struct may be written to / read
+from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
 FFI-mappable scalars. On x86-64 SysV, a `layout(C)` struct in the ABI's register classes and no
 larger than 16 bytes may also cross by value; MEMORY-class/larger structs and other platform ABIs
 remain pointer-only.
@@ -674,6 +693,12 @@ interface (its template is instantiated in importers), so it may reference only 
 items — a private same-module fn/type/const in a generic `pub` body is rejected. The import graph must be a DAG —
 cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
 qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
+
+Bare type lookup first checks a declaration in the current module, then the closed compiler-provided
+alias table defined under Error handling. Thus a non-entry module may reuse a builtin's bare type
+name without taking that name away from any other module. Provider-qualified builtin lookup follows
+that table's exact import rule, while the entry module still rejects an unmangled canonical
+collision.
 
 Hermetic input discovery includes reachable `.align` units and exact static files explicitly
 registered by compiler-known constructors. Such a constructor cannot scan directories, run code,

@@ -95,8 +95,8 @@ For `borrow x: T`:
 - moving, replacing, or dropping that owner invalidates the returned value.
 
 The first implementation accepts a bound local or a field place whose owning root is a bound local.
-It rejects an unbound Move temporary at a borrowed parameter because the owner would otherwise need
-a second hidden lifetime-extension rule.
+It rejects every unbound temporary or rvalue at a borrowed parameter because the call requires
+stable caller storage and the language does not create a hidden addressable temporary.
 
 ### 2.3 Mutable borrow
 
@@ -972,7 +972,7 @@ QueryStatic
   producer-owned QueryMetaPlan and per-driver checked-evidence pointers
   generated bind thunk
   generated decode thunk
-  generated QueryMeta materialization thunk
+  D12-generated QueryMeta materialization thunk
   per-driver checked-metadata state/fingerprint
 ```
 
@@ -996,9 +996,10 @@ per-row field-name lookup, reflection, boxing, or map allocation.
 The QueryMeta thunk is generated code, not reflection. Given the selected driver, `MetaDetail`, and
 explicit output region, it materializes exactly the Summary/Parameter/Column rows from the
 producer-owned plan and checked-evidence tables. It never reads source files, `.align-db`, interface
-summaries, decoder code, or a database at runtime. D1 emits and tests the table/thunk skeleton for
-Declared Queries; D3/D5 populate checked evidence; D12 exposes the ordinary package call. Commands
-carry no QueryMeta plan or thunk.
+summaries, decoder code, or a database at runtime. D1 emits and tests the producer-owned plan for
+Declared Queries; D3/D5 populate checked evidence; D12 introduces the exact thunk ABI, generated
+code, descriptor-header version, and ordinary package call together with that thunk's first native
+consumer. Commands carry no QueryMeta plan or thunk.
 
 The producer's descriptor function returns the corresponding static pointer. When the item is
 `pub`, its interface exports that descriptor contract. Generated thunks stay in the producer object
@@ -3637,11 +3638,14 @@ this is not a duplicate definition. Type resolution preserves sema's exact prece
    parameter reports `DuplicateTypeParameter`; if the duplicate pass fails, that item does not
    enter the shadowing pass. Otherwise, the first parameter that shares a local declared-type name
    reports `TypeParameterShadowsLocalType`;
-2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>` resolve before
-   every qualified user definition, including definitions in a unit literally named `json`;
+2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>`, plus the closed
+   nominal-alias spellings `core.Error`, `crypto.argon2_params`, and `regex.regex_match`, resolve
+   before every qualified user definition. The `crypto` and `regex` forms require the matching std
+   capability in producer source; interface reconstruction derives the same imports from those
+   structured public type paths rather than serializing a second identity;
 3. another declared type parameter wins only when used bare and without arguments;
-4. another bare source-builtin spelling resolves to that builtin;
-5. every remaining bare name resolves through the local-definition index; and
+4. every bare name first resolves through the local-definition index;
+5. only after a local miss, another bare source-builtin spelling resolves to that builtin; and
 6. exact `summary.unit.Name` resolves locally unless rule 2 applies. Another qualified name,
    including `summary.unit.child.Name`, is a conservative foreign leaf and never prefix- or
    suffix-resolves locally.
@@ -3716,7 +3720,7 @@ weighted dependency edges including parallel edges, the finite scan-based solve 
 lattice direction, direct-actual measurement is independent of nested-reference discovery, each
 local-reference actual is scanned at most once per containing reference during dependency
 construction, and no definition is recursively instantiated. Each shape failure maps to one public
-import error: `ReservedLocalType`, `DuplicateLocalType`, `DuplicateTypeParameter`,
+import error: `DuplicateLocalType`, `DuplicateTypeParameter`,
 `TypeParameterShadowsLocalType`, `TypeParameterWithArguments`, `InvalidTypeArity`, or
 `UnresolvedBareType`. After the complete structured shape succeeds, a transported generic
 declaration that does not parse as its specified single fragment returns `GenericBodySyntax`; one
@@ -3865,7 +3869,7 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; am-h replaces the ambiguous checked-HIR `lifted_capture_count`/`exportable` pair with the single required `FnOrigin` record and no name spelling decides whether inference or linkage applies | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, a local definition using the producer-reserved exact name `Error`, `argon2_params`, or `regex_match`, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; the complete struct/sum definition set is scanned for reserved names before duplicate detection; `generic_body` is precisely the producer's item-span fragment: it starts at `fn` for a function or the declared type name for a struct/sum, omits `pub` and every struct `align`/`layout` prefix, and contains exactly that full declaration/body; validation reconstructs `pub` plus canonical `align(N)` then `layout(C)` prefixes from the structured record, rejects a module/import, extra item, trailing non-END token, or syntax error, parses exactly one declaration, and compares its kind, name, ordered type parameters/bounds, ordered function parameter modes/types and return type, ordered struct fields plus reconstructed layout attributes, or ordered sum variants against the structured record; an extra `pub` in the fragment is a syntax error because visibility is reconstructed rather than compared; function parameter names and generic function implementation expressions are deliberately transported but are not separate structured interface fields; a structured generic `layout(C)` struct returns `GenericCLayoutUnsupported`, within a struct that gate precedes `GenericBodySyntax`, and syntax precedes `GenericBodyMismatch`; all three precede header validation; reserved-local-name rejection precedes duplicate-local-definition rejection and has the exact `ReservedLocalType(name)` import error; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; a local definition sharing any other source-builtin spelling is not a duplicate, and non-shadowing type-parameter, qualified `json.*` builtin, bare builtin, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement for edge weight, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree; named-return inference uses a reverse direct-call worklist so a changed summary reprocesses only its callers; am-h replaces the ambiguous checked-HIR `lifted_capture_count`/`exportable` pair with the single required `FnOrigin` record and no name spelling decides whether inference or linkage applies | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, roots inconsistent with resolved parameter/return types, an entry declaration whose unmangled canonical name collides with `Error`, `argon2_params`, or `regex_match`, duplicate/ambiguous local definitions or type parameters, a function/struct/sum type parameter shadowing a local definition, an otherwise-unresolved parameter-with-arguments, wrong local/source-builtin arity, unresolved bare names, recursive generic-capability bindings, an exposure-aware positive constructor-growth edge in a declaration-parameter dependency cycle, generic-body/type-parameter shape disagreement, and every missing or recursive nominal/tuple/tagged id reachable through any by-value `Ty`/`Scalar` wrapper reject before consumer-visible side effects in the stated total order; imported units are non-entry and their same-spelled local definitions are ordinary nominal types; `generic_body` is precisely the producer's item-span fragment: it starts at `fn` for a function or the declared type name for a struct/sum, omits `pub` and every struct `align`/`layout` prefix, and contains exactly that full declaration/body; validation reconstructs `pub` plus canonical `align(N)` then `layout(C)` prefixes from the structured record, rejects a module/import, extra item, trailing non-END token, or syntax error, parses exactly one declaration, and compares its kind, name, ordered type parameters/bounds, ordered function parameter modes/types and return type, ordered struct fields plus reconstructed layout attributes, or ordered sum variants against the structured record; an extra `pub` in the fragment is a syntax error because visibility is reconstructed rather than compared; function parameter names and generic function implementation expressions are deliberately transported but are not separate structured interface fields; a structured generic `layout(C)` struct returns `GenericCLayoutUnsupported`, within a struct that gate precedes `GenericBodySyntax`, and syntax precedes `GenericBodyMismatch`; all three precede header validation; producer and importer both validate generic parameter lists in stored declaration/parameter order with duplicate-before-shadow precedence; local definitions win bare lookup over the three nominal aliases, and non-shadowing type-parameter, qualified builtin, bare builtin fallback, exact local, unit-prefix foreign, and other foreign resolution follows the recorded sema precedence; positive acyclic transformations and zero-weight cycles remain valid and parallel zero/positive edges remain distinct; non-empty generic-template and nested function-value summaries reject until their consumer-side transports exist; interface analysis uses one structured definition index, a least-fixed-point `{intrinsic borrow, dependent parameter positions}` summary and a separate greatest-fixed-point growth-transport summary per local definition across all public roots, with capability-aware opaque stops for transport, complete direct-actual measurement, and no recursive instantiation; layout validation shares completed nodes across the program and uses an iterative enter/exit traversal; both layout and borrow-capability traversal through header-mediated nominal cycles are cycle-safe and never overflow the compiler stack | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; only reachable explicit returns, loop breaks, and trailing values contribute roots or loop post-state: eager children follow source order and stop after the first non-fallthrough child; `&&`/`||`, `if`/`match` arms, and `else` fallback fork from their common incoming state, retain every reachable dependency/return edge, exclude a diverging alternative from post-state, and join only fallthrough alternatives; `?` evaluates its operand once, contributes its reachable implicit error-return roots only when the enclosing return can borrow, and continues post-state only through the success edge; a loop builds its back-edge only from body fallthrough, its post-state only from reachable breaks, and is non-fallthrough when none exist; checker-owned evidence records the exact statement span of each `break` accepted for its target loop after the target/lambda and newly nested `arena`/`task_group` gates but before payload validation, then a post-check source-order classifier counts only reachable spans from that per-loop set and consumes the separately recorded fallthrough result of each nested loop; HIR carries the same accepted-edge bit on every checked `break`, and effect inference, EscapeCheck, MoveCheck/return-provenance, and MIR lowering may form a loop-result join, escape edge, move/borrow post-state, provenance root, or loop-exit terminator only from an accepted edge; a region-rejected `break` emits its region diagnostic first, checks and preserves its payload only for nested type/effect/ownership/escape diagnostics, records no accepted edge, remains non-fallthrough for recovery in every consumer, lowers fail-closed to `Unreachable` if malformed HIR is forced into MIR, and can neither satisfy an assertion nor combine with an unreachable accepted break to make the loop fall through; statements and tails after a non-fallthrough statement are never visited, so no dead edge can taint a summary or caller liveness; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
 | Effect source-order closure | L2b-a1 | each structural pass visits every reachable eager child once in language order; loop refinement may repeat that pass but every call, impurity flag, and boundary join is monotone and idempotent across fixpoint passes; block traversal stops after the first non-fallthrough statement and visits a tail only when the block falls through; an accepted `break value` visits the reachable effects inside `value` but joins its function-value/concrete effect into the target loop result only when `value` itself falls through to that break edge; ordinary fallthrough accepted breaks still join; written pipelines evaluate source, stage operands, terminal arguments, then terminal captures/action; `if`, `match`, `else`, short-circuit, `?`, `map_err`, nested blocks/regions, loops, explicit return, inner break, calls, aggregates, assignments, captures, pipelines, and process termination use the exhaustive product below and the same fallthrough contract as return provenance | no dead eager sibling, statement, tail, operation, branch-result, terminal argument, stage, or outer break whose payload already terminated can taint a local/result/expression boundary, named-call dependency, direct/indirect impurity, unresolved dispatch, parallel-callback purity, or fixpoint; a rejected break still visits reachable payload diagnostics but never joins a loop result; projection queries cannot reintroduce a dead tail; no conservative default may turn a proven non-fallthrough payload into a result edge | L2b-b extends the same source-order walker to function-value/capture roots |
@@ -4014,11 +4018,12 @@ Acceptance:
 - compiler-produced public `Option` and `Task` definitions validate for import; a bare
   source-builtin spelling and an exact qualified local spelling resolve with the same precedence as
   sema, while `Task` remains a local source name rather than an invented interface builtin;
-- forged public definitions named `Error`, `argon2_params`, or `regex_match` reject with
-  `ReservedLocalType` before duplicate-local and type-shape validation, matching the producer's exact
-  reserved set without rejecting any other source-builtin spelling; the precedence owner fixture
-  places an earlier same-kind duplicate before a later cross-kind reserved definition, so a
-  per-definition interleaved scan cannot pass;
+- public definitions named `Error`, `argon2_params`, or `regex_match` validate as ordinary
+  non-entry local nominals; same-unit bare references resolve to them, exact unit-qualified
+  references resolve to them for consumers, and a bare reference after a local miss resolves to the
+  builtin alias. Explicit `core.Error`, `crypto.argon2_params`, and `regex.regex_match` references
+  retain builtin capability classification. Producer-only entry declarations of the three names
+  reject before interface publication, so semantic import has no `ReservedLocalType` failure;
 - a unit named `json` with a public local `doc` definition still resolves qualified `json.doc`,
   `json.kind`, and `json.scanner<...>` as source builtins; a non-shadowing type-parameter spelling
   reused by a resolvable builtin application follows that builtin, a type parameter matching a
@@ -4212,7 +4217,7 @@ Scope:
 - versioned Query/command artifacts and interface summaries;
 - generated `QueryStatic`/`CommandStatic` data skeletons, including per-driver bind plans and checked
   state.
-- structural Params/Row contracts/fingerprints, QueryMeta plan/thunk data, plus binder/decoder ABI
+- structural Params/Row contracts/fingerprints and QueryMeta plan data, plus binder/decoder ABI
   versions in artifact bytes,
   reproducibility checks, and cache keys.
 
@@ -4243,8 +4248,9 @@ Acceptance:
   map; no fake filesystem path enters identity or diagnostics;
 - Query and command both retain source/wire/occurrence/bind/checked/cache identity; command omits
   only Row/result/decode, and command bind never uses reflection;
-- a separately compiled Query's Declared and checked QueryMeta rows come only from its static
-  plan/materialization thunk and remain available without source/interface/artifact file I/O;
+- D1 keeps a separately compiled Query's Declared QueryMeta plan available without
+  source/interface/artifact file I/O; D12 owns the corresponding checked-plan materializer and
+  cross-unit row test;
 - CheckedRequired validates every permitted driver, while CheckedOptional preserves an explicit
   mixed per-driver state;
 - artifact bytes are reproducible across checkout roots and process runs.

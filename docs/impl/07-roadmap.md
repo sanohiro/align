@@ -42,6 +42,10 @@ run concurrently; F-B combines L4 and L6 so named regions land with a useful
 materialization consumer. Q2 implements both drivers against one common
 surface, Q3 implements both checked-metadata codecs together, Q4a closes
 prepared/transaction reuse, and Q4b closes streaming/cancellation resilience.
+Q2 also closes the general namespaced-builtin type rule required by the
+settled `pkg.db.Error` surface: non-entry local types win bare lookup,
+provider-qualified builtin spellings remain available, and only a true entry
+canonical collision is rejected.
 Q3 starts alongside Q4a after Q2; Q5a/Q5b follow Q3;
 D11 mutation and D12 read-only inspection may be two parallel PRs because they
 are independently useful failure domains. Q6 follows Q4b. The first public
@@ -271,7 +275,8 @@ every item below has since completed as recorded in the per-milestone sections, 
      placeholder. **4b-1 DONE (foundation)** — errors can be
      **user-defined sum types**: `Scalar::Enum(u32)` makes an enum a first-class `Option`/`Result`
      payload, so `Result<T, MyError>` works end to end. **4b-2 DONE** — the canonical **`Error` is a
-     builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a reserved type name):
+     builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a compiler-provided bare alias;
+     non-entry modules may reuse the local name and spell the builtin `core.Error`):
      `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` = sugar), `match` discriminates,
      `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
@@ -3611,7 +3616,7 @@ L1b Move sum/Option/Result payload completion — complete
 L2a parameter-mode and borrow/region-summary representation and interface identity
 L2b recursive parameter/capture return provenance and function-value joins
 L2c cleanup-ABI record and dynamic bit for recursively Move returns
-L2d shared borrow over reusable Move owners
+L2d shared borrow over stable bound Copy/Move storage
 L2e borrow mut/out + all-peer aliases + replacement/effect rules
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent views + root transfer
 L4  named arena region capability + clone_in
@@ -3655,7 +3660,7 @@ the exact engine/version origin and result-nullability information actually avai
 `NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database,
 including the exact top-level/nested codec, checked-in Query/command byte+digest goldens,
-structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan/thunk, and
+structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan, and
 binder/decoder ABI versions. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
 connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
@@ -3682,7 +3687,9 @@ Summary→Parameter→Column group order, canonical duplicate-constraint `key_or
 same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
 multi-invalid error precedence. The D12 gate compares exact signature notation with the owning API
 table, syntax-checks positional examples, and requires separately compiled Query metadata to come
-from the producer-owned plan/thunk without runtime artifact I/O. D11 and D12 are part
+from the producer-owned plan through the D12-owned exact materializer thunk without runtime artifact
+I/O. D12 introduces that thunk ABI/code and its descriptor-header version with this first consumer;
+D1 does not publish a dormant call edge. D11 and D12 are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

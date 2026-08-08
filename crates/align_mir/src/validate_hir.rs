@@ -2024,6 +2024,9 @@ struct BodyContext {
     /// this one narrow lexical fact while entering a `let` initializer and clears it for every
     /// retained child.
     pooled_initializer: Option<hir::LocalId>,
+    /// Only the direct integer-literal child of unary `-` may carry the positive magnitude one
+    /// past the signed maximum. Sema uses that exact HIR shape for `INT_MIN`.
+    signed_min_magnitude: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2512,6 +2515,7 @@ impl<'a> BodyValidator<'a> {
                 loop_targets: Vec::new(),
                 spawn: None,
                 pooled_initializer: None,
+                signed_min_magnitude: false,
             };
             if !self.walk_block(&function.body, context.clone()) {
                 return false;
@@ -3416,6 +3420,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::Unsafe(_)
+            | hir::ExprKind::RawNull
             | hir::ExprKind::RawAlloc(_)
             | hir::ExprKind::RawFree(_)
             | hir::ExprKind::RawLoad { .. }
@@ -3433,6 +3438,22 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderNew { .. }
             | hir::ExprKind::BuilderWrite { .. }
             | hir::ExprKind::BuilderToString(_) => true,
+            hir::ExprKind::RawPointerLoad { .. } => true,
+            hir::ExprKind::StaticDescriptorView { offset, .. } => {
+                self.static_descriptor_body_ok(context) && matches!(offset, 16 | 32 | 48)
+            }
+            hir::ExprKind::RawCall {
+                args,
+                param_tys,
+                param_modes,
+                return_cleanup,
+                ..
+            } => {
+                self.static_descriptor_body_ok(context)
+                    && args.len() == param_tys.len()
+                    && args.len() == param_modes.len()
+                    && *return_cleanup == hir::ReturnCleanupAbi::None
+            }
             hir::ExprKind::ResourceFromRaw { resource, parent, .. } => {
                 self.program.resources.get(*resource as usize).is_some()
                     && expression.ty == Ty::Resource(*resource)
@@ -4750,6 +4771,7 @@ impl<'a> BodyValidator<'a> {
             loop_targets: Vec::new(),
             spawn: None,
             pooled_initializer: None,
+            signed_min_magnitude: false,
         };
         let mut work = vec![BodyWork::EnterBlock(root, context)];
         while let Some(item) = work.pop() {
@@ -4799,12 +4821,19 @@ impl<'a> BodyValidator<'a> {
             ($child:expr, $child_context:expr) => {{
                 let mut child_context = $child_context;
                 child_context.pooled_initializer = None;
+                child_context.signed_min_magnitude = false;
                 work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
         match &expression.kind {
-            hir::ExprKind::Unary { expr, .. }
-            | hir::ExprKind::Cast(expr)
+            hir::ExprKind::Unary { op, expr } => {
+                let mut child_context = context.clone();
+                child_context.pooled_initializer = None;
+                child_context.signed_min_magnitude = *op == align_ast::UnOp::Neg
+                    && matches!(expr.kind, hir::ExprKind::Int(_));
+                work.push(BodyWork::EnterExpr(expr, child_context));
+            }
+            hir::ExprKind::Cast(expr)
             | hir::ExprKind::TaskGet(expr)
             | hir::ExprKind::OptionSome(expr)
             | hir::ExprKind::ResultOk(expr)
@@ -4847,6 +4876,12 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::CallFnValue { callee, args } => {
+                for arg in args.iter().rev() {
+                    push_expr!(arg, context.clone());
+                }
+                push_expr!(callee, context.clone());
+            }
+            hir::ExprKind::RawCall { callee, args, .. } => {
                 for arg in args.iter().rev() {
                     push_expr!(arg, context.clone());
                 }
@@ -4932,6 +4967,13 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::RawLoad { ptr, offset, .. } => {
                 push_expr!(offset, context.clone());
+                push_expr!(ptr, context.clone());
+            }
+            hir::ExprKind::RawPointerLoad { ptr, offset } => {
+                push_expr!(offset, context.clone());
+                push_expr!(ptr, context.clone());
+            }
+            hir::ExprKind::StaticDescriptorView { ptr, .. } => {
                 push_expr!(ptr, context.clone());
             }
             hir::ExprKind::RawOffset { ptr, offset } => {
@@ -5303,6 +5345,11 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 };
                 let (min, max) = int_range(integer)?;
+                let max = if context.signed_min_magnitude && integer.signed {
+                    max.checked_add(1)?
+                } else {
+                    max
+                };
                 (*value >= min && *value <= max).then_some((expression.ty, true, Vec::new()))
             }
             hir::ExprKind::Float(_) => {
@@ -6030,6 +6077,9 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
             }
+            hir::ExprKind::RawNull => {
+                (context.unsafe_depth > 0).then_some((Ty::Raw, true, Vec::new()))
+            }
             hir::ExprKind::RawAlloc(size) => {
                 let flow = self.expr_flow(size)?;
                 (context.unsafe_depth > 0 && flow.ty == i64_ty())
@@ -6048,6 +6098,116 @@ impl<'a> BodyValidator<'a> {
                 }
                 let (falls, breaks) = strict_flow(&[pointer, offset]);
                 Some((align_sema::scalar_to_ty(*scalar), falls, breaks))
+            }
+            hir::ExprKind::RawPointerLoad { ptr, offset } => {
+                let pointer = self.expr_flow(ptr)?;
+                let offset = self.expr_flow(offset)?;
+                if context.unsafe_depth == 0
+                    || pointer.ty != Ty::Raw
+                    || offset.ty != i64_ty()
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[pointer, offset]);
+                Some((Ty::Raw, falls, breaks))
+            }
+            hir::ExprKind::StaticDescriptorView { ptr, offset } => {
+                let pointer = self.expr_flow(ptr)?;
+                if context.unsafe_depth == 0
+                    || pointer.ty != Ty::Raw
+                    || !matches!(offset, 16 | 32 | 48)
+                    || self.static_descriptor_data_kind(context, ptr).is_none()
+                    || expression.ty != Ty::Str
+                {
+                    return None;
+                }
+                Some((Ty::Str, pointer.falls, pointer.breaks))
+            }
+            hir::ExprKind::RawCall {
+                callee,
+                args,
+                param_tys,
+                param_modes,
+                return_borrow,
+                return_region,
+                return_cleanup,
+            } => {
+                let callee_flow = self.expr_flow(callee)?;
+                let hir::ExprKind::RawPointerLoad { ptr, offset } = &callee.kind else {
+                    return None;
+                };
+                let query = self.static_descriptor_data_kind(context, ptr)?;
+                let hir::ExprKind::Int(offset) = &offset.kind else {
+                    return None;
+                };
+                let Ok(offset) = u32::try_from(*offset) else {
+                    return None;
+                };
+                let arg_flows = self.expr_flows(args)?;
+                if context.unsafe_depth == 0
+                    || callee_flow.ty != Ty::Raw
+                    || args.len() != param_tys.len()
+                    || args.len() != param_modes.len()
+                    || *return_borrow != hir::ReturnBorrowSummary::None
+                    || *return_region != hir::ReturnRegionSummary::None
+                    || *return_cleanup != hir::ReturnCleanupAbi::None
+                    || arg_flows
+                        .iter()
+                        .zip(param_tys)
+                        .any(|(flow, expected)| !self.body_ty_matches(flow.ty, *expected))
+                    || args.iter().enumerate().any(|(index, argument)| {
+                        matches!(
+                            param_modes.get(index),
+                            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+                        ) && !self.borrow_arg_is_valid(
+                            context,
+                            argument,
+                            param_modes[index],
+                        )
+                    })
+                {
+                    return None;
+                }
+                let i32_ty = Ty::Int(align_sema::IntTy {
+                    bits: 32,
+                    signed: true,
+                });
+                let signature_ok = match offset {
+                    64 => {
+                        args.len() == 2
+                            && param_tys.first() == Some(&Ty::Raw)
+                            && param_modes.as_slice()
+                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                            && expression.ty == i32_ty
+                    }
+                    72 => {
+                        args.len() == 1
+                            && param_tys.as_slice() == [Ty::Raw]
+                            && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                            && expression.ty == i32_ty
+                    }
+                    80 => {
+                        query
+                            && args.len() == 1
+                            && param_tys.as_slice() == [Ty::Raw]
+                            && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                            && expression.ty == i32_ty
+                    }
+                    88 => {
+                        query
+                            && args.len() == 1
+                            && param_tys.as_slice() == [Ty::Raw]
+                            && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                    }
+                    _ => false,
+                };
+                if !signature_ok {
+                    return None;
+                }
+                let mut flows = vec![callee_flow];
+                flows.extend(arg_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((expression.ty, falls, breaks))
             }
             hir::ExprKind::RawStore { ptr, offset, value } => {
                 let pointer = self.expr_flow(ptr)?;
@@ -9324,7 +9484,51 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn raw_store_ty_ok(&self, ty: Ty) -> bool {
-        align_sema::ty_to_scalar(ty).is_some_and(|scalar| self.raw_scalar_ok(scalar))
+        ty == Ty::Raw
+            || align_sema::ty_to_scalar(ty).is_some_and(|scalar| self.raw_scalar_ok(scalar))
+    }
+
+    fn static_descriptor_body_ok(&self, context: &BodyContext) -> bool {
+        self.program
+            .fns
+            .get(context.function)
+            .is_some_and(|function| {
+                let name = function.name.as_str();
+                name.starts_with("pkg.db$") || name.starts_with("pkg.db.")
+            })
+    }
+
+    /// Return whether the compiler-private `$static` field belongs to a Query (`true`) or command
+    /// (`false`). Every trusted pointer load must remain rooted directly in this field; accepting an
+    /// arbitrary `raw` child here would turn the package bridge into a general hidden memory read.
+    fn static_descriptor_data_kind(
+        &self,
+        context: &BodyContext,
+        expression: &hir::Expr,
+    ) -> Option<bool> {
+        if !self.static_descriptor_body_ok(context) {
+            return None;
+        }
+        let hir::ExprKind::Field { root, path } = &expression.kind else {
+            return None;
+        };
+        if path.as_slice() != [0] || expression.ty != Ty::Raw {
+            return None;
+        }
+        let Ty::Struct(id) = self
+            .program
+            .fns
+            .get(context.function)?
+            .locals
+            .get(*root as usize)?
+            .ty
+        else {
+            return None;
+        };
+        let definition = self.program.structs.get(id as usize)?;
+        align_sema::static_descriptor_struct_is_valid(definition).then(|| {
+            definition.name.starts_with("pkg.db$query$")
+        })
     }
 
     fn mangled_call_name_matches(

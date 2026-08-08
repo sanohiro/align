@@ -146,6 +146,32 @@ pub fn main() -> Result<(), Error> {
 
 // --- env.set / env.get round-trip -------------------------------------------------------------
 
+/// `env.get` sees a variable inherited by the generated executable, not only a value set from
+/// Align code. This is the process-boundary behavior used by tool/integration entry points.
+#[test]
+fn env_get_inherits_process_environment() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.env
+pub fn main() -> Result<(), Error> {
+  match env.get(\"ALIGN_M9_INHERITED\") {
+    Some(v) => print(v),
+    None => print(\"none\"),
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run_with_env(
+        "m9-env-inherited",
+        prog,
+        &[("ALIGN_M9_INHERITED", "inherited-value")],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "inherited-value\n");
+}
+
 /// `env.set` then `env.get` round-trips the value; an unset name yields `None`.
 #[test]
 fn env_set_get_round_trip() {

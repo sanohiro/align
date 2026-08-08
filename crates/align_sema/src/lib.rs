@@ -2495,13 +2495,13 @@ impl Bound {
         }
     }
     /// Whether a concrete type satisfies this bound (checked at instantiation). `Eq` = anything with
-    /// `==` (int/float/char/bool/str); `Ord` = the ordered scalars (int/float/char) plus `str`
+    /// `==` (int/float/char/bool/str/string); `Ord` = the ordered scalars (int/float/char) plus strings
     /// (byte-lexicographic — the ordered completion of `Eq(str)`); `Num` = the numerics (int/float).
     fn satisfied_by(self, ty: Ty) -> bool {
         match self {
             Bound::Unconstrained => true,
-            Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str),
-            Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str),
+            Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str | Ty::String),
+            Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String),
             Bound::Num => ty.is_numeric(),
             // RegionPlain is structural and needs the complete nominal definition tables.  Its
             // concrete check is owned by generic-call finalization, not this scalar predicate.
@@ -3776,15 +3776,62 @@ struct TypeEntry {
 /// qualified `mod.Type` from an importer (with import + `pub` checks).
 type ModTypes = HashMap<String, HashMap<String, TypeEntry>>;
 
+#[derive(Clone, Copy)]
+struct BuiltinNominalAlias {
+    bare: &'static str,
+    explicit: &'static str,
+    canonical: &'static str,
+    required_import: Option<&'static str>,
+}
+
+const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
+    BuiltinNominalAlias {
+        bare: "Error",
+        explicit: "core.Error",
+        canonical: "Error",
+        required_import: None,
+    },
+    BuiltinNominalAlias {
+        bare: "argon2_params",
+        explicit: "crypto.argon2_params",
+        canonical: "argon2_params",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "regex_match",
+        explicit: "regex.regex_match",
+        canonical: "regex_match",
+        required_import: Some("std.regex"),
+    },
+];
+
+fn builtin_nominal_alias_by_bare(name: &str) -> Option<BuiltinNominalAlias> {
+    BUILTIN_NOMINAL_ALIASES
+        .iter()
+        .copied()
+        .find(|alias| alias.bare == name)
+}
+
+fn builtin_nominal_alias_by_explicit(path: &str) -> Option<BuiltinNominalAlias> {
+    BUILTIN_NOMINAL_ALIASES
+        .iter()
+        .copied()
+        .find(|alias| alias.explicit == path)
+}
+
 /// Resolve a type-name path to its canonical key, applying module visibility. A single segment is a
 /// type in `cur_module` (or a builtin reserved type); a dotted `mod.Type` must name an imported module
 /// and a `pub` type. `None` (with a diagnostic, unless the single-segment miss is left to the
 /// caller) if it does not resolve. `emit_unknown` controls whether a single-segment miss reports an
 /// error here (callers that still want to try other interpretations pass `false`).
+// This resolver keeps the complete namespace context explicit at the single call boundary; the
+// arguments are the independently-built tables and diagnostics needed for deterministic lookup.
+#[allow(clippy::too_many_arguments)]
 fn canonical_type_name(
     path: &ast::Path,
     cur_module: &str,
-    imports: &std::collections::HashSet<String>,
+    user_imports: &std::collections::HashSet<String>,
+    builtin_imports: &std::collections::HashSet<String>,
     table: &ModTypes,
     emit_unknown: bool,
     span: Span,
@@ -3793,22 +3840,12 @@ fn canonical_type_name(
     let segs = &path.segments;
     let bare = segs.last().map(|s| s.name.as_str()).unwrap_or("");
     if segs.len() <= 1 {
-        // `Error` is the builtin error sum type — visible everywhere, no import.
-        if bare == "Error" {
-            return Some("Error".to_string());
-        }
-        // `argon2_params` is the builtin std.crypto Argon2 parameters struct — likewise visible
-        // everywhere (a reserved type name), so `argon2_params{...}` is an ordinary struct literal.
-        if bare == "argon2_params" {
-            return Some("argon2_params".to_string());
-        }
-        // `regex_match` is the builtin Copy span returned by `std.regex` searches.
-        if bare == "regex_match" {
-            return Some("regex_match".to_string());
-        }
         match table.get(cur_module).and_then(|m| m.get(bare)) {
             Some(e) => Some(e.canonical.clone()),
             None => {
+                if let Some(alias) = builtin_nominal_alias_by_bare(bare) {
+                    return Some(alias.canonical.to_string());
+                }
                 if emit_unknown {
                     diags.error(format!("unknown type: '{bare}'"), span);
                 }
@@ -3816,6 +3853,23 @@ fn canonical_type_name(
             }
         }
     } else {
+        let explicit = segs
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(alias) = builtin_nominal_alias_by_explicit(&explicit) {
+            if let Some(required) = alias.required_import
+                && !builtin_imports.contains(required)
+            {
+                diags.error(
+                    format!("`{explicit}` requires `import {required}` — the capability is not imported"),
+                    span,
+                );
+                return None;
+            }
+            return Some(alias.canonical.to_string());
+        }
         let mut module = String::new();
         for (i, s) in segs[..segs.len() - 1].iter().enumerate() {
             if i > 0 {
@@ -3823,7 +3877,7 @@ fn canonical_type_name(
             }
             module.push_str(&s.name);
         }
-        if module != cur_module && !imports.contains(&module) {
+        if module != cur_module && !user_imports.contains(&module) {
             diags.error(format!("module `{module}` is not imported (add `import {module}`)"), span);
             return None;
         }
@@ -4941,18 +4995,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ast::Item::Resource(r) => (&r.name.name, r.vis, r.type_params.len(), r.span),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
-            if bare == "Error" {
-                diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
-            }
-            if bare == "argon2_params" {
+            if m.is_entry && builtin_nominal_alias_by_bare(bare).is_some() {
                 diags.error(
-                    "'argon2_params' is a reserved type name (the builtin std.crypto Argon2 parameters struct)".to_string(),
-                    span,
-                );
-            }
-            if bare == "regex_match" {
-                diags.error(
-                    "'regex_match' is a reserved type name (the builtin std.regex match span struct)".to_string(),
+                    format!(
+                        "'{bare}' collides with a compiler-provided builtin type in the unmangled entry namespace"
+                    ),
                     span,
                 );
             }
@@ -5184,6 +5231,19 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             (m.path.as_str(), set)
         })
         .collect();
+    let builtin_imports_by_module: HashMap<&str, std::collections::HashSet<String>> = modules
+        .iter()
+        .map(|m| {
+            let set = m
+                .file
+                .imports
+                .iter()
+                .map(path_str)
+                .filter(|path| BUILTIN_MODULES.contains(&path.as_str()))
+                .collect();
+            (m.path.as_str(), set)
+        })
+        .collect();
 
     // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
     // (variant order must match `ERROR_VARIANT_CODE`). Registered right after the concrete user
@@ -5309,6 +5369,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 &mut TyCx {
                     cur_module: $module,
                     imports: imports_by_module.get(*$module).unwrap_or(&no_imports),
+                    builtin_imports: builtin_imports_by_module.get(*$module).unwrap_or(&no_imports),
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
@@ -5411,6 +5472,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             &mut TyCx {
                 cur_module: $module,
                 imports: $imports,
+                builtin_imports: builtin_imports_by_module
+                    .get(*$module)
+                    .unwrap_or(&no_imports),
                 type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
@@ -5818,7 +5882,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 }
                 let canonical = mangle_fn(&m.path, m.is_entry, bare);
                 let ann_ty = c.ty.as_ref().map(|t| {
-                    let ty = resolve_type(t, tcx!(m.path.as_str(), &no_imports), &[], diags);
+                    let ty = resolve_type(t, tcx!(&m.path.as_str(), &no_imports), &[], diags);
                     match ty {
                         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error => ty,
                         // A top-level aggregate constant is a **static `slice<T>` view** of per-unit
@@ -5957,7 +6021,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            let ty = resolve_type(&p.ty, tcx!(module, imports), &tparams, diags);
+            let ty = resolve_type(&p.ty, tcx!(&module, imports), &tparams, diags);
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
                 && bounds.get(index as usize) != Some(&Bound::RegionPlain)
             {
@@ -5984,7 +6048,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, tcx!(module, imports), &tparams, diags);
+                let r = resolve_type(t, tcx!(&module, imports), &tparams, diags);
                 if let Ty::ArrayBuilder(Scalar::Param(index)) = r
                     && bounds.get(index as usize) != Some(&Bound::RegionPlain)
                 {
@@ -6241,7 +6305,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 let cname = sig.name.name.clone();
                 let mut params: Vec<Ty> = Vec::with_capacity(sig.params.len());
                 for p in &sig.params {
-                    let ty = resolve_type(&p.ty, tcx!(m.path.as_str(), imports), &[], diags);
+                    let ty = resolve_type(&p.ty, tcx!(&m.path.as_str(), imports), &[], diags);
                     // `Ty::Error` already produced a diagnostic in `resolve_type` — don't pile a
                     // second "not FFI-safe" error on the same root cause. A parameter also accepts a
                     // `str`/`slice`/`bytes` view — passed to C as its data pointer (see
@@ -6273,7 +6337,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 }
                 let ret = match &sig.ret {
                     Some(t) => {
-                        let r = resolve_type(t, tcx!(m.path.as_str(), imports), &[], diags);
+                        let r = resolve_type(t, tcx!(&m.path.as_str(), imports), &[], diags);
                         // A `()` (void) return is allowed; otherwise an FFI-safe scalar or a
                         // `layout(C)` struct returned **by value** (SysV register return; codegen
                         // enforces the ABI/target/size limits). (`Ty::Error` already reported.)
@@ -11525,6 +11589,22 @@ impl EffectScan<'_> {
                 walk!(offset);
                 self.impure_direct = true;
             }
+            ExprKind::RawPointerLoad { ptr, offset } => {
+                walk!(ptr);
+                walk!(offset);
+                self.impure_direct = true;
+            }
+            ExprKind::StaticDescriptorView { ptr, .. } => {
+                walk!(ptr);
+                self.impure_direct = true;
+            }
+            ExprKind::RawCall { callee, args, .. } => {
+                walk!(callee);
+                for arg in args {
+                    walk!(arg);
+                }
+                self.impure_direct = true;
+            }
             ExprKind::RawStore { ptr, offset, value } => {
                 walk!(ptr);
                 walk!(offset);
@@ -11680,7 +11760,8 @@ impl EffectScan<'_> {
             | ExprKind::ConstArray { .. }
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
-            | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
+            | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. }
+            | ExprKind::RawNull => {}
         }
         true
     }
@@ -14351,6 +14432,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawAlloc(..)
             | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. }
+            | ExprKind::RawPointerLoad { .. }
+            | ExprKind::StaticDescriptorView { .. }
+            | ExprKind::RawCall { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
             | ExprKind::RawIsNull(..)
@@ -14503,7 +14587,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
-            | ExprKind::ArrayGroupAggMulti { .. } => values.push(Region::Static),
+            | ExprKind::ArrayGroupAggMulti { .. }
+            | ExprKind::RawNull => values.push(Region::Static),
                 },
                 Work::Shorter(count, initial) => {
                     let start = values
@@ -14664,6 +14749,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawAlloc(..)
             | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. }
+            | ExprKind::RawPointerLoad { .. }
+            | ExprKind::StaticDescriptorView { .. }
+            | ExprKind::RawCall { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
             | ExprKind::RawIsNull(..)
@@ -14868,7 +14956,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
-            | ExprKind::CryptoArgon2 { .. } => {}
+            | ExprKind::CryptoArgon2 { .. }
+            | ExprKind::RawNull => {}
             }
         }
         false
@@ -15915,6 +16004,17 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(ptr, depth);
                 self.walk(offset, depth);
             }
+            ExprKind::RawPointerLoad { ptr, offset } => {
+                self.walk(ptr, depth);
+                self.walk(offset, depth);
+            }
+            ExprKind::StaticDescriptorView { ptr, .. } => self.walk(ptr, depth),
+            ExprKind::RawCall { callee, args, .. } => {
+                self.walk(callee, depth);
+                for arg in args {
+                    self.walk(arg, depth);
+                }
+            }
             ExprKind::RawStore { ptr, offset, value } => {
                 self.walk(ptr, depth);
                 self.walk(offset, depth);
@@ -16393,7 +16493,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
-            | ExprKind::IndexField { .. } => {}
+            | ExprKind::IndexField { .. }
+            | ExprKind::RawNull => {}
         }
     }
 }
@@ -18673,6 +18774,18 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
+            ExprKind::RawCall {
+                args,
+                param_modes,
+                return_borrow,
+                ..
+            } => self.map_summary_roots(
+                return_borrow,
+                Some(param_modes.as_slice()),
+                |index| args.get(index as usize),
+            ),
+            ExprKind::RawPointerLoad { .. } => BorrowRoots::new(),
+            ExprKind::StaticDescriptorView { ptr, .. } => self.borrow_sources(ptr),
             ExprKind::Spawn { closure, .. } => self.borrow_sources(closure),
             ExprKind::Closure { captures, .. } => {
                 let mut roots = BorrowRoots::new();
@@ -18850,7 +18963,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RegexCompile { .. } | ExprKind::RegexIsMatch { .. } | ExprKind::RegexFind { .. }
             | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } | ExprKind::RegexReplace { .. }
             | ExprKind::RegexCaptures { .. } | ExprKind::RegexGroupCount { .. }
-            | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. } => {
+            | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. }
+            | ExprKind::RawNull => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums, self.tagged_types),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -22872,6 +22986,28 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ptr, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
             }
+            ExprKind::RawPointerLoad { ptr, offset } => {
+                move_expr!(self, ptr, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
+            }
+            ExprKind::StaticDescriptorView { ptr, .. } => {
+                move_expr!(self, ptr, moved, false, false);
+            }
+            ExprKind::RawCall {
+                callee,
+                args,
+                param_modes,
+                ..
+            } => {
+                move_expr!(self, callee, moved, false, false);
+                for (index, argument) in args.iter().enumerate() {
+                    let consuming = !matches!(
+                        param_modes.get(index),
+                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    );
+                    move_expr!(self, argument, moved, consuming, true);
+                }
+            }
             ExprKind::RawStore { ptr, offset, value } => {
                 move_expr!(self, ptr, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
@@ -23484,7 +23620,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Str(_)
             | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
-            | ExprKind::OptionNone => {}
+            | ExprKind::OptionNone
+            | ExprKind::RawNull => {}
         }
         true
     }
@@ -24923,6 +25060,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26292,6 +26430,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26326,6 +26465,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -26354,23 +26494,30 @@ impl<'a, 't> Checker<'a, 't> {
     /// Resolve a type-name path to its canonical key (a bare name in `cur_module`, or a qualified
     /// `mod.Type` with import + `pub` checks). Emits a diagnostic on failure.
     fn canonical_type(&mut self, path: &ast::Path, span: Span) -> Option<String> {
-        canonical_type_name(path, &self.cur_module, self.user_imports, self.type_table, true, span, self.diags)
+        canonical_type_name(
+            path,
+            &self.cur_module,
+            self.user_imports,
+            self.imports,
+            self.type_table,
+            true,
+            span,
+            self.diags,
+        )
     }
 
     /// Resolve a bare type name to its canonical key in the current module (or a builtin reserved type),
     /// without emitting an error — for speculative interpretations (e.g. `Name.Variant`) that fall
     /// through to other meanings when `Name` is not a type here.
     fn local_type(&self, bare: &str) -> Option<String> {
-        if bare == "Error" {
-            return Some("Error".to_string());
-        }
-        if bare == "argon2_params" {
-            return Some("argon2_params".to_string());
-        }
-        if bare == "regex_match" {
-            return Some("regex_match".to_string());
-        }
-        self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
+        self.type_table
+            .get(&self.cur_module)
+            .and_then(|types| types.get(bare))
+            .map(|entry| entry.canonical.clone())
+            .or_else(|| {
+                builtin_nominal_alias_by_bare(bare)
+                    .map(|alias| alias.canonical.to_string())
+            })
     }
 
     /// Resolve the receiver of a `Type.Variant` access/constructor to the type's canonical name —
@@ -26394,9 +26541,21 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind
             && let Some(name) = single_name(p) {
                 return Ok(self.local_type(name));
-            }
+        }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
+        if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
+            if let Some(required) = alias.required_import
+                && !self.imports.contains(required)
+            {
+                self.diags.error(
+                    format!("`{flat}` requires `import {required}` — the capability is not imported"),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some(alias.canonical.to_string()));
+        }
         let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
         if module == self.cur_module || !self.user_imports.contains(module) {
             return Ok(None);
@@ -26561,6 +26720,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// scalar/vector retry point; `AfterRhs` applies the former parent logic only after both
     /// operands have completed.
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        #[allow(clippy::large_enum_variant)]
         enum Frame<'e> {
             Enter {
                 expr: &'e ast::Expr,
@@ -26664,14 +26824,24 @@ impl<'a, 't> Checker<'a, 't> {
                         | BinOp::Sub
                         | BinOp::Mul
                         | BinOp::Div
-                        | BinOp::Rem
-                        | BinOp::Eq
+                        | BinOp::Rem => {
+                            if matches!(self.resolve(lhs.ty), Ty::Vec(..)) {
+                                (None, None)
+                            } else {
+                                (Some(lhs.ty), Some(self.diags.len()))
+                            }
+                        }
+                        BinOp::Eq
                         | BinOp::Ne
                         | BinOp::Lt
                         | BinOp::Le
                         | BinOp::Gt
                         | BinOp::Ge => {
-                            if matches!(self.resolve(lhs.ty), Ty::Vec(..)) {
+                            if matches!(self.resolve(lhs.ty), Ty::Vec(..) | Ty::Str | Ty::String) {
+                                // Text operands deliberately retain their natural ownership type
+                                // until `finish_binary` normalizes both sides to borrowed `str`.
+                                // Feeding one side's exact type into the other would reject the
+                                // supported mixed `string`/`str` case before normalization.
                                 (None, None)
                             } else {
                                 (Some(lhs.ty), Some(self.diags.len()))
@@ -26739,8 +26909,8 @@ impl<'a, 't> Checker<'a, 't> {
     fn finish_binary(
         &mut self,
         op: BinOp,
-        l: Expr,
-        r: Expr,
+        mut l: Expr,
+        mut r: Expr,
         expected: Option<Ty>,
         span: Span,
     ) -> Expr {
@@ -26784,7 +26954,36 @@ impl<'a, 't> Checker<'a, 't> {
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
                     ty = Ty::Mask(s, n);
                 } else {
-                    let t = self.unify(l.ty, r.ty, span);
+                    let l_ty = self.resolve(l.ty);
+                    let r_ty = self.resolve(r.ty);
+                    let both_strings = matches!(l_ty, Ty::Str | Ty::String)
+                        && matches!(r_ty, Ty::Str | Ty::String);
+                    let t = if both_strings {
+                        // String operators are non-consuming byte comparisons. Normalize an owned
+                        // operand to the same zero-cost `str` view used by argument coercion before
+                        // MIR sees the binary expression. This also makes mixed `string`/`str`
+                        // comparisons one path and keeps codegen's string ABI independent of
+                        // ownership.
+                        if l_ty == Ty::String {
+                            let operand_span = l.span;
+                            l = Expr {
+                                kind: ExprKind::StrBorrow(Box::new(l)),
+                                ty: Ty::Str,
+                                span: operand_span,
+                            };
+                        }
+                        if r_ty == Ty::String {
+                            let operand_span = r.span;
+                            r = Expr {
+                                kind: ExprKind::StrBorrow(Box::new(r)),
+                                ty: Ty::Str,
+                                span: operand_span,
+                            };
+                        }
+                        Ty::Str
+                    } else {
+                        self.unify(l.ty, r.ty, span)
+                    };
                     let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
                     if let Ty::Param(i) = t {
                         // A generic value: equality needs `Eq`, ordering needs `Ord`.
@@ -26797,15 +26996,6 @@ impl<'a, 't> Checker<'a, 't> {
                             let what = if is_eq { "equality" } else { "ordering" };
                             self.diags.error(self.bound_needed_msg(i, what, needed), span);
                         }
-                    } else if t == Ty::String {
-                        // Owned `string` comparison (`==`/`!=` and ordering) is not implemented yet
-                        // (only the `str` view is comparable). Comparing it would otherwise fall
-                        // through to codegen's integer path and ICE — reject it here with a clear "not
-                        // yet" message (the same "deferred, not structural" treatment as before).
-                        self.diags.error(
-                            "owned `string` values are not directly comparable yet — take a `str` view of each (numbers, bool, char, and `str` are the comparable types)".to_string(),
-                            span,
-                        );
                     } else if t != Ty::Error {
                         // A concrete non-generic operand. Equality is defined for scalars + `str`,
                         // ordering for numbers + `char` + `str` (byte-lexicographic) — there is NO
@@ -26821,10 +27011,10 @@ impl<'a, 't> Checker<'a, 't> {
                             let shown = self.ty_display(t);
                             let msg = if is_eq {
                                 format!(
-                                    "`==` and `!=` compare scalars and strings only (numbers, bool, char, str); {shown} has no equality — compare a struct's fields explicitly, `match` on a sum value, or compare arrays element-wise as a pipeline",
+                                    "`==` and `!=` compare scalars and strings only (numbers, bool, char, str, string); {shown} has no equality — compare a struct's fields explicitly, `match` on a sum value, or compare arrays element-wise as a pipeline",
                                 )
                             } else {
-                                format!("`<`, `<=`, `>`, `>=` order numbers, char, and str only; {shown} has no ordering")
+                                format!("`<`, `<=`, `>`, `>=` order numbers, char, and strings only; {shown} has no ordering")
                             };
                             self.diags.error(msg, span);
                         }
@@ -28268,10 +28458,13 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "heap" && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
-            // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` /
-            // `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a module name, not a value).
+            // `raw.null()` / `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` /
+            // `raw.store(p, off, v)` / `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a
+            // module name, not a value).
             // `unsafe {}`-only.
-            if module == "raw" && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
+            if module == "raw"
+                && matches!(method, "null" | "alloc" | "free" | "load" | "store" | "offset")
+            {
                 return self.check_raw_op(method, args, expected, span);
             }
             if module == "resource"
@@ -28545,6 +28738,9 @@ impl<'a, 't> Checker<'a, 't> {
         });
         if !leftmost_is_local
             && let Some(modpath) = flatten_module_path(recv) {
+                if modpath == "pkg.db.internal.descriptor" {
+                    return self.check_static_descriptor_op(method, args, expected, span);
+                }
                 match self.resolve_qualified_fn(&modpath, method, span) {
                     Ok(Some(mangled)) => {
                         let display = format!("{modpath}.{method}");
@@ -29194,6 +29390,435 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
+    }
+
+    /// Closed compiler/package bridge for Q2 static database descriptors. These operations are
+    /// deliberately unavailable to applications: only source owned by `pkg.db` or one of its
+    /// descendant modules may form the checked HIR nodes, and every use remains visibly `unsafe`.
+    fn check_static_descriptor_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if self.cur_module != "pkg.db" && !self.cur_module.starts_with("pkg.db.") {
+            self.diags.error(
+                "static descriptor operations are compiler-private to `pkg.db`".to_owned(),
+                span,
+            );
+            return err;
+        }
+        if !self.user_imports.contains("pkg.db.internal.descriptor") {
+            self.diags.error(
+                "static descriptor operations require `import pkg.db.internal.descriptor`"
+                    .to_owned(),
+                span,
+            );
+            return err;
+        }
+        if self.unsafe_depth == 0 {
+            self.diags.error(
+                "static descriptor operations require an unsafe { } block".to_owned(),
+                span,
+            );
+            return err;
+        }
+        let expected_arity = match method {
+            "data"
+            | "q1_plan"
+            | "descriptor_id_pointer"
+            | "sqlite_sql_pointer"
+            | "postgres_sql_pointer"
+            | "descriptor_id"
+            | "sqlite_sql"
+            | "postgres_sql"
+            | "binder"
+            | "static_validator"
+            | "row_validator"
+            | "decoder" => 1,
+            "validate_static" | "validate_row" | "decode" => 2,
+            "bind" => 3,
+            "parameter_known" => 2,
+            "execute_sqlite" | "execute_postgres" => 4,
+            "one_sqlite" | "one_postgres" => 5,
+            _ => {
+                self.diags.error(
+                    format!("unknown static descriptor operation '{method}'"),
+                    span,
+                );
+                return err;
+            }
+        };
+        if args.len() != expected_arity {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects {expected_arity} argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err;
+        }
+
+        let statement = self.check_expr(&args[0], None);
+        let ExprKind::Local(root) = statement.kind else {
+            if statement.ty != Ty::Error {
+                self.diags.error(
+                    "a static descriptor operation requires a bound Query or command value"
+                        .to_owned(),
+                    args[0].span,
+                );
+            }
+            return err;
+        };
+        let Ty::Struct(struct_id) = self.resolve(statement.ty) else {
+            if statement.ty != Ty::Error {
+                self.diags.error(
+                    "a static descriptor operation requires `db.query<P, R>` or `db.command<P>`"
+                        .to_owned(),
+                    args[0].span,
+                );
+            }
+            return err;
+        };
+        let Some(instance) = self.struct_instances.get(&struct_id).cloned() else {
+            self.diags.error(
+                "a static descriptor operation requires a concrete generic descriptor".to_owned(),
+                args[0].span,
+            );
+            return err;
+        };
+        let query = instance.canonical == "pkg.db$query" && instance.args.len() == 2;
+        let command = instance.canonical == "pkg.db$command" && instance.args.len() == 1;
+        if (!query && !command)
+            || !self
+                .structs
+                .get(struct_id as usize)
+                .is_some_and(static_descriptor_struct_is_valid)
+        {
+            self.diags.error(
+                "a static descriptor operation requires `db.query<P, R>` or `db.command<P>`"
+                    .to_owned(),
+                args[0].span,
+            );
+            return err;
+        }
+        if matches!(method, "validate_row" | "decode") && !query {
+            self.diags.error(
+                format!("static descriptor operation '{method}' requires a Query"),
+                args[0].span,
+            );
+            return err;
+        }
+
+        // Native PostgreSQL execution options name a Params field.  The name is checked against
+        // the concrete structural contract here, not by reading the runtime artifact or doing a
+        // reflection lookup.  Generic templates are deliberately left as a harmless marker: the
+        // template is discarded and this operation is checked again for every concrete P.
+        if method == "parameter_known" {
+            let name = self.check_str_init(&args[1]);
+            let mut result = Expr { kind: ExprKind::Bool(false), ty: Ty::Bool, span };
+            if let Ty::Struct(params_id) = self.resolve(instance.args[0])
+                && let Some(definition) = self.structs.get(params_id as usize)
+            {
+                for field in definition.fields.iter().rev() {
+                    let condition = Expr {
+                        kind: ExprKind::Binary {
+                            op: BinOp::Eq,
+                            lhs: Box::new(name.clone()),
+                            rhs: Box::new(Expr {
+                                kind: ExprKind::Str(field.name.clone()),
+                                ty: Ty::Str,
+                                span,
+                            }),
+                        },
+                        ty: Ty::Bool,
+                        span,
+                    };
+                    let yes = Expr {
+                        kind: ExprKind::Bool(true),
+                        ty: Ty::Bool,
+                        span,
+                    };
+                    result = Expr {
+                        kind: ExprKind::If {
+                            cond: Box::new(condition),
+                            then: hir::Block {
+                                stmts: Vec::new(),
+                                value: Some(Box::new(yes)),
+                            },
+                            els: hir::Block {
+                                stmts: Vec::new(),
+                                value: Some(Box::new(result)),
+                            },
+                        },
+                        ty: Ty::Bool,
+                        span,
+                    };
+                }
+            }
+            self.constrain(Ty::Bool, expected, span);
+            return result;
+        }
+
+        // The common execution surface is intentionally unable to import the public driver
+        // modules (that would create a cycle).  These four compiler-private operations therefore
+        // turn into an ordinary generic call only after P/R are concrete.  The finalization pass
+        // queues the existing driver-engine monomorph in the consumer unit, preserving normal
+        // per-unit generic visibility and the exact native engine ownership boundary.
+        if matches!(method, "execute_sqlite" | "execute_postgres" | "one_sqlite" | "one_postgres") {
+            let exec_ty = self
+                .enum_ids
+                .get("pkg.db$exec")
+                .copied()
+                .map(Ty::Enum)
+                .unwrap_or(Ty::Error);
+            let target = self.check_expr(&args[1], Some(exec_ty));
+            if target.ty != Ty::Error && !self.source_ty_matches(target.ty, exec_ty) {
+                self.diags.error(
+                    format!("database execution requires `pkg.db.exec`, got {}", self.ty_display(target.ty)),
+                    args[1].span,
+                );
+                return err;
+            }
+            let params_ty = instance.args[0];
+            let params = self.check_expr(&args[2], Some(params_ty));
+            if params.ty != Ty::Error && !self.source_ty_matches(params.ty, params_ty) {
+                self.diags.error(
+                    format!("database parameters mismatch: expected {}, got {}", self.ty_display(params_ty), self.ty_display(params.ty)),
+                    args[2].span,
+                );
+                return err;
+            }
+            let query_id_index = if method.starts_with("one_") { 4 } else { 3 };
+            let query_id = self.check_str_init(&args[query_id_index]);
+            if query_id.ty != Ty::Error && !self.source_ty_matches(query_id.ty, Ty::Str) {
+                self.diags.error(
+                    format!("database query id must be `str`, got {}", self.ty_display(query_id.ty)),
+                    args[query_id_index].span,
+                );
+                return err;
+            }
+            let out = if method.starts_with("one_") {
+                let out = self.check_expr(&args[3], Some(Ty::ArenaHandle));
+                if out.ty != Ty::Error && !self.source_ty_matches(out.ty, Ty::ArenaHandle) {
+                    self.diags.error(
+                        format!("database row output requires `region`, got {}", self.ty_display(out.ty)),
+                        args[3].span,
+                    );
+                    return err;
+                }
+                Some(out)
+            } else {
+                None
+            };
+
+            let payload = if command {
+                let Some(&result_id) = self.struct_ids.get("pkg.db$exec_result") else {
+                    self.diags.error("pkg.db execution result type is unavailable".to_owned(), span);
+                    return err;
+                };
+                Ty::Struct(result_id)
+            } else {
+                instance.args[1]
+            };
+            let Some(payload_scalar) = ty_to_scalar(payload) else {
+                self.diags.error(
+                    format!("database execution result must be a scalar payload, got {}", self.ty_display(payload)),
+                    span,
+                );
+                return err;
+            };
+            // `pkg.db` owns its public Error sum type.  It intentionally shadows the
+            // language-wide builtin Error used by core/std operations, so the generated
+            // dispatch call must retain the package enum identity rather than silently
+            // changing the declared result to `Result<_, Error>`.
+            let error_id = self
+                .enum_ids
+                .get("pkg.db$Error")
+                .copied()
+                .unwrap_or(self.error_enum_id);
+            let result_ty = Ty::Result(payload_scalar, Scalar::Enum(error_id));
+            let sqlite = method.ends_with("sqlite");
+            let base = if sqlite {
+                if method.starts_with("one_") {
+                    "pkg.db.internal.sqlite$one_prevalidated"
+                } else {
+                    "pkg.db.internal.sqlite$execute_prevalidated"
+                }
+            } else if method.starts_with("one_") {
+                "pkg.db.internal.postgres$one_prevalidated"
+            } else {
+                "pkg.db.internal.postgres$execute_prevalidated"
+            };
+            let available = self.sigs.contains_key(base);
+            let (func, type_args, call_args) = if available || self.mono_args.is_empty() {
+                let type_args = if method.starts_with("one_") {
+                    vec![params_ty, payload]
+                } else {
+                    vec![params_ty]
+                };
+                let mut call_args = vec![target, params, statement, query_id];
+                if let Some(out) = out {
+                    // The native engine's stable order is target, Params, descriptor, region,
+                    // query id. SQLite additionally receives an explicit `None` timeout.
+                    call_args = vec![call_args[0].clone(), call_args[1].clone(), call_args[2].clone(), out, call_args[3].clone()];
+                }
+                if sqlite {
+                    call_args.push(Expr {
+                        kind: ExprKind::OptionNone,
+                        ty: Ty::Option(Scalar::Int(IntTy { bits: 32, signed: true })),
+                        span,
+                    });
+                }
+                (base.to_owned(), type_args, call_args)
+            } else {
+                // A common call can be type-checked in a consumer that imports only the other
+                // first-party driver.  Keep the source-level operation total and return the same
+                // explicit Unsupported category instead of manufacturing an unresolved symbol.
+                (
+                    "pkg.db$unsupported".to_owned(),
+                    vec![payload],
+                    vec![query_id],
+                )
+            };
+            self.constrain(result_ty, expected, span);
+            return Expr {
+                kind: ExprKind::Call {
+                    func,
+                    args: call_args,
+                    type_args,
+                },
+                ty: result_ty,
+                span,
+            };
+        }
+
+        let data = Expr {
+            kind: ExprKind::Field {
+                root,
+                path: vec![0],
+            },
+            ty: Ty::Raw,
+            span: args[0].span,
+        };
+        if method == "data" {
+            self.constrain(Ty::Raw, expected, span);
+            return Expr { kind: data.kind, ty: Ty::Raw, span };
+        }
+        if matches!(method, "descriptor_id" | "sqlite_sql" | "postgres_sql") {
+            let offset = match method {
+                "descriptor_id" => 16,
+                "sqlite_sql" => 32,
+                "postgres_sql" => 48,
+                _ => unreachable!(),
+            };
+            self.constrain(Ty::Str, expected, span);
+            return Expr {
+                kind: ExprKind::StaticDescriptorView {
+                    ptr: Box::new(data),
+                    offset,
+                },
+                ty: Ty::Str,
+                span,
+            };
+        }
+        let offset = match method {
+            "q1_plan" => 8,
+            "descriptor_id_pointer" => 16,
+            "sqlite_sql_pointer" => 32,
+            "postgres_sql_pointer" => 48,
+            "binder" | "bind" => 64,
+            "static_validator" | "validate_static" => 72,
+            "row_validator" | "validate_row" => 80,
+            "decoder" | "decode" => 88,
+            _ => unreachable!(),
+        };
+        let pointer_offset = Expr {
+            kind: ExprKind::Int(i128::from(offset)),
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span,
+        };
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(data),
+                offset: Box::new(pointer_offset),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        if matches!(
+            method,
+            "q1_plan"
+                | "descriptor_id_pointer"
+                | "sqlite_sql_pointer"
+                | "postgres_sql_pointer"
+                | "binder"
+                | "static_validator"
+                | "row_validator"
+                | "decoder"
+        ) {
+            self.constrain(Ty::Raw, expected, span);
+            return callee;
+        }
+
+        let context = self.check_expr(&args[1], Some(Ty::Raw));
+        if context.ty != Ty::Error && !self.source_ty_matches(context.ty, Ty::Raw) {
+            self.diags.error(
+                format!("descriptor context must be raw, got {}", self.ty_display(context.ty)),
+                args[1].span,
+            );
+            return err;
+        }
+        let mut call_args = vec![context];
+        let mut param_tys = vec![Ty::Raw];
+        let mut param_modes = vec![ast::ParamMode::ByValue];
+        if method == "bind" {
+            let params_ty = instance.args[0];
+            let params = self.check_expr(&args[2], Some(params_ty));
+            if params.ty != Ty::Error && !self.source_ty_matches(params.ty, params_ty) {
+                self.diags.error(
+                    format!(
+                        "descriptor params mismatch: expected {}, got {}",
+                        self.ty_display(params_ty),
+                        self.ty_display(params.ty)
+                    ),
+                    args[2].span,
+                );
+                return err;
+            }
+            self.validate_borrow_argument(&params, ast::ParamMode::Borrow, "descriptor binder");
+            call_args.push(params);
+            param_tys.push(params_ty);
+            param_modes.push(ast::ParamMode::Borrow);
+        }
+        let ret = if method == "decode" {
+            instance.args[1]
+        } else {
+            Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            })
+        };
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                callee: Box::new(callee),
+                args: call_args,
+                param_tys,
+                param_modes,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
     }
 
     /// For a no-arg reduction (`recv.sum()`/`.min()`/`.max()`) whose surface is shared with the array
@@ -32285,10 +32910,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// layout). A non-`layout(C)` struct has a compiler-private layout, so it is not raw-storable.
     fn is_raw_storable(&self, ty: Ty) -> bool {
         is_raw_scalar(ty)
+            || ty == Ty::Raw
             || matches!(ty, Ty::Struct(id) if self.structs.get(id as usize).is_some_and(|s| s.c_repr))
     }
 
-    /// `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (draft.md §6.5). Valid only
+    /// `raw.null()` / `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (draft.md §6.5). Valid only
     /// inside an `unsafe {}` block. `alloc` takes an integer byte size and yields a `raw` pointer;
     /// `free` takes a `raw` pointer and yields unit. The memory is manually managed (no auto-drop),
     /// which is exactly why these are confined to `unsafe`.
@@ -32301,10 +32927,11 @@ impl<'a, 't> Checker<'a, 't> {
             );
         }
         let nargs = match method {
+            "null" => 0,
             "alloc" | "free" => 1,
             "load" | "offset" => 2,
             "store" => 3,
-            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store/offset"),
+            _ => unreachable!("check_raw_op is only dispatched for null/alloc/free/load/store/offset"),
         };
         if args.len() != nargs {
             self.diags.error(format!("'raw.{method}' takes {nargs} argument(s), got {}", args.len()), span);
@@ -32313,6 +32940,10 @@ impl<'a, 't> Checker<'a, 't> {
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
         // Helper: check a `raw`-pointer argument.
         match method {
+            "null" => {
+                self.constrain(Ty::Raw, expected, span);
+                Expr { kind: ExprKind::RawNull, ty: Ty::Raw, span }
+            }
             "alloc" => {
                 // `size` is a byte count — an integer (an unconstrained literal defaults to i64, and
                 // codegen widens any narrower width to the i64 runtime signature).
@@ -32340,11 +32971,21 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_raw_ptr_offset(&p, &off, "load", args[0].span, args[1].span);
                 let Some(ty) = expected.filter(|t| self.is_raw_storable(*t)) else {
                     self.diags.error(
-                        "'raw.load' needs a primitive-scalar or `layout(C)` struct result type — annotate it, e.g. `x: i64 := raw.load(p, 0)`".to_string(),
+                        "'raw.load' needs a primitive-scalar, `raw`, or `layout(C)` struct result type — annotate it, e.g. `x: i64 := raw.load(p, 0)`".to_string(),
                         span,
                     );
                     return err;
                 };
+                if ty == Ty::Raw {
+                    return Expr {
+                        kind: ExprKind::RawPointerLoad {
+                            ptr: Box::new(p),
+                            offset: Box::new(off),
+                        },
+                        ty,
+                        span,
+                    };
+                }
                 let scalar = ty_to_scalar(ty).expect("a raw-storable type has a Scalar");
                 Expr { kind: ExprKind::RawLoad { ptr: Box::new(p), offset: Box::new(off), scalar }, ty, span }
             }
@@ -32361,7 +33002,7 @@ impl<'a, 't> Checker<'a, 't> {
                 let store_ok = self.is_raw_storable(v.ty) || matches!(v.ty, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error);
                 if !store_ok {
                     self.diags.error(
-                        format!("'raw.store' stores a primitive scalar or a `layout(C)` struct, got {}", ty_name(v.ty)),
+                        format!("'raw.store' stores a primitive scalar, `raw`, or a `layout(C)` struct, got {}", ty_name(v.ty)),
                         args[2].span,
                     );
                     return err;
@@ -32377,7 +33018,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_raw_ptr_offset(&p, &n, "offset", args[0].span, args[1].span);
                 Expr { kind: ExprKind::RawOffset { ptr: Box::new(p), offset: Box::new(n) }, ty: Ty::Raw, span }
             }
-            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store/offset"),
+            _ => unreachable!("check_raw_op is only dispatched for null/alloc/free/load/store/offset"),
         }
     }
 
@@ -37283,6 +37924,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut cx = TyCx {
             cur_module: &self.cur_module,
             imports: self.user_imports,
+            builtin_imports: self.imports,
             type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
@@ -38044,6 +38686,25 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ptr);
                 self.finalize_expr(offset);
             }
+            ExprKind::RawPointerLoad { ptr, offset } => {
+                self.finalize_expr(ptr);
+                self.finalize_expr(offset);
+            }
+            ExprKind::StaticDescriptorView { ptr, .. } => self.finalize_expr(ptr),
+            ExprKind::RawCall {
+                callee,
+                args,
+                param_tys,
+                ..
+            } => {
+                self.finalize_expr(callee);
+                for argument in args {
+                    self.finalize_expr(argument);
+                }
+                for ty in param_tys {
+                    *ty = self.finalize(*ty);
+                }
+            }
             ExprKind::RawStore { ptr, offset, value } => {
                 self.finalize_expr(ptr);
                 self.finalize_expr(offset);
@@ -38578,7 +39239,8 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
-            | ExprKind::IndexField { .. } => {}
+            | ExprKind::IndexField { .. }
+            | ExprKind::RawNull => {}
         }
         if let Some(t) = recomputed {
             e.ty = t;
@@ -40898,6 +41560,9 @@ struct TyCx<'a> {
     cur_module: &'a str,
     /// The user modules `cur_module` imports — a qualified `mod.Type` must name one (or `cur_module`).
     imports: &'a std::collections::HashSet<String>,
+    /// Builtin capability modules imported by `cur_module`. Provider-qualified nominal aliases
+    /// under `std` use this set; `core.Error` is the sole import-free explicit spelling.
+    builtin_imports: &'a std::collections::HashSet<String>,
     /// Every module's bare→(canonical, pub?) type names, for qualified-type resolution.
     type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
@@ -41158,7 +41823,16 @@ fn resolve_type(
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
     // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
     if path.segments.len() > 1 {
-        return match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+        return match canonical_type_name(
+            path,
+            cx.cur_module,
+            cx.imports,
+            cx.builtin_imports,
+            cx.type_table,
+            true,
+            span,
+            diags,
+        ) {
             Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
             None => Ty::Error,
         };
@@ -41694,7 +42368,16 @@ fn resolve_type(
             // Otherwise a user type in the current module (a bare name resolves there). The canonical
             // key handles per-module namespacing; `resolve_user_type` dispatches to struct / enum /
             // generic template.
-            match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+            match canonical_type_name(
+                path,
+                cx.cur_module,
+                cx.imports,
+                cx.builtin_imports,
+                cx.type_table,
+                true,
+                span,
+                diags,
+            ) {
                 Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
                 None => Ty::Error,
             }
@@ -44399,9 +45082,9 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(!lt.has_errors(), "str ordering (`<`) should check");
         let (_r, ge) = check("fn f(s: str) -> bool = s >= \"x\"\n");
         assert!(!ge.has_errors(), "str ordering (`>=`) should check");
-        // Owned `string` ordering stays deferred (only the `str` view is comparable).
+        // Owned `string` ordering uses the same non-consuming `str` borrow as the direct `str` form.
         let (_s, owned) = check("fn f() -> bool {\n  a := \"x\".clone()\n  b := \"y\".clone()\n  return a < b\n}\n");
-        assert!(owned.has_errors(), "owned `string` ordering must still error");
+        assert!(!owned.has_errors(), "owned `string` ordering should borrow through `str`");
     }
 
     #[test]
