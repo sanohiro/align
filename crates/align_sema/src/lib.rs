@@ -29437,10 +29437,12 @@ impl<'a, 't> Checker<'a, 't> {
             | "binder"
             | "static_validator"
             | "row_validator"
-            | "decoder" => 1,
+            | "decoder"
+            | "meta_materializer" => 1,
             "validate_static" | "validate_row" | "decode" => 2,
             "bind" => 3,
             "parameter_known" => 2,
+            "materialize_meta" => 4,
             "execute_sqlite" | "execute_postgres" => 4,
             "one_sqlite" | "one_postgres" => 5,
             _ => {
@@ -29505,7 +29507,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        if matches!(method, "validate_row" | "decode") && !query {
+        if matches!(method, "validate_row" | "decode" | "materialize_meta") && !query {
             self.diags.error(
                 format!("static descriptor operation '{method}' requires a Query"),
                 args[0].span,
@@ -29734,6 +29736,7 @@ impl<'a, 't> Checker<'a, 't> {
             "static_validator" | "validate_static" => 72,
             "row_validator" | "validate_row" => 80,
             "decoder" | "decode" => 88,
+            "meta_materializer" | "materialize_meta" => 96,
             _ => unreachable!(),
         };
         let pointer_offset = Expr {
@@ -29762,9 +29765,56 @@ impl<'a, 't> Checker<'a, 't> {
                 | "static_validator"
                 | "row_validator"
                 | "decoder"
+                | "meta_materializer"
         ) {
             self.constrain(Ty::Raw, expected, span);
             return callee;
+        }
+
+        if method == "materialize_meta" {
+            let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+            let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+            let driver = self.check_expr(&args[1], Some(u8_ty));
+            let detail = self.check_expr(&args[2], Some(u8_ty));
+            let index = self.check_expr(&args[3], Some(i64_ty));
+            if [driver.ty, detail.ty, index.ty].contains(&Ty::Error) {
+                return err;
+            }
+            for (value, required, label) in [
+                (&driver, u8_ty, "driver tag"),
+                (&detail, u8_ty, "detail tag"),
+                (&index, i64_ty, "row index"),
+            ] {
+                if !self.source_ty_matches(value.ty, required) {
+                    self.diags.error(
+                        format!(
+                            "QueryMeta {label} has the wrong type: got {}",
+                            self.ty_display(value.ty)
+                        ),
+                        value.span,
+                    );
+                    return err;
+                }
+            }
+            let Some(&meta_id) = self.struct_ids.get("pkg.db$QueryMeta") else {
+                self.diags.error("pkg.db QueryMeta type is unavailable".to_owned(), span);
+                return err;
+            };
+            let ret = Ty::Option(Scalar::Struct(meta_id));
+            self.constrain(ret, expected, span);
+            return Expr {
+                kind: ExprKind::RawCall {
+                    callee: Box::new(callee),
+                    args: vec![driver, detail, index],
+                    param_tys: vec![u8_ty, u8_ty, i64_ty],
+                    param_modes: vec![ast::ParamMode::ByValue; 3],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                },
+                ty: ret,
+                span,
+            };
         }
 
         let context = self.check_expr(&args[1], Some(Ty::Raw));

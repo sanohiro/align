@@ -2629,6 +2629,31 @@ unnamed constraintは `name = None` を返す。
 artifact I/Oなしで得られることを固定する。
 `EXPLAIN ANALYZE` は実行を明示する。
 
+#### Q5b1/D12 static Query metadata implementation closure matrix
+
+Q5b1は独立して有用な最初のD12 consumerである。complete common `meta_query` operationを
+publishし、immutable Query descriptorをexact generated materializer thunkで拡張する。
+database/schema/table/column/key/index catalog inspectionとEXPLAINはQ5b2に残す。このboundaryが
+およそ1,000 hand-written lineを超えるのは、public record surface、producer thunk、descriptor
+ABI、common package consumer、separate-compilation linkage、region owner testが1つのsafety
+chainだからである。どれかを分割すると、読めないproducerまたはreflection/runtime-artifact
+fallbackをpublishする。Q5b2はnative catalogとstatement executionという別failure domainで、
+その下に有用でstableなQ5b1 consumerを持つ。
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public typeとoption formation | §18の全`MetaDetail`、metadata discriminator、ref、exact flat common record declarationと、D12-owned common/SQLite/PostgreSQL metadata/EXPLAIN option sumを追加する。Q5b1では`meta_query`だけをpublishし、残るexact signatureはstubやhidden overloadを置かずQ5b2へまとめてdeferする。 | `pkg_db_q5b1::q5b1_publishes_exact_query_surface_without_catalog_stubs` |
+| descriptor formationとvalidation | fixed 8-aligned execution descriptorを96-byte v1から104-byte v2へbumpする。offset 96はexactly 1 native pointerで、Queryではnon-null、commandではnull、既存offsetは全て不変とする。Query identityをtrustする前にversion/reserved/kind/mask/string/thunk agreementを検証する。全execution pathをatomicに更新し、malformed headerはoption、driver state、thunk invocation前にQuery-lessでfailする。 | `pkg_db_q1::generated_runtime_data_is_producer_owned`、既存`pkg_db_q2` SQLite/PostgreSQL execution owner |
+| producer planからgenerated code | D1 planと`StaticQueryArtifact`に既にあるD3/D5 checked evidenceから、Queryごとにmonomorph-free thunkを1つ生成する。exact native signatureは`fn(driver_tag: u8, detail_tag: u8, row_index: i64) -> Option<QueryMeta>`で、driver/detail tagはpublic declaration order、nonnegative indexは§18 row orderを`None`まで辿る。thunkはimmutable literalをembedし、runtime source/interface/artifact/metadata-file/decoder/reflection/native/allocation workを行わない。 | `pkg_db_q5b1::static_query_metadata_thunk_links_from_its_producer_unit` |
+| detail、state、discriminator、order | NamesではSummaryをexactly 1つ、Summary/FullではSummary、distinct parameterをone-based protocol order、columnをzero-based decoder orderでmaterializeする。Declared/DatabaseCheckedとavailable/ambiguous evidenceについて§18.2.1の全field-presence ruleを適用し、non-applicable fieldは`None`、必要なcellではnullableを`Unknown`に保つ。 | `pkg_db_q5b1::static_query_metadata_materializes_exact_declared_projections`、`checked_query_metadata_projection_uses_only_selected_driver_evidence` |
+| identityとdigest | exact Query/driver restriction/class/artifact/state/source hash/wire hash/rewrite versionを全rowでrepeatする。exact D1 byteのartifact digest、selected driver entryだけ、checked metadata digestをfingerprintとして使い、checked prepare/schema/server identityは許されたSummary/Full cellだけに置く。 | Q5b1の2 projection ownerと`pkg_db_q1::artifact_semantics_and_checked_in_goldens` |
+| package dispatchとerror | `meta_query`はexplicit `exec`、Query、detail、destination region、common option sliceを1つずつ取る。complete descriptor、source-order option、driver restriction、live exec stateの順に検証してからthunkを呼ぶ。Query-specific failureは`Some(query_id)`、untrusted descriptorは`None`を保ち、SQL/catalog requestを行わない。 | `pkg_db_q5b1::meta_query_rejects_non_live_execution_targets_before_materialization`、Q5b1 declared-projection runtime owner、既存`pkg_db_q2::common_surface_dispatches_to_*` owner |
+| region ownershipとallocation | 全returned string leafを`out`へcloneし、exact flat recordを`array_builder<QueryMeta>(out)`でpushし、one compacting buildを行う。generated thunkはstatic viewを返しallocationしない。final arrayと全string byteは`out`だけを使い、source thunk/native cleanup後も生存し、region外へescapeできない。 | Q5b1 declared-projection runtime ownerとthunk MIR whitelist、`align_mir::tagged_copy_fields_from_dynamic_struct_arrays_survive_the_hir_gate` |
+| separateとgeneric compilation | materializerをdescriptor producer objectに置き、immutable static dataからreferenceし、descriptor relocationを通してexact thunk targetだけをimportする。consumer-side Query-body instantiationなしでconcrete common package codeから呼ぶ。whole-program/per-unit outputはpublic/private Queryで一致する。 | `pkg_db_q5b1::static_query_metadata_thunk_links_from_its_producer_unit`、whole-program ownerのentry-private Query |
+| construction、move、return、cleanup | Query descriptorはconstruction、local copy、argument、branch join、returnを通じてCopy immutable valueのままにする。`meta_query`はQuery/exec ownerをmoveせず、return後にreferenceをretainせず、success pathごとにregion builderをexactly once consume/buildする。failureはtemporary stateをreleaseし`out`を終了しない。 | `pkg_db_q1::typed_descriptor_contract_matrix`、Q5b1 whole/per-unit runtime owner |
+| malformed compiler input | handcrafted HIR/MIRのwrong materializer offset/signature、command use、return type、parameter type/mode、non-static descriptor source、header relocationをfail closedにする。malformed formをunchecked raw callとしてcodegenへ到達させない。 | `pkg_db_q5b1::materializer_call_is_query_only_and_exactly_typed`、`align_mir::static_descriptor_bridge_retains_concrete_bare_call_abis` |
+| explicit Q5b2 deferral | database/schema/table/column/key/index catalog operation、typed identifier U+0000 precedence、native option application、canonical constraint/index ordering、common/native EXPLAINとvisible PostgreSQL ANALYZEは後続Q5b2 capabilityに残す。Q5b1はこれらのD12 acceptance cellを完了扱いせずplaceholder implementationを追加しない。 | `pkg_db_q5b1::q5b1_publishes_exact_query_surface_without_catalog_stubs` |
+
 ### D13 — batch、SoA、高価値native path
 
 bounded batch generation、PostgreSQL binary format、segmented child/validity bitmap、

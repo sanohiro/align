@@ -62,6 +62,27 @@ pub ExecuteOption {
   ResultFormat(Format)
 }
 
+pub MetaOption {
+  SearchPathOnly
+  IncludeSystemCatalogs
+}
+
+pub ExplainOption {
+  Analyze
+  Format(PlanFormat)
+  Verbose(bool)
+  Costs(bool)
+  Buffers(bool)
+  Timing(bool)
+  Settings(bool)
+  Wal(bool)
+}
+
+pub PlanFormat {
+  Text
+  Json
+}
+
 fn contract_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Unsupported(
   pkg.db.ContractError {
     query_id: None,

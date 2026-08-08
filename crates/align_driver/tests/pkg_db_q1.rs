@@ -999,9 +999,9 @@ fn generated_runtime_data_is_producer_owned() {
             else {
                 panic!("descriptor constructor must start with relocation-bearing static data");
             };
-            assert_eq!(data.bytes.len(), 96);
+            assert_eq!(data.bytes.len(), 104);
             assert_eq!(data.align, 8);
-            assert_eq!(&data.bytes[0..4], &1u32.to_le_bytes());
+            assert_eq!(&data.bytes[0..4], &2u32.to_le_bytes());
             assert_eq!(data.bytes[4], u8::from(descriptor.consumer == StaticDescriptorConsumer::Command));
             assert_eq!(&data.bytes[6..8], &[0, 0]);
             let q1 = data
@@ -1025,9 +1025,20 @@ fn generated_runtime_data_is_producer_owned() {
                 ).then_some(relocation.offset))
                 .collect::<Vec<_>>();
             if descriptor.consumer == StaticDescriptorConsumer::Query {
-                assert_eq!(thunk_offsets, vec![64, 72, 80, 88]);
+                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96]);
+                let materializer = data
+                    .relocations
+                    .iter()
+                    .find(|relocation| relocation.offset == 96)
+                    .expect("D12 QueryMeta materializer relocation");
+                assert!(matches!(
+                    &materializer.target,
+                    align_mir::StaticDataTarget::Function(name)
+                        if name.as_str().ends_with("$query_meta_v1")
+                ));
             } else {
                 assert_eq!(thunk_offsets, vec![64, 72]);
+                assert_eq!(&data.bytes[96..104], &[0; 8]);
             }
             assert!(matches!(
                 statements.get(1),

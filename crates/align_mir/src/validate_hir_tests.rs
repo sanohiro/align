@@ -52,6 +52,37 @@ fn aggregate_region_builder_source_survives_the_complete_hir_gate() {
     }
 }
 
+#[test]
+fn tagged_copy_fields_from_dynamic_struct_arrays_survive_the_hir_gate() {
+    let source = r#"
+Row {
+  optional: Option<str>,
+}
+
+Fallible {
+  value: Result<str, Error>,
+}
+
+fn main() -> i32 {
+  arena out {
+    mut rows: array_builder<Row> := array_builder(out)
+    rows.push(Row { optional: Some("x") })
+    built := rows.build()
+    optional := built[0].optional else { "" }
+    fixed := [Fallible { value: Ok("yz") }]
+    fallible := fixed[0].value else { "" }
+    return (optional.len() + fallible.len()) as i32
+  }
+}
+"#;
+    let program = checked_source_program(source);
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&program),
+        "Copy Option/Result element fields must survive the fail-closed HIR gate",
+    );
+    assert_eq!(lower_program(&program).fns.len(), 1);
+}
+
 fn declaration_header_program() -> hir::Program {
     let mut program = baseline_program();
     let slice_i32 = Ty::Slice(scalar_int(32));

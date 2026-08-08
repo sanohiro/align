@@ -58,6 +58,16 @@ pub ExecuteOption {
   BusyTimeoutNs(i64)
 }
 
+pub MetaOption {
+  IncludeInternalObjects
+  IncludeHiddenColumns
+}
+
+pub ExplainOption {
+  QueryPlan
+  Bytecode
+}
+
 fn contract_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Unsupported(
   pkg.db.ContractError {
     query_id: None,
