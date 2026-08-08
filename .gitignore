@@ -46,6 +46,8 @@ ll_out/
 
 # stray alignc build outputs run from the repo root
 /main
+# Persistent operational lock created by `alignc db prepare`; metadata remains tracked.
+**/.align-db/.publication.lock
 # W7 control: the Go binary is built by hand from bench/web_e2e/go
 bench/web_e2e/go/goserver
 bench/web_e2e/go/go.sum

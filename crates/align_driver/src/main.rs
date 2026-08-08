@@ -673,6 +673,9 @@ fn parse_db_prepare(args: &[OsString]) -> Result<DbPrepareOptions, String> {
             if url_env.is_none() || schema_id.is_none() {
                 return Err("PostgreSQL requires `--url-env NAME --schema-id ID`".to_string());
             }
+            if url_env.as_deref().is_some_and(|name| name.starts_with("PG")) {
+                return Err("PostgreSQL --url-env must not begin with `PG`".to_string());
+            }
             if database.is_some() || memory || migrations.is_some() {
                 return Err("--database, --memory, and --migrations are valid only for SQLite".to_string());
             }

@@ -7,7 +7,9 @@ use crate::db_prepare::{
     MetadataDescriber, MigrationCatalog, NativeColumnDescription, NativeParameterDescription,
     NativeStatementDescription, PreparationEnvironment, PrepareError,
 };
-use align_interface::{Driver, DriverEntry, Hash128, MetaNullability, StaticArtifact};
+use align_interface::{
+    Driver, DriverEntry, Hash128, MetaNullability, StaticArtifact, StaticOptionValue,
+};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
@@ -171,6 +173,7 @@ type SqliteOpen =
 type SqliteClose = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SqliteErrmsg = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type SqliteVersion = unsafe extern "C" fn() -> *const c_char;
+type SqliteVersionNumber = unsafe extern "C" fn() -> c_int;
 type SqlitePrepare = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
@@ -196,6 +199,7 @@ struct SqliteApi {
     close_v2: SqliteClose,
     errmsg: SqliteErrmsg,
     libversion: SqliteVersion,
+    libversion_number: SqliteVersionNumber,
     prepare_v2: SqlitePrepare,
     finalize: SqliteFinalize,
     bind_parameter_count: SqliteCount,
@@ -236,6 +240,7 @@ impl SqliteApi {
                 close_v2: library.symbol(b"sqlite3_close_v2\0")?,
                 errmsg: library.symbol(b"sqlite3_errmsg\0")?,
                 libversion: library.symbol(b"sqlite3_libversion\0")?,
+                libversion_number: library.symbol(b"sqlite3_libversion_number\0")?,
                 prepare_v2: library.symbol(b"sqlite3_prepare_v2\0")?,
                 finalize: library.symbol(b"sqlite3_finalize\0")?,
                 bind_parameter_count: library.symbol(b"sqlite3_bind_parameter_count\0")?,
@@ -474,6 +479,45 @@ fn sqlite_tail_empty(bytes: &[u8]) -> bool {
     true
 }
 
+fn static_options(artifact: &StaticArtifact) -> &[align_interface::StaticOption] {
+    match artifact {
+        StaticArtifact::Query(query) => &query.static_options,
+        StaticArtifact::Command(command) => &command.static_options,
+    }
+}
+
+fn require_sqlite_version(api: &SqliteApi, artifact: &StaticArtifact) -> Result<(), PrepareError> {
+    // SAFETY: the function table retains the loaded SQLite library for this call.
+    let encoded = unsafe { (api.libversion_number)() };
+    if encoded <= 0 {
+        return Err(fail("SQLite library version number is unavailable"));
+    }
+    let encoded =
+        u32::try_from(encoded).map_err(|_| fail("SQLite library version number is invalid"))?;
+    let actual = (
+        encoded / 1_000_000,
+        (encoded / 1_000) % 1_000,
+        encoded % 1_000,
+    );
+    for option in static_options(artifact) {
+        if let StaticOptionValue::SQLiteRequireVersionAtLeast {
+            major,
+            minor,
+            patch,
+        } = option.value
+        {
+            let required = (major, minor, patch);
+            if actual < required {
+                return Err(fail(format!(
+                    "SQLite {}.{}.{} is older than required version {major}.{minor}.{patch}",
+                    actual.0, actual.1, actual.2
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MetadataDescriber for SqliteDescriber {
     fn driver(&self) -> Driver {
         Driver::SQLite
@@ -506,6 +550,7 @@ impl MetadataDescriber for SqliteDescriber {
             .api
             .as_ref()
             .ok_or_else(|| fail("SQLite function table is absent"))?;
+        require_sqlite_version(api, artifact)?;
         let sql = CString::new(entry.wire_sql.as_slice())
             .map_err(|_| fail("SQLite SQL contains U+0000"))?;
         let sql_len = c_int::try_from(entry.wire_sql.len())
@@ -787,7 +832,7 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
             .rsplit_once(':')
             .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit port"))?
     };
-    if host.is_empty() || host.contains(',') {
+    if host.is_empty() || host.contains(',') || host.contains('%') {
         return Err(fail(
             "PostgreSQL preparation URL must select exactly one explicit host",
         ));
@@ -823,6 +868,8 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
                         | "password"
                         | "service"
                         | "servicefile"
+                        | "target_session_attrs"
+                        | "load_balance_hosts"
                         | "client_encoding"
                         | "options"
                 )
@@ -834,6 +881,77 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
         }
     }
     Ok(())
+}
+
+fn reject_ambient_postgres_environment() -> Result<(), PrepareError> {
+    if std::env::vars_os().any(|(name, _)| {
+        name.to_str()
+            .is_some_and(|name| name.as_bytes().starts_with(b"PG"))
+    }) {
+        return Err(fail(
+            "PostgreSQL preparation rejects ambient PG* environment variables",
+        ));
+    }
+    Ok(())
+}
+
+fn postgres_parameter_oids(
+    artifact: &StaticArtifact,
+    entry: &DriverEntry,
+) -> Result<Vec<u32>, PrepareError> {
+    let parameter_count = entry.bindings.len();
+    let mut oids = vec![0; parameter_count];
+    let mut ordinals = vec![false; parameter_count];
+    for binding in &entry.bindings {
+        let index = binding
+            .protocol_ordinal
+            .checked_sub(1)
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+            .filter(|index| *index < parameter_count)
+            .ok_or_else(|| fail("PostgreSQL parameter ordinal is not dense"))?;
+        if std::mem::replace(&mut ordinals[index], true) {
+            return Err(fail("PostgreSQL parameter ordinal is duplicated"));
+        }
+    }
+    for option in static_options(artifact) {
+        let StaticOptionValue::PostgreSQLParameterType {
+            parameter_name,
+            canonical_type_name,
+        } = &option.value
+        else {
+            continue;
+        };
+        let oid = match canonical_type_name.as_str() {
+            "int8" => 20,
+            _ => {
+                return Err(fail(format!(
+                    "unsupported PostgreSQL parameter type `{canonical_type_name}`"
+                )));
+            }
+        };
+        let binding = entry
+            .bindings
+            .iter()
+            .find(|binding| binding.source_name == *parameter_name)
+            .ok_or_else(|| {
+                fail(format!(
+                    "PostgreSQL parameter type names unknown Params field `{parameter_name}`"
+                ))
+            })?;
+        let index = binding
+            .protocol_ordinal
+            .checked_sub(1)
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+            .filter(|index| *index < oids.len())
+            .ok_or_else(|| fail("PostgreSQL parameter ordinal is not dense"))?;
+        if oids[index] != 0 {
+            return Err(fail(format!(
+                "duplicate PostgreSQL parameter type for `{parameter_name}`"
+            )));
+        }
+        oids[index] = oid;
+    }
+    Ok(oids)
 }
 
 impl PostgresDescriber {
@@ -852,6 +970,7 @@ impl PostgresDescriber {
             return Ok(());
         }
         validate_complete_postgres_url(&self.url)?;
+        reject_ambient_postgres_environment()?;
         let api = PostgresApi::load()?;
         let url = CString::new(self.url.as_bytes())
             .map_err(|_| fail("PostgreSQL URL contains U+0000"))?;
@@ -1141,13 +1260,21 @@ impl MetadataDescriber for PostgresDescriber {
             .map_err(|_| fail("PostgreSQL prepared name contains U+0000"))?;
         let sql = CString::new(entry.wire_sql.as_slice())
             .map_err(|_| fail("PostgreSQL SQL contains U+0000"))?;
+        let parameter_oids = postgres_parameter_oids(artifact, entry)?;
+        let parameter_count = c_int::try_from(parameter_oids.len())
+            .map_err(|_| fail("PostgreSQL parameter count exceeds i32"))?;
+        let parameter_oids_pointer = if parameter_oids.is_empty() {
+            std::ptr::null()
+        } else {
+            parameter_oids.as_ptr()
+        };
         let prepared = unsafe {
             (api.prepare)(
                 self.connection,
                 name_c.as_ptr(),
                 sql.as_ptr(),
-                0,
-                std::ptr::null(),
+                parameter_count,
+                parameter_oids_pointer,
             )
         };
         if prepared.is_null() {

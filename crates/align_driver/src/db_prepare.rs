@@ -16,7 +16,7 @@ use crate::static_inputs::{
 use crate::{lower_to_mir, BuiltStaticArtifact, Checked};
 use align_interface::{
     static_options_hash, CheckedColumnMeta, CheckedParameterMeta, Driver, DriverEntry, Hash128,
-    MetaNullability, StaticArtifact,
+    MetaNullability, StaticArtifact, StaticOptionValue,
 };
 use align_span::SourceMap;
 use std::collections::{HashMap, HashSet};
@@ -483,6 +483,52 @@ fn driver_entry(artifact: &StaticArtifact, driver: Driver) -> Option<&DriverEntr
     .find(|entry| entry.driver == driver)
 }
 
+fn artifact_static_options(artifact: &StaticArtifact) -> &[align_interface::StaticOption] {
+    match artifact {
+        StaticArtifact::Query(query) => &query.static_options,
+        StaticArtifact::Command(command) => &command.static_options,
+    }
+}
+
+fn validate_preparation_options(
+    selected: &[&BuiltStaticArtifact],
+    driver: Driver,
+) -> Result<(), PrepareError> {
+    for built in selected {
+        for option in artifact_static_options(&built.artifact) {
+            match (&option.value, driver) {
+                (StaticOptionValue::Check { .. }, _) => {}
+                (StaticOptionValue::SQLiteRequireVersionAtLeast { .. }, Driver::SQLite) => {}
+                (
+                    StaticOptionValue::PostgreSQLParameterType {
+                        canonical_type_name,
+                        ..
+                    },
+                    Driver::PostgreSQL,
+                ) if canonical_type_name == "int8" => {}
+                (
+                    StaticOptionValue::PostgreSQLParameterType {
+                        canonical_type_name,
+                        ..
+                    },
+                    Driver::PostgreSQL,
+                ) => {
+                    return Err(fail(format!(
+                        "unsupported PostgreSQL parameter type `{canonical_type_name}`"
+                    )));
+                }
+                _ => {
+                    return Err(fail(format!(
+                        "descriptor `{}` has an option for a different database driver",
+                        built.descriptor_id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn logical_base(logical_type: &str) -> &str {
     logical_type
         .strip_prefix("Option<")
@@ -793,6 +839,7 @@ pub fn build_metadata_batch(
             "the reachable program contains no selected static Query or command",
         ));
     }
+    validate_preparation_options(&selected, driver)?;
 
     // The first potentially native operation happens only after the complete compiler-owned
     // inventory/selection pass above.

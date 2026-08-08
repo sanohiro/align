@@ -354,11 +354,9 @@ fn schema_identities_and_publication_are_exact_and_check_is_read_only() {
     assert_eq!(written.selected, 3);
     assert_eq!(written.changed, 3);
     let publication_lock = project.dir.join(".align-db/.publication.lock");
-    assert!(
-        std::fs::symlink_metadata(&publication_lock)
-            .expect("publication lock")
-            .is_file()
-    );
+    assert!(std::fs::symlink_metadata(&publication_lock)
+        .expect("publication lock")
+        .is_file());
     let clean = publish_metadata_batch(&batch, true).expect("metadata is current");
     assert_eq!(clean.changed, 0);
     let path = &batch.files[0].path;
@@ -838,6 +836,17 @@ fn prepare_cli_input_and_precedence_matrix() {
             vec!["--driver", "sqlite", "--memory", "--unknown", "value"],
             "unknown `db prepare` option",
         ),
+        (
+            vec![
+                "--driver",
+                "postgres",
+                "--url-env",
+                "PGHOSTADDR",
+                "--schema-id",
+                "v1",
+            ],
+            "must not begin with `PG`",
+        ),
         (vec!["--memory"], "requires --driver"),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
@@ -915,6 +924,8 @@ fn postgres_rejects_ambient_connection_defaults_before_native_load() {
         "postgresql:///align",
         "postgresql://align:align@127.0.0.1/align",
         "postgresql://align:align@127.0.0.1:5432/align?host=elsewhere",
+        "postgresql://align:align@127.0.0.1:5432/align?target_session_attrs=primary",
+        "postgresql://align:align@host%2Chost:5432/align",
         "host=127.0.0.1 dbname=align user=align password=align",
     ] {
         let mut describer = PostgresDescriber::new(url.to_string(), "q3-test-v1".to_string());
@@ -927,6 +938,113 @@ fn postgres_rejects_ambient_connection_defaults_before_native_load() {
             "{url}: {error}"
         );
     }
+
+    let project = project("pkg-db-q3-postgres-ambient");
+    let entry = project.dir.join(&project.entry);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .args([
+            "db",
+            "prepare",
+            entry.to_str().expect("UTF-8 entry"),
+            "--driver",
+            "postgres",
+            "--url-env",
+            "ALIGN_DB_Q3_AMBIENT_URL",
+            "--schema-id",
+            "v1",
+            "--query",
+            "app.pg_read.query",
+        ])
+        .env(
+            "ALIGN_DB_Q3_AMBIENT_URL",
+            "postgresql://align:align@127.0.0.1:5432/align",
+        )
+        .env("PGHOSTADDR", "127.0.0.2")
+        .output()
+        .expect("run ambient PostgreSQL rejection");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("rejects ambient PG* environment variables"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn prepare_rejects_unsupported_static_options_before_native_work() {
+    let project = project("pkg-db-q3-postgres-option-validation");
+    std::fs::write(
+        project.dir.join("app/pg_read.align"),
+        r#"module app.pg_read
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: i64 }
+pub Row { value: i64 }
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT :value AS value",
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int4")],
+)
+"#,
+    )
+    .expect("write unsupported PostgreSQL option fixture");
+    let entry = project.dir.join(&project.entry);
+    let (mut source_map, checked) = checked_project(&project);
+    let mut describer = FakeDescriber::new(Driver::PostgreSQL);
+    let error = build_metadata_batch(
+        &mut source_map,
+        &entry,
+        &checked,
+        &["app.pg_read.query".to_string()],
+        &mut describer,
+    )
+    .expect_err("unsupported parameter type must fail before native work");
+    assert_eq!(describer.environment_calls, 0, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported PostgreSQL parameter type `int4`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sqlite_prepare_enforces_static_version_options() {
+    let project = project("pkg-db-q3-sqlite-version-option");
+    std::fs::write(
+        project.dir.join("app/read.align"),
+        r#"module app.read
+import pkg.db
+import pkg.db.sqlite
+
+pub Params { value: i64 }
+pub Row { value: i64 }
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query_file(
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [pkg.db.sqlite.QueryOption.RequireVersionAtLeast(4294967295, 0, 0)],
+)
+"#,
+    )
+    .expect("write SQLite version option fixture");
+    let entry = project.dir.join(&project.entry);
+    let (mut source_map, checked) = checked_project(&project);
+    let mut describer = SqliteDescriber::memory(sqlite_memory_schema_fingerprint(None));
+    let error = build_metadata_batch(
+        &mut source_map,
+        &entry,
+        &checked,
+        &["app.read.query".to_string()],
+        &mut describer,
+    )
+    .expect_err("newer required SQLite version must fail before statement preparation");
+    assert!(
+        error.to_string().contains("older than required version"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -941,6 +1059,23 @@ fn postgres_native_prepare_describes_the_selected_query() {
         return;
     };
     let project = project("pkg-db-q3-postgres-native");
+    std::fs::write(
+        project.dir.join("app/pg_read.align"),
+        r#"module app.pg_read
+import pkg.db
+import pkg.db.postgres
+
+pub Params { typed: i64, inferred: i64 }
+pub Row { inferred: i64, typed: i64 }
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:inferred AS BIGINT) AS inferred, :typed AS typed",
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [pkg.db.postgres.QueryOption.ParameterType("typed", "int8")],
+)
+"#,
+    )
+    .expect("write PostgreSQL parameter type fixture");
     let entry = project.dir.join(&project.entry);
     let (mut source_map, checked) = checked_project(&project);
     let mut describer = PostgresDescriber::new(url.clone(), "q3-test-v1".to_string());
