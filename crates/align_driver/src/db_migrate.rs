@@ -183,34 +183,47 @@ pub fn resolve_migration_paths(
     entry: &Path,
     migrations: &Path,
 ) -> Result<ResolvedMigrationPaths, MigrationError> {
-    let entry_metadata = std::fs::symlink_metadata(entry).map_err(|error| {
+    let lexical_entry = if entry.is_absolute() {
+        entry.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| fail(format!("cannot resolve current directory: {error}")))?
+            .join(entry)
+    };
+    let entry_metadata = std::fs::symlink_metadata(&lexical_entry).map_err(|error| {
         fail(format!(
             "cannot inspect migration entry `{}`: {error}",
-            entry.display()
+            lexical_entry.display()
         ))
     })?;
     if entry_metadata.file_type().is_symlink() || !entry_metadata.file_type().is_file() {
         return Err(fail(format!(
             "migration entry `{}` must be a regular non-symlink file",
-            entry.display()
+            lexical_entry.display()
         )));
     }
-    if entry.extension().and_then(|value| value.to_str()) != Some("align") {
+    if lexical_entry.extension().and_then(|value| value.to_str()) != Some("align") {
         return Err(fail(format!(
             "migration entry `{}` must have extension .align",
-            entry.display()
+            lexical_entry.display()
         )));
     }
-    let entry = std::fs::canonicalize(entry).map_err(|error| {
+    let entry = std::fs::canonicalize(&lexical_entry).map_err(|error| {
         fail(format!(
             "cannot resolve migration entry `{}`: {error}",
-            entry.display()
+            lexical_entry.display()
         ))
     })?;
-    let project_root = entry
+    let project_root = lexical_entry
         .parent()
         .ok_or_else(|| fail("migration entry has no lexical project root"))?
         .to_path_buf();
+    let physical_project_root = std::fs::canonicalize(&project_root).map_err(|error| {
+        fail(format!(
+            "cannot resolve migration project root `{}`: {error}",
+            project_root.display()
+        ))
+    })?;
     if migrations.is_absolute()
         || migrations.components().any(|component| {
             matches!(
@@ -253,7 +266,7 @@ pub fn resolve_migration_paths(
             candidate.display()
         ))
     })?;
-    if !resolved.starts_with(&project_root) {
+    if !resolved.starts_with(&physical_project_root) {
         return Err(fail("migration directory escapes the project root"));
     }
     let metadata = std::fs::metadata(&resolved).map_err(|error| {
@@ -494,7 +507,7 @@ fn contains_sql_token(bytes: &[u8]) -> Result<bool, MigrationError> {
 fn leading_words(bytes: &[u8]) -> Result<Vec<String>, MigrationError> {
     let mut words = Vec::new();
     let mut index = 0usize;
-    while index < bytes.len() && words.len() < 2 {
+    while index < bytes.len() && words.len() < 5 {
         if bytes[index].is_ascii_whitespace() || bytes[index] == b';' {
             index += 1;
         } else if bytes[index..].starts_with(b"--") {
@@ -542,7 +555,8 @@ fn rejects_transaction_control(bytes: &[u8]) -> Result<bool, MigrationError> {
     Ok(matches!(
         words.first().map(String::as_str),
         Some("BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE")
-    ) || matches!(words.as_slice(), [first, second, ..] if first == "START" && second == "TRANSACTION"))
+    ) || matches!(words.as_slice(), [first, second, ..] if matches!(first.as_str(), "START" | "PREPARE" | "SET") && second == "TRANSACTION")
+        || matches!(words.as_slice(), [first, second, third, fourth, fifth, ..] if first == "SET" && second == "SESSION" && third == "CHARACTERISTICS" && fourth == "AS" && fifth == "TRANSACTION"))
 }
 
 fn screen_ranges(
@@ -656,8 +670,22 @@ fn canonical_checksum(value: &str) -> bool {
 }
 
 fn filename_version(value: &str) -> Option<u32> {
-    let prefix = value.as_bytes().get(..4)?;
-    if value.as_bytes().get(4) != Some(&b'_') || !prefix.iter().all(u8::is_ascii_digit) {
+    let bytes = value.as_bytes();
+    let prefix = bytes.get(..4)?;
+    if bytes.len() < 10
+        || bytes.get(4) != Some(&b'_')
+        || !value.ends_with(".sql")
+        || !prefix.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let stem = &bytes[5..bytes.len() - 4];
+    if stem.is_empty()
+        || !stem[0].is_ascii_lowercase()
+        || !stem[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
         return None;
     }
     std::str::from_utf8(prefix).ok()?.parse().ok()

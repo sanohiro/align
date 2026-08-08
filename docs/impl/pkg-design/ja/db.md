@@ -1568,6 +1568,14 @@ Forbidden user SQLはApplying commit後にseparate worker connectionで実行す
 行わず、history connectionがfinal native-lock/revalidation/Applied-or-Failed transactionを始める前に
 closeする。このためworker-local temporary object/settingはhistory mutationへ影響せず、recorded
 history-connection invariantの外である。persistent changeはfinal validationから可視である。
+runnerはworker前に公開したexact Applied-prefix-plus-Applying history snapshotを保持する。final native
+lock下でowned schemaをvalidateし、complete historyをsnapshotと比較してから全history rowを
+snapshotへ戻してrereadする。observed snapshotがunchangedの場合だけAppliedまたはFailedを公開し、
+row changeはApplyingを復元してvisibleに失敗する。workerがowned tableを削除した場合、このmigrate
+invocationはexact table
+（PostgreSQLでは両owned objectがabsentの場合のみschemaも）を再作成し、Applyingを復元してvisibleに
+失敗する。malformed replacementはdrop/adoptせずlater migrationをblockするため、user SQLまたは
+non-cooperating writerはdirty checkpointをerase/forgeしてautomatic retryへ変えられない。
 Required user SQLは1 transaction connection上に残り、その
 connection-local inventoryをrow insert前に検証する。lock acquisitionは常にvalidationより先で、
 対応read/history mutation完了後だけnative transaction/lockを解放する。
@@ -2568,7 +2576,7 @@ driver/commandで分割するとdormant producer/consumer seamまたは同じper
 | history codec/state reconciliation | migrate中だけ§17.6のexact owned objectを作成し、complete persistent/session-local history-table/attached-object inventoryと全row/state combinationを検証し、version順でreconcileし、complete current/extra/mismatch/dirty matrixをpanic/silent upgradeなしでclassifyする。1本のjoined PostgreSQL catalog queryがtable invariantを所有し、unrelated schema objectを除外する。malformed schema/row stateはmutation前にrejectする。 | SQLite TEMP-trigger/shadowとPostgreSQL trigger/rule/RLS/default/index/ACL negativeを含む両driverの `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` |
 | overlap exclusion/cleanup | 全SQLite commandはexact persistent OS-lock inodeを作成可能かつ保持し、全PostgreSQL commandはoperation全体でexact advisory keyを保持する。そのcooperating lock後、SQLite read snapshot/`BEGIN IMMEDIATE` とblind-first-SQL PostgreSQL `READ COMMITTED` SHARE ROW EXCLUSIVE/ACCESS EXCLUSIVE table lockがnon-cooperating DB writerに対してvalidation/history accessをatomicにする。SQLSTATE-bound rollback/bootstrapがexistence raceなしでabsent tableを扱う。Forbiddenはhistoryをmutateしないworkerへuser SQLを分離する。全success/error/Drop/process-loss edgeでworker、native transaction/table lock、operation lockの順に解放する。 | SQLite absent-lock creation/external-writer race/TEMP-trigger/two-process ownerとrequired PostgreSQL concurrent-session/external-DDL-DML/bootstrap-race owner |
 | Required execution | migration lock下で各Required fileとApplied history insertを1 transactionで行う。statement/history failureはcomplete fileをrollbackする。不確定commitはclose/reconnect/relockしexact Applied/absentをclassifyし、same-invocation retryしない。current Applied prefixを再実行しない。 | SQLiteとrequired PostgreSQL atomic/multi-statement/error/restart/outcome-unknown owner |
-| Forbidden execution/dirty state | screened statement 1つを要求し、transaction外execution前にApplying(0)をdurably observeし、Applied(1)をrecordする。native errorはbest-effortでFailed(0)、不確定final publicationはAppliedまたはdirty Applyingへreconcileする。dirty stateは継続をblockし自動retryしない。 | 両driverのbefore/after/error-recording/outcome-unknown fault matrixとexecution counter |
+| Forbidden execution/dirty state | screened statement 1つを要求し、transaction外execution前にApplying(0)とそのexact history snapshotをdurably observeする。final native lock下でsnapshotをcompare/restoreし、observed snapshotがunchangedの場合だけApplied(1)またはFailed(0)をrecordする。row changeまたはabsent owned history objectはApplyingをrestoreしてvisibleに失敗し、malformed replacementはfail closedする。native errorはbest-effortでFailed(0)、不確定final publicationはAppliedまたはdirty Applyingへreconcileする。dirty stateは継続をblockし自動retryしない。 | 両driverのbefore/after/error-recording/history-forgery/outcome-unknown fault matrixとexecution counter |
 | status/check | operational lock file以外を作らず、schema/history creation、migration、repairを行わない。catalog/history provenance付きexact ordered row/summaryを出し、statusはinspection後success、checkはexact current Applied setだけsuccess。missing historyはempty、missing SQLite targetはinput error。 | empty/current/compound-mismatch/dirty/history-onlyを跨ぐ `pkg_db_q5a::status_and_check_are_read_only_and_ordered` |
 | repair | current version 1つ、action 1つ、argv/catalog/dirty historyに一致するexact lowercase checksumを要求する。acceptはscreened countでAppliedを記録し、clearはdirty rowだけを削除する。Applied/absent/stale/mismatchは何も変更しない。 | 両action/driverの `pkg_db_q5a::repair_is_dirty_and_checksum_bound` |
 | secret/allocation/diagnostic | result cleanup前にnative error/history stringをcopyし、PostgreSQL URL/valueをprintせず、allocation前に全native countをboundし、malformed rowをindex/panicせずrejectし、statement/result/connectionをexactly once closeする。 | malformed native/history owner、URL redaction owner、self-review FFI checklist、required PostgreSQL CI |
@@ -2590,6 +2598,8 @@ pre-implementation adversarial reviewはsource work前に次のroot-cause class�
 | P1 focused continuationがnon-cooperating DB writerとのvalidation-to-DML raceを発見した | matrixを2 lock layerへ再設計した。OS/advisory lockがAlignをserializeし、SQLite transaction/PostgreSQL table lockがnative validation/history accessを覆い、Forbidden workerはhistory DMLを行わない。 |
 | focused lock reviewがunprotected schema-wide stateとracy PostgreSQL existence branchを含んでいた | invariantを1 catalog queryで検証するhistory-table-attached behaviorだけにし、blind first-SQL lockとSQLSTATE-bound rollback/bootstrapでexistence raceを除去した。worker-local stateはhistory-connection invariant外で、Applyingはrepair必須/no-retry dirty stateのままである。 |
 | final inspection reviewがPostgreSQL `SHARE` とindex creationのcompatibilityを発見した | inspectionはordinary readerを許可し、DMLとordinary/concurrent index/DDL modeに競合する `SHARE ROW EXCLUSIVE` を使う。 |
+| author-side implementation passがForbidden user SQL自身によるApplying rowのerase/forgeをfinal validation前に許していた | runnerはexact pre-worker history snapshotを保持し、final native lock下でcompare/restoreし、row change時はrestored Applyingとvisible failureを残す。absent owned tableはApplyingをrestoreしてfailするためだけに再作成し、malformed replacementはblocking errorのままにする。 |
+| focused implementation reviewがmalformed rowをrestorable changeとして扱い、不確定restore commitでcurrent Applying rowだけを確認していた | 両adapterはrestore前にcomplete row semanticsをvalidateし、malformed replacementを変更しない。全Applying commit reconciliationはcomplete expected history snapshotを比較するため、partial/unapplied restoreをexactと報告できない。 |
 
 ### D12 — category metadataとEXPLAIN
 

@@ -616,11 +616,6 @@ fn parse_db_migration(
     command: DbMigrationCommand,
     args: &[OsString],
 ) -> Result<DbMigrationOptions, String> {
-    let tokens = args
-        .iter()
-        .enumerate()
-        .map(|(index, token)| db_text(token, &format!("db migration argument {}", index + 1)))
-        .collect::<Result<Vec<_>, _>>()?;
     let mut entry = None;
     let mut migrations = None;
     let mut driver_value = None;
@@ -630,8 +625,8 @@ fn parse_db_migration(
     let mut action = None;
     let mut expected_checksum = None;
     let mut index = 0usize;
-    while index < tokens.len() {
-        let flag = &tokens[index];
+    while index < args.len() {
+        let flag = db_text(&args[index], &format!("db migration argument {}", index + 1))?;
         index += 1;
         if matches!(flag.as_str(), "--accept-applied" | "--clear-dirty") {
             if action.is_some() {
@@ -656,9 +651,10 @@ fn parse_db_migration(
         ) {
             return Err(format!("unknown `db` migration option `{flag}`"));
         }
-        let value = tokens
+        let value = args
             .get(index)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
+            .ok_or_else(|| format!("{flag} requires a value"))
+            .and_then(|value| db_text(value, &format!("db migration argument {}", index + 1)))?;
         if value.starts_with("--") {
             return Err(format!("{flag} requires a value"));
         }
@@ -796,9 +792,9 @@ fn run_db_migration(command: DbMigrationCommand, args: &[OsString]) -> ExitCode 
         }
     };
     let mut source_map = SourceMap::new();
-    let checked = check(&mut source_map, &paths.entry.display().to_string(), &source);
-    if checked.diags.has_errors() {
-        eprint!("{}", format_diagnostics(&source_map, &checked.diags));
+    let walk = build_per_unit(&mut source_map, &paths.entry.display().to_string(), &source);
+    if walk.diags.has_errors() {
+        eprint!("{}", format_diagnostics(&source_map, &walk.diags));
         return ExitCode::FAILURE;
     }
     let catalog = match read_migration_catalog(&paths.migrations) {
@@ -1163,6 +1159,9 @@ fn usage() {
            size       build then report the executable's size breakdown\n  \
            cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
            db prepare regenerate checked SQLite/PostgreSQL metadata\n  \
+           db migrate apply an explicit SQLite/PostgreSQL migration catalog\n  \
+           db status/check  inspect migration state; check requires exact current state\n  \
+           db repair  checksum-bound repair of one dirty forbidden migration\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \

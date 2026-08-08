@@ -66,6 +66,8 @@ const SQLITE_ROW: c_int = 100;
 const SQLITE_DONE: c_int = 101;
 const SQLITE_INTEGER: c_int = 1;
 const SQLITE_TEXT: c_int = 3;
+const MAX_HISTORY_ROWS: usize = 10_000;
+const MAX_NATIVE_TEXT_BYTES: usize = 1_048_576;
 
 type SqliteOpen =
     unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_int, *const c_char) -> c_int;
@@ -233,9 +235,12 @@ impl SqliteConnection {
                 .unwrap_or_else(|| format!("{context} failed with status {status}"))
         } else {
             // SAFETY: sqlite3_exec returns a NUL-terminated allocation owned by the caller.
-            let copied = unsafe { CStr::from_ptr(native_error) }
-                .to_string_lossy()
-                .into_owned();
+            let bytes = unsafe { CStr::from_ptr(native_error) }.to_bytes();
+            let copied = if bytes.len() > MAX_NATIVE_TEXT_BYTES {
+                "SQLite native diagnostic exceeded the tool limit".to_string()
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            };
             // SAFETY: the error allocation is released exactly once after copying.
             unsafe { (self.api.free)(native_error.cast()) };
             copied
@@ -283,6 +288,9 @@ impl SqliteConnection {
                 match unsafe { (self.api.step)(statement) } {
                     SQLITE_DONE => break,
                     SQLITE_ROW => {
+                        if rows.len() >= MAX_HISTORY_ROWS {
+                            return Err(fail("SQLite tool query exceeded the row limit"));
+                        }
                         let mut row = Vec::with_capacity(expected_fields);
                         for field in 0..fields {
                             let native_type = unsafe { (self.api.column_type)(statement, field) };
@@ -299,6 +307,11 @@ impl SqliteConnection {
                                     }
                                     let length = usize::try_from(length)
                                         .map_err(|_| fail("SQLite text length exceeds usize"))?;
+                                    if length > MAX_NATIVE_TEXT_BYTES {
+                                        return Err(fail(
+                                            "SQLite text value exceeds the tool limit",
+                                        ));
+                                    }
                                     let pointer =
                                         unsafe { (self.api.column_text)(statement, field) };
                                     if pointer.is_null() && length != 0 {
@@ -341,15 +354,19 @@ impl SqliteConnection {
             (Ok(rows), _) => Ok(rows),
         }
     }
-}
 
-impl Drop for SqliteConnection {
-    fn drop(&mut self) {
+    fn close(&mut self) {
         if !self.database.is_null() {
             // SAFETY: this wrapper owns the open connection and closes it at most once.
             unsafe { (self.api.close_v2)(self.database) };
             self.database = std::ptr::null_mut();
         }
+    }
+}
+
+impl Drop for SqliteConnection {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -362,11 +379,12 @@ fn sqlite_message(api: &SqliteApi, database: *mut c_void) -> Option<String> {
     if pointer.is_null() {
         None
     } else {
-        Some(
-            unsafe { CStr::from_ptr(pointer) }
-                .to_string_lossy()
-                .into_owned(),
-        )
+        let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
+        Some(if bytes.len() > MAX_NATIVE_TEXT_BYTES {
+            "SQLite native diagnostic exceeded the tool limit".to_string()
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        })
     }
 }
 
@@ -442,6 +460,18 @@ impl SqliteOperationLock {
                 std::io::Error::last_os_error()
             )));
         }
+        let locked_metadata = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot reinspect acquired migration lock `{}`: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if !locked_metadata.file_type().is_file() || locked_metadata.len() != 0 {
+            return Err(fail(format!(
+                "acquired migration lock `{}` must remain an empty regular file",
+                lock_path.display()
+            )));
+        }
         Ok(Self { _file: file })
     }
 }
@@ -476,6 +506,51 @@ fn sqlite_u32(value: &SqliteValue, what: &str) -> Result<u32, MigrationError> {
         )));
     };
     u32::try_from(*value).map_err(|_| fail(format!("migration history {what} is outside u32")))
+}
+
+fn validate_native_history_identity(
+    format_version: u32,
+    version: u32,
+    filename: &str,
+    checksum: &str,
+) -> Result<(), MigrationError> {
+    if format_version != 1 || !(1..=9999).contains(&version) {
+        return Err(fail("migration history contains an invalid format/version"));
+    }
+    let bytes = filename.as_bytes();
+    let stem = bytes
+        .get(5..bytes.len().saturating_sub(4))
+        .unwrap_or_default();
+    if bytes.len() < 10
+        || bytes.get(4) != Some(&b'_')
+        || !filename.ends_with(".sql")
+        || bytes
+            .get(..4)
+            .is_none_or(|prefix| !prefix.iter().all(u8::is_ascii_digit))
+        || stem.is_empty()
+        || !stem[0].is_ascii_lowercase()
+        || !stem[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        || filename
+            .get(..4)
+            .and_then(|prefix| prefix.parse::<u32>().ok())
+            != Some(version)
+    {
+        return Err(fail(format!(
+            "migration history version {version:04} has an invalid filename"
+        )));
+    }
+    if checksum.len() != 32
+        || !checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(fail(format!(
+            "migration history version {version:04} has an invalid checksum"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_sqlite_schema(connection: &SqliteConnection) -> Result<bool, MigrationError> {
@@ -534,13 +609,19 @@ fn read_sqlite_history(connection: &SqliteConnection) -> Result<Vec<HistoryRow>,
                     "SQLite migration history returned an invalid row shape",
                 ));
             };
+            let format_version = sqlite_u32(format_version, "format_version")?;
+            let version = sqlite_u32(version, "version")?;
+            let filename = sqlite_text(filename, "filename")?;
+            let checksum = sqlite_text(checksum, "checksum")?;
+            validate_native_history_identity(format_version, version, &filename, &checksum)?;
             let policy_value = sqlite_u32(policy, "policy")?;
             let state_value = sqlite_u32(state, "state")?;
+            let completed_statements = sqlite_u32(completed, "completed_statements")?;
             Ok(HistoryRow {
-                format_version: sqlite_u32(format_version, "format_version")?,
-                version: sqlite_u32(version, "version")?,
-                filename: sqlite_text(filename, "filename")?,
-                checksum: sqlite_text(checksum, "checksum")?,
+                format_version,
+                version,
+                filename,
+                checksum,
                 policy: u8::try_from(policy_value)
                     .ok()
                     .and_then(MigrationPolicy::from_tag)
@@ -549,7 +630,7 @@ fn read_sqlite_history(connection: &SqliteConnection) -> Result<Vec<HistoryRow>,
                     .ok()
                     .and_then(StoredMigrationState::from_tag)
                     .ok_or_else(|| fail("migration history state is invalid"))?,
-                completed_statements: sqlite_u32(completed, "completed_statements")?,
+                completed_statements,
             })
         })
         .collect()
@@ -594,6 +675,19 @@ fn history_insert_sql(
     )
 }
 
+fn stored_history_insert_sql(table: &str, row: &HistoryRow) -> String {
+    format!(
+        "INSERT INTO {table} (format_version,version,filename,checksum,policy,state,completed_statements) VALUES ({},{},{},{},{},{},{})",
+        row.format_version,
+        row.version,
+        sql_literal(&row.filename),
+        sql_literal(&row.checksum),
+        row.policy.tag(),
+        row.state.tag(),
+        row.completed_statements,
+    )
+}
+
 fn rollback(connection: &SqliteConnection) {
     let _ = connection.execute(b"ROLLBACK", "SQLite migration rollback");
 }
@@ -621,27 +715,6 @@ fn sqlite_snapshot(
     }
 }
 
-fn sqlite_write_phase<T>(
-    connection: &SqliteConnection,
-    body: impl FnOnce() -> Result<T, MigrationError>,
-) -> Result<T, MigrationError> {
-    connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
-    match body() {
-        Ok(value) => {
-            if let Err(error) = connection.execute(b"COMMIT", "SQLite migration commit") {
-                rollback(connection);
-                Err(error)
-            } else {
-                Ok(value)
-            }
-        }
-        Err(error) => {
-            rollback(connection);
-            Err(error)
-        }
-    }
-}
-
 fn ensure_prefix(report: &MigrationReport) -> Result<(), MigrationError> {
     if report.can_migrate() {
         Ok(())
@@ -652,11 +725,154 @@ fn ensure_prefix(report: &MigrationReport) -> Result<(), MigrationError> {
     }
 }
 
+fn ensure_ready(report: &MigrationReport, version: u32) -> Result<(), MigrationError> {
+    for row in &report.rows {
+        let expected = if row.version < version {
+            MigrationStatus::Applied
+        } else {
+            MigrationStatus::Pending
+        };
+        if row.status != expected {
+            return Err(fail(format!(
+                "migration history is not ready to apply version {version:04}"
+            )));
+        }
+    }
+    if report
+        .rows
+        .iter()
+        .any(|row| row.version == version && row.status == MigrationStatus::Pending)
+    {
+        Ok(())
+    } else {
+        Err(fail(format!(
+            "migration version {version:04} is not pending"
+        )))
+    }
+}
+
+#[derive(Clone)]
+enum SqliteCommitExpectation {
+    Bootstrap,
+    Applied(u32),
+    Applying {
+        version: u32,
+        history: Vec<HistoryRow>,
+    },
+    Failed(u32),
+    Cleared(u32),
+}
+
+fn sqlite_reconcile_commit(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    catalog: &ScreenedCatalog,
+    expectation: SqliteCommitExpectation,
+    commit_error: MigrationError,
+) -> Result<(), MigrationError> {
+    connection.close();
+    *connection = SqliteConnection::open(path, SQLITE_OPEN_READWRITE)?;
+    if matches!(&expectation, SqliteCommitExpectation::Bootstrap) {
+        connection.execute(b"BEGIN IMMEDIATE", "SQLite bootstrap reconciliation")?;
+        let exists = validate_sqlite_schema(connection).map_err(|error| {
+            rollback(connection);
+            fail(format!(
+                "SQLite bootstrap commit outcome is unknown after `{commit_error}`; reconciliation failed: {error}"
+            ))
+        })?;
+        if !exists {
+            rollback(connection);
+            return Err(fail(format!(
+                "SQLite bootstrap commit failed and reconciliation proved it was not applied: {commit_error}"
+            )));
+        }
+        let report = inspect_sqlite(connection, catalog, true).map_err(|error| {
+            rollback(connection);
+            fail(format!(
+                "SQLite bootstrap commit outcome is unknown after `{commit_error}`; reconciliation failed: {error}"
+            ))
+        })?;
+        connection.execute(b"COMMIT", "SQLite bootstrap reconciliation commit")?;
+        return ensure_prefix(&report);
+    }
+    let report = sqlite_snapshot(connection, catalog, true).map_err(|error| {
+        fail(format!(
+            "SQLite commit outcome is unknown after `{commit_error}`; reconciliation failed: {error}"
+        ))
+    })?;
+    let status = |version| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.version == version)
+            .map(|row| row.status)
+    };
+    let observed_history = report
+        .rows
+        .iter()
+        .filter_map(|row| row.history.clone())
+        .collect::<Vec<_>>();
+    let reconciled = match &expectation {
+        SqliteCommitExpectation::Bootstrap => report.can_migrate(),
+        SqliteCommitExpectation::Applied(version) => {
+            status(*version) == Some(MigrationStatus::Applied)
+        }
+        SqliteCommitExpectation::Applying { history, .. } => {
+            observed_history.as_slice() == history.as_slice()
+        }
+        SqliteCommitExpectation::Failed(version) => {
+            status(*version) == Some(MigrationStatus::DirtyFailed)
+        }
+        SqliteCommitExpectation::Cleared(version) => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+    };
+    if reconciled {
+        return Ok(());
+    }
+    let known_absence = match &expectation {
+        SqliteCommitExpectation::Bootstrap => false,
+        SqliteCommitExpectation::Applied(version) | SqliteCommitExpectation::Failed(version) => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+        SqliteCommitExpectation::Applying { version, .. } => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+        SqliteCommitExpectation::Cleared(version) => matches!(
+            status(*version),
+            Some(MigrationStatus::DirtyApplying | MigrationStatus::DirtyFailed)
+        ),
+    };
+    if known_absence {
+        Err(fail(format!(
+            "SQLite commit failed and reconciliation proved the requested change was not applied: {commit_error}"
+        )))
+    } else {
+        Err(fail(format!(
+            "SQLite commit outcome is unknown after reconciliation: {commit_error}"
+        )))
+    }
+}
+
+fn sqlite_commit(
+    connection: &mut SqliteConnection,
+    path: &Path,
+    catalog: &ScreenedCatalog,
+    expectation: SqliteCommitExpectation,
+) -> Result<(), MigrationError> {
+    match connection.execute(b"COMMIT", "SQLite migration commit") {
+        Ok(()) => Ok(()),
+        Err(error) => sqlite_reconcile_commit(connection, path, catalog, expectation, error),
+    }
+}
+
 fn sqlite_bootstrap(
-    connection: &SqliteConnection,
+    connection: &mut SqliteConnection,
+    path: &Path,
     catalog: &ScreenedCatalog,
 ) -> Result<(), MigrationError> {
-    sqlite_write_phase(connection, || {
+    connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
+    let result = (|| {
         if validate_sqlite_schema(connection)? {
             return Err(fail("SQLite migration history appeared during bootstrap"));
         }
@@ -666,17 +882,31 @@ fn sqlite_bootstrap(
         )?;
         let report = inspect_sqlite(connection, catalog, true)?;
         ensure_prefix(&report)
-    })
+    })();
+    match result {
+        Ok(()) => sqlite_commit(
+            connection,
+            path,
+            catalog,
+            SqliteCommitExpectation::Bootstrap,
+        ),
+        Err(error) => {
+            rollback(connection);
+            Err(error)
+        }
+    }
 }
 
 fn sqlite_required(
-    connection: &SqliteConnection,
+    connection: &mut SqliteConnection,
+    path: &Path,
     catalog: &ScreenedCatalog,
     migration: &ScreenedMigration,
 ) -> Result<(), MigrationError> {
-    sqlite_write_phase(connection, || {
+    connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
+    let result = (|| {
         let before = inspect_sqlite(connection, catalog, true)?;
-        ensure_prefix(&before)?;
+        ensure_ready(&before, migration.version)?;
         let row = before
             .rows
             .iter()
@@ -693,7 +923,7 @@ fn sqlite_required(
             &format!("SQLite migration {:04}", migration.version),
         )?;
         let after_sql = inspect_sqlite(connection, catalog, true)?;
-        ensure_prefix(&after_sql)?;
+        ensure_ready(&after_sql, migration.version)?;
         connection.execute(
             history_insert_sql(
                 migration,
@@ -716,18 +946,32 @@ fn sqlite_required(
             ));
         }
         Ok(())
-    })
+    })();
+    match result {
+        Ok(()) => sqlite_commit(
+            connection,
+            path,
+            catalog,
+            SqliteCommitExpectation::Applied(migration.version),
+        ),
+        Err(error) => {
+            rollback(connection);
+            Err(error)
+        }
+    }
 }
 
 fn sqlite_forbidden(
-    history_connection: &SqliteConnection,
+    history_connection: &mut SqliteConnection,
     path: &Path,
     catalog: &ScreenedCatalog,
     migration: &ScreenedMigration,
 ) -> Result<(), MigrationError> {
-    sqlite_write_phase(history_connection, || {
+    history_connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
+    let mut expected_history = None;
+    let applying = (|| {
         let before = inspect_sqlite(history_connection, catalog, true)?;
-        ensure_prefix(&before)?;
+        ensure_ready(&before, migration.version)?;
         let row = before
             .rows
             .iter()
@@ -739,11 +983,42 @@ fn sqlite_forbidden(
                 migration.version
             )));
         }
+        let mut history = before
+            .rows
+            .iter()
+            .filter_map(|row| row.history.clone())
+            .collect::<Vec<_>>();
+        history.push(HistoryRow {
+            format_version: 1,
+            version: migration.version,
+            filename: migration.filename.clone(),
+            checksum: migration.checksum.clone(),
+            policy: migration.policy,
+            state: StoredMigrationState::Applying,
+            completed_statements: 0,
+        });
+        history.sort_by_key(|row| row.version);
+        expected_history = Some(history);
         history_connection.execute(
             history_insert_sql(migration, StoredMigrationState::Applying, 0).as_bytes(),
             "SQLite Applying history insert",
         )
-    })?;
+    })();
+    if let Err(error) = applying {
+        rollback(history_connection);
+        return Err(error);
+    }
+    let applying_history = expected_history
+        .ok_or_else(|| fail("SQLite Applying snapshot was not captured before publication"))?;
+    sqlite_commit(
+        history_connection,
+        path,
+        catalog,
+        SqliteCommitExpectation::Applying {
+            version: migration.version,
+            history: applying_history.clone(),
+        },
+    )?;
 
     let native_result = SqliteConnection::open(path, SQLITE_OPEN_READWRITE).and_then(|worker| {
         worker.execute(
@@ -757,7 +1032,32 @@ fn sqlite_forbidden(
         StoredMigrationState::Failed
     };
     let completed = u32::from(final_state == StoredMigrationState::Applied);
-    let publication = sqlite_write_phase(history_connection, || {
+    history_connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
+    let publication = (|| {
+        let restored_missing = !validate_sqlite_schema(history_connection)?;
+        let history_unchanged = if restored_missing {
+            false
+        } else {
+            let observed = read_sqlite_history(history_connection)?;
+            reconcile(MigrationDriver::Sqlite, catalog, observed.clone())?;
+            observed == applying_history
+        };
+        if restored_missing {
+            history_connection.execute(
+                SQLITE_HISTORY_DDL.as_bytes(),
+                "SQLite forbidden missing-history restore",
+            )?;
+        }
+        history_connection.execute(
+            b"DELETE FROM main.__align_migrations_v1",
+            "SQLite forbidden history snapshot restore",
+        )?;
+        for row in &applying_history {
+            history_connection.execute(
+                stored_history_insert_sql("main.__align_migrations_v1", row).as_bytes(),
+                "SQLite forbidden history snapshot restore",
+            )?;
+        }
         let before = inspect_sqlite(history_connection, catalog, true)?;
         let expected = before
             .rows
@@ -767,6 +1067,9 @@ fn sqlite_forbidden(
             return Err(fail(
                 "SQLite forbidden migration lost its Applying history row",
             ));
+        }
+        if !history_unchanged {
+            return Ok(true);
         }
         history_connection.execute(
             format!(
@@ -793,19 +1096,50 @@ fn sqlite_forbidden(
                 "SQLite forbidden migration final state did not reread exactly",
             ));
         }
-        Ok(())
-    });
+        Ok(false)
+    })();
+    let publication = match publication {
+        Ok(history_changed) => {
+            let committed = sqlite_commit(
+                history_connection,
+                path,
+                catalog,
+                if history_changed {
+                    SqliteCommitExpectation::Applying {
+                        version: migration.version,
+                        history: applying_history.clone(),
+                    }
+                } else if final_state == StoredMigrationState::Applied {
+                    SqliteCommitExpectation::Applied(migration.version)
+                } else {
+                    SqliteCommitExpectation::Failed(migration.version)
+                },
+            );
+            committed.map(|()| history_changed)
+        }
+        Err(error) => {
+            rollback(history_connection);
+            Err(error)
+        }
+    };
     match (native_result, publication) {
-        (Err(native_error), Ok(())) => Err(native_error),
+        (Err(native_error), Ok(true)) => Err(fail(format!(
+            "{native_error}; SQLite migration history changed and the exact Applying snapshot was restored"
+        ))),
+        (Err(native_error), Ok(false)) => Err(native_error),
         (Err(native_error), Err(record_error)) => Err(fail(format!(
             "{native_error}; additionally failed to record Failed state: {record_error}"
         ))),
-        (Ok(()), result) => result,
+        (Ok(()), Ok(true)) => Err(fail(
+            "SQLite migration history changed; the exact Applying snapshot was restored",
+        )),
+        (Ok(()), Ok(false)) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
     }
 }
 
 fn sqlite_migrate(
-    connection: &SqliteConnection,
+    connection: &mut SqliteConnection,
     path: &Path,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
@@ -813,7 +1147,7 @@ fn sqlite_migrate(
     let exists = validate_sqlite_schema(connection);
     rollback(connection);
     if !exists? {
-        sqlite_bootstrap(connection, catalog)?;
+        sqlite_bootstrap(connection, path, catalog)?;
     }
     let initial = sqlite_snapshot(connection, catalog, true)?;
     ensure_prefix(&initial)?;
@@ -825,7 +1159,7 @@ fn sqlite_migrate(
         .collect::<Vec<_>>();
     for migration in &pending {
         match migration.policy {
-            MigrationPolicy::Required => sqlite_required(connection, catalog, migration)?,
+            MigrationPolicy::Required => sqlite_required(connection, path, catalog, migration)?,
             MigrationPolicy::Forbidden => sqlite_forbidden(connection, path, catalog, migration)?,
         }
     }
@@ -839,13 +1173,15 @@ fn sqlite_migrate(
 }
 
 fn sqlite_repair(
-    connection: &SqliteConnection,
+    connection: &mut SqliteConnection,
+    path: &Path,
     catalog: &ScreenedCatalog,
     version: u32,
     action: RepairAction,
     expected_checksum: &str,
 ) -> Result<MigrationReport, MigrationError> {
-    sqlite_write_phase(connection, || {
+    connection.execute(b"BEGIN IMMEDIATE", "SQLite migration write transaction")?;
+    let result = (|| {
         let report = inspect_sqlite(connection, catalog, true)?;
         let row = report
             .rows
@@ -907,7 +1243,25 @@ fn sqlite_repair(
             ));
         }
         Ok(after)
-    })
+    })();
+    match result {
+        Ok(report) => {
+            sqlite_commit(
+                connection,
+                path,
+                catalog,
+                match action {
+                    RepairAction::AcceptApplied => SqliteCommitExpectation::Applied(version),
+                    RepairAction::ClearDirty => SqliteCommitExpectation::Cleared(version),
+                },
+            )?;
+            Ok(report)
+        }
+        Err(error) => {
+            rollback(connection);
+            Err(error)
+        }
+    }
 }
 
 pub fn run_sqlite_migration(
@@ -974,16 +1328,23 @@ pub fn run_sqlite_migration(
     } else {
         SQLITE_OPEN_READONLY
     };
-    let connection = SqliteConnection::open(&native_path, flags)?;
+    let mut connection = SqliteConnection::open(&native_path, flags)?;
     match operation {
-        MigrationOperation::Migrate => sqlite_migrate(&connection, &native_path, catalog),
+        MigrationOperation::Migrate => sqlite_migrate(&mut connection, &native_path, catalog),
         MigrationOperation::Status => sqlite_snapshot(&connection, catalog, false),
         MigrationOperation::Check => sqlite_snapshot(&connection, catalog, false),
         MigrationOperation::Repair {
             version,
             action,
             expected_checksum,
-        } => sqlite_repair(&connection, catalog, version, action, expected_checksum),
+        } => sqlite_repair(
+            &mut connection,
+            &native_path,
+            catalog,
+            version,
+            action,
+            expected_checksum,
+        ),
     }
 }
 
@@ -1020,6 +1381,7 @@ type PqResultErrorField = unsafe extern "C" fn(*const c_void, c_int) -> *const c
 type PqCount = unsafe extern "C" fn(*const c_void) -> c_int;
 type PqGetIsNull = unsafe extern "C" fn(*const c_void, c_int, c_int) -> c_int;
 type PqGetValue = unsafe extern "C" fn(*const c_void, c_int, c_int) -> *mut c_char;
+type PqGetLength = unsafe extern "C" fn(*const c_void, c_int, c_int) -> c_int;
 
 struct PostgresApi {
     _library: dynamic::Library,
@@ -1036,6 +1398,7 @@ struct PostgresApi {
     nfields: PqCount,
     getisnull: PqGetIsNull,
     getvalue: PqGetValue,
+    getlength: PqGetLength,
 }
 
 impl PostgresApi {
@@ -1073,6 +1436,7 @@ impl PostgresApi {
                 nfields: native(library.symbol(b"PQnfields\0"))?,
                 getisnull: native(library.symbol(b"PQgetisnull\0"))?,
                 getvalue: native(library.symbol(b"PQgetvalue\0"))?,
+                getlength: native(library.symbol(b"PQgetlength\0"))?,
                 _library: library,
             })
         }
@@ -1149,7 +1513,7 @@ impl PostgresConnection {
             });
         }
         let status = unsafe { (self.api.result_status)(result) };
-        let decoded = if status == 1 {
+        let decoded = if matches!(status, 1 | 2) {
             Ok(())
         } else {
             const PG_DIAG_SQLSTATE: c_int = b'C' as c_int;
@@ -1195,6 +1559,9 @@ impl PostgresConnection {
             }
             let capacity =
                 usize::try_from(rows).map_err(|_| fail("PostgreSQL row count exceeds usize"))?;
+            if capacity > MAX_HISTORY_ROWS {
+                return Err(fail("PostgreSQL tool query exceeded the row limit"));
+            }
             let mut output = Vec::with_capacity(capacity);
             for row in 0..rows {
                 let mut values = Vec::with_capacity(expected_fields);
@@ -1203,9 +1570,30 @@ impl PostgresConnection {
                         values.push(None);
                     } else {
                         let pointer = unsafe { (self.api.getvalue)(result, row, field) };
-                        values.push(Some(pq_owned_text(pointer).ok_or_else(|| {
-                            fail("PostgreSQL query returned invalid UTF-8 or null text")
-                        })?));
+                        let length = unsafe { (self.api.getlength)(result, row, field) };
+                        if length < 0 {
+                            return Err(fail("PostgreSQL query returned a negative value length"));
+                        }
+                        let length = usize::try_from(length)
+                            .map_err(|_| fail("PostgreSQL value length exceeds usize"))?;
+                        if length > MAX_NATIVE_TEXT_BYTES {
+                            return Err(fail("PostgreSQL text value exceeds the tool limit"));
+                        }
+                        if pointer.is_null() && length != 0 {
+                            return Err(fail("PostgreSQL query returned null text storage"));
+                        }
+                        let bytes = if length == 0 {
+                            &[][..]
+                        } else {
+                            // SAFETY: libpq owns `length` bytes until PQclear; validation and copy
+                            // complete before that result owner is released.
+                            unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) }
+                        };
+                        values.push(Some(
+                            std::str::from_utf8(bytes)
+                                .map_err(|_| fail("PostgreSQL query value is not UTF-8"))?
+                                .to_string(),
+                        ));
                     }
                 }
                 output.push(values);
@@ -1231,14 +1619,19 @@ impl PostgresConnection {
         }
         Ok(())
     }
+
+    fn close(&mut self) {
+        if !self.connection.is_null() {
+            // SAFETY: this wrapper owns the live PGconn and releases it at most once.
+            unsafe { (self.api.finish)(self.connection) };
+            self.connection = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for PostgresConnection {
     fn drop(&mut self) {
-        if !self.connection.is_null() {
-            unsafe { (self.api.finish)(self.connection) };
-            self.connection = std::ptr::null_mut();
-        }
+        self.close();
     }
 }
 
@@ -1246,10 +1639,11 @@ fn pq_owned_text(pointer: *const c_char) -> Option<String> {
     if pointer.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(pointer) }
-        .to_str()
-        .ok()
-        .map(str::to_string)
+    let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
+    if bytes.len() > MAX_NATIVE_TEXT_BYTES {
+        return Some("PostgreSQL native diagnostic exceeded the tool limit".to_string());
+    }
+    std::str::from_utf8(bytes).ok().map(str::to_string)
 }
 
 fn postgres_begin_and_lock(
@@ -1277,7 +1671,7 @@ fn postgres_rollback(connection: &PostgresConnection) {
 
 fn postgres_schema_inventory_sql() -> &'static str {
     r#"WITH target AS (
-  SELECT c.oid AS table_oid,c.relkind,c.relpersistence,c.relowner,c.relispartition,c.relrowsecurity,c.relforcerowsecurity,n.oid AS schema_oid,n.nspowner
+  SELECT c.oid AS table_oid,c.relkind,c.relpersistence,c.relowner,c.relispartition,c.relrowsecurity,c.relforcerowsecurity,c.relreplident,n.oid AS schema_oid,n.nspowner
   FROM pg_catalog.pg_namespace n
   JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname='migrations_v1'
   WHERE n.nspname='align_internal'
@@ -1300,7 +1694,7 @@ fn postgres_schema_inventory_sql() -> &'static str {
   GROUP BY conrelid
 ), indexes AS (
   SELECT i.indrelid,pg_catalog.count(*) AS count,
-         pg_catalog.bool_and(i.indisprimary AND i.indisvalid AND i.indisready AND i.indimmediate AND i.indisunique AND i.indnatts=1 AND i.indnkeyatts=1 AND i.indkey[0]=2 AND am.amname='btree' AND x.indpred IS NULL AND x.indexprs IS NULL) AS exact
+         pg_catalog.bool_and(i.indisprimary AND i.indisvalid AND i.indisready AND i.indimmediate AND i.indisunique AND NOT i.indisexclusion AND NOT i.indnullsnotdistinct AND i.indnatts=1 AND i.indnkeyatts=1 AND i.indkey[0]=2 AND i.indoption[0]=0 AND i.indcollation[0]=0 AND am.amname='btree' AND x.indpred IS NULL AND x.indexprs IS NULL AND i.indclass[0]=(SELECT op.oid FROM pg_catalog.pg_opclass op WHERE op.opcmethod=am.oid AND op.opcintype='integer'::pg_catalog.regtype AND op.opcdefault)) AS exact
   FROM pg_catalog.pg_index i
   JOIN target t ON t.table_oid=i.indrelid
   JOIN pg_catalog.pg_class ic ON ic.oid=i.indexrelid
@@ -1314,12 +1708,15 @@ SELECT t.relkind,t.relpersistence,(t.relowner=pg_catalog.current_user::regrole):
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_trigger g WHERE g.tgrelid=t.table_oid AND NOT g.tgisinternal),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_rewrite r WHERE r.ev_class=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_policy p WHERE p.polrelid=t.table_oid),
-       (SELECT pg_catalog.count(*)::text FROM pg_catalog.aclexplode(COALESCE((SELECT relacl FROM pg_catalog.pg_class WHERE oid=t.table_oid),pg_catalog.acldefault('r',t.relowner))) a WHERE a.grantee<>t.relowner AND a.privilege_type IS NOT NULL)
+       (SELECT pg_catalog.count(*)::text FROM pg_catalog.aclexplode(COALESCE((SELECT relacl FROM pg_catalog.pg_class WHERE oid=t.table_oid),pg_catalog.acldefault('r',t.relowner))) a WHERE a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
+       (SELECT am.amname FROM pg_catalog.pg_am am WHERE am.oid=(SELECT relam FROM pg_catalog.pg_class WHERE oid=t.table_oid)),
+       t.relreplident,
+       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_publication_rel pr WHERE pr.prrelid=t.table_oid)
 FROM target t JOIN columns c ON c.attrelid=t.table_oid JOIN constraints k ON k.conrelid=t.table_oid JOIN indexes i ON i.indrelid=t.table_oid"#
 }
 
 fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), MigrationError> {
-    let rows = connection.query(postgres_schema_inventory_sql(), 19)?;
+    let rows = connection.query(postgres_schema_inventory_sql(), 22)?;
     let [row] = rows.as_slice() else {
         return Err(fail(
             "PostgreSQL migration history schema has an invalid object inventory",
@@ -1341,10 +1738,18 @@ fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), Migra
         "CHECK (((completed_statements >= 0) AND (completed_statements <= '4294967295'::bigint)))",
         "PRIMARY KEY (version)",
     ];
-    let constraint_lines = constraints
+    let mut constraint_lines = constraints
         .lines()
-        .map(|line| line.split_once(':').map_or(line, |(_, value)| value))
+        .map(|line| {
+            canonical_postgres_constraint(line.split_once(':').map_or(line, |(_, value)| value))
+        })
         .collect::<Vec<_>>();
+    constraint_lines.sort();
+    let mut required_checks = required_checks
+        .iter()
+        .map(|value| canonical_postgres_constraint(value))
+        .collect::<Vec<_>>();
+    required_checks.sort();
     if value(0, "relation kind")? != "r"
         || value(1, "persistence")? != "p"
         || value(2, "owner")? != "true"
@@ -1356,9 +1761,7 @@ fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), Migra
         || value(8, "column count")? != "7"
         || value(10, "constraint count")? != "7"
         || value(11, "constraint timing")? != "true"
-        || required_checks
-            .iter()
-            .any(|required| !constraint_lines.contains(required))
+        || constraint_lines != required_checks
         || value(12, "index count")? != "1"
         || value(13, "primary index")? != "true"
         || value(14, "inheritance inventory")? != "0"
@@ -1366,12 +1769,24 @@ fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), Migra
         || value(16, "rewrite-rule inventory")? != "0"
         || value(17, "policy inventory")? != "0"
         || value(18, "ACL inventory")? != "0"
+        || value(19, "table access method")? != "heap"
+        || value(20, "replica identity")? != "d"
+        || value(21, "publication inventory")? != "0"
     {
         return Err(fail(
             "PostgreSQL migration history schema does not match the canonical contract",
         ));
     }
     Ok(())
+}
+
+fn canonical_postgres_constraint(value: &str) -> String {
+    value
+        .replace("::bigint", "")
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'(' | b')' | b'\'' | b'"'))
+        .map(char::from)
+        .collect()
 }
 
 fn parse_postgres_u32(value: Option<&String>, what: &str) -> Result<u32, MigrationError> {
@@ -1398,16 +1813,27 @@ fn read_postgres_history(
             let [format_version, version, filename, checksum, policy, state, completed] = row.as_slice() else {
                 return Err(fail("PostgreSQL migration history returned an invalid row shape"));
             };
+            let format_version = parse_postgres_u32(format_version.as_ref(), "format_version")?;
+            let version = parse_postgres_u32(version.as_ref(), "version")?;
+            let filename = filename
+                .clone()
+                .ok_or_else(|| fail("PostgreSQL migration history filename is NULL"))?;
+            let checksum = checksum
+                .clone()
+                .ok_or_else(|| fail("PostgreSQL migration history checksum is NULL"))?;
+            validate_native_history_identity(format_version, version, &filename, &checksum)?;
             let policy = parse_postgres_u32(policy.as_ref(), "policy")?;
             let state = parse_postgres_u32(state.as_ref(), "state")?;
+            let completed_statements =
+                parse_postgres_u32(completed.as_ref(), "completed_statements")?;
             Ok(HistoryRow {
-                format_version: parse_postgres_u32(format_version.as_ref(), "format_version")?,
-                version: parse_postgres_u32(version.as_ref(), "version")?,
-                filename: filename.clone().ok_or_else(|| fail("PostgreSQL migration history filename is NULL"))?,
-                checksum: checksum.clone().ok_or_else(|| fail("PostgreSQL migration history checksum is NULL"))?,
+                format_version,
+                version,
+                filename,
+                checksum,
                 policy: u8::try_from(policy).ok().and_then(MigrationPolicy::from_tag).ok_or_else(|| fail("PostgreSQL migration history policy is invalid"))?,
                 state: u8::try_from(state).ok().and_then(StoredMigrationState::from_tag).ok_or_else(|| fail("PostgreSQL migration history state is invalid"))?,
-                completed_statements: parse_postgres_u32(completed.as_ref(), "completed_statements")?,
+                completed_statements,
             })
         })
         .collect()
@@ -1497,8 +1923,138 @@ fn postgres_inspect_phase(
     }
 }
 
+#[derive(Clone)]
+enum PostgresCommitExpectation {
+    Bootstrap,
+    Applied(u32),
+    Applying {
+        version: u32,
+        history: Vec<HistoryRow>,
+    },
+    Failed(u32),
+    Cleared(u32),
+}
+
+fn postgres_reconcile_commit(
+    connection: &mut PostgresConnection,
+    url: &str,
+    catalog: &ScreenedCatalog,
+    expectation: PostgresCommitExpectation,
+    commit_error: MigrationError,
+) -> Result<(), MigrationError> {
+    connection.close();
+    *connection = PostgresConnection::open(url).map_err(|error| {
+        fail(format!(
+            "PostgreSQL commit outcome is unknown after `{commit_error}`; reconnect failed: {error}"
+        ))
+    })?;
+    connection.advisory_lock(true).map_err(|error| {
+        fail(format!(
+            "PostgreSQL commit outcome is unknown after `{commit_error}`; relock failed: {error}"
+        ))
+    })?;
+    if matches!(&expectation, PostgresCommitExpectation::Bootstrap) {
+        match postgres_begin_and_lock(connection, true) {
+            Ok(()) => {}
+            Err(error) if error.sqlstate.as_deref() == Some("42P01") => {
+                postgres_rollback(connection);
+                return Err(fail(format!(
+                    "PostgreSQL bootstrap commit failed and reconciliation proved it was not applied: {commit_error}"
+                )));
+            }
+            Err(error) => {
+                postgres_rollback(connection);
+                return Err(fail(format!(
+                    "PostgreSQL bootstrap commit outcome is unknown after `{commit_error}`; relock failed: {}",
+                    error.message
+                )));
+            }
+        }
+        let report = inspect_postgres_locked(connection, catalog).map_err(|error| {
+            postgres_rollback(connection);
+            fail(format!(
+                "PostgreSQL bootstrap commit outcome is unknown after `{commit_error}`; reconciliation failed: {error}"
+            ))
+        })?;
+        connection.execute(b"COMMIT", "PostgreSQL bootstrap reconciliation commit")?;
+        return ensure_prefix(&report);
+    }
+    let report = postgres_inspect_phase(connection, catalog, true, false).map_err(|error| {
+        fail(format!(
+            "PostgreSQL commit outcome is unknown after `{commit_error}`; reconciliation failed: {error}"
+        ))
+    })?;
+    let status = |version| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.version == version)
+            .map(|row| row.status)
+    };
+    let observed_history = report
+        .rows
+        .iter()
+        .filter_map(|row| row.history.clone())
+        .collect::<Vec<_>>();
+    let reconciled = match &expectation {
+        PostgresCommitExpectation::Bootstrap => report.can_migrate(),
+        PostgresCommitExpectation::Applied(version) => {
+            status(*version) == Some(MigrationStatus::Applied)
+        }
+        PostgresCommitExpectation::Applying { history, .. } => {
+            observed_history.as_slice() == history.as_slice()
+        }
+        PostgresCommitExpectation::Failed(version) => {
+            status(*version) == Some(MigrationStatus::DirtyFailed)
+        }
+        PostgresCommitExpectation::Cleared(version) => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+    };
+    if reconciled {
+        return Ok(());
+    }
+    let known_absence = match &expectation {
+        PostgresCommitExpectation::Bootstrap => false,
+        PostgresCommitExpectation::Applied(version)
+        | PostgresCommitExpectation::Failed(version) => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+        PostgresCommitExpectation::Applying { version, .. } => {
+            status(*version) == Some(MigrationStatus::Pending)
+        }
+        PostgresCommitExpectation::Cleared(version) => matches!(
+            status(*version),
+            Some(MigrationStatus::DirtyApplying | MigrationStatus::DirtyFailed)
+        ),
+    };
+    if known_absence {
+        Err(fail(format!(
+            "PostgreSQL commit failed and reconciliation proved the requested change was not applied: {commit_error}"
+        )))
+    } else {
+        Err(fail(format!(
+            "PostgreSQL commit outcome is unknown after reconciliation: {commit_error}"
+        )))
+    }
+}
+
+fn postgres_commit(
+    connection: &mut PostgresConnection,
+    url: &str,
+    catalog: &ScreenedCatalog,
+    expectation: PostgresCommitExpectation,
+    context: &str,
+) -> Result<(), MigrationError> {
+    match connection.execute(b"COMMIT", context) {
+        Ok(()) => Ok(()),
+        Err(error) => postgres_reconcile_commit(connection, url, catalog, expectation, error),
+    }
+}
+
 fn postgres_bootstrap(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
+    url: &str,
     catalog: &ScreenedCatalog,
 ) -> Result<(), MigrationError> {
     connection.execute(
@@ -1518,7 +2074,13 @@ fn postgres_bootstrap(
         ensure_prefix(&report)
     })();
     match result {
-        Ok(()) => connection.execute(b"COMMIT", "PostgreSQL history bootstrap commit"),
+        Ok(()) => postgres_commit(
+            connection,
+            url,
+            catalog,
+            PostgresCommitExpectation::Bootstrap,
+            "PostgreSQL history bootstrap commit",
+        ),
         Err(error) => {
             postgres_rollback(connection);
             Err(error)
@@ -1527,14 +2089,18 @@ fn postgres_bootstrap(
 }
 
 fn postgres_required(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
+    url: &str,
     catalog: &ScreenedCatalog,
     migration: &ScreenedMigration,
 ) -> Result<(), MigrationError> {
-    postgres_begin_and_lock(connection, true).map_err(MigrationError::from)?;
+    if let Err(error) = postgres_begin_and_lock(connection, true) {
+        postgres_rollback(connection);
+        return Err(error.into());
+    }
     let result = (|| {
         let before = inspect_postgres_locked(connection, catalog)?;
-        ensure_prefix(&before)?;
+        ensure_ready(&before, migration.version)?;
         if before
             .rows
             .iter()
@@ -1552,7 +2118,7 @@ fn postgres_required(
             &format!("PostgreSQL migration {:04}", migration.version),
         )?;
         let after_sql = inspect_postgres_locked(connection, catalog)?;
-        ensure_prefix(&after_sql)?;
+        ensure_ready(&after_sql, migration.version)?;
         connection.execute(
             history_insert_sql(
                 migration,
@@ -1581,7 +2147,99 @@ fn postgres_required(
         Ok(())
     })();
     match result {
-        Ok(()) => connection.execute(b"COMMIT", "PostgreSQL migration commit"),
+        Ok(()) => postgres_commit(
+            connection,
+            url,
+            catalog,
+            PostgresCommitExpectation::Applied(migration.version),
+            "PostgreSQL migration commit",
+        ),
+        Err(error) => {
+            postgres_rollback(connection);
+            Err(error)
+        }
+    }
+}
+
+fn postgres_restore_missing_forbidden_history(
+    connection: &mut PostgresConnection,
+    url: &str,
+    catalog: &ScreenedCatalog,
+    history: &[HistoryRow],
+    version: u32,
+) -> Result<(), MigrationError> {
+    connection.execute(
+        b"BEGIN ISOLATION LEVEL READ COMMITTED",
+        "PostgreSQL forbidden missing-history restore",
+    )?;
+    let restored = (|| {
+        let rows = connection.query(
+            "SELECT (pg_catalog.to_regnamespace('align_internal') IS NOT NULL)::text,(pg_catalog.to_regclass('align_internal.migrations_v1') IS NOT NULL)::text",
+            2,
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(fail(
+                "PostgreSQL forbidden history restore returned an invalid shape",
+            ));
+        };
+        match (row[0].as_deref(), row[1].as_deref()) {
+            (Some("false"), Some("false")) => connection.execute(
+                b"CREATE SCHEMA \"align_internal\"",
+                "PostgreSQL forbidden history schema restore",
+            )?,
+            (Some("true"), Some("false")) => {
+                let owner = connection.query(
+                    "SELECT (nspowner=current_user::regrole)::text FROM pg_catalog.pg_namespace WHERE nspname='align_internal'",
+                    1,
+                )?;
+                if owner.as_slice() != [vec![Some("true".to_string())]] {
+                    return Err(fail(
+                        "PostgreSQL forbidden history schema is not owned by the current role",
+                    ));
+                }
+            }
+            _ => {
+                return Err(fail(
+                    "PostgreSQL forbidden history restore raced an owned-object replacement",
+                ));
+            }
+        }
+        connection.execute(
+            POSTGRES_HISTORY_DDL.as_bytes(),
+            "PostgreSQL forbidden history table restore",
+        )?;
+        validate_postgres_schema(connection)?;
+        for row in history {
+            connection.execute(
+                stored_history_insert_sql("\"align_internal\".\"migrations_v1\"", row).as_bytes(),
+                "PostgreSQL forbidden history snapshot restore",
+            )?;
+        }
+        let report = inspect_postgres_locked(connection, catalog)?;
+        if report
+            .rows
+            .iter()
+            .find(|row| row.version == version)
+            .map(|row| row.status)
+            != Some(MigrationStatus::DirtyApplying)
+        {
+            return Err(fail(
+                "PostgreSQL restored forbidden history did not reread as Applying",
+            ));
+        }
+        Ok(())
+    })();
+    match restored {
+        Ok(()) => postgres_commit(
+            connection,
+            url,
+            catalog,
+            PostgresCommitExpectation::Applying {
+                version,
+                history: history.to_vec(),
+            },
+            "PostgreSQL forbidden history restore commit",
+        ),
         Err(error) => {
             postgres_rollback(connection);
             Err(error)
@@ -1590,15 +2248,19 @@ fn postgres_required(
 }
 
 fn postgres_forbidden(
-    history_connection: &PostgresConnection,
+    history_connection: &mut PostgresConnection,
     url: &str,
     catalog: &ScreenedCatalog,
     migration: &ScreenedMigration,
 ) -> Result<(), MigrationError> {
-    postgres_begin_and_lock(history_connection, true).map_err(MigrationError::from)?;
+    if let Err(error) = postgres_begin_and_lock(history_connection, true) {
+        postgres_rollback(history_connection);
+        return Err(error.into());
+    }
+    let mut expected_history = None;
     let applying = (|| {
         let before = inspect_postgres_locked(history_connection, catalog)?;
-        ensure_prefix(&before)?;
+        ensure_ready(&before, migration.version)?;
         if before
             .rows
             .iter()
@@ -1611,6 +2273,22 @@ fn postgres_forbidden(
                 migration.version
             )));
         }
+        let mut history = before
+            .rows
+            .iter()
+            .filter_map(|row| row.history.clone())
+            .collect::<Vec<_>>();
+        history.push(HistoryRow {
+            format_version: 1,
+            version: migration.version,
+            filename: migration.filename.clone(),
+            checksum: migration.checksum.clone(),
+            policy: migration.policy,
+            state: StoredMigrationState::Applying,
+            completed_statements: 0,
+        });
+        history.sort_by_key(|row| row.version);
+        expected_history = Some(history);
         history_connection.execute(
             history_insert_sql(migration, StoredMigrationState::Applying, 0)
                 .replace(
@@ -1625,7 +2303,18 @@ fn postgres_forbidden(
         postgres_rollback(history_connection);
         return Err(error);
     }
-    history_connection.execute(b"COMMIT", "PostgreSQL Applying history commit")?;
+    let applying_history = expected_history
+        .ok_or_else(|| fail("PostgreSQL Applying snapshot was not captured before publication"))?;
+    postgres_commit(
+        history_connection,
+        url,
+        catalog,
+        PostgresCommitExpectation::Applying {
+            version: migration.version,
+            history: applying_history.clone(),
+        },
+        "PostgreSQL Applying history commit",
+    )?;
 
     let native_result = PostgresConnection::open(url).and_then(|worker| {
         worker.execute(
@@ -1639,8 +2328,42 @@ fn postgres_forbidden(
         StoredMigrationState::Failed
     };
     let completed = u32::from(final_state == StoredMigrationState::Applied);
-    postgres_begin_and_lock(history_connection, true).map_err(MigrationError::from)?;
+    if let Err(error) = postgres_begin_and_lock(history_connection, true) {
+        postgres_rollback(history_connection);
+        if error.sqlstate.as_deref() == Some("42P01") {
+            postgres_restore_missing_forbidden_history(
+                history_connection,
+                url,
+                catalog,
+                &applying_history,
+                migration.version,
+            )?;
+            return match native_result {
+                Ok(()) => Err(fail(
+                    "PostgreSQL forbidden SQL removed migration history; the exact Applying snapshot was restored",
+                )),
+                Err(native_error) => Err(fail(format!(
+                    "{native_error}; migration history was removed and the exact Applying snapshot was restored"
+                ))),
+            };
+        }
+        return Err(error.into());
+    }
     let publication = (|| {
+        validate_postgres_schema(history_connection)?;
+        let observed = read_postgres_history(history_connection)?;
+        reconcile(MigrationDriver::Postgres, catalog, observed.clone())?;
+        let history_unchanged = observed == applying_history;
+        history_connection.execute(
+            b"DELETE FROM \"align_internal\".\"migrations_v1\"",
+            "PostgreSQL forbidden history snapshot restore",
+        )?;
+        for row in &applying_history {
+            history_connection.execute(
+                stored_history_insert_sql("\"align_internal\".\"migrations_v1\"", row).as_bytes(),
+                "PostgreSQL forbidden history snapshot restore",
+            )?;
+        }
         let before = inspect_postgres_locked(history_connection, catalog)?;
         if before
             .rows
@@ -1652,6 +2375,9 @@ fn postgres_forbidden(
             return Err(fail(
                 "PostgreSQL forbidden migration lost its Applying history row",
             ));
+        }
+        if !history_unchanged {
+            return Ok(true);
         }
         history_connection.execute(
             format!(
@@ -1677,26 +2403,49 @@ fn postgres_forbidden(
                 "PostgreSQL forbidden migration final state did not reread exactly",
             ));
         }
-        Ok(())
+        Ok(false)
     })();
     let publication = match publication {
-        Ok(()) => history_connection.execute(b"COMMIT", "PostgreSQL forbidden history commit"),
+        Ok(history_changed) => postgres_commit(
+            history_connection,
+            url,
+            catalog,
+            if history_changed {
+                PostgresCommitExpectation::Applying {
+                    version: migration.version,
+                    history: applying_history.clone(),
+                }
+            } else if final_state == StoredMigrationState::Applied {
+                PostgresCommitExpectation::Applied(migration.version)
+            } else {
+                PostgresCommitExpectation::Failed(migration.version)
+            },
+            "PostgreSQL forbidden history commit",
+        )
+        .map(|()| history_changed),
         Err(error) => {
             postgres_rollback(history_connection);
             Err(error)
         }
     };
     match (native_result, publication) {
-        (Err(native_error), Ok(())) => Err(native_error),
+        (Err(native_error), Ok(true)) => Err(fail(format!(
+            "{native_error}; PostgreSQL migration history changed and the exact Applying snapshot was restored"
+        ))),
+        (Err(native_error), Ok(false)) => Err(native_error),
         (Err(native_error), Err(record_error)) => Err(fail(format!(
             "{native_error}; additionally failed to record Failed state: {record_error}"
         ))),
-        (Ok(()), result) => result,
+        (Ok(()), Ok(true)) => Err(fail(
+            "PostgreSQL migration history changed; the exact Applying snapshot was restored",
+        )),
+        (Ok(()), Ok(false)) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
     }
 }
 
 fn postgres_migrate(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
     url: &str,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
@@ -1716,7 +2465,7 @@ fn postgres_migrate(
         }
         Err(error) if error.sqlstate.as_deref() == Some("42P01") => {
             postgres_rollback(connection);
-            postgres_bootstrap(connection, catalog)?;
+            postgres_bootstrap(connection, url, catalog)?;
             postgres_inspect_phase(connection, catalog, true, false)?
         }
         Err(error) => {
@@ -1733,7 +2482,7 @@ fn postgres_migrate(
         .collect::<Vec<_>>();
     for migration in &pending {
         match migration.policy {
-            MigrationPolicy::Required => postgres_required(connection, catalog, migration)?,
+            MigrationPolicy::Required => postgres_required(connection, url, catalog, migration)?,
             MigrationPolicy::Forbidden => postgres_forbidden(connection, url, catalog, migration)?,
         }
     }
@@ -1747,7 +2496,8 @@ fn postgres_migrate(
 }
 
 fn postgres_repair(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
+    url: &str,
     catalog: &ScreenedCatalog,
     version: u32,
     action: RepairAction,
@@ -1819,7 +2569,17 @@ fn postgres_repair(
     })();
     match result {
         Ok(report) => {
-            connection.execute(b"COMMIT", "PostgreSQL repair commit")?;
+            postgres_commit(
+                connection,
+                url,
+                catalog,
+                if action == RepairAction::AcceptApplied {
+                    PostgresCommitExpectation::Applied(version)
+                } else {
+                    PostgresCommitExpectation::Cleared(version)
+                },
+                "PostgreSQL repair commit",
+            )?;
             Ok(report)
         }
         Err(error) => {
@@ -1834,10 +2594,10 @@ pub fn run_postgres_migration(
     operation: MigrationOperation<'_>,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
-    let connection = PostgresConnection::open(url)?;
+    let mut connection = PostgresConnection::open(url)?;
     connection.advisory_lock(operation.writes_database())?;
     match operation {
-        MigrationOperation::Migrate => postgres_migrate(&connection, url, catalog),
+        MigrationOperation::Migrate => postgres_migrate(&mut connection, url, catalog),
         MigrationOperation::Status | MigrationOperation::Check => {
             postgres_inspect_phase(&connection, catalog, false, true)
         }
@@ -1845,7 +2605,14 @@ pub fn run_postgres_migration(
             version,
             action,
             expected_checksum,
-        } => postgres_repair(&connection, catalog, version, action, expected_checksum),
+        } => postgres_repair(
+            &mut connection,
+            url,
+            catalog,
+            version,
+            action,
+            expected_checksum,
+        ),
     }
 }
 
@@ -1865,11 +2632,13 @@ mod tests {
     }
 
     fn temporary_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "align-db-migrate-{name}-{}-{}.sqlite",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ))
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "align-db-migrate-{name}-{}-{}.sqlite",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("test")
+            ))
     }
 
     #[test]
@@ -1903,6 +2672,70 @@ mod tests {
         );
         drop(connection);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.align-migrate.lock", path.display()));
+    }
+
+    #[test]
+    fn sqlite_history_rejects_persistent_and_temporary_attached_behavior() {
+        let path = temporary_path("history-objects");
+        let raw = catalog("CREATE TABLE users(id INTEGER PRIMARY KEY);");
+        let screened = screen_sqlite_catalog_native(&raw).unwrap();
+        run_sqlite_migration(&path, MigrationOperation::Migrate, &screened).unwrap();
+
+        let connection = SqliteConnection::open(&path, SQLITE_OPEN_READWRITE).unwrap();
+        connection
+            .execute(
+                b"CREATE TEMP TRIGGER align_temp_history AFTER UPDATE ON main.__align_migrations_v1 BEGIN SELECT 1; END",
+                "temporary trigger fixture",
+            )
+            .unwrap();
+        assert!(
+            sqlite_snapshot(&connection, &screened, true)
+                .unwrap_err()
+                .to_string()
+                .contains("temporary")
+        );
+        drop(connection);
+
+        let connection = SqliteConnection::open(&path, SQLITE_OPEN_READWRITE).unwrap();
+        connection
+            .execute(
+                b"CREATE TRIGGER align_history AFTER UPDATE ON main.__align_migrations_v1 BEGIN SELECT 1; END",
+                "persistent trigger fixture",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            run_sqlite_migration(&path, MigrationOperation::Status, &screened)
+                .unwrap_err()
+                .to_string()
+                .contains("attached objects")
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.align-migrate.lock", path.display()));
+    }
+
+    #[test]
+    fn sqlite_operation_lock_excludes_overlapping_writer_and_reader() {
+        let path = temporary_path("lock");
+        let exclusive = SqliteOperationLock::acquire(&path, true).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let shared = SqliteOperationLock::acquire(&worker_path, false).unwrap();
+            sent.send(()).unwrap();
+            drop(shared);
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(exclusive);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader acquires after writer release");
+        worker.join().unwrap();
         let _ = std::fs::remove_file(format!("{}.align-migrate.lock", path.display()));
     }
 }
