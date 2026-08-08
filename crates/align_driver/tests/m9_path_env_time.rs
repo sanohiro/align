@@ -153,7 +153,6 @@ fn env_get_inherits_process_environment() {
     if !backend_available() {
         return;
     }
-    unsafe { std::env::set_var("ALIGN_M9_INHERITED", "inherited-value") };
     let prog = "\
 import std.env
 pub fn main() -> Result<(), Error> {
@@ -164,8 +163,11 @@ pub fn main() -> Result<(), Error> {
   return Ok(())
 }
 ";
-    let out = build_and_run("m9-env-inherited", prog);
-    unsafe { std::env::remove_var("ALIGN_M9_INHERITED") };
+    let out = build_and_run_with_env(
+        "m9-env-inherited",
+        prog,
+        &[("ALIGN_M9_INHERITED", "inherited-value")],
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "inherited-value\n");
 }

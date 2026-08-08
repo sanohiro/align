@@ -1276,7 +1276,6 @@ fn inherited_environment_survives_pkg_db_link_closure() {
     if !backend_available() {
         return;
     }
-    unsafe { std::env::set_var("ALIGN_DB_Q2_INHERITED", "inherited-value") };
     let main = r#"module main
 import std.env
 import pkg.db
@@ -1290,8 +1289,12 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi("pkg-db-q2-inherited-environment", &package_files(main), "main.align");
-    unsafe { std::env::remove_var("ALIGN_DB_Q2_INHERITED") };
+    let output = build_and_run_multi_with_env(
+        "pkg-db-q2-inherited-environment",
+        &package_files(main),
+        "main.align",
+        &[("ALIGN_DB_Q2_INHERITED", "inherited-value")],
+    );
     assert_eq!(
         output.status.code(),
         Some(42),

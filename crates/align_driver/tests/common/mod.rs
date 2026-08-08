@@ -145,11 +145,31 @@ impl Drop for TempArtifacts {
 /// Compile `src` to a native executable, run it, and return its `Output`. Asserts the program
 /// type-checks. The temp object/exe are cleaned up even if the test later panics.
 pub fn build_and_run(name: &str, src: &str) -> std::process::Output {
-    build_and_run_args(name, src, &[])
+    build_and_run_args_with_env(name, src, &[], &[])
 }
 
 /// [`build_and_run`] with trailing arguments forwarded to the compiled program.
 pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::process::Output {
+    build_and_run_args_with_env(name, src, prog_args, &[])
+}
+
+/// [`build_and_run`] with explicit environment pairs applied to the generated child. Environment
+/// mutation stays in the child process, so parallel Rust tests never race through `set_var`.
+pub fn build_and_run_with_env(
+    name: &str,
+    src: &str,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    build_and_run_args_with_env(name, src, &[], envs)
+}
+
+/// [`build_and_run_args`] with explicit environment pairs applied to the generated child.
+pub fn build_and_run_args_with_env(
+    name: &str,
+    src: &str,
+    prog_args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     // Run the whole compile→link→run on a **large-stack worker thread** (the production `alignc`
     // binary compiles on its 8 MB main thread; only this in-process harness runs on the 2 MB default
     // test-thread stack). Sema/MIR-lowering/codegen all recurse per expression-nesting level, so a
@@ -158,6 +178,10 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     // A panic inside (an assertion failure) is re-raised on the test thread so failures still report.
     let (name, src) = (name.to_string(), src.to_string());
     let prog_args: Vec<String> = prog_args.iter().map(|a| a.to_string()).collect();
+    let envs: Vec<(String, String)> = envs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
     let handle = std::thread::Builder::new()
         .name(format!("align-build-{name}"))
         .stack_size(32 * 1024 * 1024)
@@ -171,7 +195,7 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
             );
             let mir = lower_to_mir(&checked.hir);
             let arg_refs: Vec<&str> = prog_args.iter().map(String::as_str).collect();
-            emit_link_run(&mir, &name, &arg_refs)
+            emit_link_run(&mir, &name, &arg_refs, &envs)
         })
         .expect("spawn build thread");
     match handle.join() {
@@ -187,6 +211,7 @@ fn emit_link_run(
     mir: &align_driver::MirProgram,
     name: &str,
     prog_args: &[&str],
+    envs: &[(String, String)],
 ) -> std::process::Output {
     let dir = std::env::temp_dir();
     // Include the process id so two concurrent test-suite runs on one machine (e.g. parallel CI)
@@ -211,10 +236,12 @@ fn emit_link_run(
     )
     .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
-    std::process::Command::new(&exe)
-        .args(prog_args)
-        .output()
-        .expect("run")
+    let mut command = std::process::Command::new(&exe);
+    command.args(prog_args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run")
 }
 
 /// A compiled Align executable plus a guard that removes its object + exe on drop. Returned by
