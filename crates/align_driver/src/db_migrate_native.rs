@@ -1454,6 +1454,10 @@ struct PostgresCommandError {
     sqlstate: Option<String>,
 }
 
+fn postgres_history_is_missing(error: &PostgresCommandError) -> bool {
+    matches!(error.sqlstate.as_deref(), Some("42P01" | "3F000"))
+}
+
 impl From<PostgresCommandError> for MigrationError {
     fn from(error: PostgresCommandError) -> Self {
         fail(error.message)
@@ -1905,7 +1909,7 @@ fn postgres_inspect_phase(
 ) -> Result<MigrationReport, MigrationError> {
     match postgres_begin_and_lock(connection, write) {
         Ok(()) => {}
-        Err(error) if error.sqlstate.as_deref() == Some("42P01") => {
+        Err(error) if postgres_history_is_missing(&error) => {
             postgres_rollback(connection);
             if absent_allowed {
                 return postgres_absent_snapshot(connection, catalog);
@@ -1963,7 +1967,7 @@ fn postgres_reconcile_commit(
     if matches!(&expectation, PostgresCommitExpectation::Bootstrap) {
         match postgres_begin_and_lock(connection, true) {
             Ok(()) => {}
-            Err(error) if error.sqlstate.as_deref() == Some("42P01") => {
+            Err(error) if postgres_history_is_missing(&error) => {
                 postgres_rollback(connection);
                 return Err(fail(format!(
                     "PostgreSQL bootstrap commit failed and reconciliation proved it was not applied: {commit_error}"
@@ -2337,7 +2341,7 @@ fn postgres_forbidden(
     let completed = u32::from(final_state == StoredMigrationState::Applied);
     if let Err(error) = postgres_begin_and_lock(history_connection, true) {
         postgres_rollback(history_connection);
-        if error.sqlstate.as_deref() == Some("42P01") {
+        if postgres_history_is_missing(&error) {
             postgres_restore_missing_forbidden_history(
                 history_connection,
                 url,
@@ -2471,7 +2475,7 @@ fn postgres_migrate(
                 }
             }
         }
-        Err(error) if error.sqlstate.as_deref() == Some("42P01") => {
+        Err(error) if postgres_history_is_missing(&error) => {
             postgres_rollback(connection);
             postgres_bootstrap(connection, url, catalog)?;
             postgres_inspect_phase(connection, catalog, true, false)?
@@ -2513,7 +2517,7 @@ fn postgres_repair(
 ) -> Result<MigrationReport, MigrationError> {
     if let Err(error) = postgres_begin_and_lock(connection, true) {
         postgres_rollback(connection);
-        return if error.sqlstate.as_deref() == Some("42P01") {
+        return if postgres_history_is_missing(&error) {
             Err(fail("PostgreSQL migration history is missing"))
         } else {
             Err(error.into())
@@ -2777,5 +2781,19 @@ mod tests {
                 .to_string()
                 .contains("PostgreSQL migration requires")
         );
+    }
+
+    #[test]
+    fn postgres_missing_history_sqlstates_cover_table_and_schema_absence() {
+        for sqlstate in ["42P01", "3F000"] {
+            assert!(postgres_history_is_missing(&PostgresCommandError {
+                message: "missing history fixture".to_owned(),
+                sqlstate: Some(sqlstate.to_owned()),
+            }));
+        }
+        assert!(!postgres_history_is_missing(&PostgresCommandError {
+            message: "unrelated failure fixture".to_owned(),
+            sqlstate: Some("42501".to_owned()),
+        }));
     }
 }

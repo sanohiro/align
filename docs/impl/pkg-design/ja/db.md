@@ -1560,7 +1560,8 @@ validation/mutation前に `LOCK TABLE "align_internal"."migrations_v1" IN ACCESS
 catalog/history read前に
 prior writerを待ち、transaction endまでlater readへのtable writerを止める。
 
-SQLSTATE `42P01` (undefined table)だけがfailed transaction rollback後にabsent-table pathを選ぶ。
+SQLSTATE `42P01` (undefined table)または `3F000` (invalid schema name)だけがfailed transaction
+rollback後にabsent-owned-object pathを選ぶ。
 `migrate` はnew transaction 1つでexact schema/table bootstrapをattemptし、new objectをvalidate/commit後、
 blind-lock phaseから再開する。pre-existing schema/creation raceはadoptせずfailする。`status`/`check` は
 new transaction 1つとcatalog query 1本を使い、両object absentをempty snapshot、一方だけpresentを
@@ -2607,6 +2608,7 @@ pre-implementation adversarial reviewはsource work前に次のroot-cause class�
 | focused implementation reviewがmalformed rowをrestorable changeとして扱い、不確定restore commitでcurrent Applying rowだけを確認していた | 両adapterはrestore前にcomplete row semanticsをvalidateし、malformed replacementを変更しない。全Applying commit reconciliationはcomplete expected history snapshotを比較するため、partial/unapplied restoreをexactと報告できない。 |
 | Align compiler self-reviewがpublic native PostgreSQL entryのCLI-only input check依存、preparation固有diagnostic、2つの `SET ... TRANSACTION` spelling漏れ、attached behaviorからinbound-FK triggerとcolumn ACLの欠落を発見した | native entryはcontext-specific shared validatorでlibpq load前にambient/complete-URL validationを再実行する。screeningは `SET LOCAL TRANSACTION` と `SET SESSION TRANSACTION` をrejectする。joined inventoryは全table triggerとnon-owner column ACLを数え、owner testで固定する。 |
 | full-diff reviewがtoken-free SQLite tailのrejectとunchanged Forbidden historyのdestructive rewriteを発見した | SQLite screeningは全complete statementを確認した後のtoken-free trailing byteを無視する。両adapterはunchanged Applying rowをin-place updateし、changed/missing snapshotだけをrestoreする。SQLiteはinbound foreign keyをrejectするため、必要なrestoreがapplication dataへcascadeしない。 |
+| required PostgreSQL CIがfirst-run bootstrapでabsent tableだけをmissing historyとして扱っていたことを発見した | 全blind history lockはPostgreSQLの両absent-object SQLSTATEを認識する。missing tableは `42P01`、missing schemaは `3F000` とし、後続のexact inventory queryが両owned objectのabsentを判定する。 |
 
 ### D12 — category metadataとEXPLAIN
 
