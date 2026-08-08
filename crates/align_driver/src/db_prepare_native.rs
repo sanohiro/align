@@ -778,7 +778,7 @@ impl MetadataDescriber for PostgresDescriber {
             .into_iter()
             .map(|row| row.into_iter().next().flatten().ok_or_else(|| fail("PostgreSQL search path contains NULL")))
             .collect::<Result<Vec<_>, _>>()?;
-        let extensions = self.query_rows(
+        let mut extensions = self.query_rows(
             "SELECT n.nspname,e.extname,e.extversion FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace ORDER BY n.nspname,e.extname,e.extversion",
             3,
         )?.into_iter().map(|row| {
@@ -788,6 +788,7 @@ impl MetadataDescriber for PostgresDescriber {
                 version: row[2].clone(),
             })
         }).collect::<Result<Vec<_>, PrepareError>>()?;
+        extensions.sort();
         let schema_fingerprint = crate::db_prepare::postgres_schema_fingerprint(
             &self.schema_id,
             &search_path,

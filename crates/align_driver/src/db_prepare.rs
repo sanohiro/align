@@ -354,12 +354,20 @@ fn project_root(entry_path: &Path) -> Result<PathBuf, PrepareError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    parent.canonicalize().map_err(|error| {
-        fail(format!(
-            "cannot resolve project root `{}`: {error}",
-            parent.display()
-        ))
-    })
+    let root = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| fail(format!("cannot resolve current directory: {error}")))?
+            .join(parent)
+    };
+    if !root.is_dir() {
+        return Err(fail(format!("project root `{}` is not a directory", root.display())));
+    }
+    // Preserve the lexical root spelling used by SourceMap paths. The static-input reader performs
+    // its own canonical containment check, while this avoids `/var` versus `/private/var` aliasing
+    // from making an in-root sibling SQL file appear outside the project on macOS.
+    Ok(root)
 }
 
 fn select_artifacts<'a>(
@@ -396,12 +404,20 @@ fn select_artifacts<'a>(
             .as_bytes()
             .cmp(right.descriptor_id.as_bytes())
     });
+    let mut paths = HashMap::new();
     for artifact in &selected {
         if driver_entry(&artifact.artifact, driver).is_none() {
             return Err(fail(format!(
                 "descriptor `{}` does not permit {}",
                 artifact.descriptor_id,
                 driver_name(driver)
+            )));
+        }
+        let path_hash = Hash128::of(artifact.descriptor_id.as_bytes()).to_hex();
+        if let Some(previous) = paths.insert(path_hash, artifact.descriptor_id.as_str()) {
+            return Err(fail(format!(
+                "descriptor IDs `{previous}` and `{}` collide in the metadata path",
+                artifact.descriptor_id
             )));
         }
     }
@@ -424,9 +440,87 @@ fn driver_entry(artifact: &StaticArtifact, driver: Driver) -> Option<&DriverEntr
     .find(|entry| entry.driver == driver)
 }
 
+fn logical_base(logical_type: &str) -> &str {
+    logical_type
+        .strip_prefix("Option<")
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(logical_type)
+}
+
+fn validate_native_type(
+    driver: Driver,
+    logical_type: &str,
+    native_type: Option<&str>,
+    native_type_id: Option<i64>,
+) -> Result<(), PrepareError> {
+    let logical = logical_base(logical_type);
+    match driver {
+        Driver::SQLite => {
+            if native_type_id.is_some() {
+                return Err(fail("SQLite metadata unexpectedly contains a native type ID"));
+            }
+            let Some(native) = native_type else {
+                // SQLite supplies no declaration for parameters and many expressions. Runtime
+                // storage-class validation remains mandatory for this checked descriptor.
+                return Ok(());
+            };
+            let upper = native.to_ascii_uppercase();
+            let affinity = if upper.contains("INT") {
+                "integer"
+            } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+                "text"
+            } else if upper.is_empty() || upper.contains("BLOB") {
+                "blob"
+            } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+                "real"
+            } else {
+                "numeric"
+            };
+            let supported = match logical {
+                "i8" | "i16" | "i32" | "i64" => affinity == "integer",
+                "f64" => affinity == "real",
+                "str" | "string" => affinity == "text",
+                "slice<u8>" | "array<u8>" => affinity == "blob",
+                _ => false,
+            };
+            if !supported {
+                return Err(fail(format!(
+                    "SQLite native type `{native}` does not support logical type `{logical_type}`"
+                )));
+            }
+        }
+        Driver::PostgreSQL => {
+            let Some(oid) = native_type_id else {
+                return Err(fail("PostgreSQL metadata is missing a native type OID"));
+            };
+            let Some(native) = native_type else {
+                return Err(fail("PostgreSQL metadata is missing a canonical native type name"));
+            };
+            let expected = match logical {
+                "i16" => &[21][..],
+                "i32" => &[23][..],
+                "i64" => &[20][..],
+                "f32" => &[700][..],
+                "f64" => &[701][..],
+                "bool" => &[16][..],
+                "str" | "string" => &[25, 1043, 19][..],
+                "slice<u8>" | "array<u8>" => &[17][..],
+                _ => &[][..],
+            };
+            if oid < 0 || !expected.contains(&(oid as u32)) || native.is_empty() {
+                return Err(fail(format!(
+                    "PostgreSQL native type `{native}` (OID {oid}) does not support logical type `{logical_type}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parameter_records(
     artifact: &StaticArtifact,
     description: &NativeStatementDescription,
+    driver: Driver,
 ) -> Result<Vec<ParsedMetadataParameter>, PrepareError> {
     let declared = match artifact {
         StaticArtifact::Query(query) => query
@@ -483,6 +577,12 @@ fn parameter_records(
                     "database parameter order/name does not match the static Params plan",
                 ));
             }
+            validate_native_type(
+                driver,
+                &logical_type,
+                native.native_type.as_deref(),
+                native.native_type_id,
+            )?;
             Ok(ParsedMetadataParameter {
                 source_name: source_name.to_string(),
                 logical_type,
@@ -499,6 +599,7 @@ fn parameter_records(
 fn column_records(
     artifact: &StaticArtifact,
     description: &NativeStatementDescription,
+    driver: Driver,
 ) -> Result<Vec<ParsedMetadataColumn>, PrepareError> {
     let StaticArtifact::Query(query) = artifact else {
         if description.columns.is_empty() {
@@ -524,6 +625,12 @@ fn column_records(
                     "database column order/name does not match the static Row plan",
                 ));
             }
+            validate_native_type(
+                driver,
+                &declared.logical_type,
+                native.native_type.as_deref(),
+                native.native_type_id,
+            )?;
             Ok(ParsedMetadataColumn {
                 source_alias: declared.source_alias.clone(),
                 logical_type: declared.logical_type.clone(),
@@ -602,8 +709,8 @@ fn record(
                     version: extension.version.clone(),
                 })
                 .collect(),
-            parameters: parameter_records(artifact, description)?,
-            columns: column_records(artifact, description)?,
+            parameters: parameter_records(artifact, description, entry.driver)?,
+            columns: column_records(artifact, description, entry.driver)?,
         },
     ))
 }
