@@ -18,7 +18,7 @@ fn fail(reason: impl Into<String>) -> PrepareError {
 }
 
 #[cfg(unix)]
-mod dynamic {
+pub(crate) mod dynamic {
     use super::*;
 
     const RTLD_NOW: c_int = 2;
@@ -139,7 +139,7 @@ mod dynamic {
 }
 
 #[cfg(not(unix))]
-mod dynamic {
+pub(crate) mod dynamic {
     use super::*;
 
     pub struct Library;
@@ -797,7 +797,7 @@ pub struct PostgresDescriber {
 
 type PostgresOrigin = (Option<String>, Option<String>, Option<String>);
 
-fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
+pub(crate) fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
     let rest = url
         .strip_prefix("postgresql://")
         .or_else(|| url.strip_prefix("postgres://"))
@@ -882,7 +882,7 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
     Ok(())
 }
 
-fn reject_ambient_postgres_environment() -> Result<(), PrepareError> {
+pub(crate) fn reject_ambient_postgres_environment() -> Result<(), PrepareError> {
     if std::env::vars_os().any(|(name, _)| {
         name.to_str()
             .is_some_and(|name| name.as_bytes().starts_with(b"PG"))
