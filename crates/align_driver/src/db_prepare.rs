@@ -501,11 +501,32 @@ fn validate_preparation_options(
                 (StaticOptionValue::SQLiteRequireVersionAtLeast { .. }, Driver::SQLite) => {}
                 (
                     StaticOptionValue::PostgreSQLParameterType {
+                        parameter_name,
                         canonical_type_name,
                         ..
                     },
                     Driver::PostgreSQL,
-                ) if canonical_type_name == "int8" => {}
+                ) if canonical_type_name == "int8" => {
+                    let contract = match &built.artifact {
+                        StaticArtifact::Query(query) => &query.params_type,
+                        StaticArtifact::Command(command) => &command.params_type,
+                    };
+                    let field = root_fields(contract)
+                        .map_err(fail)?
+                        .iter()
+                        .find(|field| field.name == *parameter_name)
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "PostgreSQL parameter type names unknown Params field `{parameter_name}`"
+                            ))
+                        })?;
+                    let logical_type = field.ty.spelling();
+                    if logical_base(&logical_type) != "i64" {
+                        return Err(fail(format!(
+                            "PostgreSQL parameter type `int8` requires `{parameter_name}` to be i64 or Option<i64>"
+                        )));
+                    }
+                }
                 (
                     StaticOptionValue::PostgreSQLParameterType {
                         canonical_type_name,

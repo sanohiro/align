@@ -1009,6 +1009,70 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
             .contains("unsupported PostgreSQL parameter type `int4`"),
         "{error}"
     );
+
+    std::fs::write(
+        project.dir.join("app/pg_read.align"),
+        r#"module app.pg_read
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: i32 }
+pub Row { value: i32 }
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT :value AS value",
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+"#,
+    )
+    .expect("write mismatched PostgreSQL option fixture");
+    let (mut source_map, checked) = checked_project(&project);
+    let mut describer = FakeDescriber::new(Driver::PostgreSQL);
+    let error = build_metadata_batch(
+        &mut source_map,
+        &entry,
+        &checked,
+        &["app.pg_read.query".to_string()],
+        &mut describer,
+    )
+    .expect_err("mismatched parameter type must fail before native work");
+    assert_eq!(describer.environment_calls, 0, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("requires `value` to be i64 or Option<i64>"),
+        "{error}"
+    );
+
+    std::fs::write(
+        project.dir.join("app/pg_read.align"),
+        r#"module app.pg_read
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: Option<i64> }
+pub Row { value: Option<i64> }
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT :value AS value",
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+"#,
+    )
+    .expect("write optional PostgreSQL option fixture");
+    let (mut source_map, checked) = checked_project(&project);
+    let mut describer = FakeDescriber::new(Driver::PostgreSQL);
+    build_metadata_batch(
+        &mut source_map,
+        &entry,
+        &checked,
+        &["app.pg_read.query".to_string()],
+        &mut describer,
+    )
+    .expect("Option<i64> must accept PostgreSQL int8 before native work");
+    assert_eq!(describer.environment_calls, 1);
 }
 
 #[test]
@@ -1076,6 +1140,29 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
 "#,
     )
     .expect("write PostgreSQL parameter type fixture");
+    std::fs::write(
+        project.dir.join("app/pg_command.align"),
+        r#"module app.pg_command
+import pkg.db
+import pkg.db.postgres
+
+pub Params {}
+pub Row {}
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "CREATE TEMP TABLE align_q3_postgres_probe(value BIGINT)",
+  [pkg.db.CommandOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [],
+)
+
+pub fn zero() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT FROM (VALUES (1)) AS align_q3_zero(value)",
+  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [],
+)
+"#,
+    )
+    .expect("write PostgreSQL zero-column Query fixture");
     let entry = project.dir.join(&project.entry);
     let (mut source_map, checked) = checked_project(&project);
     let mut describer = PostgresDescriber::new(url.clone(), "q3-test-v1".to_string());
@@ -1086,11 +1173,12 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
         &[
             "app.pg_read.query".to_string(),
             "app.pg_command.command".to_string(),
+            "app.pg_command.zero".to_string(),
         ],
         &mut describer,
     )
     .expect("native PostgreSQL metadata");
-    assert_eq!(batch.files.len(), 2);
+    assert_eq!(batch.files.len(), 3);
     let bytes = &batch
         .files
         .iter()
@@ -1122,6 +1210,8 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
             "app.pg_read.query",
             "--query",
             "app.pg_command.command",
+            "--query",
+            "app.pg_command.zero",
         ]);
         if check_only {
             command.arg("--check");

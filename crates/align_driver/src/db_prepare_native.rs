@@ -654,8 +654,7 @@ impl MetadataDescriber for SqliteDescriber {
                     nullable: MetaNullability::Unknown,
                 });
             }
-            let query = matches!(artifact, StaticArtifact::Query(_));
-            if query == columns.is_empty() {
+            if matches!(artifact, StaticArtifact::Command(_)) && !columns.is_empty() {
                 return Err(fail(
                     "SQLite statement result kind disagrees with the static descriptor",
                 ));
@@ -1382,8 +1381,7 @@ impl MetadataDescriber for PostgresDescriber {
                     nullable: MetaNullability::Unknown,
                 });
             }
-            let query = matches!(artifact, StaticArtifact::Query(_));
-            if query == columns.is_empty() {
+            if matches!(artifact, StaticArtifact::Command(_)) && !columns.is_empty() {
                 return Err(fail(
                     "PostgreSQL statement result kind disagrees with the static descriptor",
                 ));
