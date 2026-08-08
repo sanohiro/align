@@ -6,12 +6,12 @@ use crate::{
 };
 use align_interface::{
     static_artifact_digest, static_options_hash, BindRetention, BindingEntry, CanonicalContract,
-    CanonicalDefinitionBody, CanonicalType, CheckPolicy, CheckedMetadata, CheckedQueryEvidence,
-    DeclaredColumnMeta, DeclaredParameterMeta, Driver, DriverEntry, Hash128, MetaStatementClass,
-    ParameterOccurrence, QueryMetaPlan, RewriteEntry, Span, StaticArtifact, StaticArtifactError,
-    StaticCommandArtifact, StaticOption, StaticOptionOwner, StaticOptionValue, StaticQueryArtifact,
-    VerificationState, BINDER_ABI_VERSION, DECODER_ABI_VERSION, REWRITE_FORMAT_VERSION,
-    STATIC_ARTIFACT_FORMAT_VERSION,
+    CanonicalDefinitionBody, CanonicalType, CheckPolicy, CheckedColumnMeta, CheckedMetadata,
+    CheckedParameterMeta, CheckedQueryEvidence, DeclaredColumnMeta, DeclaredParameterMeta, Driver,
+    DriverEntry, Hash128, MetaNullability, MetaStatementClass, ParameterOccurrence, QueryMetaPlan,
+    RewriteEntry, Span, StaticArtifact, StaticArtifactError, StaticCommandArtifact, StaticOption,
+    StaticOptionOwner, StaticOptionValue, StaticQueryArtifact, VerificationState,
+    BINDER_ABI_VERSION, DECODER_ABI_VERSION, REWRITE_FORMAT_VERSION, STATIC_ARTIFACT_FORMAT_VERSION,
 };
 use align_sema::{StaticCheckPolicy, StaticDescriptorOption};
 use std::collections::{HashMap, HashSet};
@@ -326,7 +326,9 @@ fn scan_sql(sql: &[u8]) -> Result<SqlScan, String> {
     })
 }
 
-fn root_fields(contract: &CanonicalContract) -> Result<&[align_interface::CanonicalField], String> {
+pub(crate) fn root_fields(
+    contract: &CanonicalContract,
+) -> Result<&[align_interface::CanonicalField], String> {
     let CanonicalType::Named { path, args } = &contract.root else {
         return Err("contract root is not a named struct".to_string());
     };
@@ -339,6 +341,10 @@ fn root_fields(contract: &CanonicalContract) -> Result<&[align_interface::Canoni
         CanonicalDefinitionBody::Struct { fields } => Ok(fields),
         CanonicalDefinitionBody::Sum { .. } => Err("contract root is not a struct".to_string()),
     }
+}
+
+pub(crate) fn static_statement_class(sql: &[u8]) -> Result<MetaStatementClass, String> {
+    scan_sql(sql).map(|scan| scan.statement_class)
 }
 
 fn bind_retention(ty: &CanonicalType) -> Result<BindRetention, String> {
@@ -807,6 +813,79 @@ pub fn build_static_artifacts(
     descriptors: &[StaticDescriptor],
     resolved: &ResolvedStaticInputs,
 ) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
+    build_static_artifacts_inner(descriptors, resolved, true)
+}
+
+/// Build the same validated artifacts in the private regeneration mode. Missing or stale checked
+/// evidence remains output to replace; every SQL, type, option, and artifact invariant still runs.
+pub(crate) fn build_static_artifacts_for_regeneration(
+    descriptors: &[StaticDescriptor],
+    resolved: &ResolvedStaticInputs,
+) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
+    build_static_artifacts_inner(descriptors, resolved, false)
+}
+
+fn install_regeneration_placeholders(artifact: &mut StaticArtifact) {
+    const ZERO_ID: &str = "00000000000000000000000000000000";
+    let zero = Hash128 { lo: 0, hi: 0 };
+    match artifact {
+        StaticArtifact::Query(query) => {
+            for entry in &mut query.driver_entries {
+                if entry.checked_metadata.policy != CheckPolicy::CheckedRequired {
+                    continue;
+                }
+                entry.checked_metadata = CheckedMetadata {
+                    policy: CheckPolicy::CheckedRequired,
+                    state: VerificationState::DatabaseChecked,
+                    metadata_format_version: Some(1),
+                    metadata_digest: Some(zero),
+                    query_evidence: Some(CheckedQueryEvidence {
+                        prepare_identity: ZERO_ID.to_string(),
+                        schema_identity: ZERO_ID.to_string(),
+                        server_identity: ZERO_ID.to_string(),
+                        parameters: query.query_meta_plan.parameters.iter().map(|parameter| {
+                            CheckedParameterMeta {
+                                ordinal: parameter.ordinal,
+                                native_type: None,
+                                native_type_id: None,
+                            }
+                        }).collect(),
+                        columns: query.query_meta_plan.columns.iter().map(|column| {
+                            CheckedColumnMeta {
+                                ordinal: column.ordinal,
+                                native_type: None,
+                                native_type_id: None,
+                                origin_schema: None,
+                                origin_table: None,
+                                origin_column: None,
+                                nullable: MetaNullability::Unknown,
+                            }
+                        }).collect(),
+                    }),
+                };
+            }
+        }
+        StaticArtifact::Command(command) => {
+            for entry in &mut command.driver_entries {
+                if entry.checked_metadata.policy == CheckPolicy::CheckedRequired {
+                    entry.checked_metadata = CheckedMetadata {
+                        policy: CheckPolicy::CheckedRequired,
+                        state: VerificationState::DatabaseChecked,
+                        metadata_format_version: Some(1),
+                        metadata_digest: Some(zero),
+                        query_evidence: None,
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn build_static_artifacts_inner(
+    descriptors: &[StaticDescriptor],
+    resolved: &ResolvedStaticInputs,
+    apply_metadata: bool,
+) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
     let inputs = resolved
         .inputs
         .iter()
@@ -973,7 +1052,14 @@ pub fn build_static_artifacts(
                 })
             }
         };
-        apply_checked_metadata(descriptor, input, &mut artifact, scan.statement_class)?;
+        if apply_metadata {
+            apply_checked_metadata(descriptor, input, &mut artifact, scan.statement_class)?;
+        } else {
+            // Required+Declared is invalid in the normal codec. These private placeholders let the
+            // codec validate the rest of the artifact before native regeneration; they are never
+            // published, cached, installed in MIR, or consulted by the metadata writer.
+            install_regeneration_placeholders(&mut artifact);
+        }
         let bytes = match &artifact {
             StaticArtifact::Query(query) => align_interface::encode_static_query(query),
             StaticArtifact::Command(command) => align_interface::encode_static_command(command),

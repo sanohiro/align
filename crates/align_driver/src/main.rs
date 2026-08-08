@@ -13,6 +13,7 @@
 //!   alignc run       <file>   Build, run, and return its exit code
 //!   alignc size      <file>   Build then report the executable's size breakdown
 //!   alignc cache clear        Remove the resolved codegen cache
+//!   alignc db prepare <file>  Regenerate checked database metadata
 //!
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
 //! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
@@ -24,6 +25,7 @@
 //! item 1).
 
 use std::path::{Path, PathBuf};
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,6 +39,20 @@ use align_span::SourceMap;
 mod size;
 
 fn main() -> ExitCode {
+    let raw_os = std::env::args_os().collect::<Vec<_>>();
+    if raw_os.get(1).is_some_and(|value| value == "db") {
+        return match raw_os.get(2).and_then(|value| value.to_str()) {
+            Some("prepare") => run_db_prepare(&raw_os[3..]),
+            Some(other) => {
+                eprintln!("alignc: unknown `db` subcommand `{other}` (expected: prepare)");
+                ExitCode::FAILURE
+            }
+            None => {
+                eprintln!("alignc: `db` requires the UTF-8 subcommand `prepare`");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let raw: Vec<String> = std::env::args().collect();
     // Package-manager smoke tests and bug reports need a cheap, source-free way to identify the
     // compiler. Keep this before flag parsing: `--version` is a complete invocation, not a build
@@ -540,6 +556,286 @@ fn parse_profile(args: &[String]) -> Result<(Profile, Vec<String>), String> {
     Ok((profile, rest))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbPrepareDriver {
+    Sqlite,
+    Postgres,
+}
+
+struct DbPrepareOptions {
+    entry: String,
+    driver: DbPrepareDriver,
+    queries: Vec<String>,
+    check_only: bool,
+    database: Option<String>,
+    schema_id: Option<String>,
+    memory: bool,
+    migrations: Option<String>,
+    url_env: Option<String>,
+}
+
+fn db_text(value: &OsString, what: &str) -> Result<String, String> {
+    let value = value.to_str().ok_or_else(|| format!("{what} must be UTF-8"))?;
+    if value.is_empty() || value.as_bytes().contains(&0) {
+        return Err(format!("{what} must be non-empty and contain no U+0000"));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_db_prepare(args: &[OsString]) -> Result<DbPrepareOptions, String> {
+    let entry = args
+        .first()
+        .ok_or_else(|| "`db prepare` requires an entry .align path".to_string())
+        .and_then(|value| db_text(value, "entry path"))?;
+    if entry.starts_with("--") {
+        return Err("`db prepare` requires the entry path before options".to_string());
+    }
+    let mut driver = None;
+    let mut queries = Vec::new();
+    let mut check_only = false;
+    let mut database = None;
+    let mut schema_id = None;
+    let mut memory = false;
+    let mut migrations = None;
+    let mut url_env = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        let flag = args
+            .get(index)
+            .ok_or_else(|| "db prepare option index is out of range".to_string())
+            .and_then(|value| db_text(value, "option name"))?;
+        index += 1;
+        if flag == "--check" {
+            if check_only {
+                return Err("duplicate --check".to_string());
+            }
+            check_only = true;
+            continue;
+        }
+        if flag == "--memory" {
+            if memory {
+                return Err("duplicate --memory".to_string());
+            }
+            memory = true;
+            continue;
+        }
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("{flag} requires a value"))
+            .and_then(|value| db_text(value, &format!("{flag} value")))?;
+        if value.starts_with("--") {
+            return Err(format!("{flag} requires a value"));
+        }
+        index += 1;
+        match flag.as_str() {
+            "--driver" => {
+                if driver.is_some() {
+                    return Err("duplicate --driver".to_string());
+                }
+                driver = Some(match value.as_str() {
+                    "sqlite" => DbPrepareDriver::Sqlite,
+                    "postgres" => DbPrepareDriver::Postgres,
+                    _ => return Err("--driver must be `sqlite` or `postgres`".to_string()),
+                });
+            }
+            "--query" => {
+                if queries.iter().any(|query| query == &value) {
+                    return Err(format!("duplicate --query descriptor `{value}`"));
+                }
+                queries.push(value);
+            }
+            "--database" if database.is_none() => database = Some(value),
+            "--schema-id" if schema_id.is_none() => schema_id = Some(value),
+            "--migrations" if migrations.is_none() => migrations = Some(value),
+            "--url-env" if url_env.is_none() => url_env = Some(value),
+            "--database" | "--schema-id" | "--migrations" | "--url-env" => {
+                return Err(format!("duplicate {flag}"));
+            }
+            _ => return Err(format!("unknown `db prepare` option `{flag}`")),
+        }
+    }
+    let driver = driver.ok_or_else(|| "`db prepare` requires --driver sqlite|postgres".to_string())?;
+    match driver {
+        DbPrepareDriver::Sqlite => {
+            let database_form = database.is_some() && schema_id.is_some() && !memory && migrations.is_none();
+            let memory_form = memory && database.is_none() && schema_id.is_none();
+            if !database_form && !memory_form {
+                return Err(
+                    "SQLite requires exactly `--database PATH --schema-id ID` or `--memory [--migrations DIR]`"
+                        .to_string(),
+                );
+            }
+            if url_env.is_some() {
+                return Err("--url-env is valid only for PostgreSQL".to_string());
+            }
+        }
+        DbPrepareDriver::Postgres => {
+            if url_env.is_none() || schema_id.is_none() {
+                return Err("PostgreSQL requires `--url-env NAME --schema-id ID`".to_string());
+            }
+            if url_env.as_deref().is_some_and(|name| name.starts_with("PG")) {
+                return Err("PostgreSQL --url-env must not begin with `PG`".to_string());
+            }
+            if database.is_some() || memory || migrations.is_some() {
+                return Err("--database, --memory, and --migrations are valid only for SQLite".to_string());
+            }
+        }
+    }
+    Ok(DbPrepareOptions {
+        entry,
+        driver,
+        queries,
+        check_only,
+        database,
+        schema_id,
+        memory,
+        migrations,
+        url_env,
+    })
+}
+
+fn run_db_prepare(args: &[OsString]) -> ExitCode {
+    use align_driver::db_prepare::{
+        build_metadata_batch, publish_metadata_batch, read_migration_catalog,
+        sqlite_database_schema_fingerprint, sqlite_memory_schema_fingerprint,
+    };
+    use align_driver::db_prepare_native::{PostgresDescriber, SqliteDescriber};
+
+    let options = match parse_db_prepare(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry = PathBuf::from(&options.entry);
+    let source = match std::fs::read_to_string(&entry) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("alignc: cannot read `{}`: {error}", entry.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, &entry.display().to_string(), &source);
+    if checked.diags.has_errors() {
+        eprint!("{}", format_diagnostics(&source_map, &checked.diags));
+        return ExitCode::FAILURE;
+    }
+
+    let result = match options.driver {
+        DbPrepareDriver::Sqlite => {
+            let mut describer = if let Some(database) = &options.database {
+                let Some(schema_id) = options.schema_id.as_deref() else {
+                    eprintln!("alignc: SQLite database preparation lost its validated --schema-id");
+                    return ExitCode::FAILURE;
+                };
+                let fingerprint = match sqlite_database_schema_fingerprint(schema_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("alignc: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                SqliteDescriber::database(Path::new(database), fingerprint)
+            } else if let Some(directory) = &options.migrations {
+                let catalog = match read_migration_catalog(Path::new(directory)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("alignc: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                SqliteDescriber::memory_with_migrations(catalog)
+            } else {
+                SqliteDescriber::memory(sqlite_memory_schema_fingerprint(None))
+            };
+            build_metadata_batch(
+                &mut source_map,
+                &entry,
+                &checked,
+                &options.queries,
+                &mut describer,
+            )
+            .map(|batch| (batch, if options.memory { "memory" } else { "database" }))
+        }
+        DbPrepareDriver::Postgres => {
+            let Some(environment_name) = options.url_env.as_deref() else {
+                eprintln!("alignc: PostgreSQL preparation lost its validated --url-env");
+                return ExitCode::FAILURE;
+            };
+            let url = match std::env::var(environment_name) {
+                Ok(value) if !value.is_empty() && !value.as_bytes().contains(&0) => value,
+                Ok(_) => {
+                    eprintln!("alignc: environment variable `{environment_name}` is empty");
+                    return ExitCode::FAILURE;
+                }
+                Err(std::env::VarError::NotPresent) => {
+                    eprintln!("alignc: environment variable `{environment_name}` is not set");
+                    return ExitCode::FAILURE;
+                }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    eprintln!("alignc: environment variable `{environment_name}` is not UTF-8");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Some(schema_id) = options.schema_id.clone() else {
+                eprintln!("alignc: PostgreSQL preparation lost its validated --schema-id");
+                return ExitCode::FAILURE;
+            };
+            let mut describer = PostgresDescriber::new(url, schema_id);
+            build_metadata_batch(
+                &mut source_map,
+                &entry,
+                &checked,
+                &options.queries,
+                &mut describer,
+            )
+            .map(|batch| (batch, "postgres"))
+        }
+    };
+    let (batch, source_kind) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "driver={} schema_source={} schema_identity={} engine_version={} driver_version={} queries={}",
+        match batch.driver {
+            align_driver::Driver::SQLite => "sqlite",
+            align_driver::Driver::PostgreSQL => "postgres",
+        },
+        source_kind,
+        batch.environment.schema_fingerprint.to_hex(),
+        batch.environment.engine_version,
+        batch.environment.driver_version,
+        batch.files.len(),
+    );
+    if batch.driver == align_driver::Driver::PostgreSQL {
+        println!("search_path={}", batch.environment.search_path.join(","));
+        for extension in &batch.environment.extensions {
+            println!(
+                "extension={}.{}@{}",
+                extension.schema,
+                extension.name,
+                extension.version.as_deref().unwrap_or("<none>")
+            );
+        }
+    }
+    match publish_metadata_batch(&batch, options.check_only) {
+        Ok(report) => {
+            println!("selected={} changed={}", report.selected, report.changed);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn usage() {
     eprintln!(
         "usage: alignc <command> <file.align> [--target-cpu baseline|native]\n  \
@@ -558,6 +854,7 @@ fn usage() {
            run        build and run (returns the exit code)\n  \
            size       build then report the executable's size breakdown\n  \
            cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
+           db prepare regenerate checked SQLite/PostgreSQL metadata\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \

@@ -1170,15 +1170,30 @@ catalogをtool action内で列挙する。`--query` は対象をさらに絞る�
 modeだけがmissing/stale artifactを許し、`--check` は何も書かない。normal buildは
 environmentを読まずDBへ接続しない。mutableなSQLite DB fileとPostgreSQL targetは
 non-empty/non-secret UTF-8かつU+0000なしの `--schema-id` を必須にする。
+PostgreSQL URLはnon-empty user/password、exactly one host、nonzero port、exactly one
+databaseを明示する。target override、service expansion、`client_encoding`、startup
+`options`を拒否し、toolが`PQconnectdbParams`でpackage-owned UTF-8とempty startup-option
+sequenceを渡すため、ambient `PG*` defaultがtarget/encoding/SQL settingを選ばない。
 `--memory [--migrations]` は§16.6からidentityをderiveして `--schema-id` を禁止する。
+1 preparation batchは1 schema snapshotだけを観測する。SQLiteはmigration transaction後に
+read transactionを開始して`sqlite_schema`を読み、PostgreSQLはenvironment capture前に
+read-only repeatable-read transactionを開始する。全selected prepare/describeまで保持し、
+preparation connectionと一緒にcloseする。
 
 ### 16.3 metadata location
 
 ```text
 .align-db/
+  .publication.lock
   sqlite/<descriptor-id-hash>.json
   postgres/<descriptor-id-hash>.json
 ```
+
+`.publication.lock` はemptyなimplementation-owned cross-process lockで、build inputでも
+artifact identityでもない。normal compilationはchecked metadata snapshot全体でshared OS
+lockを保持し、preparationはcomparison、staging、replacement、rollback全体でexclusive
+lockを保持する。最初のpublication後もfileを残すため、process exitだけでsynchronizationが
+解放され、stale-lock recoveryを必要としない。
 
 `descriptor-id-hash` はQueryのquery_idまたはcommand_idである`descriptor_id` exact bytesの
 `Hash128::of(...).to_hex()`。directoryはexactに
@@ -2178,6 +2193,66 @@ breadthは含めない。このpathが最初にlandする時または変わる�
 measurementでdirect libsqlite3 loopと比較する。
 
 ### D3 — checked metadata core + SQLite
+
+#### Q3/D3+D5 implementation closure matrix
+
+Q3は1つのchecked/offline capabilityである。regeneration command、canonical metadata
+codec、SQLite/PostgreSQL describer、normal-build consumerを一緒にlandする。片方のdriverを
+分割するとshared path/identity/stale/diagnostic contractがportability peerなしで決まり、
+writerとconsumerを分割すると安全に消費できないmetadataを公開する。このcapabilityは
+1,000 hand-written linesを超える見込みだが、tool/native/codec/compiler境界をdriver別に
+重複証明するより1回で閉じる方がintegration riskは低い。
+
+既存v1 JSONと `ALIGNMIG`/`ALIGNSID`/`ALIGNSRV`/`ALIGNPRP` streamはexact public contractの
+ままである。DBを開き明示migration directoryを列挙できるのは `alignc db prepare` だけで、
+normal check/buildはderived metadata pathだけを読む。
+
+| closure cell | required implementation closure | exact owner evidence |
+|---|---|---|
+| command/input grammar | §16.2のexact command、repeatable `--query`、`--check`、driver別environment formを実装し、invalid/duplicate/cross-driver inputをcompile/native work前に拒否する。 | `pkg_db_q3::prepare_cli_input_and_precedence_matrix` |
+| regeneration/selection | reachable graphだけをregeneration modeでcompileし、descriptorをUTF-8 ID順にselectする。unknown/duplicate/excluded driver/path hash collisionはDB open前に拒否する。 | `pkg_db_q3::regeneration_ignores_missing_required_metadata_and_is_deterministic` と `pkg_db_q3::selection_rejects_unknown_and_duplicate_ids_before_native_open` |
+| canonical codec | §16.3のone-line-LF JSONをproduction reader/writerと独立goldenで固定し、malformed/noncanonical inputはpanic/partial publicationなしで拒否する。 | `pkg_db_q3::checked_metadata_sqlite_query_and_postgres_command_goldens` とstatic-input malformed matrix |
+| schema/server identity | exact `ALIGNMIG`/`ALIGNSID` とderived identityを実装し、migrationの全validationを最初のSQLite apply前に終える。 | `pkg_db_q3::schema_identity_goldens_match_an_independent_encoder` とmigration owners |
+| SQLite describe | explicit targetだけをopenし、validated migrationをtransactionally applyし、descriptorごとの全`RequireVersionAtLeast`をlinked SQLite componentsとstatement preparation前に比較してから、exact wire SQLのcount/name/type/originを記録する。nullabilityはowned query-level evidenceがなければ`Unknown`。 | `pkg_db_q3::sqlite_native_prepare_describes_the_selected_query`、`pkg_db_q3::sqlite_prepare_enforces_static_version_options` と `pkg_db_q3::migration_catalog_validates_before_sqlite_open_and_applies_atomically` |
+| PostgreSQL describe | library load前に全ambient `PG*`を拒否し、selected non-`PG*` env valueだけでUTF-8 connectionを開く。supported `ParameterType`は対応する`i64`または`Option<i64>` fieldだけをbinding protocol ordinalごとのexact `PQprepare` OID vectorへ写し、collision-free nameでprepare/describeしてOID/name/origin/search path/extensions/versionを記録する。unsupported mappingはstatement preparation前に失敗する。zero-column Queryはempty Rowと一致し、native result columnを持つcommandだけを拒否する。prepared state/result/connectionを全pathでexactly once cleanupする。 | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load`、`pkg_db_q3::prepare_rejects_unsupported_static_options_before_native_work`、`pkg_db_q3::postgres_native_prepare_describes_the_selected_query` とrequired PostgreSQL CI |
+| publication/offline consumption | 全canonical recordをmemory形成してからsame-directory staging/atomic replacementを行う。`--check`は同じnative workを行うがwriteしない。1つのshared publication guardをwhole-programまたはmulti-unit build全体で保持してgeneration混在を禁止する。normal buildはcurrent evidenceだけを`DatabaseChecked`へ昇格しDB/network/env/directory scanを行わない。 | `pkg_db_q3::schema_identities_and_publication_are_exact_and_check_is_read_only`、`pkg_db_q3::generated_metadata_is_consumed_offline_and_stale_required_evidence_fails` とpublication lock owner |
+
+Q3のchecked-in native evidence matrixは次である。
+
+| Driver | required environment | owned observation | fail-closed rule | owner |
+|---|---|---|---|---|
+| SQLite | macOS arm64 Homebrew SQLite 3.53.3、Ubuntu CI system SQLite ABI 3 | prepare tail、parameter/result order/name、declaration/origin API、migration transaction、runtime library version | expression declaration/query nullabilityが得られなければ`null`/`Unknown`を記録しruntime storage/NULL validationを残す | SQLite native/migration owner tests |
+| PostgreSQL | required CI PostgreSQL 16.4 + libpq ABI 5。client versionはCIで表示 | UTF-8 connection、parameter/result OID/name、table/attribute origin、search path、extension、server/client version | §10.3のclosed OID mappingだけを受理し、catalog `NOT NULL`からresult nullabilityを`Unknown`より強くしない | PostgreSQL native owner test |
+
+macOSのPostgreSQL testはserver URL未設定なら理由付きskipできる。required `db-postgres` CIは
+`ALIGN_DB_POSTGRES_REQUIRED=1` とPostgreSQL 16.4を使い、未設定/接続不能をfailureにする。
+
+最初のfull-diff reviewで、deterministic stateに関する3つのgapについてQ3 matrixを再度
+開いた。finding-to-fix closureは次である。
+
+| finding | root-cause closure | owner evidence |
+|---|---|---|
+| ambient libpq default | library load前にuser/password/single host/port/databaseを明示したcomplete URLを要求し、target/startup overrideを拒否する。`PQconnectdbParams`でpackage-owned `client_encoding=UTF8`とempty startup-option sequenceを最後に渡す。 | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load` とrequired PostgreSQL CI |
+| statement間のschema drift | SQLiteは`sqlite_schema`を読む1つのread transaction、PostgreSQLは1つのread-only repeatable-read transactionを開始する。environment captureから全selected describeまで維持し、connection Dropで解放する。 | SQLite native/migration owners と `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` |
+| filesystem generationの混在 | 永続するimplementation-owned `.align-db/.publication.lock` はbuild inputではない。normal readerはmetadata snapshot全体でshared OS lockを保持し、publicationはcomparison/staging/replacement/rollback全体でexclusive lockを保持する。最初のlock fileより前に開始したreaderはresolution中にfileが現れたら拒否する。process exitはlockを自動解放する。 | `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races`、`pkg_db_q3::schema_identities_and_publication_are_exact_and_check_is_read_only` とoffline whole/per-unit consumption |
+
+required second full-diff reviewは、最初のconnection closureがURL keyを列挙した一方で
+libpq独自のenvironment lookupを閉じておらず、regenerationがnative static optionをhashへ
+含めても適用していないことを検出した。個別keywordの追加ではなく境界を次のように再設計する。
+
+| finding | root-cause closure | owner evidence |
+|---|---|---|
+| ambient libpq target selector | `PG`で始まる`--url-env`名を拒否し、library load前に全ambient `PG*` variableの存在を拒否する。process-global environmentを変更せず、`PGHOSTADDR`、`PGTARGETSESSIONATTRS`、`PGLOADBALANCEHOSTS`と将来のlibpq追加を一括して閉じる。complete URL、package UTF-8、empty startup-option ruleは引き続き必須である。 | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load` とrequired PostgreSQL CI |
+| prepare/runtime static-option drift | regenerationでQ3 native-option set全体を適用する。SQLiteはstatement preparation前に全要求version tupleを比較する。PostgreSQLはprotocol ordinalごとにsupported `int8`だけをOID 20へ写してdense vectorを`PQprepare`へ渡し、unsupported mappingはstatement preparation前に失敗する。 | `pkg_db_q3::sqlite_prepare_enforces_static_version_options`、`pkg_db_q3::postgres_native_prepare_describes_the_selected_query` とrequired PostgreSQL CI |
+| per-unit snapshot scope | 最初のstatic producerからper-unit walk全体の終了までouter shared publication guardを保持し、legacy absent-file guardは最後のunit後にvalidateする。unit内resolutionのsnapshot checkも維持し、producer unit間へpublicationが割り込んでgenerationを混在させることを禁止する。 | `pkg_db_q3::generated_metadata_is_consumed_offline_and_stale_required_evidence_fails` と `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races` |
+
+required redesign re-reviewは2つのlocal closure errorを検出した。strategyを変えずexact ownerで
+次のように閉じる。
+
+| finding | root-cause closure | owner evidence |
+|---|---|---|
+| logical pairを確認せずnative typeを受理 | native work前にnamed Params fieldをresolveし、Q2 `int8` mappingは`i64`または`Option<i64>`だけを受理する。同じvalidationがconnection/environment captureとOID-vector constructionの両方より先にある。 | `pkg_db_q3::prepare_rejects_unsupported_static_options_before_native_work` |
+| zero-column Queryをcommandと分類 | Query/commandはnative column vectorのempty/nonemptyではなくartifact discriminatorで決める。両describerはempty Rowに対するzero columnsを受理し、native result columnを持つcommandだけを拒否する。 | `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` のPostgreSQL zero-column caseとexact result-count validation |
 
 `.align-db/sqlite` exact derived path/canonical fail-closed JSONとindependent byte/digest golden、
 `alignc db prepare`/`--check`、producer-owned checked QueryMeta evidence、explicit

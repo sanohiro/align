@@ -20,6 +20,8 @@ pub use align_sema::{
 };
 
 pub mod cache;
+pub mod db_prepare;
+pub mod db_prepare_native;
 pub mod explain;
 pub mod static_artifacts;
 pub mod static_inputs;
@@ -39,6 +41,7 @@ pub use static_inputs::{
     StaticInputError, StaticInputManifest, STATIC_INPUT_MANIFEST_FORMAT_VERSION,
     STATIC_INPUT_MANIFEST_MAGIC,
 };
+use static_inputs::lock_metadata_publication_shared;
 pub use static_runtime::{
     FakeBoundValue, FakeCardinality, FakeDecodedField, FakeExecution, FakeExecutionError,
     FakeStatementKind, FakeValue, GeneratedBindField, GeneratedBindThunk, GeneratedCommandRuntime,
@@ -1163,6 +1166,20 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags);
+    let lexical_project_root = std::path::Path::new(name)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // Preserve the entry path's lexical spelling (`/var` versus macOS's canonical `/private/var`,
+    // and in-root source symlinks) while making a relative CLI root absolute. Static-input
+    // resolution canonicalizes separately for containment checks.
+    let project_root = if lexical_project_root.is_absolute() {
+        lexical_project_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(lexical_project_root))
+            .unwrap_or_else(|_| lexical_project_root.to_path_buf())
+    };
 
     let by_path: HashMap<&str, &LoadedUnit> = loaded.iter().map(|l| (l.path.as_str(), l)).collect();
     // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
@@ -1248,6 +1265,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     // imports it. Without this, the bottom-up walk below would re-render and re-parse every
     // transitive dependency's summary once per importer — O(N^2) in the DAG's fan-in.
     let mut interface_ast_cache: HashMap<String, align_ast::File> = HashMap::new();
+    let mut publication_lock = None;
+    let mut publication_lock_attempted = false;
+    let mut publication_lock_span = None;
 
     for unit_path in &order {
         let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
@@ -1389,22 +1409,23 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                         continue;
                     }
                 }
-
-                let lexical_project_root = std::path::Path::new(name)
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                // Preserve the entry path's lexical spelling (`/var` versus macOS's canonical
-                // `/private/var`, and in-root source symlinks) while making a relative CLI root
-                // absolute so the resolver never prefixes it to an already-rooted SourceMap name.
-                // The static-input boundary canonicalizes separately for containment checks.
-                let project_root = if lexical_project_root.is_absolute() {
-                    lexical_project_root.to_path_buf()
-                } else {
-                    std::env::current_dir()
-                        .map(|current| current.join(lexical_project_root))
-                        .unwrap_or_else(|_| lexical_project_root.to_path_buf())
-                };
+                if !static_descriptors.is_empty() && !publication_lock_attempted {
+                    publication_lock_attempted = true;
+                    publication_lock_span = static_descriptors
+                        .first()
+                        .map(|descriptor| descriptor.constructor_span);
+                    match lock_metadata_publication_shared(&project_root) {
+                        Ok(lock) => publication_lock = Some(lock),
+                        Err(error) => {
+                            diags.error(
+                                error.to_string(),
+                                publication_lock_span
+                                    .unwrap_or_else(|| align_span::Span::new(0, 0, 0)),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let resolved = match resolve_static_descriptors(
                     &project_root,
                     source_map,
@@ -1482,6 +1503,15 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 );
             }
         }
+    }
+
+    if let Some(lock) = &publication_lock
+        && let Err(error) = lock.validate()
+    {
+        diags.error(
+            error.to_string(),
+            publication_lock_span.unwrap_or_else(|| align_span::Span::new(0, 0, 0)),
+        );
     }
 
     // Assemble one artifact per cleanly-checked unit, in bottom-up (dependency-first) order. A unit

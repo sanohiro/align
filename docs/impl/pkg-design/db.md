@@ -2076,7 +2076,12 @@ a compiler manifest and is not required by the first implementation.
 SQLite accepts exactly one schema environment: `--database <path> --schema-id <id>`, or `--memory`
 optionally initialized from the canonical migration sequence in `--migrations <dir>` (§16.6).
 PostgreSQL accepts `--url-env <name> --schema-id <id>`; the environment variable's value is read only
-by this explicit command. `schema-id` is a non-empty, non-secret UTF-8 release/schema identity chosen
+by this explicit command. Its URL must explicitly contain a non-empty user and password, exactly one
+host, a nonzero port, and exactly one database. Target overrides, service expansion,
+`client_encoding`, and startup `options` are rejected; the tool appends package-owned UTF-8 through
+`PQconnectdbParams` and supplies an explicit empty startup-option sequence, so libpq cannot select a
+target, encoding, or SQL setting from ambient `PG*` defaults.
+`schema-id` is a non-empty, non-secret UTF-8 release/schema identity chosen
 by the caller and must contain no U+0000. It is required for a mutable database target because
 normal offline builds cannot rediscover that target's schema. The migration-backed memory form
 derives its identity and forbids `--schema-id`. Direct URL flags may exist for local use but must be
@@ -2095,6 +2100,11 @@ This is the only workflow allowed to contact a database. It:
 7. writes deterministic repository metadata;
 8. supports `--check`, which fails when regeneration would change repository metadata.
 
+One preparation batch observes one schema snapshot. SQLite begins a read transaction and touches
+`sqlite_schema` after any migration transaction; PostgreSQL begins a read-only repeatable-read
+transaction before capturing environment state. The snapshot remains open through every selected
+prepare/describe and closes with the preparation connection.
+
 Preparation compiles the reachable units in an explicit regeneration mode that still enforces every
 language/Query contract but temporarily treats missing/stale checked metadata as the artifact to
 regenerate. A normal `build`/`check` never enters that mode. `--check` performs the same describe
@@ -2110,11 +2120,18 @@ For each descriptor/driver pair, the path is exact:
 
 ```text
 .align-db/
+  .publication.lock
   sqlite/
     <descriptor-id-hash>.json
   postgres/
     <descriptor-id-hash>.json
 ```
+
+`.publication.lock` is an empty implementation-owned cross-process lock, not a build input or an
+artifact identity. Normal compilation holds a shared OS lock across its complete checked-metadata
+snapshot; preparation holds the exclusive lock across comparison, staging, replacement, and
+rollback. The file remains after first publication so a process exit releases synchronization
+without stale-lock recovery.
 
 `descriptor-id-hash` is `Hash128::of(descriptor_id.as_bytes()).to_hex()`. `descriptor_id` is the
 Query's `query_id` or command's `command_id`. The driver directory is exactly
@@ -3558,6 +3575,77 @@ catalogs, or later native breadth. A named local measurement compares prepared b
 decode with an equivalent direct libsqlite3 loop when this path first lands or changes.
 
 ### D3 — checked Query metadata core + SQLite
+
+#### Q3/D3+D5 implementation closure matrix
+
+Q3 is one checked/offline capability. The regeneration command, canonical metadata codec,
+SQLite and PostgreSQL describers, and normal-build consumer land together. Splitting either driver
+would let the first environment define shared path, identity, stale-state, and diagnostic behavior
+without its portability peer; splitting the writer from normal compilation would publish metadata
+that no checked descriptor can safely consume. The capability is expected to exceed roughly 1,000
+hand-written lines because it closes one tool/native/codec/compiler boundary once instead of
+duplicating its proof across driver-only and producer-only PRs.
+
+The existing v1 JSON record and `ALIGNMIG`/`ALIGNSID`/`ALIGNSRV`/`ALIGNPRP` streams remain the exact
+public contract. Preparation adds no ambient build input: only `alignc db prepare` may open a
+database or enumerate the explicitly named migration directory, while normal `check`/`build`
+continue to read only the exact derived metadata paths already recorded in the static-input
+manifest.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| command and input grammar | Implement exactly `alignc db prepare ENTRY --driver sqlite|postgres`, repeatable `--query`, `--check`, and the driver-specific environment forms from §16.2. Reject missing, duplicate, cross-driver, unknown, empty, NUL-bearing, and non-UTF-8 inputs before compilation or native work. SQLite accepts exactly database+schema-id or memory with optional migrations; PostgreSQL accepts exactly url-env+schema-id and reads that one environment variable only after complete option validation. | `pkg_db_q3::prepare_cli_input_and_precedence_matrix` with native-open, environment-read, migration-enumeration, and write counters |
+| regeneration compile and selection | Compile only the entry-reachable graph in an explicit regeneration mode that enforces the normal descriptor/source/options/type contracts but treats missing/stale checked evidence as output to replace. Sort descriptors by exact UTF-8 ID; apply repeated `--query` as a closed set; reject unknown IDs, duplicate selectors, descriptors that exclude the selected driver, and hash collisions before opening the database. Query and command share the inventory and path rule. | `pkg_db_q3::regeneration_ignores_missing_required_metadata_and_is_deterministic` and `pkg_db_q3::selection_rejects_unknown_and_duplicate_ids_before_native_open` |
+| canonical metadata codec | Produce the exact one-line-LF §16.3 JSON bytes with independent SQLite-Query and PostgreSQL-command byte/digest goldens. Production writer, existing fail-closed reader, and a test-only independent encoder must agree for every Option state, escaping class, signed/native ID, dense ordinal, source identity, origin, and nullability tag. Re-encoding a decoded production record is byte-identical; malformed/noncanonical input is rejected without panic or partial publication. | `pkg_db_q3::checked_metadata_sqlite_query_and_postgres_command_goldens` and the static-input malformed codec matrix |
+| schema and server identities | Implement the exact `ALIGNMIG` catalog and `ALIGNSID` schema streams plus the derived `ALIGNSRV`/`ALIGNPRP` identities. Migration validation completes before the first SQLite apply and follows the exact immediate-entry/name/version/gap/symlink/UTF-8/NUL/order rules. Database SQLite uses only explicit schema-id; PostgreSQL binds explicit schema-id, reported search path, and canonically sorted extensions. | `pkg_db_q3::schema_identity_goldens_match_an_independent_encoder`, `pkg_db_q3::migration_catalog_validates_before_sqlite_open_and_applies_atomically`, and `pkg_db_q3::migration_catalog_rejects_invalid_names_and_symlinks` |
+| SQLite describe | Open only the explicit database or private in-memory target, apply a validated migration catalog transactionally when selected, enforce every `RequireVersionAtLeast` tuple against the linked SQLite components before preparing that descriptor, then prepare every chosen descriptor with its exact SQLite wire SQL. Require one statement/tail, dense parameter count/names, exact result count/names, and supported native declaration/storage mapping. Record only engine-reported origin; nullability remains `Unknown` unless an owned query-level API proves it. Finalize each statement and close the connection exactly once on success and every error. | `pkg_db_q3::sqlite_native_prepare_describes_the_selected_query`, `pkg_db_q3::sqlite_prepare_enforces_static_version_options`, and `pkg_db_q3::migration_catalog_validates_before_sqlite_open_and_applies_atomically` |
+| PostgreSQL describe | Reject every ambient `PG*` variable before libpq load, connect using only the selected non-`PG*` environment value, require an open UTF-8 connection, map each supported `ParameterType` only for its matching `i64` or `Option<i64>` field by binding protocol ordinal into the exact `PQprepare` OID vector, prepare/describe each exact `$n` wire statement under a collision-free generated native name, and record dense parameter/result OIDs, names, and reported table/attribute origins. Record server version, ordered search path, and sorted extensions; catalog `NOT NULL` never upgrades arbitrary Query nullability above `Unknown`. Unsupported static type mappings fail before statement preparation. Zero-column Query results match an empty Row; only commands reject native result columns. Deallocate prepared state and finish exactly once on every path. | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load`, `pkg_db_q3::prepare_rejects_unsupported_static_options_before_native_work`, `pkg_db_q3::postgres_native_prepare_describes_the_selected_query`, and required provisioned PostgreSQL CI |
+| comparison, publication, and failure atomicity | Form and validate every selected canonical record in memory before filesystem mutation. `--check` performs the same native work and exact byte comparison but never writes. Normal mode writes only changed records through same-directory temporary files and atomic replacement after the complete batch succeeds; no failed batch leaves a partial driver set. Existing unselected files are untouched. | `pkg_db_q3::schema_identities_and_publication_are_exact_and_check_is_read_only` plus the selection and native-failure owners above |
+| offline compiler consumption | A subsequent normal build promotes only exact current driver evidence to `DatabaseChecked`; Optional missing/stale stays Declared, Required fails per permitted driver, and `AnySupportedDriver` requires both files. One shared publication guard covers the complete whole-program or multi-unit build, so no build can combine metadata generations. SQL/options/Params/Row/schema edits invalidate the exact producer/cache identity. Checked native evidence never removes runtime name/type/NULL validation and normal builds perform zero environment, network, database, or directory-enumeration work. | `pkg_db_q3::generated_metadata_is_consumed_offline_and_stale_required_evidence_fails`, `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races`, and the cumulative Q1/Q2 runtime validation owners |
+
+The author-side matrix-to-diff pass must map every emitted JSON field to one artifact input or
+driver-owned observation, and every native handle/allocation to its success, early-error, and Drop
+cleanup edge. Q3 reopens this matrix if regeneration needs an ambient input, if a partial batch can
+publish, if either driver infers `No` nullability from catalog state, or if normal compilation can
+contact a database.
+
+Q3's checked-in native evidence matrix is:
+
+| Driver | Required environment | Owned observation | Fail-closed rule | Owner |
+|---|---|---|---|---|
+| SQLite | macOS arm64 Homebrew SQLite 3.53.3; Ubuntu CI system SQLite ABI 3 | prepare tail, parameter/result order and names, declaration/origin APIs, migration transaction, runtime library version | expression declarations and query nullability remain unavailable; record `null`/`Unknown` and retain runtime storage/NULL validation | `pkg_db_q3::sqlite_native_prepare_describes_the_selected_query`, `pkg_db_q3::migration_catalog_validates_before_sqlite_open_and_applies_atomically` |
+| PostgreSQL | required CI PostgreSQL 16.4 with libpq ABI 5; client version printed by CI | UTF-8 connection, prepared parameter/result OIDs and names, table/attribute origin, search path, extensions, server/client versions | only the closed §10.3 OID mapping is accepted; catalog `NOT NULL` never upgrades result nullability above `Unknown` | `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` |
+
+The macOS PostgreSQL test may skip with a reported reason when no server URL is configured. The
+required `db-postgres` CI job sets `ALIGN_DB_POSTGRES_REQUIRED=1`, provisions PostgreSQL 16.4, and
+turns that absence or an unreachable server into failure.
+
+The first full-diff review reopened the Q3 matrix for three deterministic-state gaps. Their closure
+is one finding-to-fix set:
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| ambient libpq defaults | Require one complete URL with explicit user, password, single host, port, and database before library load; reject target/startup overrides, append package-owned `client_encoding=UTF8`, and override `PGOPTIONS` with an empty startup-option sequence through `PQconnectdbParams`. | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load` and required PostgreSQL CI |
+| per-statement schema drift | SQLite establishes one read transaction by reading `sqlite_schema`; PostgreSQL establishes one read-only repeatable-read transaction. Each remains open across environment capture and every selected describe and is released by connection Drop. | SQLite native/migration owners and `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` |
+| mixed filesystem generations | The persistent implementation-owned `.align-db/.publication.lock` file is not a build input. Normal readers hold its shared OS lock across the complete metadata snapshot; publication holds the exclusive lock across comparison, staging, replacement, and rollback. A reader that predates the first lock file rejects if that file appears during resolution. Process exit releases either lock automatically. | `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races`, `pkg_db_q3::schema_identities_and_publication_are_exact_and_check_is_read_only`, and offline whole/per-unit consumption |
+
+The required second full-diff review found that the first connection closure enumerated URL keys but
+did not close libpq's independent environment lookup, and that regeneration hashed but did not apply
+native static options. This is a boundary redesign rather than another keyword patch:
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| ambient libpq target selectors | Reject a `--url-env` name beginning with `PG` and reject the presence of every ambient `PG*` variable before library load. This closes current selectors such as `PGHOSTADDR`, `PGTARGETSESSIONATTRS`, and `PGLOADBALANCEHOSTS` plus future libpq additions without mutating process-global environment state. The complete URL, package UTF-8, and empty startup-option rules remain required. | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load` and required PostgreSQL CI |
+| prepare/runtime static-option drift | Apply the complete Q3 native-option set during regeneration: SQLite compares every requested version tuple before statement preparation, while PostgreSQL maps only the supported `int8` contract to OID 20 by protocol ordinal and passes the dense vector to `PQprepare`; unsupported mappings fail before statement preparation. | `pkg_db_q3::sqlite_prepare_enforces_static_version_options`, `pkg_db_q3::postgres_native_prepare_describes_the_selected_query`, and required PostgreSQL CI |
+| per-unit snapshot scope | Retain one outer shared publication guard from the first static producer through the complete per-unit walk and validate a legacy absent-file guard after the last unit. Per-unit resolution keeps its inner snapshot check, but publication cannot interleave generations between producer units. | `pkg_db_q3::generated_metadata_is_consumed_offline_and_stale_required_evidence_fails` and `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races` |
+
+The required redesign re-review found two local closure errors. Both close against their exact owners
+without changing the strategy:
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| native type accepted without its logical pair | Resolve the named Params field before native work and accept the Q2 `int8` mapping only for `i64` or `Option<i64>`. The same validation precedes both connection/environment capture and OID-vector construction. | `pkg_db_q3::prepare_rejects_unsupported_static_options_before_native_work` |
+| zero-column Query classified as a command | Query versus command is the artifact discriminator, not whether the native column vector is empty. Both describers accept zero columns for an empty Row; only a command with native result columns is rejected. | PostgreSQL zero-column case in `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` and exact result-count validation |
 
 - canonical `.align-db/sqlite` artifact;
 - `alignc db prepare` and `--check`;

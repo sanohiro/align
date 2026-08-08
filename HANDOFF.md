@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-07._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-08._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -18,8 +18,12 @@ array construction without a hidden heap vector; and the library-boundary
 prerequisites are complete through L7. `pkg.db` Q1/D1 now provides typed static
 Query/command descriptors, exact versioned artifacts, producer-owned ordinal
 bind/decode/metadata plans, whole/per-unit cache identity, and fail-closed fake
-driver execution. Q1 owns no native database resource. The next product wave is
-Q2, one scalar execution vertical across SQLite and PostgreSQL (D2 + D4).
+driver execution. Q1 owns no native database resource. Q2 now closes scalar
+execution across SQLite and PostgreSQL (D2 + D4). Q3 now closes deterministic
+checked-metadata regeneration and offline consumption across both drivers
+(D3 + D5), including exact schema identities, fail-closed native description,
+atomic publication, and required PostgreSQL CI coverage. The next product work
+may proceed independently along the Q4a runtime and Q5 schema-tooling paths.
 
 The completed prerequisite waves and current product boundary are:
 
@@ -31,7 +35,10 @@ F-B region materialization      complete through L4 + L6
 F-C static artifacts             complete through L5
 F-D package integration          complete through L7
 Q1 static Query vertical         complete through D1
-next: Q2 dual-driver scalar      D2 + D4
+Q2 dual-driver scalar parity     complete through D2 + D4
+Q3 checked/offline parity        complete through D3 + D5
+next: Q4a reusable execution     D6 + D7
+next: Q5 schema tooling          D11 || D12
 ```
 
 The exact cell contracts and owner matrices remain in
