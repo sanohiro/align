@@ -3559,6 +3559,39 @@ decode with an equivalent direct libsqlite3 loop when this path first lands or c
 
 ### D3 — checked Query metadata core + SQLite
 
+#### Q3/D3+D5 implementation closure matrix
+
+Q3 is one checked/offline capability. The regeneration command, canonical metadata codec,
+SQLite and PostgreSQL describers, and normal-build consumer land together. Splitting either driver
+would let the first environment define shared path, identity, stale-state, and diagnostic behavior
+without its portability peer; splitting the writer from normal compilation would publish metadata
+that no checked descriptor can safely consume. The capability is expected to exceed roughly 1,000
+hand-written lines because it closes one tool/native/codec/compiler boundary once instead of
+duplicating its proof across driver-only and producer-only PRs.
+
+The existing v1 JSON record and `ALIGNMIG`/`ALIGNSID`/`ALIGNSRV`/`ALIGNPRP` streams remain the exact
+public contract. Preparation adds no ambient build input: only `alignc db prepare` may open a
+database or enumerate the explicitly named migration directory, while normal `check`/`build`
+continue to read only the exact derived metadata paths already recorded in the static-input
+manifest.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| command and input grammar | Implement exactly `alignc db prepare ENTRY --driver sqlite|postgres`, repeatable `--query`, `--check`, and the driver-specific environment forms from §16.2. Reject missing, duplicate, cross-driver, unknown, empty, NUL-bearing, and non-UTF-8 inputs before compilation or native work. SQLite accepts exactly database+schema-id or memory with optional migrations; PostgreSQL accepts exactly url-env+schema-id and reads that one environment variable only after complete option validation. | `pkg_db_q3::prepare_cli_input_and_precedence_matrix` with native-open, environment-read, migration-enumeration, and write counters |
+| regeneration compile and selection | Compile only the entry-reachable graph in an explicit regeneration mode that enforces the normal descriptor/source/options/type contracts but treats missing/stale checked evidence as output to replace. Sort descriptors by exact UTF-8 ID; apply repeated `--query` as a closed set; reject unknown IDs, duplicate selectors, descriptors that exclude the selected driver, and hash collisions before opening the database. Query and command share the inventory and path rule. | `pkg_db_q3::regeneration_inventory_and_selection_matrix` in whole and per-unit-shaped graphs, including CheckedRequired with missing/stale input |
+| canonical metadata codec | Produce the exact one-line-LF §16.3 JSON bytes with independent SQLite-Query and PostgreSQL-command byte/digest goldens. Production writer, existing fail-closed reader, and a test-only independent encoder must agree for every Option state, escaping class, signed/native ID, dense ordinal, source identity, origin, and nullability tag. Re-encoding a decoded production record is byte-identical; malformed/noncanonical input is rejected without panic or partial publication. | `pkg_db_q3::checked_metadata_sqlite_query_golden`, `pkg_db_q3::checked_metadata_postgres_command_golden`, and the static-input malformed codec matrix |
+| schema and server identities | Implement the exact `ALIGNMIG` catalog and `ALIGNSID` schema streams plus the derived `ALIGNSRV`/`ALIGNPRP` identities. Migration validation completes before the first SQLite apply and follows the exact immediate-entry/name/version/gap/symlink/UTF-8/NUL/order rules. Database SQLite uses only explicit schema-id; PostgreSQL binds explicit schema-id, reported search path, and canonically sorted extensions. | `pkg_db_q3::migration_catalog_and_schema_identity_goldens` plus name/gap/symlink/multi-invalid no-apply owners and recreated-PostgreSQL-schema identity parity |
+| SQLite describe | Open only the explicit database or private in-memory target, apply a validated migration catalog transactionally when selected, then prepare every chosen descriptor with its exact SQLite wire SQL. Require one statement/tail, dense parameter count/names, exact result count/names, and supported native declaration/storage mapping. Record only engine-reported origin; nullability remains `Unknown` unless an owned query-level API proves it. Finalize each statement and close the connection exactly once on success and every error. | `pkg_db_q3::sqlite_prepare_query_command_and_evidence_matrix`, including base/expression/outer-join origins, unsupported/mismatch twins, migration rollback, and prepare/finalize/open/close counts |
+| PostgreSQL describe | Connect using only the selected environment value, require an open UTF-8 connection, prepare/describe each exact `$n` wire statement under a collision-free generated native name, and record dense parameter/result OIDs, names, and reported table/attribute origins. Record server version, ordered search path, and sorted extensions; catalog `NOT NULL` never upgrades arbitrary Query nullability above `Unknown`. Deallocate prepared state and finish exactly once on every path. | `pkg_db_q3::postgres_prepare_query_command_and_evidence_matrix`, required provisioned PostgreSQL integration, recreated-schema reproducibility, base/expression/outer-join evidence, and prepare/result/clear/finish counters |
+| comparison, publication, and failure atomicity | Form and validate every selected canonical record in memory before filesystem mutation. `--check` performs the same native work and exact byte comparison but never writes. Normal mode writes only changed records through same-directory temporary files and atomic replacement after the complete batch succeeds; no failed batch leaves a partial driver set. Existing unselected files are untouched. | `pkg_db_q3::prepare_check_and_atomic_publication_matrix` for missing/equal/stale, injected native/encode/write/rename failures, selected subsets, and unchanged-byte preservation |
+| offline compiler consumption | A subsequent normal build promotes only exact current driver evidence to `DatabaseChecked`; Optional missing/stale stays Declared, Required fails per permitted driver, and `AnySupportedDriver` requires both files. SQL/options/Params/Row/schema edits invalidate the exact producer/cache identity. Checked native evidence never removes runtime name/type/NULL validation and normal builds perform zero environment, network, database, or directory-enumeration work. | `pkg_db_q3::checked_policy_offline_whole_and_per_unit`, exact per-driver stale matrix, manifest/cache invalidation matrix, runtime mismatch/NULL owners, and no-I/O counters |
+
+The author-side matrix-to-diff pass must map every emitted JSON field to one artifact input or
+driver-owned observation, and every native handle/allocation to its success, early-error, and Drop
+cleanup edge. Q3 reopens this matrix if regeneration needs an ambient input, if a partial batch can
+publish, if either driver infers `No` nullability from catalog state, or if normal compilation can
+contact a database.
+
 - canonical `.align-db/sqlite` artifact;
 - `alignc db prepare` and `--check`;
 - exact derived path, canonical fail-closed JSON, independent byte/digest golden, and

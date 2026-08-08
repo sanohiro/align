@@ -313,6 +313,38 @@ pub fn resolve_static_descriptors(
     descriptors: &[StaticDescriptor],
     resolution_digest: Hash128,
 ) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
+    resolve_static_descriptors_inner(
+        project_root,
+        source_map,
+        descriptors,
+        resolution_digest,
+        true,
+    )
+}
+
+/// Resolve descriptor/source inputs without reading the metadata files being regenerated.
+pub(crate) fn resolve_static_descriptors_for_regeneration(
+    project_root: &Path,
+    source_map: &mut SourceMap,
+    descriptors: &[StaticDescriptor],
+    resolution_digest: Hash128,
+) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
+    resolve_static_descriptors_inner(
+        project_root,
+        source_map,
+        descriptors,
+        resolution_digest,
+        false,
+    )
+}
+
+fn resolve_static_descriptors_inner(
+    project_root: &Path,
+    source_map: &mut SourceMap,
+    descriptors: &[StaticDescriptor],
+    resolution_digest: Hash128,
+    load_checked_metadata: bool,
+) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
     let mut descriptor_ids = HashSet::with_capacity(descriptors.len());
     for descriptor in descriptors {
         if let Err(error) = validate_descriptor_id(&descriptor.descriptor_id) {
@@ -445,14 +477,46 @@ pub fn resolve_static_descriptors(
                 })
                 .collect();
         }
-        let metadata = permitted_drivers(restriction)
-            .iter()
-            .copied()
-            .map(|driver| snapshot_checked_metadata_record(project_root, &descriptor.descriptor_id, driver))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
-            })?;
+        let metadata = if load_checked_metadata {
+            permitted_drivers(restriction)
+                .iter()
+                .copied()
+                .map(|driver| {
+                    snapshot_checked_metadata_record(
+                        project_root,
+                        &descriptor.descriptor_id,
+                        driver,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    descriptor_input_error(
+                        descriptor,
+                        StaticDescriptorInputErrorCause::Input(error),
+                    )
+                })?
+        } else {
+            permitted_drivers(restriction)
+                .iter()
+                .copied()
+                .map(|driver| {
+                    Ok((
+                        CheckedMetadataInput {
+                            driver,
+                            logical_path: metadata_logical_path(&descriptor.descriptor_id, driver)?,
+                            state: MetadataState::Missing,
+                        },
+                        None,
+                    ))
+                })
+                .collect::<Result<Vec<_>, StaticInputError>>()
+                .map_err(|error| {
+                    descriptor_input_error(
+                        descriptor,
+                        StaticDescriptorInputErrorCause::Input(error),
+                    )
+                })?
+        };
         input.input.checked_metadata = metadata.iter().map(|(input, _)| input.clone()).collect();
         input.checked_metadata_records = metadata
             .into_iter()
@@ -943,23 +1007,29 @@ fn snapshot_checked_metadata_record(
         Ok(metadata) if metadata.is_file() => {
             let bytes = read_metadata_bytes(&root, &path, &logical)?;
             let record = parse_checked_metadata(&bytes, &logical, descriptor_id, driver)?;
-            Ok((CheckedMetadataInput {
-                driver,
-                logical_path: logical,
-                state: MetadataState::Present {
-                    content_hash: record.metadata_digest,
-                    format_version: record.format_version,
+            Ok((
+                CheckedMetadataInput {
+                    driver,
+                    logical_path: logical,
+                    state: MetadataState::Present {
+                        content_hash: record.metadata_digest,
+                        format_version: record.format_version,
+                    },
                 },
-            }, Some(record)))
+                Some(record),
+            ))
         }
         Ok(_) => Err(StaticInputError::NotRegularFile(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             ensure_metadata_parent_inside(&root, &path)?;
-            Ok((CheckedMetadataInput {
-                driver,
-                logical_path: logical,
-                state: MetadataState::Missing,
-            }, None))
+            Ok((
+                CheckedMetadataInput {
+                    driver,
+                    logical_path: logical,
+                    state: MetadataState::Missing,
+                },
+                None,
+            ))
         }
         Err(error) => Err(StaticInputError::Io {
             path,
@@ -996,6 +1066,262 @@ fn parse_checked_metadata(
         })?;
     record.metadata_digest = Hash128::of(bytes);
     Ok(record)
+}
+
+/// Encode one Q3 checked-metadata record using the exact canonical v1 JSON contract.
+///
+/// The writer deliberately emits fields directly in contract order instead of routing through a
+/// general JSON value/map. Before returning publishable bytes it feeds them through the production
+/// fail-closed reader and requires semantic equality, which catches non-dense ordinals, invalid
+/// driver/source combinations, unsorted extensions, and every other reader invariant before a
+/// temporary file is created.
+pub(crate) fn encode_checked_metadata(
+    descriptor_id: &str,
+    record: &ParsedCheckedMetadata,
+) -> Result<Vec<u8>, StaticInputError> {
+    fn string(output: &mut Vec<u8>, value: &str) -> Result<(), StaticInputError> {
+        if value.len() > MAX_FIELD_BYTES || value.as_bytes().contains(&0) {
+            return Err(StaticInputError::NonCanonical(
+                "checked metadata text is too large or contains U+0000".to_string(),
+            ));
+        }
+        output.push(b'"');
+        for character in value.chars() {
+            match character {
+                '"' => output.extend_from_slice(br#"\""#),
+                '\\' => output.extend_from_slice(br#"\\"#),
+                '\u{0008}' => output.extend_from_slice(br#"\b"#),
+                '\t' => output.extend_from_slice(br#"\t"#),
+                '\n' => output.extend_from_slice(br#"\n"#),
+                '\u{000c}' => output.extend_from_slice(br#"\f"#),
+                '\r' => output.extend_from_slice(br#"\r"#),
+                control if control <= '\u{001f}' => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let value = control as u32;
+                    output.extend_from_slice(br#"\u00"#);
+                    output.push(HEX[((value >> 4) & 0xf) as usize]);
+                    output.push(HEX[(value & 0xf) as usize]);
+                }
+                scalar => {
+                    let mut encoded = [0u8; 4];
+                    output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+                }
+            }
+        }
+        output.push(b'"');
+        Ok(())
+    }
+
+    fn field(output: &mut Vec<u8>, first: bool, name: &str) {
+        if !first {
+            output.push(b',');
+        }
+        output.push(b'"');
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b"\":");
+    }
+
+    fn hash(output: &mut Vec<u8>, value: Hash128) {
+        output.push(b'"');
+        output.extend_from_slice(value.to_hex().as_bytes());
+        output.push(b'"');
+    }
+
+    fn optional_string(output: &mut Vec<u8>, value: Option<&str>) -> Result<(), StaticInputError> {
+        match value {
+            Some(value) => string(output, value),
+            None => {
+                output.extend_from_slice(b"null");
+                Ok(())
+            }
+        }
+    }
+
+    fn optional_i64(output: &mut Vec<u8>, value: Option<i64>) {
+        match value {
+            Some(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            None => output.extend_from_slice(b"null"),
+        }
+    }
+
+    let mut output = Vec::new();
+    output.push(b'{');
+    field(&mut output, true, "format_version");
+    output.extend_from_slice(record.format_version.to_string().as_bytes());
+    field(&mut output, false, "descriptor_id");
+    string(&mut output, descriptor_id)?;
+    let (module, item) = descriptor_id.rsplit_once('.').ok_or_else(|| {
+        StaticInputError::NonCanonical("checked metadata descriptor id has no module".to_string())
+    })?;
+    field(&mut output, false, "module");
+    string(&mut output, module)?;
+    field(&mut output, false, "item");
+    string(&mut output, item)?;
+    field(&mut output, false, "driver");
+    string(&mut output, driver_dir(record.driver))?;
+    field(&mut output, false, "driver_restriction");
+    string(
+        &mut output,
+        match record.driver_restriction {
+            DriverRestriction::AnySupportedDriver => "any_supported_driver",
+            DriverRestriction::SQLiteOnly => "sqlite_only",
+            DriverRestriction::PostgreSQLOnly => "postgres_only",
+        },
+    )?;
+    field(&mut output, false, "statement_kind");
+    string(
+        &mut output,
+        match record.statement_kind {
+            MetadataStatementKind::Query => "query",
+            MetadataStatementKind::Command => "command",
+        },
+    )?;
+    field(&mut output, false, "statement_class");
+    string(
+        &mut output,
+        match record.statement_class {
+            MetaStatementClass::Select => "select",
+            MetaStatementClass::Dml => "dml",
+            MetaStatementClass::Ddl => "ddl",
+            MetaStatementClass::Native => "native",
+            MetaStatementClass::Unknown => "unknown",
+        },
+    )?;
+    field(&mut output, false, "source_identity");
+    output.push(b'{');
+    field(&mut output, true, "kind");
+    match &record.source_identity {
+        SqlSourceIdentity::File { logical_path } => {
+            string(&mut output, "file")?;
+            field(&mut output, false, "logical_path");
+            string(&mut output, logical_path)?;
+        }
+        SqlSourceIdentity::Inline {
+            query_or_command_id,
+        } => {
+            string(&mut output, "inline")?;
+            field(&mut output, false, "descriptor_id");
+            string(&mut output, query_or_command_id)?;
+        }
+    }
+    output.push(b'}');
+    field(&mut output, false, "source_sql_hash");
+    hash(&mut output, record.source_sql_hash);
+    field(&mut output, false, "wire_sql_hash");
+    hash(&mut output, record.wire_sql_hash);
+    field(&mut output, false, "rewrite_format_version");
+    output.extend_from_slice(record.rewrite_format_version.to_string().as_bytes());
+    field(&mut output, false, "static_options_hash");
+    hash(&mut output, record.static_options_hash);
+    field(&mut output, false, "params_fingerprint");
+    hash(&mut output, record.params_fingerprint);
+    field(&mut output, false, "row_fingerprint");
+    match record.row_fingerprint {
+        Some(value) => hash(&mut output, value),
+        None => output.extend_from_slice(b"null"),
+    }
+    field(&mut output, false, "schema_fingerprint");
+    hash(&mut output, record.schema_fingerprint);
+    field(&mut output, false, "engine_version");
+    string(&mut output, &record.engine_version)?;
+    field(&mut output, false, "driver_version");
+    string(&mut output, &record.driver_version)?;
+    field(&mut output, false, "search_path");
+    output.push(b'[');
+    for (index, path) in record.search_path.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        string(&mut output, path)?;
+    }
+    output.push(b']');
+    field(&mut output, false, "extensions");
+    output.push(b'[');
+    for (index, extension) in record.extensions.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        output.push(b'{');
+        field(&mut output, true, "schema");
+        string(&mut output, &extension.schema)?;
+        field(&mut output, false, "name");
+        string(&mut output, &extension.name)?;
+        field(&mut output, false, "version");
+        optional_string(&mut output, extension.version.as_deref())?;
+        output.push(b'}');
+    }
+    output.push(b']');
+    field(&mut output, false, "parameters");
+    output.push(b'[');
+    for (index, parameter) in record.parameters.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        output.push(b'{');
+        field(&mut output, true, "source_name");
+        string(&mut output, &parameter.source_name)?;
+        field(&mut output, false, "protocol_ordinal");
+        output.extend_from_slice(parameter.checked.ordinal.to_string().as_bytes());
+        field(&mut output, false, "logical_type");
+        string(&mut output, &parameter.logical_type)?;
+        field(&mut output, false, "native_type");
+        optional_string(&mut output, parameter.checked.native_type.as_deref())?;
+        field(&mut output, false, "native_type_id");
+        optional_i64(&mut output, parameter.checked.native_type_id);
+        output.push(b'}');
+    }
+    output.push(b']');
+    field(&mut output, false, "columns");
+    output.push(b'[');
+    for (index, column) in record.columns.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        output.push(b'{');
+        field(&mut output, true, "ordinal");
+        output.extend_from_slice(column.checked.ordinal.to_string().as_bytes());
+        field(&mut output, false, "source_alias");
+        string(&mut output, &column.source_alias)?;
+        field(&mut output, false, "logical_type");
+        string(&mut output, &column.logical_type)?;
+        field(&mut output, false, "native_type");
+        optional_string(&mut output, column.checked.native_type.as_deref())?;
+        field(&mut output, false, "native_type_id");
+        optional_i64(&mut output, column.checked.native_type_id);
+        field(&mut output, false, "nullable");
+        string(
+            &mut output,
+            match column.checked.nullable {
+                MetaNullability::Yes => "yes",
+                MetaNullability::No => "no",
+                MetaNullability::Unknown => "unknown",
+            },
+        )?;
+        field(&mut output, false, "origin_schema");
+        optional_string(&mut output, column.checked.origin_schema.as_deref())?;
+        field(&mut output, false, "origin_table");
+        optional_string(&mut output, column.checked.origin_table.as_deref())?;
+        field(&mut output, false, "origin_column");
+        optional_string(&mut output, column.checked.origin_column.as_deref())?;
+        output.push(b'}');
+    }
+    output.extend_from_slice(b"]}\n");
+    if output.len() > MAX_FIELD_BYTES {
+        return Err(StaticInputError::NonCanonical(
+            "checked metadata exceeds the field limit".to_string(),
+        ));
+    }
+
+    let logical_path = metadata_logical_path(descriptor_id, record.driver)?;
+    let parsed = parse_checked_metadata(&output, &logical_path, descriptor_id, record.driver)?;
+    let mut expected = record.clone();
+    expected.metadata_digest = Hash128::of(&output);
+    if parsed != expected {
+        return Err(StaticInputError::NonCanonical(
+            "checked metadata writer failed semantic round trip".to_string(),
+        ));
+    }
+    Ok(output)
 }
 
 struct MetadataJsonParser<'a> {

@@ -1,17 +1,17 @@
 //! Q1/D1 static Query/command artifact formation.
 
 use crate::{
-    static_inputs::{MetadataState, MetadataStatementKind, ParsedCheckedMetadata},
     ResolvedStaticInput, ResolvedStaticInputs, StaticDescriptor, StaticDescriptorConsumer,
+    static_inputs::{MetadataState, MetadataStatementKind, ParsedCheckedMetadata},
 };
 use align_interface::{
-    static_artifact_digest, static_options_hash, BindRetention, BindingEntry, CanonicalContract,
-    CanonicalDefinitionBody, CanonicalType, CheckPolicy, CheckedMetadata, CheckedQueryEvidence,
-    DeclaredColumnMeta, DeclaredParameterMeta, Driver, DriverEntry, Hash128, MetaStatementClass,
-    ParameterOccurrence, QueryMetaPlan, RewriteEntry, Span, StaticArtifact, StaticArtifactError,
-    StaticCommandArtifact, StaticOption, StaticOptionOwner, StaticOptionValue, StaticQueryArtifact,
-    VerificationState, BINDER_ABI_VERSION, DECODER_ABI_VERSION, REWRITE_FORMAT_VERSION,
-    STATIC_ARTIFACT_FORMAT_VERSION,
+    BINDER_ABI_VERSION, BindRetention, BindingEntry, CanonicalContract, CanonicalDefinitionBody,
+    CanonicalType, CheckPolicy, CheckedColumnMeta, CheckedMetadata, CheckedParameterMeta,
+    CheckedQueryEvidence, DECODER_ABI_VERSION, DeclaredColumnMeta, DeclaredParameterMeta, Driver,
+    DriverEntry, Hash128, MetaNullability, MetaStatementClass, ParameterOccurrence, QueryMetaPlan,
+    REWRITE_FORMAT_VERSION, RewriteEntry, STATIC_ARTIFACT_FORMAT_VERSION, Span, StaticArtifact,
+    StaticArtifactError, StaticCommandArtifact, StaticOption, StaticOptionOwner, StaticOptionValue,
+    StaticQueryArtifact, VerificationState, static_artifact_digest, static_options_hash,
 };
 use align_sema::{StaticCheckPolicy, StaticDescriptorOption};
 use std::collections::{HashMap, HashSet};
@@ -326,7 +326,9 @@ fn scan_sql(sql: &[u8]) -> Result<SqlScan, String> {
     })
 }
 
-fn root_fields(contract: &CanonicalContract) -> Result<&[align_interface::CanonicalField], String> {
+pub(crate) fn root_fields(
+    contract: &CanonicalContract,
+) -> Result<&[align_interface::CanonicalField], String> {
     let CanonicalType::Named { path, args } = &contract.root else {
         return Err("contract root is not a named struct".to_string());
     };
@@ -339,6 +341,10 @@ fn root_fields(contract: &CanonicalContract) -> Result<&[align_interface::Canoni
         CanonicalDefinitionBody::Struct { fields } => Ok(fields),
         CanonicalDefinitionBody::Sum { .. } => Err("contract root is not a struct".to_string()),
     }
+}
+
+pub(crate) fn static_statement_class(sql: &[u8]) -> Result<MetaStatementClass, String> {
+    scan_sql(sql).map(|scan| scan.statement_class)
 }
 
 fn bind_retention(ty: &CanonicalType) -> Result<BindRetention, String> {
@@ -609,7 +615,9 @@ fn checked_identities(
     server.u8(driver_tag(metadata.driver));
     server.string(&metadata.engine_version)?;
     server.string(&metadata.driver_version)?;
-    server.u32(u32::try_from(metadata.search_path.len()).map_err(|_| "too many search-path entries")?);
+    server.u32(
+        u32::try_from(metadata.search_path.len()).map_err(|_| "too many search-path entries")?,
+    );
     for path in &metadata.search_path {
         server.string(path)?;
     }
@@ -662,27 +670,36 @@ fn checked_query_metadata(
         || metadata.source_sql_hash != query.source_sql_hash
         || metadata.wire_sql_hash != entry.wire_sql_hash
         || metadata.rewrite_format_version != entry.rewrite_format_version
-        || metadata.static_options_hash != static_options_hash(&query.static_options).map_err(|e| e.to_string())?
+        || metadata.static_options_hash
+            != static_options_hash(&query.static_options).map_err(|e| e.to_string())?
         || metadata.params_fingerprint != query.params_fingerprint
         || metadata.row_fingerprint != Some(query.row_fingerprint)
     {
         return stale("artifact inputs changed");
     }
     if metadata.parameters.len() != query.query_meta_plan.parameters.len()
-        || metadata.parameters.iter().zip(&query.query_meta_plan.parameters).any(|(actual, declared)| {
-            actual.checked.ordinal != declared.ordinal
-                || actual.source_name != declared.source_name
-                || actual.logical_type != declared.logical_type
-        })
+        || metadata
+            .parameters
+            .iter()
+            .zip(&query.query_meta_plan.parameters)
+            .any(|(actual, declared)| {
+                actual.checked.ordinal != declared.ordinal
+                    || actual.source_name != declared.source_name
+                    || actual.logical_type != declared.logical_type
+            })
     {
         return stale("parameter plan changed");
     }
     if metadata.columns.len() != query.query_meta_plan.columns.len()
-        || metadata.columns.iter().zip(&query.query_meta_plan.columns).any(|(actual, declared)| {
-            actual.checked.ordinal != declared.ordinal
-                || actual.source_alias != declared.source_alias
-                || actual.logical_type != declared.logical_type
-        })
+        || metadata
+            .columns
+            .iter()
+            .zip(&query.query_meta_plan.columns)
+            .any(|(actual, declared)| {
+                actual.checked.ordinal != declared.ordinal
+                    || actual.source_alias != declared.source_alias
+                    || actual.logical_type != declared.logical_type
+            })
     {
         return stale("column plan changed");
     }
@@ -696,8 +713,16 @@ fn checked_query_metadata(
             prepare_identity,
             schema_identity: metadata.schema_fingerprint.to_hex(),
             server_identity,
-            parameters: metadata.parameters.iter().map(|parameter| parameter.checked.clone()).collect(),
-            columns: metadata.columns.iter().map(|column| column.checked.clone()).collect(),
+            parameters: metadata
+                .parameters
+                .iter()
+                .map(|parameter| parameter.checked.clone())
+                .collect(),
+            columns: metadata
+                .columns
+                .iter()
+                .map(|column| column.checked.clone())
+                .collect(),
         }),
     })
 }
@@ -715,7 +740,8 @@ fn checked_command_metadata(
         || metadata.source_sql_hash != command.source_sql_hash
         || metadata.wire_sql_hash != entry.wire_sql_hash
         || metadata.rewrite_format_version != entry.rewrite_format_version
-        || metadata.static_options_hash != static_options_hash(&command.static_options).map_err(|e| e.to_string())?
+        || metadata.static_options_hash
+            != static_options_hash(&command.static_options).map_err(|e| e.to_string())?
         || metadata.params_fingerprint != command.params_fingerprint
         || metadata.row_fingerprint.is_some()
         || !metadata.columns.is_empty()
@@ -766,8 +792,15 @@ fn apply_checked_metadata(
         if entry.checked_metadata.policy == CheckPolicy::DeclaredOnly {
             return Ok(());
         }
-        let snapshot = input.input.checked_metadata.iter().find(|snapshot| snapshot.driver == entry.driver);
-        let record = input.checked_metadata_records.iter().find(|record| record.driver == entry.driver);
+        let snapshot = input
+            .input
+            .checked_metadata
+            .iter()
+            .find(|snapshot| snapshot.driver == entry.driver);
+        let record = input
+            .checked_metadata_records
+            .iter()
+            .find(|record| record.driver == entry.driver);
         let result = match (snapshot.map(|snapshot| &snapshot.state), record) {
             (Some(MetadataState::Present { .. }), Some(record)) => validate(entry, record),
             (Some(MetadataState::Missing), None) => Err("checked metadata is missing".to_string()),
@@ -776,7 +809,12 @@ fn apply_checked_metadata(
         match result {
             Ok(metadata) => entry.checked_metadata = metadata,
             Err(_) if entry.checked_metadata.policy == CheckPolicy::CheckedOptional => {}
-            Err(reason) => return Err(fail(descriptor, format!("checked metadata for {:?} is stale: {reason}", entry.driver))),
+            Err(reason) => {
+                return Err(fail(
+                    descriptor,
+                    format!("checked metadata for {:?} is stale: {reason}", entry.driver),
+                ));
+            }
         }
         Ok(())
     }
@@ -806,6 +844,90 @@ fn apply_checked_metadata(
 pub fn build_static_artifacts(
     descriptors: &[StaticDescriptor],
     resolved: &ResolvedStaticInputs,
+) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
+    build_static_artifacts_inner(descriptors, resolved, true)
+}
+
+/// Build the same validated descriptor artifacts used by normal compilation while deliberately
+/// leaving their per-driver verification state at `Declared`.
+///
+/// This is the Q3 regeneration boundary: `alignc db prepare` must be able to replace missing or
+/// stale checked metadata, but it must not weaken any SQL, descriptor, type, option, or artifact
+/// validation. Keeping the mode private to the driver prevents ordinary builds from bypassing a
+/// `CheckedRequired` policy.
+pub(crate) fn build_static_artifacts_for_regeneration(
+    descriptors: &[StaticDescriptor],
+    resolved: &ResolvedStaticInputs,
+) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
+    build_static_artifacts_inner(descriptors, resolved, false)
+}
+
+fn install_regeneration_placeholders(artifact: &mut StaticArtifact) {
+    const ZERO_ID: &str = "00000000000000000000000000000000";
+    let zero = Hash128 { lo: 0, hi: 0 };
+    match artifact {
+        StaticArtifact::Query(query) => {
+            for entry in &mut query.driver_entries {
+                if entry.checked_metadata.policy != CheckPolicy::CheckedRequired {
+                    continue;
+                }
+                entry.checked_metadata = CheckedMetadata {
+                    policy: CheckPolicy::CheckedRequired,
+                    state: VerificationState::DatabaseChecked,
+                    metadata_format_version: Some(1),
+                    metadata_digest: Some(zero),
+                    query_evidence: Some(CheckedQueryEvidence {
+                        prepare_identity: ZERO_ID.to_string(),
+                        schema_identity: ZERO_ID.to_string(),
+                        server_identity: ZERO_ID.to_string(),
+                        parameters: query
+                            .query_meta_plan
+                            .parameters
+                            .iter()
+                            .map(|parameter| CheckedParameterMeta {
+                                ordinal: parameter.ordinal,
+                                native_type: None,
+                                native_type_id: None,
+                            })
+                            .collect(),
+                        columns: query
+                            .query_meta_plan
+                            .columns
+                            .iter()
+                            .map(|column| CheckedColumnMeta {
+                                ordinal: column.ordinal,
+                                native_type: None,
+                                native_type_id: None,
+                                origin_schema: None,
+                                origin_table: None,
+                                origin_column: None,
+                                nullable: MetaNullability::Unknown,
+                            })
+                            .collect(),
+                    }),
+                };
+            }
+        }
+        StaticArtifact::Command(command) => {
+            for entry in &mut command.driver_entries {
+                if entry.checked_metadata.policy == CheckPolicy::CheckedRequired {
+                    entry.checked_metadata = CheckedMetadata {
+                        policy: CheckPolicy::CheckedRequired,
+                        state: VerificationState::DatabaseChecked,
+                        metadata_format_version: Some(1),
+                        metadata_digest: Some(zero),
+                        query_evidence: None,
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn build_static_artifacts_inner(
+    descriptors: &[StaticDescriptor],
+    resolved: &ResolvedStaticInputs,
+    apply_metadata: bool,
 ) -> Result<Vec<BuiltStaticArtifact>, StaticArtifactBuildError> {
     let inputs = resolved
         .inputs
@@ -973,7 +1095,15 @@ pub fn build_static_artifacts(
                 })
             }
         };
-        apply_checked_metadata(descriptor, input, &mut artifact, scan.statement_class)?;
+        if apply_metadata {
+            apply_checked_metadata(descriptor, input, &mut artifact, scan.statement_class)?;
+        } else {
+            // Required+Declared is intentionally invalid in the normal artifact codec. Install
+            // structurally valid private placeholders so regeneration still receives the codec's
+            // complete semantic validation before native work. These values are never published,
+            // cached, installed in MIR, or consulted by the metadata writer.
+            install_regeneration_placeholders(&mut artifact);
+        }
         let bytes = match &artifact {
             StaticArtifact::Query(query) => align_interface::encode_static_query(query),
             StaticArtifact::Command(command) => align_interface::encode_static_command(command),
@@ -1037,11 +1167,15 @@ mod tests {
                 MetaStatementClass::Dml,
             ),
             (
-                b"WITH RECURSIVE a(x) AS (VALUES (1)), b AS (SELECT x FROM a) DELETE FROM users".as_slice(),
+                b"WITH RECURSIVE a(x) AS (VALUES (1)), b AS (SELECT x FROM a) DELETE FROM users"
+                    .as_slice(),
                 MetaStatementClass::Dml,
             ),
         ] {
-            assert_eq!(scan_sql(sql).expect("CTE statement").statement_class, expected);
+            assert_eq!(
+                scan_sql(sql).expect("CTE statement").statement_class,
+                expected
+            );
         }
     }
 
