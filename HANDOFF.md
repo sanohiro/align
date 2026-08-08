@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-08._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-09._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -22,8 +22,11 @@ driver execution. Q1 owns no native database resource. Q2 now closes scalar
 execution across SQLite and PostgreSQL (D2 + D4). Q3 now closes deterministic
 checked-metadata regeneration and offline consumption across both drivers
 (D3 + D5), including exact schema identities, fail-closed native description,
-atomic publication, and required PostgreSQL CI coverage. The next product work
-may proceed independently along the Q4a runtime and Q5 schema-tooling paths.
+atomic publication, and required PostgreSQL CI coverage. Q5a/D11 migration
+lifecycle tooling and Q5b1's producer-owned static Query metadata consumer have
+also shipped; Q5b2 completes D12 native catalog inspection and EXPLAIN. The next
+product work may proceed independently along the Q4a runtime and remaining Q5b
+inspection paths.
 
 The completed prerequisite waves and current product boundary are:
 
@@ -38,7 +41,7 @@ Q1 static Query vertical         complete through D1
 Q2 dual-driver scalar parity     complete through D2 + D4
 Q3 checked/offline parity        complete through D3 + D5
 next: Q4a reusable execution     D6 + D7
-next: Q5 schema tooling          D11 || D12
+Q5 schema tooling/inspection     D11 + Q5b1 complete; next Q5b2/D12
 ```
 
 The exact cell contracts and owner matrices remain in
@@ -73,6 +76,12 @@ delay prepared/transaction implementation.
 D13 and D14 then run as two additive release trains whose independently useful
 driver rails may proceed in parallel; their internal acceptance labels do not
 serialize unrelated native surfaces.
+
+The user-directed release checkpoint is the end of the complete committed
+`pkg.db` roadmap through D14. At that point, perform the formal versioned Align
+release workflow—not only a release build—including the workspace version and
+lockfile bump, matching release notes, `chore(release): Align vX.Y.Z` on `main`,
+and the matching tag and push.
 
 Every eight hours of active implementation should leave a compiling,
 owner-test-backed source checkpoint. Every twenty-four hours should leave a

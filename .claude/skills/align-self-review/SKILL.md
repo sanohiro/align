@@ -14,6 +14,19 @@ as part of the review, not a warm-up for a bot.
 Start by listing the diff so you review the actual change, not the whole tree:
 `git diff --stat origin/main...HEAD` and `git diff origin/main...HEAD`.
 
+## Recurrence memory — read before the gates
+
+Read [`FINDINGS.md`](FINDINGS.md) completely before reviewing a diff. It is the
+tracked root-cause ledger for recent independent findings, with event and PR
+counts. A class with two events is an explicit checklist item; a class with
+three events requires an automated or parameterized owner when feasible.
+
+Record valid findings from the previous merged PR at the start of the next
+capability. Do not mutate the reviewed final SHA merely to update this ledger.
+Deduplicate repeated rendering of one review comment, keep rejected claims out
+of the counts, and count preflight/test failures separately from review
+findings.
+
 ---
 
 ## Gate 1 — "Added a variant → update every pass" (the #1 soundness killer)
@@ -83,6 +96,17 @@ The same concept is encoded independently in 2–4 places; you update one and a 
 - [ ] **Scalar size/width agree across** `scalar_bytes` ↔ `int_type` / `int_bits` ↔ `abi_type` (a mismatch = heap overflow, e.g. #26 `Scalar::Unit` 1 byte vs i32; #20 `int_bits` 64 vs `int_type` i32).
 - [ ] **A new/changed runtime builtin**: the codegen `add_function` / `fn_type` declaration matches **both** the `align_runtime` `extern "C"` signature **and** every call site (param count, types, return). (#3, #24, #113, #171, #208) — declare the by-value aggregate return the same way `str_clone` does.
 - [ ] **Payload-acceptance rules** (`ty_to_scalar`, what an `Option`/`Result` may carry) don't drift between sema and codegen. (#15, #56, #106 `Ty::Fn` missing in `abi_type`, #122)
+- [ ] **Validation phases are complete, not tag-only.** Write the actual guard
+  order from the owning closure matrix. A descriptor kind, driver byte, or
+  discriminator does not prove the rest of its state. Validate every promised
+  version, reserved byte, closed/poisoned flag, pointer, length, thunk, and
+  lease field before the first losing-phase allocation, native side effect, or
+  indirect call. Pin multi-invalid precedence with a parameterized owner.
+- [ ] **Native link closures preserve surrounding order.** Normalize at the
+  earliest existing closure member, keep unrelated prefix and suffix libraries
+  in caller order, and append prerequisites only after dependents. Test an
+  arbitrary library both before and after the closure; three Q2 review findings
+  came from fixing only the named library.
 
 **LLVM-IR correctness idioms (emitting new IR):**
 - [ ] **Byte-offset / raw GEP uses `build_gep`, not `build_in_bounds_gep`** — an out-of-object `inbounds` GEP is poison and lets LLVM delete later bounds checks. Force **alignment 1** on raw un-aligned load/store, and keep the doc comment truthful about it. (#263)
@@ -109,6 +133,12 @@ The M6 builtin arc surfaced a whole class of sema bugs around type variables and
 - **Perf** (mostly medium — one glance, don't chase every nit): don't clone a `Copy` type (`Ty`, small structs); `&str` over `String`; `with_capacity` for known sizes; hoist invariant work out of hot loops (#94 re-lowered captures in an inner sort loop). The bot posts one comment per line — treat fifteen near-identical clone nits as *one* lesson.
 - **Concurrency** (`task_group` / `par_map`): on a worker panic, the shared counter must still be decremented and the condvar notified (guard / `catch_unwind`); never `unwrap_or(0)` a `join()` (swallows the failure); justify any `unsafe impl Send/Sync`. (#114, #117, #179)
 - **Parser/lexer**: on invalid UTF-8 advance `pos` by exactly the bytes consumed, not `'\u{FFFD}'.len_utf8()` (#22, #231); lookahead must survive a newline token (#21); `//` is a comment, not a `/` line-continuation (#18); a saved/restored flag (e.g. `no_struct_literal`) must be restored on *every* exit — a `?` early-return leaks the mutated state and corrupts the rest of the parse (#272). Don't `diags.error` for something a helper you call already reports (`parse_path`→`parse_ident`) — return `None`/sentinel (#272).
+- **SQL/protocol scanners**: parameterize every lexical mode (ordinary and
+  escape strings, quoted identifiers, line/block comments, dollar quotes),
+  statement prefixes such as CTEs, placeholders inside and outside those
+  modes, and token-free trailing whitespace/comments after the final
+  statement. Three findings across #718 and #723 came from closing one scanner
+  state without the siblings.
 - **SIMD arch parity**: a hand-written SIMD routine must ship as a **set** — x86 (`#[cfg(target_arch = "x86_64")]` + `is_x86_feature_detected!`) **and** arm64 (`#[cfg(target_arch = "aarch64")]`, NEON is ARMv8-A baseline) **and** a scalar fallback — with a test asserting every available path matches the scalar oracle byte-for-byte. Never land an x86-only intrinsic on a live path (it silently makes ARM slower); the dispatcher's non-x86 arm must reach NEON, not scalar. (`json_decode_index`/`json_structural_index` carry both; the carry-less fold pairs `pclmulqdq` with NEON `PMULL`.) Auto-vectorized loops and the `vec`/`mask` surface go through LLVM per target arch, so they need no per-arch code — only explicit intrinsics do.
 - **Tests actually exercise the case**: no silent bypass — `None => continue`, `unwrap_or_default()` on `read_dir`, or an empty input set makes a test pass without asserting (#286); an "out-of-range" test must use an out-of-range index, not `s[0]` on a len-1 array (#247); every new guard/rejection deserves a negative test (null/zero/non-pow-2 align #293, leading-`-` lib name #268, assign-from-local #283). Print the diagnostics on failure so the runner shows them (#286).
 - **Tests/bench portability**: unique temp paths (PID) + RAII cleanup, no leaks/races (#20, #37, #132, #134); branch on `cfg!(target_os/arch)`, don't hardcode `.so` / drop `.exe` / x86-only `target-cpu` on ARM (#128, #152, #167); a process exit code is the **low byte** on Unix but full 32-bit on Windows — `cfg!(windows)` the expected value (#287).
