@@ -2627,8 +2627,9 @@ this excludes persistent and connection-local indexes, triggers, views, and rewr
 Every history query and mutation explicitly qualifies `main.__align_migrations_v1`, so a temporary
 object cannot shadow the owned table.
 PostgreSQL requires a permanent ordinary heap table owned by the current role, with no partition or
-inheritance relation, row security, forced row security, user trigger, rewrite rule, policy, extra
-index, generated/default/identity expression, non-owner ACL, or other behavior-affecting object
+inheritance relation, row security, forced row security, trigger (including an internal trigger from
+an inbound foreign key), rewrite rule, policy, extra index, generated/default/identity expression,
+non-owner table or column ACL, or other behavior-affecting object
 attached to the history table. Its only index is the valid, ready, immediate,
 default-btree primary-key index on `version`; its constraints are exactly that primary key and the
 six immediate validated checks in the DDL. The schema is owned by the current role. Unrelated schema
@@ -2716,8 +2717,8 @@ and ambient-`PG*` rejection rules from §16.2.
 
 Validation precedence is one deterministic sequence:
 
-1. decode every argv token as non-empty UTF-8 without U+0000, then reject unknown or duplicate
-   options in source order;
+1. visit argv tokens in source order, decoding each as non-empty UTF-8 without U+0000 before
+   rejecting an unknown or duplicate option at that token;
 2. validate the operation-specific required fields, exactly one matching target, repair action,
    version, and lowercase expected checksum;
 3. validate entry, project-relative catalog containment, then the complete §16.6 catalog;
@@ -2754,7 +2755,9 @@ The policy directive is recognized only as the exact first physical line termina
 CRLF or leading bytes do not match it and therefore select the default Required policy. SQL
 screening ignores quoted strings, quoted identifiers, line/block comments, and PostgreSQL
 dollar-quoted bodies. It rejects a top-level statement whose first tokens form `BEGIN`, `START
-TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, or `RELEASE`. SQLite statement
+TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`,
+`SET TRANSACTION`, `SET LOCAL TRANSACTION`, `SET SESSION TRANSACTION`, or `SET SESSION
+CHARACTERISTICS AS TRANSACTION`. SQLite statement
 boundaries, including trigger bodies, use `sqlite3_complete`; PostgreSQL boundaries use the same
 dollar-quote-aware driver scanner. Both drivers finish this complete screening phase before opening
 the target or publishing an Applying row; native execution remains authoritative for SQL validity.
@@ -4047,7 +4050,7 @@ thin driver adapters produces less duplicated proof and lower integration risk.
 |---|---|---|
 | CLI and target identity | Implement the exact migrate/status/check/repair forms and validation precedence in §17.6. Resolve entry, project-relative catalog, and relative SQLite target without cwd discovery; read only the selected non-`PG*` PostgreSQL URL variable after all non-secret validation. | `pkg_db_q5a::migration_cli_rejects_invalid_forms_before_catalog_environment_or_native_work` and path/symlink matrix |
 | catalog and policy screening | Reuse the Q3 `ALIGNMIG` catalog bytes/digest. Parse the exact first physical line, count complete driver statements, and reject empty, transaction-control, NUL, invalid UTF-8, and multi-statement Forbidden files before target mutation. | cumulative Q3 catalog goldens plus `pkg_db_q5a::migration_policy_and_statement_screening_is_exact` |
-| history codec/state reconciliation | Create only the exact §17.6 owned objects during migrate, validate the complete persistent/session-local history-table and attached-object inventory plus every row/state combination, reconcile in version order, and classify the complete current/extra/mismatch/dirty matrix without panic or silent upgrade. One joined PostgreSQL catalog query owns the table invariant; unrelated schema objects are excluded. Reject malformed schema or row state before mutation. | `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` for both drivers, including SQLite TEMP-trigger/shadow and PostgreSQL trigger/rule/RLS/default/index/ACL negatives |
+| history codec/state reconciliation | Create only the exact §17.6 owned objects during migrate, validate the complete persistent/session-local history-table and attached-object inventory plus every row/state combination, reconcile in version order, and classify the complete current/extra/mismatch/dirty matrix without panic or silent upgrade. One joined PostgreSQL catalog query owns the table invariant; unrelated schema objects are excluded. Reject malformed schema or row state before mutation. | `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` for both drivers, including SQLite TEMP-trigger/shadow and PostgreSQL user/inbound-FK trigger, rule, RLS, default, index, and table/column ACL negatives |
 | overlap exclusion and cleanup | Every SQLite command may create then holds the exact persistent OS-lock inode; every PostgreSQL command holds the exact advisory key across the operation. After those cooperating locks, SQLite read snapshots/`BEGIN IMMEDIATE` and blind-first-SQL PostgreSQL `READ COMMITTED` SHARE ROW EXCLUSIVE/ACCESS EXCLUSIVE table locks make validation plus history access atomic against non-cooperating DB writers. SQLSTATE-bound rollback/bootstrap handles an absent table without an existence race. Forbidden isolates user SQL on a worker that never mutates history. Every success/error/Drop/process-loss edge releases worker, native transaction/table lock, and operation lock in that order. | SQLite absent-lock creation, external writer race, TEMP-trigger, and two-process owners; required PostgreSQL concurrent-session/external-DDL-DML/bootstrap-race owners |
 | Required execution | Under the migration lock, run each Required file and its Applied history insert in one transaction. Statement/history failure rolls back that complete file; an uncertain commit closes/reconnects/relocks and classifies exact Applied versus absent without same-invocation retry. Already Applied current prefixes are not re-executed. | SQLite and required PostgreSQL atomic/multi-statement/error/restart/outcome-unknown owners |
 | Forbidden execution and dirty state | Require one screened statement and durably observe Applying(0) plus its exact history snapshot before executing outside a transaction. Under the final native lock compare and restore that snapshot, recording Applied(1) or Failed(0) only when the observed snapshot was unchanged. Any row change or absent owned history object restores Applying and fails visibly, while a malformed replacement fails closed. Native error best-effort records Failed(0); uncertain final publication reconciles as Applied or dirty Applying. Either dirty state blocks continuation and is never retried automatically. | both-driver before/after/error-recording/history-forgery/outcome-unknown fault matrix and execution counters |
@@ -4074,6 +4077,7 @@ The pre-implementation adversarial review closed these root-cause classes before
 | final inspection review found PostgreSQL `SHARE` compatible with index creation | Inspection uses `SHARE ROW EXCLUSIVE`, which permits readers while conflicting with DML and ordinary/concurrent index or DDL modes. |
 | author-side implementation pass found Forbidden user SQL could erase or forge its own Applying row before final validation | The runner now retains the exact pre-worker history snapshot, compares and restores it under the final native lock, and leaves restored Applying plus a visible failure after any row change. An absent owned table is recreated only to restore Applying and fail; a malformed replacement remains a blocking error. |
 | focused implementation review found malformed rows were treated as restorable changes and uncertain restore commits checked only the current Applying row | Both adapters now validate complete row semantics before any restore and leave malformed replacements untouched. Every Applying commit reconciliation compares the complete expected history snapshot, so a partial or unapplied restore cannot be reported as exact. |
+| Align compiler self-review found the public native PostgreSQL entry relied on CLI-only input checks, inherited preparation-specific diagnostics, missed two `SET ... TRANSACTION` spellings, and omitted inbound-FK triggers and column ACLs from attached behavior | The native entry now repeats ambient/complete-URL validation before libpq load through context-specific shared validators. Screening rejects `SET LOCAL TRANSACTION` and `SET SESSION TRANSACTION`. The joined inventory counts all table triggers and non-owner column ACLs, with owner tests. |
 
 ### D12 — category-specific metadata and EXPLAIN
 

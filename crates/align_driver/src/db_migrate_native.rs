@@ -1349,13 +1349,11 @@ pub fn run_sqlite_migration(
 }
 
 pub fn validate_postgres_migration_environment() -> Result<(), MigrationError> {
-    native(crate::db_prepare_native::reject_ambient_postgres_environment())
+    native(crate::db_prepare_native::reject_ambient_postgres_migration_environment())
 }
 
 pub fn validate_postgres_migration_url(url: &str) -> Result<(), MigrationError> {
-    native(crate::db_prepare_native::validate_complete_postgres_url(
-        url,
-    ))
+    native(crate::db_prepare_native::validate_complete_postgres_migration_url(url))
 }
 
 const POSTGRES_HISTORY_DDL: &str = r#"CREATE TABLE "align_internal"."migrations_v1" (
@@ -1702,13 +1700,14 @@ fn postgres_schema_inventory_sql() -> &'static str {
   JOIN pg_catalog.pg_index x ON x.indexrelid=i.indexrelid
   GROUP BY i.indrelid
 )
-SELECT t.relkind,t.relpersistence,(t.relowner=pg_catalog.current_user::regrole)::text,t.relispartition::text,t.relrowsecurity::text,t.relforcerowsecurity::text,
-       (t.nspowner=pg_catalog.current_user::regrole)::text,c.signature,c.count::text,k.signature,k.count::text,k.immediate::text,i.count::text,i.exact::text,
+SELECT t.relkind,t.relpersistence,(t.relowner=current_user::pg_catalog.regrole)::text,t.relispartition::text,t.relrowsecurity::text,t.relforcerowsecurity::text,
+       (t.nspowner=current_user::pg_catalog.regrole)::text,c.signature,c.count::text,k.signature,k.count::text,k.immediate::text,i.count::text,i.exact::text,
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_inherits h WHERE h.inhrelid=t.table_oid OR h.inhparent=t.table_oid),
-       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_trigger g WHERE g.tgrelid=t.table_oid AND NOT g.tgisinternal),
+       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_trigger g WHERE g.tgrelid=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_rewrite r WHERE r.ev_class=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_policy p WHERE p.polrelid=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.aclexplode(COALESCE((SELECT relacl FROM pg_catalog.pg_class WHERE oid=t.table_oid),pg_catalog.acldefault('r',t.relowner))) a WHERE a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
+       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_attribute ca CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(ca.attacl,ARRAY[]::pg_catalog.aclitem[])) a WHERE ca.attrelid=t.table_oid AND ca.attnum>0 AND NOT ca.attisdropped AND a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
        (SELECT am.amname FROM pg_catalog.pg_am am WHERE am.oid=(SELECT relam FROM pg_catalog.pg_class WHERE oid=t.table_oid)),
        t.relreplident,
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_publication_rel pr WHERE pr.prrelid=t.table_oid)
@@ -1716,7 +1715,7 @@ FROM target t JOIN columns c ON c.attrelid=t.table_oid JOIN constraints k ON k.c
 }
 
 fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), MigrationError> {
-    let rows = connection.query(postgres_schema_inventory_sql(), 22)?;
+    let rows = connection.query(postgres_schema_inventory_sql(), 23)?;
     let [row] = rows.as_slice() else {
         return Err(fail(
             "PostgreSQL migration history schema has an invalid object inventory",
@@ -1768,10 +1767,11 @@ fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), Migra
         || value(15, "trigger inventory")? != "0"
         || value(16, "rewrite-rule inventory")? != "0"
         || value(17, "policy inventory")? != "0"
-        || value(18, "ACL inventory")? != "0"
-        || value(19, "table access method")? != "heap"
-        || value(20, "replica identity")? != "d"
-        || value(21, "publication inventory")? != "0"
+        || value(18, "table ACL inventory")? != "0"
+        || value(19, "column ACL inventory")? != "0"
+        || value(20, "table access method")? != "heap"
+        || value(21, "replica identity")? != "d"
+        || value(22, "publication inventory")? != "0"
     {
         return Err(fail(
             "PostgreSQL migration history schema does not match the canonical contract",
@@ -2189,7 +2189,7 @@ fn postgres_restore_missing_forbidden_history(
             )?,
             (Some("true"), Some("false")) => {
                 let owner = connection.query(
-                    "SELECT (nspowner=current_user::regrole)::text FROM pg_catalog.pg_namespace WHERE nspname='align_internal'",
+                    "SELECT (nspowner=current_user::pg_catalog.regrole)::text FROM pg_catalog.pg_namespace WHERE nspname='align_internal'",
                     1,
                 )?;
                 if owner.as_slice() != [vec![Some("true".to_string())]] {
@@ -2594,6 +2594,8 @@ pub fn run_postgres_migration(
     operation: MigrationOperation<'_>,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
+    validate_postgres_migration_environment()?;
+    validate_postgres_migration_url(url)?;
     let mut connection = PostgresConnection::open(url)?;
     connection.advisory_lock(operation.writes_database())?;
     match operation {
@@ -2737,5 +2739,15 @@ mod tests {
             .expect("reader acquires after writer release");
         worker.join().unwrap();
         let _ = std::fs::remove_file(format!("{}.align-migrate.lock", path.display()));
+    }
+
+    #[test]
+    fn postgres_migration_validation_uses_migration_diagnostics() {
+        assert!(
+            validate_postgres_migration_url("not-a-url")
+                .unwrap_err()
+                .to_string()
+                .contains("PostgreSQL migration requires")
+        );
     }
 }

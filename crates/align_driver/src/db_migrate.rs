@@ -556,6 +556,7 @@ fn rejects_transaction_control(bytes: &[u8]) -> Result<bool, MigrationError> {
         words.first().map(String::as_str),
         Some("BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE")
     ) || matches!(words.as_slice(), [first, second, ..] if matches!(first.as_str(), "START" | "PREPARE" | "SET") && second == "TRANSACTION")
+        || matches!(words.as_slice(), [first, second, third, ..] if first == "SET" && matches!(second.as_str(), "LOCAL" | "SESSION") && third == "TRANSACTION")
         || matches!(words.as_slice(), [first, second, third, fourth, fifth, ..] if first == "SET" && second == "SESSION" && third == "CHARACTERISTICS" && fourth == "AS" && fifth == "TRANSACTION"))
 }
 
@@ -931,6 +932,19 @@ mod tests {
                 .0
                 .contains("transaction-control")
         );
+        for sql in [
+            "SET LOCAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET SESSION TRANSACTION READ ONLY",
+        ] {
+            let catalog =
+                crate::db_prepare::encode_migration_catalog(vec![entry(1, sql)]).expect("catalog");
+            assert!(
+                screen_postgres_catalog(&catalog)
+                    .unwrap_err()
+                    .0
+                    .contains("transaction-control")
+            );
+        }
     }
 
     #[test]

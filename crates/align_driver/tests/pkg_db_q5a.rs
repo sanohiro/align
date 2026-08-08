@@ -501,6 +501,32 @@ fn postgres_required_migration_lifecycle() {
 
     std::fs::write(
         project.dir.join("db/migrations/0004_history_trigger.sql"),
+        "CREATE TABLE align_q5a_history_ref(version integer REFERENCES align_internal.migrations_v1(version));",
+    )
+    .expect("write inbound-history-FK migration");
+    let raw =
+        read_migration_catalog(&project.dir.join("db/migrations")).expect("inbound FK catalog");
+    let inbound_fk = screen_postgres_catalog(&raw).expect("screen inbound FK catalog");
+    assert!(run_postgres_migration(&url, MigrationOperation::Migrate, &inbound_fk).is_err());
+    let after_inbound_fk = run_postgres_migration(&url, MigrationOperation::Status, &inbound_fk)
+        .expect("status after rejected inbound history FK");
+    assert_eq!(after_inbound_fk.rows[3].status, MigrationStatus::Pending);
+
+    std::fs::write(
+        project.dir.join("db/migrations/0004_history_trigger.sql"),
+        "GRANT SELECT (checksum) ON align_internal.migrations_v1 TO PUBLIC;",
+    )
+    .expect("write history-column-ACL migration");
+    let raw =
+        read_migration_catalog(&project.dir.join("db/migrations")).expect("column ACL catalog");
+    let column_acl = screen_postgres_catalog(&raw).expect("screen column ACL catalog");
+    assert!(run_postgres_migration(&url, MigrationOperation::Migrate, &column_acl).is_err());
+    let after_column_acl = run_postgres_migration(&url, MigrationOperation::Status, &column_acl)
+        .expect("status after rejected history column ACL");
+    assert_eq!(after_column_acl.rows[3].status, MigrationStatus::Pending);
+
+    std::fs::write(
+        project.dir.join("db/migrations/0004_history_trigger.sql"),
         "CREATE FUNCTION align_q5a_history_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$; CREATE TRIGGER align_q5a_bad BEFORE UPDATE ON align_internal.migrations_v1 FOR EACH ROW EXECUTE FUNCTION align_q5a_history_trigger();",
     )
     .expect("write history-invariant migration");
