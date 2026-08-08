@@ -1340,14 +1340,13 @@ import pkg.db.sqlite
 import pkg.db.postgres
 import app.portable_query
 
-fn main(args: array<str>) -> Result<(), Error> {
-  url := args[1]
+fn run(url: str) -> i32 {
   sqlite := pkg.db.sqlite.connect(":memory:", [])
   postgres := pkg.db.postgres.connect(url, [])
-  match sqlite {
-    Err(_) => { print(2); return Ok(()) }
+  return match sqlite {
+    Err(_) => 2
     Ok(sqlite_connection) => match postgres {
-      Err(_) => { print(3); return Ok(()) }
+      Err(_) => 3
       Ok(postgres_connection) => {
         sqlite_target := pkg.db.exec_conn(sqlite_connection)
         postgres_target := pkg.db.exec_conn(postgres_connection)
@@ -1369,13 +1368,17 @@ fn main(args: array<str>) -> Result<(), Error> {
               [],
             )
             postgres_ok := match postgres_row { Ok(row) => row.value == 42, Err(_) => false }
-            if sqlite_ok && postgres_ok { print(42) } else { print(4) }
-            return Ok(())
+            if sqlite_ok && postgres_ok { 42 } else { 4 }
           }
         }
       }
     }
   }
+}
+
+fn main(args: array<str>) -> Result<(), Error> {
+  print(run(args[1]))
+  return Ok(())
 }
 "#;
     let files = [
@@ -1397,7 +1400,13 @@ fn main(args: array<str>) -> Result<(), Error> {
         &[postgres_url.as_str()],
         &[],
     );
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "status: {:?}; stdout: {}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "42\n",
