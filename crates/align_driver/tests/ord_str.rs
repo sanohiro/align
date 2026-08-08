@@ -1,9 +1,10 @@
 //! `Ord(str)` — byte-lexicographic ordering on `str` (settled 2026-07-09). The `<`/`<=`/`>`/`>=`
 //! operators compare `str` views by bytes (= Unicode scalar order for valid UTF-8), one `memcmp`
 //! over the shared prefix with the shorter string ordering first on a tie; locale collation stays a
-//! `pkg` concern. String keys in `sort_by_key` use the same comparator. Owned `string` ordering and
-//! `bool` ordering stay rejected. These are end-to-end run tests (the sema-level accept/reject lives
-//! in `align_sema`'s unit tests); each returns a small (`< 256`) exit code the harness reads back.
+//! `pkg` concern. String keys in `sort_by_key` use the same comparator. Owned `string` ordering
+//! borrows through the same `str` comparator, while `bool` ordering stays rejected. These are
+//! end-to-end run tests (the sema-level accept/reject lives in `align_sema`'s unit tests); each
+//! returns a small (`< 256`) exit code the harness reads back.
 
 mod common;
 use common::*;

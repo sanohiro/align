@@ -75,13 +75,11 @@ alignc/                  workspace root
 
 Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 
-## Known implementation gaps (2026-07-25)
+## Current implementation notes (2026-08-08)
 
-These are mismatches between accepted/intended source and the current lowering, not new language
-rules:
-
-- Direct owned-`string` comparison is specified but not lowered; compare through `str`-typed helper
-  parameters for now (`draft.md` §5).
+String comparison is complete for both `str` and owned `string`: owned operands use the ordinary
+non-consuming `str` borrow before lowering, including mixed and generic `Eq`/`Ord` comparisons
+(`draft.md` §5).
 
 ## Required native-library boundary (settled 2026-07-27)
 

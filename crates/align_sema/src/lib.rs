@@ -45082,9 +45082,9 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(!lt.has_errors(), "str ordering (`<`) should check");
         let (_r, ge) = check("fn f(s: str) -> bool = s >= \"x\"\n");
         assert!(!ge.has_errors(), "str ordering (`>=`) should check");
-        // Owned `string` ordering stays deferred (only the `str` view is comparable).
+        // Owned `string` ordering uses the same non-consuming `str` borrow as the direct `str` form.
         let (_s, owned) = check("fn f() -> bool {\n  a := \"x\".clone()\n  b := \"y\".clone()\n  return a < b\n}\n");
-        assert!(owned.has_errors(), "owned `string` ordering must still error");
+        assert!(!owned.has_errors(), "owned `string` ordering should borrow through `str`");
     }
 
     #[test]
