@@ -103,6 +103,21 @@ pub struct PublicationReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationEntry {
+    pub version: u32,
+    pub filename: String,
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationCatalog {
+    pub entries: Vec<MigrationEntry>,
+    pub encoded: Vec<u8>,
+    pub fingerprint: Hash128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareError(pub String);
 
 impl std::fmt::Display for PrepareError {
@@ -168,6 +183,120 @@ impl IdentityWriter {
         }
         Ok(())
     }
+}
+
+fn migration_name(name: &str) -> Option<u32> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 10 || &bytes[4..5] != b"_" || !name.ends_with(".sql") {
+        return None;
+    }
+    if !bytes[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let stem = &bytes[5..bytes.len() - 4];
+    if stem.is_empty()
+        || !stem[0].is_ascii_lowercase()
+        || !stem[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return None;
+    }
+    let version = name[..4].parse::<u32>().ok()?;
+    (version != 0).then_some(version)
+}
+
+/// Read and validate the exact immediate-entry SQLite migration catalog before native work.
+pub fn read_migration_catalog(directory: &Path) -> Result<MigrationCatalog, PrepareError> {
+    let mut directory_entries = fs::read_dir(directory)
+        .map_err(|error| fail(format!("cannot enumerate migration directory `{}`: {error}", directory.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| fail(format!("cannot enumerate migration directory `{}`: {error}", directory.display())))?;
+    directory_entries.sort_by(|left, right| {
+        left.file_name()
+            .as_encoded_bytes()
+            .cmp(right.file_name().as_encoded_bytes())
+    });
+
+    let mut selected = Vec::new();
+    for entry in directory_entries {
+        let raw_name = entry.file_name();
+        let name = raw_name.to_str().ok_or_else(|| {
+            fail(format!(
+                "migration directory `{}` contains a non-UTF-8 entry name",
+                directory.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            fail(format!("cannot inspect migration entry `{name}`: {error}"))
+        })?;
+        if file_type.is_symlink() {
+            return Err(fail(format!("migration entry `{name}` is a symlink")));
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(version) = migration_name(name) else {
+            if name.ends_with(".sql") {
+                return Err(fail(format!("migration filename `{name}` is invalid")));
+            }
+            continue;
+        };
+        selected.push((version, name.to_string(), entry.path()));
+    }
+    if selected.is_empty() {
+        return Err(fail("migration catalog contains no migration files"));
+    }
+    selected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.as_bytes().cmp(right.1.as_bytes())));
+    for (index, (version, name, _)) in selected.iter().enumerate() {
+        let expected = u32::try_from(index + 1).map_err(|_| fail("migration count exceeds u32"))?;
+        if *version != expected {
+            return Err(fail(format!(
+                "migration `{name}` has version {version:04}; expected {expected:04}"
+            )));
+        }
+    }
+
+    let mut entries = Vec::with_capacity(selected.len());
+    for (version, filename, path) in selected {
+        let bytes = fs::read(&path)
+            .map_err(|error| fail(format!("cannot read migration `{filename}`: {error}")))?;
+        std::str::from_utf8(&bytes)
+            .map_err(|_| fail(format!("migration `{filename}` is not UTF-8")))?;
+        if bytes.contains(&0) {
+            return Err(fail(format!("migration `{filename}` contains U+0000")));
+        }
+        entries.push(MigrationEntry { version, filename, path, bytes });
+    }
+    encode_migration_catalog(entries)
+}
+
+/// Encode the canonical `ALIGNMIG` stream. Exposed so independent fixtures can pin the empty form
+/// even though `--migrations` itself requires at least one selected entry.
+pub fn encode_migration_catalog(entries: Vec<MigrationEntry>) -> Result<MigrationCatalog, PrepareError> {
+    let mut writer = IdentityWriter::new(b"ALIGNMIG");
+    writer.u32(1);
+    writer.u32(u32::try_from(entries.len()).map_err(|_| fail("migration count exceeds u32"))?);
+    let mut expected = 1u32;
+    for entry in &entries {
+        if entry.version != expected {
+            return Err(fail("migration entries are not a contiguous sequence beginning at 0001"));
+        }
+        if migration_name(&entry.filename) != Some(entry.version) {
+            return Err(fail(format!("migration filename `{}` is invalid", entry.filename)));
+        }
+        std::str::from_utf8(&entry.bytes)
+            .map_err(|_| fail(format!("migration `{}` is not UTF-8", entry.filename)))?;
+        if entry.bytes.contains(&0) {
+            return Err(fail(format!("migration `{}` contains U+0000", entry.filename)));
+        }
+        writer.u32(entry.version);
+        writer.string(&entry.filename)?;
+        writer.hash(Hash128::of(&entry.bytes));
+        expected = expected.checked_add(1).ok_or_else(|| fail("migration version overflow"))?;
+    }
+    let fingerprint = Hash128::of(&writer.bytes);
+    Ok(MigrationCatalog { entries, encoded: writer.bytes, fingerprint })
 }
 
 pub fn sqlite_database_schema_fingerprint(schema_id: &str) -> Result<Hash128, PrepareError> {

@@ -21,6 +21,7 @@ pub use align_sema::{
 
 pub mod cache;
 pub mod db_prepare;
+pub mod db_prepare_native;
 pub mod explain;
 pub mod static_artifacts;
 pub mod static_inputs;
