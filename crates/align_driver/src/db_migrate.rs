@@ -647,11 +647,6 @@ pub fn screen_sqlite_catalog(
                 )));
             }
             ranges.push(start..entry.bytes.len());
-        } else if !entry.bytes[start..].is_empty() && !complete(&entry.bytes[start..])? {
-            return Err(fail(format!(
-                "migration `{}` contains incomplete SQLite SQL",
-                entry.filename
-            )));
         }
         entries.push(screen_ranges(entry, policy, ranges)?);
     }
@@ -970,6 +965,22 @@ mod tests {
                 .to_string()
                 .contains("transaction-control")
         );
+    }
+
+    #[test]
+    fn sqlite_screening_ignores_token_free_trailing_bytes() {
+        for sql in [
+            "SELECT 1;\n",
+            "SELECT 1; -- trailing comment\n",
+            "SELECT 1; /* tail */",
+        ] {
+            let catalog =
+                crate::db_prepare::encode_migration_catalog(vec![entry(1, sql)]).expect("catalog");
+            let screened =
+                screen_sqlite_catalog(&catalog, |bytes| Ok(matches!(bytes.last(), Some(b';'))))
+                    .expect("screen SQLite trailing bytes");
+            assert_eq!(screened.entries[0].statement_count, 1);
+        }
     }
 
     #[test]

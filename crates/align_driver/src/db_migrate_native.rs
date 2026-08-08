@@ -567,6 +567,13 @@ fn validate_sqlite_schema(connection: &SqliteConnection) -> Result<bool, Migrati
             "SQLite migration history has a temporary shadow or attached object",
         ));
     }
+    let inbound_foreign_keys = connection.query(
+        "SELECT fk.\"table\" FROM main.sqlite_schema AS object JOIN pragma_foreign_key_list(object.name) AS fk WHERE object.type='table' AND fk.\"table\"='__align_migrations_v1' LIMIT 1",
+        1,
+    )?;
+    if !inbound_foreign_keys.is_empty() {
+        return Err(fail("SQLite migration history has an inbound foreign key"));
+    }
     if rows.is_empty() {
         return Ok(false);
     }
@@ -1042,33 +1049,33 @@ fn sqlite_forbidden(
             reconcile(MigrationDriver::Sqlite, catalog, observed.clone())?;
             observed == applying_history
         };
-        if restored_missing {
+        if !history_unchanged {
+            if restored_missing {
+                history_connection.execute(
+                    SQLITE_HISTORY_DDL.as_bytes(),
+                    "SQLite forbidden missing-history restore",
+                )?;
+            }
             history_connection.execute(
-                SQLITE_HISTORY_DDL.as_bytes(),
-                "SQLite forbidden missing-history restore",
-            )?;
-        }
-        history_connection.execute(
-            b"DELETE FROM main.__align_migrations_v1",
-            "SQLite forbidden history snapshot restore",
-        )?;
-        for row in &applying_history {
-            history_connection.execute(
-                stored_history_insert_sql("main.__align_migrations_v1", row).as_bytes(),
+                b"DELETE FROM main.__align_migrations_v1",
                 "SQLite forbidden history snapshot restore",
             )?;
-        }
-        let before = inspect_sqlite(history_connection, catalog, true)?;
-        let expected = before
-            .rows
-            .iter()
-            .find(|row| row.version == migration.version);
-        if expected.map(|row| row.status) != Some(MigrationStatus::DirtyApplying) {
-            return Err(fail(
-                "SQLite forbidden migration lost its Applying history row",
-            ));
-        }
-        if !history_unchanged {
+            for row in &applying_history {
+                history_connection.execute(
+                    stored_history_insert_sql("main.__align_migrations_v1", row).as_bytes(),
+                    "SQLite forbidden history snapshot restore",
+                )?;
+            }
+            let restored = inspect_sqlite(history_connection, catalog, true)?;
+            let expected = restored
+                .rows
+                .iter()
+                .find(|row| row.version == migration.version);
+            if expected.map(|row| row.status) != Some(MigrationStatus::DirtyApplying) {
+                return Err(fail(
+                    "SQLite forbidden migration lost its Applying history row",
+                ));
+            }
             return Ok(true);
         }
         history_connection.execute(
@@ -2354,29 +2361,30 @@ fn postgres_forbidden(
         let observed = read_postgres_history(history_connection)?;
         reconcile(MigrationDriver::Postgres, catalog, observed.clone())?;
         let history_unchanged = observed == applying_history;
-        history_connection.execute(
-            b"DELETE FROM \"align_internal\".\"migrations_v1\"",
-            "PostgreSQL forbidden history snapshot restore",
-        )?;
-        for row in &applying_history {
+        if !history_unchanged {
             history_connection.execute(
-                stored_history_insert_sql("\"align_internal\".\"migrations_v1\"", row).as_bytes(),
+                b"DELETE FROM \"align_internal\".\"migrations_v1\"",
                 "PostgreSQL forbidden history snapshot restore",
             )?;
-        }
-        let before = inspect_postgres_locked(history_connection, catalog)?;
-        if before
-            .rows
-            .iter()
-            .find(|row| row.version == migration.version)
-            .map(|row| row.status)
-            != Some(MigrationStatus::DirtyApplying)
-        {
-            return Err(fail(
-                "PostgreSQL forbidden migration lost its Applying history row",
-            ));
-        }
-        if !history_unchanged {
+            for row in &applying_history {
+                history_connection.execute(
+                    stored_history_insert_sql("\"align_internal\".\"migrations_v1\"", row)
+                        .as_bytes(),
+                    "PostgreSQL forbidden history snapshot restore",
+                )?;
+            }
+            let restored = inspect_postgres_locked(history_connection, catalog)?;
+            if restored
+                .rows
+                .iter()
+                .find(|row| row.version == migration.version)
+                .map(|row| row.status)
+                != Some(MigrationStatus::DirtyApplying)
+            {
+                return Err(fail(
+                    "PostgreSQL forbidden migration lost its Applying history row",
+                ));
+            }
             return Ok(true);
         }
         history_connection.execute(
@@ -2697,6 +2705,26 @@ mod tests {
                 .to_string()
                 .contains("temporary")
         );
+        drop(connection);
+
+        let connection = SqliteConnection::open(&path, SQLITE_OPEN_READWRITE).unwrap();
+        connection
+            .execute(
+                b"CREATE TABLE history_ref(version INTEGER REFERENCES __align_migrations_v1(version) ON DELETE CASCADE)",
+                "inbound foreign key fixture",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            run_sqlite_migration(&path, MigrationOperation::Status, &screened)
+                .unwrap_err()
+                .to_string()
+                .contains("inbound foreign key")
+        );
+        let connection = SqliteConnection::open(&path, SQLITE_OPEN_READWRITE).unwrap();
+        connection
+            .execute(b"DROP TABLE history_ref", "inbound foreign key cleanup")
+            .unwrap();
         drop(connection);
 
         let connection = SqliteConnection::open(&path, SQLITE_OPEN_READWRITE).unwrap();
