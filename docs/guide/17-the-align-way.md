@@ -43,4 +43,4 @@ Align's speed comes from what the compiler can *prove*: contiguous memory, no al
 
 ## Nothing hidden — read code by its keywords
 
-Everything costly or dangerous in Align announces itself with a greppable word: allocation (`arena`, `heap.new`, `builder`, `.clone()`, `.to_array()`), failure (`Result`, `?`), mutation (`mut`, `out`), threads (`par_map`, `spawn`), the unchecked world (`unsafe`, `raw`, `extern`). A reader — human or AI — audits a file by scanning for those words, and their absence is a guarantee, not a hope. Write code that keeps this property: the next reader of your program is the point of the language.
+Everything costly or dangerous in Align announces itself with a greppable word: allocation (`arena`, `heap.new`, `builder`, `.clone()`, `.to_array()`), failure (`Result`, `?`), mutation (`mut`, `out`, `borrow mut`), threads (`par_map`, `spawn`), native resources (`resource`), the unchecked world (`unsafe`, `raw`, `extern`). A reader — human or AI — audits a file by scanning for those words, and their absence is a guarantee, not a hope. Write code that keeps this property: the next reader of your program is the point of the language.

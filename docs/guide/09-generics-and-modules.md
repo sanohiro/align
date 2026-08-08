@@ -26,7 +26,7 @@ Type parameters are **always inferred from the arguments** — there is no turbo
 
 ## The bounds: `Num` ⊃ `Ord` ⊃ `Eq`
 
-An unbounded `T` is opaque — you can move it, store it, return it, and nothing else. Capabilities come from exactly three built-in bounds:
+An unbounded `T` is opaque — you can move it, store it, return it, and nothing else. Capabilities come from three built-in bounds:
 
 - `T: Eq` — `==`, `!=`
 - `T: Ord` — comparisons (implies `Eq`)
@@ -34,7 +34,7 @@ An unbounded `T` is opaque — you can move it, store it, return it, and nothing
 
 Use an operation the bound doesn't grant and the *definition* fails to compile — not the call site, later, in someone else's build.
 
-That is the entire constraint system, on purpose. **There are no user-defined traits or interfaces** (a decision, not a gap): trait hierarchies are where languages grow a second, Turing-complete type-level dialect that humans skim and AIs hallucinate. Align's bet is that three bounds plus concrete types cover the real generic code a data-oriented program contains, and everything else is better said with a plain function.
+Those three, plus one closed structural bound `RegionPlain` (used only for region-backed plain construction — it grants no arithmetic or equality), are the entire built-in constraint system, on purpose. **There are no user-defined traits or interfaces** (a decision, not a gap): trait hierarchies are where languages grow a second, Turing-complete type-level dialect that humans skim and AIs hallucinate. Align's bet is that three bounds plus concrete types cover the real generic code a data-oriented program contains, and everything else is better said with a plain function.
 
 ## Generic types
 
@@ -62,7 +62,7 @@ fn main() -> i32 {
 }
 ```
 
-`Option<T>` and `Result<T, E>` are exactly this mechanism, shipped with the language. Current limits, honestly labeled: a generic *function* over a generic *struct* (`fn first<T>(p: Pair<T>) -> T`) is implementation in progress, and constructing a payload-less variant alone (`Opt.Empty`) needs context to pin `T`.
+`Option<T>` and `Result<T, E>` are exactly this mechanism, shipped with the language. A generic *function* over a generic *struct* (`fn first<T>(p: Pair<T>) -> T`) works, and a type parameter may appear under `array`, `slice`, or an application of another top-level generic definition. One honest limit remains: constructing a payload-less variant alone (`Opt.Empty`) needs context to pin `T`.
 
 ## Modules are files
 

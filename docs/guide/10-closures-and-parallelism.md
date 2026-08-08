@@ -44,7 +44,7 @@ Current limits (implementation in progress): a lambda bound to a value needs typ
 
 ## Purity is inferred — and parallelism requires it
 
-The compiler infers, for every function, whether it is **Pure** (no I/O, no rng, no FFI, no mutation of anything external). You never annotate it; you can't get it wrong. You only notice when it protects you:
+The compiler infers, for every function, whether it is **Pure** (no I/O, no rng, no FFI, and no mutation of external state it does not own — updating a value passed as an explicit `borrow mut` parameter still counts as Pure, since the caller handed it over for exactly that). You never annotate it; you can't get it wrong. You only notice when it protects you:
 
 ```align
 fn show(x: i64) -> i64 {

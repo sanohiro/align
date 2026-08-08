@@ -10,7 +10,7 @@ How do you put this all together to build an entire application? Let's build a m
 
 In OOP, a game entity is a class with fields and methods. In ECS:
 - **Entities** are just IDs (e.g., `i64`). They contain no data.
-- **Components** are plain data, stored as flat, parallel columns — the same field-per-column shape [chapter 11](11-data-oriented.md) taught as `soa<T>`, though here they are bare top-level arrays rather than an actual `soa<T>` value: `soa<T>` is arena-bound (chapter 20), while these components must outlive any single frame's arena.
+- **Components** are plain data, stored as flat, parallel columns — the same field-per-column shape [chapter 11](11-data-oriented.md) taught as `soa<T>`, though here they are plain arrays owned in `main` rather than an actual `soa<T>` value: `soa<T>` is arena-bound (chapter 20), while these components must outlive any single frame's arena. (A top-level `:=` is a compile-time constant, so the columns are declared inside `main` and threaded into systems by `borrow mut`; the fragments below show the shape.)
 - **Systems** are functions that iterate over components using pipelines.
 
 Let's model a tiny 1D world where things have positions and velocities.

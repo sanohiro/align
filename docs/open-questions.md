@@ -2801,6 +2801,50 @@ shipped behavior normative without fixing the internal sorting algorithm. Full c
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
+### Scalar-family `==` / `Ord` admission for 128-bit id types — pending (post-`pkg.db`, `std.id`)
+
+ULID / UUID value ergonomics want `==` / `Ord` on a 128-bit `id`, but the settled rule is
+"`==` supports scalars and strings only." Proposal: define a one-time admission criterion —
+fixed-size Copy, no interior structure, a total byte order, O(1) compare, no allocation — and admit
+qualifying types by explicit per-type decision, with `id` the first. The criterion rejects `decimal`
+(value equality ≠ byte equality), so it is not an open door. Motivation is data-oriented:
+`group_by id` is a top workload, so an id column that cannot compare or group is a hole in the most
+common key type. Do not ship a method-comparison dialect or an undecided `==`; if unresolved, defer
+`std.id` whole (ideal-or-defer). When settled, update `draft.md`, `docs/language-spec.md`, and
+`docs/design-notes.md` in one pass.
+
+### `test` block syntax for in-language testing — pending (post-`pkg.db`, `core.test`)
+
+No in-language test mechanism exists. Proposal: a top-level `test "name" { body }` declaration typed
+as `fn() -> Result<(), Error>` (failure = `Err` early-return, reusing the one error model), with
+`expect` / `expect_eq` builtins callable only inside test blocks, and an `align test` runner that
+executes one test per subprocess (abort isolation) in declaration order. This adds new grammar, so it
+goes through the large-design gate before implementation. The tail `Ok(())` wrap is part of the
+`test` construct and must be documented, not hidden (nothing-hidden).
+
+### Library stances pending confirmation — YAML / i18n / server TLS / long-lived mutable state
+
+Recommendations recorded here for confirmation; on approval each moves to Settled or `non-goals.md`.
+
+- **YAML** — never in core/std, and no "subset" (its ambiguity lives at the center of the spec, not
+  the edge, so a subset boundary cannot be named). If ever needed, a document-type parser
+  (kubeconfig, compose) tested against that schema, not a general YAML surface. Output is always
+  JSON. Industry precedent agrees: only Ruby put YAML in its stdlib and paid a ~10-year unsafe-load
+  security cost; Python/Go/Java/Node keep json/xml/csv but deliberately omit YAML.
+- **i18n** — Unicode correctness (UTF-8 validation, text carried unbroken) is already met;
+  locale-dependent behavior (collation, locale formats, case-fold, TZ display, translation) is
+  permanently out of core/std, consistent with ASCII-only `eq_ignore_ascii_case` and
+  byte-lexicographic `Ord(str)`. Normalization/grapheme work, if a real consumer appears, is an
+  isolated `pkg.unicode`.
+- **Server-side TLS** — v1 assumes a reverse proxy; requires a pkg.web forwarded-header trust
+  discipline (interpret `X-Forwarded-*` only from a configured trusted proxy; default distrust),
+  without which the proxy assumption is a client-IP spoofing hole. Revisit at HTTP/2 (ALPN) or real
+  standalone-deploy demand — a revisit, not a permanent no.
+- **Long-lived mutable state** (e.g. a server-lifetime Pool) — currently expressible only in
+  `main`'s outermost scope threaded by `borrow mut`. Whether that is ergonomic enough for
+  server-shaped programs, or wants a dedicated form, is open. Guide chapters 20 and 22 sketch this
+  and now carry a note to that effect; their full rewrite follows this resolution.
+
 ### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 
 Found by the M15 S2 adversarial gate; reproduced on the untouched whole-program path, so
