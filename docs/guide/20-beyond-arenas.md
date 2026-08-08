@@ -12,7 +12,7 @@ In an Object-Oriented language, you would `new Player()` and let the Garbage Col
 
 ## The Pool
 
-A Pool is just a pre-allocated block of parallel columns that reuses slots — the same column-per-field shape [chapter 11](11-data-oriented.md) taught as `soa<T>`. It cannot literally *be* a `soa<T>`, though: those columns are arena-resident (`to_soa` must be called inside an `arena`, and the columns die with it), while a Pool's whole point is data that outlives any single arena. So here the columns are bare top-level bindings instead, kept alive for as long as the server runs. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column:
+A Pool is just a pre-allocated block of parallel columns that reuses slots — the same column-per-field shape [chapter 11](11-data-oriented.md) taught as `soa<T>`. It cannot literally *be* a `soa<T>`, though: those columns are arena-resident (`to_soa` must be called inside an `arena`, and the columns die with it), while a Pool's whole point is data that outlives any single arena. So the columns instead live in `main`'s outermost scope — owned there for as long as the server runs, and threaded into each handler by a `borrow mut` parameter. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column. (The fragments below show the column *shape*; a top-level `:=` is a compile-time constant, so these `mut` columns are declared inside `main`, not at file scope.)
 
 ```align
 mut alive := [false, false, false, false].to_array()

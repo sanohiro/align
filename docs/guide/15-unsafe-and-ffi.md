@@ -23,7 +23,7 @@ fn main() -> i32 {
 }
 ```
 
-`null` / `alloc` / `free` / `load` / `store` / `offset` — that is the entire unsafe vocabulary. No pointer arithmetic operators, no casts-through-pointers dialect: six named operations you can grep for. `raw.null()` is the explicit native-ABI null sentinel; it does not add null to ordinary Align values. *Holding* a `raw` is safe (it's a Copy value; pass it around freely); only operating on one needs the block.
+`null` / `alloc` / `free` / `load` / `store` / `offset` — that is the entire unsafe vocabulary. No pointer arithmetic operators, no casts-through-pointers dialect: six named operations you can grep for. (A `resource` type's own internal code adds a few representation-privilege verbs — `resource.from_raw`, `.into_raw`, `.view_from_raw` — usable only inside that type's `unsafe` code, never a bypass in ordinary `unsafe`.) `raw.null()` is the explicit native-ABI null sentinel; it does not add null to ordinary Align values. *Holding* a `raw` is safe (it's a Copy value; pass it around freely); only operating on one needs the block.
 
 `load` and `store` admit primitive scalars, `raw` pointers, and eligible `layout(C)` structs. A
 native wrapper can therefore keep a C handle in a package-owned state block without casting the

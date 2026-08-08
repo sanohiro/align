@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/05-memory.md)
 
-Align has no garbage collector, no manual `free`, and no lifetime annotations. Instead: **where data lives is a decision you make**, ownership is **a property of the type**, and the compiler infers every lifetime and rejects the programs that would dangle. This chapter is the whole model — it is small.
+Align has no garbage collector, no manual `free`, and no lifetime annotations. Instead: **where data lives is a decision you make**, ownership is **a property of the type**, and the compiler infers every lifetime and rejects the programs that would dangle. This chapter is the core of the model — it is small.
 
 ## Values (the default)
 
@@ -109,4 +109,4 @@ That's all of it. When you create data, ask one question — *what is its lifeti
 - One value that must outlive the frame → **`heap.new`** in the arena that matches its lifetime.
 - Just looking at someone else's data → **a view** (`str`, `slice`), free of charge.
 
-Everything else — when to free, whether it escapes, who owns what — is the compiler's job, checked at compile time, invisible in the source except at the two visible points: `arena {}` where a lifetime begins and ends, and `.clone()` where you pay for a copy.
+Everything else — when to free, whether it escapes, who owns what — is the compiler's job, checked at compile time, invisible in the source except at a few visible points: `arena {}` (or a named `arena r {}`) where a lifetime begins and ends, `.clone()` where you pay for a copy, and a `borrow` / `borrow mut` parameter where a function reads or updates a value it does not own.

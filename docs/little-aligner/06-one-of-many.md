@@ -96,7 +96,7 @@ fn area(s: Shape) -> i64 = match s {
 
 **Q12.** What may a payload be?
 
-**A12.** Scalars and plain structs — `Wrap(Point)` is fine, and the arm `Wrap(p) => p.x + p.y` reaches inside. (An owning payload like `string` is not accepted today.)
+**A12.** Scalars and plain structs — `Wrap(Point)` is fine, and the arm `Wrap(p) => p.x + p.y` reaches inside. (An owning payload like `string` is accepted too — the whole sum simply becomes a Move value, and only the live arm is dropped.)
 
 ---
 

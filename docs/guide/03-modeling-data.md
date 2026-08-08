@@ -69,7 +69,7 @@ fn main() -> i32 {
 }
 ```
 
-Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional. They may be scalars, borrowed `str` views, structs, sums, owned strings, or supported owned arrays. Owned payloads make the whole sum value a Move value; only the live arm is recursively dropped. Multiple owned payloads in one variant must share one allocation mode. Nested tagged payload types such as `Result<Option<T>, E>` remain a later implementation slice.
+Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional. They may be scalars, borrowed `str` views, structs, sums, owned strings, or supported owned arrays. Owned payloads make the whole sum value a Move value; only the live arm is recursively dropped. Multiple owned payloads in one variant must share one allocation mode. Nested tagged payloads such as `Result<Option<T>, E>` work too, reusing the same one error model and one ownership model rather than a second mechanism.
 
 ## `match`
 

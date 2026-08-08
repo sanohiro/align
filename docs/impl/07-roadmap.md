@@ -3723,6 +3723,87 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
                                 io_uring); no DB-specific frontend shortcut
 ```
 
+## Post-pkg.db library waves (planned, not yet gated)
+
+Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
+Nothing here is a committed contract: each becomes a gated design under `impl/std-design/` or
+`impl/pkg-design/` at its own implementation start (broad-contract items — `core.test` syntax,
+`std.id` scalar admission — go through the design/open-questions gate first). This section records
+the plan so the sequencing survives; it does not lock any surface.
+
+### Convergence — a few foundations unlock many exits
+
+```text
+1. HTTP client streaming receive (de-chunk + incremental read + SSE)
+     highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
+2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + PKCS#8 PEM)
+     unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
+3. Small pieces: std.xml (well-formed read-only) + std.time named formatters
+     unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
+     (encoding.percent_encode already shipped; only a '/'-passthrough path variant remains)
+4. Transport: mTLS / Unix domain socket / proxy, then HTTP/2
+     unlock Kubernetes, Docker, corporate networks, gRPC-family services
+```
+
+### Planned packages (order)
+
+```text
+language self-hosting : core.test (+bench) -> std.log -> core.codec -> pkg.frame
+domain                : pkg.auth -> pkg.kv -> pkg.csv -> pkg.ws -> pkg.template
+cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 / MinIO / B2)
+```
+
+### One-line capability outline (core / prerequisites / open decision)
+
+- **core.test** — top-level `test "name" { body: Result<(), Error> }`; `expect`/`expect_eq`
+  (test-block-only builtins); per-test subprocess runner; failure = `Err` early-return.
+  **Requires a language decision: new `test` block syntax — design gate.**
+- **std.id** — one 128-bit Copy scalar; ULID / UUIDv7 / UUIDv4 differ only by generation rule +
+  text form; monotonic ULID via an explicit Move generator; CSPRNG source; parse strict.
+  **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,
+  no interior structure, total byte order, O(1), no allocation — admits `id`, rejects decimal).**
+- **std.log** — level-gated line logger; explicit Move logger (no global state); best-effort
+  writes; formatting via existing template/builder + `write_hex`/`write_float`.
+- **core.codec** — columnar wire format, **data only, NOT RPC**; `codec.open` validates once then
+  column access is zero-copy region-bound to input; Arrow-compatible buffer layout, own minimal
+  type set (i64/f64/bool/str) in v1; golden-vector both directions.
+- **pkg.frame** — dataframe over `soa-groupby` + codec batches; hash equi-join v1; reuses the
+  array pipeline (no query DSL); built after codec settles.
+- **pkg.auth** — JWT HS256, argon2id PHC, session token; pure assembly over shipped
+  crypto/base64url (no new base infra); `now_ns` passed in; all Impure (FFI); HS256 key ≥ 32B.
+- **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on
+  protocol violation. (rediss:// TLS deferred; plaintext TCP v1.)
+- **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
+  fields only are arena-normalized; BOM stripped once.
+- **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to
+  the package (not added to public crypto).
+- **pkg.template** — escape-by-default HTML builder; `raw` is the one unescaped path; shares the
+  shipped `encoding.html_escape` 5-entity table.
+- **std.xml** — well-formed-only read-only reader; DOCTYPE / DTD / PI / external entity rejected
+  (XXE / billion-laughs closed by construction); namespaces not expanded; consumers S3 + Azure Blob.
+- **std.time formatters** — rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped
+  i64-ns timeline; parse self-output + minimal compat; no strftime DSL, no locale/TZ (permanent
+  non-goal). Plus `encoding.percent_encode_path`.
+- **std.crypto asymmetric** — RS256 / ES256 / Ed25519 sign+verify + PKCS#8 PEM load; per-alg
+  function names (alg-confusion closed by shape); ES256 raw r||s 64B; all Impure (FFI).
+- **std.http client streaming** — `http_read_stream` (distinct type from the shipped server-side
+  `http_stream`); de-chunk also completes the one-shot API; SSE receive per WHATWG; mid-body Drop
+  closes rather than pool-returns.
+- **std.fs.watch** — non-recursive directory watch; Move + blocking `next()` →
+  `{path, Created|Modified|Removed}`; kqueue/inotify; consumers: `--watch` tooling, cert reload.
+
+### Deferred / stance (pending confirmation in `open-questions.md`)
+
+- **YAML** — never in core/std; no "subset". If ever needed, a document-type parser
+  (kubeconfig, compose), tested against that schema. Output is always JSON. (Only Ruby put YAML in
+  its stdlib; it paid a ~10-year unsafe-load security cost.)
+- **i18n** — Unicode correctness (UTF-8, text carried unbroken) already met; locale-dependent
+  behavior (collation, locale formats, case-fold, TZ display, translation) permanently out of
+  core/std. Consistent with `eq_ignore_ascii_case` ASCII-only and byte-lexicographic `Ord(str)`.
+- **Server-side TLS** — v1 assumes a reverse proxy; requires pkg.web forwarded-header trust
+  discipline (interpret `X-Forwarded-*` only from a configured trusted proxy; default distrust).
+  Revisit at HTTP/2 (ALPN) or real standalone-deploy demand — a revisit, not a permanent no.
+
 ## Out of v1 Scope (intentional)
 
 As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, whole-frontend
