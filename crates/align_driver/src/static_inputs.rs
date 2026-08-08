@@ -481,40 +481,25 @@ fn resolve_static_descriptors_inner(
             permitted_drivers(restriction)
                 .iter()
                 .copied()
-                .map(|driver| {
-                    snapshot_checked_metadata_record(
-                        project_root,
-                        &descriptor.descriptor_id,
-                        driver,
-                    )
-                })
+                .map(|driver| snapshot_checked_metadata_record(project_root, &descriptor.descriptor_id, driver))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
-                    descriptor_input_error(
-                        descriptor,
-                        StaticDescriptorInputErrorCause::Input(error),
-                    )
+                    descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
                 })?
         } else {
             permitted_drivers(restriction)
                 .iter()
                 .copied()
                 .map(|driver| {
-                    Ok((
-                        CheckedMetadataInput {
-                            driver,
-                            logical_path: metadata_logical_path(&descriptor.descriptor_id, driver)?,
-                            state: MetadataState::Missing,
-                        },
-                        None,
-                    ))
+                    Ok((CheckedMetadataInput {
+                        driver,
+                        logical_path: metadata_logical_path(&descriptor.descriptor_id, driver)?,
+                        state: MetadataState::Missing,
+                    }, None))
                 })
                 .collect::<Result<Vec<_>, StaticInputError>>()
                 .map_err(|error| {
-                    descriptor_input_error(
-                        descriptor,
-                        StaticDescriptorInputErrorCause::Input(error),
-                    )
+                    descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
                 })?
         };
         input.input.checked_metadata = metadata.iter().map(|(input, _)| input.clone()).collect();
@@ -1007,29 +992,23 @@ fn snapshot_checked_metadata_record(
         Ok(metadata) if metadata.is_file() => {
             let bytes = read_metadata_bytes(&root, &path, &logical)?;
             let record = parse_checked_metadata(&bytes, &logical, descriptor_id, driver)?;
-            Ok((
-                CheckedMetadataInput {
-                    driver,
-                    logical_path: logical,
-                    state: MetadataState::Present {
-                        content_hash: record.metadata_digest,
-                        format_version: record.format_version,
-                    },
+            Ok((CheckedMetadataInput {
+                driver,
+                logical_path: logical,
+                state: MetadataState::Present {
+                    content_hash: record.metadata_digest,
+                    format_version: record.format_version,
                 },
-                Some(record),
-            ))
+            }, Some(record)))
         }
         Ok(_) => Err(StaticInputError::NotRegularFile(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             ensure_metadata_parent_inside(&root, &path)?;
-            Ok((
-                CheckedMetadataInput {
-                    driver,
-                    logical_path: logical,
-                    state: MetadataState::Missing,
-                },
-                None,
-            ))
+            Ok((CheckedMetadataInput {
+                driver,
+                logical_path: logical,
+                state: MetadataState::Missing,
+            }, None))
         }
         Err(error) => Err(StaticInputError::Io {
             path,
