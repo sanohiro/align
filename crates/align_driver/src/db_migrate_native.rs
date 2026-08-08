@@ -1718,7 +1718,7 @@ SELECT t.relkind,t.relpersistence,(t.relowner=current_user::pg_catalog.regrole):
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_rewrite r WHERE r.ev_class=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_policy p WHERE p.polrelid=t.table_oid),
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.aclexplode(COALESCE((SELECT relacl FROM pg_catalog.pg_class WHERE oid=t.table_oid),pg_catalog.acldefault('r',t.relowner))) a WHERE a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
-       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_attribute ca CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(ca.attacl,ARRAY[]::pg_catalog.aclitem[])) a WHERE ca.attrelid=t.table_oid AND ca.attnum>0 AND NOT ca.attisdropped AND a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
+       (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_attribute ca CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(ca.attacl,pg_catalog.acldefault('c',t.relowner))) a WHERE ca.attrelid=t.table_oid AND ca.attnum>0 AND NOT ca.attisdropped AND a.grantee<>t.relowner AND a.privilege_type IS NOT NULL),
        (SELECT am.amname FROM pg_catalog.pg_am am WHERE am.oid=(SELECT relam FROM pg_catalog.pg_class WHERE oid=t.table_oid)),
        t.relreplident,
        (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_publication_rel pr WHERE pr.prrelid=t.table_oid)
@@ -2810,5 +2810,7 @@ mod tests {
         for ambiguous in ["a.attidentity ||", "a.attgenerated ||", "contype ||"] {
             assert!(!sql.contains(ambiguous));
         }
+        assert!(sql.contains("COALESCE(ca.attacl,pg_catalog.acldefault('c',t.relowner))"));
+        assert!(!sql.contains("ARRAY[]::pg_catalog.aclitem[]"));
     }
 }
