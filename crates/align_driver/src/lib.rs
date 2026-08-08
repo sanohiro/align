@@ -2671,10 +2671,14 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
 /// therefore keep the established `extern "C" link(...)` behavior.
 pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
     const LIBPQ_CLOSURE: [&str; 5] = ["pq", "ssl", "crypto", "zstd", "z"];
-    if !link_libs.iter().any(|library| library == "pq") {
+    let Some(pq_index) = link_libs.iter().position(|library| library == "pq") else {
         return link_libs.to_vec();
-    }
-    let mut ordered = link_libs
+    };
+    // Keep the original `pq` position as the closure boundary. Libraries before it may be
+    // independent prerequisites; libraries after it may be dependencies introduced by libpq
+    // itself (for example LDAP on a custom static build), and moving either side changes the
+    // caller's existing archive order.
+    let mut ordered = link_libs[..pq_index]
         .iter()
         .filter(|library| !LIBPQ_CLOSURE.contains(&library.as_str()))
         .cloned()
@@ -2684,6 +2688,12 @@ pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
             ordered.push(library.to_string());
         }
     }
+    ordered.extend(
+        link_libs[pq_index + 1..]
+            .iter()
+            .filter(|library| !LIBPQ_CLOSURE.contains(&library.as_str()))
+            .cloned(),
+    );
     ordered
 }
 
@@ -3126,6 +3136,15 @@ mod tests {
     fn link_order_without_libpq_is_unchanged() {
         let input = ["crypto", "z", "zstd"].into_iter().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(order_link_libs(&input), input);
+    }
+
+    #[test]
+    fn libpq_closure_preserves_libraries_after_pq() {
+        let input = ["pq", "ldap", "ssl", "crypto"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(order_link_libs(&input), ["pq", "ssl", "crypto", "ldap"]);
     }
 
     #[test]
