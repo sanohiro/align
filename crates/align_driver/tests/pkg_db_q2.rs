@@ -1340,14 +1340,14 @@ import pkg.db.sqlite
 import pkg.db.postgres
 import app.portable_query
 
-fn main(args: array<str>) -> i32 {
+fn main(args: array<str>) -> Result<(), Error> {
   url := args[1]
   sqlite := pkg.db.sqlite.connect(":memory:", [])
   postgres := pkg.db.postgres.connect(url, [])
-  return match sqlite {
-    Err(_) => 2
+  match sqlite {
+    Err(_) => { print(2); return Ok(()) }
     Ok(sqlite_connection) => match postgres {
-      Err(_) => 3
+      Err(_) => { print(3); return Ok(()) }
       Ok(postgres_connection) => {
         sqlite_target := pkg.db.exec_conn(sqlite_connection)
         postgres_target := pkg.db.exec_conn(postgres_connection)
@@ -1369,7 +1369,8 @@ fn main(args: array<str>) -> i32 {
               [],
             )
             postgres_ok := match postgres_row { Ok(row) => row.value == 42, Err(_) => false }
-            if sqlite_ok && postgres_ok { 42 } else { 4 }
+            if sqlite_ok && postgres_ok { print(42) } else { print(4) }
+            return Ok(())
           }
         }
       }
@@ -1396,11 +1397,11 @@ fn main(args: array<str>) -> i32 {
         &[postgres_url.as_str()],
         &[],
     );
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
         String::from_utf8_lossy(&output.stdout),
+        "42\n",
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 }
