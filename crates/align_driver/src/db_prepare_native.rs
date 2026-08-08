@@ -342,6 +342,13 @@ impl SqliteDescriber {
                 return Err(error);
             }
         }
+        if let Err(error) = self.execute_script(
+            b"BEGIN; SELECT rootpage FROM sqlite_schema LIMIT 1;",
+            "SQLite schema snapshot",
+        ) {
+            self.close();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -634,7 +641,8 @@ impl Drop for SqliteDescriber {
     }
 }
 
-type PqConnect = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type PqConnectParams =
+    unsafe extern "C" fn(*const *const c_char, *const *const c_char, c_int) -> *mut c_void;
 type PqFinish = unsafe extern "C" fn(*mut c_void);
 type PqStatus = unsafe extern "C" fn(*const c_void) -> c_int;
 type PqClientEncoding = unsafe extern "C" fn(*const c_void) -> c_int;
@@ -661,7 +669,7 @@ type PqIndexedInt = unsafe extern "C" fn(*const c_void, c_int) -> c_int;
 
 struct PostgresApi {
     _library: dynamic::Library,
-    connectdb: PqConnect,
+    connectdb_params: PqConnectParams,
     finish: PqFinish,
     status: PqStatus,
     client_encoding: PqClientEncoding,
@@ -707,7 +715,7 @@ impl PostgresApi {
         // owns the dynamic library for the complete lifetime of every call.
         unsafe {
             Ok(Self {
-                connectdb: library.symbol(b"PQconnectdb\0")?,
+                connectdb_params: library.symbol(b"PQconnectdbParams\0")?,
                 finish: library.symbol(b"PQfinish\0")?,
                 status: library.symbol(b"PQstatus\0")?,
                 client_encoding: library.symbol(b"PQclientEncoding\0")?,
@@ -745,6 +753,89 @@ pub struct PostgresDescriber {
 
 type PostgresOrigin = (Option<String>, Option<String>, Option<String>);
 
+fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
+    let rest = url
+        .strip_prefix("postgresql://")
+        .or_else(|| url.strip_prefix("postgres://"))
+        .ok_or_else(|| fail("PostgreSQL preparation requires a complete postgresql:// URL"))?;
+    if rest.contains('#') {
+        return Err(fail(
+            "PostgreSQL preparation URL must not contain a fragment",
+        ));
+    }
+    let (authority, path_and_query) = rest
+        .split_once('/')
+        .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit database"))?;
+    let (userinfo, host_port) = authority.rsplit_once('@').ok_or_else(|| {
+        fail("PostgreSQL preparation URL must include an explicit user and password")
+    })?;
+    let (user, password) = userinfo
+        .split_once(':')
+        .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit password"))?;
+    if user.is_empty() || password.is_empty() {
+        return Err(fail(
+            "PostgreSQL preparation URL must include a non-empty user and password",
+        ));
+    }
+    let (host, port) = if let Some(ipv6) = host_port.strip_prefix('[') {
+        let (host, port) = ipv6
+            .split_once("]:")
+            .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit port"))?;
+        (host, port)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit port"))?
+    };
+    if host.is_empty() || host.contains(',') {
+        return Err(fail(
+            "PostgreSQL preparation URL must select exactly one explicit host",
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| fail("PostgreSQL preparation URL has an invalid explicit port"))?;
+    if port == 0 {
+        return Err(fail("PostgreSQL preparation URL port must be non-zero"));
+    }
+    let (database, query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(database, query)| {
+            (database, Some(query))
+        });
+    if database.is_empty() || database.contains('/') {
+        return Err(fail(
+            "PostgreSQL preparation URL must select exactly one explicit database",
+        ));
+    }
+    if let Some(query) = query {
+        for parameter in query.split('&') {
+            let key = parameter.split_once('=').map_or(parameter, |(key, _)| key);
+            if key.contains('%')
+                || matches!(
+                    key,
+                    "host"
+                        | "hostaddr"
+                        | "port"
+                        | "dbname"
+                        | "database"
+                        | "user"
+                        | "password"
+                        | "service"
+                        | "servicefile"
+                        | "client_encoding"
+                        | "options"
+                )
+            {
+                return Err(fail(
+                    "PostgreSQL preparation URL contains a forbidden target or startup override",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl PostgresDescriber {
     pub fn new(url: String, schema_id: String) -> Self {
         Self {
@@ -760,11 +851,33 @@ impl PostgresDescriber {
         if !self.connection.is_null() {
             return Ok(());
         }
+        validate_complete_postgres_url(&self.url)?;
         let api = PostgresApi::load()?;
         let url = CString::new(self.url.as_bytes())
             .map_err(|_| fail("PostgreSQL URL contains U+0000"))?;
-        // SAFETY: URL is a live NUL-terminated string for this synchronous call.
-        let connection = unsafe { (api.connectdb)(url.as_ptr()) };
+        let dbname = CString::new("dbname").map_err(|_| fail("invalid libpq keyword"))?;
+        let client_encoding =
+            CString::new("client_encoding").map_err(|_| fail("invalid libpq keyword"))?;
+        let options = CString::new("options").map_err(|_| fail("invalid libpq keyword"))?;
+        let utf8 = CString::new("UTF8").map_err(|_| fail("invalid libpq value"))?;
+        // One ASCII space is a non-empty libpq value (so PGOPTIONS is not consulted) and an empty
+        // startup-option sequence after server tokenization.
+        let no_startup_options = CString::new(" ").map_err(|_| fail("invalid libpq value"))?;
+        let keywords = [
+            dbname.as_ptr(),
+            client_encoding.as_ptr(),
+            options.as_ptr(),
+            std::ptr::null(),
+        ];
+        let values = [
+            url.as_ptr(),
+            utf8.as_ptr(),
+            no_startup_options.as_ptr(),
+            std::ptr::null(),
+        ];
+        // SAFETY: both pointer arrays and every referenced C string stay live for this synchronous
+        // call. Expansion parses the first `dbname` URL; the later package-owned UTF-8 value wins.
+        let connection = unsafe { (api.connectdb_params)(keywords.as_ptr(), values.as_ptr(), 1) };
         if connection.is_null() {
             return Err(fail("libpq returned a null PostgreSQL connection"));
         }
@@ -782,7 +895,24 @@ impl PostgresDescriber {
         }
         self.connection = connection;
         self.api = Some(api);
+        if let Err(error) = self.execute_command(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            "PostgreSQL schema snapshot",
+        ) {
+            self.close();
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn close(&mut self) {
+        if !self.connection.is_null() {
+            if let Some(api) = &self.api {
+                // SAFETY: this describer owns one PGconn and releases it at most once.
+                unsafe { (api.finish)(self.connection) };
+            }
+            self.connection = std::ptr::null_mut();
+        }
     }
 
     fn query_rows(
@@ -840,6 +970,37 @@ impl PostgresDescriber {
         decoded
     }
 
+    fn execute_command(&self, sql: &str, context: &str) -> Result<(), PrepareError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let sql = CString::new(sql).map_err(|_| fail(format!("{context} contains U+0000")))?;
+        // SAFETY: the connection and command text are live for this synchronous call.
+        let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
+        if result.is_null() {
+            return Err(fail(format!("libpq returned a null {context} result")));
+        }
+        let status = unsafe { (api.result_status)(result) };
+        let error = if status == 1 {
+            None
+        } else {
+            Some(fail(
+                pq_text(
+                    unsafe { (api.result_error_message)(result) },
+                    &format!("{context} error"),
+                )
+                .unwrap_or_else(|_| format!("{context} failed with status {status}")),
+            ))
+        };
+        // SAFETY: this non-null PGresult is cleared exactly once after copying its error text.
+        unsafe { (api.clear)(result) };
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn type_name(&mut self, oid: u32) -> Result<String, PrepareError> {
         if let Some(name) = self.type_names.get(&oid) {
             return Ok(name.clone());
@@ -875,33 +1036,7 @@ impl PostgresDescriber {
     }
 
     fn deallocate(&self, name: &str) -> Result<(), PrepareError> {
-        let api = self
-            .api
-            .as_ref()
-            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
-        let sql = CString::new(format!("DEALLOCATE \"{name}\""))
-            .map_err(|_| fail("PostgreSQL prepared name contains U+0000"))?;
-        let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
-        if result.is_null() {
-            return Err(fail("libpq returned a null DEALLOCATE result"));
-        }
-        let status = unsafe { (api.result_status)(result) };
-        let error = if status == 1 {
-            None
-        } else {
-            Some(fail(
-                pq_text(
-                    unsafe { (api.result_error_message)(result) },
-                    "PostgreSQL DEALLOCATE error",
-                )
-                .unwrap_or_else(|_| format!("PostgreSQL DEALLOCATE failed with status {status}")),
-            ))
-        };
-        unsafe { (api.clear)(result) };
-        match error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.execute_command(&format!("DEALLOCATE \"{name}\""), "PostgreSQL DEALLOCATE")
     }
 }
 
@@ -1142,12 +1277,6 @@ impl MetadataDescriber for PostgresDescriber {
 
 impl Drop for PostgresDescriber {
     fn drop(&mut self) {
-        if !self.connection.is_null() {
-            if let Some(api) = &self.api {
-                // SAFETY: this describer owns one PGconn and releases it exactly once.
-                unsafe { (api.finish)(self.connection) };
-            }
-            self.connection = std::ptr::null_mut();
-        }
+        self.close();
     }
 }

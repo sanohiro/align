@@ -353,6 +353,12 @@ fn schema_identities_and_publication_are_exact_and_check_is_read_only() {
     let written = publish_metadata_batch(&batch, false).expect("publish metadata");
     assert_eq!(written.selected, 3);
     assert_eq!(written.changed, 3);
+    let publication_lock = project.dir.join(".align-db/.publication.lock");
+    assert!(
+        std::fs::symlink_metadata(&publication_lock)
+            .expect("publication lock")
+            .is_file()
+    );
     let clean = publish_metadata_batch(&batch, true).expect("metadata is current");
     assert_eq!(clean.changed, 0);
     let path = &batch.files[0].path;
@@ -901,6 +907,26 @@ fn prepare_cli_input_and_precedence_matrix() {
         String::from_utf8_lossy(&checked.stderr)
     );
     assert!(String::from_utf8_lossy(&checked.stdout).contains("selected=1 changed=0"));
+}
+
+#[test]
+fn postgres_rejects_ambient_connection_defaults_before_native_load() {
+    for url in [
+        "postgresql:///align",
+        "postgresql://align:align@127.0.0.1/align",
+        "postgresql://align:align@127.0.0.1:5432/align?host=elsewhere",
+        "host=127.0.0.1 dbname=align user=align password=align",
+    ] {
+        let mut describer = PostgresDescriber::new(url.to_string(), "q3-test-v1".to_string());
+        let error = describer
+            .environment()
+            .expect_err("reject incomplete or overriding PostgreSQL URL");
+        assert!(
+            error.to_string().contains("PostgreSQL preparation")
+                && error.to_string().contains("URL"),
+            "{url}: {error}"
+        );
+    }
 }
 
 #[test]

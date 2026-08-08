@@ -16,7 +16,7 @@ use align_sema::{
 use align_span::{FileId, SourceMap, Span};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -24,6 +24,157 @@ pub const STATIC_INPUT_MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const STATIC_INPUT_MANIFEST_MAGIC: [u8; 8] = *b"ALIGNINP";
 const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEQUENCE: usize = 1 << 16;
+const METADATA_PUBLICATION_LOCK: &str = ".align-db/.publication.lock";
+
+/// A cross-process metadata snapshot guard. Existing repositories without a lock file remain
+/// readable, but the guard verifies that no first publisher appeared while that legacy snapshot
+/// was being read. Once created, the lock file is stable operational state rather than a build
+/// input; OS locks are released automatically if a compiler or preparation process exits.
+pub(crate) struct MetadataPublicationLock {
+    _file: Option<File>,
+    absent_path: Option<PathBuf>,
+}
+
+impl MetadataPublicationLock {
+    pub(crate) fn validate(&self) -> Result<(), StaticInputError> {
+        let Some(path) = &self.absent_path else {
+            return Ok(());
+        };
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(StaticInputError::Stale(
+                "checked metadata publication overlapped static-input resolution".to_string(),
+            )),
+            Err(error) => Err(StaticInputError::Io {
+                path: path.clone(),
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+
+fn open_existing_publication_lock(
+    path: &Path,
+    write: bool,
+) -> Result<File, StaticInputError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| StaticInputError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StaticInputError::NotRegularFile(path.to_path_buf()));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(path)
+        .map_err(|error| StaticInputError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+pub(crate) fn lock_metadata_publication_shared(
+    project_root: &Path,
+) -> Result<MetadataPublicationLock, StaticInputError> {
+    let path = project_root.join(METADATA_PUBLICATION_LOCK);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MetadataPublicationLock {
+                _file: None,
+                absent_path: Some(path),
+            });
+        }
+        Err(error) => {
+            return Err(StaticInputError::Io {
+                path,
+                message: error.to_string(),
+            });
+        }
+        Ok(_) => {}
+    }
+    let file = open_existing_publication_lock(&path, false)?;
+    file.lock_shared().map_err(|error| StaticInputError::Io {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    Ok(MetadataPublicationLock {
+        _file: Some(file),
+        absent_path: None,
+    })
+}
+
+pub(crate) fn lock_metadata_publication_exclusive(
+    project_root: &Path,
+) -> Result<MetadataPublicationLock, StaticInputError> {
+    let directory = project_root.join(".align-db");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(StaticInputError::InvalidPath(format!(
+                "metadata root `{}` is not a real directory",
+                directory.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+                        StaticInputError::Io {
+                            path: directory.clone(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(StaticInputError::InvalidPath(format!(
+                            "metadata root `{}` is not a real directory",
+                            directory.display()
+                        )));
+                    }
+                }
+                Err(error) => {
+                    return Err(StaticInputError::Io {
+                        path: directory.clone(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(StaticInputError::Io {
+                path: directory,
+                message: error.to_string(),
+            });
+        }
+    }
+    let path = project_root.join(METADATA_PUBLICATION_LOCK);
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_existing_publication_lock(&path, true)?
+        }
+        Err(error) => {
+            return Err(StaticInputError::Io {
+                path,
+                message: error.to_string(),
+            });
+        }
+    };
+    file.lock().map_err(|error| StaticInputError::Io {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    Ok(MetadataPublicationLock {
+        _file: Some(file),
+        absent_path: None,
+    })
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -362,6 +513,21 @@ fn resolve_static_descriptors_inner(
             ));
         }
     }
+    let publication_lock = if load_checked_metadata {
+        descriptors
+            .first()
+            .map(|descriptor| {
+                lock_metadata_publication_shared(project_root).map_err(|error| {
+                    descriptor_input_error(
+                        descriptor,
+                        StaticDescriptorInputErrorCause::Input(error),
+                    )
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let mut resolved = Vec::with_capacity(descriptors.len());
     let mut file_snapshots = HashMap::new();
     for descriptor in descriptors {
@@ -511,6 +677,15 @@ fn resolve_static_descriptors_inner(
             descriptor_input_error(descriptor, StaticDescriptorInputErrorCause::Input(error))
         })?;
         resolved.push(input);
+    }
+
+    if let (Some(lock), Some(descriptor)) = (&publication_lock, descriptors.first()) {
+        lock.validate().map_err(|error| {
+            descriptor_input_error(
+                descriptor,
+                StaticDescriptorInputErrorCause::Input(error),
+            )
+        })?;
     }
 
     let manifest = match StaticInputManifest::new(
@@ -2579,6 +2754,32 @@ mod tests {
             logical_path: metadata_logical_path(id, driver).expect("metadata path"),
             state,
         }
+    }
+
+    #[test]
+    fn metadata_publication_lock_closes_first_publish_and_overlap_races() {
+        let root = temp_root("publication-lock");
+        let legacy_reader = lock_metadata_publication_shared(&root).expect("legacy read guard");
+        let first_writer =
+            lock_metadata_publication_exclusive(&root).expect("first publication lock");
+        assert!(matches!(
+            legacy_reader.validate(),
+            Err(StaticInputError::Stale(_))
+        ));
+        drop(legacy_reader);
+        drop(first_writer);
+
+        let writer = lock_metadata_publication_exclusive(&root).expect("publication writer");
+        let lock_path = root.join(METADATA_PUBLICATION_LOCK);
+        let reader_file = open_existing_publication_lock(&lock_path, false).expect("reader file");
+        let error = reader_file
+            .try_lock_shared()
+            .expect_err("exclusive writer must exclude a reader");
+        assert!(matches!(error, std::fs::TryLockError::WouldBlock));
+        drop(writer);
+        reader_file
+            .lock_shared()
+            .expect("reader proceeds after writer release");
     }
 
     fn descriptor(

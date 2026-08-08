@@ -1170,15 +1170,30 @@ catalogをtool action内で列挙する。`--query` は対象をさらに絞る�
 modeだけがmissing/stale artifactを許し、`--check` は何も書かない。normal buildは
 environmentを読まずDBへ接続しない。mutableなSQLite DB fileとPostgreSQL targetは
 non-empty/non-secret UTF-8かつU+0000なしの `--schema-id` を必須にする。
+PostgreSQL URLはnon-empty user/password、exactly one host、nonzero port、exactly one
+databaseを明示する。target override、service expansion、`client_encoding`、startup
+`options`を拒否し、toolが`PQconnectdbParams`でpackage-owned UTF-8とempty startup-option
+sequenceを渡すため、ambient `PG*` defaultがtarget/encoding/SQL settingを選ばない。
 `--memory [--migrations]` は§16.6からidentityをderiveして `--schema-id` を禁止する。
+1 preparation batchは1 schema snapshotだけを観測する。SQLiteはmigration transaction後に
+read transactionを開始して`sqlite_schema`を読み、PostgreSQLはenvironment capture前に
+read-only repeatable-read transactionを開始する。全selected prepare/describeまで保持し、
+preparation connectionと一緒にcloseする。
 
 ### 16.3 metadata location
 
 ```text
 .align-db/
+  .publication.lock
   sqlite/<descriptor-id-hash>.json
   postgres/<descriptor-id-hash>.json
 ```
+
+`.publication.lock` はemptyなimplementation-owned cross-process lockで、build inputでも
+artifact identityでもない。normal compilationはchecked metadata snapshot全体でshared OS
+lockを保持し、preparationはcomparison、staging、replacement、rollback全体でexclusive
+lockを保持する。最初のpublication後もfileを残すため、process exitだけでsynchronizationが
+解放され、stale-lock recoveryを必要としない。
 
 `descriptor-id-hash` はQueryのquery_idまたはcommand_idである`descriptor_id` exact bytesの
 `Hash128::of(...).to_hex()`。directoryはexactに
@@ -2211,6 +2226,15 @@ Q3のchecked-in native evidence matrixは次である。
 
 macOSのPostgreSQL testはserver URL未設定なら理由付きskipできる。required `db-postgres` CIは
 `ALIGN_DB_POSTGRES_REQUIRED=1` とPostgreSQL 16.4を使い、未設定/接続不能をfailureにする。
+
+最初のfull-diff reviewで、deterministic stateに関する3つのgapについてQ3 matrixを再度
+開いた。finding-to-fix closureは次である。
+
+| finding | root-cause closure | owner evidence |
+|---|---|---|
+| ambient libpq default | library load前にuser/password/single host/port/databaseを明示したcomplete URLを要求し、target/startup overrideを拒否する。`PQconnectdbParams`でpackage-owned `client_encoding=UTF8`とempty startup-option sequenceを最後に渡す。 | `pkg_db_q3::postgres_rejects_ambient_connection_defaults_before_native_load` とrequired PostgreSQL CI |
+| statement間のschema drift | SQLiteは`sqlite_schema`を読む1つのread transaction、PostgreSQLは1つのread-only repeatable-read transactionを開始する。environment captureから全selected describeまで維持し、connection Dropで解放する。 | SQLite native/migration owners と `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` |
+| filesystem generationの混在 | 永続するimplementation-owned `.align-db/.publication.lock` はbuild inputではない。normal readerはmetadata snapshot全体でshared OS lockを保持し、publicationはcomparison/staging/replacement/rollback全体でexclusive lockを保持する。最初のlock fileより前に開始したreaderはresolution中にfileが現れたら拒否する。process exitはlockを自動解放する。 | `static_inputs::tests::metadata_publication_lock_closes_first_publish_and_overlap_races`、`pkg_db_q3::schema_identities_and_publication_are_exact_and_check_is_read_only` とoffline whole/per-unit consumption |
 
 `.align-db/sqlite` exact derived path/canonical fail-closed JSONとindependent byte/digest golden、
 `alignc db prepare`/`--check`、producer-owned checked QueryMeta evidence、explicit

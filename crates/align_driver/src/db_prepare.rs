@@ -9,8 +9,9 @@ use crate::static_artifacts::{
     build_static_artifacts_for_regeneration, root_fields, static_statement_class,
 };
 use crate::static_inputs::{
-    encode_checked_metadata, metadata_path, resolve_static_descriptors_for_regeneration,
-    ParsedCheckedMetadata, ParsedMetadataColumn, ParsedMetadataExtension, ParsedMetadataParameter,
+    encode_checked_metadata, lock_metadata_publication_exclusive, lock_metadata_publication_shared,
+    metadata_path, resolve_static_descriptors_for_regeneration, ParsedCheckedMetadata,
+    ParsedMetadataColumn, ParsedMetadataExtension, ParsedMetadataParameter,
 };
 use crate::{lower_to_mir, BuiltStaticArtifact, Checked};
 use align_interface::{
@@ -930,6 +931,13 @@ pub fn publish_metadata_batch(
         staged: Option<PathBuf>,
     }
 
+    let publication_lock = if check_only {
+        lock_metadata_publication_shared(&batch.project_root)
+    } else {
+        lock_metadata_publication_exclusive(&batch.project_root)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+
     let mut changes = Vec::new();
     for file in &batch.files {
         metadata_parent_is_safe(&batch.project_root, &file.path)?;
@@ -969,6 +977,9 @@ pub fn publish_metadata_batch(
         }
     }
     if check_only {
+        publication_lock
+            .validate()
+            .map_err(|error| fail(error.to_string()))?;
         if changes.is_empty() {
             return Ok(PublicationReport {
                 selected: batch.files.len(),
