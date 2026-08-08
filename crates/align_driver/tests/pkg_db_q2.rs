@@ -1272,6 +1272,36 @@ fn postgres_required_mode_requires_configuration() {
 }
 
 #[test]
+fn inherited_environment_survives_pkg_db_link_closure() {
+    if !backend_available() {
+        return;
+    }
+    unsafe { std::env::set_var("ALIGN_DB_Q2_INHERITED", "inherited-value") };
+    let main = r#"module main
+import std.env
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.postgres
+
+fn main() -> i32 {
+  return match env.get("ALIGN_DB_Q2_INHERITED") {
+    Some(value) => if value == "inherited-value" { 42 } else { 2 }
+    None => 1
+  }
+}
+"#;
+    let output = build_and_run_multi("pkg-db-q2-inherited-environment", &package_files(main), "main.align");
+    unsafe { std::env::remove_var("ALIGN_DB_Q2_INHERITED") };
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn postgres_required_portable_query_runs_against_both_drivers() {
     if !backend_available() {
         return;
@@ -1289,6 +1319,7 @@ fn postgres_required_portable_query_runs_against_both_drivers() {
         eprintln!("postgres portable-query integration skipped: ALIGN_DB_POSTGRES_URL is not set");
         return;
     }
+    let postgres_url = std::env::var("ALIGN_DB_POSTGRES_URL").expect("configured URL");
     const QUERY: &str = r#"module app.portable_query
 import pkg.db
 
@@ -1359,7 +1390,12 @@ fn main() -> i32 {
         ("app/portable_query.align", QUERY),
         ("main.align", main),
     ];
-    let output = build_and_run_multi("pkg-db-q2-required-postgres-portable", &files, "main.align");
+    let output = build_and_run_multi_with_env(
+        "pkg-db-q2-required-postgres-portable",
+        &files,
+        "main.align",
+        &[("ALIGN_DB_POSTGRES_URL", postgres_url.as_str())],
+    );
     assert_eq!(
         output.status.code(),
         Some(42),

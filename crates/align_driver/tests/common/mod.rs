@@ -374,6 +374,18 @@ pub fn build_and_run_multi(
     files: &[(&str, &str)],
     entry: &str,
 ) -> std::process::Output {
+    build_and_run_multi_with_env(name, files, entry, &[])
+}
+
+/// [`build_and_run_multi`] with explicit environment pairs applied to the generated child. The
+/// default helper still inherits the test process environment; integration tests that model a
+/// tool-provided value use this variant to pin the exact child input at the process boundary.
+pub fn build_and_run_multi_with_env(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     let proj = TempProject::new(name, files);
     let entry_path = proj.entry(entry);
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
@@ -402,7 +414,11 @@ pub fn build_and_run_multi(
     )
     .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
-    std::process::Command::new(&exe).output().expect("run")
+    let mut command = std::process::Command::new(&exe);
+    for &(key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run")
 }
 
 /// Compile + run a multi-file program through the whole-program path, including the compiler-owned
