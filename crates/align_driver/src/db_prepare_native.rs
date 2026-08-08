@@ -8,7 +8,7 @@ use crate::db_prepare::{
     NativeStatementDescription, PreparationEnvironment, PrepareError,
 };
 use align_interface::{Driver, DriverEntry, Hash128, MetaNullability, StaticArtifact};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
 fn fail(reason: impl Into<String>) -> PrepareError {
@@ -38,11 +38,15 @@ mod dynamic {
         pub fn open(candidates: &[&str]) -> Result<Self, PrepareError> {
             let mut failures = Vec::new();
             for candidate in candidates {
-                let name = CString::new(*candidate).map_err(|_| fail("native library name contains NUL"))?;
+                let name = CString::new(*candidate)
+                    .map_err(|_| fail("native library name contains NUL"))?;
                 // SAFETY: `name` is a live NUL-terminated string and RTLD_NOW is a supported flag.
                 let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
                 if !handle.is_null() {
-                    return Ok(Self { handle, name: (*candidate).to_string() });
+                    return Ok(Self {
+                        handle,
+                        name: (*candidate).to_string(),
+                    });
                 }
                 // SAFETY: `dlerror` returns either null or a process-owned NUL-terminated message.
                 let message = unsafe {
@@ -55,11 +59,15 @@ mod dynamic {
                 };
                 failures.push(format!("{candidate}: {message}"));
             }
-            Err(fail(format!("cannot load native database library ({})", failures.join("; "))))
+            Err(fail(format!(
+                "cannot load native database library ({})",
+                failures.join("; ")
+            )))
         }
 
         pub unsafe fn symbol<T: Copy>(&self, name: &'static [u8]) -> Result<T, PrepareError> {
-            let name = CStr::from_bytes_with_nul(name).map_err(|_| fail("native symbol name is not terminated"))?;
+            let name = CStr::from_bytes_with_nul(name)
+                .map_err(|_| fail("native symbol name is not terminated"))?;
             // Clear a prior loader error before resolving this symbol.
             unsafe { dlerror() };
             // SAFETY: the library handle is live and `name` is NUL terminated.
@@ -71,7 +79,9 @@ mod dynamic {
                     "symbol resolved to null".to_string()
                 } else {
                     // SAFETY: non-null `dlerror` text is NUL terminated and loader owned.
-                    unsafe { CStr::from_ptr(error) }.to_string_lossy().into_owned()
+                    unsafe { CStr::from_ptr(error) }
+                        .to_string_lossy()
+                        .into_owned()
                 };
                 return Err(fail(format!(
                     "cannot resolve `{}` from {}: {detail}",
@@ -80,11 +90,38 @@ mod dynamic {
                 )));
             }
             if std::mem::size_of::<T>() != std::mem::size_of::<*mut c_void>() {
-                return Err(fail("native function pointer has an unsupported representation"));
+                return Err(fail(
+                    "native function pointer has an unsupported representation",
+                ));
             }
             // SAFETY: the caller chooses the exact C function-pointer type for this named symbol;
             // the size equality above rejects non-pointer `T` representations.
             Ok(unsafe { std::mem::transmute_copy(&pointer) })
+        }
+
+        pub unsafe fn optional_symbol<T: Copy>(
+            &self,
+            name: &'static [u8],
+        ) -> Result<Option<T>, PrepareError> {
+            let name = CStr::from_bytes_with_nul(name)
+                .map_err(|_| fail("native symbol name is not terminated"))?;
+            // Clear a prior loader error before resolving this optional symbol.
+            unsafe { dlerror() };
+            // SAFETY: the library handle is live and `name` is NUL terminated.
+            let pointer = unsafe { dlsym(self.handle, name.as_ptr()) };
+            // SAFETY: this reads the thread-local loader error for the immediately preceding call.
+            let error = unsafe { dlerror() };
+            if pointer.is_null() || !error.is_null() {
+                return Ok(None);
+            }
+            if std::mem::size_of::<T>() != std::mem::size_of::<*mut c_void>() {
+                return Err(fail(
+                    "native function pointer has an unsupported representation",
+                ));
+            }
+            // SAFETY: the caller chooses the exact optional C function-pointer type for this named
+            // symbol; the size equality above rejects non-pointer `T` representations.
+            Ok(Some(unsafe { std::mem::transmute_copy(&pointer) }))
         }
     }
 
@@ -107,16 +144,30 @@ mod dynamic {
 
     impl Library {
         pub fn open(_candidates: &[&str]) -> Result<Self, PrepareError> {
-            Err(fail("database preparation is not yet supported on this host"))
+            Err(fail(
+                "database preparation is not yet supported on this host",
+            ))
         }
 
         pub unsafe fn symbol<T: Copy>(&self, _name: &'static [u8]) -> Result<T, PrepareError> {
-            Err(fail("database preparation is not yet supported on this host"))
+            Err(fail(
+                "database preparation is not yet supported on this host",
+            ))
+        }
+
+        pub unsafe fn optional_symbol<T: Copy>(
+            &self,
+            _name: &'static [u8],
+        ) -> Result<Option<T>, PrepareError> {
+            Err(fail(
+                "database preparation is not yet supported on this host",
+            ))
         }
     }
 }
 
-type SqliteOpen = unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_int, *const c_char) -> c_int;
+type SqliteOpen =
+    unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_int, *const c_char) -> c_int;
 type SqliteClose = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SqliteErrmsg = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type SqliteVersion = unsafe extern "C" fn() -> *const c_char;
@@ -152,9 +203,9 @@ struct SqliteApi {
     column_count: SqliteCount,
     column_name: SqliteIndexedText,
     column_decltype: SqliteIndexedText,
-    column_database_name: SqliteIndexedText,
-    column_table_name: SqliteIndexedText,
-    column_origin_name: SqliteIndexedText,
+    column_database_name: Option<SqliteIndexedText>,
+    column_table_name: Option<SqliteIndexedText>,
+    column_origin_name: Option<SqliteIndexedText>,
     exec: SqliteExec,
     free: SqliteFree,
 }
@@ -170,7 +221,13 @@ impl SqliteApi {
         ];
         #[cfg(not(target_os = "macos"))]
         let candidates = ["libsqlite3.so.0", "libsqlite3.so", "libsqlite3.dylib", ""];
-        let library = dynamic::Library::open(&candidates.iter().copied().filter(|value| !value.is_empty()).collect::<Vec<_>>())?;
+        let library = dynamic::Library::open(
+            &candidates
+                .iter()
+                .copied()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        )?;
         // SAFETY: every symbol is assigned its documented sqlite3 C signature and the library is
         // retained in the same table for longer than any call.
         unsafe {
@@ -186,9 +243,9 @@ impl SqliteApi {
                 column_count: library.symbol(b"sqlite3_column_count\0")?,
                 column_name: library.symbol(b"sqlite3_column_name\0")?,
                 column_decltype: library.symbol(b"sqlite3_column_decltype\0")?,
-                column_database_name: library.symbol(b"sqlite3_column_database_name\0")?,
-                column_table_name: library.symbol(b"sqlite3_column_table_name\0")?,
-                column_origin_name: library.symbol(b"sqlite3_column_origin_name\0")?,
+                column_database_name: library.optional_symbol(b"sqlite3_column_database_name\0")?,
+                column_table_name: library.optional_symbol(b"sqlite3_column_table_name\0")?,
+                column_origin_name: library.optional_symbol(b"sqlite3_column_origin_name\0")?,
                 exec: library.symbol(b"sqlite3_exec\0")?,
                 free: library.symbol(b"sqlite3_free\0")?,
                 _library: library,
@@ -232,7 +289,9 @@ impl SqliteDescriber {
         Self {
             api: None,
             database: std::ptr::null_mut(),
-            schema_fingerprint: crate::db_prepare::sqlite_memory_schema_fingerprint(Some(catalog.fingerprint)),
+            schema_fingerprint: crate::db_prepare::sqlite_memory_schema_fingerprint(Some(
+                catalog.fingerprint,
+            )),
             source: SqliteSource::Memory(Some(catalog)),
         }
     }
@@ -248,11 +307,15 @@ impl SqliteDescriber {
                     .map_err(|_| fail("SQLite database path contains U+0000"))?,
                 1,
             ),
-            SqliteSource::Memory(_) => (CString::new(":memory:").map_err(|_| fail("invalid SQLite memory name"))?, 2 | 4),
+            SqliteSource::Memory(_) => (
+                CString::new(":memory:").map_err(|_| fail("invalid SQLite memory name"))?,
+                2 | 4,
+            ),
         };
         let mut database = std::ptr::null_mut();
         // SAFETY: all pointers are live for the call and `database` is valid output storage.
-        let status = unsafe { (api.open_v2)(name.as_ptr(), &mut database, flags, std::ptr::null()) };
+        let status =
+            unsafe { (api.open_v2)(name.as_ptr(), &mut database, flags, std::ptr::null()) };
         if status != 0 || database.is_null() {
             let message = if database.is_null() {
                 format!("SQLite open failed with status {status}")
@@ -269,7 +332,11 @@ impl SqliteDescriber {
         self.database = database;
         self.api = Some(api);
         if let SqliteSource::Memory(Some(catalog)) = &self.source {
-            let scripts = catalog.entries.iter().map(|entry| entry.bytes.clone()).collect::<Vec<_>>();
+            let scripts = catalog
+                .entries
+                .iter()
+                .map(|entry| entry.bytes.clone())
+                .collect::<Vec<_>>();
             if let Err(error) = self.apply_migrations(&scripts) {
                 self.close();
                 return Err(error);
@@ -279,7 +346,10 @@ impl SqliteDescriber {
     }
 
     fn execute_script(&self, bytes: &[u8], context: &str) -> Result<(), PrepareError> {
-        let api = self.api.as_ref().ok_or_else(|| fail("SQLite function table is absent"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("SQLite function table is absent"))?;
         let sql = CString::new(bytes).map_err(|_| fail(format!("{context} contains U+0000")))?;
         let mut error_message = std::ptr::null_mut();
         // SAFETY: the connection and SQL are live for this synchronous call; no callback is used.
@@ -310,7 +380,9 @@ impl SqliteDescriber {
     fn apply_migrations(&self, scripts: &[Vec<u8>]) -> Result<(), PrepareError> {
         self.execute_script(b"BEGIN IMMEDIATE", "SQLite migration transaction")?;
         for (index, script) in scripts.iter().enumerate() {
-            if let Err(error) = self.execute_script(script, &format!("SQLite migration {:04}", index + 1)) {
+            if let Err(error) =
+                self.execute_script(script, &format!("SQLite migration {:04}", index + 1))
+            {
                 let _ = self.execute_script(b"ROLLBACK", "SQLite migration rollback");
                 return Err(error);
             }
@@ -345,12 +417,29 @@ fn sqlite_text(pointer: *const c_char, what: &str) -> Result<String, PrepareErro
         .map_err(|_| fail(format!("{what} is not UTF-8")))
 }
 
-fn sqlite_optional_text(pointer: *const c_char, what: &str) -> Result<Option<String>, PrepareError> {
+fn sqlite_optional_text(
+    pointer: *const c_char,
+    what: &str,
+) -> Result<Option<String>, PrepareError> {
     if pointer.is_null() {
         Ok(None)
     } else {
         sqlite_text(pointer, what).map(Some)
     }
+}
+
+fn sqlite_optional_origin(
+    function: Option<SqliteIndexedText>,
+    statement: *mut c_void,
+    index: c_int,
+    what: &str,
+) -> Result<Option<String>, PrepareError> {
+    let Some(function) = function else {
+        return Ok(None);
+    };
+    // SAFETY: the optional symbol has SQLite's indexed column-text signature, and the caller keeps
+    // the prepared statement live while the returned text is copied.
+    sqlite_optional_text(unsafe { function(statement, index) }, what)
 }
 
 fn sqlite_tail_empty(bytes: &[u8]) -> bool {
@@ -360,9 +449,14 @@ fn sqlite_tail_empty(bytes: &[u8]) -> bool {
             index += 1;
         } else if bytes.get(index..index + 2) == Some(b"--") {
             index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' { index += 1; }
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
         } else if bytes.get(index..index + 2) == Some(b"/*") {
-            let Some(end) = bytes[index + 2..].windows(2).position(|window| window == b"*/") else {
+            let Some(end) = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+            else {
                 return false;
             };
             index += end + 4;
@@ -380,7 +474,10 @@ impl MetadataDescriber for SqliteDescriber {
 
     fn environment(&mut self) -> Result<PreparationEnvironment, PrepareError> {
         self.open()?;
-        let api = self.api.as_ref().ok_or_else(|| fail("SQLite function table is absent"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("SQLite function table is absent"))?;
         // SAFETY: the loaded function table and connection stay live in `self`.
         let version = sqlite_text(unsafe { (api.libversion)() }, "SQLite library version")?;
         Ok(PreparationEnvironment {
@@ -398,18 +495,32 @@ impl MetadataDescriber for SqliteDescriber {
         entry: &DriverEntry,
     ) -> Result<NativeStatementDescription, PrepareError> {
         self.open()?;
-        let api = self.api.as_ref().ok_or_else(|| fail("SQLite function table is absent"))?;
-        let sql = CString::new(entry.wire_sql.as_slice()).map_err(|_| fail("SQLite SQL contains U+0000"))?;
-        let sql_len = c_int::try_from(entry.wire_sql.len()).map_err(|_| fail("SQLite SQL exceeds i32 length"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("SQLite function table is absent"))?;
+        let sql = CString::new(entry.wire_sql.as_slice())
+            .map_err(|_| fail("SQLite SQL contains U+0000"))?;
+        let sql_len = c_int::try_from(entry.wire_sql.len())
+            .map_err(|_| fail("SQLite SQL exceeds i32 length"))?;
         let mut statement = std::ptr::null_mut();
         let mut tail = std::ptr::null();
         // SAFETY: SQL and output pointers are valid and the connection is live.
         let status = unsafe {
-            (api.prepare_v2)(self.database, sql.as_ptr(), sql_len, &mut statement, &mut tail)
+            (api.prepare_v2)(
+                self.database,
+                sql.as_ptr(),
+                sql_len,
+                &mut statement,
+                &mut tail,
+            )
         };
         if status != 0 || statement.is_null() {
-            let message = sqlite_text(unsafe { (api.errmsg)(self.database) }, "SQLite prepare error")
-                .unwrap_or_else(|_| format!("SQLite prepare failed with status {status}"));
+            let message = sqlite_text(
+                unsafe { (api.errmsg)(self.database) },
+                "SQLite prepare error",
+            )
+            .unwrap_or_else(|_| format!("SQLite prepare failed with status {status}"));
             if !statement.is_null() {
                 // SAFETY: partial prepared statement is finalized once.
                 unsafe { (api.finalize)(statement) };
@@ -420,7 +531,9 @@ impl MetadataDescriber for SqliteDescriber {
         let result = (|| {
             let start = sql.as_ptr() as usize;
             let tail_address = tail as usize;
-            let offset = tail_address.checked_sub(start).ok_or_else(|| fail("SQLite returned a tail before SQL"))?;
+            let offset = tail_address
+                .checked_sub(start)
+                .ok_or_else(|| fail("SQLite returned a tail before SQL"))?;
             if offset > entry.wire_sql.len() || !sqlite_tail_empty(&entry.wire_sql[offset..]) {
                 return Err(fail("SQLite prepared SQL contains more than one statement"));
             }
@@ -429,14 +542,19 @@ impl MetadataDescriber for SqliteDescriber {
             if parameter_count < 0 {
                 return Err(fail("SQLite returned a negative parameter count"));
             }
-            let mut parameters = Vec::with_capacity(parameter_count as usize);
+            let parameter_capacity = usize::try_from(parameter_count)
+                .map_err(|_| fail("SQLite parameter count exceeds usize"))?;
+            let mut parameters = Vec::with_capacity(parameter_capacity);
             for index in 1..=parameter_count {
                 let raw_name = unsafe { (api.bind_parameter_name)(statement, index) };
                 let name = sqlite_optional_text(raw_name, "SQLite parameter name")?.map(|name| {
-                    name.strip_prefix([':', '@', '$']).unwrap_or(&name).to_string()
+                    name.strip_prefix([':', '@', '$'])
+                        .unwrap_or(&name)
+                        .to_string()
                 });
                 parameters.push(NativeParameterDescription {
-                    ordinal: u32::try_from(index).map_err(|_| fail("SQLite parameter ordinal overflow"))?,
+                    ordinal: u32::try_from(index)
+                        .map_err(|_| fail("SQLite parameter ordinal overflow"))?,
                     source_name: name,
                     native_type: None,
                     native_type_id: None,
@@ -446,30 +564,39 @@ impl MetadataDescriber for SqliteDescriber {
             if column_count < 0 {
                 return Err(fail("SQLite returned a negative column count"));
             }
-            let mut columns = Vec::with_capacity(column_count as usize);
+            let column_capacity = usize::try_from(column_count)
+                .map_err(|_| fail("SQLite column count exceeds usize"))?;
+            let mut columns = Vec::with_capacity(column_capacity);
             for index in 0..column_count {
                 let source_alias = sqlite_text(
                     unsafe { (api.column_name)(statement, index) },
                     "SQLite result column name",
                 )?;
                 columns.push(NativeColumnDescription {
-                    ordinal: u32::try_from(index).map_err(|_| fail("SQLite column ordinal overflow"))?,
+                    ordinal: u32::try_from(index)
+                        .map_err(|_| fail("SQLite column ordinal overflow"))?,
                     source_alias,
                     native_type: sqlite_optional_text(
                         unsafe { (api.column_decltype)(statement, index) },
                         "SQLite declared column type",
                     )?,
                     native_type_id: None,
-                    origin_schema: sqlite_optional_text(
-                        unsafe { (api.column_database_name)(statement, index) },
+                    origin_schema: sqlite_optional_origin(
+                        api.column_database_name,
+                        statement,
+                        index,
                         "SQLite origin schema",
                     )?,
-                    origin_table: sqlite_optional_text(
-                        unsafe { (api.column_table_name)(statement, index) },
+                    origin_table: sqlite_optional_origin(
+                        api.column_table_name,
+                        statement,
+                        index,
                         "SQLite origin table",
                     )?,
-                    origin_column: sqlite_optional_text(
-                        unsafe { (api.column_origin_name)(statement, index) },
+                    origin_column: sqlite_optional_origin(
+                        api.column_origin_name,
+                        statement,
+                        index,
                         "SQLite origin column",
                     )?,
                     nullable: MetaNullability::Unknown,
@@ -477,9 +604,14 @@ impl MetadataDescriber for SqliteDescriber {
             }
             let query = matches!(artifact, StaticArtifact::Query(_));
             if query == columns.is_empty() {
-                return Err(fail("SQLite statement result kind disagrees with the static descriptor"));
+                return Err(fail(
+                    "SQLite statement result kind disagrees with the static descriptor",
+                ));
             }
-            Ok(NativeStatementDescription { parameters, columns })
+            Ok(NativeStatementDescription {
+                parameters,
+                columns,
+            })
         })();
 
         // SAFETY: the statement was produced above and is finalized exactly once here.
@@ -488,7 +620,9 @@ impl MetadataDescriber for SqliteDescriber {
             return Err(error);
         }
         if finalize != 0 {
-            return Err(fail(format!("SQLite finalize failed with status {finalize}")));
+            return Err(fail(format!(
+                "SQLite finalize failed with status {finalize}"
+            )));
         }
         result
     }
@@ -504,7 +638,6 @@ type PqConnect = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type PqFinish = unsafe extern "C" fn(*mut c_void);
 type PqStatus = unsafe extern "C" fn(*const c_void) -> c_int;
 type PqClientEncoding = unsafe extern "C" fn(*const c_void) -> c_int;
-type PqErrorMessage = unsafe extern "C" fn(*const c_void) -> *const c_char;
 type PqServerVersion = unsafe extern "C" fn(*const c_void) -> c_int;
 type PqLibVersion = unsafe extern "C" fn() -> c_int;
 type PqExec = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
@@ -532,7 +665,6 @@ struct PostgresApi {
     finish: PqFinish,
     status: PqStatus,
     client_encoding: PqClientEncoding,
-    error_message: PqErrorMessage,
     server_version: PqServerVersion,
     lib_version: PqLibVersion,
     exec: PqExec,
@@ -564,7 +696,13 @@ impl PostgresApi {
         ];
         #[cfg(not(target_os = "macos"))]
         let candidates = ["libpq.so.5", "libpq.so", "libpq.5.dylib", ""];
-        let library = dynamic::Library::open(&candidates.iter().copied().filter(|value| !value.is_empty()).collect::<Vec<_>>())?;
+        let library = dynamic::Library::open(
+            &candidates
+                .iter()
+                .copied()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        )?;
         // SAFETY: every entry below uses libpq's exact C function-pointer signature and the table
         // owns the dynamic library for the complete lifetime of every call.
         unsafe {
@@ -573,7 +711,6 @@ impl PostgresApi {
                 finish: library.symbol(b"PQfinish\0")?,
                 status: library.symbol(b"PQstatus\0")?,
                 client_encoding: library.symbol(b"PQclientEncoding\0")?,
-                error_message: library.symbol(b"PQerrorMessage\0")?,
                 server_version: library.symbol(b"PQserverVersion\0")?,
                 lib_version: library.symbol(b"PQlibVersion\0")?,
                 exec: library.symbol(b"PQexec\0")?,
@@ -624,7 +761,8 @@ impl PostgresDescriber {
             return Ok(());
         }
         let api = PostgresApi::load()?;
-        let url = CString::new(self.url.as_bytes()).map_err(|_| fail("PostgreSQL URL contains U+0000"))?;
+        let url = CString::new(self.url.as_bytes())
+            .map_err(|_| fail("PostgreSQL URL contains U+0000"))?;
         // SAFETY: URL is a live NUL-terminated string for this synchronous call.
         let connection = unsafe { (api.connectdb)(url.as_ptr()) };
         if connection.is_null() {
@@ -632,10 +770,10 @@ impl PostgresDescriber {
         }
         // SAFETY: the connection is live until the failure cleanup or ownership transfer below.
         if unsafe { (api.status)(connection) } != 0 {
-            let message = pq_text(unsafe { (api.error_message)(connection) }, "PostgreSQL connection error")
-                .unwrap_or_else(|_| "PostgreSQL connection failed".to_string());
             unsafe { (api.finish)(connection) };
-            return Err(fail(message));
+            // Native connection diagnostics may echo arbitrary connection-string fields. Keep
+            // every URL credential out of tool output by returning only package-owned text.
+            return Err(fail("PostgreSQL connection failed"));
         }
         // Align's package/runtime contract fixes the client encoding to UTF-8 (libpq tag 6).
         if unsafe { (api.client_encoding)(connection) } != 6 {
@@ -647,8 +785,15 @@ impl PostgresDescriber {
         Ok(())
     }
 
-    fn query_rows(&self, sql: &str, expected_fields: usize) -> Result<Vec<Vec<Option<String>>>, PrepareError> {
-        let api = self.api.as_ref().ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+    fn query_rows(
+        &self,
+        sql: &str,
+        expected_fields: usize,
+    ) -> Result<Vec<Vec<Option<String>>>, PrepareError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
         let sql = CString::new(sql).map_err(|_| fail("PostgreSQL tool query contains U+0000"))?;
         // SAFETY: the connection and SQL are live for this synchronous libpq call.
         let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
@@ -658,17 +803,22 @@ impl PostgresDescriber {
         let decoded = (|| {
             let status = unsafe { (api.result_status)(result) };
             if status != 2 {
-                return Err(fail(pq_text(
-                    unsafe { (api.result_error_message)(result) },
-                    "PostgreSQL query error",
-                ).unwrap_or_else(|_| format!("PostgreSQL query failed with status {status}"))));
+                return Err(fail(
+                    pq_text(
+                        unsafe { (api.result_error_message)(result) },
+                        "PostgreSQL query error",
+                    )
+                    .unwrap_or_else(|_| format!("PostgreSQL query failed with status {status}")),
+                ));
             }
             let rows = unsafe { (api.ntuples)(result) };
             let fields = unsafe { (api.nfields)(result) };
             if rows < 0 || fields < 0 || usize::try_from(fields).ok() != Some(expected_fields) {
                 return Err(fail("PostgreSQL tool query returned an invalid shape"));
             }
-            let mut output = Vec::with_capacity(rows as usize);
+            let row_count =
+                usize::try_from(rows).map_err(|_| fail("PostgreSQL row count exceeds usize"))?;
+            let mut output = Vec::with_capacity(row_count);
             for row in 0..rows {
                 let mut values = Vec::with_capacity(expected_fields);
                 for field in 0..fields {
@@ -695,7 +845,10 @@ impl PostgresDescriber {
             return Ok(name.clone());
         }
         let rows = self.query_rows(&format!("SELECT pg_catalog.format_type({oid},NULL)"), 1)?;
-        let name = rows.first().and_then(|row| row.first()).and_then(Option::as_ref)
+        let name = rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Option::as_ref)
             .ok_or_else(|| fail(format!("PostgreSQL type OID {oid} has no canonical name")))?
             .clone();
         self.type_names.insert(oid, name.clone());
@@ -715,11 +868,17 @@ impl PostgresDescriber {
         let Some(row) = rows.first() else {
             return Ok((None, None, None));
         };
-        Ok((row[0].clone(), row[1].clone(), row[2].clone()))
+        let [schema, table, column] = row.as_slice() else {
+            return Err(fail("PostgreSQL origin query returned an invalid shape"));
+        };
+        Ok((schema.clone(), table.clone(), column.clone()))
     }
 
     fn deallocate(&self, name: &str) -> Result<(), PrepareError> {
-        let api = self.api.as_ref().ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
         let sql = CString::new(format!("DEALLOCATE \"{name}\""))
             .map_err(|_| fail("PostgreSQL prepared name contains U+0000"))?;
         let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
@@ -730,10 +889,13 @@ impl PostgresDescriber {
         let error = if status == 1 {
             None
         } else {
-            Some(fail(pq_text(
-                unsafe { (api.result_error_message)(result) },
-                "PostgreSQL DEALLOCATE error",
-            ).unwrap_or_else(|_| format!("PostgreSQL DEALLOCATE failed with status {status}"))))
+            Some(fail(
+                pq_text(
+                    unsafe { (api.result_error_message)(result) },
+                    "PostgreSQL DEALLOCATE error",
+                )
+                .unwrap_or_else(|_| format!("PostgreSQL DEALLOCATE failed with status {status}")),
+            ))
         };
         unsafe { (api.clear)(result) };
         match error {
@@ -760,8 +922,12 @@ fn postgres_version(value: c_int) -> Result<String, PrepareError> {
         return Err(fail("PostgreSQL version is unavailable"));
     }
     let major = value / 10000;
-    let minor = value % 10000;
-    Ok(format!("{major}.{minor}"))
+    if value >= 100000 {
+        return Ok(format!("{major}.{}", value % 10000));
+    }
+    let minor = (value % 10000) / 100;
+    let patch = value % 100;
+    Ok(format!("{major}.{minor}.{patch}"))
 }
 
 impl MetadataDescriber for PostgresDescriber {
@@ -771,21 +937,36 @@ impl MetadataDescriber for PostgresDescriber {
 
     fn environment(&mut self) -> Result<PreparationEnvironment, PrepareError> {
         self.open()?;
-        let api = self.api.as_ref().ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
         let engine_version = postgres_version(unsafe { (api.server_version)(self.connection) })?;
         let driver_version = postgres_version(unsafe { (api.lib_version)() })?;
-        let search_path = self.query_rows("SELECT pg_catalog.unnest(pg_catalog.current_schemas(true))", 1)?
+        let search_path = self
+            .query_rows(
+                "SELECT pg_catalog.unnest(pg_catalog.current_schemas(true))",
+                1,
+            )?
             .into_iter()
-            .map(|row| row.into_iter().next().flatten().ok_or_else(|| fail("PostgreSQL search path contains NULL")))
+            .map(|row| {
+                row.into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| fail("PostgreSQL search path contains NULL"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut extensions = self.query_rows(
             "SELECT n.nspname,e.extname,e.extversion FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace ORDER BY n.nspname,e.extname,e.extversion",
             3,
         )?.into_iter().map(|row| {
+            let [schema, name, version] = row.as_slice() else {
+                return Err(fail("PostgreSQL extension query returned an invalid shape"));
+            };
             Ok(crate::db_prepare::PreparationExtension {
-                schema: row[0].clone().ok_or_else(|| fail("PostgreSQL extension schema is NULL"))?,
-                name: row[1].clone().ok_or_else(|| fail("PostgreSQL extension name is NULL"))?,
-                version: row[2].clone(),
+                schema: schema.clone().ok_or_else(|| fail("PostgreSQL extension schema is NULL"))?,
+                name: name.clone().ok_or_else(|| fail("PostgreSQL extension name is NULL"))?,
+                version: version.clone(),
             })
         }).collect::<Result<Vec<_>, PrepareError>>()?;
         extensions.sort();
@@ -809,16 +990,30 @@ impl MetadataDescriber for PostgresDescriber {
         entry: &DriverEntry,
     ) -> Result<NativeStatementDescription, PrepareError> {
         self.open()?;
-        let api = self.api.as_ref().ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
         let descriptor_id = match artifact {
             StaticArtifact::Query(query) => &query.query_id,
             StaticArtifact::Command(command) => &command.command_id,
         };
-        let name = format!("align_q3_{}", Hash128::of(descriptor_id.as_bytes()).to_hex());
-        let name_c = CString::new(name.as_bytes()).map_err(|_| fail("PostgreSQL prepared name contains U+0000"))?;
-        let sql = CString::new(entry.wire_sql.as_slice()).map_err(|_| fail("PostgreSQL SQL contains U+0000"))?;
+        let name = format!(
+            "align_q3_{}",
+            Hash128::of(descriptor_id.as_bytes()).to_hex()
+        );
+        let name_c = CString::new(name.as_bytes())
+            .map_err(|_| fail("PostgreSQL prepared name contains U+0000"))?;
+        let sql = CString::new(entry.wire_sql.as_slice())
+            .map_err(|_| fail("PostgreSQL SQL contains U+0000"))?;
         let prepared = unsafe {
-            (api.prepare)(self.connection, name_c.as_ptr(), sql.as_ptr(), 0, std::ptr::null())
+            (api.prepare)(
+                self.connection,
+                name_c.as_ptr(),
+                sql.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
         };
         if prepared.is_null() {
             return Err(fail("libpq returned a null prepare result"));
@@ -827,10 +1022,15 @@ impl MetadataDescriber for PostgresDescriber {
         let prepare_error = if prepare_status == 1 {
             None
         } else {
-            Some(fail(pq_text(
-                unsafe { (api.result_error_message)(prepared) },
-                "PostgreSQL prepare error",
-            ).unwrap_or_else(|_| format!("PostgreSQL prepare failed with status {prepare_status}"))))
+            Some(fail(
+                pq_text(
+                    unsafe { (api.result_error_message)(prepared) },
+                    "PostgreSQL prepare error",
+                )
+                .unwrap_or_else(|_| {
+                    format!("PostgreSQL prepare failed with status {prepare_status}")
+                }),
+            ))
         };
         unsafe { (api.clear)(prepared) };
         if let Some(error) = prepare_error {
@@ -845,24 +1045,36 @@ impl MetadataDescriber for PostgresDescriber {
             let decoded = (|| {
                 let status = unsafe { (api.result_status)(described) };
                 if status != 1 {
-                    return Err(fail(pq_text(
-                        unsafe { (api.result_error_message)(described) },
-                        "PostgreSQL describe error",
-                    ).unwrap_or_else(|_| format!("PostgreSQL describe failed with status {status}"))));
+                    return Err(fail(
+                        pq_text(
+                            unsafe { (api.result_error_message)(described) },
+                            "PostgreSQL describe error",
+                        )
+                        .unwrap_or_else(|_| {
+                            format!("PostgreSQL describe failed with status {status}")
+                        }),
+                    ));
                 }
                 let parameter_count = unsafe { (api.nparams)(described) };
                 let column_count = unsafe { (api.nfields)(described) };
                 if parameter_count < 0 || column_count < 0 {
                     return Err(fail("PostgreSQL describe returned a negative count"));
                 }
-                let mut parameter_oids = Vec::with_capacity(parameter_count as usize);
+                let parameter_capacity = usize::try_from(parameter_count)
+                    .map_err(|_| fail("PostgreSQL parameter count exceeds usize"))?;
+                let mut parameter_oids = Vec::with_capacity(parameter_capacity);
                 for index in 0..parameter_count {
                     parameter_oids.push(unsafe { (api.paramtype)(described, index) });
                 }
-                let mut column_data = Vec::with_capacity(column_count as usize);
+                let column_capacity = usize::try_from(column_count)
+                    .map_err(|_| fail("PostgreSQL column count exceeds usize"))?;
+                let mut column_data = Vec::with_capacity(column_capacity);
                 for index in 0..column_count {
                     column_data.push((
-                        pq_text(unsafe { (api.fname)(described, index) }, "PostgreSQL column name")?,
+                        pq_text(
+                            unsafe { (api.fname)(described, index) },
+                            "PostgreSQL column name",
+                        )?,
                         unsafe { (api.ftype)(described, index) },
                         unsafe { (api.ftable)(described, index) },
                         unsafe { (api.ftablecol)(described, index) },
@@ -894,7 +1106,8 @@ impl MetadataDescriber for PostgresDescriber {
             }
             let mut columns = Vec::with_capacity(decoded.1.len());
             for (index, (alias, oid, table_oid, attribute)) in decoded.1.into_iter().enumerate() {
-                let (origin_schema, origin_table, origin_column) = self.origin(table_oid, attribute)?;
+                let (origin_schema, origin_table, origin_column) =
+                    self.origin(table_oid, attribute)?;
                 columns.push(NativeColumnDescription {
                     ordinal: u32::try_from(index)
                         .map_err(|_| fail("PostgreSQL column ordinal overflow"))?,
@@ -909,9 +1122,14 @@ impl MetadataDescriber for PostgresDescriber {
             }
             let query = matches!(artifact, StaticArtifact::Query(_));
             if query == columns.is_empty() {
-                return Err(fail("PostgreSQL statement result kind disagrees with the static descriptor"));
+                return Err(fail(
+                    "PostgreSQL statement result kind disagrees with the static descriptor",
+                ));
             }
-            Ok(NativeStatementDescription { parameters, columns })
+            Ok(NativeStatementDescription {
+                parameters,
+                columns,
+            })
         })();
         let cleanup = self.deallocate(&name);
         match (final_result, cleanup) {

@@ -600,7 +600,10 @@ fn parse_db_prepare(args: &[OsString]) -> Result<DbPrepareOptions, String> {
     let mut url_env = None;
     let mut index = 1usize;
     while index < args.len() {
-        let flag = db_text(&args[index], "option name")?;
+        let flag = args
+            .get(index)
+            .ok_or_else(|| "db prepare option index is out of range".to_string())
+            .and_then(|value| db_text(value, "option name"))?;
         index += 1;
         if flag == "--check" {
             if check_only {

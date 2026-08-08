@@ -2,16 +2,16 @@
 
 mod common;
 use align_driver::db_prepare::{
-    MetadataDescriber, MigrationEntry, NativeColumnDescription, NativeParameterDescription,
-    NativeStatementDescription, PreparationEnvironment, PrepareError, build_metadata_batch,
-    encode_migration_catalog, postgres_schema_fingerprint, publish_metadata_batch,
-    read_migration_catalog, sqlite_database_schema_fingerprint, sqlite_memory_schema_fingerprint,
-};
-use align_driver::{
-    Driver, Hash128, build_per_unit, build_static_artifacts, check, lower_to_mir,
-    resolve_static_descriptors,
+    build_metadata_batch, encode_migration_catalog, postgres_schema_fingerprint,
+    publish_metadata_batch, read_migration_catalog, sqlite_database_schema_fingerprint,
+    sqlite_memory_schema_fingerprint, MetadataDescriber, MigrationEntry, NativeColumnDescription,
+    NativeParameterDescription, NativeStatementDescription, PreparationEnvironment, PrepareError,
 };
 use align_driver::db_prepare_native::{PostgresDescriber, SqliteDescriber};
+use align_driver::{
+    build_per_unit, build_static_artifacts, check, lower_to_mir, resolve_static_descriptors,
+    Driver, Hash128,
+};
 use align_interface::{DriverEntry, MetaNullability, StaticArtifact, VerificationState};
 use align_span::SourceMap;
 use common::Proj;
@@ -203,7 +203,7 @@ impl MetadataDescriber for FakeDescriber {
                     native_type: Some(
                         match self.driver {
                             Driver::SQLite => "INTEGER",
-                            Driver::PostgreSQL => "int8",
+                            Driver::PostgreSQL => "bigint",
                         }
                         .to_string(),
                     ),
@@ -217,7 +217,7 @@ impl MetadataDescriber for FakeDescriber {
                     native_type: Some(
                         match self.driver {
                             Driver::SQLite => "INTEGER",
-                            Driver::PostgreSQL => "int8",
+                            Driver::PostgreSQL => "bigint",
                         }
                         .to_string(),
                     ),
@@ -267,12 +267,10 @@ fn regeneration_ignores_missing_required_metadata_and_is_deterministic() {
     assert_eq!(first.files.len(), 3);
     assert!(first.files.iter().all(|file| file.bytes.ends_with(b"}\n")));
     let nullable = b"\"nullable\":\"unknown\"";
-    assert!(
-        first.files[0]
-            .bytes
-            .windows(nullable.len())
-            .any(|bytes| bytes == nullable)
-    );
+    assert!(first.files[0]
+        .bytes
+        .windows(nullable.len())
+        .any(|bytes| bytes == nullable));
 
     let (mut source_map, checked) = checked_project(&project);
     let mut second_describer = FakeDescriber::new(Driver::SQLite);
@@ -333,14 +331,12 @@ fn schema_identities_and_publication_are_exact_and_check_is_read_only() {
         sqlite_database_schema_fingerprint("schema-v1").expect("stable SQLite schema identity")
     );
     assert!(sqlite_database_schema_fingerprint("bad\0id").is_err());
-    assert!(
-        postgres_schema_fingerprint(
-            "schema-v1",
-            &["app".to_string(), "public".to_string()],
-            &[],
-        )
-        .is_ok()
-    );
+    assert!(postgres_schema_fingerprint(
+        "schema-v1",
+        &["app".to_string(), "public".to_string()],
+        &[],
+    )
+    .is_ok());
 
     let project = project("pkg-db-q3-publication");
     let entry = project.dir.join(&project.entry);
@@ -370,6 +366,22 @@ fn schema_identities_and_publication_are_exact_and_check_is_read_only() {
         std::fs::read(path).expect("read repaired metadata"),
         batch.files[0].bytes
     );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside = project.dir.join("outside-metadata.json");
+        std::fs::write(&outside, b"outside\n").expect("write symlink target");
+        std::fs::remove_file(path).expect("remove metadata destination");
+        symlink(&outside, path).expect("create metadata symlink");
+        let error = publish_metadata_batch(&batch, false).expect_err("reject metadata symlink");
+        assert!(error.to_string().contains("is a symlink"));
+        assert_eq!(
+            std::fs::read(&outside).expect("read symlink target"),
+            b"outside\n"
+        );
+    }
 }
 
 #[test]
@@ -379,6 +391,7 @@ fn selection_rejects_unknown_and_duplicate_ids_before_native_open() {
     for selected in [
         vec!["app.missing.query".to_string()],
         vec!["app.read.query".to_string(), "app.read.query".to_string()],
+        vec!["app.read.query".to_string()],
     ] {
         let (mut source_map, checked) = checked_project(&project);
         let mut describer = FakeDescriber::new(Driver::PostgreSQL);
@@ -421,9 +434,9 @@ fn generated_metadata_is_consumed_offline_and_stale_required_evidence_fails() {
             StaticArtifact::Query(query) => &query.driver_entries,
             StaticArtifact::Command(command) => &command.driver_entries,
         };
-        assert!(entries.iter().all(|entry| {
-            entry.checked_metadata.state == VerificationState::DatabaseChecked
-        }));
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.checked_metadata.state == VerificationState::DatabaseChecked }));
     }
 
     let entry_source = std::fs::read_to_string(&entry).expect("read entry for per-unit build");
@@ -449,9 +462,9 @@ fn generated_metadata_is_consumed_offline_and_stale_required_evidence_fails() {
             StaticArtifact::Query(query) => &query.driver_entries,
             StaticArtifact::Command(command) => &command.driver_entries,
         };
-        assert!(entries.iter().all(|entry| {
-            entry.checked_metadata.state == VerificationState::DatabaseChecked
-        }));
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.checked_metadata.state == VerificationState::DatabaseChecked }));
     }
 
     let read_path = project.dir.join("app/read.sql");
@@ -484,8 +497,12 @@ fn sqlite_native_prepare_describes_the_selected_query() {
     )
     .expect("native SQLite metadata");
     assert_eq!(batch.files.len(), 2);
-    let bytes = &batch.files.iter().find(|file| file.descriptor_id == "app.read.query")
-        .expect("SQLite Query metadata").bytes;
+    let bytes = &batch
+        .files
+        .iter()
+        .find(|file| file.descriptor_id == "app.read.query")
+        .expect("SQLite Query metadata")
+        .bytes;
     for needle in [
         b"\"driver\":\"sqlite\"".as_slice(),
         b"\"source_name\":\"value\"".as_slice(),
@@ -494,16 +511,23 @@ fn sqlite_native_prepare_describes_the_selected_query() {
     ] {
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
     }
-
 }
 
 fn reference_migration_bytes(entries: &[(u32, &str, &[u8])]) -> Vec<u8> {
     let mut bytes = b"ALIGNMIG".to_vec();
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&u32::try_from(entries.len()).expect("fixture count").to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(entries.len())
+            .expect("fixture count")
+            .to_le_bytes(),
+    );
     for (version, filename, content) in entries {
         bytes.extend_from_slice(&version.to_le_bytes());
-        bytes.extend_from_slice(&u32::try_from(filename.len()).expect("fixture filename").to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(filename.len())
+                .expect("fixture filename")
+                .to_le_bytes(),
+        );
         bytes.extend_from_slice(filename.as_bytes());
         let hash = Hash128::of(content);
         bytes.extend_from_slice(&hash.lo.to_le_bytes());
@@ -513,7 +537,11 @@ fn reference_migration_bytes(entries: &[(u32, &str, &[u8])]) -> Vec<u8> {
 }
 
 fn reference_string(bytes: &mut Vec<u8>, value: &str) {
-    bytes.extend_from_slice(&u32::try_from(value.len()).expect("fixture string length").to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("fixture string length")
+            .to_le_bytes(),
+    );
     bytes.extend_from_slice(value.as_bytes());
 }
 
@@ -543,11 +571,19 @@ fn reference_schema_identity(
         reference_string(&mut bytes, schema_id);
     }
     if driver == Driver::PostgreSQL {
-        bytes.extend_from_slice(&u32::try_from(search_path.len()).expect("fixture path count").to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(search_path.len())
+                .expect("fixture path count")
+                .to_le_bytes(),
+        );
         for path in search_path {
             reference_string(&mut bytes, path);
         }
-        bytes.extend_from_slice(&u32::try_from(extensions.len()).expect("fixture extension count").to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(extensions.len())
+                .expect("fixture extension count")
+                .to_le_bytes(),
+        );
         for (schema, name, version) in extensions {
             reference_string(&mut bytes, schema);
             reference_string(&mut bytes, name);
@@ -591,7 +627,14 @@ fn schema_identity_goldens_match_an_independent_encoder() {
         ),
         (
             "schema_identity_sqlite_migrations_v1",
-            reference_schema_identity(Driver::SQLite, 0, None, Some(Some(migration_digest)), &[], &[]),
+            reference_schema_identity(
+                Driver::SQLite,
+                0,
+                None,
+                Some(Some(migration_digest)),
+                &[],
+                &[],
+            ),
             sqlite_memory_schema_fingerprint(Some(migration_digest)),
             include_str!("golden/schema_identity_sqlite_migrations_v1.hex"),
             include_str!("golden/schema_identity_sqlite_migrations_v1.digest"),
@@ -625,7 +668,10 @@ fn schema_identity_goldens_match_an_independent_encoder() {
     ];
     for (name, bytes, production, expected_hex, expected_digest) in fixtures {
         assert_eq!(Hash128::of(&bytes), production, "{name}");
-        let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert_eq!(hex, expected_hex.trim(), "{name}");
         assert_eq!(production.to_hex(), expected_digest.trim(), "{name}");
     }
@@ -641,7 +687,14 @@ fn migration_catalog_validates_before_sqlite_open_and_applies_atomically() {
     std::fs::write(migrations.join("0002_seed.sql"), second).expect("write second migration");
     std::fs::write(migrations.join("0001_create_items.sql"), first).expect("write first migration");
     let catalog = read_migration_catalog(&migrations).expect("read migration catalog");
-    assert_eq!(catalog.entries.iter().map(|entry| entry.version).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(
+        catalog
+            .entries
+            .iter()
+            .map(|entry| entry.version)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
     assert_eq!(
         catalog.encoded,
         reference_migration_bytes(&[
@@ -650,7 +703,12 @@ fn migration_catalog_validates_before_sqlite_open_and_applies_atomically() {
         ])
     );
     assert_eq!(catalog.fingerprint, Hash128::of(&catalog.encoded));
-    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
     assert_eq!(
         hex(&catalog.encoded),
         include_str!("golden/migration_catalog_nonempty_v1.hex").trim()
@@ -672,14 +730,20 @@ fn migration_catalog_validates_before_sqlite_open_and_applies_atomically() {
     )
     .expect("describe migrated SQLite schema");
     assert_eq!(batch.files.len(), 1);
-    assert!(batch.files[0].bytes.windows(b"\"origin_table\":\"items\"".len())
+    assert!(batch.files[0]
+        .bytes
+        .windows(b"\"origin_table\":\"items\"".len())
         .any(|window| window == b"\"origin_table\":\"items\""));
 
     std::fs::remove_file(migrations.join("0002_seed.sql")).expect("remove second migration");
     std::fs::write(migrations.join("0003_gap.sql"), b"SELECT 1;").expect("write gap migration");
-    assert!(read_migration_catalog(&migrations).unwrap_err().to_string().contains("expected 0002"));
+    assert!(read_migration_catalog(&migrations)
+        .unwrap_err()
+        .to_string()
+        .contains("expected 0002"));
 
-    let empty = encode_migration_catalog(Vec::<MigrationEntry>::new()).expect("encode empty catalog");
+    let empty =
+        encode_migration_catalog(Vec::<MigrationEntry>::new()).expect("encode empty catalog");
     assert_eq!(empty.encoded, reference_migration_bytes(&[]));
     assert_eq!(
         hex(&empty.encoded),
@@ -698,7 +762,10 @@ fn migration_catalog_rejects_invalid_names_and_symlinks() {
     std::fs::create_dir(&migrations).expect("create migrations");
     let invalid = migrations.join("0001_Create.sql");
     std::fs::write(&invalid, b"SELECT 1;").expect("write invalid migration");
-    assert!(read_migration_catalog(&migrations).unwrap_err().to_string().contains("filename"));
+    assert!(read_migration_catalog(&migrations)
+        .unwrap_err()
+        .to_string()
+        .contains("filename"));
     std::fs::remove_file(&invalid).expect("remove invalid migration");
 
     #[cfg(unix)]
@@ -710,11 +777,19 @@ fn migration_catalog_rejects_invalid_names_and_symlinks() {
         std::fs::write(&target, b"SELECT 1;").expect("write symlink target");
         let link = migrations.join("0001_link.sql");
         symlink(&target, &link).expect("create migration symlink");
-        assert!(read_migration_catalog(&migrations).unwrap_err().to_string().contains("symlink"));
+        assert!(read_migration_catalog(&migrations)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
         std::fs::remove_file(&link).expect("remove symlink");
-        let non_utf8 = migrations.join(std::ffi::OsString::from_vec(vec![0xff, b'.', b's', b'q', b'l']));
+        let non_utf8 = migrations.join(std::ffi::OsString::from_vec(vec![
+            0xff, b'.', b's', b'q', b'l',
+        ]));
         if std::fs::write(&non_utf8, b"SELECT 1;").is_ok() {
-            assert!(read_migration_catalog(&migrations).unwrap_err().to_string().contains("non-UTF-8"));
+            assert!(read_migration_catalog(&migrations)
+                .unwrap_err()
+                .to_string()
+                .contains("non-UTF-8"));
         }
     }
 }
@@ -731,14 +806,24 @@ fn prepare_cli_input_and_precedence_matrix() {
         ),
         (
             vec![
-                "--driver", "postgres", "--url-env", "Q3_MUST_NOT_BE_READ", "--schema-id", "v1",
+                "--driver",
+                "postgres",
+                "--url-env",
+                "Q3_MUST_NOT_BE_READ",
+                "--schema-id",
+                "v1",
                 "--memory",
             ],
             "valid only for SQLite",
         ),
         (
             vec![
-                "--driver", "sqlite", "--memory", "--query", "app.read.query", "--query",
+                "--driver",
+                "sqlite",
+                "--memory",
+                "--query",
+                "app.read.query",
+                "--query",
                 "app.read.query",
             ],
             "duplicate --query",
@@ -750,15 +835,40 @@ fn prepare_cli_input_and_precedence_matrix() {
         (vec!["--memory"], "requires --driver"),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
-            .args(["db", "prepare", missing_entry.to_str().expect("UTF-8 missing entry")])
+            .args([
+                "db",
+                "prepare",
+                missing_entry.to_str().expect("UTF-8 missing entry"),
+            ])
             .args(arguments)
             .output()
             .expect("run invalid db prepare");
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(expected), "expected `{expected}` in `{stderr}`");
+        assert!(
+            stderr.contains(expected),
+            "expected `{expected}` in `{stderr}`"
+        );
     }
     assert!(!project.dir.join(".align-db").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+            .args([
+                std::ffi::OsString::from("db"),
+                std::ffi::OsString::from("prepare"),
+                missing_entry.as_os_str().to_owned(),
+                std::ffi::OsString::from("--query"),
+                std::ffi::OsString::from_vec(vec![0xff]),
+            ])
+            .output()
+            .expect("run non-UTF-8 db prepare");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must be UTF-8"));
+    }
 
     let command = |check_only: bool| {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
@@ -778,19 +888,29 @@ fn prepare_cli_input_and_precedence_matrix() {
         command.output().expect("run alignc db prepare")
     };
     let written = command(false);
-    assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
     assert!(String::from_utf8_lossy(&written.stdout).contains("selected=1 changed=1"));
     let checked = command(true);
-    assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
     assert!(String::from_utf8_lossy(&checked.stdout).contains("selected=1 changed=0"));
-
 }
 
 #[test]
 fn postgres_native_prepare_describes_the_selected_query() {
     let required = std::env::var_os("ALIGN_DB_POSTGRES_REQUIRED").is_some();
     let Some(url) = std::env::var("ALIGN_DB_POSTGRES_URL").ok() else {
-        assert!(!required, "ALIGN_DB_POSTGRES_URL is required by this test environment");
+        assert!(
+            !required,
+            "ALIGN_DB_POSTGRES_URL is required by this test environment"
+        );
         eprintln!("skipping PostgreSQL Q3 owner: ALIGN_DB_POSTGRES_URL is not set");
         return;
     };
@@ -810,8 +930,12 @@ fn postgres_native_prepare_describes_the_selected_query() {
     )
     .expect("native PostgreSQL metadata");
     assert_eq!(batch.files.len(), 2);
-    let bytes = &batch.files.iter().find(|file| file.descriptor_id == "app.pg_read.query")
-        .expect("PostgreSQL Query metadata").bytes;
+    let bytes = &batch
+        .files
+        .iter()
+        .find(|file| file.descriptor_id == "app.pg_read.query")
+        .expect("PostgreSQL Query metadata")
+        .bytes;
     for needle in [
         b"\"driver\":\"postgres\"".as_slice(),
         b"\"native_type\":\"bigint\"".as_slice(),
@@ -844,9 +968,19 @@ fn postgres_native_prepare_describes_the_selected_query() {
         command.output().expect("run PostgreSQL db prepare CLI")
     };
     let published = run_cli(false);
-    assert!(published.status.success(), "{}", String::from_utf8_lossy(&published.stderr));
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
     let output = [published.stdout.as_slice(), published.stderr.as_slice()].concat();
-    assert!(!output.windows(url.len()).any(|window| window == url.as_bytes()));
+    assert!(!output
+        .windows(url.len())
+        .any(|window| window == url.as_bytes()));
     let checked = run_cli(true);
-    assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
 }

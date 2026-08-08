@@ -9,13 +9,13 @@ use crate::static_artifacts::{
     build_static_artifacts_for_regeneration, root_fields, static_statement_class,
 };
 use crate::static_inputs::{
-    ParsedCheckedMetadata, ParsedMetadataColumn, ParsedMetadataExtension, ParsedMetadataParameter,
     encode_checked_metadata, metadata_path, resolve_static_descriptors_for_regeneration,
+    ParsedCheckedMetadata, ParsedMetadataColumn, ParsedMetadataExtension, ParsedMetadataParameter,
 };
-use crate::{BuiltStaticArtifact, Checked, lower_to_mir};
+use crate::{lower_to_mir, BuiltStaticArtifact, Checked};
 use align_interface::{
-    CheckedColumnMeta, CheckedParameterMeta, Driver, DriverEntry, Hash128, MetaNullability,
-    StaticArtifact, static_options_hash,
+    static_options_hash, CheckedColumnMeta, CheckedParameterMeta, Driver, DriverEntry, Hash128,
+    MetaNullability, StaticArtifact,
 };
 use align_span::SourceMap;
 use std::collections::{HashMap, HashSet};
@@ -138,7 +138,9 @@ struct IdentityWriter {
 
 impl IdentityWriter {
     fn new(magic: &[u8; 8]) -> Self {
-        Self { bytes: magic.to_vec() }
+        Self {
+            bytes: magic.to_vec(),
+        }
     }
 
     fn u8(&mut self, value: u8) {
@@ -158,7 +160,9 @@ impl IdentityWriter {
         if value.as_bytes().contains(&0) {
             return Err(fail("database schema identity text contains U+0000"));
         }
-        self.u32(u32::try_from(value.len()).map_err(|_| fail("schema identity text is too large"))?);
+        self.u32(
+            u32::try_from(value.len()).map_err(|_| fail("schema identity text is too large"))?,
+        );
         self.bytes.extend_from_slice(value.as_bytes());
         Ok(())
     }
@@ -209,9 +213,19 @@ fn migration_name(name: &str) -> Option<u32> {
 /// Read and validate the exact immediate-entry SQLite migration catalog before native work.
 pub fn read_migration_catalog(directory: &Path) -> Result<MigrationCatalog, PrepareError> {
     let mut directory_entries = fs::read_dir(directory)
-        .map_err(|error| fail(format!("cannot enumerate migration directory `{}`: {error}", directory.display())))?
+        .map_err(|error| {
+            fail(format!(
+                "cannot enumerate migration directory `{}`: {error}",
+                directory.display()
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| fail(format!("cannot enumerate migration directory `{}`: {error}", directory.display())))?;
+        .map_err(|error| {
+            fail(format!(
+                "cannot enumerate migration directory `{}`: {error}",
+                directory.display()
+            ))
+        })?;
     directory_entries.sort_by(|left, right| {
         left.file_name()
             .as_encoded_bytes()
@@ -227,9 +241,9 @@ pub fn read_migration_catalog(directory: &Path) -> Result<MigrationCatalog, Prep
                 directory.display()
             ))
         })?;
-        let file_type = entry.file_type().map_err(|error| {
-            fail(format!("cannot inspect migration entry `{name}`: {error}"))
-        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| fail(format!("cannot inspect migration entry `{name}`: {error}")))?;
         if file_type.is_symlink() {
             return Err(fail(format!("migration entry `{name}` is a symlink")));
         }
@@ -247,7 +261,11 @@ pub fn read_migration_catalog(directory: &Path) -> Result<MigrationCatalog, Prep
     if selected.is_empty() {
         return Err(fail("migration catalog contains no migration files"));
     }
-    selected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.as_bytes().cmp(right.1.as_bytes())));
+    selected.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
     for (index, (version, name, _)) in selected.iter().enumerate() {
         let expected = u32::try_from(index + 1).map_err(|_| fail("migration count exceeds u32"))?;
         if *version != expected {
@@ -266,37 +284,58 @@ pub fn read_migration_catalog(directory: &Path) -> Result<MigrationCatalog, Prep
         if bytes.contains(&0) {
             return Err(fail(format!("migration `{filename}` contains U+0000")));
         }
-        entries.push(MigrationEntry { version, filename, path, bytes });
+        entries.push(MigrationEntry {
+            version,
+            filename,
+            path,
+            bytes,
+        });
     }
     encode_migration_catalog(entries)
 }
 
 /// Encode the canonical `ALIGNMIG` stream. Exposed so independent fixtures can pin the empty form
 /// even though `--migrations` itself requires at least one selected entry.
-pub fn encode_migration_catalog(entries: Vec<MigrationEntry>) -> Result<MigrationCatalog, PrepareError> {
+pub fn encode_migration_catalog(
+    entries: Vec<MigrationEntry>,
+) -> Result<MigrationCatalog, PrepareError> {
     let mut writer = IdentityWriter::new(b"ALIGNMIG");
     writer.u32(1);
     writer.u32(u32::try_from(entries.len()).map_err(|_| fail("migration count exceeds u32"))?);
     let mut expected = 1u32;
     for entry in &entries {
         if entry.version != expected {
-            return Err(fail("migration entries are not a contiguous sequence beginning at 0001"));
+            return Err(fail(
+                "migration entries are not a contiguous sequence beginning at 0001",
+            ));
         }
         if migration_name(&entry.filename) != Some(entry.version) {
-            return Err(fail(format!("migration filename `{}` is invalid", entry.filename)));
+            return Err(fail(format!(
+                "migration filename `{}` is invalid",
+                entry.filename
+            )));
         }
         std::str::from_utf8(&entry.bytes)
             .map_err(|_| fail(format!("migration `{}` is not UTF-8", entry.filename)))?;
         if entry.bytes.contains(&0) {
-            return Err(fail(format!("migration `{}` contains U+0000", entry.filename)));
+            return Err(fail(format!(
+                "migration `{}` contains U+0000",
+                entry.filename
+            )));
         }
         writer.u32(entry.version);
         writer.string(&entry.filename)?;
         writer.hash(Hash128::of(&entry.bytes));
-        expected = expected.checked_add(1).ok_or_else(|| fail("migration version overflow"))?;
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| fail("migration version overflow"))?;
     }
     let fingerprint = Hash128::of(&writer.bytes);
-    Ok(MigrationCatalog { entries, encoded: writer.bytes, fingerprint })
+    Ok(MigrationCatalog {
+        entries,
+        encoded: writer.bytes,
+        fingerprint,
+    })
 }
 
 pub fn sqlite_database_schema_fingerprint(schema_id: &str) -> Result<Hash128, PrepareError> {
@@ -311,9 +350,7 @@ pub fn sqlite_database_schema_fingerprint(schema_id: &str) -> Result<Hash128, Pr
     Ok(Hash128::of(&writer.bytes))
 }
 
-pub fn sqlite_memory_schema_fingerprint(
-    catalog_fingerprint: Option<Hash128>,
-) -> Hash128 {
+pub fn sqlite_memory_schema_fingerprint(catalog_fingerprint: Option<Hash128>) -> Hash128 {
     let mut writer = IdentityWriter::new(b"ALIGNSID");
     writer.u32(1);
     writer.u8(Driver::SQLite as u8);
@@ -362,7 +399,10 @@ fn project_root(entry_path: &Path) -> Result<PathBuf, PrepareError> {
             .join(parent)
     };
     if !root.is_dir() {
-        return Err(fail(format!("project root `{}` is not a directory", root.display())));
+        return Err(fail(format!(
+            "project root `{}` is not a directory",
+            root.display()
+        )));
     }
     // Preserve the lexical root spelling used by SourceMap paths. The static-input reader performs
     // its own canonical containment check, while this avoids `/var` versus `/private/var` aliasing
@@ -381,9 +421,11 @@ fn select_artifacts<'a>(
         .collect::<HashMap<_, _>>();
     let mut selected = Vec::new();
     if selected_ids.is_empty() {
-        selected.extend(artifacts.iter().filter(|artifact| {
-            driver_entry(&artifact.artifact, driver).is_some()
-        }));
+        selected.extend(
+            artifacts
+                .iter()
+                .filter(|artifact| driver_entry(&artifact.artifact, driver).is_some()),
+        );
     } else {
         let mut seen = HashSet::new();
         for id in selected_ids {
@@ -457,7 +499,9 @@ fn validate_native_type(
     match driver {
         Driver::SQLite => {
             if native_type_id.is_some() {
-                return Err(fail("SQLite metadata unexpectedly contains a native type ID"));
+                return Err(fail(
+                    "SQLite metadata unexpectedly contains a native type ID",
+                ));
             }
             let Some(native) = native_type else {
                 // SQLite supplies no declaration for parameters and many expressions. Runtime
@@ -494,20 +538,25 @@ fn validate_native_type(
                 return Err(fail("PostgreSQL metadata is missing a native type OID"));
             };
             let Some(native) = native_type else {
-                return Err(fail("PostgreSQL metadata is missing a canonical native type name"));
+                return Err(fail(
+                    "PostgreSQL metadata is missing a canonical native type name",
+                ));
             };
             let expected = match logical {
-                "i16" => &[21][..],
-                "i32" => &[23][..],
-                "i64" => &[20][..],
-                "f32" => &[700][..],
-                "f64" => &[701][..],
-                "bool" => &[16][..],
-                "str" | "string" => &[25, 1043, 19][..],
-                "slice<u8>" | "array<u8>" => &[17][..],
+                "i16" => &[(21, "smallint")][..],
+                "i32" => &[(23, "integer")][..],
+                "i64" => &[(20, "bigint")][..],
+                "f32" => &[(700, "real")][..],
+                "f64" => &[(701, "double precision")][..],
+                "bool" => &[(16, "boolean")][..],
+                "str" | "string" => &[(25, "text"), (1043, "character varying"), (19, "name")][..],
+                "slice<u8>" | "array<u8>" => &[(17, "bytea")][..],
                 _ => &[][..],
             };
-            if oid < 0 || !expected.contains(&(oid as u32)) || native.is_empty() {
+            let type_matches = u32::try_from(oid)
+                .ok()
+                .is_some_and(|oid| expected.contains(&(oid, native)));
+            if !type_matches {
                 return Err(fail(format!(
                     "PostgreSQL native type `{native}` (OID {oid}) does not support logical type `{logical_type}`"
                 )));
@@ -519,8 +568,8 @@ fn validate_native_type(
 
 fn parameter_records(
     artifact: &StaticArtifact,
+    entry: &DriverEntry,
     description: &NativeStatementDescription,
-    driver: Driver,
 ) -> Result<Vec<ParsedMetadataParameter>, PrepareError> {
     let declared = match artifact {
         StaticArtifact::Query(query) => query
@@ -537,11 +586,7 @@ fn parameter_records(
             .collect::<Vec<_>>(),
         StaticArtifact::Command(command) => {
             let fields = root_fields(&command.params_type).map_err(fail)?;
-            let mut bindings = command
-                .driver_entries
-                .first()
-                .map(|entry| entry.bindings.iter().collect::<Vec<_>>())
-                .ok_or_else(|| fail("command artifact has no driver entry"))?;
+            let mut bindings = entry.bindings.iter().collect::<Vec<_>>();
             bindings.sort_by_key(|binding| binding.protocol_ordinal);
             bindings
                 .into_iter()
@@ -578,7 +623,7 @@ fn parameter_records(
                 ));
             }
             validate_native_type(
-                driver,
+                entry.driver,
                 &logical_type,
                 native.native_type.as_deref(),
                 native.native_type_id,
@@ -709,7 +754,7 @@ fn record(
                     version: extension.version.clone(),
                 })
                 .collect(),
-            parameters: parameter_records(artifact, description, entry.driver)?,
+            parameters: parameter_records(artifact, entry, description)?,
             columns: column_records(artifact, description, entry.driver)?,
         },
     ))
@@ -794,9 +839,14 @@ static PUBLICATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn metadata_parent_is_safe(root: &Path, path: &Path) -> Result<(), PrepareError> {
     let relative = path.strip_prefix(root).map_err(|_| {
-        fail(format!("metadata path `{}` escapes the project root", path.display()))
+        fail(format!(
+            "metadata path `{}` escapes the project root",
+            path.display()
+        ))
     })?;
-    let parent = relative.parent().ok_or_else(|| fail("metadata path has no parent"))?;
+    let parent = relative
+        .parent()
+        .ok_or_else(|| fail("metadata path has no parent"))?;
     let mut current = root.to_path_buf();
     for component in parent.components() {
         current.push(component);
@@ -827,9 +877,15 @@ fn metadata_parent_is_safe(root: &Path, path: &Path) -> Result<(), PrepareError>
 }
 
 fn temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf, PrepareError> {
-    let name = destination.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-        fail(format!("metadata path `{}` has no UTF-8 filename", destination.display()))
-    })?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            fail(format!(
+                "metadata path `{}` has no UTF-8 filename",
+                destination.display()
+            ))
+        })?;
     let nonce = PUBLICATION_NONCE.fetch_add(1, Ordering::Relaxed);
     Ok(destination.with_file_name(format!(
         ".{name}.{purpose}.{}.{}",
@@ -839,12 +895,22 @@ fn temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf, PrepareE
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), PrepareError> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| {
-        fail(format!("cannot create temporary metadata `{}`: {error}", path.display()))
-    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            fail(format!(
+                "cannot create temporary metadata `{}`: {error}",
+                path.display()
+            ))
+        })?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(path);
-        return Err(fail(format!("cannot write temporary metadata `{}`: {error}", path.display())));
+        return Err(fail(format!(
+            "cannot write temporary metadata `{}`: {error}",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -867,11 +933,31 @@ pub fn publish_metadata_batch(
     let mut changes = Vec::new();
     for file in &batch.files {
         metadata_parent_is_safe(&batch.project_root, &file.path)?;
-        let previous = match fs::read(&file.path) {
-            Ok(bytes) => Some(bytes),
+        let previous = match fs::symlink_metadata(&file.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(fail(format!(
+                    "metadata destination `{}` is a symlink",
+                    file.path.display()
+                )));
+            }
+            Ok(metadata) if metadata.is_file() => Some(fs::read(&file.path).map_err(|error| {
+                fail(format!(
+                    "cannot read metadata `{}`: {error}",
+                    file.path.display()
+                ))
+            })?),
+            Ok(_) => {
+                return Err(fail(format!(
+                    "metadata destination `{}` is not a regular file",
+                    file.path.display()
+                )));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(fail(format!("cannot read metadata `{}`: {error}", file.path.display())));
+                return Err(fail(format!(
+                    "cannot inspect metadata `{}`: {error}",
+                    file.path.display()
+                )));
             }
         };
         if previous.as_deref() != Some(file.bytes.as_slice()) {
@@ -884,7 +970,10 @@ pub fn publish_metadata_batch(
     }
     if check_only {
         if changes.is_empty() {
-            return Ok(PublicationReport { selected: batch.files.len(), changed: 0 });
+            return Ok(PublicationReport {
+                selected: batch.files.len(),
+                changed: 0,
+            });
         }
         return Err(fail(format!(
             "{} checked metadata file(s) are missing or stale",
@@ -893,9 +982,15 @@ pub fn publish_metadata_batch(
     }
 
     for change in &mut changes {
-        let parent = change.destination.parent().ok_or_else(|| fail("metadata path has no parent"))?;
+        let parent = change
+            .destination
+            .parent()
+            .ok_or_else(|| fail("metadata path has no parent"))?;
         fs::create_dir_all(parent).map_err(|error| {
-            fail(format!("cannot create metadata directory `{}`: {error}", parent.display()))
+            fail(format!(
+                "cannot create metadata directory `{}`: {error}",
+                parent.display()
+            ))
         })?;
         metadata_parent_is_safe(&batch.project_root, &change.destination)?;
         let staged = temporary_path(&change.destination, "new")?;
@@ -918,24 +1013,30 @@ pub fn publish_metadata_batch(
 
     let mut applied = 0usize;
     while applied < changes.len() {
-        let staged = changes[applied]
+        let change = changes
+            .get(applied)
+            .ok_or_else(|| fail("metadata publication index is out of range"))?;
+        let staged = change
             .staged
             .as_ref()
             .ok_or_else(|| fail("metadata publication lost a staged file"))?;
-        if let Err(error) = fs::rename(staged, &changes[applied].destination) {
+        let destination = change.destination.clone();
+        if let Err(error) = fs::rename(staged, &destination) {
             let mut rollback_error = None;
             for prior in changes[..applied].iter().rev() {
                 let rollback = match &prior.previous {
-                    Some(bytes) => temporary_path(&prior.destination, "rollback").and_then(|path| {
-                        write_new_file(&path, bytes)?;
-                        fs::rename(&path, &prior.destination).map_err(|rename_error| {
-                            let _ = fs::remove_file(&path);
-                            fail(format!(
-                                "cannot restore metadata `{}`: {rename_error}",
-                                prior.destination.display()
-                            ))
+                    Some(bytes) => {
+                        temporary_path(&prior.destination, "rollback").and_then(|path| {
+                            write_new_file(&path, bytes)?;
+                            fs::rename(&path, &prior.destination).map_err(|rename_error| {
+                                let _ = fs::remove_file(&path);
+                                fail(format!(
+                                    "cannot restore metadata `{}`: {rename_error}",
+                                    prior.destination.display()
+                                ))
+                            })
                         })
-                    }),
+                    }
                     None => fs::remove_file(&prior.destination).map_err(|remove_error| {
                         fail(format!(
                             "cannot remove newly published metadata `{}`: {remove_error}",
@@ -956,15 +1057,18 @@ pub fn publish_metadata_batch(
             if let Some(rollback) = rollback_error {
                 return Err(fail(format!(
                     "cannot publish metadata `{}`: {error}; rollback also failed: {rollback}",
-                    changes[applied].destination.display()
+                    destination.display()
                 )));
             }
             return Err(fail(format!(
                 "cannot publish metadata `{}`: {error}",
-                changes[applied].destination.display()
+                destination.display()
             )));
         }
         applied += 1;
     }
-    Ok(PublicationReport { selected: batch.files.len(), changed: changes.len() })
+    Ok(PublicationReport {
+        selected: batch.files.len(),
+        changed: changes.len(),
+    })
 }
