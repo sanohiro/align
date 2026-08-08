@@ -19,7 +19,10 @@ use align_interface::{
 };
 use align_span::SourceMap;
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const METADATA_FORMAT_VERSION: u32 = 1;
 
@@ -88,8 +91,15 @@ pub struct PreparedMetadataFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedMetadataBatch {
     pub driver: Driver,
+    pub project_root: PathBuf,
     pub environment: PreparationEnvironment,
     pub files: Vec<PreparedMetadataFile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationReport {
+    pub selected: usize,
+    pub changed: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +115,109 @@ impl std::error::Error for PrepareError {}
 
 fn fail(reason: impl Into<String>) -> PrepareError {
     PrepareError(reason.into())
+}
+
+struct IdentityWriter {
+    bytes: Vec<u8>,
+}
+
+impl IdentityWriter {
+    fn new(magic: &[u8; 8]) -> Self {
+        Self { bytes: magic.to_vec() }
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn hash(&mut self, value: Hash128) {
+        self.bytes.extend_from_slice(&value.lo.to_le_bytes());
+        self.bytes.extend_from_slice(&value.hi.to_le_bytes());
+    }
+
+    fn string(&mut self, value: &str) -> Result<(), PrepareError> {
+        if value.as_bytes().contains(&0) {
+            return Err(fail("database schema identity text contains U+0000"));
+        }
+        self.u32(u32::try_from(value.len()).map_err(|_| fail("schema identity text is too large"))?);
+        self.bytes.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+
+    fn extensions(&mut self, extensions: &[PreparationExtension]) -> Result<(), PrepareError> {
+        self.u32(u32::try_from(extensions.len()).map_err(|_| fail("too many extensions"))?);
+        let mut previous = None;
+        for extension in extensions {
+            if previous.is_some_and(|value: &PreparationExtension| value >= extension) {
+                return Err(fail("extensions are not strictly sorted"));
+            }
+            self.string(&extension.schema)?;
+            self.string(&extension.name)?;
+            match &extension.version {
+                Some(version) => {
+                    self.u8(1);
+                    self.string(version)?;
+                }
+                None => self.u8(0),
+            }
+            previous = Some(extension);
+        }
+        Ok(())
+    }
+}
+
+pub fn sqlite_database_schema_fingerprint(schema_id: &str) -> Result<Hash128, PrepareError> {
+    if schema_id.is_empty() {
+        return Err(fail("SQLite --schema-id must not be empty"));
+    }
+    let mut writer = IdentityWriter::new(b"ALIGNSID");
+    writer.u32(1);
+    writer.u8(Driver::SQLite as u8);
+    writer.u8(1);
+    writer.string(schema_id)?;
+    Ok(Hash128::of(&writer.bytes))
+}
+
+pub fn sqlite_memory_schema_fingerprint(
+    catalog_fingerprint: Option<Hash128>,
+) -> Hash128 {
+    let mut writer = IdentityWriter::new(b"ALIGNSID");
+    writer.u32(1);
+    writer.u8(Driver::SQLite as u8);
+    writer.u8(0);
+    match catalog_fingerprint {
+        Some(fingerprint) => {
+            writer.u8(1);
+            writer.hash(fingerprint);
+        }
+        None => writer.u8(0),
+    }
+    Hash128::of(&writer.bytes)
+}
+
+pub fn postgres_schema_fingerprint(
+    schema_id: &str,
+    search_path: &[String],
+    extensions: &[PreparationExtension],
+) -> Result<Hash128, PrepareError> {
+    if schema_id.is_empty() {
+        return Err(fail("PostgreSQL --schema-id must not be empty"));
+    }
+    let mut writer = IdentityWriter::new(b"ALIGNSID");
+    writer.u32(1);
+    writer.u8(Driver::PostgreSQL as u8);
+    writer.u8(2);
+    writer.string(schema_id)?;
+    writer.u32(u32::try_from(search_path.len()).map_err(|_| fail("too many search-path entries"))?);
+    for entry in search_path {
+        writer.string(entry)?;
+    }
+    writer.extensions(extensions)?;
+    Ok(Hash128::of(&writer.bytes))
 }
 
 fn project_root(entry_path: &Path) -> Result<PathBuf, PrepareError> {
@@ -131,7 +244,9 @@ fn select_artifacts<'a>(
         .collect::<HashMap<_, _>>();
     let mut selected = Vec::new();
     if selected_ids.is_empty() {
-        selected.extend(artifacts.iter());
+        selected.extend(artifacts.iter().filter(|artifact| {
+            driver_entry(&artifact.artifact, driver).is_some()
+        }));
     } else {
         let mut seen = HashSet::new();
         for id in selected_ids {
@@ -433,7 +548,187 @@ pub fn build_metadata_batch(
     }
     Ok(PreparedMetadataBatch {
         driver,
+        project_root,
         environment,
         files,
     })
+}
+
+static PUBLICATION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn metadata_parent_is_safe(root: &Path, path: &Path) -> Result<(), PrepareError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        fail(format!("metadata path `{}` escapes the project root", path.display()))
+    })?;
+    let parent = relative.parent().ok_or_else(|| fail("metadata path has no parent"))?;
+    let mut current = root.to_path_buf();
+    for component in parent.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(fail(format!(
+                    "metadata parent `{}` is a symlink",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(fail(format!(
+                    "metadata parent `{}` is not a directory",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect metadata parent `{}`: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf, PrepareError> {
+    let name = destination.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        fail(format!("metadata path `{}` has no UTF-8 filename", destination.display()))
+    })?;
+    let nonce = PUBLICATION_NONCE.fetch_add(1, Ordering::Relaxed);
+    Ok(destination.with_file_name(format!(
+        ".{name}.{purpose}.{}.{}",
+        std::process::id(),
+        nonce
+    )))
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), PrepareError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| {
+        fail(format!("cannot create temporary metadata `{}`: {error}", path.display()))
+    })?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(fail(format!("cannot write temporary metadata `{}`: {error}", path.display())));
+    }
+    Ok(())
+}
+
+/// Compare or publish one complete in-memory metadata batch.
+///
+/// Check mode is strictly read-only. Write mode stages every changed record before the first
+/// replacement and rolls already-replaced records back from their exact previous bytes if a later
+/// rename fails. Temporary files always share the destination directory.
+pub fn publish_metadata_batch(
+    batch: &PreparedMetadataBatch,
+    check_only: bool,
+) -> Result<PublicationReport, PrepareError> {
+    struct Change {
+        destination: PathBuf,
+        previous: Option<Vec<u8>>,
+        staged: Option<PathBuf>,
+    }
+
+    let mut changes = Vec::new();
+    for file in &batch.files {
+        metadata_parent_is_safe(&batch.project_root, &file.path)?;
+        let previous = match fs::read(&file.path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(fail(format!("cannot read metadata `{}`: {error}", file.path.display())));
+            }
+        };
+        if previous.as_deref() != Some(file.bytes.as_slice()) {
+            changes.push(Change {
+                destination: file.path.clone(),
+                previous,
+                staged: None,
+            });
+        }
+    }
+    if check_only {
+        if changes.is_empty() {
+            return Ok(PublicationReport { selected: batch.files.len(), changed: 0 });
+        }
+        return Err(fail(format!(
+            "{} checked metadata file(s) are missing or stale",
+            changes.len()
+        )));
+    }
+
+    for change in &mut changes {
+        let parent = change.destination.parent().ok_or_else(|| fail("metadata path has no parent"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            fail(format!("cannot create metadata directory `{}`: {error}", parent.display()))
+        })?;
+        metadata_parent_is_safe(&batch.project_root, &change.destination)?;
+        let staged = temporary_path(&change.destination, "new")?;
+        let bytes = batch
+            .files
+            .iter()
+            .find(|file| file.path == change.destination)
+            .map(|file| file.bytes.as_slice())
+            .ok_or_else(|| fail("metadata publication lost a selected record"))?;
+        if let Err(error) = write_new_file(&staged, bytes) {
+            for earlier in &changes {
+                if let Some(path) = &earlier.staged {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            return Err(error);
+        }
+        change.staged = Some(staged);
+    }
+
+    let mut applied = 0usize;
+    while applied < changes.len() {
+        let staged = changes[applied]
+            .staged
+            .as_ref()
+            .ok_or_else(|| fail("metadata publication lost a staged file"))?;
+        if let Err(error) = fs::rename(staged, &changes[applied].destination) {
+            let mut rollback_error = None;
+            for prior in changes[..applied].iter().rev() {
+                let rollback = match &prior.previous {
+                    Some(bytes) => temporary_path(&prior.destination, "rollback").and_then(|path| {
+                        write_new_file(&path, bytes)?;
+                        fs::rename(&path, &prior.destination).map_err(|rename_error| {
+                            let _ = fs::remove_file(&path);
+                            fail(format!(
+                                "cannot restore metadata `{}`: {rename_error}",
+                                prior.destination.display()
+                            ))
+                        })
+                    }),
+                    None => fs::remove_file(&prior.destination).map_err(|remove_error| {
+                        fail(format!(
+                            "cannot remove newly published metadata `{}`: {remove_error}",
+                            prior.destination.display()
+                        ))
+                    }),
+                };
+                if let Err(error) = rollback {
+                    rollback_error = Some(error);
+                    break;
+                }
+            }
+            for pending in &changes[applied..] {
+                if let Some(path) = &pending.staged {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            if let Some(rollback) = rollback_error {
+                return Err(fail(format!(
+                    "cannot publish metadata `{}`: {error}; rollback also failed: {rollback}",
+                    changes[applied].destination.display()
+                )));
+            }
+            return Err(fail(format!(
+                "cannot publish metadata `{}`: {error}",
+                changes[applied].destination.display()
+            )));
+        }
+        applied += 1;
+    }
+    Ok(PublicationReport { selected: batch.files.len(), changed: changes.len() })
 }
