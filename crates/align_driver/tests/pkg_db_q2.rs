@@ -1393,7 +1393,7 @@ fn main(args: array<str>) -> Result<(), Error> {
         ("app/portable_query.align", QUERY),
         ("main.align", main),
     ];
-    let output = build_and_run_multi_args_with_env(
+    let output = build_and_run_multi_with_static_descriptors_args_with_env(
         "pkg-db-q2-required-postgres-portable",
         &files,
         "main.align",

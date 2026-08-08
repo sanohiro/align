@@ -472,10 +472,23 @@ pub fn build_and_run_multi_with_static_descriptors(
     files: &[(&str, &str)],
     entry: &str,
 ) -> std::process::Output {
+    build_and_run_multi_with_static_descriptors_args_with_env(name, files, entry, &[], &[])
+}
+
+/// [`build_and_run_multi_with_static_descriptors`] with arguments and explicit environment pairs
+/// applied to the generated child.
+pub fn build_and_run_multi_with_static_descriptors_args_with_env(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    prog_args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     let proj = TempProject::new(name, files);
     let entry_path = proj.entry(entry);
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
     let entry_name = entry_path.display().to_string();
+    let prog_args: Vec<String> = prog_args.iter().map(|arg| (*arg).to_owned()).collect();
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, &entry_name, &entry_src);
     assert!(
@@ -501,7 +514,12 @@ pub fn build_and_run_multi_with_static_descriptors(
     )
     .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
-    std::process::Command::new(&exe).output().expect("run")
+    let mut command = std::process::Command::new(&exe);
+    command.args(&prog_args);
+    for &(key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run")
 }
 
 /// Compile a multi-file Align program together with one C ABI fixture, link, and run it. The C
