@@ -1076,7 +1076,7 @@ fn main() -> i32 {
     let position = |library: &str| {
         ordered_link_libs
             .iter()
-            .position(|linked| linked == library)
+            .rposition(|linked| linked == library)
             .unwrap_or_else(|| {
                 panic!("missing `{library}` in ordered link list: {ordered_link_libs:?}")
             })

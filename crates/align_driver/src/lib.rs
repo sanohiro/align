@@ -2661,39 +2661,27 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
     link_objects(&[obj], exe, link_libs, profile)
 }
 
-/// Return the link-library list with the supported libpq native closure in static-link order.
+/// Return the link-library list with an ordered supported libpq closure tail.
 ///
 /// MIR and per-unit capability unions intentionally preserve first-seen order for deterministic
 /// identity. That order can put a `crypto` request from an unrelated module before `pq`, however;
 /// a static ELF linker has already scanned that archive by the time libpq introduces its symbols.
-/// When `pq` is present, normalize the known closure (including the runtime's compression
-/// dependencies) to dependent-first order. Programs without `pq` retain their existing order and
-/// therefore keep the established `extern "C" link(...)` behavior.
+/// When `pq` is present, preserve the complete original list and append one dependent-first
+/// closure tail. Repetition is intentional: a library after `pq` may itself introduce OpenSSL or
+/// compression references, so the tail must be after every such suffix library. Programs without
+/// `pq` retain their existing order and therefore keep the established `extern "C" link(...)`
+/// behavior.
 pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
     const LIBPQ_CLOSURE: [&str; 5] = ["pq", "ssl", "crypto", "zstd", "z"];
-    let Some(pq_index) = link_libs.iter().position(|library| library == "pq") else {
+    if !link_libs.iter().any(|library| library == "pq") {
         return link_libs.to_vec();
-    };
-    // Keep the original `pq` position as the closure boundary. Libraries before it may be
-    // independent prerequisites; libraries after it may be dependencies introduced by libpq
-    // itself (for example LDAP on a custom static build), and moving either side changes the
-    // caller's existing archive order.
-    let mut ordered = link_libs[..pq_index]
-        .iter()
-        .filter(|library| !LIBPQ_CLOSURE.contains(&library.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+    }
+    let mut ordered = link_libs.to_vec();
     for library in LIBPQ_CLOSURE {
         if link_libs.iter().any(|candidate| candidate == library) {
             ordered.push(library.to_string());
         }
     }
-    ordered.extend(
-        link_libs[pq_index + 1..]
-            .iter()
-            .filter(|library| !LIBPQ_CLOSURE.contains(&library.as_str()))
-            .cloned(),
-    );
     ordered
 }
 
@@ -3128,7 +3116,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             order_link_libs(&input),
-            ["sqlite3", "pq", "ssl", "crypto", "zstd", "z"]
+            [
+                "crypto",
+                "z",
+                "zstd",
+                "sqlite3",
+                "pq",
+                "ssl",
+                "pq",
+                "ssl",
+                "crypto",
+                "zstd",
+                "z",
+            ]
         );
     }
 
@@ -3144,7 +3144,10 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(order_link_libs(&input), ["pq", "ssl", "crypto", "ldap"]);
+        assert_eq!(
+            order_link_libs(&input),
+            ["pq", "ldap", "ssl", "crypto", "pq", "ssl", "crypto"]
+        );
     }
 
     #[test]
