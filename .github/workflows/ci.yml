@@ -24,7 +24,7 @@ jobs:
   db-postgres:
     name: PostgreSQL integration (required)
     runs-on: ubuntu-24.04
-    # Keep the server version explicit: this job is the non-skippable D4/Q2 and D5/Q3 gate.
+    # Keep the server version explicit: this job is the non-skippable D4/Q2, D5/Q3, and D11/Q5a gate.
     services:
       postgres:
         image: postgres:16.4
@@ -99,6 +99,11 @@ jobs:
         shell: bash
         run: |
           scripts/cargo.sh test --locked -p align_driver --test pkg_db_q3 -- --nocapture
+
+      - name: Required migration lifecycle integration
+        shell: bash
+        run: |
+          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5a -- --nocapture
 
   build-and-test:
     name: ${{ matrix.name }}

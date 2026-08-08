@@ -14,6 +14,7 @@
 //!   alignc size      <file>   Build then report the executable's size breakdown
 //!   alignc cache clear        Remove the resolved codegen cache
 //!   alignc db prepare <file>  Regenerate checked database metadata
+//!   alignc db migrate/status/check/repair  Operate an explicit SQL migration catalog
 //!
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
 //! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
@@ -43,12 +44,16 @@ fn main() -> ExitCode {
     if raw_os.get(1).is_some_and(|value| value == "db") {
         return match raw_os.get(2).and_then(|value| value.to_str()) {
             Some("prepare") => run_db_prepare(&raw_os[3..]),
+            Some("migrate") => run_db_migration(DbMigrationCommand::Migrate, &raw_os[3..]),
+            Some("status") => run_db_migration(DbMigrationCommand::Status, &raw_os[3..]),
+            Some("check") => run_db_migration(DbMigrationCommand::Check, &raw_os[3..]),
+            Some("repair") => run_db_migration(DbMigrationCommand::Repair, &raw_os[3..]),
             Some(other) => {
-                eprintln!("alignc: unknown `db` subcommand `{other}` (expected: prepare)");
+                eprintln!("alignc: unknown `db` subcommand `{other}` (expected: prepare, migrate, status, check, or repair)");
                 ExitCode::FAILURE
             }
             None => {
-                eprintln!("alignc: `db` requires the UTF-8 subcommand `prepare`");
+                eprintln!("alignc: `db` requires a UTF-8 subcommand");
                 ExitCode::FAILURE
             }
         };
@@ -582,6 +587,305 @@ fn db_text(value: &OsString, what: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbMigrationCommand {
+    Migrate,
+    Status,
+    Check,
+    Repair,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbMigrationDriver {
+    Sqlite,
+    Postgres,
+}
+
+struct DbMigrationOptions {
+    entry: String,
+    migrations: String,
+    driver: DbMigrationDriver,
+    sqlite_path: Option<String>,
+    postgres_url_env: Option<String>,
+    version: Option<u32>,
+    action: Option<align_driver::db_migrate_native::RepairAction>,
+    expected_checksum: Option<String>,
+}
+
+fn parse_db_migration(
+    command: DbMigrationCommand,
+    args: &[OsString],
+) -> Result<DbMigrationOptions, String> {
+    let mut entry = None;
+    let mut migrations = None;
+    let mut driver_value = None;
+    let mut sqlite_path = None;
+    let mut postgres_url_env = None;
+    let mut version_value = None;
+    let mut action = None;
+    let mut expected_checksum = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let flag = db_text(&args[index], &format!("db migration argument {}", index + 1))?;
+        index += 1;
+        if matches!(flag.as_str(), "--accept-applied" | "--clear-dirty") {
+            if action.is_some() {
+                return Err("repair requires exactly one action".to_string());
+            }
+            action = Some(if flag == "--accept-applied" {
+                align_driver::db_migrate_native::RepairAction::AcceptApplied
+            } else {
+                align_driver::db_migrate_native::RepairAction::ClearDirty
+            });
+            continue;
+        }
+        if !matches!(
+            flag.as_str(),
+            "--entry"
+                | "--migrations"
+                | "--driver"
+                | "--sqlite-path"
+                | "--postgres-url-env"
+                | "--version"
+                | "--expect-checksum"
+        ) {
+            return Err(format!("unknown `db` migration option `{flag}`"));
+        }
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("{flag} requires a value"))
+            .and_then(|value| db_text(value, &format!("db migration argument {}", index + 1)))?;
+        if value.starts_with("--") {
+            return Err(format!("{flag} requires a value"));
+        }
+        index += 1;
+        match flag.as_str() {
+            "--entry" if entry.is_none() => entry = Some(value.clone()),
+            "--migrations" if migrations.is_none() => migrations = Some(value.clone()),
+            "--driver" if driver_value.is_none() => driver_value = Some(value.clone()),
+            "--sqlite-path" if sqlite_path.is_none() => sqlite_path = Some(value.clone()),
+            "--postgres-url-env" if postgres_url_env.is_none() => {
+                postgres_url_env = Some(value.clone())
+            }
+            "--version" if version_value.is_none() => version_value = Some(value.clone()),
+            "--expect-checksum" if expected_checksum.is_none() => {
+                expected_checksum = Some(value.clone())
+            }
+            _ => return Err(format!("duplicate {flag}")),
+        }
+    }
+    let entry = entry.ok_or_else(|| "db migration requires --entry ENTRY".to_string())?;
+    let migrations = migrations.ok_or_else(|| "db migration requires --migrations DIR".to_string())?;
+    let driver = match driver_value
+        .as_deref()
+        .ok_or_else(|| "db migration requires --driver sqlite|postgres".to_string())?
+    {
+        "sqlite" => DbMigrationDriver::Sqlite,
+        "postgres" => DbMigrationDriver::Postgres,
+        _ => return Err("--driver must be `sqlite` or `postgres`".to_string()),
+    };
+    match driver {
+        DbMigrationDriver::Sqlite => {
+            if sqlite_path.is_none() || postgres_url_env.is_some() {
+                return Err("SQLite migration requires exactly --sqlite-path PATH".to_string());
+            }
+        }
+        DbMigrationDriver::Postgres => {
+            if postgres_url_env.is_none() || sqlite_path.is_some() {
+                return Err("PostgreSQL migration requires exactly --postgres-url-env NAME".to_string());
+            }
+            let name = postgres_url_env.as_deref().expect("checked above");
+            let mut bytes = name.bytes();
+            if name.starts_with("PG")
+                || !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err("--postgres-url-env must be a non-PG* environment identifier".to_string());
+            }
+        }
+    }
+    if command == DbMigrationCommand::Repair {
+        let value = version_value
+            .as_deref()
+            .ok_or_else(|| "db repair requires --version N".to_string())?;
+        let version = value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| (1..=9999).contains(value))
+            .ok_or_else(|| "--version must be an integer from 1 through 9999".to_string())?;
+        if action.is_none() {
+            return Err("db repair requires exactly one action".to_string());
+        }
+        let checksum = expected_checksum
+            .as_deref()
+            .ok_or_else(|| "db repair requires --expect-checksum HASH".to_string())?;
+        if checksum.len() != 32
+            || !checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("--expect-checksum must be exactly 32 lowercase hexadecimal bytes".to_string());
+        }
+        return Ok(DbMigrationOptions {
+            entry,
+            migrations,
+            driver,
+            sqlite_path,
+            postgres_url_env,
+            version: Some(version),
+            action,
+            expected_checksum,
+        });
+    } else {
+        if version_value.is_some() {
+            return Err("--version is valid only for db repair".to_string());
+        }
+        if action.is_some() {
+            return Err("repair actions are valid only for db repair".to_string());
+        }
+        if expected_checksum.is_some() {
+            return Err("--expect-checksum is valid only for db repair".to_string());
+        }
+    }
+    Ok(DbMigrationOptions {
+        entry,
+        migrations,
+        driver,
+        sqlite_path,
+        postgres_url_env,
+        version: None,
+        action,
+        expected_checksum,
+    })
+}
+
+fn run_db_migration(command: DbMigrationCommand, args: &[OsString]) -> ExitCode {
+    use align_driver::db_migrate::{
+        resolve_migration_paths, resolve_sqlite_target, screen_postgres_catalog,
+    };
+    use align_driver::db_migrate_native::{
+        run_postgres_migration, run_sqlite_migration, screen_sqlite_catalog_native,
+        validate_postgres_migration_environment, validate_postgres_migration_url,
+        MigrationOperation,
+    };
+    use align_driver::db_prepare::read_migration_catalog;
+
+    let options = match parse_db_migration(command, args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let paths = match resolve_migration_paths(Path::new(&options.entry), Path::new(&options.migrations)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match std::fs::read_to_string(&paths.entry) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("alignc: cannot read `{}`: {error}", paths.entry.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut source_map = SourceMap::new();
+    let walk = build_per_unit(&mut source_map, &paths.entry.display().to_string(), &source);
+    if walk.diags.has_errors() {
+        eprint!("{}", format_diagnostics(&source_map, &walk.diags));
+        return ExitCode::FAILURE;
+    }
+    let catalog = match read_migration_catalog(&paths.migrations) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let operation = match command {
+        DbMigrationCommand::Migrate => MigrationOperation::Migrate,
+        DbMigrationCommand::Status => MigrationOperation::Status,
+        DbMigrationCommand::Check => MigrationOperation::Check,
+        DbMigrationCommand::Repair => MigrationOperation::Repair {
+            version: options.version.expect("validated repair version"),
+            action: options.action.expect("validated repair action"),
+            expected_checksum: options
+                .expected_checksum
+                .as_deref()
+                .expect("validated repair checksum"),
+        },
+    };
+    let result = match options.driver {
+        DbMigrationDriver::Sqlite => {
+            let screened = match screen_sqlite_catalog_native(&catalog) {
+                Ok(screened) => screened,
+                Err(error) => {
+                    eprintln!("alignc: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let target = resolve_sqlite_target(
+                &paths.project_root,
+                Path::new(options.sqlite_path.as_deref().expect("validated SQLite target")),
+            );
+            run_sqlite_migration(&target, operation, &screened)
+        }
+        DbMigrationDriver::Postgres => {
+            let screened = match screen_postgres_catalog(&catalog) {
+                Ok(screened) => screened,
+                Err(error) => {
+                    eprintln!("alignc: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(error) = validate_postgres_migration_environment() {
+                eprintln!("alignc: {error}");
+                return ExitCode::FAILURE;
+            }
+            let name = options
+                .postgres_url_env
+                .as_deref()
+                .expect("validated PostgreSQL environment name");
+            let url = match std::env::var(name) {
+                Ok(value) if !value.is_empty() && !value.as_bytes().contains(&0) => value,
+                Ok(_) => {
+                    eprintln!("alignc: environment variable `{name}` is empty");
+                    return ExitCode::FAILURE;
+                }
+                Err(std::env::VarError::NotPresent) => {
+                    eprintln!("alignc: environment variable `{name}` is not set");
+                    return ExitCode::FAILURE;
+                }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    eprintln!("alignc: environment variable `{name}` is not UTF-8");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(error) = validate_postgres_migration_url(&url) {
+                eprintln!("alignc: {error}");
+                return ExitCode::FAILURE;
+            }
+            run_postgres_migration(&url, operation, &screened)
+        }
+    };
+    match result {
+        Ok(report) => {
+            print!("{}", report.render());
+            if command == DbMigrationCommand::Check && !report.is_current() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn parse_db_prepare(args: &[OsString]) -> Result<DbPrepareOptions, String> {
     let entry = args
         .first()
@@ -855,6 +1159,9 @@ fn usage() {
            size       build then report the executable's size breakdown\n  \
            cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
            db prepare regenerate checked SQLite/PostgreSQL metadata\n  \
+           db migrate apply an explicit SQLite/PostgreSQL migration catalog\n  \
+           db status/check  inspect migration state; check requires exact current state\n  \
+           db repair  checksum-bound repair of one dirty forbidden migration\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
