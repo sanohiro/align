@@ -18,7 +18,7 @@ fn fail(reason: impl Into<String>) -> PrepareError {
 }
 
 #[cfg(unix)]
-mod dynamic {
+pub(crate) mod dynamic {
     use super::*;
 
     const RTLD_NOW: c_int = 2;
@@ -139,7 +139,7 @@ mod dynamic {
 }
 
 #[cfg(not(unix))]
-mod dynamic {
+pub(crate) mod dynamic {
     use super::*;
 
     pub struct Library;
@@ -797,50 +797,78 @@ pub struct PostgresDescriber {
 
 type PostgresOrigin = (Option<String>, Option<String>, Option<String>);
 
-fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
+fn validate_complete_postgres_url_for(url: &str, operation: &str) -> Result<(), PrepareError> {
     let rest = url
         .strip_prefix("postgresql://")
         .or_else(|| url.strip_prefix("postgres://"))
-        .ok_or_else(|| fail("PostgreSQL preparation requires a complete postgresql:// URL"))?;
+        .ok_or_else(|| {
+            fail(format!(
+                "PostgreSQL {operation} requires a complete postgresql:// URL"
+            ))
+        })?;
     if rest.contains('#') {
-        return Err(fail(
-            "PostgreSQL preparation URL must not contain a fragment",
-        ));
+        return Err(fail(format!(
+            "PostgreSQL {operation} URL must not contain a fragment"
+        )));
     }
     let (authority, path_and_query) = rest
         .split_once('/')
-        .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit database"))?;
+        .ok_or_else(|| {
+            fail(format!(
+                "PostgreSQL {operation} URL must include an explicit database"
+            ))
+        })?;
     let (userinfo, host_port) = authority.rsplit_once('@').ok_or_else(|| {
-        fail("PostgreSQL preparation URL must include an explicit user and password")
+        fail(format!(
+            "PostgreSQL {operation} URL must include an explicit user and password"
+        ))
     })?;
     let (user, password) = userinfo
         .split_once(':')
-        .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit password"))?;
+        .ok_or_else(|| {
+            fail(format!(
+                "PostgreSQL {operation} URL must include an explicit password"
+            ))
+        })?;
     if user.is_empty() || password.is_empty() {
-        return Err(fail(
-            "PostgreSQL preparation URL must include a non-empty user and password",
-        ));
+        return Err(fail(format!(
+            "PostgreSQL {operation} URL must include a non-empty user and password"
+        )));
     }
     let (host, port) = if let Some(ipv6) = host_port.strip_prefix('[') {
         let (host, port) = ipv6
             .split_once("]:")
-            .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit port"))?;
+            .ok_or_else(|| {
+                fail(format!(
+                    "PostgreSQL {operation} URL must include an explicit port"
+                ))
+            })?;
         (host, port)
     } else {
         host_port
             .rsplit_once(':')
-            .ok_or_else(|| fail("PostgreSQL preparation URL must include an explicit port"))?
+            .ok_or_else(|| {
+                fail(format!(
+                    "PostgreSQL {operation} URL must include an explicit port"
+                ))
+            })?
     };
     if host.is_empty() || host.contains(',') || host.contains('%') {
-        return Err(fail(
-            "PostgreSQL preparation URL must select exactly one explicit host",
-        ));
+        return Err(fail(format!(
+            "PostgreSQL {operation} URL must select exactly one explicit host"
+        )));
     }
     let port = port
         .parse::<u16>()
-        .map_err(|_| fail("PostgreSQL preparation URL has an invalid explicit port"))?;
+        .map_err(|_| {
+            fail(format!(
+                "PostgreSQL {operation} URL has an invalid explicit port"
+            ))
+        })?;
     if port == 0 {
-        return Err(fail("PostgreSQL preparation URL port must be non-zero"));
+        return Err(fail(format!(
+            "PostgreSQL {operation} URL port must be non-zero"
+        )));
     }
     let (database, query) = path_and_query
         .split_once('?')
@@ -848,9 +876,9 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
             (database, Some(query))
         });
     if database.is_empty() || database.contains('/') {
-        return Err(fail(
-            "PostgreSQL preparation URL must select exactly one explicit database",
-        ));
+        return Err(fail(format!(
+            "PostgreSQL {operation} URL must select exactly one explicit database"
+        )));
     }
     if let Some(query) = query {
         for parameter in query.split('&') {
@@ -873,25 +901,41 @@ fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
                         | "options"
                 )
             {
-                return Err(fail(
-                    "PostgreSQL preparation URL contains a forbidden target or startup override",
-                ));
+                return Err(fail(format!(
+                    "PostgreSQL {operation} URL contains a forbidden target or startup override"
+                )));
             }
         }
     }
     Ok(())
 }
 
-fn reject_ambient_postgres_environment() -> Result<(), PrepareError> {
+pub(crate) fn validate_complete_postgres_url(url: &str) -> Result<(), PrepareError> {
+    validate_complete_postgres_url_for(url, "preparation")
+}
+
+pub(crate) fn validate_complete_postgres_migration_url(url: &str) -> Result<(), PrepareError> {
+    validate_complete_postgres_url_for(url, "migration")
+}
+
+fn reject_ambient_postgres_environment_for(operation: &str) -> Result<(), PrepareError> {
     if std::env::vars_os().any(|(name, _)| {
         name.to_str()
             .is_some_and(|name| name.as_bytes().starts_with(b"PG"))
     }) {
-        return Err(fail(
-            "PostgreSQL preparation rejects ambient PG* environment variables",
-        ));
+        return Err(fail(format!(
+            "PostgreSQL {operation} rejects ambient PG* environment variables"
+        )));
     }
     Ok(())
+}
+
+pub(crate) fn reject_ambient_postgres_environment() -> Result<(), PrepareError> {
+    reject_ambient_postgres_environment_for("preparation")
+}
+
+pub(crate) fn reject_ambient_postgres_migration_environment() -> Result<(), PrepareError> {
+    reject_ambient_postgres_environment_for("migration")
 }
 
 fn postgres_parameter_oids(
