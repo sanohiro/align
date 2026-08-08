@@ -503,6 +503,27 @@ pub fn meta_query<P, R>(
         }))
       }
     }
+    connection_state := match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(reference) => resource.raw(reference)
+    }
+    mut live_exec := false
+    if !connection_state.is_null() {
+      state_version: u32 := raw.load(connection_state, 0)
+      state_driver: u8 := raw.load(connection_state, 4)
+      state_closed: u8 := raw.load(connection_state, 5)
+      state_reserved: u16 := raw.load(connection_state, 6)
+      state_native: raw := raw.load(connection_state, 8)
+      live_exec = state_version == 1 && state_driver == connection_driver && state_closed == 0
+        && state_reserved == 0 && !state_native.is_null()
+    }
+    if !live_exec {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.meta.exec".clone(),
+        message: "database metadata requires a live execution target".clone(),
+      }))
+    }
 
     mut rows: array_builder<QueryMeta> := array_builder(out)
     detail_tag: u8 := match detail {

@@ -1,7 +1,7 @@
 //! pkg.db Q5b1/D12 static Query metadata materializer owners.
 
 mod common;
-use align_driver::{GeneratedMetaDetail, GeneratedQueryMetaEntry, generated_query_meta_rows};
+use align_driver::{generated_query_meta_rows, GeneratedMetaDetail, GeneratedQueryMetaEntry};
 use align_interface::{
     CheckPolicy, CheckedColumnMeta, CheckedParameterMeta, CheckedQueryEvidence, Driver, Hash128,
     MetaNullability, StaticArtifact, StaticOptionValue, VerificationState,
@@ -27,6 +27,44 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.query(
   "SELECT :id AS id, :id AS again",
   [],
 )
+"#;
+
+const TEST_STATE: &str = r#"module pkg.db.q5b1_test
+import pkg.db
+
+fn state(target: pkg.db.exec) -> raw {
+  unsafe {
+    return match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(reference) => resource.raw(reference)
+    }
+  }
+}
+
+pub fn set_version(target: pkg.db.exec, value: u32) {
+  unsafe { raw.store(state(target), 0, value) }
+}
+
+pub fn set_closed(target: pkg.db.exec, value: u8) {
+  unsafe { raw.store(state(target), 5, value) }
+}
+
+pub fn set_reserved(target: pkg.db.exec, value: u16) {
+  unsafe { raw.store(state(target), 6, value) }
+}
+
+pub fn take_native(target: pkg.db.exec) -> raw {
+  unsafe {
+    connection_state := state(target)
+    native: raw := raw.load(connection_state, 8)
+    raw.store(connection_state, 8, raw.null())
+    return native
+  }
+}
+
+pub fn restore_native(target: pkg.db.exec, native: raw) {
+  unsafe { raw.store(state(target), 8, native) }
+}
 "#;
 
 const MAIN: &str = r#"module main
@@ -166,6 +204,57 @@ fn main() -> i32 {
 }
 "#;
 
+const NON_LIVE_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.q5b1_test
+import app.lookup
+
+fn rejected(result: Result<array<pkg.db.QueryMeta>, pkg.db.Error>) -> bool = match result {
+  Ok(_) => false
+  Err(error) => match error {
+    Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
+      Some(query_id) => query_id == "app.lookup.query"
+      None => false
+    }
+    _ => false
+  }
+}
+
+fn main() -> i32 {
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  connection := opened else { return 1 }
+  target := pkg.db.exec_conn(connection)
+  query := app.lookup.query()
+  arena out {
+    pkg.db.q5b1_test.set_closed(target, 1)
+    closed := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
+    pkg.db.q5b1_test.set_closed(target, 0)
+    if !rejected(closed) { return 2 }
+
+    pkg.db.q5b1_test.set_version(target, 0)
+    wrong_version := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
+    pkg.db.q5b1_test.set_version(target, 1)
+    if !rejected(wrong_version) { return 3 }
+
+    pkg.db.q5b1_test.set_reserved(target, 1)
+    reserved := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
+    pkg.db.q5b1_test.set_reserved(target, 0)
+    if !rejected(reserved) { return 4 }
+
+    native := pkg.db.q5b1_test.take_native(target)
+    missing_native := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
+    pkg.db.q5b1_test.restore_native(target, native)
+    if !rejected(missing_native) { return 5 }
+
+    valid := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
+    rows := valid else { return 6 }
+    if rows.len() != 1 { return 7 }
+    return 42
+  }
+}
+"#;
+
 fn package_files() -> Vec<(&'static str, &'static str)> {
     vec![
         ("pkg/db.align", DB),
@@ -179,6 +268,14 @@ fn package_files() -> Vec<(&'static str, &'static str)> {
         ("app/lookup.align", LOOKUP),
         ("main.align", MAIN),
     ]
+}
+
+fn non_live_package_files() -> Vec<(&'static str, &'static str)> {
+    let mut files = package_files();
+    files.retain(|(path, _)| *path != "main.align");
+    files.push(("pkg/db/q5b1_test.align", TEST_STATE));
+    files.push(("main.align", NON_LIVE_MAIN));
+    files
 }
 
 #[test]
@@ -278,6 +375,25 @@ fn static_query_metadata_materializes_exact_declared_projections() {
     let files = package_files();
     let output = build_and_run_multi_with_static_descriptors(
         "pkg-db-q5b1-query-meta-whole",
+        &files,
+        "main.align",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn meta_query_rejects_non_live_execution_targets_before_materialization() {
+    if !backend_available() {
+        return;
+    }
+    let files = non_live_package_files();
+    let output = build_and_run_multi_with_static_descriptors(
+        "pkg-db-q5b1-query-meta-live-exec",
         &files,
         "main.align",
     );
