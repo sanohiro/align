@@ -2318,7 +2318,7 @@ pub fn summary_to_source(
 ) -> Result<String, ImportCompatibilityError> {
     validate_for_import(summary)?;
     let mut out = String::new();
-    let mut builtin_type_imports = std::collections::BTreeSet::new();
+    let mut builtin_type_imports = std::collections::BTreeSet::<String>::new();
     let mut collect_type = |root: &IType| {
         let mut work = vec![root];
         while let Some(ty) = work.pop() {
@@ -2326,10 +2326,10 @@ pub fn summary_to_source(
                 IType::Named { path, args } => {
                     match path.as_str() {
                         "crypto.argon2_params" => {
-                            builtin_type_imports.insert("std.crypto");
+                            builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "regex.regex_match" => {
-                            builtin_type_imports.insert("std.regex");
+                            builtin_type_imports.insert("std.regex".to_string());
                         }
                         _ => {}
                     }
@@ -2366,13 +2366,18 @@ pub fn summary_to_source(
             collect_type(ty);
         }
     }
-    for import in builtin_type_imports {
-        out.push_str(&format!("import {import}\n"));
-    }
+    // Render the capability imports and transitive dependency imports from one canonical set. A
+    // dependency can itself be the builtin module required by a public nominal type (for example,
+    // `std.crypto` for `crypto.argon2_params`); emitting both sources separately would synthesize a
+    // duplicate import that sema rejects even though the producer summary is valid.
+    let mut imports = builtin_type_imports;
     for dep in dep_units {
         if *dep != summary.unit {
-            out.push_str(&format!("import {dep}\n"));
+            imports.insert((*dep).to_string());
         }
+    }
+    for import in imports {
+        out.push_str(&format!("import {import}\n"));
     }
     for c in &summary.consts {
         out.push_str("pub ");

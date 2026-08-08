@@ -737,6 +737,33 @@ fn resource_metadata_round_trips_and_rejects_each_corruption_class() {
 }
 
 #[test]
+fn summary_source_deduplicates_builtin_and_dependency_imports() {
+    let sums = summaries(&[
+        unit(
+            "lib",
+            false,
+            "module lib\n\
+             import std.crypto\n\
+             import std.regex\n\
+             pub fn builtin_value(p: crypto.argon2_params, m: regex.regex_match) -> i64 = p.parallelism + m.end\n",
+        ),
+        unit("main", true, "module main\nimport lib\nfn main() -> i32 = 0\n"),
+    ]);
+    let summary = find(&sums, "lib");
+    let rendered = summary_to_source(summary, &["std.regex", "std.crypto"]).unwrap();
+    assert_eq!(
+        rendered.lines().filter(|line| *line == "import std.crypto").count(),
+        1,
+        "builtin capability import must not be repeated when it is also a dependency"
+    );
+    assert_eq!(
+        rendered.lines().filter(|line| *line == "import std.regex").count(),
+        1,
+        "builtin capability import must not be repeated when it is also a dependency"
+    );
+}
+
+#[test]
 fn deserialize_unknown_version_fails_closed() {
     let sums = one("pub fn f() -> i64 = 1\nfn main() -> i32 = 0\n");
     let mut bytes = serialize(&sums[0]);
