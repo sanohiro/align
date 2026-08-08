@@ -3592,6 +3592,17 @@ cleanup edge. Q3 reopens this matrix if regeneration needs an ambient input, if 
 publish, if either driver infers `No` nullability from catalog state, or if normal compilation can
 contact a database.
 
+Q3's checked-in native evidence matrix is:
+
+| Driver | Required environment | Owned observation | Fail-closed rule | Owner |
+|---|---|---|---|---|
+| SQLite | macOS arm64 Homebrew SQLite 3.53.3; Ubuntu CI system SQLite ABI 3 | prepare tail, parameter/result order and names, declaration/origin APIs, migration transaction, runtime library version | expression declarations and query nullability remain unavailable; record `null`/`Unknown` and retain runtime storage/NULL validation | `pkg_db_q3::sqlite_native_prepare_describes_the_selected_query`, `pkg_db_q3::migration_catalog_validates_before_sqlite_open_and_applies_atomically` |
+| PostgreSQL | required CI PostgreSQL 16.4 with libpq ABI 5; client version printed by CI | UTF-8 connection, prepared parameter/result OIDs and names, table/attribute origin, search path, extensions, server/client versions | only the closed §10.3 OID mapping is accepted; catalog `NOT NULL` never upgrades result nullability above `Unknown` | `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` |
+
+The macOS PostgreSQL test may skip with a reported reason when no server URL is configured. The
+required `db-postgres` CI job sets `ALIGN_DB_POSTGRES_REQUIRED=1`, provisions PostgreSQL 16.4, and
+turns that absence or an unreachable server into failure.
+
 - canonical `.align-db/sqlite` artifact;
 - `alignc db prepare` and `--check`;
 - exact derived path, canonical fail-closed JSON, independent byte/digest golden, and

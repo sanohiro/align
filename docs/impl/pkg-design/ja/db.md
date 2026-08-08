@@ -2179,6 +2179,39 @@ measurementでdirect libsqlite3 loopと比較する。
 
 ### D3 — checked metadata core + SQLite
 
+#### Q3/D3+D5 implementation closure matrix
+
+Q3は1つのchecked/offline capabilityである。regeneration command、canonical metadata
+codec、SQLite/PostgreSQL describer、normal-build consumerを一緒にlandする。片方のdriverを
+分割するとshared path/identity/stale/diagnostic contractがportability peerなしで決まり、
+writerとconsumerを分割すると安全に消費できないmetadataを公開する。このcapabilityは
+1,000 hand-written linesを超える見込みだが、tool/native/codec/compiler境界をdriver別に
+重複証明するより1回で閉じる方がintegration riskは低い。
+
+既存v1 JSONと `ALIGNMIG`/`ALIGNSID`/`ALIGNSRV`/`ALIGNPRP` streamはexact public contractの
+ままである。DBを開き明示migration directoryを列挙できるのは `alignc db prepare` だけで、
+normal check/buildはderived metadata pathだけを読む。
+
+| closure cell | required implementation closure | exact owner evidence |
+|---|---|---|
+| command/input grammar | §16.2のexact command、repeatable `--query`、`--check`、driver別environment formを実装し、invalid/duplicate/cross-driver inputをcompile/native work前に拒否する。 | `pkg_db_q3::prepare_cli_input_and_precedence_matrix` |
+| regeneration/selection | reachable graphだけをregeneration modeでcompileし、descriptorをUTF-8 ID順にselectする。unknown/duplicate/excluded driver/path hash collisionはDB open前に拒否する。 | `pkg_db_q3::regeneration_ignores_missing_required_metadata_and_is_deterministic` とselection owner |
+| canonical codec | §16.3のone-line-LF JSONをproduction reader/writerと独立goldenで固定し、malformed/noncanonical inputはpanic/partial publicationなしで拒否する。 | `pkg_db_q3::checked_metadata_sqlite_query_and_postgres_command_goldens` とstatic-input malformed matrix |
+| schema/server identity | exact `ALIGNMIG`/`ALIGNSID` とderived identityを実装し、migrationの全validationを最初のSQLite apply前に終える。 | `pkg_db_q3::schema_identity_goldens_match_an_independent_encoder` とmigration owners |
+| SQLite describe | explicit targetだけをopenし、validated migrationをtransactionally applyして、exact wire SQLのcount/name/type/originを記録する。nullabilityはowned query-level evidenceがなければ`Unknown`。 | SQLite native/migration owner tests |
+| PostgreSQL describe | selected env valueだけでUTF-8 connectionを開き、collision-free nameでprepare/describeし、OID/name/origin/search path/extensions/versionを記録する。prepared state/result/connectionを全pathでexactly once cleanupする。 | `pkg_db_q3::postgres_native_prepare_describes_the_selected_query` とrequired PostgreSQL CI |
+| publication/offline consumption | 全canonical recordをmemory形成してからsame-directory staging/atomic replacementを行う。`--check`は同じnative workを行うがwriteしない。normal buildはcurrent evidenceだけを`DatabaseChecked`へ昇格しDB/network/env/directory scanを行わない。 | publication ownerと`pkg_db_q3::generated_metadata_is_consumed_offline_and_stale_required_evidence_fails` |
+
+Q3のchecked-in native evidence matrixは次である。
+
+| Driver | required environment | owned observation | fail-closed rule | owner |
+|---|---|---|---|---|
+| SQLite | macOS arm64 Homebrew SQLite 3.53.3、Ubuntu CI system SQLite ABI 3 | prepare tail、parameter/result order/name、declaration/origin API、migration transaction、runtime library version | expression declaration/query nullabilityが得られなければ`null`/`Unknown`を記録しruntime storage/NULL validationを残す | SQLite native/migration owner tests |
+| PostgreSQL | required CI PostgreSQL 16.4 + libpq ABI 5。client versionはCIで表示 | UTF-8 connection、parameter/result OID/name、table/attribute origin、search path、extension、server/client version | §10.3のclosed OID mappingだけを受理し、catalog `NOT NULL`からresult nullabilityを`Unknown`より強くしない | PostgreSQL native owner test |
+
+macOSのPostgreSQL testはserver URL未設定なら理由付きskipできる。required `db-postgres` CIは
+`ALIGN_DB_POSTGRES_REQUIRED=1` とPostgreSQL 16.4を使い、未設定/接続不能をfailureにする。
+
 `.align-db/sqlite` exact derived path/canonical fail-closed JSONとindependent byte/digest golden、
 `alignc db prepare`/`--check`、producer-owned checked QueryMeta evidence、explicit
 temp/in-memory schema setupと`ALIGNMIG`/`ALIGNSID` catalog/order/fingerprint golden、

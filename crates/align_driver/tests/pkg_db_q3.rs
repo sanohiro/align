@@ -8,7 +8,8 @@ use align_driver::db_prepare::{
     read_migration_catalog, sqlite_database_schema_fingerprint, sqlite_memory_schema_fingerprint,
 };
 use align_driver::{
-    Driver, Hash128, build_static_artifacts, check, lower_to_mir, resolve_static_descriptors,
+    Driver, Hash128, build_per_unit, build_static_artifacts, check, lower_to_mir,
+    resolve_static_descriptors,
 };
 use align_driver::db_prepare_native::{PostgresDescriber, SqliteDescriber};
 use align_interface::{DriverEntry, MetaNullability, StaticArtifact, VerificationState};
@@ -25,7 +26,7 @@ const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sql
 const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
 
 fn project(tag: &str) -> Proj {
-    let main = "module main\nimport app.read\nimport app.write\nimport app.sqlite_table\nimport app.pg_read\nfn main() -> i32 = 0\n";
+    let main = "module main\nimport app.read\nimport app.write\nimport app.sqlite_table\nimport app.sqlite_command\nimport app.pg_read\nimport app.pg_command\nfn main() -> i32 = 0\n";
     let project = Proj::new(tag, &[("main.align", main)], "main.align");
     for directory in ["pkg/db/internal", "app"] {
         std::fs::create_dir_all(project.dir.join(directory)).expect("create package directory");
@@ -49,7 +50,6 @@ pub Params { value: i64 }
 pub Row { value: i64 }
 
 pub fn query() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query_file(
-  "read.sql",
   [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
   [],
 )
@@ -99,6 +99,36 @@ pub Row { value: i64 }
 pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
   "SELECT CAST(:value AS BIGINT) AS value",
   [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [],
+)
+"#,
+        ),
+        (
+            "app/sqlite_command.align",
+            r#"module app.sqlite_command
+import pkg.db
+import pkg.db.sqlite
+
+pub Params {}
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.sqlite.command(
+  "CREATE TEMP TABLE align_q3_sqlite_probe(value INTEGER)",
+  [pkg.db.CommandOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
+  [],
+)
+"#,
+        ),
+        (
+            "app/pg_command.align",
+            r#"module app.pg_command
+import pkg.db
+import pkg.db.postgres
+
+pub Params {}
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "CREATE TEMP TABLE align_q3_postgres_probe(value BIGINT)",
+  [pkg.db.CommandOption.Check(pkg.db.CheckPolicy.CheckedRequired)],
   [],
 )
 "#,
@@ -162,19 +192,24 @@ impl MetadataDescriber for FakeDescriber {
             StaticArtifact::Command(command) => (command.command_id.as_str(), false),
         };
         self.describe_calls.push(id.to_string());
+        let empty_params = matches!(id, "app.sqlite_command.command" | "app.pg_command.command");
         Ok(NativeStatementDescription {
-            parameters: vec![NativeParameterDescription {
-                ordinal: 1,
-                source_name: (self.driver == Driver::SQLite).then(|| "value".to_string()),
-                native_type: Some(
-                    match self.driver {
-                        Driver::SQLite => "INTEGER",
-                        Driver::PostgreSQL => "int8",
-                    }
-                    .to_string(),
-                ),
-                native_type_id: (self.driver == Driver::PostgreSQL).then_some(20),
-            }],
+            parameters: if empty_params {
+                Vec::new()
+            } else {
+                vec![NativeParameterDescription {
+                    ordinal: 1,
+                    source_name: (self.driver == Driver::SQLite).then(|| "value".to_string()),
+                    native_type: Some(
+                        match self.driver {
+                            Driver::SQLite => "INTEGER",
+                            Driver::PostgreSQL => "int8",
+                        }
+                        .to_string(),
+                    ),
+                    native_type_id: (self.driver == Driver::PostgreSQL).then_some(20),
+                }]
+            },
             columns: if query {
                 vec![NativeColumnDescription {
                     ordinal: 0,
@@ -223,9 +258,13 @@ fn regeneration_ignores_missing_required_metadata_and_is_deterministic() {
     assert_eq!(describer.environment_calls, 1);
     assert_eq!(
         describer.describe_calls,
-        ["app.read.query", "app.sqlite_table.query"]
+        [
+            "app.read.query",
+            "app.sqlite_command.command",
+            "app.sqlite_table.query",
+        ]
     );
-    assert_eq!(first.files.len(), 2);
+    assert_eq!(first.files.len(), 3);
     assert!(first.files.iter().all(|file| file.bytes.ends_with(b"}\n")));
     let nullable = b"\"nullable\":\"unknown\"";
     assert!(
@@ -316,8 +355,8 @@ fn schema_identities_and_publication_are_exact_and_check_is_read_only() {
     );
 
     let written = publish_metadata_batch(&batch, false).expect("publish metadata");
-    assert_eq!(written.selected, 2);
-    assert_eq!(written.changed, 2);
+    assert_eq!(written.selected, 3);
+    assert_eq!(written.changed, 3);
     let clean = publish_metadata_batch(&batch, true).expect("metadata is current");
     assert_eq!(clean.changed, 0);
     let path = &batch.files[0].path;
@@ -376,8 +415,36 @@ fn generated_metadata_is_consumed_offline_and_stale_required_evidence_fails() {
         build_static_artifacts(&checked.static_descriptors, &resolved)
     };
     let artifacts = build_offline().expect("consume current metadata offline");
-    assert_eq!(artifacts.len(), 4);
+    assert_eq!(artifacts.len(), 6);
     for artifact in &artifacts {
+        let entries = match &artifact.artifact {
+            StaticArtifact::Query(query) => &query.driver_entries,
+            StaticArtifact::Command(command) => &command.driver_entries,
+        };
+        assert!(entries.iter().all(|entry| {
+            entry.checked_metadata.state == VerificationState::DatabaseChecked
+        }));
+    }
+
+    let entry_source = std::fs::read_to_string(&entry).expect("read entry for per-unit build");
+    let mut per_unit_sources = SourceMap::new();
+    let per_unit = build_per_unit(
+        &mut per_unit_sources,
+        entry.to_str().expect("UTF-8 entry"),
+        &entry_source,
+    );
+    assert!(
+        !per_unit.diags.has_errors(),
+        "per-unit checked metadata diagnostics: {}",
+        align_driver::format_diagnostics(&per_unit_sources, &per_unit.diags)
+    );
+    let per_unit_artifacts = per_unit
+        .units
+        .iter()
+        .flat_map(|unit| unit.static_artifacts.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(per_unit_artifacts.len(), 6);
+    for artifact in per_unit_artifacts {
         let entries = match &artifact.artifact {
             StaticArtifact::Query(query) => &query.driver_entries,
             StaticArtifact::Command(command) => &command.driver_entries,
@@ -409,12 +476,16 @@ fn sqlite_native_prepare_describes_the_selected_query() {
         &mut source_map,
         &entry,
         &checked,
-        &["app.read.query".to_string()],
+        &[
+            "app.read.query".to_string(),
+            "app.sqlite_command.command".to_string(),
+        ],
         &mut describer,
     )
     .expect("native SQLite metadata");
-    assert_eq!(batch.files.len(), 1);
-    let bytes = &batch.files[0].bytes;
+    assert_eq!(batch.files.len(), 2);
+    let bytes = &batch.files.iter().find(|file| file.descriptor_id == "app.read.query")
+        .expect("SQLite Query metadata").bytes;
     for needle in [
         b"\"driver\":\"sqlite\"".as_slice(),
         b"\"source_name\":\"value\"".as_slice(),
@@ -649,9 +720,46 @@ fn migration_catalog_rejects_invalid_names_and_symlinks() {
 }
 
 #[test]
-fn prepare_cli_writes_then_checks_sqlite_metadata() {
+fn prepare_cli_input_and_precedence_matrix() {
     let project = project("pkg-db-q3-cli");
     let entry = project.dir.join(&project.entry);
+    let missing_entry = project.dir.join("missing.align");
+    for (arguments, expected) in [
+        (
+            vec!["--driver", "sqlite", "--database", "db.sqlite"],
+            "SQLite requires exactly",
+        ),
+        (
+            vec![
+                "--driver", "postgres", "--url-env", "Q3_MUST_NOT_BE_READ", "--schema-id", "v1",
+                "--memory",
+            ],
+            "valid only for SQLite",
+        ),
+        (
+            vec![
+                "--driver", "sqlite", "--memory", "--query", "app.read.query", "--query",
+                "app.read.query",
+            ],
+            "duplicate --query",
+        ),
+        (
+            vec!["--driver", "sqlite", "--memory", "--unknown", "value"],
+            "unknown `db prepare` option",
+        ),
+        (vec!["--memory"], "requires --driver"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+            .args(["db", "prepare", missing_entry.to_str().expect("UTF-8 missing entry")])
+            .args(arguments)
+            .output()
+            .expect("run invalid db prepare");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "expected `{expected}` in `{stderr}`");
+    }
+    assert!(!project.dir.join(".align-db").exists());
+
     let command = |check_only: bool| {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
         command.args([
@@ -676,18 +784,6 @@ fn prepare_cli_writes_then_checks_sqlite_metadata() {
     assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("selected=1 changed=0"));
 
-    let invalid = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
-        .args([
-            "db",
-            "prepare",
-            entry.to_str().expect("UTF-8 entry"),
-            "--driver",
-            "postgres",
-            "--memory",
-        ])
-        .output()
-        .expect("run invalid prepare");
-    assert!(!invalid.status.success());
 }
 
 #[test]
@@ -706,12 +802,16 @@ fn postgres_native_prepare_describes_the_selected_query() {
         &mut source_map,
         &entry,
         &checked,
-        &["app.pg_read.query".to_string()],
+        &[
+            "app.pg_read.query".to_string(),
+            "app.pg_command.command".to_string(),
+        ],
         &mut describer,
     )
     .expect("native PostgreSQL metadata");
-    assert_eq!(batch.files.len(), 1);
-    let bytes = &batch.files[0].bytes;
+    assert_eq!(batch.files.len(), 2);
+    let bytes = &batch.files.iter().find(|file| file.descriptor_id == "app.pg_read.query")
+        .expect("PostgreSQL Query metadata").bytes;
     for needle in [
         b"\"driver\":\"postgres\"".as_slice(),
         b"\"native_type\":\"bigint\"".as_slice(),
@@ -735,6 +835,8 @@ fn postgres_native_prepare_describes_the_selected_query() {
             "q3-test-v1",
             "--query",
             "app.pg_read.query",
+            "--query",
+            "app.pg_command.command",
         ]);
         if check_only {
             command.arg("--check");

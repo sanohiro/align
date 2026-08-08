@@ -848,6 +848,7 @@ fn usage() {
            run        build and run (returns the exit code)\n  \
            size       build then report the executable's size breakdown\n  \
            cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
+           db prepare regenerate checked SQLite/PostgreSQL metadata\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
