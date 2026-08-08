@@ -1277,7 +1277,7 @@ import app.portable_query
 fn main() -> i32 {
   url := match env.get("ALIGN_DB_POSTGRES_URL") {
     Some(value) => value
-    None => return 1
+    None => { return 1 }
   }
   sqlite := pkg.db.sqlite.connect(":memory:", [])
   postgres := pkg.db.postgres.connect(url, [])

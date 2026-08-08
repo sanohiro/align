@@ -64,6 +64,10 @@ jobs:
           echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
 
+      - name: Build compiler and runtime
+        shell: bash
+        run: scripts/cargo.sh build --workspace --locked
+
       - name: Print database evidence
         shell: bash
         run: |
