@@ -1686,7 +1686,7 @@ fn postgres_schema_inventory_sql() -> &'static str {
   WHERE n.nspname='align_internal'
 ), columns AS (
   SELECT a.attrelid,
-         pg_catalog.string_agg(a.attname || ':' || pg_catalog.format_type(a.atttypid,a.atttypmod) || ':' || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':' || (ad.oid IS NOT NULL)::text, ',' ORDER BY a.attnum) AS signature,
+         pg_catalog.string_agg(a.attname || ':' || pg_catalog.format_type(a.atttypid,a.atttypmod) || ':' || a.attnotnull::text || ':' || a.attidentity::text || ':' || a.attgenerated::text || ':' || (ad.oid IS NOT NULL)::text, ',' ORDER BY a.attnum) AS signature,
          pg_catalog.count(*) AS count
   FROM pg_catalog.pg_attribute a
   LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
@@ -1695,7 +1695,7 @@ fn postgres_schema_inventory_sql() -> &'static str {
   GROUP BY a.attrelid
 ), constraints AS (
   SELECT conrelid,
-         pg_catalog.string_agg(contype || ':' || pg_catalog.pg_get_constraintdef(oid,false), E'\n' ORDER BY contype,pg_catalog.pg_get_constraintdef(oid,false)) AS signature,
+         pg_catalog.string_agg(contype::text || ':' || pg_catalog.pg_get_constraintdef(oid,false), E'\n' ORDER BY contype,pg_catalog.pg_get_constraintdef(oid,false)) AS signature,
          pg_catalog.count(*) AS count,
          pg_catalog.bool_and(convalidated AND NOT condeferrable AND NOT condeferred) AS immediate
   FROM pg_catalog.pg_constraint
@@ -2795,5 +2795,20 @@ mod tests {
             message: "unrelated failure fixture".to_owned(),
             sqlstate: Some("42501".to_owned()),
         }));
+    }
+
+    #[test]
+    fn postgres_inventory_casts_internal_char_discriminators_before_concatenation() {
+        let sql = postgres_schema_inventory_sql();
+        for discriminator in [
+            "a.attidentity::text",
+            "a.attgenerated::text",
+            "contype::text",
+        ] {
+            assert!(sql.contains(discriminator));
+        }
+        for ambiguous in ["a.attidentity ||", "a.attgenerated ||", "contype ||"] {
+            assert!(!sql.contains(ambiguous));
+        }
     }
 }
