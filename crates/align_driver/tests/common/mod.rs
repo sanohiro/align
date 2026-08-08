@@ -401,7 +401,7 @@ pub fn build_and_run_multi(
     files: &[(&str, &str)],
     entry: &str,
 ) -> std::process::Output {
-    build_and_run_multi_with_env(name, files, entry, &[])
+    build_and_run_multi_args_with_env(name, files, entry, &[], &[])
 }
 
 /// [`build_and_run_multi`] with explicit environment pairs applied to the generated child. The
@@ -413,10 +413,24 @@ pub fn build_and_run_multi_with_env(
     entry: &str,
     envs: &[(&str, &str)],
 ) -> std::process::Output {
+    build_and_run_multi_args_with_env(name, files, entry, &[], envs)
+}
+
+/// [`build_and_run_multi`] with arguments and explicit environment pairs applied to the generated
+/// child. Arguments are cloned before compilation so the child-input boundary remains independent
+/// of the caller's temporary source strings.
+pub fn build_and_run_multi_args_with_env(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    prog_args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     let proj = TempProject::new(name, files);
     let entry_path = proj.entry(entry);
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
     let entry_name = entry_path.display().to_string();
+    let prog_args: Vec<String> = prog_args.iter().map(|arg| (*arg).to_owned()).collect();
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, &entry_name, &entry_src);
     assert!(
@@ -442,6 +456,7 @@ pub fn build_and_run_multi_with_env(
     .expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let mut command = std::process::Command::new(&exe);
+    command.args(&prog_args);
     for &(key, value) in envs {
         command.env(key, value);
     }

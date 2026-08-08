@@ -1335,17 +1335,13 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.query(
 )
 "#;
     let main = r#"module main
-import std.env
 import pkg.db
 import pkg.db.sqlite
 import pkg.db.postgres
 import app.portable_query
 
-fn main() -> i32 {
-  url := match env.get("ALIGN_DB_POSTGRES_URL") {
-    Some(value) => value
-    None => { return 1 }
-  }
+fn main(args: array<str>) -> i32 {
+  url := args[1]
   sqlite := pkg.db.sqlite.connect(":memory:", [])
   postgres := pkg.db.postgres.connect(url, [])
   return match sqlite {
@@ -1393,11 +1389,12 @@ fn main() -> i32 {
         ("app/portable_query.align", QUERY),
         ("main.align", main),
     ];
-    let output = build_and_run_multi_with_env(
+    let output = build_and_run_multi_args_with_env(
         "pkg-db-q2-required-postgres-portable",
         &files,
         "main.align",
-        &[("ALIGN_DB_POSTGRES_URL", postgres_url.as_str())],
+        &[postgres_url.as_str()],
+        &[],
     );
     assert_eq!(
         output.status.code(),
