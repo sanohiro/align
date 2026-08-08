@@ -1416,8 +1416,9 @@ explicit metadata workflowである。通常buildにはどのcommandも組み込
 BEGIN/COMMIT/ROLLBACK/SAVEPOINTなどnative transaction-control statementは禁止し、runnerが
 boundaryを所有する。driver-authoritativeなscript preparation/screeningで最初のmutation前に
 rejectする。
-requiredはmigration lock取得後、全statementとApplied history insertを1 transactionで
-行う。全statement後にexact history schemaとalready-Applied prefixを再検証し、Applied rowをinsertして
+requiredはmigration lock取得後、native write transactionをbeginしてdatabase-native history lockを
+取得し、exact history schema/already-Applied prefixを再検証してから全statementを実行する。
+全statement後に同じschema/prefixを再検証し、Applied rowをinsertして
 rereadする。commit前に観測したerrorは全体rollbackし、不確定commit responseは下記reconciliation
 ruleを使う。transaction内で拒否されたstatementを外へ出してretryしない。
 
@@ -1445,7 +1446,9 @@ retryを確認してdirty rowだけを削除する。DB effectをundoせず、Ap
 
 database commitまたはconnection-loss errorはclientが観測できないoutcomeを持ち得る。runnerはその
 不確実性をrollback済みと主張しない。failed native connectionをcloseし、fresh connection 1つをopen、
-同じmigration lockを再取得してexact historyを1回rereadする。Required transactionではexact Applied
+上記native lock下でexact historyを1回rereadする。SQLiteはconnection replacement中もseparate OS-lock
+descriptorを保持し、PostgreSQLはnative table lock/reread前にconnection-owned advisory lockを再取得する。
+Required transactionではexact Applied
 rowがSQLとhistory両方のcommitを証明し、absentならどちらもcommitしておらず、そのinvocationでは
 retryせずnot-appliedを報告する。Forbiddenはnative execution前にApplying insertのdurable observationを
 必須とする。不確定なfinal updateはAppliedまたはdirty Applying rowとしてreconcileする。reconnect、
@@ -1511,18 +1514,22 @@ index、trigger、view、rewritten table formを除外する。全history query/
 PostgreSQLはcurrent role所有の
 permanent ordinary heap tableを要求し、partition/inheritance relation、row security、forced row
 security、user trigger、rewrite rule、policy、extra index、generated/default/identity expression、
-non-owner ACL、`align_internal` 内の他のuser-addressable relationを許可しない。唯一のindexは
+non-owner ACL、history tableへattachされた他のbehavior-affecting objectを許可しない。唯一のindexは
 `version` 上のvalid/ready/immediate/default-btree primary-key indexで、constraintはそのprimary keyと
-DDL中の6個のimmediate validated checkだけである。schemaもcurrent role所有でnon-owner ACLを持たない。
+DDL中の6個のimmediate validated checkだけである。schemaはcurrent role所有である。fully qualified
+history DMLへ影響しないunrelated schema object/schema grantはこのtable invariantに含めない。
 
-readerはこのcomplete ancillary-object inventoryに加え、driver catalogからexact column order、
-declared type、nullability、primary key、check expressionを検証し、さらに全rowのstorage/type、
+readerはこのcomplete table-attached ancillary-object inventoryに加え、1本のjoined driver-catalog
+queryでexact column order、declared type、nullability、primary key、check expressionを検証し、
+さらに全rowのstorage/type、
 exact lowercase checksum、filename/version agreement、field combinationを検証する。PostgreSQLでは
 `completed_statements` だけが `bigint` で、contractは上記のfull unsigned 32-bit rangeである。
 schema disagreement、unrepresentable native value、semantic row violationはmutation前にcommandを
 失敗させる。replaced/weakened tableはfail closedする。
 `Applying` と `Failed` は `policy = Forbidden` かつ `completed_statements = 0`、`Applied` は
-driver-screened statement countと一致しなければならない。Requiredはmigration transaction内で
+current catalog fileがあればdriver-screened statement countと一致しなければならない。
+HistoryOnly Applied rowはrescreenするfileがないためForbiddenは1、Requiredはnonzero `u32` を要求し、
+そのversionを再導入するとexact-count checkを戻す。Requiredはmigration transaction内で
 Applied rowだけをpublishする。ForbiddenはApplying(0)、native success後のApplied(1)、
 best-effort error recordのFailed(0)だけを持つ。
 
@@ -1537,6 +1544,33 @@ databaseはread-onlyでopenしhistory/schema objectは作成しない。
 PostgreSQLはsession advisory lock key `(1095518535, 1296647985)` (`ALIG`, `MIG1`) を、
 writeではexclusive、readではshared modeで保持する。process/connection lossはOS/advisory lockを
 解放するがSQLite fileは削除しない。
+
+OS/advisory lockはcooperating Align commandをserializeし、database-native lockはnon-cooperating
+database connectionに対するvalidation-to-history-DML intervalを閉じる。SQLite bootstrap、Required、
+repair、Forbiddenの各history transitionは `BEGIN IMMEDIATE` を使い、write reservation取得後だけ
+validateする。SQLite `status`/`check` はread transaction 1つを使い、最初の
+`main.sqlite_schema` readでschema/row validation前にsnapshotを固定する。PostgreSQLの各history phaseは
+explicit `READ COMMITTED` transaction 1つを使う。`BEGIN` 後のfirst SQLは存在queryなしで、全history
+validation/mutation前に `LOCK TABLE "align_internal"."migrations_v1" IN ACCESS EXCLUSIVE MODE`、
+`status`/`check` validation前に `IN SHARE ROW EXCLUSIVE MODE` を取得する。後者はordinary readerを
+許可しつつhistory DMLとordinary/concurrent index/DDL lock modeに競合する。このlockはfirst
+catalog/history read前に
+prior writerを待ち、transaction endまでlater readへのtable writerを止める。
+
+SQLSTATE `42P01` (undefined table)だけがfailed transaction rollback後にabsent-table pathを選ぶ。
+`migrate` はnew transaction 1つでexact schema/table bootstrapをattemptし、new objectをvalidate/commit後、
+blind-lock phaseから再開する。pre-existing schema/creation raceはadoptせずfailする。`status`/`check` は
+new transaction 1つとcatalog query 1本を使い、両object absentをempty snapshot、一方だけpresentを
+invalidとする。`repair` はmissing historyを報告し、他のlock errorは直接failする。これによりbootstrap/
+first-reader raceをdeterministicにし、`migrate` だけがhistoryを作る規則を保つ。
+
+Forbidden user SQLはApplying commit後にseparate worker connectionで実行する。workerはhistory DMLを
+行わず、history connectionがfinal native-lock/revalidation/Applied-or-Failed transactionを始める前に
+closeする。このためworker-local temporary object/settingはhistory mutationへ影響せず、recorded
+history-connection invariantの外である。persistent changeはfinal validationから可視である。
+Required user SQLは1 transaction connection上に残り、その
+connection-local inventoryをrow insert前に検証する。lock acquisitionは常にvalidationより先で、
+対応read/history mutation完了後だけnative transaction/lockを解放する。
 
 migration directoryはproject-root-relativeである。entryはexisting regular non-symlink `.align`
 fileで、そのlexical parentをproject rootとする。absolute migration path、`..`、symlink directory、
@@ -1585,9 +1619,10 @@ PostgreSQL dollar-quoted bodyを無視する。top-level first tokenが `BEGIN`�
 SQLite boundaryはtrigger bodyを含め `sqlite3_complete`、PostgreSQLは同じdollar-quote-aware
 driver scannerを使う。両driverともtarget openやApplying publish前にscreeningを完了し、SQL validityは
 native executionがauthoritativeである。
-user SQL後かつ全history insert/update前に、同じlock下でcomplete owned persistent/connection-local
-schema/ancillary-object inventoryとexpected prefixを再検証する。Requiredはcommit前にnew rowも
-rereadする。Forbiddenもnative statement後/final update前に同じ検証を行う。historyを
+user SQL後かつ全history insert/update前に、上記operation lockとdatabase-native lockの両方の下で
+complete owned persistent/applicable history-connection-local schema/ancillary-object inventoryと
+expected prefixを再検証する。Requiredはcommit前にnew rowもrereadする。Forbiddenはworkerをcloseし、
+history connection上でfinal native lockを取得してからfinal update前の同じ検証を行う。historyを
 alter/replace/shadowしたりbehaviorをattachするSQLはRequired fileをrollbackするかForbidden rowを
 visible dirtyに残し、progressをsilent erase/forgeできない。
 
@@ -1604,9 +1639,10 @@ print tagは順に `pending`、`applied`、`name_mismatch`、`checksum_mismatch`
 全commandはcurrent catalog rowをversion順、その後HistoryOnly rowをversion順に出す。全fieldは常に
 存在し、`catalog_*` はcurrent catalog、`history_*` はstored rowだけをsourceにする。missing sideは
 exact unavailable token `-`、`history_state` は `applying`、`applied`、`failed`、`-` のいずれか。
+`history_completed` はstored decimal `u32` または `-` である。
 
 ```text
-migration version=0001 catalog_name=0001_create_users.sql catalog_checksum=<32hex> catalog_policy=required history_name=0001_create_users.sql history_checksum=<32hex> history_policy=required history_state=applied state=applied
+migration version=0001 catalog_name=0001_create_users.sql catalog_checksum=<32hex> catalog_policy=required history_name=0001_create_users.sql history_checksum=<32hex> history_policy=required history_state=applied history_completed=1 state=applied
 summary driver=sqlite applied=1 pending=0 dirty=0 mismatched=0 history_only=0
 ```
 
@@ -2521,13 +2557,16 @@ Q5aはCLI、canonical catalog reuse、driver-owned screening/locking、persisten
 execution、inspection、explicit repairを跨ぐ1つのexternal-state capabilityである。SQLiteと
 PostgreSQLを同時に入れ、history/state/repair semanticsのdriver driftを防ぐ。これはQ5の意図的な
 mutation halfであり、D12は独立したread-only capabilityとして残す。
+このcapabilityは2 FFI adapterとfault/concurrency ownerを含むため手書き約1,000行を超える見込みである。
+driver/commandで分割するとdormant producer/consumer seamまたは同じpersistent-state proofの重複を
+残す。shared state machine 1つとthin driver adapterの方がproof重複とintegration riskを下げる。
 
 | Closure cell | Required implementation closure | Exact owner evidence |
 |---|---|---|
 | CLI/target identity | §17.6のexact migrate/status/check/repair formとvalidation precedenceを実装する。cwd discoveryなしでentry、project-relative catalog、relative SQLite targetをresolveし、non-secret validation後にselected non-`PG*` PostgreSQL URL variableだけを読む。 | `pkg_db_q5a::migration_cli_rejects_invalid_forms_before_catalog_environment_or_native_work` とpath/symlink matrix |
 | catalog/policy screening | Q3の `ALIGNMIG` catalog byte/digestを再利用する。exact first physical lineをparseしcomplete driver statementをcountし、target mutation前にempty、transaction-control、NUL、invalid UTF-8、multi-statement Forbidden fileをrejectする。 | cumulative Q3 catalog goldenと `pkg_db_q5a::migration_policy_and_statement_screening_is_exact` |
-| history codec/state reconciliation | migrate中だけ§17.6のexact owned objectを作成し、complete persistent/session-local table/ancillary-object inventoryと全row/state combinationを検証し、version順でreconcileし、complete current/extra/mismatch/dirty matrixをpanic/silent upgradeなしでclassifyする。malformed schema/row stateはmutation前にrejectする。 | SQLite TEMP-trigger/shadowとPostgreSQL trigger/rule/RLS/default/index/ACL negativeを含む両driverの `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` |
-| overlap exclusion/cleanup | 全SQLite commandはexact persistent OS-lock inodeを作成可能かつ保持し、全PostgreSQL commandはbootstrap/read/validationとoperation全体でexact advisory keyを保持する。second writerはhistory/native mutation前にblockし、全success/error/Drop/process-loss edgeでlockまたはconnection-owned advisory stateを解放する。 | SQLite absent-lock creation/two-process exclusion ownerとrequired PostgreSQL concurrent-session owner |
+| history codec/state reconciliation | migrate中だけ§17.6のexact owned objectを作成し、complete persistent/session-local history-table/attached-object inventoryと全row/state combinationを検証し、version順でreconcileし、complete current/extra/mismatch/dirty matrixをpanic/silent upgradeなしでclassifyする。1本のjoined PostgreSQL catalog queryがtable invariantを所有し、unrelated schema objectを除外する。malformed schema/row stateはmutation前にrejectする。 | SQLite TEMP-trigger/shadowとPostgreSQL trigger/rule/RLS/default/index/ACL negativeを含む両driverの `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` |
+| overlap exclusion/cleanup | 全SQLite commandはexact persistent OS-lock inodeを作成可能かつ保持し、全PostgreSQL commandはoperation全体でexact advisory keyを保持する。そのcooperating lock後、SQLite read snapshot/`BEGIN IMMEDIATE` とblind-first-SQL PostgreSQL `READ COMMITTED` SHARE ROW EXCLUSIVE/ACCESS EXCLUSIVE table lockがnon-cooperating DB writerに対してvalidation/history accessをatomicにする。SQLSTATE-bound rollback/bootstrapがexistence raceなしでabsent tableを扱う。Forbiddenはhistoryをmutateしないworkerへuser SQLを分離する。全success/error/Drop/process-loss edgeでworker、native transaction/table lock、operation lockの順に解放する。 | SQLite absent-lock creation/external-writer race/TEMP-trigger/two-process ownerとrequired PostgreSQL concurrent-session/external-DDL-DML/bootstrap-race owner |
 | Required execution | migration lock下で各Required fileとApplied history insertを1 transactionで行う。statement/history failureはcomplete fileをrollbackする。不確定commitはclose/reconnect/relockしexact Applied/absentをclassifyし、same-invocation retryしない。current Applied prefixを再実行しない。 | SQLiteとrequired PostgreSQL atomic/multi-statement/error/restart/outcome-unknown owner |
 | Forbidden execution/dirty state | screened statement 1つを要求し、transaction外execution前にApplying(0)をdurably observeし、Applied(1)をrecordする。native errorはbest-effortでFailed(0)、不確定final publicationはAppliedまたはdirty Applyingへreconcileする。dirty stateは継続をblockし自動retryしない。 | 両driverのbefore/after/error-recording/outcome-unknown fault matrixとexecution counter |
 | status/check | operational lock file以外を作らず、schema/history creation、migration、repairを行わない。catalog/history provenance付きexact ordered row/summaryを出し、statusはinspection後success、checkはexact current Applied setだけsuccess。missing historyはempty、missing SQLite targetはinput error。 | empty/current/compound-mismatch/dirty/history-onlyを跨ぐ `pkg_db_q5a::status_and_check_are_read_only_and_ordered` |
@@ -2544,10 +2583,13 @@ pre-implementation adversarial reviewはsource work前に次のroot-cause class�
 |---|---|
 | P1 absent-lock readerがfirst writerとraceできた | 全commandが同じpersistent SQLite inodeをatomic create/openしてlockする。read-onlyはdatabase/historyを指し、operational lockだけをfilesystem writeとする。 |
 | P1 commit response lossをrollback/dirtyと断定していた | Required/Forbidden publicationはfresh-connection history reconciliation 1回とexact permitted outcomeを使い、same-invocation automatic retryをしない。 |
-| P1 column/check検証がbehavior-changing attached objectを除外しなかった | SQLite schema-row inventoryとPostgreSQL relation/index/constraint/trigger/rule/RLS/ACL inventoryを閉じ、fail closedする。 |
+| P1 column/check検証がbehavior-changing attached objectを除外しなかった | SQLite schema-row inventoryとPostgreSQL history-table relation/index/constraint/trigger/rule/RLS/ACL inventoryを閉じ、fail closedする。 |
 | P2 compound mismatchにtotal order/value provenanceがなかった | Name、checksum、policy、native stateを1 total orderとし、全output rowがexact unavailable marker付きcatalog/history fieldを常に持つ。 |
 | P2 validation phase内部のwinnerが未規定だった | token、field、directory、file、statement、connection、schema、historyのtraversal/error precedenceをexactにした。 |
 | P1 revised reviewがSQLite connection-local behaviorを `sqlite_schema` 外に発見した | matrixをpersistent/session-local modifier全体へ再openし、exact `main` qualificationと `sqlite_temp_schema` rejectionでTEMP trigger/shadow pathを閉じた。 |
+| P1 focused continuationがnon-cooperating DB writerとのvalidation-to-DML raceを発見した | matrixを2 lock layerへ再設計した。OS/advisory lockがAlignをserializeし、SQLite transaction/PostgreSQL table lockがnative validation/history accessを覆い、Forbidden workerはhistory DMLを行わない。 |
+| focused lock reviewがunprotected schema-wide stateとracy PostgreSQL existence branchを含んでいた | invariantを1 catalog queryで検証するhistory-table-attached behaviorだけにし、blind first-SQL lockとSQLSTATE-bound rollback/bootstrapでexistence raceを除去した。worker-local stateはhistory-connection invariant外で、Applyingはrepair必須/no-retry dirty stateのままである。 |
+| final inspection reviewがPostgreSQL `SHARE` とindex creationのcompatibilityを発見した | inspectionはordinary readerを許可し、DMLとordinary/concurrent index/DDL modeに競合する `SHARE ROW EXCLUSIVE` を使う。 |
 
 ### D12 — category metadataとEXPLAIN
 

@@ -2515,9 +2515,10 @@ preparation/screening rejects them before any migration mutates the database.
 `required` has one all-or-nothing algorithm on both drivers:
 
 1. acquire the driver migration lock;
-2. begin one transaction;
+2. begin one native write transaction, acquire its database-native history lock, and revalidate the
+   exact history schema and already-Applied prefix;
 3. execute every statement in file order;
-4. revalidate the exact history schema and already-Applied prefix, then insert and reread the applied
+4. revalidate the same schema/prefix, then insert and reread the applied
    history row in the same transaction;
 5. commit; an error observed before commit rolls back the whole file, while an uncertain commit
    response uses the reconciliation rule below.
@@ -2556,7 +2557,9 @@ native success but before the history update, and during error recording on SQLi
 
 A database commit or connection-loss error may have an outcome the client cannot observe. The runner
 never converts that uncertainty into a claimed rollback. It closes the failed native connection,
-opens one fresh connection, reacquires the same migration lock, and rereads exact history once.
+opens one fresh connection, and rereads exact history once under the native lock above. SQLite
+retains its separate OS-lock descriptor across connection replacement; PostgreSQL reacquires its
+connection-owned advisory lock before the native table lock and reread.
 For a Required transaction, an exact Applied row proves that both SQL and history committed; absence
 proves neither committed, and the command reports not-applied without retrying in that invocation.
 For Forbidden execution, the Applying insert must be durably observed before native execution. An
@@ -2625,20 +2628,25 @@ Every history query and mutation explicitly qualifies `main.__align_migrations_v
 object cannot shadow the owned table.
 PostgreSQL requires a permanent ordinary heap table owned by the current role, with no partition or
 inheritance relation, row security, forced row security, user trigger, rewrite rule, policy, extra
-index, generated/default/identity expression, non-owner ACL, or other user-addressable relation in
-`align_internal`. Its only index is the valid, ready, immediate, default-btree primary-key index on
-`version`; its constraints are exactly that primary key and the six immediate validated checks in
-the DDL. The schema is owned by the current role and has no non-owner ACL.
+index, generated/default/identity expression, non-owner ACL, or other behavior-affecting object
+attached to the history table. Its only index is the valid, ready, immediate,
+default-btree primary-key index on `version`; its constraints are exactly that primary key and the
+six immediate validated checks in the DDL. The schema is owned by the current role. Unrelated schema
+objects and schema grants do not affect fully qualified history DML and are not part of this table
+invariant.
 
-Readers validate that complete ancillary-object inventory plus exact column order, declared types,
-nullability, primary key, and check expressions through driver catalogs, then validate every row's
+Readers validate that complete table-attached ancillary-object inventory plus exact column order,
+declared types, nullability, primary key, and check expressions through one joined driver-catalog
+query, then validate every row's
 storage/type, exact lowercase checksum spelling, filename/version agreement, and field combinations.
 PostgreSQL `completed_statements` alone is `bigint`; its contract is still the full unsigned 32-bit
 range above. A schema disagreement, unrepresentable native value, or semantic row violation fails
 the command before any mutation. A replaced or weakened table therefore fails closed rather than
 being upgraded.
 `Applying` and `Failed` require `policy = Forbidden` and `completed_statements = 0`. `Applied`
-requires `completed_statements` to equal the driver-screened statement count. Required migrations
+with a current catalog file requires `completed_statements` to equal the driver-screened statement
+count. A HistoryOnly Applied row has no file to rescreen: Forbidden still requires one and Required
+requires a nonzero `u32`; reintroducing that version restores the exact-count check. Required migrations
 publish only one `Applied` row inside their migration transaction; they never expose Applying or
 Failed. Forbidden migrations expose Applying with zero, then Applied with one after native success;
 best-effort error recording changes only Applying to Failed and leaves zero.
@@ -2655,6 +2663,37 @@ the database read-only and never create history/schema objects. PostgreSQL holds
 lock key
 `(1095518535, 1296647985)` (`ALIG`, `MIG1`) in exclusive or shared mode respectively. Process or
 connection loss releases the OS/advisory lock; the persistent SQLite file is never deleted.
+
+The OS/advisory lock serializes cooperating Align commands; database-native locking closes the
+validation-to-history-DML interval against non-cooperating database connections. SQLite bootstrap,
+Required, repair, and each Forbidden history transition use `BEGIN IMMEDIATE`; validation occurs
+only after that transaction acquires its write reservation. SQLite `status`/`check` use one read
+transaction whose first `main.sqlite_schema` read fixes the snapshot before schema and row
+validation. Each PostgreSQL history phase uses one explicit `READ COMMITTED` transaction. Its first
+SQL after `BEGIN` blindly attempts
+`LOCK TABLE "align_internal"."migrations_v1" IN ACCESS EXCLUSIVE MODE` before history
+validation/mutation or `IN SHARE ROW EXCLUSIVE MODE` before `status`/`check` validation. The latter
+still permits ordinary readers but conflicts with history DML and both ordinary and concurrent
+index/DDL lock modes. The lock therefore waits
+for prior writers before the first catalog/history read, and later reads see no table writer until
+transaction end. No existence query precedes the lock.
+
+Only SQLSTATE `42P01` (undefined table) selects the absent-table path, after rollback of that failed
+transaction. `migrate` then attempts the exact schema plus table bootstrap in one new transaction,
+validates its new objects, commits, and restarts from the blind-lock phase; a pre-existing schema or
+any creation race fails rather than being adopted. `status`/`check` use one new transaction and one
+catalog query: both objects absent is the empty snapshot, while exactly one present is invalid.
+`repair` reports missing history. Every other lock error fails directly. This makes bootstrap and
+first-reader races deterministic without weakening the rule that only `migrate` creates history.
+
+Forbidden user SQL runs on a separate worker connection after Applying commits. That worker never
+performs history DML and is closed before the history connection starts the final native-lock,
+revalidation, and Applied/Failed transaction. Thus worker-local temporary objects or settings cannot
+affect history mutation and are outside the recorded history-connection invariant; persistent changes
+remain visible to the final validation. Required user SQL remains on the one transaction connection,
+so its connection-local inventory is validated before the row insert. Lock acquisition always
+precedes validation, and the native transaction/lock is released only after the corresponding read
+or history mutation completes.
 
 The migration directory is project-root-relative. The entry must be an existing regular,
 non-symlink `.align` file; its lexical parent is the project root. An absolute migration path,
@@ -2711,11 +2750,12 @@ boundaries, including trigger bodies, use `sqlite3_complete`; PostgreSQL boundar
 dollar-quote-aware driver scanner. Both drivers finish this complete screening phase before opening
 the target or publishing an Applying row; native execution remains authoritative for SQL validity.
 After user SQL and before every history insert/update, the runner revalidates the complete owned
-persistent and connection-local schema/ancillary-object inventory and expected prefix under the same
-lock. Required also rereads its new row before commit. Forbidden performs the same validation after
-its native statement and before the final update. SQL that alters, replaces, shadows, or attaches
-behavior to history therefore rolls back a Required file or leaves a Forbidden row visibly dirty;
-it cannot silently erase or forge progress.
+persistent and applicable history-connection-local schema/ancillary-object inventory and expected
+prefix under both the operation lock and database-native lock above. Required also rereads its new
+row before commit. Forbidden closes its worker, acquires the final native lock on the history
+connection, then performs the same validation before the final update. SQL that alters, replaces,
+shadows, or attaches behavior to history therefore rolls back a Required file or leaves a Forbidden
+row visibly dirty; it cannot silently erase or forge progress.
 
 History comparison is version ordered. Every current catalog version produces exactly one status:
 `Pending`, `Applied`, `NameMismatch`, `ChecksumMismatch`, `PolicyMismatch`, `DirtyApplying`, or
@@ -2732,10 +2772,11 @@ counts therefore cover every printed row exactly once.
 All four commands print current catalog rows in version order followed by HistoryOnly rows in
 version order. Every field is always present. `catalog_*` values come only from the current catalog;
 `history_*` values come only from the stored row. A missing side uses the exact unavailable token
-`-`, and `history_state` is `applying`, `applied`, `failed`, or `-`:
+`-`, `history_state` is `applying`, `applied`, `failed`, or `-`, and `history_completed` is the
+stored decimal `u32` or `-`:
 
 ```text
-migration version=0001 catalog_name=0001_create_users.sql catalog_checksum=<32hex> catalog_policy=required history_name=0001_create_users.sql history_checksum=<32hex> history_policy=required history_state=applied state=applied
+migration version=0001 catalog_name=0001_create_users.sql catalog_checksum=<32hex> catalog_policy=required history_name=0001_create_users.sql history_checksum=<32hex> history_policy=required history_state=applied history_completed=1 state=applied
 summary driver=sqlite applied=1 pending=0 dirty=0 mismatched=0 history_only=0
 ```
 
@@ -3988,13 +4029,17 @@ Q5a is one external-state capability spanning CLI, canonical catalog reuse, driv
 screening/locking, persistent history, migration execution, inspection, and explicit repair. SQLite
 and PostgreSQL land together so history/state/repair semantics cannot drift by driver. This is the
 deliberate mutation half of Q5; D12 remains an independent read-only capability.
+The capability is expected to exceed roughly 1,000 hand-written lines because it includes two FFI
+adapters and their fault/concurrency owners. Splitting by driver or command would leave a dormant
+producer/consumer seam or duplicate the same persistent-state proof; one shared state machine with
+thin driver adapters produces less duplicated proof and lower integration risk.
 
 | Closure cell | Required implementation closure | Exact owner evidence |
 |---|---|---|
 | CLI and target identity | Implement the exact migrate/status/check/repair forms and validation precedence in §17.6. Resolve entry, project-relative catalog, and relative SQLite target without cwd discovery; read only the selected non-`PG*` PostgreSQL URL variable after all non-secret validation. | `pkg_db_q5a::migration_cli_rejects_invalid_forms_before_catalog_environment_or_native_work` and path/symlink matrix |
 | catalog and policy screening | Reuse the Q3 `ALIGNMIG` catalog bytes/digest. Parse the exact first physical line, count complete driver statements, and reject empty, transaction-control, NUL, invalid UTF-8, and multi-statement Forbidden files before target mutation. | cumulative Q3 catalog goldens plus `pkg_db_q5a::migration_policy_and_statement_screening_is_exact` |
-| history codec/state reconciliation | Create only the exact §17.6 owned objects during migrate, validate the complete persistent/session-local table and ancillary-object inventory plus every row/state combination, reconcile in version order, and classify the complete current/extra/mismatch/dirty matrix without panic or silent upgrade. Reject malformed schema or row state before mutation. | `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` for both drivers, including SQLite TEMP-trigger/shadow and PostgreSQL trigger/rule/RLS/default/index/ACL negatives |
-| overlap exclusion and cleanup | Every SQLite command may create then holds the exact persistent OS-lock inode; every PostgreSQL command holds the exact advisory key across bootstrap/read/validation and the complete operation. A second writer blocks before history/native mutation; every success/error/Drop/process-loss edge releases the lock or connection-owned advisory state. | SQLite absent-lock creation plus two-process exclusion owner and required PostgreSQL concurrent-session owner |
+| history codec/state reconciliation | Create only the exact §17.6 owned objects during migrate, validate the complete persistent/session-local history-table and attached-object inventory plus every row/state combination, reconcile in version order, and classify the complete current/extra/mismatch/dirty matrix without panic or silent upgrade. One joined PostgreSQL catalog query owns the table invariant; unrelated schema objects are excluded. Reject malformed schema or row state before mutation. | `pkg_db_q5a::migration_history_state_matrix_is_fail_closed` for both drivers, including SQLite TEMP-trigger/shadow and PostgreSQL trigger/rule/RLS/default/index/ACL negatives |
+| overlap exclusion and cleanup | Every SQLite command may create then holds the exact persistent OS-lock inode; every PostgreSQL command holds the exact advisory key across the operation. After those cooperating locks, SQLite read snapshots/`BEGIN IMMEDIATE` and blind-first-SQL PostgreSQL `READ COMMITTED` SHARE ROW EXCLUSIVE/ACCESS EXCLUSIVE table locks make validation plus history access atomic against non-cooperating DB writers. SQLSTATE-bound rollback/bootstrap handles an absent table without an existence race. Forbidden isolates user SQL on a worker that never mutates history. Every success/error/Drop/process-loss edge releases worker, native transaction/table lock, and operation lock in that order. | SQLite absent-lock creation, external writer race, TEMP-trigger, and two-process owners; required PostgreSQL concurrent-session/external-DDL-DML/bootstrap-race owners |
 | Required execution | Under the migration lock, run each Required file and its Applied history insert in one transaction. Statement/history failure rolls back that complete file; an uncertain commit closes/reconnects/relocks and classifies exact Applied versus absent without same-invocation retry. Already Applied current prefixes are not re-executed. | SQLite and required PostgreSQL atomic/multi-statement/error/restart/outcome-unknown owners |
 | Forbidden execution and dirty state | Require one screened statement and durably observe Applying(0) before executing outside a transaction, then record Applied(1). Native error best-effort records Failed(0); uncertain final publication reconciles as Applied or dirty Applying. Either dirty state blocks continuation and is never retried automatically. | both-driver before/after/error-recording/outcome-unknown fault matrix and execution counters |
 | status/check | Create at most the operational lock file and perform no schema/history creation, migration, or repair. Emit exact ordered rows/summary with catalog/history provenance; status succeeds after inspection while check succeeds only for one exact current Applied set. Missing history is empty; missing SQLite target is an input error. | `pkg_db_q5a::status_and_check_are_read_only_and_ordered` for empty/current/compound-mismatch/dirty/history-only states |
@@ -4011,10 +4056,13 @@ The pre-implementation adversarial review closed these root-cause classes before
 |---|---|
 | P1 absent-lock readers could race a first writer | Every command atomically creates/opens and locks the same persistent SQLite inode; read-only refers to the database/history, with the operational lock as the sole filesystem write. |
 | P1 commit response loss was incorrectly called rollback/dirty | Required and Forbidden publication use one fresh-connection history reconciliation with exact permitted outcomes and no automatic same-invocation retry. |
-| P1 columns/checks did not exclude behavior-changing attached objects | The SQLite schema-row inventory and PostgreSQL relation/index/constraint/trigger/rule/RLS/ACL inventory are now closed and fail-closed. |
+| P1 columns/checks did not exclude behavior-changing attached objects | The SQLite schema-row inventory and PostgreSQL history-table relation/index/constraint/trigger/rule/RLS/ACL inventory are now closed and fail-closed. |
 | P2 compound mismatches had no total order or value provenance | Name, checksum, policy, native state is one total order; every output row carries always-present catalog and history fields with exact unavailable markers. |
 | P2 validation phases had unspecified internal winners | Token, field, directory, file, statement, connection, schema, and history traversal/error precedence is now exact. |
 | P1 revised review found SQLite connection-local behavior outside `sqlite_schema` | The matrix was reopened around persistent plus session-local modifiers; exact `main` qualification and `sqlite_temp_schema` rejection close TEMP trigger and shadowing paths. |
+| P1 focused continuation found a validation-to-DML race with non-cooperating DB writers | The matrix was redesigned around two lock layers: OS/advisory locks serialize Align, while SQLite transactions and PostgreSQL table locks cover native validation/history access; Forbidden worker connections never perform history DML. |
+| focused lock review included unprotected schema-wide state and a racy PostgreSQL existence branch | The invariant now contains only history-table-attached behavior validated by one catalog query; blind first-SQL locking plus SQLSTATE-bound rollback/bootstrap removes the existence race. Worker-local state is explicitly outside the history-connection invariant, while Applying remains an explicit no-retry dirty state requiring repair. |
+| final inspection review found PostgreSQL `SHARE` compatible with index creation | Inspection uses `SHARE ROW EXCLUSIVE`, which permits readers while conflicting with DML and ordinary/concurrent index or DDL modes. |
 
 ### D12 — category-specific metadata and EXPLAIN
 
