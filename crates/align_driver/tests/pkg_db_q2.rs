@@ -997,6 +997,7 @@ pub fn one() -> pkg.db.query<Params, Row> = pkg.db.query(
 )
 "#;
     let main = r#"module main
+import std.crypto
 import pkg.db
 import pkg.db.sqlite
 import app.common_command
@@ -1041,7 +1042,9 @@ fn main() -> i32 {
           }
           Ok(_) => false
         }
-        if created_ok && selected_ok && timeout_ok { 42 } else { 2 }
+        digest := crypto.sha256("libpq link order")
+        crypto_ok := digest.len() == 32
+        if created_ok && selected_ok && timeout_ok && crypto_ok { 42 } else { 2 }
       }
     }
   }
@@ -1051,14 +1054,37 @@ fn main() -> i32 {
     let mut files = package_files(main);
     files.push(("app/common_command.align", COMMAND));
     files.push(("app/common_query.align", QUERY));
+    let whole = build_and_run_multi_with_static_descriptors(
+        "pkg-db-q2-common-sqlite-whole",
+        &files,
+        "main.align",
+    );
+    assert_eq!(
+        whole.status.code(),
+        Some(42),
+        "whole stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&whole.stdout),
+        String::from_utf8_lossy(&whole.stderr),
+    );
     let built = build_per_unit_multi("pkg-db-q2-common-sqlite", &files, "main.align");
     let link_libs = built.link_libs_union();
-    for library in ["pq", "ssl", "crypto"] {
-        assert!(
-            link_libs.iter().any(|linked| linked == library),
-            "common database build must retain libpq dependency `{library}`: {link_libs:?}"
-        );
-    }
+    assert!(
+        link_libs.iter().any(|linked| linked == "pq"),
+        "missing libpq: {link_libs:?}"
+    );
+    let ordered_link_libs = order_link_libs(&link_libs);
+    let position = |library: &str| {
+        ordered_link_libs
+            .iter()
+            .position(|linked| linked == library)
+            .unwrap_or_else(|| {
+                panic!("missing `{library}` in ordered link list: {ordered_link_libs:?}")
+            })
+    };
+    assert!(
+        position("pq") < position("ssl") && position("ssl") < position("crypto"),
+        "libpq TLS closure must be ordered dependent-first: {ordered_link_libs:?}"
+    );
     let output = built.link_and_run();
     assert_eq!(
         output.status.code(),

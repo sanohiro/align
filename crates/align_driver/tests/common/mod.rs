@@ -11,6 +11,7 @@ pub use align_driver::{
     PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, backend_available, build_per_unit,
     build_thin_lto, cas_blob_path, check, check_per_unit, emit_llvm_ir, emit_object_file,
     link_executable, link_objects, lower_to_mir, lower_to_mir_per_unit,
+    lower_to_mir_with_static_descriptors, order_link_libs,
 };
 pub use align_span::SourceMap;
 
@@ -385,6 +386,47 @@ pub fn build_and_run_multi(
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
+    let pid = std::process::id();
+    let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
+    let exe = proj.dir.join(format!(
+        "align-mtest-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    emit_object_file(
+        &mir,
+        &obj,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    std::process::Command::new(&exe).output().expect("run")
+}
+
+/// Compile + run a multi-file program through the whole-program path, including the compiler-owned
+/// static descriptor replacement used by `pkg.db` Query/command constructors. The ordinary helper
+/// intentionally stays a small frontend/codegen probe; descriptor users need this explicit variant
+/// so the test cannot accidentally execute an unreachable `process.abort` constructor.
+pub fn build_and_run_multi_with_static_descriptors(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+) -> std::process::Output {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_name, &entry_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir_with_static_descriptors(&checked, &mut sm, &proj.dir)
+        .expect("install static descriptor data");
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
     let exe = proj.dir.join(format!(

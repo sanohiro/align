@@ -54,6 +54,9 @@ pub use align_interface::{Driver, DriverRestriction};
 pub struct Checked {
     pub hir: align_sema::Program,
     pub static_descriptors: Vec<StaticDescriptor>,
+    /// The source-level module path that owns the entry function. Whole-program descriptor
+    /// installation uses it to distinguish the entry's plain symbols from non-entry mangled ones.
+    pub entry_unit: String,
     pub diags: Diagnostics,
 }
 fn static_interface_hash(
@@ -189,7 +192,7 @@ fn static_implementation_hash(
 /// codegen-owned byte global; application source cannot spell or inspect that field.
 fn install_static_descriptor_data(
     mir: &mut align_mir::Program,
-    is_entry: bool,
+    entry_unit: Option<&str>,
     descriptors: &[StaticDescriptor],
     artifacts: &[BuiltStaticArtifact],
 ) -> Result<(), String> {
@@ -284,7 +287,11 @@ fn install_static_descriptor_data(
                     descriptor.descriptor_id
                 )
             })?;
-        let symbol = if is_entry {
+        // Whole-program MIR keeps entry-unit functions plain and prefixes every other module;
+        // per-unit MIR follows the same rule for the unit being emitted. The explicit entry-unit
+        // identity prevents a malformed/non-entry descriptor from binding to an unrelated plain
+        // function with the same item name.
+        let symbol = if entry_unit == Some(descriptor.unit.as_str()) {
             descriptor.item.clone()
         } else {
             format!("{}${}", descriptor.unit, descriptor.item)
@@ -850,6 +857,39 @@ fn install_static_descriptor_data(
     Ok(())
 }
 
+/// Lower a checked whole program and install its compiler-owned static descriptor data.
+///
+/// The normal CLI build uses the per-unit path, which installs descriptors while producing each
+/// producer artifact. The whole-program path remains a supported inspection and differential-test
+/// surface, so it needs the same post-lowering descriptor replacement before codegen.
+pub fn lower_to_mir_with_static_descriptors(
+    checked: &Checked,
+    source_map: &mut SourceMap,
+    project_root: &std::path::Path,
+) -> Result<align_mir::Program, String> {
+    let mut mir = lower_to_mir(&checked.hir);
+    if checked.static_descriptors.is_empty() {
+        return Ok(mir);
+    }
+    let resolution_digest = align_interface::codegen_impl_hash(&mir);
+    let resolved = resolve_static_descriptors(
+        project_root,
+        source_map,
+        &checked.static_descriptors,
+        resolution_digest,
+    )
+    .map_err(|error| error.to_string())?;
+    let artifacts = build_static_artifacts(&checked.static_descriptors, &resolved)
+        .map_err(|error| error.to_string())?;
+    install_static_descriptor_data(
+        &mut mir,
+        Some(checked.entry_unit.as_str()),
+        &checked.static_descriptors,
+        &artifacts,
+    )?;
+    Ok(mir)
+}
+
 /// lexer -> parser -> sema for the entry file plus its transitively-imported **user** modules
 /// (multi-file, slice B1). User modules resolve by filename convention: `import geom` →
 /// `<entry-dir>/geom.align`, which must declare `module geom`. Builtin imports (`core.*`/`std.*`)
@@ -1029,6 +1069,11 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     Checked {
         hir: checked.program,
         static_descriptors: checked.static_descriptors,
+        entry_unit: loaded
+            .iter()
+            .find(|unit| unit.is_entry)
+            .map(|unit| unit.path.clone())
+            .unwrap_or_else(|| "main".to_string()),
         diags,
     }
 }
@@ -1389,7 +1434,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 };
                 if let Err(reason) = install_static_descriptor_data(
                     &mut mir,
-                    u.is_entry,
+                    u.is_entry.then_some(u.path.as_str()),
                     &static_descriptors,
                     &static_artifacts,
                 ) {
@@ -2616,6 +2661,32 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
     link_objects(&[obj], exe, link_libs, profile)
 }
 
+/// Return the link-library list with the supported libpq native closure in static-link order.
+///
+/// MIR and per-unit capability unions intentionally preserve first-seen order for deterministic
+/// identity. That order can put a `crypto` request from an unrelated module before `pq`, however;
+/// a static ELF linker has already scanned that archive by the time libpq introduces its symbols.
+/// When `pq` is present, normalize the known closure (including the runtime's compression
+/// dependencies) to dependent-first order. Programs without `pq` retain their existing order and
+/// therefore keep the established `extern "C" link(...)` behavior.
+pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
+    const LIBPQ_CLOSURE: [&str; 5] = ["pq", "ssl", "crypto", "zstd", "z"];
+    if !link_libs.iter().any(|library| library == "pq") {
+        return link_libs.to_vec();
+    }
+    let mut ordered = link_libs
+        .iter()
+        .filter(|library| !LIBPQ_CLOSURE.contains(&library.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for library in LIBPQ_CLOSURE {
+        if link_libs.iter().any(|candidate| candidate == library) {
+            ordered.push(library.to_string());
+        }
+    }
+    ordered
+}
+
 /// Link one or more object files (plus the Align runtime and the always-linked C libraries) into an
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
@@ -2644,6 +2715,7 @@ pub fn link_objects_instrumented(
 fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
+    let ordered_link_libs = order_link_libs(link_libs);
     let mut cmd = std::process::Command::new("cc");
     for obj in objs {
         cmd.arg(obj);
@@ -2697,16 +2769,17 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
     // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user
     // declared (validated in sema). All go AFTER the objects/archive that reference them (`-l`
-    // resolves left-to-right against preceding inputs). Each name is a single `-l<name>` argv (no
+    // resolves left-to-right against preceding inputs). The supported libpq closure is normalized
+    // by `order_link_libs` immediately before this loop. Each name is a single `-l<name>` argv (no
     // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
-    for lib in link_libs {
+    for lib in &ordered_link_libs {
         cmd.arg(format!("-l{lib}"));
     }
     let status = cmd
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
     if !status.success() {
-        return Err(link_failure_message(status.code(), link_libs));
+        return Err(link_failure_message(status.code(), &ordered_link_libs));
     }
     // Mach-O strip: ld64 has no `--strip-all`, so the size profiles run the external `strip` on the
     // linked image. `strip` ships with the same Xcode CLT as the `cc`/`ld` above (the existing
@@ -3035,6 +3108,24 @@ mod tests {
     fn support_libs_are_pinned_per_format() {
         assert_eq!(support_libs(ObjectFormat::Elf), ["-lpthread", "-ldl", "-lm"]);
         assert_eq!(support_libs(ObjectFormat::MachO), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn libpq_closure_is_ordered_after_unrelated_crypto_requests() {
+        let input = ["crypto", "z", "zstd", "sqlite3", "pq", "ssl"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order_link_libs(&input),
+            ["sqlite3", "pq", "ssl", "crypto", "zstd", "z"]
+        );
+    }
+
+    #[test]
+    fn link_order_without_libpq_is_unchanged() {
+        let input = ["crypto", "z", "zstd"].into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(order_link_libs(&input), input);
     }
 
     #[test]

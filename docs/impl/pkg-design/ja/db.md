@@ -303,8 +303,10 @@ compiler/frontendが所有するもの:
 runtimeはregion-builder chunk/compact、checked owner-tied native view/UTF-8 validation、
 既存arena/allocation helperだけを提供する。DB Query意味論、SQL parser、reflection、
 DB handle typeをruntimeへ置かない。基本driver callはgenerated package codeから
-libsqlite3/libpqへ直接行う。common PostgreSQL dispatchはstatic ELF linkでlibpqのTLS依存closure
-が残るよう、libssl/libcryptoも明示的にlinkする。
+libsqlite3/libpqへ直接行う。common PostgreSQL dispatchもlibssl/libcryptoを明示して
+static ELF linkでlibpqのTLS dependency closureを保持する。`pq`を含む場合、driverは
+unitごとのfirst-seen discoveryに依存せず、最終linkで`pq`、`ssl`、`crypto`、supportedな
+`zstd`/`z`の順へ正規化する。
 
 `align_driver` は明示tool (`alignc db prepare`、migrate/status/check)、deterministic
 artifact I/O、tool-only schema setupを所有する。
@@ -1933,7 +1935,9 @@ Q2 author probeはApple Silicon macOS 26.5.2でconsumed C signatureを
 SQLite 3.51.0を報告した一方、明示選択したHomebrew libraryは3.53.3だったため、Q2は
 discovery metadataから推測せずlinked runtime versionをtest/reportする。
 libpqのTLS依存はsupported targetでlibssl/libcryptoへ解決するため、generated package link
-contractではこのdependency closureをtransitive linker任せにせず明示する。
+contractではこのdependency closureをtransitive linker任せにせず明示する。`pq`を含む最終link
+では、unitごとのfirst-seen discoveryに依存せず、driverが`pq`、`ssl`、`crypto`、続いて
+supportedな`zstd`/`z`の順に正規化する。
 
 SQLiteでは`sqlite3_prepare_v3` tailが最初のterminator直後のbyte 74を指し、comment付き
 tailを再prepareするとsecond statementになった。従ってcomplete tailを走査しwhitespace/comment
@@ -2112,7 +2116,7 @@ semantic helperやhandleを追加しない。
 | PostgreSQL result/cardinality | `BufferedFull`でもSQLiteと同順に、0 row Cardinality、row0 validate/cache、invalidなら即error、validかつrow1存在ならCardinality、singletonだけdecodeする。row1以降はvalidateしない。CommandはPGRES_COMMAND_OKとPQcmdTuples ruleを守りclear exactly once。 | 0/1/2+、malformed-first/valid-first-malformed-second winner、validator/decoder count、name/NULL/type/range/count、command/affected/clear/direct |
 | native error ownership | cleanup前にnative detailをexact owned `db.NativeError`へcopyしmessage parseなしでstable categoryへmapする。Native errorはQuery IDを持たない。`db.ContractError`だけがquery_idを持ち、trusted statementは`Some(id)`、Query-less inputまたはidentity trust前のinvalid headerは`None`。 | cleanup後field、SQLSTATE/SQLite、identity twin、malformed/Query-less error、allocation/drop |
 | FFI/ABI and malformed input | SQLite/libpq declaration/status/pointer/length/destructor/libraryをpinする。descriptor rawはfirst header load前にnull-checkし、complete fixed headerをvalidateしてからembedded pointerをfollow/thunk invokeする。invalid length/text/header/thunkをnative side effect前にrejectする。 | D0、C signature、Rust/Align inventory、null/header/embedded-pointer malformed test、ASan等、x86_64/ARM64/macOS CI |
-| native library dependency closure | native link contractを明示する。SQLiteは`sqlite3`、PostgreSQLは`pq`、supported libpq TLS closureは`ssl`と`crypto`を使う。common dispatchは両driver pathを保持し得るため、SQLite-only callでもELF上のordered closureをtransitive `DT_NEEDED` discoveryに依存せずlinkする。 | `pkg_db_q2::common_surface_dispatches_to_sqlite_without_driver_cycle`のlink-library inventoryとexecutable、Linux required PostgreSQL integration |
+| native library dependency closure | native link contractを明示する。SQLiteは`sqlite3`、PostgreSQLは`pq`、supported libpq TLS closureは`ssl`と`crypto`を使う。common dispatchは両driver pathを保持し得るため、SQLite-only callでもELF上のordered closureをtransitive `DT_NEEDED` discoveryに依存せずlinkする。別unitが先に`crypto`を要求しても、最終linkは`pq`/`ssl`/`crypto`/`zstd`/`z`の順を正規化する。 | `pkg_db_q2::common_surface_dispatches_to_sqlite_without_driver_cycle`のwhole/per-unit executableとordered link inventory、Linux required PostgreSQL integration |
 | allocation parity | scalar connect/execute/one successはvisible connection/execution/native objectとPostgreSQL Text parameter storageだけをallocateする。per-row heap allocation、error allocation、runtime dictionary、artifact/source I/Oは禁止する。partial allocationごとにownerとcleanup edgeを1つ持つ。 | success/各injected partial failureのallocation/copy counter、DB runtime helperを含まないemitted-symbol inventory、package対direct driver measurement |
 | required PostgreSQL gate | pinned provisioned `db-postgres` CI jobを追加する。jobはephemeral connectionを`ALIGN_DB_POSTGRES_URL`で渡し、`ALIGN_DB_POSTGRES_REQUIRED=1`を設定する。missing/unreachable configはfailureとし、同じportable Queryを両driverで実行する。local absenceだけは理由付きskip可。native library/server versionをevidenceとして表示し、URLはsource・artifact・logへ埋め込まない。 | missing URLのrequired-mode self-test、provisioned PostgreSQL job、portable dual-driver integration target、unconditional/required-mode skip branch不在 |
 
