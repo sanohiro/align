@@ -213,6 +213,9 @@ fn install_static_descriptor_data(
     if descriptors.len() != artifacts.len() {
         return Err("static descriptor/artifact count mismatch".to_string());
     }
+    if descriptors.is_empty() {
+        return Ok(());
+    }
     let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
     let u32_ty = Ty::Int(IntTy { bits: 32, signed: false });
     let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
