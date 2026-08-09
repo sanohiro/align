@@ -129,6 +129,7 @@ if [[ $# -gt 0 ]]; then
   "$@"
 fi
 if [[ "$rust_changed" == true ]]; then
+  scripts/lint-ratchet.sh
   scripts/test-pr.sh
   # Clippy keeps its own target dir: clippy and build/test record incompatible
   # fingerprints in a shared dir, so alternating them forces a near-full
