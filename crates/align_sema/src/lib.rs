@@ -688,6 +688,130 @@ pub enum Ty {
     Error,
 }
 
+/// Compile-time tripwire: adding a [`Ty`] or [`Scalar`] variant fails this match, so the
+/// build itself hands you the Gate-1 sweep instead of a reviewer finding it later. Before
+/// adding the new arm here, confirm the variant is handled **explicitly** (not via a `_`
+/// wildcard) in every pass that matches over these enums — the align-self-review Gate-1
+/// list: `region_of`, `tracks_region`, `null_moved_source`, `is_move`/`ret_is_move`,
+/// `MoveCheck`/`EscapeCheck`, drop insertion, `ty_to_scalar`/`scalar_to_ty`, MIR lowering,
+/// and codegen's `abi_type`/`scalar_bytes`/`int_type`/`int_bits`. A variant carrying an
+/// owned or region payload additionally needs a use-after-free / double-free owner test.
+#[allow(dead_code)]
+const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
+    match *ty {
+        Ty::Int { .. }
+        | Ty::Param { .. }
+        | Ty::IntVar { .. }
+        | Ty::Float { .. }
+        | Ty::FloatVar { .. }
+        | Ty::Bool
+        | Ty::Char
+        | Ty::Option { .. }
+        | Ty::Result { .. }
+        | Ty::Tagged { .. }
+        | Ty::Box { .. }
+        | Ty::Array { .. }
+        | Ty::Vec { .. }
+        | Ty::Mask { .. }
+        | Ty::StructArray { .. }
+        | Ty::DynStructArray { .. }
+        | Ty::Slice { .. }
+        | Ty::Soa { .. }
+        | Ty::DynSliceArray { .. }
+        | Ty::DynArray { .. }
+        | Ty::DynVecArray { .. }
+        | Ty::DynMaskArray { .. }
+        | Ty::DynFixedArray { .. }
+        | Ty::DynFixedStructArray { .. }
+        | Ty::DynResponseArray
+        | Ty::Str
+        | Ty::String
+        | Ty::ArenaHandle
+        | Ty::Raw
+        | Ty::Resource { .. }
+        | Ty::ResourceRef { .. }
+        | Ty::Builder
+        | Ty::Writer
+        | Ty::Reader
+        | Ty::Buffer
+        | Ty::ArrayBuilder { .. }
+        | Ty::VecArrayBuilder { .. }
+        | Ty::MaskArrayBuilder { .. }
+        | Ty::FixedArrayBuilder { .. }
+        | Ty::FixedStructArrayBuilder { .. }
+        | Ty::StrFinder
+        | Ty::File
+        | Ty::Rng
+        | Ty::Regex
+        | Ty::Captures
+        | Ty::CliCommand
+        | Ty::CliParsed
+        | Ty::TcpConn
+        | Ty::TcpListener
+        | Ty::UdpSocket
+        | Ty::Child
+        | Ty::Command
+        | Ty::RunOutput
+        | Ty::HttpRequest
+        | Ty::HttpResponse
+        | Ty::HttpClient
+        | Ty::HttpServer
+        | Ty::HttpRequestCtx
+        | Ty::ResponseBuilder
+        | Ty::HttpStream
+        | Ty::HttpHeaders
+        | Ty::JsonDoc
+        | Ty::JsonScanner { .. }
+        | Ty::Struct { .. }
+        | Ty::Tuple { .. }
+        | Ty::Fn { .. }
+        | Ty::Enum { .. }
+        | Ty::Task { .. }
+        | Ty::DictEncoded { .. }
+        | Ty::Unit
+        | Ty::Error => {}
+    }
+    match *scalar {
+        Scalar::Int { .. }
+        | Scalar::Float { .. }
+        | Scalar::Bool
+        | Scalar::Char
+        | Scalar::Unit
+        | Scalar::Struct { .. }
+        | Scalar::String
+        | Scalar::DynArray { .. }
+        | Scalar::DynStructArray { .. }
+        | Scalar::DynResponseArray
+        | Scalar::Str
+        | Scalar::Slice { .. }
+        | Scalar::Enum { .. }
+        | Scalar::Tagged { .. }
+        | Scalar::Soa { .. }
+        | Scalar::JsonDoc
+        | Scalar::Param { .. }
+        | Scalar::Reader
+        | Scalar::Writer
+        | Scalar::Buffer
+        | Scalar::Regex
+        | Scalar::Captures
+        | Scalar::CliParsed
+        | Scalar::TcpConn
+        | Scalar::TcpListener
+        | Scalar::UdpSocket
+        | Scalar::Child
+        | Scalar::File
+        | Scalar::HttpResponse
+        | Scalar::HttpServer
+        | Scalar::HttpRequestCtx
+        | Scalar::ResponseBuilder
+        | Scalar::HttpStream
+        | Scalar::RunOutput
+        | Scalar::Fn { .. }
+        | Scalar::Resource { .. }
+        | Scalar::ResourceRef { .. } => {}
+    }
+}
+
 /// Convert a concrete scalar [`Ty`] to a [`Scalar`]; `None` for vars/composites/structs.
 /// A primitive scalar type (int/float/bool/char) — the only values `raw.load`/`raw.store` move
 /// through raw memory soundly in the first cut (no `str` views, no structs/aggregates).

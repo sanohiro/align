@@ -270,6 +270,29 @@ Benchmarks are separate local measurements run only for the changed
 performance path or an explicit performance/resource claim. See
 `docs/impl/16-test-policy.md` for selection and growth rules.
 
+**CI is the final guard, never the discovery loop.** Do not push a change to
+find out whether required verification passes. Every required CI check must be
+runnable locally, and service-dependent verification uses local Docker rather
+than CI round-trips: a diff touching `apps/db` or the `pkg_db_*` driver tests
+must pass `scripts/db-verify-local.sh` (a CI-parity disposable PostgreSQL
+container running the same required suites) before it is pushed. When a new
+required CI job is added, add or extend the matching local script in the same
+PR.
+
+**The preflight stamp binds the exact pushed HEAD.** Run `scripts/pre-pr.sh`
+on the final commit immediately before pushing; any later commit, amend, or
+rebase invalidates the stamp and requires a rerun. Push and open/update the PR
+as one uninterrupted step — three recent Preflight CI failures were stamps
+belonging to a different SHA, each costing a full round-trip.
+
+**Recurred finding classes are closed by machinery, not prose.** When
+`.claude/skills/align-self-review/FINDINGS.md` reaches its two-event threshold
+the class becomes an explicit checklist question; at three events it must get a
+compile-time tripwire, lint, structural assertion, or parameterized owner where
+feasible (for example, `align_sema`'s `variant_sweep_tripwire` turns a missed
+Gate-1 enum sweep into a build failure). Adding another checklist sentence for
+an already-recurred class is not closure.
+
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.
 

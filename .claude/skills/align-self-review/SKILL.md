@@ -27,6 +27,15 @@ Deduplicate repeated rendering of one review comment, keep rejected claims out
 of the counts, and count preflight/test failures separately from review
 findings.
 
+**Ledger-to-diff extraction pass (run before requesting any review).** Every
+finding in PR #727 cited an existing normative line of the owning design doc —
+the reviewer found them by reading the design against the diff. Do the same
+mechanically first: from the design sections your diff touches, extract every
+line containing `must` / `exact` / `every` / `before` / `reject` / `required`,
+and point each extracted obligation at its implementation site and owner test
+(or record its explicit deferral in the plan of record). Obligations recalled
+from memory do not count; work from the extracted lines.
+
 ---
 
 ## Gate 1 — "Added a variant → update every pass" (the #1 soundness killer)
@@ -102,6 +111,15 @@ The same concept is encoded independently in 2–4 places; you update one and a 
   version, reserved byte, closed/poisoned flag, pointer, length, thunk, and
   lease field before the first losing-phase allocation, native side effect, or
   indirect call. Pin multi-invalid precedence with a parameterized owner.
+- [ ] **Duplicated validators drift on version bumps.** When a header/ABI gains
+  a version or field, every copied validator must gain the same check — #727's
+  v3 tail-reserved field passed one validator and not its duplicates. Prefer
+  collapsing copies into one shared validator so the bump has a single owner.
+- [ ] **A native status enum alone does not prove the operation happened.**
+  PostgreSQL answers `COMMIT` inside an aborted transaction with
+  `PGRES_COMMAND_OK` and a `ROLLBACK` command tag (#727 P1). For
+  commit/rollback-class operations, check the command tag (`PQcmdStatus`) or
+  equivalent effect evidence, not only the result-status enum.
 - [ ] **The exported surface is exactly the reviewed ledger.** Inventory every
   `pub` function and constructor in changed package modules. A cross-module
   implementation helper must live under the settled `internal` import boundary
@@ -145,6 +163,13 @@ The M6 builtin arc surfaced a whole class of sema bugs around type variables and
   modes, and token-free trailing whitespace/comments after the final
   statement. Three findings across #718 and #723 came from closing one scanner
   state without the siblings.
+- **Dual-driver sibling sweep**: Gate 1's "sweep every parallel case" applies
+  across database drivers too. When you handle a status, sentinel, tag, or
+  error arm in one driver, grep the sibling driver for the same arm before
+  calling it done (#727: the `-1` unsupported-shape sentinel was mapped on the
+  PostgreSQL path and missed on SQLite). The durable closure is one
+  parameterized parity owner that runs the same input matrix through both
+  drivers and diffs the outcome classes.
 - **SIMD arch parity**: a hand-written SIMD routine must ship as a **set** — x86 (`#[cfg(target_arch = "x86_64")]` + `is_x86_feature_detected!`) **and** arm64 (`#[cfg(target_arch = "aarch64")]`, NEON is ARMv8-A baseline) **and** a scalar fallback — with a test asserting every available path matches the scalar oracle byte-for-byte. Never land an x86-only intrinsic on a live path (it silently makes ARM slower); the dispatcher's non-x86 arm must reach NEON, not scalar. (`json_decode_index`/`json_structural_index` carry both; the carry-less fold pairs `pclmulqdq` with NEON `PMULL`.) Auto-vectorized loops and the `vec`/`mask` surface go through LLVM per target arch, so they need no per-arch code — only explicit intrinsics do.
 - **Tests actually exercise the case**: no silent bypass — `None => continue`, `unwrap_or_default()` on `read_dir`, or an empty input set makes a test pass without asserting (#286); an "out-of-range" test must use an out-of-range index, not `s[0]` on a len-1 array (#247); every new guard/rejection deserves a negative test (null/zero/non-pow-2 align #293, leading-`-` lib name #268, assign-from-local #283). Print the diagnostics on failure so the runner shows them (#286).
 - **Tests/bench portability**: unique temp paths (PID) + RAII cleanup, no leaks/races (#20, #37, #132, #134); branch on `cfg!(target_os/arch)`, don't hardcode `.so` / drop `.exe` / x86-only `target-cpu` on ARM (#128, #152, #167); a process exit code is the **low byte** on Unix but full 32-bit on Windows — `cfg!(windows)` the expected value (#287).
